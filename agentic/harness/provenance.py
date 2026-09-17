@@ -134,6 +134,7 @@ def write_run_record(
     result: str | None = None,
     events: list[dict] | None = None,
     extra_jsonl: dict[str, list[Any]] | None = None,
+    arrivals: list[float | None] | None = None,
 ) -> Path | None:
     """Write the bundle; never raises (best-effort provenance must not fail the run).
 
@@ -144,8 +145,12 @@ def write_run_record(
         d = runs_dir / f"{config.get('runid', 'local')}-{config.get('scenario', 'run')}"
         d.mkdir(parents=True, exist_ok=True)
         with (d / "messages.jsonl").open("w") as fh:
-            for m in messages:
-                fh.write(json.dumps(_jsonable(m), default=str) + "\n")
+            for n, m in enumerate(messages):
+                row = _jsonable(m)
+                t_at = arrivals[n] if arrivals and n < len(arrivals) else None
+                if isinstance(row, dict) and t_at is not None:
+                    row = {**row, "__t__": t_at}   # arrival stamp: offline turn latency (trace_adapter.trace_from_bundle)
+                fh.write(json.dumps(row, default=str) + "\n")
         # Operator-specific side streams (e.g. the ACP client's event log, `acp-updates.jsonl`): one file each,
         # one JSON object per line, next to messages.jsonl.
         for name, rows in (extra_jsonl or {}).items():

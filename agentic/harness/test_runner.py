@@ -133,6 +133,14 @@ def test_prose_follow_up_cap_is_recorded_not_hidden(runner):
     assert r.final.is_error is False  # the last turn did complete; the cap is a separate (gating) row in run.py
 
 
+def test_every_message_gets_an_arrival_stamp_in_order(runner):
+    # the REPL benchmark's turn latency comes from these stamps: one per message, monotonic, seconds since start
+    _Client.turns = [[AssistantMessage([TextBlock("working")]), AssistantMessage([TextBlock("done")]), ResultMessage()]]
+    r = _run(runner, persona=None)
+    assert len(r.arrivals) == len(r.messages) == 3
+    assert all(isinstance(t, float) and t >= 0 for t in r.arrivals) and r.arrivals == sorted(r.arrivals)
+
+
 def test_autonomous_run_and_max_turns_raise(runner):
     _Client.turns = [[AssistantMessage([TextBlock("ok")]), ResultMessage()]]
     r = _run(runner, persona=None)
