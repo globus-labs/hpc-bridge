@@ -30,7 +30,9 @@ from claude_agent_sdk import (  # type: ignore[import-not-found]
     PermissionResultAllow,
     query,
 )
-from human_sim import HumanSim, ends_with_question
+
+# MAX_PROSE_FOLLOWUPS: used by the prose loop below, re-exported to hermes_runner
+from human_sim import MAX_PROSE_FOLLOWUPS, HumanSim, ends_with_question
 from invariants import Trace, logical_name
 from trace_adapter import _result_to_dict, build_trace, insert_interjections
 
@@ -54,9 +56,7 @@ HPC_BRIDGE_TOOLS = (
 # (run_smoke.sh forwards it) — the mounted storage.db must then already hold the search scope
 # (granted once via `hpc-bridge-catalog`); unset, the suite stays on the BYO/discovery path.
 _REQUIRED_ENV = ("HPC_BRIDGE_USER_DIR", "HPC_BRIDGE_SSH_USER", "HPC_BRIDGE_SSH_KEY")
-# Interactive runs: when the agent ends a turn with a prose question instead of AskUserQuestion, the
-# human-sim replies and the conversation continues — at most this many times per run.
-MAX_PROSE_FOLLOWUPS = 3
+# MAX_PROSE_FOLLOWUPS (the prose-answer cap) lives in human_sim — shared with the hermes/ACP driver's turn policy.
 # Passed EXPLICITLY to the MCP server. The CLI spawns the server with its own env layered UNDER this dict, so
 # the server also inherits the jail's environment (run_smoke.sh has relied on that for GLOBUS_COMPUTE_USER_DIR
 # and HPC_BRIDGE_ENDPOINT_NAME since the first harness commit). Naming them here makes the dependency visible
@@ -83,9 +83,12 @@ class RunResult:
     dialogue: list[Any] = None  # interactive mode: the human-sim's Q&A Exchanges
     prose_followups: int = 0          # interactive: prose questions the sim answered (client.query follow-ups)
     followups_capped: bool = False    # the run ended because MAX_PROSE_FOLLOWUPS was hit — the agent kept asking
+    nudges: int = 0                   # ACP driver: mid-task pauses the sim told the operator to carry on from
+    nudges_capped: bool = False       # the nudge budget ran out — the operator kept pausing without finishing (diagnostic)
     human_sim_model: str | None = None  # interactive: which model played the user (bundle provenance)
     hooks_fired: list[dict] = None    # chaos: the MIDRUN_HOOKS that fired (tool, nth, call index, rc, output)
     interjections: list[dict] = None  # `interject` hooks: what the USER said mid-run, and after which call (stamped into the trace)
+    acp_events: list[dict] = None     # ACP operators: the client's event log (persisted as acp-updates.jsonl; cross-checked)
 
 
 class HookWatcher:
@@ -378,7 +381,7 @@ async def run_scenario(
                             break
                         reply = await human.reply(last_text)
                         followups += 1
-                        print(f"  ! human({persona}) answers a PROSE question: {reply[:160]}", file=sys.stderr, flush=True)
+                        print(f"  ! human({persona}) answers a PROSE question: {reply}", file=sys.stderr, flush=True)
                         await client.query(reply)
                 live.pop("client", None)
             else:

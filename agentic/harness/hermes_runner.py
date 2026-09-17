@@ -18,6 +18,11 @@ Two modes:
 
 The trace comes from hermes' own ``state.db`` (see hermes_trace); prose Q&A is stamped in as synthetic
 AskUserQuestion calls so the interactive graders apply unchanged. Mid-run chaos hooks are not supported here.
+
+The ACP path (``HPCB_HERMES_ACP=1``, ``_run_acp``) is the benchmark driver: ONE persistent session, and after every
+operator turn the human-sim decides reply / nudge / conclude (``HumanSim.move`` via ``AcpResponder``) — a decisive
+operator that ends a turn on a plan gets a "carry on", a wrap-up ends the session, a standing decline is never
+nudged. Nudges are stamped as ``user_nudge`` markers, never as questions.
 """
 from __future__ import annotations
 
@@ -31,7 +36,8 @@ from pathlib import Path
 
 import hermes_setup
 from hermes_trace import exchanges_from_messages, load_messages, stamp_exchanges, trace_from_messages
-from runner import HPC_BRIDGE_TOOLS, MAX_PROSE_FOLLOWUPS, RunResult  # shared dataclass + logical tool names + cap
+from human_sim import MAX_NUDGES, MAX_PROSE_FOLLOWUPS
+from runner import HPC_BRIDGE_TOOLS, RunResult  # shared dataclass + logical tool names
 
 _HERMES_BIN = "hermes"
 # Harness plumbing + Anthropic auth the hermes child has no business seeing. ALCF_INFERENCE_TOKEN is KEPT (hermes
@@ -132,6 +138,30 @@ async def _run_turn(full_prompt: str, child_env: dict[str, str], timeout_s: int)
         raise
 
 
+class AcpResponder:
+    """The ACP session's interactive `respond` hook: after EVERY operator turn, ask the persona'd human-sim what a
+    person does next (`HumanSim.move` — reply / nudge / conclude) and send that, keeping the replies IN ORDER for the
+    post-run stamping. `exchanges_from_messages` pairs each `user` row after the first with `replies[N]`, and a nudge
+    is a user row like any answer, so nudges are recorded too (kind "nudge" → stamped as `user_nudge`, never as a
+    question). Turn CONTINUATION no longer hinges on `ends_with_question`; the guards (a standing decline is never
+    nudged; each budget ends in conclude) live in the sim so they are tested there."""
+
+    def __init__(self, human, persona: str | None) -> None:
+        self.human = human
+        self.persona = persona
+        self.replies: list[dict] = []   # {answer, kind} per message SENT, in order
+
+    async def __call__(self, turn) -> str | None:
+        move = await self.human.move(turn.text)
+        tag = f"{move.kind}{f': {move.reason}' if move.reason else ''}"
+        if move.action == "conclude":
+            print(f"  human({self.persona}) concludes [{tag}]", file=sys.stderr, flush=True)
+            return None
+        self.replies.append({"answer": move.reply, "kind": move.kind})
+        print(f"  human({self.persona}) [{tag}]: {move.reply}", file=sys.stderr, flush=True)   # the full reply: the operator sees all of it, so should the log
+        return move.reply
+
+
 def _turn_final_text(rows: list[dict], after_id: int) -> str:
     """The operator's last PROSE (assistant text) in the messages added since ``after_id`` — this turn's closing
     message, which a prose question ends with. Empty when the turn closed on tool calls (task done, no question)."""
@@ -162,38 +192,29 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
     full_prompt = _lead(ablate_skill, interactive=interactive) + "\n\n" + prompt
     db = home / "state.db"
     human = None
-    replies: list[dict] = []   # {answer, kind} per human-sim turn, in order — correlated to prose questions POST-RUN
-    state = {"capped": False}
     respond = None
     if interactive:
-        from human_sim import HumanSim, ends_with_question
+        from human_sim import HumanSim
 
+        # The sim decides EVERY turn (reply / nudge / conclude) off the ACP capture's turn text — reliable and
+        # complete when prompt() returns. Only {answer, kind} is recorded per message sent; the question TEXT + its
+        # trace INDEX are reconstructed POST-RUN from the flushed state.db (exchanges_from_messages) — the ACP
+        # capture's count/joined-chunks misaligned both.
         human = HumanSim(persona=persona, goal=user_goal, totp_secret=os.environ.get("HPCB_SIM_TOTP_SECRET") or None)
-
-        async def respond(turn):
-            # ends_with_question(turn.text) uses the ACP capture (reliable, complete when prompt() returns) to
-            # decide whether the operator asked — this drives turn CONTINUATION and completes runs. We record only
-            # {answer, kind}; the question TEXT + its trace INDEX are reconstructed POST-RUN from the flushed
-            # state.db (exchanges_from_messages) — the ACP capture's count/joined-chunks misaligned both.
-            if not ends_with_question(turn.text):
-                return None        # the operator finished / didn't ask — end the session
-            if len(replies) >= MAX_PROSE_FOLLOWUPS:
-                state["capped"] = True
-                return None
-            reply, kind, reason = await human.reply_hermes(turn.text)
-            replies.append({"answer": reply, "kind": kind})
-            print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply[:140]}",
-                  file=sys.stderr, flush=True)
-            return reply
+        respond = AcpResponder(human, persona)
 
     print(f"  hermes-ACP: model={alcf_model} home={home} "
           f"({'interactive ' + str(persona) if interactive else 'autonomous'})", file=sys.stderr, flush=True)
     t0 = time.time()
     err = False
     stop = "?"
+    cap = None
     try:
-        resp, _cap = await acp_client.run_session("hermes", ["acp"], full_prompt, cwd=repo, env=child_env,
-                                                  mcp_servers=mcp, respond=respond, max_turns=MAX_PROSE_FOLLOWUPS + 1)
+        # turns: the task + every answer + every nudge (each budget ends in a `conclude`, so this bound is never hit
+        # by the sim itself — it only guards a respond hook that keeps returning text)
+        resp, cap = await acp_client.run_session("hermes", ["acp"], full_prompt, cwd=repo, env=child_env,
+                                                 mcp_servers=mcp, respond=respond,
+                                                 max_turns=1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES)
         stop = str(getattr(resp, "stop_reason", "") or "")
     except asyncio.CancelledError:
         raise
@@ -206,15 +227,18 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
     trace = trace_from_messages(rows)
     if interactive:
         # Stamp POST-RUN from the flushed state.db: correlate each recorded reply to the operator's prose question
-        # by message order, so the synthetic AskUserQuestion lands at the right trace index with the clean ask text.
-        trace = stamp_exchanges(trace, exchanges_from_messages(rows, replies))
+        # by message order, so the synthetic AskUserQuestion lands at the right trace index with the clean ask text
+        # (a nudge lands as a `user_nudge` marker instead — it answered no question).
+        trace = stamp_exchanges(trace, exchanges_from_messages(rows, respond.replies))
     answer = trace.texts[-1] if trace.texts else ""
     return RunResult(
         trace=trace,
         final=HermesFinal(result=answer, is_error=err, session_id=(rows[0].get("session_id") if rows else None)),
         messages=rows, dialogue=(human.dialogue if human else []),
-        prose_followups=len(replies), followups_capped=state["capped"],
+        prose_followups=(human.answers if human else 0), followups_capped=(human.followups_capped if human else False),
+        nudges=(human.nudges if human else 0), nudges_capped=(human.nudges_capped if human else False),
         human_sim_model=(human.model if human else None),
+        acp_events=(list(cap.events) if cap is not None else None),
     )
 
 
@@ -296,7 +320,7 @@ async def run_scenario(
         exchanges.append({"call_index": max(0, calls_so_far - 1), "question": last_text[-1000:],
                           "answer": reply, "kind": kind})
         transcript.append(("user", reply))
-        print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply[:140]}",
+        print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply}",
               file=sys.stderr, flush=True)
 
     rows = load_messages(db) if db.is_file() else []

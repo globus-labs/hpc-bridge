@@ -33,7 +33,8 @@ if [ -f "$ENV_FILE" ]; then
   done < "$ENV_FILE"
 fi
 
-# Which harness drives hpc-bridge: `claude` (default) or `hermes` (an ALCF-hosted model, no Anthropic auth).
+# Which harness drives hpc-bridge: `claude` (default), `hermes` (an ALCF-hosted model, no Anthropic auth), or
+# `claude-acp` (Claude Code over ACP via Zed's adapter — the subscription token, like `claude`).
 OPERATOR="${HPCB_OPERATOR:-claude}"
 AUTH_ARGS=()
 if [ "$OPERATOR" = "hermes" ]; then
@@ -147,6 +148,13 @@ if [ "$OPERATOR" = "hermes" ]; then
   # When the operator's model endpoint is a tunnel on the HOST (e.g. argo-proxy at host.docker.internal), the jail —
   # which runs on the fake-cluster docker network — needs a route to the host gateway to reach it.
   case "${HPCB_ALCF_BASE_URL:-}" in *host.docker.internal*) ARGS+=( --add-host=host.docker.internal:host-gateway ) ;; esac
+fi
+if [ "$OPERATOR" = "claude-acp" ]; then
+  # Claude Code driven over ACP (Zed's claude-agent-acp, in the image): the subscription token is already in
+  # AUTH_ARGS (same auth as the claude operator); the model pin + benchmark scoring are forwarded when set.
+  ARGS+=( -e HPCB_OPERATOR=claude-acp )
+  [ -n "${HPCB_CLAUDE_ACP_MODEL:-}" ] && ARGS+=( -e HPCB_CLAUDE_ACP_MODEL )
+  [ -n "${HPCB_BENCHMARK_MODE:-}" ] && ARGS+=( -e HPCB_BENCHMARK_MODE )
 fi
 if [ -n "$HPCB_T_NETWORK" ]; then
   ARGS+=( --network "$HPCB_T_NETWORK" )   # the fake cluster's compose network: the jail reaches `login:22` directly

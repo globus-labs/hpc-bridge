@@ -3,6 +3,33 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.17 — 2026-09-09 — the account floor: an account-required facility starts nothing without an account
+
+### Fixed
+- **`account_required` is now enforced at the billed start.** A catalog entry that requires an allocation account
+  (NCSA Delta, Anvil, the fake MEP profile) gets **no block** from `ensure_endpoint_up(confirm_spend=True)` — or from
+  the implicit provision inside `run_shell(shape="compute")` — until an account is set: the call returns the new
+  status/phase **`needs_account`**, spend stays unconfirmed, and the notice says what an account is (a project /
+  allocation id, never a login name) and where it comes from. Before, the flag was stored on the facility and never
+  read: live on Delta (2026-09-09) the agent confirmed spend after the user offered their *login name*, the MEP
+  submitted a GPU block Slurm could only reject, and — a MEP having no login shape to run the rejection probe — the
+  plugin reported "allocating nodes…" for five minutes until the user cancelled. Graders treat `needs_account` as
+  "nothing started", like `needs_confirmation`.
+- **A scheduler-rejected submission is now a terminal `down`, not "allocating nodes…".** When the block's submit
+  is refused (parsl's "could not read job ID from submit command" / "failed to start block", or the scheduler's own
+  "invalid account/qos/partition"), `ensure_endpoint_up` returns `status="down"` with a **REJECTED** notice naming
+  the partition, the account and the one-line cause, and the implicit provision inside `run_shell` fails the same
+  way — instead of reporting "allocating nodes…" with the cause buried in a suffix (live on the fake MEP,
+  2026-09-09: five polls before the agent read it). Change the account/partition and confirm again; never retry
+  unchanged. **Best-effort on a MEP:** this fires only when the executor's failure reaches a canary — it did on one
+  of two live runs; on the other nothing reached the client and only the 300-second "a rejection is invisible from
+  here" hint spoke (the agent still recovered from it). The remaining blind spot is `Planned/MEP block rejection
+  visibility.md`.
+- **Wording: "no login node" → "no login shape through this channel".** The compute-only notices and the catalog
+  access note said the facility had no login node; the facility's login nodes exist — a multi-user endpoint just
+  does not expose them — so allocation names and balances come from the facility's own tools or the user's own SSH
+  session. The skill adds: a login name is not an account; ask for the project/allocation id instead of confirming.
+
 ## 0.1.16 — 2026-09-05 — ship SKILL.md in the wheel so an installed server serves the guidance
 
 ### Fixed

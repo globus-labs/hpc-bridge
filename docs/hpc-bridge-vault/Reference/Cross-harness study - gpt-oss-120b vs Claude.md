@@ -234,6 +234,14 @@ with a proper interactive driver (ACP, or a direct tool-call loop where the huma
 which also cuts the input-token cost (a single control model was ~$5 of Argo spend, 1.7M input tokens, because
 each turn re-sends the whole conversation + the guidance resource).
 
+> [!success] Follow-up 6 — resolved by the ACP driver and the core-pair campaign (2026-09-08/09)
+> The driver was built ([[ACP interactive benchmark driver]]: one persistent session, a human-sim turn policy, the
+> graders tiered under benchmark mode), the objective was refined to **like models through a variety of harnesses**,
+> and the first harness-axis measurement was run: **claude-sonnet-4.6 through hermes vs through Claude Code, 30/30,
+> identical dialogue shape and call counts** — see [[Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09]].
+> With the operator held constant the "Claude 8/8 vs open 0" gap of this study is confirmed as an operator/model
+> confound: the harness does not move a capable model; the model is the lever for the weaker ones.
+
 ## Reading
 
 - The interactive comparison is confounded by the operator (above); treat the cross-model *interactive* numbers

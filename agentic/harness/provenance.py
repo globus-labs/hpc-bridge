@@ -133,6 +133,7 @@ def write_run_record(
     failed: list[str] | None = None,
     result: str | None = None,
     events: list[dict] | None = None,
+    extra_jsonl: dict[str, list[Any]] | None = None,
 ) -> Path | None:
     """Write the bundle; never raises (best-effort provenance must not fail the run).
 
@@ -145,6 +146,14 @@ def write_run_record(
         with (d / "messages.jsonl").open("w") as fh:
             for m in messages:
                 fh.write(json.dumps(_jsonable(m), default=str) + "\n")
+        # Operator-specific side streams (e.g. the ACP client's event log, `acp-updates.jsonl`): one file each,
+        # one JSON object per line, next to messages.jsonl.
+        for name, rows in (extra_jsonl or {}).items():
+            if rows is None:
+                continue
+            with (d / f"{name}.jsonl").open("w") as fh:
+                for r in rows:
+                    fh.write(json.dumps(_jsonable(r), default=str) + "\n")
         gates = set(gating or [])
         record = {
             "schema": 2,

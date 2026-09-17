@@ -33,6 +33,8 @@ This vault has two halves:
 - [[Plugin packaging]] — `.mcp.json` · `plugin.json` · the `driving-hpc` skill · `hpc-connect` · the fresh-user script
 - [[Configuration]] — environment variables
 - [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the user recipe + config gotchas
+- [[Cross-harness study - gpt-oss-120b vs Claude]] — the first weaker-model study (2026-09-06) and its confound analysis: the OPERATOR dominated the model signal; why those interactive numbers are not a model comparison
+- [[Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09]] — **the harness-axis result**: claude-sonnet-4.6 through hermes vs through Claude Code (both over ACP, same client/sim/graders/guidance): 30/30, identical dialogue shape and call counts; process metrics, validity notes, next steps
 - [[MEP facilities survey]] — which real facilities run a Globus Compute MEP: registry candidates, their template keys, the unmapped-identity behaviour (2026-09-03)
 - [[Model sweep 2026-09-03]] — the cheap-tier agentic model sweep (six new-user scenarios × Opus/Sonnet/Haiku): 29/30 on round 2; what the failures actually were
 - [[Model sweep 2026-09-03 block tier]] — the block-tier sweep: stranger's MEP walk 6/6 on all three models; node starvation → the idle-node gate (#69); the human-sim fixes (#70); #39 fires on every SSH bring-up
@@ -41,6 +43,8 @@ This vault has two halves:
 
 ## Planned — design notes (core built; deferred extras remain)
 - [[V1 release]] — **the plan of record** for the sprint (scope, tiers, what's ticked); reorient here when a task runs long
+- [[ACP interactive benchmark driver]] — the cross-harness benchmark's plan of record: the agent-agnostic ACP driver, the human-sim turn policy, trace sources per harness, the Claude-Code-over-ACP operator, the refined objective (like models through a variety of harnesses) and the ordered next steps
+- [[Cross-harness portability]] — running hpc-bridge beyond Claude Code: what is host-neutral, the two portability levers (guidance delivery, the server-side spend gate), the harness matrix
 - [[In-terminal Globus login]] — design + live findings for the login that is now built ([[login]]; Tier-2 B, [#48](https://github.com/ryanchard/hpc-bridge/issues/48))
 - [[Endpoint reuse and MEP integration]] — the zero-SSH ladder: Phase 1 (reuse our own, [#20](https://github.com/ryanchard/hpc-bridge/issues/20)) and Phase 2 M1 (facility MEPs, [#41](https://github.com/ryanchard/hpc-bridge/issues/41)) both **shipped**; M2 (consent) deferred to V1.x; plus the live record of the no-account failure
 - [[Discovery channel model]] — the target model: channels, the provide-vs-discover matrix, the principles. Remaining: per-channel ablation flags + the resolution trace ([#7](https://github.com/ryanchard/hpc-bridge/issues/7))

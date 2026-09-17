@@ -162,18 +162,27 @@ def stamp_exchanges(trace: Trace, exchanges: list[dict] | None) -> Trace:
     interactive graders (spend_follows_question / choice_respected / refusal_exercised / no_spend_after_decline
     — all keyed on ``t.named("AskUserQuestion")`` with the answer in ``ToolCall.answers``) work for the hermes
     operator exactly as for Claude. hermes has no AskUserQuestion tool: the operator asks in prose and the
-    human-sim replies in prose. Each exchange = ``{call_index, question, answer}``; the synthetic call is
+    human-sim replies in prose. Each exchange = ``{call_index, question, answer, kind}``; the synthetic call is
     inserted right AFTER ``call_index`` (the trace position where the operator asked). Highest index first so
     earlier inserts don't shift later ones. No structured options are attached (prose has none), which is safe:
     choice_respected only flags a provisioned partition that matches a NON-chosen OPTION label, so with no
-    options it cannot false-positive."""
-    todo = [e for e in (exchanges or []) if e.get("question")]
+    options it cannot false-positive.
+
+    A NUDGE (kind "nudge" — the ACP turn policy told a paused operator to carry on) is stamped as a ``user_nudge``
+    marker (like the runner's ``user_interjection``), NOT as an AskUserQuestion: the operator put nothing to the
+    user, so it must not count as a spend question answered — "Login node is up, next I'll provision" + "carry on"
+    would otherwise satisfy `spend_follows_question` through the broad spend-ish regex (`node`, `provision`)."""
+    todo = [e for e in (exchanges or []) if e.get("question") or e.get("kind") == "nudge"]
     for e in sorted(todo, key=lambda e: -int(e.get("call_index") or 0)):
         k = int(e.get("call_index") or 0)
         at = min(k + 1, len(trace.calls))
-        q = str(e["question"])
+        q = str(e.get("question") or "")
         a = str(e.get("answer") or "")
-        tc = ToolCall.of("AskUserQuestion", {"questions": [{"question": q}]}, answers={q: a})
+        if e.get("kind") == "nudge":
+            tc = ToolCall(name="user_nudge", input={"text": a}, result={"after_call": k, "paused_on": q[-300:]},
+                          raw_name="user_nudge")
+        else:
+            tc = ToolCall.of("AskUserQuestion", {"questions": [{"question": q}]}, answers={q: a})
         trace.calls.insert(at, tc)
     return trace
 

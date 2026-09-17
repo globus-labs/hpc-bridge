@@ -13,6 +13,11 @@ import contextlib
 import io
 import sys
 import types
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
 
 
 def _load_acp_client(monkeypatch):
@@ -82,3 +87,66 @@ def test_session_update_logs_and_captures(monkeypatch):
     assert "→ [execute] run_shell(command=hostname, shape=compute)" in out
     assert [c["title"] for c in bc.capture.tool_calls] == ["connect_facility", "run_shell"]
     assert [c["kind"] for c in bc.capture.tool_calls] == ["ToolKind.OTHER", "ToolKind.EXECUTE"]
+
+
+def test_join_chunks_streamed_deltas_concatenate_verbatim(monkeypatch):
+    """Argo streams token deltas; ' '.join put spaces inside words and the human-sim read 'part ition' (2026-09-08)."""
+    ac = _load_acp_client(monkeypatch)
+    deltas = ["Can", " you", " confirm", " `", "eth", "0", "`", " and", " the", " part", "ition", "?", " Once", " conf", "irmed", ","]
+    assert ac._join_chunks(deltas) == "Can you confirm `eth0` and the partition? Once confirmed,"
+
+
+def test_join_chunks_whole_messages_keep_a_boundary(monkeypatch):
+    """Non-streaming providers send whole messages per chunk: two sentences must not fuse into one word."""
+    ac = _load_acp_client(monkeypatch)
+    assert ac._join_chunks(["Sure — confirm the interface first.", "Hostname came back as c1."]) == \
+        "Sure — confirm the interface first.\nHostname came back as c1."
+    assert ac._join_chunks(["", "a", None, "b"]) == "ab"          # empties skipped, no separator invented
+    assert ac._join_chunks(["9587", ".5", " SU"]) == "9587.5 SU"   # a delta after '.' that is not a new sentence
+
+
+def test_capture_events_are_recorded_in_order_and_jsonable(monkeypatch):
+    """The event log is what the bundle persists (acp-updates.jsonl) and what the cross-check reads."""
+    import json
+
+    ac = _load_acp_client(monkeypatch)
+    bc = ac.BenchClient()
+    bc.capture.turn = 1
+    chunk = type("AgentMessageChunk", (), {})()
+    chunk.__dict__.update(content=type("T", (), {"text": "Login node is up."})())
+    done = type("ToolCallProgress", (), {})()
+    done.__dict__.update(tool_call_id="1", status="completed", raw_output=None, content=None)
+    _drive(bc, [
+        _tool_update(title="mcp__hpc_bridge__connect_facility", kind="ToolKind.OTHER", raw_input={"facility": "f1"}, tool_call_id="1"),
+        done,
+        chunk,
+    ])
+    kinds = [e["event"] for e in bc.capture.events]
+    assert kinds == ["tool_call", "tool_call_update", "message_chunk"]
+    assert bc.capture.events[0]["title"] == "mcp__hpc_bridge__connect_facility"
+    assert bc.capture.events[0]["raw_input"] == {"facility": "f1"} and bc.capture.events[0]["turn"] == 1
+    assert bc.capture.events[1]["status"] == "completed"
+    assert bc.capture.events[2]["text"] == "Login node is up."
+    json.dumps(bc.capture.events)      # persisted verbatim: must be JSON-able
+
+
+def test_permission_response_serializes_under_the_real_acp_package(monkeypatch):
+    """The integration the stubbed schema hid: the response BenchClient returns must survive the library's own
+    serialization (`model_dump` → json.dumps). Under agent-client-protocol 0.12.1 the outcome must be an
+    `AllowedOutcome(outcome="selected")`; the legacy `SelectedPermissionOutcome` is opaque to json.dumps and the
+    agent waits forever (first claude-acp cell, 2026-09-08)."""
+    import json
+
+    acp = pytest.importorskip("acp")
+    from acp.schema import PermissionOption
+    monkeypatch.syspath_prepend(str(HERE))
+    sys.modules.pop("acp_client", None)
+    import acp_client
+    assert acp_client.acp is acp                   # the REAL package, not the stub the other tests install
+    bc = acp_client.BenchClient()
+    opts = [PermissionOption(option_id="deny", kind="reject_once", name="Deny"),
+            PermissionOption(option_id="allow_once", kind="allow_once", name="Allow once")]
+    resp = asyncio.run(bc.request_permission(opts, "s", type("TC", (), {"title": "run_shell", "tool_call_id": "1"})()))
+    payload = json.dumps(resp.model_dump(mode="json", by_alias=True, exclude_none=True))   # what the transport sends
+    assert '"optionId": "allow_once"' in payload and '"outcome": "selected"' in payload
+    assert bc.capture.events[-1]["event"] == "permission" and bc.capture.events[-1]["chosen"] == "allow_once"

@@ -1,7 +1,7 @@
 {
   "name": "hpc-bridge",
   "description": "Extend an AI agent onto real HPC via a personal Globus Compute endpoint, managed as an interactive REPL.",
-  "version": "0.1.16",
+  "version": "0.1.17",
   "author": {
     "name": "hpc-bridge"
   },

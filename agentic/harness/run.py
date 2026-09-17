@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from acp_trace import capture_crosscheck
 from cluster_ops import (
     capture_logs_cmd,
     delete_endpoint_cmd,
@@ -578,14 +579,19 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # Operator dispatch: `hermes` drives the SAME scenario + graders with an ALCF-hosted model (guidance over MCP).
     # Autonomous AND interactive (persona) scenarios are supported; refuse only what it can't yet drive rather than
     # grade it vacuously.
-    if operator == "hermes":
+    if operator in ("hermes", "claude-acp"):
         reason = ("cross-restart chains (PHASES)" if phases else
                   "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
         if reason:
-            print(f"RESULT: SKIPPED — the hermes operator does not support {reason} yet")
+            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
             return 2
-        from hermes_runner import run_scenario as _run_scenario
-        model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")   # provenance: the model hermes actually used
+        if operator == "hermes":
+            from hermes_runner import run_scenario as _run_scenario
+            model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")   # provenance: the model hermes actually used
+        else:
+            # Claude Code driven over ACP (Zed's claude-agent-acp) — the second harness on the harness axis
+            from acp_runner import run_scenario as _run_scenario
+            model = os.environ.get("HPCB_CLAUDE_ACP_MODEL", "").strip() or "default"
     else:
         _run_scenario = run_scenario
 
@@ -674,10 +680,15 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         if res.dialogue:
             print(f"\n=== DIALOGUE (persona: {persona}) ===")
             for x in res.dialogue:
+                # ACP turn policy: a nudge answered a PAUSE, a conclude answered a wrap-up — label them as such,
+                # not as questions, so the transcript reads the way the sim judged it.
+                kind = getattr(x, "kind", "") or ""
+                agent_label = {"nudge": "agent paused:", "conclude": "agent said: "}.get(kind, "agent asked:")
+                human_label = "human nudged:" if kind == "nudge" else "human chose:"
                 for q in x.questions:
-                    print(f"  agent asked: {q.get('question')}")
+                    print(f"  {agent_label} {q.get('question')}")
                 for k, v in x.answers.items():
-                    print(f"  human chose: {v}   ({k[:60]}…)" if len(k) > 60 else f"  human chose: {v}   ({k})")
+                    print(f"  {human_label} {v}   ({k[:60]}…)" if len(k) > 60 else f"  {human_label} {v}   ({k})")
                 if x.note:
                     print(f"  human note:  {x.note}")
         for e in getattr(res, "interjections", None) or []:
@@ -703,9 +714,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         if persona:
             n = getattr(res, "prose_followups", 0)
             capped = getattr(res, "followups_capped", False)
+            nudges = getattr(res, "nudges", 0) or 0
+            nudges_capped = getattr(res, "nudges_capped", False)
+            # Gates on the ANSWER cap only (the agent kept asking = looping). Nudges are the ACP turn policy's
+            # "carry on" after a mid-task pause; running out of them is reported here but judged by the liveness
+            # graders (compute_ran, ends_with_stop) — a paused-out run fails on what it never did.
             results.append(Result("harness:prose_followups", not capped,
                                   f"{n} prose question(s) answered by the human-sim"
-                                  + ("; the run ENDED at the cap — the agent kept asking in prose" if capped else "")))
+                                  + (f"; {nudges} nudge(s) to carry on after a pause" if nudges else "")
+                                  + ("; the run ENDED at the cap — the agent kept asking in prose" if capped else "")
+                                  + ("; the NUDGE budget ran out — the agent kept pausing without finishing" if nudges_capped else "")))
             # Interaction DIAGNOSTIC (non-gating): how the human replies related to the operator's turns — so a run
             # that PASSED after correcting genuine operator mistakes is distinguishable from a clean one (the point
             # of the weaker-operator study). Kinds come from the human-sim (hermes prose exchanges); empty for the
@@ -736,6 +754,11 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                               "force-fed SKILL.md in the system prompt (Claude-SDK operator)" if operator == "claude"
                               else ("fetched the MCP guidance resource" if guidance_fetched(res.trace)
                                     else "did NOT fetch the MCP guidance resource (this run ran guidance-lighter)")))
+        # ACP operators: does the client's own event log agree with the graded trace on the hpc-bridge calls made?
+        # An instrument check (REPORT-ONLY until it has proven clean across runs): a mismatch means the post-run
+        # trace source (state.db / the CLI transcript) lagged, truncated or picked the wrong session.
+        if getattr(res, "acp_events", None):
+            results.append(capture_crosscheck(res.acp_events, res.trace))
         # agent_engaged + run_completed always gate: a do-nothing or truncated run must never grade OK.
         critical = set(getattr(scen, "EXPECT_OK", [r.name for r in results])) | {"agent_engaged", "run_completed", *FLOOR_NAMES}
         if persona:
@@ -815,6 +838,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             failed=failed,
             result=result_label,
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
+            # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
+            extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
         )
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on
@@ -841,8 +866,9 @@ def main() -> None:
     ap.add_argument("--no-skill", action="store_true",
                     help="ablation: withhold SKILL.md from the system prompt (measure the guidance's value)")
     ap.add_argument("--operator", default=os.environ.get("HPCB_OPERATOR") or "claude",
-                    choices=["claude", "hermes"],
-                    help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model)")
+                    choices=["claude", "hermes", "claude-acp"],
+                    help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model; "
+                         "claude-acp = Claude Code over ACP via Zed's adapter)")
     args = ap.parse_args()
     sys.exit(asyncio.run(_main(args)))
 

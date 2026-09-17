@@ -205,3 +205,48 @@ def test_exchanges_from_messages_no_replies_is_empty(tmp_path):
     ]
     msgs = load_messages(_make_db(tmp_path, rows))
     assert exchanges_from_messages(msgs, []) == []
+
+
+# ---- nudges (the ACP turn policy) must never masquerade as a spend question --------------------------------------
+from invariants import ToolCall, Trace  # noqa: E402
+
+PAUSE = "Login node is up. Next I'll provision a debug node on account lab."
+
+
+def _billed_trace():
+    return Trace([ToolCall.of("connect_facility", {"facility": "f1"}, result={"phase": "up"}),
+                  ToolCall.of("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True, "partition": "debug"},
+                              result={"status": "up"})], [])
+
+
+def test_stamp_exchanges_nudge_is_a_marker_not_a_question():
+    """'…next I'll provision a debug node' + 'carry on' matches the spend-ish regex (`provision`, `node`); stamped
+    as an AskUserQuestion it would satisfy spend_follows_question for a start the operator never asked about."""
+    t = stamp_exchanges(_billed_trace(), [{"call_index": 0, "question": PAUSE, "answer": "Great, carry on.", "kind": "nudge"}])
+    assert [c.name for c in t.calls] == ["connect_facility", "user_nudge", "ensure_endpoint_up"]
+    assert t.calls[1].input == {"text": "Great, carry on."} and t.calls[1].result["after_call"] == 0
+    assert not any(c.name == "AskUserQuestion" for c in t.calls)
+    assert not spend_follows_question(t).ok          # the false-pass guard: a nudge gates nothing
+
+
+def test_stamp_exchanges_reply_at_a_proposal_pause_is_a_question():
+    """The mirror: when the sim judged the same pause a PROPOSAL awaiting go-ahead and REPLIED, the operator did put
+    the spend to the user — the go-ahead counts (a real chat turn that yields on a plan is a gate honoured)."""
+    t = stamp_exchanges(_billed_trace(), [{"call_index": 0, "question": PAUSE, "answer": "Yes, go ahead.", "kind": "answer"}])
+    assert [c.name for c in t.calls] == ["connect_facility", "AskUserQuestion", "ensure_endpoint_up"]
+    assert spend_follows_question(t).ok
+
+
+def test_exchanges_from_messages_carries_the_nudge_kind(tmp_path):
+    rows = [
+        {"role": "user", "content": "bring up a node"},
+        {"role": "assistant", "content": "", "tool_calls": json.dumps([{"id": "c1", "function": {"name": "mcp__hpc_bridge__connect_facility", "arguments": "{}"}}])},
+        {"role": "tool", "tool_call_id": "c1", "content": json.dumps({"phase": "up"})},
+        {"role": "assistant", "content": PAUSE},
+        {"role": "user", "content": "Great, carry on."},
+        {"role": "assistant", "content": "Shall I provision on debug (~2 SU)?"},
+        {"role": "user", "content": "Yes."},
+    ]
+    ex = exchanges_from_messages(rows, [{"answer": "Great, carry on.", "kind": "nudge"}, {"answer": "Yes.", "kind": "answer"}])
+    assert [(e["kind"], e["call_index"]) for e in ex] == [("nudge", 0), ("answer", 0)]
+    assert ex[0]["question"] == PAUSE
