@@ -19,6 +19,8 @@ agentic/
   entrypoint.sh          ← stages injected creds into agent-owned copies, execs run.py
   run_smoke.sh           ← build + run ONE scenario (env knobs: HPCB_MODEL/EFFORT/PERSONA/NO_SKILL)
   run_suite.py           ← staggered, capped matrix: scenario × model × effort × persona × ablation
+  sweep_endpoints.py     ← sweep the harness' Globus Compute residue: orphan managers in the fake login containers +
+                           stale `hpc-bridge-fake-*` / `hpc-bridge-dev` endpoint records (dry-run by default; `--apply`)
   harness/
     invariants.py        ← grading core: 12 deterministic trace invariants (+ scenario-optional liveness ones)
     human_sim.py         ← the simulated user (personas; answers real AskUserQuestion calls)

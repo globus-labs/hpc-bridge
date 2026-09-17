@@ -35,6 +35,7 @@ This vault has two halves:
 - [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the user recipe + config gotchas
 - [[Cross-harness study - gpt-oss-120b vs Claude]] — the first weaker-model study (2026-09-06) and its confound analysis: the OPERATOR dominated the model signal; why those interactive numbers are not a model comparison
 - [[Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09]] — **the harness-axis result**: claude-sonnet-4.6 through hermes vs through Claude Code (both over ACP, same client/sim/graders/guidance): 30/30, identical dialogue shape and call counts; process metrics, validity notes, next steps
+- [[Handoff - ACP cross-harness 2026-09-07]] — archived thread handoff from the ACP driver's landing (#148): what shipped, the two bugs, the run recipe and gotchas; its blocker was resolved by #150
 - [[MEP facilities survey]] — which real facilities run a Globus Compute MEP: registry candidates, their template keys, the unmapped-identity behaviour (2026-09-03)
 - [[Model sweep 2026-09-03]] — the cheap-tier agentic model sweep (six new-user scenarios × Opus/Sonnet/Haiku): 29/30 on round 2; what the failures actually were
 - [[Model sweep 2026-09-03 block tier]] — the block-tier sweep: stranger's MEP walk 6/6 on all three models; node starvation → the idle-node gate (#69); the human-sim fixes (#70); #39 fires on every SSH bring-up
