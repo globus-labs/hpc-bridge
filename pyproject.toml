@@ -8,7 +8,8 @@ license-files = ["LICENSE"]
 dependencies = ["mcp>=1.28.1,<2", "pydantic>=2", "pyyaml>=6", "globus-sdk>=4.4,<5", "globus-compute-sdk>=4.15"]  # the SDK is imported at module load (credentials/remote): core, not optional  # mcp<2: 2.x renames FastMCP/MCPServer + the import path (planned migration); >=1.28.1 = the WebSocket advisory fix
 
 [project.optional-dependencies]
-dev = ["pytest>=8.4", "pytest-asyncio>=0.23", "jinja2>=3", "ruff>=0.16"]  # pytest-asyncio 1.4 needs pytest>=8.4
+dev = ["pytest>=8.4", "pytest-asyncio>=0.23", "jinja2>=3", "ruff>=0.16",
+       "agent-client-protocol==0.9.0"]   # the ACP client the agentic harness drives hermes/Claude Code with — real-schema tests; SAME pin as agentic/Dockerfile  # pytest-asyncio 1.4 needs pytest>=8.4
 integration = [
     # The endpoint daemon (local provisioning) is Unix-only — it pulls pyprctl +
     # python-daemon, which have no Windows wheels and break `pip install` there.
@@ -54,6 +55,7 @@ markers = ["real_catalog: the test may build the real catalog (the hermetic tier
 line-length = 120
 target-version = "py311"
 extend-exclude = ["agentic/runs", "agentic/fakecluster", "docs", "agentic/harness/inference_auth_token.py"]  # last: vendored upstream (MIT), kept unmodified
+force-exclude = true   # honour the excludes even for explicitly passed paths: `ruff --fix agentic/harness/*.py` once stripped a load-bearing "unused" import from the vendored script (2026-09-09)
 
 [tool.ruff.lint]
 # The rule set the code's existing `# noqa` annotations already imply (E/F/I/B/BLE/A); they were

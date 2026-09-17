@@ -66,6 +66,19 @@ def _jsonable(o: Any, depth: int = 0) -> Any:
     return str(o)
 
 
+def _selected_outcome(option_id: str) -> Any:
+    """The 'selected' permission outcome in whatever shape this `agent-client-protocol` release serializes.
+    0.12.x types `RequestPermissionResponse.outcome` as `AllowedOutcome | DeniedOutcome` (`AllowedOutcome(option_id,
+    outcome="selected")`); the older `SelectedPermissionOutcome` still imports but is no longer in that union, so
+    pydantic keeps it as an opaque object and the response dies in json.dumps — "Object of type
+    SelectedPermissionOutcome is not JSON serializable" — and the agent waits forever for an answer (found live on
+    the first claude-acp cell, 2026-09-08, after the 0.9.0 → 0.12.1 bump). 0.9.x has only the older class."""
+    allowed = getattr(__import__("acp.schema", fromlist=["AllowedOutcome"]), "AllowedOutcome", None)
+    if allowed is not None:
+        return allowed(option_id=option_id, outcome="selected")
+    return SelectedPermissionOutcome(option_id=option_id)
+
+
 def _chunk_text(content: Any) -> str:
     """Pull plain text out of an ACP content block / list of blocks."""
     if content is None:
@@ -119,7 +132,7 @@ class BenchClient(Client):
                     chosen=(getattr(chosen, "option_id", None) if chosen is not None else None))
         if chosen is None:                                          # no options offered → nothing to select
             raise acp.RequestError(-32603, "no permission options offered")  # type: ignore[attr-defined]
-        return RequestPermissionResponse(outcome=SelectedPermissionOutcome(option_id=chosen.option_id))
+        return RequestPermissionResponse(outcome=_selected_outcome(chosen.option_id))
 
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         kind = str(getattr(update, "session_update", "") or type(update).__name__)
@@ -216,7 +229,8 @@ class AcpTurn:
 
 
 async def run_session(command: str, args: list[str], task: str, *, cwd: str, env: dict[str, str],
-                      mcp_servers: list[McpServerStdio], respond=None, max_turns: int = 1) -> tuple[Any, AcpCapture]:
+                      mcp_servers: list[McpServerStdio], respond=None, max_turns: int = 1,
+                      **session_kwargs: Any) -> tuple[Any, AcpCapture]:
     """Drive an ACP agent over ONE persistent session, up to ``max_turns`` prompt turns. ``respond`` (async,
     optional) is the interactive hook: ``respond(AcpTurn) -> str | None`` — return the user's next message to send
     it as another prompt in the SAME session, or None/"" to stop. This is the clean multi-turn the transcript-replay
@@ -231,7 +245,9 @@ async def run_session(command: str, args: list[str], task: str, *, cwd: str, env
                                                                              write_text_file=False), terminal=False),
             client_info=Implementation(name="hpc-bridge-bench", version="0.1"),
         )
-        sess = await conn.new_session(cwd=cwd, mcp_servers=mcp_servers)
+        # session_kwargs: agent-specific extras, e.g. `field_meta` (ACP `_meta`) — claude-agent-acp reads
+        # `_meta.claudeCode.options.model` to pin the model.
+        sess = await conn.new_session(cwd=cwd, mcp_servers=mcp_servers, **session_kwargs)
         prompt_text = task
         for _turn in range(max(1, max_turns)):
             client.capture.turn += 1

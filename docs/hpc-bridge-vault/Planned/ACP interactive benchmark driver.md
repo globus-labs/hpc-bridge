@@ -196,10 +196,75 @@ re-stamped the ACP-era hermes bundles correctly — the sonnet-5 run the old sta
 PASS on `spend_follows_question` — and regrade now honours the recorded benchmark mode (preference graders were
 report-only live, so they no longer decide the replayed verdict). Bundle `agentic/runs/1788881977-55550-gated_provision`.
 
-Open for step 3 (Claude Code via `claude-agent-acp`): how AskUserQuestion surfaces to the ACP client (the adapter
-routes `canUseTool` to `session/request_permission`; whether the question's options become permission options and
-how the choice becomes `updatedInput` is not visible in the excerpt read) — verify empirically on the first run and
-route it to the human-sim instead of auto-approving; Node returns to the jail image.
+**Step 3 BUILT (branch `feat/claude-acp-operator`, 2026-09-08) — Claude Code over ACP, `--operator claude-acp`.**
+Facts settled by reading the published `@zed-industries/claude-agent-acp@0.23.1` build and by local probes:
+- **AskUserQuestion is DISALLOWED unconditionally** in the published build (`acp-agent.js`: "Disable this for now,
+  not a great way to expose this over ACP at the moment"); the adapter's *main* branch routes it through ACP
+  **elicitation** (`clientCapabilities.elicitation`, "must be handled by ACP elicitation, not permission options"),
+  unreleased. So today Claude Code over ACP asks in PROSE — the same loop hermes uses without `clarify`, which is
+  clean parity on the harness axis. A two-turn local probe through the real adapter confirmed it: ask → "beta" →
+  `CHOSEN=beta`, one session, 7 s, and the CLI transcript landed under `$CLAUDE_CONFIG_DIR/projects/<slug>/`.
+  When the adapter releases elicitation: `agent-client-protocol` 0.12.x has `Client.create_elicitation` +
+  `ElicitationCapabilities` — route it to the human-sim. **The jail stays on 0.9.0** (hermes' own declared pin):
+  under 0.12.1 `hermes acp` refuses to start ("ACP dependencies not installed" — an import inside its
+  `acp_adapter` fails; live 2026-09-08), while the Claude adapter works with either (probed). Moving the pin means
+  giving hermes its own venv, or a newer hermes.
+- The adapter echoes `/model` into the transcript as the first user messages (`<local-command-caveat>`,
+  `<command-name>`, `<local-command-stdout>Set model to claude-sonnet-4-6`): `claude_transcript.user_prompt_text`
+  skips local-command echoes and tool_result lines; `exchanges_from_transcript` stamps prose replies by PROMPT order.
+- `session/new` `_meta.claudeCode.options` is spread into the SDK options → `model` pins the model
+  (`HPCB_CLAUDE_ACP_MODEL`); the adapter's default is the CLI's default (claude-sonnet-4-6 today; `opus`/`haiku`
+  offered). **Like-model pairing for the campaign: `claude-sonnet-4-6` on both sides** — `argo:claude-sonnet-4.6`
+  for hermes (Argo lists it) and the adapter default for Claude Code — or sonnet-5 on both if the subscription
+  serves it; decide before the campaign and record it in the cell config.
+- Guidance is delivered over MCP on BOTH harnesses (hpc-bridge registered at `session/new`, pointer + resource;
+  the plugin skill is NOT installed in the jail) — guidance delivery held constant, so the cell measures the
+  harness driving an MCP server. `guidance_fetched` now recognises Claude Code's `ReadMcpResourceTool`.
+- A host gotcha, not a jail one: the adapter's `session/new` fails with "Invalid permissions.defaultMode: auto"
+  when the user's `~/.claude/settings.json` sets that mode (this maintainer's does); a scratch `CLAUDE_CONFIG_DIR`
+  avoids it locally, and the jail's fresh HOME never has it.
+- Jail image: Node 22 (NodeSource) + the adapter pinned globally (bin `claude-agent-acp`); the adapter bundles
+  `@anthropic-ai/claude-agent-sdk` 0.2.83 (its own CLI build) — the SDK operator uses claude-agent-sdk 0.2.152, so
+  the two Claude Code cells differ in CLI version; the transcript's `version` field records which.
+- `run_smoke.sh`: `HPCB_OPERATOR=claude-acp` (auth = the subscription token, like `claude`); forwards
+  `HPCB_CLAUDE_ACP_MODEL` + `HPCB_BENCHMARK_MODE`; `run_suite.py` keeps `HPCB_CLAUDE_ACP*` per cell.
+- **Gotcha found on the first live cell (the user spotted it in the docker log):** under `agent-client-protocol`
+  0.12.1 every `request_permission` answer died in the library's sender — "Object of type
+  SelectedPermissionOutcome is not JSON serializable" — so no permission was ever answered and the cell hung
+  (both harnesses would). 0.12.x types the outcome as `AllowedOutcome | DeniedOutcome`
+  (`AllowedOutcome(option_id, outcome="selected")`); the legacy `SelectedPermissionOutcome` still imports but is
+  outside the union, so pydantic keeps it opaque. `acp_client._selected_outcome` builds the right one per release.
+  The stubbed schema in `test_acp_client.py` hid it — the same lesson as the swallowed `_fmt_call` TypeError:
+  **test the integration**; `agent-client-protocol` is now in the dev extra at the SAME pin as the jail (0.9.0) and
+  a test pushes the client's response through the library's own serialization — the helper adapts per release
+  (`AllowedOutcome` on 0.12.x, the legacy class on 0.9.x, wire `{"outcome": {"optionId": …, "outcome": "selected"}}`).
+
+**Live-validated (2026-09-08): the first Claude-Code-over-ACP cell — `gated_provision`, fake `site`, benchmark mode,
+cooperative persona — RESULT OK.** 20 calls, one 211 s session, `answer×2, conclude×1`; every critical grader incl.
+`spend_follows_question` + `compute_ran`, clean stop, world check clean; `harness:guidance_fetched` = fetched the MCP
+guidance resource (via `ReadMcpResourceTool` — the grader extension works); `harness:acp_capture` agreed with the
+graded transcript on 13 hpc-bridge calls; 4 permission requests answered (the serialization fix works). Operator
+model `claude-sonnet-4-6` on CLI 2.1.83 (the adapter's bundled SDK); bundle
+`agentic/runs/1788883820-2748-gated_provision` (messages.jsonl = the native transcript, 88 lines, regradeable;
+`acp-updates.jsonl` 253 events). Subscription-billed (no Argo). **The harness axis now has two cells that differ
+only in the harness**: hermes over ACP and Claude Code over ACP, same client, same human-sim policy, same
+graders, same MCP guidance channel.
+
+**hermes over ACP re-validated on the same image under the restored 0.9.0 pin (free gpt-oss, `gated_provision`,
+2026-09-08): RESULT OK** — `answer×2, conclude×1`, `harness:acp_capture` agreed on 13 hpc-bridge calls, world
+check clean (bundle `agentic/runs/1788884499-24720-gated_provision`). The same run exposed a false decline in
+`_DECLINE`: the cooperative reply "No strong preferences — just use whatever defaults are cheapest … and go ahead"
+matched `^no\b` because the exemption only tolerated "No preference" with nothing in between; `no_spend_after_decline`
+reported a "billed start despite the user's refusal" (non-gating for gated_provision). Fixed with a test (up to
+two words allowed between "no" and preference/problem/idea/worries/need). This is exactly the instrument-validation
+item (step 6, the judge-agreement pass over the prose→regex classifiers) — the regex is the gate; keep auditing it.
+
+**Step 4 — the CAMPAIGN, core pair, DONE (2026-09-09).** claude-sonnet-4.6 through hermes/Argo vs through Claude
+Code, 3 scenarios × n=5, one cell at a time, harnesses interleaved: **30/30 OK**, empty failure taxonomy, no report-only
+grader fired, identical dialogue shape and hpc-bridge call counts, cross-check agreed in all 30, $23.62 Argo. Full record
+with process metrics, validity notes and what the campaign surfaced (the nudge path's first live firing, on a tunnel
+outage): `Reference/Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09.md`. Next: the hostile profile across
+both harnesses (security posture per harness), a provider-path control, a third ACP harness on the same model.
 
 **Still solid:** the driver MECHANICS (persistent session, turn boundaries, human-sim loop, teardown), the live
 `→` tool-call logging (fixed + tested), and now the gate STAMPING (`spend_follows_question`/`choice_respected`).

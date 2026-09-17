@@ -158,7 +158,7 @@ class AcpResponder:
             print(f"  human({self.persona}) concludes [{tag}]", file=sys.stderr, flush=True)
             return None
         self.replies.append({"answer": move.reply, "kind": move.kind})
-        print(f"  human({self.persona}) [{tag}]: {move.reply[:140]}", file=sys.stderr, flush=True)
+        print(f"  human({self.persona}) [{tag}]: {move.reply}", file=sys.stderr, flush=True)   # the full reply: the operator sees all of it, so should the log
         return move.reply
 
 
@@ -320,7 +320,7 @@ async def run_scenario(
         exchanges.append({"call_index": max(0, calls_so_far - 1), "question": last_text[-1000:],
                           "answer": reply, "kind": kind})
         transcript.append(("user", reply))
-        print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply[:140]}",
+        print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply}",
               file=sys.stderr, flush=True)
 
     rows = load_messages(db) if db.is_file() else []

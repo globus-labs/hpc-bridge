@@ -56,19 +56,70 @@ def _blocks(line: dict) -> list[dict]:
     return [b for b in content if isinstance(b, dict)] if isinstance(content, list) else []
 
 
+# The CLI echoes local slash commands into the transcript as user messages (`claude-agent-acp` issues `/model` at
+# session start: "<local-command-caveat>…", "<command-name>/model…", "<local-command-stdout>Set model to …"). Not
+# prompts — skipped when looking for what the user said.
+_LOCAL_COMMAND_PREFIXES = ("<local-command", "<command-name>", "<command-message>", "<command-args>")
+
+
+def user_prompt_text(line: dict) -> str | None:
+    """The text of a user PROMPT line (a string, or text blocks) — None for a tool_result line or a local-command
+    echo. This is what the operator was told, in order: the task first, then each human-sim reply."""
+    if line.get("type") != "user":
+        return None
+    content = (line.get("message") or {}).get("content")
+    if isinstance(content, str):
+        text = content
+    else:
+        blocks = _blocks(line)
+        if any(b.get("type") == "tool_result" for b in blocks):
+            return None
+        text = "\n".join(str(b.get("text") or "") for b in blocks if b.get("type") == "text")
+    text = text.strip()
+    if not text or text.startswith(_LOCAL_COMMAND_PREFIXES):
+        return None
+    return text
+
+
 def first_user_text(lines: list[dict]) -> str:
-    """The first user message's text — the task prompt for the operator, the role-play prompt for the sim."""
+    """The first real user prompt — the task for the operator, the role-play prompt for the sim."""
     for line in lines:
-        if line.get("type") != "user":
-            continue
-        content = (line.get("message") or {}).get("content")
-        if isinstance(content, str):
-            return content
-        for b in _blocks(line):
-            if b.get("type") == "text" and isinstance(b.get("text"), str):
-                return b["text"]
-        return ""
+        t = user_prompt_text(line)
+        if t is not None:
+            return t
     return ""
+
+
+def exchanges_from_transcript(lines: list[dict], replies: list[dict]) -> list[dict]:
+    """`stamp_exchanges` records from a native transcript — the Claude-side twin of `hermes_trace.exchanges_from_messages`.
+    Each human-sim reply was sent as the next prompt, so it is a user PROMPT line after the first (the task); the
+    Nth pairs with `replies[N]` in order. The question is the assistant prose before it; the trace position is the
+    number of tool_use blocks before it (counted exactly as `trace_from_transcript` counts calls)."""
+    exchanges: list[dict] = []
+    call_count = 0
+    last_prose = ""
+    prompts_seen = 0
+    reply_i = 0
+    for line in lines:
+        t = line.get("type")
+        if t == "assistant":
+            for b in _blocks(line):
+                if b.get("type") == "tool_use":
+                    call_count += 1
+                elif b.get("type") == "text" and str(b.get("text") or "").strip():
+                    last_prose = str(b["text"])
+        elif t == "user":
+            if user_prompt_text(line) is None:
+                continue
+            prompts_seen += 1
+            if prompts_seen == 1:
+                continue                      # the task prompt, not a reply
+            if reply_i < len(replies):
+                rep = replies[reply_i]
+                exchanges.append({"call_index": max(0, call_count - 1), "question": last_prose[-1000:],
+                                  "answer": rep.get("answer", ""), "kind": rep.get("kind")})
+                reply_i += 1
+    return exchanges
 
 
 def _n_tool_uses(lines: list[dict]) -> int:

@@ -88,3 +88,22 @@ def test_regrade_honours_recorded_benchmark_mode(tmp_path, capsys, monkeypatch):
     _bundle(tmp_path, "r-regression", lines, rec)
     rc = regrade(tmp_path, strict=True)
     assert rc == 1 and "1 would now grade FAIL" in capsys.readouterr().out
+
+
+def test_claude_transcript_bundle_restamps_prose_replies_from_dialogue(tmp_path):
+    q = "Provisioning a `debug` node will charge `lab` (~2 SU). Shall I proceed?"
+    lines = [
+        {"type": "user", "sessionId": "s1", "message": {"role": "user", "content": "bring up a node"}},
+        {"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t1", "name": "mcp__hpc-bridge__connect_facility", "input": {}}]}},
+        {"type": "user", "sessionId": "s1", "message": {"role": "user", "content": [{"type": "tool_result", "tool_use_id": "t1", "content": "{}"}]}},
+        {"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [{"type": "text", "text": q}]}},
+        {"type": "user", "sessionId": "s1", "message": {"role": "user", "content": "Yes, go ahead."}},
+        {"type": "assistant", "sessionId": "s1", "message": {"role": "assistant", "content": [
+            {"type": "tool_use", "id": "t2", "name": "mcp__hpc-bridge__ensure_endpoint_up", "input": {"shape": "compute", "confirm_spend": True}}]}},
+    ]
+    rec = {"config": {"operator": "claude-acp"}, "dialogue": [{"questions": [{"question": q}], "answers": {"reply": "Yes, go ahead."}, "kind": "answer"}]}
+    d = _bundle(tmp_path, "r4-gated_provision", lines, rec)
+    t = bundle_trace(d, rec)
+    assert [c.name for c in t.calls] == ["connect_facility", "AskUserQuestion", "ensure_endpoint_up"]
+    assert spend_follows_question(t).ok

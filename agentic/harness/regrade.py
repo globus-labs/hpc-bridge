@@ -46,9 +46,16 @@ def bundle_trace(d: Path, rec: dict) -> Trace:
     first = _first_line(d)
     if "__type__" in first:
         return trace_from_bundle(d)
-    from claude_transcript import load_lines, looks_like_transcript, trace_from_transcript
+    from claude_transcript import exchanges_from_transcript, load_lines, looks_like_transcript, trace_from_transcript
     if looks_like_transcript(first):
-        return trace_from_transcript(load_lines(d / "messages.jsonl"))
+        lines = load_lines(d / "messages.jsonl")
+        t = trace_from_transcript(lines)
+        replies = [{"answer": (x.get("answers") or {}).get("reply", ""), "kind": x.get("kind")}
+                   for x in rec.get("dialogue") or [] if x.get("kind") not in (None, "", "conclude")]
+        if replies:   # the claude-acp operator: prose asks, stamped by prompt order (as live)
+            from hermes_trace import stamp_exchanges
+            t = stamp_exchanges(t, exchanges_from_transcript(lines, replies))
+        return t
     if "role" in first and "tool_calls" in first:
         from hermes_trace import exchanges_from_messages, stamp_exchanges, trace_from_messages
         rows = [json.loads(line) for line in (d / "messages.jsonl").read_text().splitlines() if line.strip()]

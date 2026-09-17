@@ -13,6 +13,11 @@ import contextlib
 import io
 import sys
 import types
+from pathlib import Path
+
+import pytest
+
+HERE = Path(__file__).resolve().parent
 
 
 def _load_acp_client(monkeypatch):
@@ -123,3 +128,25 @@ def test_capture_events_are_recorded_in_order_and_jsonable(monkeypatch):
     assert bc.capture.events[1]["status"] == "completed"
     assert bc.capture.events[2]["text"] == "Login node is up."
     json.dumps(bc.capture.events)      # persisted verbatim: must be JSON-able
+
+
+def test_permission_response_serializes_under_the_real_acp_package(monkeypatch):
+    """The integration the stubbed schema hid: the response BenchClient returns must survive the library's own
+    serialization (`model_dump` → json.dumps). Under agent-client-protocol 0.12.1 the outcome must be an
+    `AllowedOutcome(outcome="selected")`; the legacy `SelectedPermissionOutcome` is opaque to json.dumps and the
+    agent waits forever (first claude-acp cell, 2026-09-08)."""
+    import json
+
+    acp = pytest.importorskip("acp")
+    from acp.schema import PermissionOption
+    monkeypatch.syspath_prepend(str(HERE))
+    sys.modules.pop("acp_client", None)
+    import acp_client
+    assert acp_client.acp is acp                   # the REAL package, not the stub the other tests install
+    bc = acp_client.BenchClient()
+    opts = [PermissionOption(option_id="deny", kind="reject_once", name="Deny"),
+            PermissionOption(option_id="allow_once", kind="allow_once", name="Allow once")]
+    resp = asyncio.run(bc.request_permission(opts, "s", type("TC", (), {"title": "run_shell", "tool_call_id": "1"})()))
+    payload = json.dumps(resp.model_dump(mode="json", by_alias=True, exclude_none=True))   # what the transport sends
+    assert '"optionId": "allow_once"' in payload and '"outcome": "selected"' in payload
+    assert bc.capture.events[-1]["event"] == "permission" and bc.capture.events[-1]["chosen"] == "allow_once"

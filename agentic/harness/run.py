@@ -579,14 +579,19 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # Operator dispatch: `hermes` drives the SAME scenario + graders with an ALCF-hosted model (guidance over MCP).
     # Autonomous AND interactive (persona) scenarios are supported; refuse only what it can't yet drive rather than
     # grade it vacuously.
-    if operator == "hermes":
+    if operator in ("hermes", "claude-acp"):
         reason = ("cross-restart chains (PHASES)" if phases else
                   "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
         if reason:
-            print(f"RESULT: SKIPPED — the hermes operator does not support {reason} yet")
+            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
             return 2
-        from hermes_runner import run_scenario as _run_scenario
-        model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")   # provenance: the model hermes actually used
+        if operator == "hermes":
+            from hermes_runner import run_scenario as _run_scenario
+            model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")   # provenance: the model hermes actually used
+        else:
+            # Claude Code driven over ACP (Zed's claude-agent-acp) — the second harness on the harness axis
+            from acp_runner import run_scenario as _run_scenario
+            model = os.environ.get("HPCB_CLAUDE_ACP_MODEL", "").strip() or "default"
     else:
         _run_scenario = run_scenario
 
@@ -861,8 +866,9 @@ def main() -> None:
     ap.add_argument("--no-skill", action="store_true",
                     help="ablation: withhold SKILL.md from the system prompt (measure the guidance's value)")
     ap.add_argument("--operator", default=os.environ.get("HPCB_OPERATOR") or "claude",
-                    choices=["claude", "hermes"],
-                    help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model)")
+                    choices=["claude", "hermes", "claude-acp"],
+                    help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model; "
+                         "claude-acp = Claude Code over ACP via Zed's adapter)")
     args = ap.parse_args()
     sys.exit(asyncio.run(_main(args)))
 

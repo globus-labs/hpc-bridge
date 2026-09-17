@@ -381,7 +381,7 @@ async def run_scenario(
                             break
                         reply = await human.reply(last_text)
                         followups += 1
-                        print(f"  ! human({persona}) answers a PROSE question: {reply[:160]}", file=sys.stderr, flush=True)
+                        print(f"  ! human({persona}) answers a PROSE question: {reply}", file=sys.stderr, flush=True)
                         await client.query(reply)
                 live.pop("client", None)
             else:

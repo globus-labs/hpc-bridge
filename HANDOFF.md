@@ -9,6 +9,32 @@ _For a week-long handoff to a co-dev. Design rationale lives in `docs/hpc-bridge
 
 Everything through #50 is on `main`. All unit tests green (**392 passed, 2 skipped**; harness graders **53 passed**). The SSH personal-endpoint path is unchanged and still green.
 
+## Cross-harness benchmark thread (2026-09-06 → 09-09) — where it stands
+
+A separate strand on top of the V1 sprint: **can other harnesses drive hpc-bridge as well as Claude Code?** Design record:
+vault `Planned/ACP interactive benchmark driver.md` (the plan of record for this thread); results: vault
+`Reference/Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09.md`; the earlier weaker-model study and its confound
+analysis: `Reference/Cross-harness study - gpt-oss-120b vs Claude.md`.
+
+- **Objective (user decision 2026-09-08):** compare *like models through a variety of harnesses* — one agent-agnostic ACP
+  driver, one persona'd human-sim, the same graders and the same MCP guidance channel — so the claim is about the harness.
+- **Built:** the ACP driver with a tested human-sim turn policy (reply / nudge / conclude; a standing decline is never
+  nudged) — #150 merged; trace sources per harness (hermes `state.db`, Claude Code's native CLI transcript; the ACP stream
+  is NOT a grading source — both adapters drop tool I/O) + a persisted ACP event log with a stream-vs-trace cross-check +
+  regrade for every bundle shape — **PR #151 open**; Claude Code as an ACP operator (`--operator claude-acp`, Zed's
+  `claude-agent-acp` in the jail) — **PR #152 open, stacked on #151**.
+- **Result:** claude-sonnet-4.6 via hermes/Argo vs via Claude Code, 3 interactive scenarios × n=5: **30/30**, empty
+  failure taxonomy, no report-only grader fired, identical dialogue shape and hpc-bridge call counts, cross-check agreed
+  in all 30; $23.62 Argo. Campaign driver/analysis/summary: `agentic/campaigns/2026-09-09-s46-core-pair/`.
+- **Next (in order):** the `hostile` profile on both harnesses (security posture per harness); a provider-path control
+  (Claude Code pointed at Argo via the adapter's gateway option); a third ACP harness on the same model (OpenCode/Goose —
+  the per-harness cost is a graded-trace reader); a second model pair (haiku-4.5).
+- **Gotchas that cost time:** `agent-client-protocol` must stay at hermes' 0.9.0 pin (0.12.x breaks `hermes acp`; the
+  Claude adapter works with either); the published Claude adapter DISALLOWS AskUserQuestion → prose asks; a host
+  `permissions.defaultMode: auto` makes the adapter's `session/new` fail (jail is fine); laptop sleep kills the Argo tunnel
+  (re-run `argo-up` for Duo); a Docker Desktop frontend restart restarts the engine (do it between cells); never
+  `ruff --fix` a glob that can name the vendored `inference_auth_token.py` (`force-exclude` now guards it).
+
 ## Resume here (2026-09-03, after #50; PR #51 open)
 
 **Where we are:** Tier 2 of the V1 sprint — `docs/hpc-bridge-vault/Planned/V1 release.md` is the plan of record. Merged today, in order: #41 (M1), #42, #43 (harness isolation), #44 (`poll_task` ORPHANED), #45, #46 (fake-cluster spike), #47 (clean stop), **#48 (in-terminal login), #49 (public registry + terminal no-account), #50 (stranger's walk)**.

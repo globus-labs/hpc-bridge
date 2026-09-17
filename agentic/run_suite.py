@@ -49,7 +49,8 @@ CELL_STOP_GRACE_S = 150.0
 _CELL_ENV_KEEP_PREFIXES = ("HPCB_TEST_", "HPCB_POOL_", "HPCB_NODE_", "HPCB_FAKE_", "HPCB_TARGET", "HPCB_OPERATOR",
                            "HPCB_ALCF", "HPCB_HERMES_EAGER",   # HPCB_HERMES_EAGER_TOOLS: expose MCP tools directly
                            "HPCB_HERMES_ACP",   # drive hermes over one persistent ACP session (not -z replay)
-                           "HPCB_BENCHMARK")    # HPCB_BENCHMARK_MODE: operator-preference graders → report-only
+                           "HPCB_BENCHMARK",    # HPCB_BENCHMARK_MODE: operator-preference graders → report-only
+                           "HPCB_CLAUDE_ACP")   # the claude-acp operator's model pin (a whole-suite choice, like HPCB_ALCF_*)
 
 
 class Stagger:
