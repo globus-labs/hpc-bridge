@@ -80,6 +80,11 @@ class MEPFacility:
         self.display_name: str | None = None
         self.template_notes: list[str] = []
         self.worker_version: str = "manager"  # what {gce_version} resolves to (entry.compute.worker_version)
+        # hpc-bridge key -> the facility template's own name for it (entry.compute.key_map; NeSI: account ->
+        # ACCOUNT_ID). Applied ONLY at the wire (`dispatch_uec`): the runtime dict keeps hpc-bridge's names,
+        # because the server writes the user's confirmed `account`/`partition` into it AFTER construction
+        # (warmth._apply_account / _apply_partition) and the account floor reads `account` from it.
+        self.key_map: dict[str, str] = {}
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -115,6 +120,7 @@ class MEPFacility:
             client_factory=client_factory,
         )
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"
+        fac.key_map = dict(getattr(c, "key_map", None) or {})
         return fac
 
     def _pinned_gce_version(self) -> str | None:
@@ -195,7 +201,8 @@ class MEPFacility:
                            f"python {py}")
         sc = self.schema or {}
         if sc.get("additionalProperties") is False:
-            allowed = set((sc.get("properties") or {}).keys()) | INTERNAL_KEYS
+            props = set((sc.get("properties") or {}).keys())
+            allowed = props | INTERNAL_KEYS | {src for src, dst in self.key_map.items() if dst in props}
             dropped = sorted(k for k in out if k not in allowed)
             for k in dropped:
                 out.pop(k)
@@ -208,6 +215,15 @@ class MEPFacility:
         the facility's schema forbids unknown keys. `compute: True` must stay in the runtime dict — the
         server's account/partition logic keys on it (dropping it there silently skipped the account the user
         confirmed; Anvil live, 2026-09-04) — but a strict schema would reject it on the wire."""
+        # facility-defined key names (NeSI: account -> ACCOUNT_ID, walltime -> WALL_TIME), applied here and only
+        # here so a value the server wrote under hpc-bridge's name after construction is renamed too. A None
+        # value is not sent under the facility's name (a required key must fail as "missing", not as null).
+        uec = dict(uec)
+        for src, dst in self.key_map.items():
+            if src in uec:
+                val = uec.pop(src)
+                if val is not None:
+                    uec[dst] = val
         sc = self.schema or {}
         if sc.get("additionalProperties") is not False:
             return uec

@@ -1,4 +1,6 @@
 # tests/test_mep_facility.py
+import pytest
+
 from hpc_bridge.facility.base import EndpointHandle, Facility
 from hpc_bridge.facility.mep import MEPFacility
 from hpc_bridge.lifecycle import EndpointState, ensure_warm, probe
@@ -91,3 +93,70 @@ def test_from_entry_threads_a_given_account_and_drops_an_empty_one():
     assert MEPFacility.from_entry(e, account="lab").config_template(Profile())[1]["account"] == "lab"
     for empty in (None, ""):
         assert "account" not in MEPFacility.from_entry(e, account=empty).config_template(Profile())[1]
+
+
+NESI_SCHEMA = {"additionalProperties": False, "required": ["ACCOUNT_ID"],
+               "properties": {"ACCOUNT_ID": {}, "WALL_TIME": {}, "MEM_PER_CPU": {}, "GPUS_PER_NODE": {}}}
+
+
+def _nesi_facility(account=None):
+    # NeSI's reannz-slurm MEP template wants "ACCOUNT_ID" (required) and "WALL_TIME" (optional), not
+    # "account"/"walltime" — confirmed live against the real facility 2026-09-07: its published schema
+    # is additionalProperties:false with only {ACCOUNT_ID, WALL_TIME, MEM_PER_CPU, GPUS_PER_NODE}, so an
+    # un-renamed "account" is REJECTED (required key missing) and an un-renamed "walltime" is silently
+    # DROPPED (every job would run at the facility's own 5-minute default with zero override).
+    # key_map defaults to {} so every existing curated MEP entry (Delta, Anvil, globus-cluster) is unaffected.
+    from tests.fakes import fake_mep_entry
+    e = fake_mep_entry(account_required=True, compute={
+        "scheduler": "slurm", "interface": "enP7s7",
+        "env_setup": "uv pip install -q globus-compute-endpoint==4.15.0",
+        "scratch_root": "$HOME/.hpc-bridge",
+        "key_map": {"account": "ACCOUNT_ID", "walltime": "WALL_TIME"},
+    })
+    fac = MEPFacility.from_entry(e, account=account)
+    fac.schema = NESI_SCHEMA
+    return fac
+
+
+def test_key_map_renames_at_the_wire_not_in_the_runtime_config():
+    fac = _nesi_facility(account="cis250223")
+    runtime = fac.sanitize_uec(dict(fac.config_template(Profile())[1]))
+    # the runtime dict keeps hpc-bridge's names: the account floor and the account/partition gates key on them
+    assert runtime["account"] == "cis250223" and runtime["walltime"] == "02:00:00"
+    assert "ACCOUNT_ID" not in runtime
+    wire = fac.dispatch_uec(runtime)
+    assert wire["ACCOUNT_ID"] == "cis250223"
+    assert wire["WALL_TIME"] == "02:00:00"  # fake_mep_entry's default walltime, renamed not dropped
+    assert "account" not in wire and "walltime" not in wire
+    assert set(wire) <= set(NESI_SCHEMA["properties"])  # nothing the strict schema would reject
+
+
+def test_key_map_carries_an_account_confirmed_after_construction():
+    # The 0.1.17 account floor: no account at connect, the user is asked, and warmth._apply_account writes
+    # the answer into the runtime config under hpc-bridge's name. A rename done at construction missed it:
+    # the wire carried no ACCOUNT_ID and NeSI rejected every submit.
+    fac = _nesi_facility(account=None)
+    runtime = fac.sanitize_uec(dict(fac.config_template(Profile())[1]))
+    assert "ACCOUNT_ID" not in fac.dispatch_uec(runtime)  # a None account is not sent as a null
+    runtime["account"] = "nesi99999"  # exactly what warmth._apply_account does
+    assert fac.dispatch_uec(runtime)["ACCOUNT_ID"] == "nesi99999"
+
+
+def test_key_map_applies_on_a_permissive_schema_too():
+    fac = _nesi_facility(account="cis250223")
+    fac.schema = None  # a facility that publishes no schema still names its own keys
+    wire = fac.dispatch_uec(dict(fac.config_template(Profile())[1]))
+    assert wire["ACCOUNT_ID"] == "cis250223" and "account" not in wire
+
+
+def test_key_map_rejects_an_unknown_source_key():
+    from pydantic import ValidationError
+
+    from tests.fakes import fake_mep_entry
+    with pytest.raises(ValidationError, match="key_map"):
+        fake_mep_entry(compute={
+            "scheduler": "slurm", "interface": "enP7s7",
+            "env_setup": "uv pip install -q globus-compute-endpoint==4.15.0",
+            "scratch_root": "$HOME/.hpc-bridge",
+            "key_map": {"qos": "QOS"},  # qos isn't one of hpc-bridge's own fixed keys — belongs in extra
+        })

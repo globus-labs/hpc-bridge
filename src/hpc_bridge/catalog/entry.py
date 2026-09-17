@@ -6,7 +6,7 @@ import re
 import uuid
 from typing import Any, Literal
 
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 
 from ..models import validate_host
 
@@ -23,6 +23,15 @@ class Allocation(BaseModel):
 
 
 SAFE_ENDPOINT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
+
+# The hpc-bridge-fixed UEC keys a MEP facility's own template is allowed to rename via Compute.key_map
+# (module-level, not a class attribute: pydantic v2 silently turns an underscore-prefixed class attribute
+# into a ModelPrivateAttr wrapper, which broke `set(v) - cls._X` with a TypeError on every Compute
+# validation, key_map present or not — found while validating this exact patch, 2026-09-07).
+MEP_RENAMEABLE_KEYS = frozenset({
+    "account", "partition", "walltime", "max_workers_per_node",
+    "nodes_per_block", "init_blocks", "max_blocks", "interface",
+})
 
 
 class Compute(BaseModel):
@@ -56,6 +65,31 @@ class Compute(BaseModel):
     # Or an explicit version string. Set from the live check that validates the entry.
     worker_version: str = "manager"
     scheduler_options: str | None = None  # raw scheduler directives, verbatim (e.g. #SBATCH for Slurm, #PBS for PBS)
+    # Facility-MEP entries only: renames for the user_endpoint_config keys hpc-bridge itself picks names for
+    # (account/partition/walltime/max_workers_per_node/nodes_per_block/init_blocks/max_blocks/interface —
+    # see MEPFacility.from_entry's `opts` dict). A facility's OWN template picks these names, case-sensitive,
+    # and disagrees with ours and with each other: Delta/Anvil already match ours (empty map, no rename
+    # needed). NeSI's reannz-slurm wants {"account": "ACCOUNT_ID", "walltime": "WALL_TIME"} — without the
+    # first, EVERY submit fails outright (ACCOUNT_ID is schema-required); without the second, walltime is
+    # silently dropped (additionalProperties: false) and every job silently runs at the facility's own
+    # default. ALCF's Polaris/Crux reportedly want {"partition": "queue"}. A facility-specific key with NO
+    # hpc-bridge equivalent (Anvil's qos, NeSI's MEM_PER_CPU/GPUS_PER_NODE) is not a rename — that's
+    # `Defaults.extra`, passed through verbatim under the facility's own name already.
+    # See docs/hpc-bridge-vault/Reference/MEP facilities survey.md and .../Planned/Endpoint reuse and MEP
+    # integration.md (M3: "curate the allowed user_endpoint_config in the entry").
+    key_map: dict[str, str] = Field(default_factory=dict)
+
+    @field_validator("key_map")
+    @classmethod
+    def _known_rename_source(cls, v: dict[str, str]) -> dict[str, str]:
+        bad = sorted(set(v) - MEP_RENAMEABLE_KEYS)
+        if bad:
+            raise ValueError(
+                f"key_map can only rename hpc-bridge's own fixed UEC keys, got unknown source key(s) "
+                f"{bad}: valid sources are {sorted(MEP_RENAMEABLE_KEYS)} (a facility-native key with no "
+                "hpc-bridge equivalent belongs in defaults.extra, passed through verbatim, not key_map)"
+            )
+        return v
 
 
 class Defaults(BaseModel):
