@@ -304,8 +304,9 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
     Globus identity a local account — zero SSH. So we only ATTACH the catalogued UUID (free) and
     read the manager's status. We deliberately do NOT warm a block here: on a MEP every shape is a
     billed scheduler block, so warming belongs behind the spend gate (ensure_endpoint_up
-    confirm_spend=True), not inside connect. There is no login node, hence no allocation listing —
-    the account (if the facility needs one) is passed directly."""
+    confirm_spend=True), not inside connect. There is no login SHAPE through this channel (the facility's login
+    nodes exist, but a MEP does not expose them), hence no allocation listing — the account (if the facility needs
+    one) is passed directly."""
     try:
         block, app.state = await ensure_warm(app.facility, app.profile, app.state)
     except Exception as exc:  # noqa: BLE001 - e.g. the SDK can't reach the status API
@@ -346,8 +347,11 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
             "attached to the facility's multi-user endpoint (zero SSH, nothing to bootstrap). Attaching "
             "does NOT test your identity mapping — the first block start does (no account there ⇒ a "
             "terminal NO ACCOUNT then, nothing billed). This "
-            "facility is COMPUTE-ONLY: there is no free login shape — every command runs on a "
-            "billed scheduler block that stays warm between calls. " + how
+            "channel is COMPUTE-ONLY: hpc-bridge reaches the facility only through its compute endpoint — the "
+            "facility's login nodes exist but are outside this channel, so there is no free login shape here and "
+            "every command runs on a billed scheduler block that stays warm between calls. Allocation names and "
+            "balances come from the facility's own allocation tool/portal or your own SSH session, not from here. "
+            + how
         ),
     )
 

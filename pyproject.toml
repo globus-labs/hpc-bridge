@@ -1,6 +1,6 @@
 [project]
 name = "hpc-bridge"
-version = "0.1.16"
+version = "0.1.17"
 description = "Extend AI coding agents into HPC via Globus Compute"
 requires-python = ">=3.11"
 license = "Apache-2.0"

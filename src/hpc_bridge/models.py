@@ -14,7 +14,7 @@ class ShellOutcome(BaseModel):
     # running: the command was dispatched and is STILL executing past the client sync-wait — it was
     # NOT cut; `task_id` is a handle to poll for its result via poll_task(task_id). The task runs up
     # to the block walltime, and the block stays warm because a running task keeps it busy.
-    phase: Literal["complete", "cold_start", "failed", "needs_confirmation", "running"]
+    phase: Literal["complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running"]
     exit_code: int | None = None
     stdout: str = ""
     stderr_snippet: str = ""
@@ -36,7 +36,9 @@ class EndpointStatus(BaseModel):
     # tearing_down: teardown_endpoint started the login-node ops (gce stop + delete over SSH) and they outlived
     # the call's wait — they keep running in the server; call teardown_endpoint again to confirm 'down'.
     # (Expanse, live 2026-09-04: stop + delete take ~3 min on its filesystem, past the client's tool window.)
-    status: Literal["up", "provisioning", "down", "needs_confirmation", "draining", "tearing_down"]
+    # needs_account: the facility requires an allocation account for every block and none is set — nothing was
+    # provisioned; re-call with account=… (a LOGIN NAME is not an account) and confirm_spend=True to proceed.
+    status: Literal["up", "provisioning", "down", "needs_confirmation", "needs_account", "draining", "tearing_down"]
     block_state: Literal["warm", "cold", "provisioning"]
     endpoint_id: str | None = None
     session_spend: NodeHours = 0.0

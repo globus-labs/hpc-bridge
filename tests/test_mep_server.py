@@ -548,3 +548,111 @@ async def test_account_is_applied_on_a_strict_schema_mep(monkeypatch):
     assert rt.user_endpoint_config["account"] == "cis250223-gpu"
     assert "compute" not in fac.dispatch_uec(rt.user_endpoint_config)
 
+
+
+# --- the account floor (0.1.17): an account-required facility starts NOTHING without an account -----------------
+
+
+def _acct_app(account_required=True):
+    fac = MEPFacility.from_entry(fake_mep_entry(account_required=account_required), client_factory=_Status)
+    return _app(fac)
+
+
+async def test_account_required_confirm_without_account_starts_nothing(monkeypatch):
+    """Live 2026-09-09 (NCSA Delta): the agent confirmed spend with no account after the user offered a LOGIN NAME;
+    the MEP submitted a block Slurm could only reject. Now: needs_account, nothing built, spend still unconfirmed."""
+    app = _acct_app()
+    await _connect(app, monkeypatch, entry=fake_mep_entry(account_required=True))
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "needs_account" and res.block_state == "cold"
+    assert app.built == []                                   # no runner, no submit
+    assert "LOGIN NAME is not an account" in res.notice and "ensure_endpoint_up(account=" in res.notice
+    assert res.account is None
+    # spend stays unconfirmed: the same call with an account re-gates cleanly and proceeds
+    res2 = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True, account="bbxx-delta-gpu")
+    assert res2.status == "up" and res2.account == "bbxx-delta-gpu"
+    assert app.built and app.built[-1][1].get("account") == "bbxx-delta-gpu"
+
+
+async def test_account_required_sticky_account_then_confirm_proceeds(monkeypatch):
+    app = _acct_app()
+    await _connect(app, monkeypatch, entry=fake_mep_entry(account_required=True))
+    first = await _ensure_endpoint_up(app, shape="compute", account="proj-1")   # sets the account, no confirm yet
+    assert first.status == "needs_confirmation"
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)    # the sticky account satisfies the floor
+    assert res.status == "up" and app.built[-1][1].get("account") == "proj-1"
+
+
+async def test_account_required_run_shell_cold_is_needs_account_not_a_submit(monkeypatch):
+    app = _acct_app()
+    await _connect(app, monkeypatch, entry=fake_mep_entry(account_required=True))
+    # the implicit provision inside run_shell: spend floor first (no ack yet) …
+    out = await _run_shell(app, "hostname", shape="compute")
+    assert out.phase == "needs_confirmation" and app.built == []
+    # … then, with spend acknowledged but no account, the account floor — still nothing submitted
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "needs_account"
+    out = await _run_shell(app, "hostname", shape="compute")
+    assert out.phase in ("needs_confirmation", "needs_account") and app.built == []
+
+
+async def test_account_not_required_is_unchanged(monkeypatch):
+    app = _acct_app(account_required=False)
+    await _connect(app, monkeypatch)
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "up" and "account" not in app.built[-1][1]
+
+
+def test_compute_only_wording_names_the_channel_not_the_facility():
+    """'no login node' was wrong (the facility has them); the notices now say the CHANNEL has no login shape."""
+    from hpc_bridge.notices import _spend_floor_guidance
+    from tests.fakes import fake_mep_entry as _e
+    app = _acct_app()
+    text = _spend_floor_guidance(app)
+    assert "login nodes are outside this channel" in text and "no login node" not in text
+    note = _e(account_required=True).summary().access_note
+    assert "no login shape through this channel" in note and "no login node" not in note
+
+
+# --- a scheduler-REJECTED submission is a terminal `down`, not "allocating nodes…" (0.1.17) -----------------------
+
+_PARSL_SUBMIT_FAILED = (
+    "TaskExecutionFailed: ++++++++ Traceback (most recent call last): parsl.executors.errors.BadStateException: Executor "
+    "GlobusComputeEngine-HighThroughputExecutor failed due to: Error 1: Failed to start block 0: Cannot launch job "
+    "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1788982817.7919347: Could not read job ID from submit "
+    "command standard output; recode=1, stdout=, stderr=sbatch: error: invalid account specified"
+)
+
+
+async def test_rejected_submission_is_a_terminal_down_naming_the_cause(monkeypatch):
+    """Live on the fake MEP (2026-09-09): the login name passed as the account; sbatch refused; the client said
+    'allocating nodes…' for five polls with the cause buried in a suffix. Now: down + REJECTED, at once."""
+    import time as _time
+
+    app = _acct_app()
+    await _connect(app, monkeypatch, entry=fake_mep_entry(account_required=True))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error=_PARSL_SUBMIT_FAILED))
+    server._shape_runtime(app, "compute").provisioning_since = _time.monotonic() - 5
+    res = await _ensure_endpoint_up(app, shape="compute", partition="compute", account="hpcbmep", confirm_spend=True)
+    assert res.status == "down" and res.block_state == "cold"
+    assert "REJECTED" in res.notice and "'hpcbmep'" in res.notice and "'compute'" in res.notice
+    assert "Could not read job ID" in res.notice and "Traceback" not in res.notice
+    assert "allocating" not in res.notice and "Do not retry unchanged" in res.notice
+    # the run_shell cold path says the same thing
+    out = await _run_shell(app, "hostname", shape="compute")
+    assert out.phase == "failed" and "REJECTED" in out.notice
+    # a corrected account re-provisions (a fresh runner whose canary answers)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "c1\n", ""))
+    res2 = await _ensure_endpoint_up(app, shape="compute", account="hpcb", confirm_spend=True)
+    assert res2.status == "up" and res2.account == "hpcb"
+
+
+def test_submit_rejection_classifier_and_cause():
+    from hpc_bridge.notices import _submit_rejected, _submit_rejection_cause
+    assert _submit_rejected(_PARSL_SUBMIT_FAILED)
+    assert _submit_rejected("sbatch: error: Batch job submission failed: Invalid qos specification")
+    assert not _submit_rejected("timeout") and not _submit_rejected(None)
+    assert not _submit_rejected("Identity failed to map to a local user name")   # that is the no-account class
+    cause = _submit_rejection_cause(_PARSL_SUBMIT_FAILED)
+    assert cause.startswith("Error 1: Failed to start block 0") and "Traceback" not in cause and len(cause) <= 220

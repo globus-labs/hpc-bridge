@@ -1154,3 +1154,18 @@ def test_decline_regex_exempts_no_preference_with_adjectives():
     assert _DECLINE.search("No — hold off on the block for now.")
     assert _DECLINE.search("No.")
     assert _DECLINE.search("No, don't provision anything today.")
+
+
+def test_needs_account_is_not_a_billed_start():
+    """0.1.17's account floor: an ensure_endpoint_up(confirm_spend=True) answered needs_account started nothing,
+    so ends_with_stop / spend_follows_question must not count it (like needs_confirmation)."""
+    from invariants import ToolCall, Trace, _billed_start_idxs, ends_with_stop
+    t = Trace([
+        ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+                    {"status": "needs_account", "block_state": "cold"}),
+        ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True, "account": "proj"},
+                    {"status": "up", "block_state": "warm"}),
+    ], [])
+    assert _billed_start_idxs(t) == [1]
+    t2 = Trace([t.calls[0]], [])
+    assert ends_with_stop(t2).ok            # nothing billed → nothing to stop
