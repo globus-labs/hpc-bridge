@@ -20,6 +20,7 @@ import contextlib
 import json
 import os
 import sys
+import time
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
@@ -89,6 +90,7 @@ class RunResult:
     hooks_fired: list[dict] = None    # chaos: the MIDRUN_HOOKS that fired (tool, nth, call index, rc, output)
     interjections: list[dict] = None  # `interject` hooks: what the USER said mid-run, and after which call (stamped into the trace)
     acp_events: list[dict] = None     # ACP operators: the client's event log (persisted as acp-updates.jsonl; cross-checked)
+    arrivals: list[float | None] = None  # parallel to `messages`: seconds since the session started (turn latency; bundle `__t__`)
 
 
 class HookWatcher:
@@ -307,6 +309,12 @@ async def run_scenario(
 
     options = ClaudeAgentOptions(**opts)
     messages: list[Any] = []
+    arrivals: list[float | None] = []   # when each message ARRIVED — a tool call's latency is its result's arrival minus its own
+    t0 = time.monotonic()
+
+    def _keep(msg: Any) -> None:
+        messages.append(msg)
+        arrivals.append(round(time.monotonic() - t0, 3))
     final: Any = None
     turn_final: Any = None   # the CURRENT turn's ResultMessage — never a previous turn's (review 2026-09-05, 2.4)
     followups = 0
@@ -349,7 +357,7 @@ async def run_scenario(
                         last_text, last_had_tool = "", False
                         turn_final = None
                         async for msg in client.receive_response():
-                            messages.append(msg)
+                            _keep(msg)
                             _live(msg)
                             await _observe(msg)
                             kind = type(msg).__name__
@@ -386,7 +394,7 @@ async def run_scenario(
                 live.pop("client", None)
             else:
                 async for msg in query(prompt=prompt, options=options):
-                    messages.append(msg)
+                    _keep(msg)
                     _live(msg)
                     await _observe(msg)
                     if type(msg).__name__ == "ResultMessage":
@@ -401,8 +409,8 @@ async def run_scenario(
         if (interactive and turn_final is None) or final is None:
             final = _AbortedResult(result=str(e))
     return RunResult(
-        trace=insert_interjections(build_trace(messages, injected_answers=injected_answers), interjections),
-        final=final, messages=messages,
+        trace=insert_interjections(build_trace(messages, injected_answers=injected_answers, arrivals=arrivals), interjections),
+        final=final, messages=messages, arrivals=arrivals,
         dialogue=(human.dialogue if human else []),
         prose_followups=followups, followups_capped=capped,
         human_sim_model=(human.model if human else None),

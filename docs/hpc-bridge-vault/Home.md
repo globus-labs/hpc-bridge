@@ -52,6 +52,7 @@ This vault has two halves:
 - [[MFA and interactive SSH auth]] — Duo/MFA + password facilities without the agent ever handling a secret: the pre-open ControlMaster hand-off (`needs_preauth`, **built**) + the non-secret push relay (deferred) ([#3](https://github.com/ryanchard/hpc-bridge/issues/3))
 - [[Aurora (PBS + bastion) bring-up]] — the first PBS + bastion/MFA facility: two-hop ProxyJump, the management-hostname pin fix, the discovered `hsn0`/`filesystems=home:flare` config. SSH/PBS path proven live; compute block validated-pending an Aurora allocation
 - [[New-user testing (clean-session)]] — `agentic/clean-session.sh` (a pristine Claude Code session) and `scripts/fresh_user_session.sh` (a pristine *Globus* user: no tokens, no cache) — the host-side counterparts to the Docker harness
+- [[REPL-like interaction benchmark]] — what "REPL-like" means without reference to hpc-bridge (P1–P7), the scripted protocol that tests the claim on a warm compute block, and the local-Bash baseline it is measured against (built, not yet run live)
 - [[Agentic testing - Plan B (runtime sandbox)]] — the live-agent regression harness (`agentic/`): the jail, invariants, scenarios, pool isolation, the fake cluster; with [[Agentic testing - Plan A (cluster cost accounting)]] (cluster side) and [[Agentic testing - Plan C (human-in-the-loop)]] (the simulated user)
 
 *(Persistent SSH / ControlMaster shipped — see [[facility-remote]].)*

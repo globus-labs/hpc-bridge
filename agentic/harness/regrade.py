@@ -91,6 +91,8 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
             scen = importlib.import_module(scen_name)
             results += [fn(t) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]
             critical |= set(getattr(scen, "EXPECT_OK", []))
+            if getattr(scen, "LOCAL_BASELINE", False):
+                critical.discard("agent_engaged")   # a calibration run that must not use hpc-bridge (run.py, same rule)
         except ModuleNotFoundError:
             pass
         # the completion gate, from what the bundle recorded (not from the trace)

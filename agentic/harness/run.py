@@ -80,10 +80,12 @@ def _combine(results: list[RunResult]) -> RunResult:
             calls.append(c)
     texts = [x for r in results for x in getattr(r.trace, "texts", [])]  # the agent's words survive a chain too
     messages = [m for r in results for m in r.messages]
+    # stamps restart per session (each phase is its own agent session); a result without stamps pads with None
+    arrivals = [t for r in results for t in ((r.arrivals or []) + [None] * (len(r.messages) - len(r.arrivals or [])))]
     dialogue = [d for r in results for d in (r.dialogue or [])]
     errored = [r for r in results if r.final is None or getattr(r.final, "is_error", False)]
     final = (errored[0] if errored else results[-1]).final
-    return RunResult(trace=Trace(calls, texts), final=final, messages=messages, dialogue=dialogue)
+    return RunResult(trace=Trace(calls, texts), final=final, messages=messages, dialogue=dialogue, arrivals=arrivals)
 
 
 async def _run_chain(phase_prompts, scen, *, model, effort, persona, user_goal, no_skill):
@@ -761,6 +763,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             results.append(capture_crosscheck(res.acp_events, res.trace))
         # agent_engaged + run_completed always gate: a do-nothing or truncated run must never grade OK.
         critical = set(getattr(scen, "EXPECT_OK", [r.name for r in results])) | {"agent_engaged", "run_completed", *FLOOR_NAMES}
+        if getattr(scen, "LOCAL_BASELINE", False):
+            # a calibration run that must NOT touch hpc-bridge (repl_baseline_local): its own liveness gate replaces
+            # agent_engaged, which would otherwise fail it for doing exactly what it was asked
+            critical.discard("agent_engaged")
         if persona:
             critical.add("harness:prose_followups")
         if getattr(scen, "MIDRUN_HOOKS", None):
@@ -840,6 +846,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
             # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
             extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
+            arrivals=(getattr(res, "arrivals", None) if res else None),
         )
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on

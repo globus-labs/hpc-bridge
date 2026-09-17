@@ -51,6 +51,17 @@ class ToolCall:
     # phase and run.py `_combine` concatenates them). Always 0 for a single-session run. Lets a
     # chain grader key on "phase 2's FIRST connect" instead of guessing from call order.
     phase: int = 0
+    # Arrival stamps (seconds since the agent session started) of the assistant message that MADE this call and of the
+    # message that carried its RESULT. None when the operator or an old bundle recorded no stamps. Their difference is
+    # the tool's latency as the agent experienced it — the REPL benchmark's turn latency (repl_protocol.py).
+    t_call: float | None = None
+    t_result: float | None = None
+
+    @property
+    def latency_s(self) -> float | None:
+        if self.t_call is None or self.t_result is None:
+            return None
+        return max(0.0, self.t_result - self.t_call)
 
     @classmethod
     def of(
