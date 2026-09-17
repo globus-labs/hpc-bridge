@@ -36,3 +36,6 @@ agentic/runs/
 agentic/fakecluster/.merged/
 # The totp profile's generated enrolment secret (a local-only sshd fixture; never committed)
 agentic/fakecluster/.totp-secret
+
+# The paper draft is its OWN git repository (Overleaf); never commit it into hpc-bridge
+docs/paper-drafting/
