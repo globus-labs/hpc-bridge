@@ -201,8 +201,9 @@ class CatalogEntry(BaseModel):
             access, note = "mep", (
                 "zero SSH — the facility runs the endpoint; you need an account there with your Globus "
                 "identity mapped to it (no account ⇒ a terminal NO ACCOUNT on first use, nothing billed). "
-                "connect_facility only attaches: no login node to warm, no allocation list — the first "
-                "billed block is where your access is actually tested"
+                "connect_facility only attaches: hpc-bridge has no login shape through this channel (the facility's "
+                "login nodes are outside it), so no allocation list — the first billed block is where your access is "
+                "actually tested"
             )
         else:
             access, note = "ssh", (

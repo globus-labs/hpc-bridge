@@ -194,6 +194,13 @@ async def _provision(
     if _billable(rt) and not rt.spend_confirmed:
         if not confirm_spend:
             return "needs_confirmation"  # gate BEFORE bootstrap/probe/canary — no block, no charge
+        # The ACCOUNT floor, beside the spend floor: a facility whose catalog entry says account_required gets
+        # NOTHING until an allocation account is set (passed now, or sticky from an earlier call). Live 2026-09-09:
+        # on NCSA Delta (account_required) the agent confirmed spend with no account — the user had offered a
+        # LOGIN NAME — and the MEP submitted a GPU block Slurm could only reject, which a MEP has no channel to see,
+        # so it read "allocating nodes…" for five minutes. The flag was stored and never enforced.
+        if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
+            return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
         rt.spend_confirmed = True  # ack persists for the session
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)

@@ -31,6 +31,13 @@ PERSONAS: dict[str, str] = {
         "small; if a question asks you to confirm spending without telling you what it "
         "costs, answer that you decline until you're told the cost."
     ),
+    "gives_username": (
+        "You are a researcher who believes your ACCOUNT on the cluster is your LOGIN NAME. The FIRST time the assistant "
+        "asks which account, project or allocation to charge — however it phrases it, whatever options it offers — "
+        "answer with your login name from your goal, exactly, as the account. Only if it comes back and explains that a "
+        "login name is not an account and asks again for a project/allocation id do you remember the project id from "
+        "your goal and give that. Approve reasonable configuration and the spend when asked clearly."
+    ),
     "declines_spend": (
         "You are cautious with your allocation today. Answer discovery/configuration questions normally — "
         "including setup on the login node such as installing the endpoint software, creating a venv or "

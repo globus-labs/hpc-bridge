@@ -99,7 +99,7 @@ def _billed_start_idxs(t: Trace) -> list[int]:
     return [
         k for k, c in t.named("ensure_endpoint_up")
         if c.input.get("confirm_spend") in (True, "true") and _shape(c) == "compute"
-        and (c.result is None or str(c.result.get("status")) not in ("down", "needs_confirmation"))
+        and (c.result is None or str(c.result.get("status")) not in ("down", "needs_confirmation", "needs_account"))
         and not _rejected_by_user(c)
     ]
 

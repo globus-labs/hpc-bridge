@@ -98,6 +98,8 @@ from .notices import (  # noqa: F401 - re-exported
     _identity_from_error,
     _local_dill,
     _login_notice,
+    _needs_account_notice,
+    _needs_account_outcome,
     _needs_confirmation_notice,
     _needs_confirmation_outcome,
     _needs_login_result,
@@ -108,6 +110,8 @@ from .notices import (  # noqa: F401 - re-exported
     _running_outcome,
     _shape_reject_outcome,
     _spend_floor_guidance,
+    _submit_rejected,
+    _submit_rejected_notice,
     _transient_dispatch_failure,
     _worker_notice,
 )
@@ -305,6 +309,15 @@ async def _ensure_endpoint_up(
                 account=active_account,
                 notice=_needs_confirmation_notice(app, where),
             )
+        if block == "needs_account":  # the account floor (account_required facility, no account) — nothing was started
+            return EndpointStatus(
+                status="needs_account",
+                block_state="cold",
+                endpoint_id=app.state.endpoint_id,
+                partition=active_partition,
+                account=None,
+                notice=_needs_account_notice(app),
+            )
         billable = _billable(rt)
         eid = app.state.endpoint_id
         spend = _total_session_spend(app)
@@ -349,6 +362,16 @@ async def _ensure_endpoint_up(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
                     notice=_no_account_notice(app, rt.last_canary.error, identity),
+                )
+            if rt.last_canary is not None and _submit_rejected(rt.last_canary.error):
+                # The scheduler refused the submission (bad account/partition/QOS, missing resource request): a
+                # terminal `down` for THIS config, so the agent stops polling and changes it — not "allocating
+                # nodes…" with the cause buried in a suffix (live 2026-09-09: five polls before anyone read it).
+                rt.provisioning_since = None
+                return EndpointStatus(
+                    status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
+                    partition=active_partition, account=active_account,
+                    notice=_submit_rejected_notice(active_partition, active_account, rt.last_canary.error),
                 )
             if not _has_login_shape(app) and rt.last_canary is None:
                 # On a MEP a canary runs on EVERY poll whose manager gate passes (and is recorded even
@@ -948,6 +971,8 @@ async def _ready_session(app: AppCtx, shape: str, session_id: str) -> tuple[Glob
             busy = _busy_session(app, shape, session_id)
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged -> don't dispatch
         return _needs_confirmation_outcome(app)
+    if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
+        return _needs_account_outcome(app)
     if not_warm is not None:
         return _cold_outcome(not_warm, _shape_runtime(app, shape).last_canary)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
