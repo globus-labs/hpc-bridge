@@ -24,5 +24,8 @@
 > [!note] One fixed config shape — a known model gap
 > `from_entry` builds one `user_endpoint_config` shape (`partition`/`account`/`walltime`/…). Real MEP templates disagree and are case-sensitive (`queue` at ALCF, `ACCOUNT_ID` at NeSI, `qos` on Anvil) — see [[MEP facilities survey]]. A per-facility key map is needed before any of those enters the registry.
 
+> [!note] Facility-named config keys — `compute.key_map` (2026-09-17)
+> A facility's template picks its own names for the keys hpc-bridge fixes (`account`, `partition`, `walltime`, …): NeSI's `reannz-slurm` wants `ACCOUNT_ID` / `WALL_TIME`, ALCF reportedly `queue`. `key_map` in the entry renames them, and the rename happens **only at the wire** (`dispatch_uec`). The runtime config keeps hpc-bridge's names because the server writes the user's confirmed `account` / `partition` into it *after* construction (`warmth._apply_account` / `_apply_partition`) and the account floor reads `account` from it; a construction-time rename silently lost a confirmed account. `sanitize_uec` keeps a key whose renamed form the strict schema accepts; a `None` value is never sent under the facility's name. Facility-native keys with no hpc-bridge equivalent stay in `defaults.extra`.
+
 ## See also
 [[facility-base]] · [[facility-remote]] · [[server]] · [[Facility catalog]] · [[MEP & templated endpoints]] · [[Endpoint reuse and MEP integration]] · [[MEP facilities survey]] · [[Cost control]] · [[shapes]]
