@@ -51,7 +51,7 @@ jobs:
         run: uv run python -m pytest -q -W error::DeprecationWarning
       - name: agentic grading core (hermetic)
         working-directory: agentic/harness
-        run: uv run --project ../.. python -m pytest test_invariants.py test_pool_and_cluster_ops.py test_scenario_knobs.py test_human_sim.py test_runner.py test_provenance.py test_targets.py test_hermes_trace.py test_hermes_setup.py test_acp_client.py test_hermes_runner.py -q -W error::DeprecationWarning
+        run: uv run --project ../.. python -m pytest test_invariants.py test_pool_and_cluster_ops.py test_scenario_knobs.py test_human_sim.py test_runner.py test_provenance.py test_targets.py test_hermes_trace.py test_hermes_setup.py test_acp_client.py test_hermes_runner.py test_claude_transcript.py test_acp_trace.py test_regrade.py -q -W error::DeprecationWarning
 
   audit:
     name: advisories in the lock

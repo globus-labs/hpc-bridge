@@ -98,3 +98,28 @@ def test_join_chunks_whole_messages_keep_a_boundary(monkeypatch):
         "Sure — confirm the interface first.\nHostname came back as c1."
     assert ac._join_chunks(["", "a", None, "b"]) == "ab"          # empties skipped, no separator invented
     assert ac._join_chunks(["9587", ".5", " SU"]) == "9587.5 SU"   # a delta after '.' that is not a new sentence
+
+
+def test_capture_events_are_recorded_in_order_and_jsonable(monkeypatch):
+    """The event log is what the bundle persists (acp-updates.jsonl) and what the cross-check reads."""
+    import json
+
+    ac = _load_acp_client(monkeypatch)
+    bc = ac.BenchClient()
+    bc.capture.turn = 1
+    chunk = type("AgentMessageChunk", (), {})()
+    chunk.__dict__.update(content=type("T", (), {"text": "Login node is up."})())
+    done = type("ToolCallProgress", (), {})()
+    done.__dict__.update(tool_call_id="1", status="completed", raw_output=None, content=None)
+    _drive(bc, [
+        _tool_update(title="mcp__hpc_bridge__connect_facility", kind="ToolKind.OTHER", raw_input={"facility": "f1"}, tool_call_id="1"),
+        done,
+        chunk,
+    ])
+    kinds = [e["event"] for e in bc.capture.events]
+    assert kinds == ["tool_call", "tool_call_update", "message_chunk"]
+    assert bc.capture.events[0]["title"] == "mcp__hpc_bridge__connect_facility"
+    assert bc.capture.events[0]["raw_input"] == {"facility": "f1"} and bc.capture.events[0]["turn"] == 1
+    assert bc.capture.events[1]["status"] == "completed"
+    assert bc.capture.events[2]["text"] == "Login node is up."
+    json.dumps(bc.capture.events)      # persisted verbatim: must be JSON-able

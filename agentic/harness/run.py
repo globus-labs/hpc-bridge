@@ -22,6 +22,7 @@ import subprocess
 import sys
 from pathlib import Path
 
+from acp_trace import capture_crosscheck
 from cluster_ops import (
     capture_logs_cmd,
     delete_endpoint_cmd,
@@ -748,6 +749,11 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                               "force-fed SKILL.md in the system prompt (Claude-SDK operator)" if operator == "claude"
                               else ("fetched the MCP guidance resource" if guidance_fetched(res.trace)
                                     else "did NOT fetch the MCP guidance resource (this run ran guidance-lighter)")))
+        # ACP operators: does the client's own event log agree with the graded trace on the hpc-bridge calls made?
+        # An instrument check (REPORT-ONLY until it has proven clean across runs): a mismatch means the post-run
+        # trace source (state.db / the CLI transcript) lagged, truncated or picked the wrong session.
+        if getattr(res, "acp_events", None):
+            results.append(capture_crosscheck(res.acp_events, res.trace))
         # agent_engaged + run_completed always gate: a do-nothing or truncated run must never grade OK.
         critical = set(getattr(scen, "EXPECT_OK", [r.name for r in results])) | {"agent_engaged", "run_completed", *FLOOR_NAMES}
         if persona:
@@ -827,6 +833,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             failed=failed,
             result=result_label,
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
+            # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
+            extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
         )
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on

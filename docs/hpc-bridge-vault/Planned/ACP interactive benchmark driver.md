@@ -164,6 +164,43 @@ Grading was never affected (the graded question comes from state.db post-run). B
 `agentic/runs/1788880401-22038-gated_provision`. **The campaign gate is met**: turn-continuation landed with tests, a
 free validation on both a cooperative and a declining persona, and a paid capable-operator validation.
 
+**Plan step 2 RESHAPED by evidence (2026-09-08) — trace SOURCES, not "trace from the update stream".** Reading both
+adapters' source: hermes' `acp_adapter/tools.py` sets `raw_output=None` for any JSON tool result (a truncated
+rendering goes into `content`), and Zed's `claude-agent-acp` `tools.ts` sets neither `rawInput` nor `rawOutput` and
+gives an MCP call only its name. So the ACP update stream is NOT a grading source for either agent; each has a
+full-fidelity POST-RUN store instead — hermes' `state.db` (`hermes_trace`) and, for Claude Code, the CLI's native
+session transcript (`$CLAUDE_CONFIG_DIR/projects/<slug>/<session>.jsonl`, which the jail's entrypoint already
+harvests into the bundle as `claude-session/`). What landed (branch `feat/trace-sources`):
+- `claude_transcript.py` — the Claude-side twin of hermes_trace: native transcript → Trace (tool_use/tool_result
+  paired, assistant text, thinking skipped, sidechains optional); AskUserQuestion answers from the line's
+  `toolUseResult.answers` when the CLI recorded them structurally, else the graders' existing fallback on the
+  rendered `"q"="a"` text; `select_operator_session` picks the operator's session out of a harvest that also holds
+  the human-sim's own SDK sessions (their first message is the role-play prompt). This is the prerequisite for the
+  Claude-Code-over-ACP cell.
+- `acp_client.AcpCapture.events` — the client's flat, JSON-able event log (user_prompt / message_chunk / tool_call /
+  tool_call_update / permission / turn_end, per prompt turn), persisted into the bundle as `acp-updates.jsonl`
+  (`provenance.write_run_record(extra_jsonl=…)`).
+- `acp_trace.capture_crosscheck` → `harness:acp_capture` (REPORT-ONLY until proven clean): the ordered hpc-bridge
+  tool NAMES in the stream vs in the graded trace — the one thing every adapter carries. A mismatch means the
+  post-run source lagged, truncated or picked the wrong session (the 2026-09-07 mid-run state.db read would have
+  shown up here). Promote to gating once clean across runs.
+- `regrade.bundle_trace` — format sniffing so every bundle regrades: SDK dict-form (`__type__`), hermes rows
+  (`role`+`tool_calls`; an ACP bundle re-stamps the prose exchanges from the record's dialogue by message order),
+  Claude CLI transcript (`sessionId`+`type`). A `-z` transcript-replay bundle replays trace-only (each turn was a
+  fresh session carrying the whole conversation, so message order doesn't identify replies). This is what the
+  offline judge-agreement pass (step 6) needs.
+**Live-validated (free, gpt-oss over ACP, gated_provision, 2026-09-08): RESULT OK**; `acp-updates.jsonl` persisted (42 events, 3
+turns) and `harness:acp_capture` agreed with the graded trace on 8 hpc-bridge calls. The stream confirmed the adapter
+finding in the wild: every completed tool call arrived with `raw_output: null`. Offline, `regrade` over all 568 bundles
+re-stamped the ACP-era hermes bundles correctly — the sonnet-5 run the old stamping bug had false-failed now regrades
+PASS on `spend_follows_question` — and regrade now honours the recorded benchmark mode (preference graders were
+report-only live, so they no longer decide the replayed verdict). Bundle `agentic/runs/1788881977-55550-gated_provision`.
+
+Open for step 3 (Claude Code via `claude-agent-acp`): how AskUserQuestion surfaces to the ACP client (the adapter
+routes `canUseTool` to `session/request_permission`; whether the question's options become permission options and
+how the choice becomes `updatedInput` is not visible in the excerpt read) — verify empirically on the first run and
+route it to the human-sim instead of auto-approving; Node returns to the jail image.
+
 **Still solid:** the driver MECHANICS (persistent session, turn boundaries, human-sim loop, teardown), the live
 `→` tool-call logging (fixed + tested), and now the gate STAMPING (`spend_follows_question`/`choice_respected`).
 Autonomous results, teardown signals, and qualitative behaviours stand.

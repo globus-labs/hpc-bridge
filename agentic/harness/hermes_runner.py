@@ -208,12 +208,13 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
     t0 = time.time()
     err = False
     stop = "?"
+    cap = None
     try:
         # turns: the task + every answer + every nudge (each budget ends in a `conclude`, so this bound is never hit
         # by the sim itself — it only guards a respond hook that keeps returning text)
-        resp, _cap = await acp_client.run_session("hermes", ["acp"], full_prompt, cwd=repo, env=child_env,
-                                                  mcp_servers=mcp, respond=respond,
-                                                  max_turns=1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES)
+        resp, cap = await acp_client.run_session("hermes", ["acp"], full_prompt, cwd=repo, env=child_env,
+                                                 mcp_servers=mcp, respond=respond,
+                                                 max_turns=1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES)
         stop = str(getattr(resp, "stop_reason", "") or "")
     except asyncio.CancelledError:
         raise
@@ -237,6 +238,7 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
         prose_followups=(human.answers if human else 0), followups_capped=(human.followups_capped if human else False),
         nudges=(human.nudges if human else 0), nudges_capped=(human.nudges_capped if human else False),
         human_sim_model=(human.model if human else None),
+        acp_events=(list(cap.events) if cap is not None else None),
     )
 
 

@@ -88,6 +88,7 @@ class RunResult:
     human_sim_model: str | None = None  # interactive: which model played the user (bundle provenance)
     hooks_fired: list[dict] = None    # chaos: the MIDRUN_HOOKS that fired (tool, nth, call index, rc, output)
     interjections: list[dict] = None  # `interject` hooks: what the USER said mid-run, and after which call (stamped into the trace)
+    acp_events: list[dict] = None     # ACP operators: the client's event log (persisted as acp-updates.jsonl; cross-checked)
 
 
 class HookWatcher:

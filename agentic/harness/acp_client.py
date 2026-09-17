@@ -35,11 +35,35 @@ from acp.schema import (
 @dataclass
 class AcpCapture:
     """What the client observed over one ACP session: the agent's prose, the tool calls it made, and the
-    permission requests it raised. Enough to verify a run and (later) build a Trace."""
+    permission requests it raised. NOT a grading source — hermes' adapter drops structured results (raw_output is
+    None for any JSON result; a truncated rendering goes into content) and Zed's claude-agent-acp sets neither
+    rawInput nor rawOutput (both verified in source, 2026-09-08); the graded Trace comes from each agent's own
+    post-run store (hermes state.db / the Claude CLI transcript). It IS the live, ordered record of what the client
+    saw: `events` is persisted into the bundle (`acp-updates.jsonl`) and cross-checked against the graded trace's
+    hpc-bridge call count (`harness:acp_capture`) so a lagging or truncated trace source is caught."""
     texts: list[str] = field(default_factory=list)                 # AgentMessageChunk content, in order
     tool_calls: list[dict] = field(default_factory=list)           # {tool_call_id, title, kind, raw_input}
     tool_results: dict[str, Any] = field(default_factory=dict)     # tool_call_id -> raw_output (final)
     permissions: list[str] = field(default_factory=list)           # titles of tool calls we auto-approved
+    events: list[dict] = field(default_factory=list)               # the flat, JSON-able event log, in order
+    turn: int = 0                                                  # prompt turn the events belong to (1-based)
+
+
+def _jsonable(o: Any, depth: int = 0) -> Any:
+    """A JSON-able copy of an ACP payload (pydantic models → their dict; unknowns → str)."""
+    if depth > 6:
+        return str(o)
+    if o is None or isinstance(o, (str, int, float, bool)):
+        return o
+    if isinstance(o, dict):
+        return {str(k): _jsonable(v, depth + 1) for k, v in o.items()}
+    if isinstance(o, (list, tuple)):
+        return [_jsonable(v, depth + 1) for v in o]
+    dump = getattr(o, "model_dump", None)
+    if callable(dump):
+        with contextlib.suppress(Exception):
+            return _jsonable(dump(), depth + 1)
+    return str(o)
 
 
 def _chunk_text(content: Any) -> str:
@@ -80,11 +104,19 @@ class BenchClient(Client):
     def __init__(self) -> None:
         self.capture = AcpCapture()
 
+    def _event(self, event: str, **fields: Any) -> None:
+        self.capture.events.append({"event": event, "turn": self.capture.turn, **{k: _jsonable(v) for k, v in fields.items()}})
+
     async def request_permission(self, options: list, session_id: str, tool_call: Any, **kwargs: Any):
         title = str(getattr(tool_call, "title", "") or getattr(tool_call, "tool_call_id", "") or "?")
         self.capture.permissions.append(title)
         allow = next((o for o in options if str(getattr(o, "kind", "")) in ("allow_once", "allow_always")), None)
         chosen = allow or (options[0] if options else None)
+        self._event("permission", title=title, tool_call_id=getattr(tool_call, "tool_call_id", None),
+                    raw_input=getattr(tool_call, "raw_input", None),
+                    options=[{"option_id": getattr(o, "option_id", None), "kind": str(getattr(o, "kind", "")),
+                              "name": getattr(o, "name", None)} for o in options],
+                    chosen=(getattr(chosen, "option_id", None) if chosen is not None else None))
         if chosen is None:                                          # no options offered → nothing to select
             raise acp.RequestError(-32603, "no permission options offered")  # type: ignore[attr-defined]
         return RequestPermissionResponse(outcome=SelectedPermissionOutcome(option_id=chosen.option_id))
@@ -92,7 +124,9 @@ class BenchClient(Client):
     async def session_update(self, session_id: str, update: Any, **kwargs: Any) -> None:
         kind = str(getattr(update, "session_update", "") or type(update).__name__)
         if "agent_message" in kind or type(update).__name__ == "AgentMessageChunk":
-            self.capture.texts.append(_chunk_text(getattr(update, "content", None)))
+            text = _chunk_text(getattr(update, "content", None))
+            self.capture.texts.append(text)
+            self._event("message_chunk", text=text)
         elif type(update).__name__ == "ToolCallStart" or kind == "tool_call":
             title = getattr(update, "title", None)
             raw_input = getattr(update, "raw_input", None)
@@ -103,6 +137,8 @@ class BenchClient(Client):
                 "kind": call_kind,
                 "raw_input": raw_input,
             })
+            self._event("tool_call", tool_call_id=getattr(update, "tool_call_id", None), title=title, kind=call_kind,
+                        raw_input=raw_input, content=_chunk_text(getattr(update, "content", None)) or None)
             # Live legibility: stream each operator tool call to stderr, so the hermes/ACP docker log gets the
             # same `  → tool(args)` play-by-play the Claude-SDK operator prints (runner.py). Without it the log
             # shows only the human-sim's replies — the operator's list_facilities/connect/run_shell steps land
@@ -111,8 +147,13 @@ class BenchClient(Client):
                 print(f"  → {_fmt_call(title, call_kind, raw_input)}", file=sys.stderr, flush=True)
         elif type(update).__name__ == "ToolCallProgress" or "tool_call_update" in kind:
             tid = getattr(update, "tool_call_id", None)
-            if tid is not None and getattr(update, "raw_output", None) is not None:
-                self.capture.tool_results[tid] = update.raw_output
+            raw_output = getattr(update, "raw_output", None)
+            if tid is not None and raw_output is not None:
+                self.capture.tool_results[tid] = raw_output
+            self._event("tool_call_update", tool_call_id=tid, status=str(getattr(update, "status", "") or ""),
+                        raw_output=raw_output, content=_chunk_text(getattr(update, "content", None)) or None)
+        else:
+            self._event("other", kind=kind)
 
     # --- fs/terminal: not used for HPC-driving (hpc-bridge tools ride the MCP server); safe stubs ---
     async def write_text_file(self, content: str, path: str, session_id: str, **kwargs: Any):
@@ -193,8 +234,11 @@ async def run_session(command: str, args: list[str], task: str, *, cwd: str, env
         sess = await conn.new_session(cwd=cwd, mcp_servers=mcp_servers)
         prompt_text = task
         for _turn in range(max(1, max_turns)):
+            client.capture.turn += 1
+            client._event("user_prompt", text=prompt_text)
             seen = len(client.capture.texts)
             resp = await conn.prompt(prompt=[acp.text_block(prompt_text)], session_id=sess.session_id)
+            client._event("turn_end", stop_reason=str(getattr(resp, "stop_reason", "") or ""))
             if respond is None:
                 break
             turn_text = _join_chunks(client.capture.texts[seen:]).strip()
