@@ -1847,3 +1847,37 @@ def test_slurm_pilot_probe_reads_finished_pilots_and_pending_reasons():
     assert cat == "queued" and "reason Priority" in why
     assert _summarize_pilot("PENDING 13 - None\n", 30) == ("queued", "— pilot 13 is queued (PENDING); waiting on the scheduler.")
     assert _summarize_pilot("RUNNING 14 - None\nF 12 42 FAILED\n", 30)[0] == "starting"   # a live pilot wins
+
+
+async def test_reaped_block_under_a_live_session_cold_starts_then_recovers():
+    # The return-later flow (agentic: block_reaped_resume): the server process lives on with its in-memory state,
+    # the pilot block is reaped underneath it (idle-release / walltime / scancel), the canary TTL expires, and the
+    # user comes back and runs again. Warm -> honest cold_start (nothing dispatched into the void, spend clock
+    # stopped) -> complete on the new block, without a second spend ask (the acknowledgement persists by design).
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", _Res(0, "HPCB_REAP marker", ""))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    _confirm_slurm(app)
+    rt = _shape_runtime(app, "compute")
+
+    out = await _run_shell(app, "cat marker")
+    assert out.phase == "complete" and out.block_state == "warm"
+    assert rt.warm_since is not None and len(runner.commands) == 1
+
+    # the block is gone; the last good canary is older than CANARY_TTL_S, so the next call must re-verify
+    runner._canary = CanaryResult(ok=False, error="timeout")
+    rt.warm_confirmed_at -= 10_000
+    out = await _run_shell(app, "cat marker")
+    assert out.phase == "cold_start" and out.block_state == "provisioning"
+    assert len(runner.commands) == 1        # not dispatched to a block that is not there
+    assert rt.warm_since is None            # the spend clock stopped (banked), not left running through the gap
+    assert rt.spend_confirmed is True       # no re-ask on the way back: the session's acknowledgement persists
+
+    # the canary's submit re-kicked a block; a worker answers again and the same session carries on
+    runner._canary = CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9")
+    out = await _run_shell(app, "cat marker")
+    assert out.phase == "complete" and out.block_state == "warm"
+    assert "HPCB_REAP" in out.stdout and len(runner.commands) == 2
+    assert rt.warm_since is not None        # a fresh clock for the new block
