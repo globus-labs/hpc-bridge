@@ -4,6 +4,8 @@ hpc-bridge lets Claude Code work on a supercomputer for you. You ask in plain la
 finds the facility, logs you in to Globus from the terminal, brings up a compute block (asking before
 it spends anything), runs your commands on a node, and releases the block when you are done.
 
+Prefer to watch first? [hpc-bridge in seven minutes](https://www.youtube.com/watch?v=uw9n9v657c8) — the idea, the design, and a live run.
+
 | Page | Read it when |
 |---|---|
 | [Install](install.md) | you are setting it up: the two commands, prerequisites, updating |

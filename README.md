@@ -4,6 +4,10 @@
 facility, logs you in to Globus once, starts a one-node scheduler job (a *block*, and it asks before it spends
 anything), runs your commands on that node, and releases it when you are done.
 
+**Seven minutes on video:** what hpc-bridge is, why an agent should sit outside the facility, and a live run on a cluster.
+
+[![hpc-bridge in seven minutes (YouTube)](https://img.youtube.com/vi/uw9n9v657c8/hqdefault.jpg)](https://www.youtube.com/watch?v=uw9n9v657c8)
+
 ## Install
 
 Two commands inside Claude Code; the repository is its own plugin marketplace.
