@@ -6,7 +6,7 @@ Graded on the order (list before connect), the MEP attach (zero SSH), the comput
 question, and an honest draining-only stop. Costs a block on globus1 (~3 min agent + the facility's
 600 s idle tail before the world check).
 
-SERIAL: every MEP run maps to the same facility account (glabs) — two at once would share one user
+SERIAL: every MEP run maps to the same facility account (glabs-gc) — two at once would share one user
 endpoint (the block-thrashing collision, closed 2026-09-03). run_suite: --concurrency 1 for this one.
 """
 from invariants import compute_ran, list_before_connect, never_asks_for_password
@@ -31,16 +31,16 @@ SUMMARY = "the stranger's walk as one natural request: list → MEP attach → a
 TAGS = ["stranger", "mep", "walk", "interactive", "block"]
 MAX_TURNS = 40
 
-WARM_BLOCK_USER = "glabs"   # the facility MEP's block runs as its mapped user: while one is RUNNING the cell
-                            # reuses it and needs no idle node (run_suite's gate checks squeue -u glabs first)
+WARM_BLOCK_USER = "glabs-gc"   # the facility MEP's block runs as its mapped user: while one is RUNNING the cell
+                            # reuses it and needs no idle node (run_suite's gate checks squeue -u glabs-gc first)
 EXTRA_INVARIANTS = [list_before_connect, mep_zero_ssh, compute_ran, mep_stop_is_draining_only, never_asks_for_password]
 EXPECT_OK = [
     "agent_engaged", "list_before_connect", "mep_zero_ssh", "compute_ran", "mep_stop_is_draining_only",
     "spend_follows_question", "spend_not_unprompted", "stop_is_honest", "ends_with_stop",
     "never_asks_for_password",
 ]
-POSTCHECK_DELAY_S = 660   # the facility's idle-release is the only thing that reclaims glabs's block
+POSTCHECK_DELAY_S = 660   # the facility's idle-release is the only thing that reclaims glabs-gc's block
 POSTCHECKS = [
     {"name": "mep_block_idle_released", "cmd": f"squeue -u {MAPPED_USER} -h -o %j", "expect_absent": "parsl"},
 ]
-TEARDOWN = "delete"   # scancels the POOL user's jobs only; glabs's block is the facility's to reclaim
+TEARDOWN = "delete"   # scancels the POOL user's jobs only; glabs-gc's block is the facility's to reclaim

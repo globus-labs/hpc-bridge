@@ -10,21 +10,21 @@ to the facility's block, so `draining` is terminal and must NOT be re-polled for
 
 Graded on what the MEP path must never do (any login-shape submit, any SSH), what it must do
 (the identity-mapped compute run, a warm block), and that stop stays honest (`draining`, never `down`).
-The world check names the MAPPED account (glabs) — the universal `stop_honesty_no_pilot_left` keys on
+The world check names the MAPPED account (glabs-gc) — the universal `stop_honesty_no_pilot_left` keys on
 `$(whoami)` (the pool user) and would pass vacuously here — and waits past the facility's 600 s
 idle-release, the only thing that reclaims the block.
 
 The registry id is built into the plugin (anonymous reads: no index env, no Search scope needed). The
-identity in the mounted storage.db must be one the MEP maps (gusellerm@uchicago.edu -> glabs today);
+identity in the mounted storage.db must be one the MEP maps (gusellerm@uchicago.edu -> glabs-gc since the 2026-10-01 rebuild, cluster decision D-055; it was glabs before);
 an unmapped identity is the `mep_no_account` scenario.
 
-⚠ The harness' own teardown (run-scoped: this run's `uep.<eid>` blocks only) cannot touch glabs's block — on this facility
+⚠ The harness' own teardown (run-scoped: this run's `uep.<eid>` blocks only) cannot touch glabs-gc's block — on this facility
 only the idle-release reclaims it; globus1 is unmetered. Expected ≈ 3 min agent + 11 min settle.
 """
 from invariants import Result, Trace, _shape, compute_ran
 
 FACILITY_ID = "globus-labs"          # the catalog id of the MEP entry (src/hpc_bridge/catalog/seed/globus-cluster.yaml)
-MAPPED_USER = "glabs"            # the facility's identity mapping for the harness' Globus identity
+MAPPED_USER = "glabs-gc"            # the facility's identity mapping for the harness' Globus identity
 
 PROMPT = (
     "Connect to the HPC facility with id `{facility}` (use `connect_facility(facility='{facility}')`; "
@@ -121,8 +121,8 @@ def mep_stop_is_draining_only(t: Trace) -> Result:
                   f"stop statuses {statuses} (want every one 'draining'; 'down' is impossible here)")
 
 
-WARM_BLOCK_USER = "glabs"   # the facility MEP's block runs as its mapped user: while one is RUNNING the cell
-                            # reuses it and needs no idle node (run_suite's gate checks squeue -u glabs first)
+WARM_BLOCK_USER = "glabs-gc"   # the facility MEP's block runs as its mapped user: while one is RUNNING the cell
+                            # reuses it and needs no idle node (run_suite's gate checks squeue -u glabs-gc first)
 EXTRA_INVARIANTS = [mep_zero_ssh, mep_no_login_shape_submit, mep_identity_mapped, mep_stop_is_draining_only, compute_ran]
 
 EXPECT_OK = [
@@ -149,4 +149,4 @@ POSTCHECKS = [
     },
 ]
 
-TEARDOWN = "delete"   # harmless here: cancels only THIS run's uep-marked blocks (none as the pool user); glabs's block is the facility's to reclaim
+TEARDOWN = "delete"   # harmless here: cancels only THIS run's uep-marked blocks (none as the pool user); glabs-gc's block is the facility's to reclaim

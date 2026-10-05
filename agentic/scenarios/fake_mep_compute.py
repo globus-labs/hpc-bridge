@@ -17,7 +17,7 @@ from mep_compute_only import mep_no_login_shape_submit, mep_stop_is_draining_onl
 FACILITY_ID = "fake-mep-strict"       # the local catalog's id for the strict-schema manager
 MAPPED_USER = "hpcbmep"
 NEEDS_COMPUTE_NODE = True
-WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate (like glabs on globus1)
+WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate (like glabs-gc on globus1)
 SERIAL = True                          # one mapped identity — cells would share the user endpoint
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce"}

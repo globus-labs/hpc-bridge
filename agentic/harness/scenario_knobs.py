@@ -7,7 +7,7 @@
     HPCB_KNOB_COOLDOWN_S=660                       # COOLDOWN_S -> run_suite waits this long after each cell (fail2ban findtime)
     HPCB_KNOB_NEEDS_NODE=<n>                       # nodes the cell occupies: NEEDS_COMPUTE_NODE (True=1, an int, False=0),
                                                    #   else DERIVED: 1 when `compute_ran` is among EXTRA_INVARIANTS
-    HPCB_KNOB_WARM_BLOCK_USER=glabs                # WARM_BLOCK_USER -> a running block of that user satisfies the need
+    HPCB_KNOB_WARM_BLOCK_USER=glabs-gc                # WARM_BLOCK_USER -> a running block of that user satisfies the need
                                                    #   (a facility MEP's warm block is what the cell reuses)
 
 Everything else a scenario declares (EXTRA_ENV, SEED_FACILITY_CACHE, …) is applied INSIDE the container

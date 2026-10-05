@@ -819,7 +819,7 @@ def test_session_state_persists_grader():
 # --- mep_compute_only: the facility-MEP path (zero SSH, compute-only, draining-only stop) ---------
 
 
-def _mep_trace(*, reused=True, login_try=None, stop_status="draining", whoami="glabs", extra_stop=False) -> Trace:
+def _mep_trace(*, reused=True, login_try=None, stop_status="draining", whoami="glabs-gc", extra_stop=False) -> Trace:
     calls = [
         ToolCall.of("mcp__endpoint__connect_facility", {"facility": "globus1"},
                     {"phase": "needs_account", "reused": reused, "allocations": [],
