@@ -19,7 +19,7 @@
   account_required: false           # AccountingStorageEnforce=none: --account optional (`lab` exists)
   compute:
     scheduler: slurm
-    interface: enP7s7               # every node; IPv4-only (no IPv6 route)
+    interface: enP7s7               # ignored by the MEP since its 2026-10-01 rebuild; the entry schema requires it
     # worker_init runs on the compute node AS THE MAPPED USER. Must be self-contained and must pin
     # the endpoint's exact globus-compute-endpoint version UNCONDITIONALLY: the MEP runs 4.15.0 and
     # a version-skewed worker fails every job with a cryptic `process_worker_pool.py: -P/--port`
