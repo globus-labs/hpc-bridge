@@ -173,7 +173,14 @@ def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None 
     if uec.get("walltime"):
         size += f" × walltime {uec['walltime']}"
     head = f"scheduler compute block{where} ({size}): spend not yet confirmed. "
-    return head + _spend_floor_guidance(app)
+    return _reap_prefix(rt) + head + _spend_floor_guidance(app)
+
+def _reap_prefix(rt: ShapeRuntime | None) -> str:
+    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone."""
+    if rt is None or rt.reaped is None:
+        return ""
+    return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; a new "
+            "block bills again. ")
 
 def _spend_floor_guidance(app: AppCtx | None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -410,13 +417,15 @@ def _needs_account_outcome(app: AppCtx | None = None) -> ShellOutcome:
     )
 
 
-def _needs_confirmation_outcome(app: AppCtx | None = None) -> ShellOutcome:
+def _needs_confirmation_outcome(app: AppCtx | None = None, rt: ShapeRuntime | None = None) -> ShellOutcome:
     """A billed shape whose spend wasn't acknowledged: the command is NOT dispatched and no
-    block is started. The agent must run the budget gate and confirm via ensure_endpoint_up."""
+    block is started by it. The agent must run the budget gate and confirm via ensure_endpoint_up.
+    After a reap found by a check, that check may already be bringing a block up — say so in block_state."""
     return ShellOutcome(
         phase="needs_confirmation",
-        block_state="cold",
-        notice="scheduler compute shape: spend not confirmed, so nothing ran. " + _spend_floor_guidance(app),
+        block_state="provisioning" if rt is not None and rt.reap_kicked else "cold",
+        notice=_reap_prefix(rt) + "scheduler compute shape: spend not confirmed, so nothing ran. "
+        + _spend_floor_guidance(app),
     )
 
 def _busy_session_outcome(task_id: str, shape: str, session_id: str) -> ShellOutcome:

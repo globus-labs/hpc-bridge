@@ -1849,11 +1849,11 @@ def test_slurm_pilot_probe_reads_finished_pilots_and_pending_reasons():
     assert _summarize_pilot("RUNNING 14 - None\nF 12 42 FAILED\n", 30)[0] == "starting"   # a live pilot wins
 
 
-async def test_reaped_block_under_a_live_session_cold_starts_then_recovers():
+async def test_reaped_block_under_a_live_session_reasks_spend_then_recovers():
     # The return-later flow (agentic: block_reaped_resume): the server process lives on with its in-memory state,
-    # the pilot block is reaped underneath it (idle-release / walltime / scancel), the canary TTL expires, and the
-    # user comes back and runs again. Warm -> honest cold_start (nothing dispatched into the void, spend clock
-    # stopped) -> complete on the new block, without a second spend ask (the acknowledgement persists by design).
+    # the pilot block is reaped underneath it (idle-release / walltime / scancel), and the user comes back and runs
+    # again. Warm -> needs_confirmation with the reason (nothing dispatched, no canary, spend clock stopped) -> a
+    # fresh confirmation for the new block -> honest provisioning -> complete on the new block, same session.
     f = FakeFacility()
     f.workers = 1
     app = AppCtx(facility=f, profile=Profile())
@@ -1866,16 +1866,20 @@ async def test_reaped_block_under_a_live_session_cold_starts_then_recovers():
     assert out.phase == "complete" and out.block_state == "warm"
     assert rt.warm_since is not None and len(runner.commands) == 1
 
-    # the block is gone; the last good canary is older than CANARY_TTL_S, so the next call must re-verify
-    runner._canary = CanaryResult(ok=False, error="timeout")
+    # long past the idle window: the block idle-released, and the server knows it without looking
     rt.warm_confirmed_at -= 10_000
+    canaries = runner.canaries
     out = await _run_shell(app, "cat marker")
-    assert out.phase == "cold_start" and out.block_state == "provisioning"
-    assert len(runner.commands) == 1        # not dispatched to a block that is not there
+    assert out.phase == "needs_confirmation" and out.block_state == "cold"
+    assert "idle-released" in out.notice and "Confirm spend again" in out.notice
+    assert len(runner.commands) == 1 and runner.canaries == canaries  # nothing submitted: no new block requested
     assert rt.warm_since is None            # the spend clock stopped (banked), not left running through the gap
-    assert rt.spend_confirmed is True       # no re-ask on the way back: the session's acknowledgement persists
+    assert rt.spend_confirmed is False      # the acknowledgement covered the reaped block only
 
-    # the canary's submit re-kicked a block; a worker answers again and the same session carries on
+    # the user confirms the new block; it cold-starts honestly, then a worker answers and the session carries on
+    runner._canary = CanaryResult(ok=False, error="timeout")
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "provisioning"
     runner._canary = CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9")
     out = await _run_shell(app, "cat marker")
     assert out.phase == "complete" and out.block_state == "warm"

@@ -24,6 +24,8 @@ Each shape has its own [[server|`ShapeRuntime`]] — its own Executor, canary, a
 
 A billed `compute` shape returns `needs_confirmation` and **starts nothing** until `ensure_endpoint_up(confirm_spend=True)` — a deterministic gate enforced in `_provision` ([[server]], `server.py:725`). It covers `run_shell` too (its canary would otherwise kick a block). The `login` shape is free and exempt. The chosen `partition` and `account` are threaded in per task via `_apply_partition` (`server.py:761`) / `_apply_account` (`:787`) and persist for the session; both are refused while a task is still running on the shape (the runner swap would cancel it).
 
+The spend acknowledgement is narrower: it covers **one block** (0.1.18). `ShapeRuntime.block_since` dates the block from its first warm confirmation; `warmth._presumed_reaped` decides, from the clock alone and before any submit, that it has gone (no task handle and no task for longer than `_idle_release_s`, or older than its walltime), and `_confirm_worker` learns it when a canary to a block it had confirmed warm times out. `_mark_reaped` then banks the warm interval up to the estimated release time, clears `spend_confirmed`, and records the reason; the next `_provision` answers `needs_confirmation` with that reason even if the call carried `confirm_spend=True` (`reap_told`), so the user is asked after learning of the reap. The clock-only check has to run first: the only way to look is a canary, and a canary to a released block requests a new billed one. When the canary found it (`reap_kicked`), the result says a block may already be coming up and `stop_endpoint` releases it.
+
 This is the front-end half of [[Cost control]] — the idle-release net catches the *back* end.
 
 ## See also

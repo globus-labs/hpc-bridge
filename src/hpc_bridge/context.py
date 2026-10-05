@@ -52,9 +52,18 @@ class ShapeRuntime:
     # wedged — the 'call again' hint must stop (a model sweep showed Sonnet retrying 7× on it).
     transient_conflicts: int = 0
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
-    # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). Persists for the
-    # session once given (no re-nagging); cleared on stop/reset when the shape state is dropped.
+    # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
+    # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
+    # the block is reaped (idle-release, walltime, or found gone) so the NEXT block is asked for again (0.1.18).
     spend_confirmed: bool = False
+    # When the current block was first confirmed warm (for its walltime), and why it is presumed or known gone.
+    # `reap_told`: the agent has been handed that reason once — the call that detects a reap always answers
+    # needs_confirmation, even if it carried confirm_spend=True, so the user is asked AFTER learning of the reap.
+    # `reap_kicked`: the reap was found by a check (a task), which may already have asked for a new block.
+    block_since: float | None = None
+    reaped: str | None = None
+    reap_told: bool = False
+    reap_kicked: bool = False
 
 
 @dataclass

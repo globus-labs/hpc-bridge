@@ -5,6 +5,17 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
 
+### Changed
+- **Spend is asked again after a block is gone.** The `confirm_spend` acknowledgement used to last the whole session,
+  so a block that idle-released, ran out its walltime, or was cancelled was silently replaced by a new billed one on
+  the next call. It now covers one block. The server presumes a block gone by the clock alone (no task for longer
+  than the known idle window, or older than the walltime) before submitting anything, or learns it when a check of a
+  block it had confirmed warm goes unanswered. Either way the next call returns `needs_confirmation` with the reason
+  — even one that passes `confirm_spend=True`, which was given before the reap was known — and the spend clock stops
+  at the estimated release time rather than when the agent next called. When a check found the block gone, the
+  result says that check may already be bringing up a new block (`block_state="provisioning"`), which
+  `stop_endpoint` releases if the user declines.
+
 ### Fixed
 - **Teardown can no longer be retargeted, run twice, or replay a stale answer.** `teardown_endpoint` decides what it
   tears down in one locked step with no await before it: an SSH endpoint's teardown is claimed and snapshotted there

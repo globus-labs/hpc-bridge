@@ -427,7 +427,10 @@ async def ensure_endpoint_up(
     `confirm_spend` is the deterministic budget floor: a scheduler compute block will not start until
     you pass confirm_spend=True (after surfacing the allocation balance to the user — see the
     driving-hpc skill). Without it the call returns status="needs_confirmation" and provisions
-    nothing. The acknowledgement persists for the session. Not needed for shape="login" (free)."""
+    nothing. The acknowledgement covers the block it starts: it holds while that block lives, and once the
+    block is gone (idle-released, past its walltime, or cancelled) the next call returns needs_confirmation
+    with the reason — even one that passes confirm_spend=True — so the user is asked again for the new block.
+    Not needed for shape="login" (free)."""
     return await _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account
     )
@@ -1046,8 +1049,8 @@ async def _ready_session(app: AppCtx, shape: str, session_id: str) -> tuple[Glob
         runner = _shape_runtime(app, shape).runner
         if not_warm is None:
             busy = _busy_session(app, shape, session_id)
-    if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged -> don't dispatch
-        return _needs_confirmation_outcome(app)
+    if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
+        return _needs_confirmation_outcome(app, _shape_runtime(app, shape))
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _needs_account_outcome(app)
     if not_warm is not None:

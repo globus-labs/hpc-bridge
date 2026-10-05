@@ -120,7 +120,7 @@ python3 agentic/run_suite.py --scenarios happy_path --repeat 3 --concurrency 3  
 python3 agentic/run_suite.py --scenarios gated_provision --repeat 2   # the spend gate (interactive)
 HPCB_NO_SKILL=1 ./agentic/run_smoke.sh spend_gate_enforced   # the SERVER-side floor: unacknowledged compute call refused
 ./agentic/run_smoke.sh session_persistence    # session shell: cwd/env persist across calls, reset clears (login-only, free)
-HPCB_TARGET=fake ./agentic/run_smoke.sh block_reaped_resume   # chaos: block reaped under an idle session, user returns — honest cold_start, session cwd survives, work completes on a new block (fake only, ~8 min)
+HPCB_TARGET=fake ./agentic/run_smoke.sh block_reaped_resume   # chaos: block reaped under an idle session, user returns — spend re-asked naming the reap, session cwd survives, work completes on a new block (fake only, ~8 min)
 ./agentic/run_smoke.sh repl_baseline_local    # REPL benchmark reference: the 10-step protocol on the agent's local Bash tool (no HPC)
 ./agentic/run_smoke.sh repl_interaction       # REPL benchmark on a warm compute block: P1/P3/P4/P5 gated, turn latency reported
 python agentic/repl_report.py agentic/runs    # side-by-side properties + latency, and the hpc-bridge / local ratio
