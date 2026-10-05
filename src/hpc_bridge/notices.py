@@ -57,6 +57,8 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     account or key on the facility must instead hear WHICH host and login name were tried, where the
     name came from, and the two remedies (found on the stranger's walk, 2026-09-03)."""
     raw = str(exc)
+    if type(exc).__name__ == "RemoteTokenStoreExists":  # already says what to do; its quoted whoami text could
+        return raw                                       # otherwise be misread as an SSH denial or a network error
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -141,18 +143,29 @@ def _billed_bounds_note(app: AppCtx, rt: ShapeRuntime) -> str:
     NOT cut at ~110s any more. The block idle-releases after `max_idletime` once nothing is running or
     queued, so keep long work in the FOREGROUND (a running task holds the block); a detached process
     is not a Compute task and would be idle-released out from under itself."""
-    idle = _idle_release_s(app)
     ceiling = int(_task_ceiling_s(rt.user_endpoint_config))
     return (f"billed block bounds — a task runs up to ~{ceiling}s (the block walltime); one that "
             f"outlives the ~{int(SYNC_WAIT_S)}s sync-wait returns a poll handle (poll_task), it is NOT "
-            f"cut. The block idle-releases after ~{idle}s once nothing runs or is queued, so run long "
-            "work as a foreground task — don't detach it (a detached process isn't a Compute task).")
+            f"cut. The block idle-releases after {_idle_window_text(app)} once nothing runs or is queued, so run "
+            "long work as a foreground task — don't detach it (a detached process isn't a Compute task).")
 
-def _needs_confirmation_notice(app: AppCtx, where: str) -> str:
+def _idle_window_text(app: AppCtx) -> str:
+    """The idle-release window as the agent should relay it: a number only when it is KNOWN. A facility endpoint's
+    window is the facility's (its template), and hpc-bridge's own 600 s default is not it (review 2026-09-05 #6a)."""
+    idle = _idle_release_s(app)
+    return f"~{idle}s" if idle is not None else "the facility's own idle window (not published to hpc-bridge)"
+
+def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None = None) -> str:
     """The spend-floor notice. Names the free login shape as the alternative ONLY where one exists —
-    on a compute-only facility every shape is billed, so pointing at shape='login' is a dead-end."""
-    head = (f"scheduler compute block{where} ({app.profile.nodes_per_block} node(s)): spend "
-            "not yet confirmed. ")
+    on a compute-only facility every shape is billed, so pointing at shape='login' is a dead-end. The size is the
+    block's own (its config), not the never-set profile default (review 2026-09-05 #6b)."""
+    from .cost import _block_nodes
+
+    uec = rt.user_endpoint_config if rt is not None else {}
+    size = f"{_block_nodes(rt, app) if rt is not None else app.profile.nodes_per_block} node(s)"
+    if uec.get("walltime"):
+        size += f" × walltime {uec['walltime']}"
+    head = f"scheduler compute block{where} ({size}): spend not yet confirmed. "
     return head + _spend_floor_guidance(app)
 
 def _spend_floor_guidance(app: AppCtx | None) -> str:

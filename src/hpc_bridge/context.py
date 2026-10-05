@@ -126,7 +126,13 @@ def _supported_shapes(app: AppCtx) -> tuple[str, ...]:
 def _has_login_shape(app: AppCtx) -> bool:
     return "login" in _supported_shapes(app)
 
-def _idle_release_s(app: AppCtx) -> int:
-    """The block's idle-release window: the facility's own (a MEP's template), else our profile's.
+def _idle_release_s(app: AppCtx) -> int | None:
+    """The block's idle-release window in seconds, or None when it is the FACILITY's and unknown.
+    A facility that declares the attribute (a MEP) owns the window: its template's value when hpc-bridge could read
+    it, else None — never our profile's 600 s, which is what we WRITE into our own endpoints' templates, not theirs
+    (review 2026-09-05 #6a). Every other facility runs the template we wrote, so the profile value is the truth.
     One source — the warm-block bounds note and the MEP stop notice used to read different ones."""
-    return int(getattr(app.facility, "max_idletime_s", None) or app.profile.max_idletime_s)
+    if hasattr(app.facility, "max_idletime_s"):
+        val = app.facility.max_idletime_s
+        return int(val) if val else None
+    return int(app.profile.max_idletime_s)

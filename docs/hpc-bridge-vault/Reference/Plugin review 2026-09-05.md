@@ -2,6 +2,11 @@
 
 Tree reviewed: `feat/mep-m1` == `origin/main` @ `0ca7f80` (#92, 0.1.5). Read-only; no live connects; nothing under `agentic/` was run. Local runs this pass: `python -m pytest -q` → **1 failed, 515 passed, 2 skipped**; `uv run ruff check .` clean; mypy clean (dimension runs). Line numbers refer to this tree.
 
+> [!success] Status 2026-10-05
+> Findings **3, 4, 5, 6(a)–(c)** and the **changed-host-key** low item are fixed in **0.1.18** (tests in
+> `tests/test_plugin_review_fixes.py`). The `_CODE_RE` comment was reworded earlier. Still open: the Expanse seed's frozen
+> worker Python. #1, #2 and the licence were done in 0.1.6 (#93, #95).
+
 ## Executive summary
 
 1. **Not ready to tag.** Three things gate the next beta tag; everything else can ride 0.1.6.

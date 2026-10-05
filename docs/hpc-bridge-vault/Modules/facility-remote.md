@@ -61,7 +61,7 @@ in every argv; hosts are allowlisted at the model boundary (`models.SAFE_HOST`) 
 `uep.<uuid>.*` dirs → wipe the token store only if we seeded it → drop the endpoint record; it RETURNS what it did and
 `_teardown_endpoint` composes its notice from that. Before, it only stopped: the endpoint stayed registered and the next
 connect re-adopted it, while the tool claimed 'deleted'. The endpoint record is now written even with no routable pin,
-so the seeded-credentials flag survives connect rebuilding the facility object.
+so the seeded-credentials flag survives connect rebuilding the facility object. **0.1.18:** that write keeps the previously stored `login_host` when the handle has none (an adopted, already-running endpoint), and `seed_storage_db` refuses on the node itself when a `storage.db` is already there (`RemoteTokenStoreExists`, quoting the failed `whoami`) — `whoami` failing does not mean there is no store, and a store we did not create is never replaced or wiped.
 
 ## Teardown reports what was measured (2026-09-05)
 `SlurmFacility.teardown()` returns `{stopped, deleted, credentials_wiped, ssh_closed, ssh_failed, error}` — every

@@ -5,7 +5,7 @@ description: How to drive HPC well through hpc-bridge. SSH is a one-time bootstr
 
 # Driving HPC with hpc-bridge
 
-- You have a **persistent session shell**: `cd` and relative paths carry across turns. Call `reset_session` for a clean slate.
+- You have a **persistent session shell**: `cd` and relative paths carry across turns — **and across blocks**: the working directory and exported variables live on the facility's shared filesystem, not on the node, so a new block after an idle release or walltime picks the session up where it was (files on node-local disk do not survive). Call `reset_session` for a clean slate.
 - A call may be **cold** on first use — `ensure_endpoint_up`/`run_shell` reporting `provisioning`/`cold_start` means a worker is still warming (a compute block may be allocating, Slurm or PBS); retry shortly.
 - Results are capped at ~10 MB: for verbose commands, redirect to a file and read it back in bounded chunks.
 

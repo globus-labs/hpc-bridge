@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import sys
 
 from ..profile import Profile
@@ -15,6 +16,25 @@ PYTHON_VERSION_TOKEN = "{python_version}"
 # Keys the SERVER reads from a shape's user_endpoint_config (shape discriminators): never dropped from the
 # runtime dict by a facility's schema filter; stripped only at dispatch (`dispatch_uec`).
 INTERNAL_KEYS = frozenset({"compute"})
+
+
+_IDLE_RE = re.compile(
+    r"^\s*max_idletime:\s*(?:(?P<lit>\d+(?:\.\d+)?)|\{\{\s*max_idletime\s*\|\s*default\(\s*(?P<dflt>\d+(?:\.\d+)?)\s*\)\s*\}\})\s*(?:#.*)?$",
+    re.MULTILINE,
+)
+
+
+def _template_idle_s(template: object) -> int | None:
+    """The block idle-release window a facility's published UEP template sets (`max_idletime: 600.0`, or the
+    Jinja default of a templated one), in seconds — None when it is not a readable constant. Feeds the agent-facing
+    "idle-releases after …" text, which must be the facility's number or say it is unknown (review 2026-09-05 #6a)."""
+    if not isinstance(template, str):
+        return None
+    m = _IDLE_RE.search(template)
+    if m is None:
+        return None
+    val = float(m.group("lit") or m.group("dflt"))
+    return int(val) if val >= 1 else None
 
 
 class MEPFacility:
@@ -176,6 +196,8 @@ class MEPFacility:
                 f"facility template not readable ({type(exc).__name__}): sending the entry's config as-is")
             return
         md = md or {}
+        if self.max_idletime_s is None:  # a curated value wins; otherwise the facility's own template says
+            self.max_idletime_s = _template_idle_s(md.get("user_config_template"))
         self.schema = md.get("user_config_schema") or None
         self.endpoint_version = str(md.get("endpoint_version") or "") or None
         self.display_name = md.get("display_name") or None

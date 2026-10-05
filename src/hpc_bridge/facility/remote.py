@@ -49,6 +49,11 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")  # endpoint names spliced into remote shell paths
 
 
+class RemoteTokenStoreExists(RuntimeError):
+    """The login node already holds a Globus token store, yet `globus-compute-endpoint whoami` failed there.
+    hpc-bridge will not replace (and later delete) a credential it did not create (review 2026-09-05 #5)."""
+
+
 @dataclass(frozen=True)
 class SshTarget:
     host: str
@@ -388,6 +393,7 @@ class RemoteEndpointCLI:
 
     def __init__(self, target: SshTarget, env_setup: str, *, remote_dir: str = "$HOME/.globus_compute") -> None:
         self.target = target
+        self.last_whoami_error: str | None = None  # the remote's words when `whoami` last failed
         self.env_setup = env_setup
         self.remote_dir = remote_dir
 
@@ -492,9 +498,24 @@ class RemoteEndpointCLI:
             raise RuntimeError(
                 f"seed storage.db (mkdir) failed: {(err or out).strip()}"
             )
+        # No-clobber, decided ON the login node in the same command as the write: `whoami` failing does not mean
+        # there is no store (env_setup broke, gce is not on PATH, the tokens lack a scope, auth.globus.org is
+        # unreachable from the node) — overwriting would destroy the user's credential, and teardown would then
+        # delete our replacement (review 2026-09-05 #5).
         rc, out, err = await ssh_exec(
-            self.target, f'base64 -d > "{db_path}"', stdin=payload
+            self.target,
+            f'if [ -e "{db_path}" ]; then echo HPCB_EXISTS; exit 3; fi; base64 -d > "{db_path}"',
+            stdin=payload,
         )
+        if "HPCB_EXISTS" in (out or ""):
+            why = (self.last_whoami_error or "no output").strip()
+            raise RemoteTokenStoreExists(
+                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db), but "
+                f"`globus-compute-endpoint whoami` failed there: {why[-300:]}. hpc-bridge will not replace a "
+                "credential it did not create. Fix what whoami reports (the facility's env_setup, gce on PATH, the "
+                "login node's network to auth.globus.org), or run `globus-compute-endpoint login` there yourself, "
+                "then call connect_facility again. Nothing was started or billed."
+            )
         if rc != 0:
             raise RuntimeError(
                 f"seed storage.db (write) failed: {(err or out).strip()}"
@@ -689,8 +710,10 @@ class RemoteEndpointCLI:
         raise RuntimeError(f"could not find endpoint {name!r} in `list` output")
 
     async def whoami(self) -> bool:
-        """True if the remote endpoint can authenticate (storage.db usable)."""
-        rc, _out, _err = await self._gce("whoami", timeout=_BOOTSTRAP_SSH_S)  # the first env_setup run lands here
+        """True if the remote endpoint can authenticate (storage.db usable). On failure the remote's own words are
+        kept in `last_whoami_error` — seed_storage_db quotes them if it then finds a store it must not replace."""
+        rc, out, err = await self._gce("whoami", timeout=_BOOTSTRAP_SSH_S)  # the first env_setup run lands here
+        self.last_whoami_error = None if rc == 0 else ((err or out or "").strip() or f"rc={rc}")
         return rc == 0
 
     def rebind(self, host: str) -> None:
@@ -943,10 +966,15 @@ class SlurmFacility:
             # written even with no routable pin (login_host None): the record also carries WHO seeded the
             # remote token store, which teardown in a later call/session needs (live 2026-09-04: the flag
             # lived on a facility object connect rebuilds every call, so teardown never wiped)
+            # An ADOPTED endpoint (already running: provision's reuse branch, or start()'s "another instance") has no
+            # fresh node to report (login_host None) — keep the node we pinned when we launched it, or the next
+            # session's control-plane SSH goes to the round-robin alias and orphans it (review 2026-09-05 #4; the
+            # guard #79 removed when it made this write unconditional).
+            prior = self.store.get(alias=self.alias, name=handle.name)
             self.store.put(
                 EndpointRecord(
                     endpoint_id=handle.endpoint_id,
-                    login_host=handle.login_host,
+                    login_host=handle.login_host or (prior.login_host if prior is not None else None),
                     alias=self.alias,
                     user=self.cli.target.user,
                     key_path=self.cli.target.key_path,

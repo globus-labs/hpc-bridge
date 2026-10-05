@@ -96,6 +96,7 @@ from .notices import (  # noqa: F401 - re-exported
     _error_outcome,
     _explain_provision_error,
     _identity_from_error,
+    _idle_window_text,
     _local_dill,
     _login_notice,
     _needs_account_notice,
@@ -307,7 +308,7 @@ async def _ensure_endpoint_up(
                 endpoint_id=app.state.endpoint_id,
                 partition=active_partition,
                 account=active_account,
-                notice=_needs_confirmation_notice(app, where),
+                notice=_needs_confirmation_notice(app, where, rt),
             )
         if block == "needs_account":  # the account floor (account_required facility, no account) — nothing was started
             return EndpointStatus(
@@ -600,7 +601,7 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
             ),
         )
     dropped = await warmth._drop_compute_shape(app)
-    idle = _idle_release_s(app)
+    idle = _idle_window_text(app)
     return EndpointStatus(
         status="draining",
         block_state="cold",
@@ -609,7 +610,7 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
         notice=(
             "stopped submitting; the block is DRAINING. On a facility multi-user endpoint hpc-bridge "
             "has no cancel channel, so the block cannot be released or confirmed from here — the "
-            f"facility's idle-release reclaims it after ~{int(idle)}s of no tasks (or at walltime). "
+            f"facility's idle-release reclaims it after {idle} of no tasks (or at walltime). "
             f"Spend may accrue for up to that tail. 'draining' is FINAL on this facility: do NOT "
             "re-poll stop_endpoint waiting for 'down'. The endpoint stays available (it's the facility's)."
         ),
@@ -728,9 +729,16 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
 
     The SSH ops run in a task (`app.teardown_task`): this call waits `_TEARDOWN_SYNC_WAIT_S` for them and
     otherwise returns `tearing_down`; calling again waits again / reports the finished result."""
-    if app.teardown_task is not None:  # an earlier call started the ops: report them, don't start again
-        return await _await_teardown(app)
-    eid = app.state.endpoint_id
+    async with app.lock:
+        # Claim the teardown slot and SNAPSHOT what it tears down before the first await: the ops below await
+        # (SSH, AMQP), and a connect_facility in the same tool batch must not retarget them at the facility it
+        # binds meanwhile — nor may a second teardown call start a second run (review 2026-09-05 #3).
+        task = app.teardown_task
+        eid = app.state.endpoint_id
+        if task is None and eid is not None and _has_login_shape(app):
+            task = app.teardown_task = asyncio.create_task(_run_teardown(app, app.facility, app.machine, eid))
+    if task is not None:  # this call started the ops, or an earlier one did: wait for them / report them
+        return await _await_teardown(app, task)
     if eid is None:
         return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
     if not _has_login_shape(app):
@@ -752,22 +760,34 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
                 "connect_facility re-attaches with zero SSH."
             ),
         )
-    await scheduler_ops._release_blocks_over_login(app, eid, _login_runner(app))  # halt spend first (a confirmed stop is stop_endpoint's job)  # noqa: E501
-    gate = await _teardown_preauth_gate(app, eid)
-    if gate is not None:
-        return gate
-    app.teardown_task = asyncio.create_task(_finish_teardown(app, eid))
-    return await _await_teardown(app)
+    raise AssertionError("unreachable: an SSH endpoint's teardown runs as app.teardown_task")  # pragma: no cover
 
 
-async def _await_teardown(app: AppCtx) -> EndpointStatus:
-    """Wait a bounded time for the in-flight teardown; its result when it finished, else `tearing_down`."""
-    task = app.teardown_task
-    assert task is not None
+async def _run_teardown(app: AppCtx, fac, machine: str | None, eid: str) -> EndpointStatus:
+    """The SSH teardown, start to finish, as ONE task on the facility/endpoint snapshotted when it was claimed:
+    release the block, stop its spend clock, gate on a one-time code if needed, then the login-node ops. Never
+    raises — _await_teardown returns its result to whichever call is waiting."""
+    try:
+        await scheduler_ops._release_blocks_over_login(app, eid, _login_runner(app))  # halt spend first (a confirmed stop is stop_endpoint's job)  # noqa: E501
+        # The release ended the block: stop its spend clock NOW, as stop_endpoint does — not after the login-node
+        # ops (minutes on Expanse), and not never on the one-time-code path (review 2026-09-05 #6c).
+        dropped = await warmth._drop_compute_shape(app)
+        gate = await _teardown_preauth_gate(app, eid, fac=fac, machine=machine, dropped=dropped)
+        if gate is not None:
+            return gate
+        return await _finish_teardown(app, eid, fac=fac, dropped=dropped)
+    except Exception as exc:  # noqa: BLE001 - a waiting call must get a structured answer, never an exception
+        return _teardown_failed(app, eid, f"teardown raised {type(exc).__name__}: {exc}"[:300], fac=fac)
+
+
+async def _await_teardown(app: AppCtx, task: asyncio.Task) -> EndpointStatus:
+    """Wait a bounded time for the in-flight teardown; its result when it finished, else `tearing_down`. Two calls
+    may wait on the same task: each gets the result, and only the slot still holding THIS task is cleared."""
     done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_SYNC_WAIT_S)
     if task in done:
-        app.teardown_task = None
-        return task.result()  # _finish_teardown never raises: every failure is folded into the notice
+        if app.teardown_task is task:
+            app.teardown_task = None
+        return task.result()  # _run_teardown never raises: every failure is folded into the notice
     return EndpointStatus(
         status="tearing_down",
         block_state="cold",
@@ -779,25 +799,29 @@ async def _await_teardown(app: AppCtx) -> EndpointStatus:
     )
 
 
-async def _finish_teardown(app: AppCtx, eid: str) -> EndpointStatus:
-    """The login-node half of teardown (the facility's `teardown()`), then clear ALL shape/state. Runs as
-    `app.teardown_task` so a slow login node cannot hold the MCP call — or be interrupted by its client."""
+async def _finish_teardown(app: AppCtx, eid: str, *, fac=None, dropped: float = 0.0) -> EndpointStatus:
+    """The login-node half of teardown (the facility's `teardown()`), then clear ALL shape/state. Runs inside
+    `app.teardown_task` so a slow login node cannot hold the MCP call — or be interrupted by its client. `fac` is
+    the facility snapshotted when the teardown was claimed, never whatever is bound by the time this runs."""
+    fac = fac if fac is not None else app.facility
     notice = "endpoint fully torn down (block released; manager gce-stopped + deleted)"
-    teardown = getattr(app.facility, "teardown", None)
+    teardown = getattr(fac, "teardown", None)
     if teardown is not None:
         try:
             # the seeded token store leaves with the endpoint (B-03)
             report = await teardown(eid, wipe_credentials=True)
         except Exception as exc:  # noqa: BLE001 - report, don't crash the tool
-            return _teardown_failed(app, eid, f"the login-node teardown raised {type(exc).__name__}: {exc}"[:300])
+            return _teardown_failed(app, eid, f"the login-node teardown raised {type(exc).__name__}: {exc}"[:300],
+                                    fac=fac, dropped=dropped)
         else:
             if isinstance(report, dict):  # say what actually happened, not what was intended (live 2026-09-04)
                 if report.get("ssh_failed"):
-                    return _teardown_failed(app, eid, report.get("error") or "ssh failed", ssh_denial=True)
+                    return _teardown_failed(app, eid, report.get("error") or "ssh failed", ssh_denial=True,
+                                            fac=fac, dropped=dropped)
                 if not report.get("stopped", True):
                     return _teardown_failed(
                         app, eid, "`globus-compute-endpoint stop` failed and the manager still reports running"
-                        + (f": {report.get('error')}" if report.get("error") else ""))
+                        + (f": {report.get('error')}" if report.get("error") else ""), fac=fac, dropped=dropped)
                 deleted = ("manager gce-stopped + deleted" if report.get("deleted") else
                            "manager gce-stopped, but DELETE FAILED: the endpoint directory and its registration "
                            "remain on the login node (the next connect will re-adopt them)")
@@ -814,19 +838,21 @@ async def _finish_teardown(app: AppCtx, eid: str) -> EndpointStatus:
         status="down",
         block_state="cold",
         endpoint_id=eid,
-        session_spend=spent,
+        session_spend=spent + dropped,
         notice=notice + ". It will NOT be reused — a fresh connect_facility re-bootstraps over SSH. "
         "Do NOT call run_shell now (it would provision a new endpoint).",
     )
 
 
-def _teardown_failed(app: AppCtx, eid: str, why: str, *, ssh_denial: bool = False) -> EndpointStatus:
+def _teardown_failed(app: AppCtx, eid: str, why: str, *, ssh_denial: bool = False, fac=None,
+                     dropped: float = 0.0) -> EndpointStatus:
     """Teardown did NOT happen: the endpoint stays bound (so a retry can finish the job) and the notice says
     what is still there. An SSH denial that offers a second factor becomes the one-time-code handoff, so a
     bring-your-own MFA facility gets the same treatment as a curated one (review 2026-09-05, Fix-now #1)."""
     from .facility.remote import key_accepted_second_factor_pending
 
-    target = getattr(getattr(app.facility, "cli", None), "target", None)
+    fac = fac if fac is not None else app.facility
+    target = getattr(getattr(fac, "cli", None), "target", None)
     facility = app.machine or "the facility"
     head = ("TEARDOWN FAILED — nothing was removed: the login-node manager is STILL RUNNING and any token copy "
             "hpc-bridge placed there is still in place. ")
@@ -836,11 +862,11 @@ def _teardown_failed(app: AppCtx, eid: str, why: str, *, ssh_denial: bool = Fals
         handoff = _needs_preauth_result(facility, target, otp_ok=True)
         detail = f"The SSH connection to the login node needs its one-time code again. {handoff.notice} "
     elif ssh_denial:
-        detail = _explain_provision_error(RuntimeError(why), app.facility) + " "
+        detail = _explain_provision_error(RuntimeError(why), fac) + " "
     else:
         detail = why + ". "
     return EndpointStatus(
-        status="up", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+        status="up", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app) + dropped,
         notice=head + detail + "Then call teardown_endpoint again to finish.",
     )
 
@@ -859,7 +885,8 @@ async def _probe_login_node(target) -> tuple[int, str]:
     return rc, (err or "").strip()
 
 
-async def _teardown_preauth_gate(app: AppCtx, eid: str) -> EndpointStatus | None:
+async def _teardown_preauth_gate(app: AppCtx, eid: str, *, fac=None, machine: str | None = None,
+                                 dropped: float = 0.0) -> EndpointStatus | None:
     """Teardown is the one post-bootstrap op that MUST SSH the login node (`gce stop` + delete run there).
     On a one-time-code facility with no shared connection open, ask for the code BEFORE any SSH — the same
     handoff connect_facility uses — instead of letting `stop`/`delete` fail their BatchMode logins and then
@@ -867,7 +894,7 @@ async def _teardown_preauth_gate(app: AppCtx, eid: str) -> EndpointStatus | None
     already gone over AMQP, so spend is halted before the user is asked for anything. None = proceed."""
     from .connect import _master_alive
 
-    fac = app.facility
+    fac = fac if fac is not None else app.facility
     target = getattr(getattr(fac, "cli", None), "target", None)
     if target is None or not getattr(target, "control_dir", None):
         return None  # no SSH control plane (a MEP), or multiplexing off: nothing to gate on
@@ -883,8 +910,8 @@ async def _teardown_preauth_gate(app: AppCtx, eid: str) -> EndpointStatus | None
         from .facility.remote import key_accepted_second_factor_pending
 
         if not key_accepted_second_factor_pending(err):
-            return _teardown_failed(app, eid, err or "ssh failed", ssh_denial=True)
-    facility = app.machine or "the facility"
+            return _teardown_failed(app, eid, err or "ssh failed", ssh_denial=True, fac=fac, dropped=dropped)
+    facility = machine or app.machine or "the facility"
     app.pending_preauth = (facility, target)
     app.preauth_resume = "teardown_endpoint()"
     handoff = _needs_preauth_result(facility, target, otp_ok=True)
@@ -892,7 +919,7 @@ async def _teardown_preauth_gate(app: AppCtx, eid: str) -> EndpointStatus | None
         status="up",  # the login-node manager is still running — nothing has been torn down yet
         block_state="cold",
         endpoint_id=eid,
-        session_spend=_total_session_spend(app),
+        session_spend=_total_session_spend(app) + dropped,
         notice=("block release dispatched; the login-node manager is STILL RUNNING — tearing it down needs an SSH "
                 f"connection to the login node, which is not open. {handoff.notice} Then call teardown_endpoint "
                 "again to finish (it may answer 'tearing_down' first: the login-node ops take a few minutes)."),

@@ -78,10 +78,19 @@ def open_master_with_code(target: SshTarget, code: str, *, state_dir: Path, time
                 return False, ("the login asked for a PASSWORD, which hpc-bridge never handles. Open the session "
                                "in your own terminal with the preauth_command instead (a key on the facility "
                                "removes the password prompt).")
+            if "identification has changed" in low or ("host key for" in low and "changed" in low):
+                # NOT the unknown-key case: the key this host presents differs from the one already trusted — the
+                # signature of a man-in-the-middle as well as of a reinstalled node. Never coach acceptance
+                # (review 2026-09-05, low: the bootstrap path already split the two; this one folded them).
+                return False, (f"HOST KEY CHANGED for {target.host}: the key it presents is not the one your ssh "
+                               "already trusts. Do NOT accept it until the facility confirms the new fingerprint "
+                               "(its documentation or support). Once verified, replace the old key "
+                               f"(`ssh-keygen -R {target.host_key_alias or target.host}`), connect once from your "
+                               f"own terminal (`{target.preauth_command()}`), then try again with a fresh code.")
             if "refusing a host key prompt" in low or "host key verification failed" in low:
                 return False, (f"UNKNOWN HOST KEY for {target.host}: your ssh does not trust this host's key yet. "
-                               f"Connect once from your own terminal (`ssh {target._destination()}`), accept the "
-                               "fingerprint, then try again with a fresh code.")
+                               f"Connect once from your own terminal (`{target.preauth_command()}`), verify and "
+                               "accept the fingerprint, then try again with a fresh code.")
             if "permission denied" in low:
                 return False, ("the code was not accepted (expired or mistyped?) — ask the user for a fresh one "
                                "and try again.")
