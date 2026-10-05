@@ -82,6 +82,11 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
             "connect_facility again; on a multi-factor facility, pre-open a session in your own terminal "
             f"first. The login name came from {src}. Nothing was started or billed."
         )
+    if "revoked" in low and ("host key" in low or "revoked by file" in low):
+        # never "not in known_hosts yet, connect and accept": the key is on a revocation list (known_hosts @revoked
+        # or RevokedHostKeys) — a stolen-key signature. Not prefixed UNKNOWN HOST KEY, so the pin is not dropped.
+        return (f"REVOKED HOST KEY for {host}: the key it presents is on your revocation list ({ssh_line[:160]}). "
+                "Do NOT connect; contact the facility. Nothing was started or billed.")
     if _HOST_KEY_UNKNOWN.search(raw):
         who = f"{user}@{host}" if user else host
         changed = "identification has changed" in low or ("host key for" in low and "changed" in low)

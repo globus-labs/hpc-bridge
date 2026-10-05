@@ -4,9 +4,10 @@ Tree reviewed: `feat/mep-m1` == `origin/main` @ `0ca7f80` (#92, 0.1.5). Read-onl
 
 > [!success] Status 2026-10-05
 > Findings **3, 4, 5, 6(a)–(c)** are fixed in **0.1.18**, after two independent reviews of the first fix (tests in
-> `tests/test_plugin_review_fixes.py`). The **changed-host-key** low item is fixed in its wording (changed and revoked
-> keys are never coached as unknown); its third remedy — dropping the pin when the alias check fails on the one-time-code
-> path — is NOT done. The `_CODE_RE` comment was reworded earlier. Still open: the Expanse seed's frozen worker Python.
+> `tests/test_plugin_review_fixes.py`; three review rounds). The **changed-host-key** low item is fixed in its wording:
+> `complete_preauth` never coaches accepting a changed or revoked key, and the connect path refuses a revoked one (it
+> already split changed from unknown). Its third remedy — dropping the pin when the alias check fails on the
+> one-time-code path — is NOT done. The `_CODE_RE` comment was reworded earlier. Still open: the Expanse seed's frozen worker Python.
 > #1, #2 and the licence were done in 0.1.6 (#93, #95).
 
 ## Executive summary

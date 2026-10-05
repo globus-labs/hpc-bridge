@@ -92,7 +92,7 @@ def open_master_with_code(target: SshTarget, code: str, *, state_dir: Path, time
                                f"(its documentation or support). Once verified, remove the old key "
                                f"(`ssh-keygen -R {shlex.quote(known)}`), connect once from your own terminal "
                                f"(`{target.preauth_command()}`), then try again with a fresh code.")
-            if "was revoked" in low or "revoked key" in low:
+            if "revoked" in low:  # known_hosts @revoked, and RevokedHostKeys ("Host key … revoked by file …")
                 return False, (f"REVOKED HOST KEY for {target.host}: the key it presents is on your revocation list. "
                                "Do NOT connect; contact the facility. hpc-bridge will not open this connection.")
             if "refusing a host key prompt" in low or "host key verification failed" in low:

@@ -770,11 +770,15 @@ def _replayable_teardown(app: AppCtx, task: asyncio.Task) -> bool:
     A one-time-code gate or a failure is a request to act and call again — answering the next call with it again
     would loop (the code may have been completed since); a 'down' for an endpoint a later run_shell replaced
     would leave the new one untouched (review 2026-10-05)."""
+    if task.cancelled():  # CancelledError is a BaseException: check before result()
+        return False
     try:
         res = task.result()
-    except Exception:  # noqa: BLE001 - _run_teardown never raises; a cancelled task is simply stale
+    except Exception:  # noqa: BLE001 - _run_teardown never raises
         return False
-    return res.status == "down" and app.state.endpoint_id in (None, app.teardown_eid)
+    # A real `down` always cleared the state; a bound endpoint (even with the same id — `gce start` re-adopts its
+    # endpoint.json after a failed delete) means there is something to tear down now, not a result to replay.
+    return res.status == "down" and app.state.endpoint_id is None
 
 
 async def _run_teardown(app: AppCtx, fac, machine: str | None, eid: str) -> EndpointStatus:
@@ -849,16 +853,22 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
             if isinstance(report, dict):  # say what actually happened, not what was intended (live 2026-09-04)
                 if report.get("ssh_failed"):
                     return _teardown_failed(app, eid, report.get("error") or "ssh failed", ssh_denial=True, fac=fac)
-                if "stopped" in report and report["stopped"] is None:  # measured: unconfirmed (absent = not reported)
+                unconfirmed = "stopped" in report and report["stopped"] is None  # measured (absent = not reported)
+                if unconfirmed and not report.get("deleted"):
+                    done = [w for k, w in (("credentials_wiped", "the Globus token copy hpc-bridge placed there was "
+                                            "removed"), ("ssh_closed", "the shared SSH connection was closed"))
+                            if report.get(k)]
                     return _teardown_failed(
-                        app, eid, "the manager's stop could not be confirmed — the login node did not answer the "
-                        "status check in time" + (f" ({report.get('error')})" if report.get("error") else ""),
-                        fac=fac, unconfirmed=True)
-                if not report.get("stopped", True):
+                        app, eid, "the manager's stop could not be confirmed — the login node did not answer in time"
+                        + (f" ({report.get('error')})" if report.get("error") else "")
+                        + (f"; {'; '.join(done)}" if done else ""), fac=fac, unconfirmed=True)
+                if not unconfirmed and not report.get("stopped", True):
                     return _teardown_failed(
                         app, eid, "`globus-compute-endpoint stop` failed and the manager still reports running"
                         + (f": {report.get('error')}" if report.get("error") else ""), fac=fac)
-                deleted = ("manager gce-stopped + deleted" if report.get("deleted") else
+                deleted = ("manager deleted (its stop was not confirmed in time, but the delete went through)"
+                           if unconfirmed else
+                           "manager gce-stopped + deleted" if report.get("deleted") else
                            "manager gce-stopped, but DELETE FAILED: the endpoint directory and its registration "
                            "remain on the login node (the next connect will re-adopt them)"
                            + (f" — {report.get('delete_error')}" if report.get("delete_error") else ""))
@@ -891,7 +901,7 @@ def _teardown_failed(app: AppCtx, eid: str, why: str, *, ssh_denial: bool = Fals
     fac = fac if fac is not None else app.facility
     target = getattr(getattr(fac, "cli", None), "target", None)
     facility = app.machine or "the facility"
-    head = ("TEARDOWN NOT CONFIRMED — the manager may or may not have stopped, and nothing else was removed. "
+    head = ("TEARDOWN NOT CONFIRMED — the manager may or may not have stopped, and its endpoint was not deleted. "
             if unconfirmed else
             "TEARDOWN FAILED — nothing was removed: the login-node manager is STILL RUNNING and any token copy "
             "hpc-bridge placed there is still in place. ")

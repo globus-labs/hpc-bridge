@@ -4,6 +4,7 @@ independent reviews of the first fix found (2026-10-05). Each test replays a fai
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import shutil
 import stat
 import subprocess
@@ -451,6 +452,9 @@ async def test_a_status_check_that_times_out_is_not_reported_as_still_running(tm
         async def status(self, name):
             raise TimeoutError
 
+        async def delete(self, name):
+            return False  # the delete did not go through either: the unconfirmed path
+
     cli = _Slow(status="running", remote_db_present=True)
     fac = SlurmFacility(_profile(), cli=cli, store=LoginNodeStore(tmp_path / "e.json"), alias=ALIAS,
                         client_factory=_no_endpoints)
@@ -525,3 +529,110 @@ def test_a_revoked_host_key_is_refused_outright(tmp_path):
                               "Host key for login.expanse.sdsc.edu was revoked.\nHost key verification failed.")
     ok, why = preauth.open_master_with_code(_target(tmp_path), "123456", state_dir=tmp_path, ssh_bin=ssh)
     assert not ok and why.startswith("REVOKED HOST KEY") and "accept" not in why.lower()
+
+
+# --- round 3 (verification of the second round, 2026-10-05) ---------------------------------------------------------
+
+async def test_an_unconfirmed_stop_whose_delete_went_through_is_down():
+    report = {"stopped": None, "deleted": True, "credentials_wiped": True, "ssh_closed": True,
+              "error": "the stop timed out on the login node", "delete_error": ""}
+
+    class _Reports(FakeFacility):
+        async def teardown(self, eid, *, wipe_credentials=False):
+            return report
+
+    app = _ssh_app(_Reports())
+    res = await server._finish_teardown(app, "eid-1")
+    assert res.status == "down" and "delete went through" in res.notice and app.state.endpoint_id is None
+
+
+async def test_an_unconfirmed_stop_reports_what_was_done():
+    report = {"stopped": None, "deleted": False, "credentials_wiped": True, "ssh_closed": True,
+              "error": "the stop timed out on the login node", "delete_error": "the delete timed out"}
+
+    class _Reports(FakeFacility):
+        async def teardown(self, eid, *, wipe_credentials=False):
+            return report
+
+    res = await server._finish_teardown(_ssh_app(_Reports()), "eid-1")
+    assert res.status == "up" and res.notice.startswith("TEARDOWN NOT CONFIRMED")
+    assert "nothing else was removed" not in res.notice
+    assert "token copy hpc-bridge placed there was removed" in res.notice and "SSH connection was closed" in res.notice
+
+
+async def test_a_stop_that_times_out_is_re_checked_not_reported_running(tmp_path):
+    class _SlowStop(_BootstrapCLI):
+        async def stop(self, name):
+            raise TimeoutError
+
+        async def status(self, name):
+            return "configured"  # the stop did finish on the node
+
+    fac = SlurmFacility(_profile(), cli=_SlowStop(status="running", remote_db_present=True),
+                        store=LoginNodeStore(tmp_path / "e.json"), alias=ALIAS, client_factory=_no_endpoints)
+    report = await fac.teardown("eid-1")
+    assert report["stopped"] is True and report.get("ssh_failed") is False
+
+
+async def test_a_down_is_not_replayed_for_a_restarted_endpoint_with_the_same_id(monkeypatch):
+    gate = asyncio.Event()
+    torn = []
+
+    class _F(FakeFacility):
+        async def teardown(self, eid, *, wipe_credentials=False):
+            torn.append(eid)
+            await gate.wait()
+
+    app = _ssh_app(_F())
+    monkeypatch.setattr(server, "_run_shell", _released)
+    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    assert (await server._teardown_endpoint(app)).status == "tearing_down"
+    gate.set()
+    await app.teardown_task
+    app.state = EndpointState(endpoint_id="eid-1")  # `gce start` re-adopted the same endpoint.json
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"})
+    await server._teardown_endpoint(app)
+    assert torn == ["eid-1", "eid-1"]
+
+
+async def test_a_record_for_another_ssh_user_does_not_license_a_replacement(tmp_path, monkeypatch):
+    store = LoginNodeStore(tmp_path / "endpoints.json")
+    cli = _BootstrapCLI(status=None, remote_db_present=False)
+    fac = SlurmFacility(_profile(), cli=cli, store=store, alias=ALIAS, client_factory=_no_endpoints)
+    store.put(dataclasses.replace(_record(fac, eid="eid-0", host=None, seeded=True), user="someone-else"))
+    monkeypatch.setattr(remote, "build_minimal_storage_db", lambda **kw: tmp_path / "x.db")
+    await fac.bootstrap(Profile(mode="interactive"))
+    assert cli.replaced_ours is False
+
+
+async def test_a_wipe_without_a_delete_clears_the_seeded_flag(tmp_path):
+    class _NoDelete(_BootstrapCLI):
+        async def delete(self, name):
+            return False
+
+        async def wipe_storage_db(self):
+            return True
+
+    store = LoginNodeStore(tmp_path / "e.json")
+    cli = _NoDelete(status="running", remote_db_present=True)
+    fac = SlurmFacility(_profile(), cli=cli, store=store, alias=ALIAS, client_factory=_no_endpoints)
+    store.put(_record(fac, eid="eid-1", host="login03.anvil.rcac.purdue.edu", seeded=True))
+    report = await fac.teardown("eid-1", wipe_credentials=True)
+    assert report["credentials_wiped"] is True and report["deleted"] is False
+    assert store.get(alias=ALIAS, name=fac.profile.endpoint_name).seeded_credentials is False
+
+
+def test_openssh_revokedhostkeys_wording_is_refused(tmp_path):
+    # OpenSSH 10.3's own text for a RevokedHostKeys hit (key type first), captured by the round-3 reviewer
+    ssh = _fake_ssh(tmp_path, "Host key ECDSA SHA256:3f0a… revoked by file /etc/ssh/revoked_keys\n"
+                              "Host key verification failed.")
+    ok, why = preauth.open_master_with_code(_target(tmp_path), "123456", state_dir=tmp_path, ssh_bin=ssh)
+    assert not ok and why.startswith("REVOKED HOST KEY") and "accept" not in why.lower()
+
+
+def test_the_connect_path_does_not_coach_accepting_a_revoked_key():
+    exc = RuntimeError("seed storage.db (mkdir) failed: @ WARNING: REVOKED HOST KEY DETECTED! @\nThe ECDSA host key "
+                       "for login.x.edu is marked as revoked.\nHost key verification failed.")
+    notice = _explain_provision_error(exc, host="login.x.edu")
+    assert notice.startswith("REVOKED HOST KEY for login.x.edu") and "accept" not in notice.lower()
+    assert not notice.startswith("UNKNOWN HOST KEY")  # so connect does not drop the pin on it either

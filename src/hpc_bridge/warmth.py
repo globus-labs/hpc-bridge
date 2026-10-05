@@ -271,9 +271,8 @@ async def _drop_compute_shape(app: AppCtx) -> float:
     points at the released block) and stop its spend clock. Keep the login shape (if any), the
     manager, the endpoint_id, and the login-node pin — the endpoint stays online and reusable. Done
     regardless of cancel confirmation: the runner is dead either way, and banking must stop now.
-    Returns the spend the dropped shape had accrued, so the caller can still report it — the shape
-    is gone from app.shapes, so _total_session_spend() no longer sees it (the dropped block's spend
-    must not vanish from the stop report)."""
+    Returns the spend the dropped shape had accrued; it is ALSO folded into `app.released_spend`, which
+    _total_session_spend() counts — so callers must not add the return value again (0.1.18)."""
     async with app.lock:
         _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
         compute = app.shapes.pop(DEFAULT_SHAPE, None)

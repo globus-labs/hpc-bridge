@@ -13,12 +13,14 @@ installed plugin only when that version changes); git tags mark releases.
   teardown awaited, and the background task then ran `gce stop`/`delete`, removed the pin and wiped the token store of
   the NEW facility (and on a facility endpoint, the detach wiped the new binding); two overlapping calls ran the
   login-node ops twice. `connect_facility` refuses to rebind while a teardown is still running, and a rebind drops the
-  previous binding's pending one-time-code handoff. A finished result is replayed only as the `down` of the same
-  endpoint — a code request already answered, or a `down` for an endpoint a later `run_shell` replaced, is not.
+  previous binding's pending one-time-code handoff. A finished result is replayed only as a `down` whose state is
+  still cleared — a code request already answered, or a `down` followed by a `run_shell` that bound an endpoint again
+  (even under the same id), starts a fresh teardown.
 - **What teardown says is what happened.** The interim `tearing_down` and the code request say whether the block
   release went through, is still in progress, or was dispatched but not confirmed (a cold login channel) — not
-  "already went through" regardless. A login-node status check or delete that times out after a successful stop is
-  reported as unconfirmed, not as "nothing was removed, still running".
+  "already went through" regardless. A login-node `stop`, status check or delete that times out is reported as
+  unconfirmed — with what the report says was done (the token copy removed, the connection closed), and as `down`
+  when the delete went through — not as "nothing was removed, still running".
 - **An adopted endpoint keeps its login-node pin.** When bootstrap adopts an endpoint that is already running, the
   stored record keeps the node pinned at launch (for the same endpoint id only) instead of being rewritten with no
   node, which sent the next session's SSH to the round-robin alias and orphaned the manager (a regression since
@@ -26,7 +28,8 @@ installed plugin only when that version changes); git tags mark releases.
 - **Credential seeding never overwrites a token store hpc-bridge did not place.** Seeding happens when
   `globus-compute-endpoint whoami` fails on the login node, but that also happens when a store exists and the
   facility's `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store is
-  present — unless hpc-bridge's own record says it placed that store (a stale copy of ours is refreshed) — and
+  present — unless hpc-bridge's own record, for the same SSH login, says it placed that store (a stale copy of ours is
+  refreshed; the flag is cleared when a wipe ran but the delete did not) — and
   `connect_facility` says so with whoami's own error. The check-and-write runs in `sh` whatever the login shell is
   (under tcsh the guard would have been skipped). Before, hpc-bridge replaced the user's credential and teardown later
   deleted the replacement.
@@ -38,7 +41,8 @@ installed plugin only when that version changes); git tags mark releases.
   teardown resumed after its one-time code reported 0).
 - **A changed host key is not coached like an unknown one** in `complete_preauth`: it says the key differs from the
   trusted one, not to accept it until the facility confirms the fingerprint, and names the `known_hosts` entry exactly
-  as OpenSSH reports it. A revoked host key is refused outright.
+  as OpenSSH reports it. A revoked host key (`known_hosts` `@revoked` or `RevokedHostKeys`) is refused outright, in
+  `complete_preauth` and on the connect path (where it also no longer drops the login-node pin).
 - **Skill:** the session's working directory and environment survive a new block (they live on the shared
   filesystem) — the `block_reaped_resume` scenario caught an agent telling the user the opposite.
 

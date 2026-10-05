@@ -948,7 +948,8 @@ class SlurmFacility:
         # store, and which node the endpoint was pinned to (review 2026-10-05).
         prior = (store.get(alias=alias, name=self.profile.endpoint_name)
                  if store is not None and alias is not None else None)
-        ours = bool(prior is not None and prior.seeded_credentials)  # an earlier run of ours placed the store
+        # an earlier run of ours placed the store — for THIS login (a record is keyed by alias + endpoint name only)
+        ours = bool(prior is not None and prior.seeded_credentials and prior.user == self.cli.target.user)
         seeded = False
         if not await self.cli.whoami():
             with tempfile.TemporaryDirectory() as tmp:
@@ -1068,7 +1069,10 @@ class SlurmFacility:
         seeded-flag) is kept so a later teardown can still do the job. The record is dropped only
         when the delete actually happened."""
         name = self.profile.endpoint_name
-        rc, err = await self.cli.stop(name)
+        try:
+            rc, err = await self.cli.stop(name)
+        except TimeoutError:  # a slow filesystem: the stop may be finishing there — the status re-check below decides
+            rc, err = None, "the stop timed out on the login node"
         if rc == 255:  # ssh itself failed: nothing ran on the login node
             return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
                     "ssh_failed": True, "error": err[:400]}
@@ -1102,6 +1106,13 @@ class SlurmFacility:
                 wiped = False
         if deleted and self.store is not None and self.alias is not None:
             self.store.remove(alias=self.alias, name=name)  # no endpoint, no pin, no seeded-flag to carry
+        elif wiped and self.store is not None and self.alias is not None:
+            # the record outlives a failed delete, but the store we placed is gone: never let a later bootstrap
+            # believe a store found there is ours to replace (review 2026-10-05)
+            rec = self.store.get(alias=self.alias, name=name)
+            if rec is not None and rec.seeded_credentials:
+                self.store.put(replace(rec, seeded_credentials=False))
+            self._seeded_credentials = False
         # `ssh_closed`: the tool's notice says so, else the agent infers the connection is "still open" (it did,
         # live 2026-09-04) and tells the user something false about what is left on their machine.
         ssh_closed = bool(await self.cli.close())  # drop the shared SSH master; the endpoint is gone
