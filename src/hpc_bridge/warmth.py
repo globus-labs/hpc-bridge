@@ -164,6 +164,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
             rt.runner.close()
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
+    app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()
     return spent
 
@@ -281,6 +282,7 @@ async def _drop_compute_shape(app: AppCtx) -> float:
         _bank_warm_interval(compute, app)  # stop the spend clock for the released block
         if compute.runner is not None:
             compute.runner.close()
+        app.released_spend += compute.spend_accrued  # still part of the session: _total_session_spend counts it
         return compute.spend_accrued
 
 def _forget_identity_verdicts(app: AppCtx) -> None:

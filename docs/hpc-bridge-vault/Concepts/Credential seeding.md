@@ -1,10 +1,11 @@
 # Credential seeding
 
-> [!warning] Never over a store we did not create (0.1.18)
+> [!warning] Never over a store we did not place (0.1.18)
 > Seeding runs when `globus-compute-endpoint whoami` fails on the login node — but it also fails when a store IS there
 > and the facility's `env_setup`, PATH, the tokens' scopes or the node's network are broken. The write refuses on the
-> node itself if `~/.globus_compute/storage.db` exists, and the connect explains whoami's error instead. Only a store
-> hpc-bridge placed is ever marked `seeded_credentials` and wiped at teardown.
+> node itself if `~/.globus_compute/storage.db` exists, unless the endpoint record says hpc-bridge placed it (a stale
+> copy of ours is refreshed), and the connect explains whoami's error instead. The check-and-write runs under `sh -c`
+> (the login shell may be tcsh or fish). Only a store hpc-bridge placed is marked `seeded_credentials` and wiped.
 
 > [!abstract] In one line
 > On first connect we build a **least-privilege `storage.db`** locally — only the two tokens an endpoint needs to `start` — and ship it to the remote `~/.globus_compute/storage.db` (`0700`/`0600`), so the daemon authenticates non-interactively without us copying our whole credential.

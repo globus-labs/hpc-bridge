@@ -68,8 +68,9 @@ def _session_spend(rt: ShapeRuntime, app: AppCtx) -> float:
     return spent
 
 def _total_session_spend(app: AppCtx) -> float:
-    """Total spend across every shape — the cost the agent sees on outcomes/status."""
-    return sum(_session_spend(rt, app) for rt in app.shapes.values())
+    """Total spend across every shape, plus the blocks already released on this binding — the cost the agent sees
+    on outcomes/status."""
+    return sum(_session_spend(rt, app) for rt in app.shapes.values()) + getattr(app, "released_spend", 0.0)
 
 def _with_spend(app: AppCtx, out: ShellOutcome) -> ShellOutcome:
     out.session_spend = _total_session_spend(app)

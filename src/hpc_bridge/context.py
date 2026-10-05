@@ -110,6 +110,15 @@ class AppCtx:
     # A teardown whose login-node ops (gce stop + delete over SSH) outlived one tool call's wait: the ops run on in
     # this task; the next teardown_endpoint call reports its result (or waits again). See server._teardown_endpoint.
     teardown_task: asyncio.Task[Any] | None = None
+    # The endpoint `teardown_task` was started for, and how its block release went (None = still releasing,
+    # True = confirmed, False = dispatched but NOT confirmed) — a finished result is replayed only for the endpoint
+    # it belongs to, and the interim `tearing_down` notice says what is true of the release (review 2026-10-05).
+    teardown_eid: str | None = None
+    teardown_release: bool | None = None
+    # Spend of blocks already RELEASED on this binding: their shapes are gone from `shapes`, so without this every
+    # later result (a teardown resumed after its one-time code, a retry) under-reported the session. Cleared with
+    # the binding (`warmth._drop_all_shapes`).
+    released_spend: float = 0.0
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

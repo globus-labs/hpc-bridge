@@ -482,12 +482,15 @@ class RemoteEndpointCLI:
         if rc != 0:
             raise RuntimeError(f"remote write {path} failed: {(err or out).strip()}")
 
-    async def seed_storage_db(self, local_db: Path) -> None:
+    async def seed_storage_db(self, local_db: Path, *, replace_ours: bool = False) -> None:
         """Ship a (trimmed) storage.db to the remote ~/.globus_compute/storage.db.
 
         The db is binary SQLite, so it rides stdin base64-encoded and is decoded
         remotely. The directory is created 0700 and the file chmod'd 0600 — this is a
-        bearer credential. Raises RuntimeError on any remote step failure."""
+        bearer credential. Raises RuntimeError on any remote step failure.
+
+        A store already on the node is replaced only with `replace_ours` — when OUR record says hpc-bridge placed
+        it (a copy of ours whose tokens went stale); otherwise RemoteTokenStoreExists (review 2026-09-05 #5)."""
         payload = base64.b64encode(Path(local_db).read_bytes()).decode("ascii")
         db_path = f"{self.remote_dir}/storage.db"
         rc, out, err = await ssh_exec(
@@ -502,11 +505,12 @@ class RemoteEndpointCLI:
         # there is no store (env_setup broke, gce is not on PATH, the tokens lack a scope, auth.globus.org is
         # unreachable from the node) — overwriting would destroy the user's credential, and teardown would then
         # delete our replacement (review 2026-09-05 #5).
-        rc, out, err = await ssh_exec(
-            self.target,
-            f'if [ -e "{db_path}" ]; then echo HPCB_EXISTS; exit 3; fi; base64 -d > "{db_path}"',
-            stdin=payload,
-        )
+        # Run the check-and-write in `sh`, not the user's login shell: under tcsh the `if [ … ]` line is a syntax error
+        # that still runs the write (a silent overwrite), and fish cannot parse it at all. `set -C` (noclobber) closes
+        # the check-then-write race too. stdin passes through `sh -c` to `base64 -d`.
+        inner = (f'db="{db_path}"; ' + ('' if replace_ours else
+                 'if [ -e "$db" ]; then echo HPCB_EXISTS; exit 3; fi; set -C; ') + 'base64 -d > "$db"')
+        rc, out, err = await ssh_exec(self.target, f"sh -c {shlex.quote(inner)}", stdin=payload)
         if "HPCB_EXISTS" in (out or ""):
             why = (self.last_whoami_error or "no output").strip()
             raise RemoteTokenStoreExists(
@@ -939,6 +943,12 @@ class SlurmFacility:
         reused = await self.find_online_endpoint(self.profile.endpoint_name)
         if reused is not None:
             return EndpointHandle(endpoint_id=reused, name=self.profile.endpoint_name, reused=True)
+        store, alias = self.store, self.alias
+        # ONE read of what an earlier run recorded, before anything below rewrites it: who placed the remote token
+        # store, and which node the endpoint was pinned to (review 2026-10-05).
+        prior = (store.get(alias=alias, name=self.profile.endpoint_name)
+                 if store is not None and alias is not None else None)
+        ours = bool(prior is not None and prior.seeded_credentials)  # an earlier run of ours placed the store
         seeded = False
         if not await self.cli.whoami():
             with tempfile.TemporaryDirectory() as tmp:
@@ -947,19 +957,22 @@ class SlurmFacility:
                     dst_path=Path(tmp) / "storage.db",
                     namespace=_resolve_namespace(),
                 )
-                await self.cli.seed_storage_db(trimmed)
+                # our OWN stale copy is refreshed (a logout, a scope change); anyone else's store is refused
+                await self.cli.seed_storage_db(trimmed, replace_ours=ours)
             seeded = True
-            if self.store is not None and self.alias is not None:
+            if store is not None and alias is not None:
                 # Record the seed NOW: a bootstrap that dies before provision completes (a first-connect
                 # install past the ssh timeout — Expanse, live 2026-09-04) must not orphan a store we placed.
-                self.store.put(EndpointRecord(
-                    endpoint_id="", login_host=None, alias=self.alias, user=self.cli.target.user,
+                # Carry the prior endpoint id and pin: this write must not erase them before provision runs.
+                store.put(EndpointRecord(
+                    endpoint_id=prior.endpoint_id if prior is not None else "",
+                    login_host=prior.login_host if prior is not None else None,
+                    alias=alias, user=self.cli.target.user,
                     key_path=self.cli.target.key_path, name=self.profile.endpoint_name,
                     provisioned_at=datetime.now(UTC).isoformat(), seeded_credentials=True,
                 ))
-        elif self.store is not None and self.alias is not None:
-            prior = self.store.get(alias=self.alias, name=self.profile.endpoint_name)
-            seeded = bool(prior is not None and prior.seeded_credentials)  # an earlier run of ours seeded it
+        else:
+            seeded = ours
         self._seeded_credentials = seeded  # remembered for teardown in THIS process; the store keeps it across sessions
         handle = await self.provision(hpc)
         if self.store is not None and self.alias is not None:
@@ -970,11 +983,12 @@ class SlurmFacility:
             # fresh node to report (login_host None) — keep the node we pinned when we launched it, or the next
             # session's control-plane SSH goes to the round-robin alias and orphans it (review 2026-09-05 #4; the
             # guard #79 removed when it made this write unconditional).
-            prior = self.store.get(alias=self.alias, name=handle.name)
+            # ...but only for the SAME endpoint: a re-registered one must not inherit the old one's node.
+            same = prior is not None and prior.endpoint_id == handle.endpoint_id
             self.store.put(
                 EndpointRecord(
                     endpoint_id=handle.endpoint_id,
-                    login_host=handle.login_host or (prior.login_host if prior is not None else None),
+                    login_host=handle.login_host or (prior.login_host if prior is not None and same else None),
                     alias=self.alias,
                     user=self.cli.target.user,
                     key_path=self.cli.target.key_path,
@@ -1058,24 +1072,41 @@ class SlurmFacility:
         if rc == 255:  # ssh itself failed: nothing ran on the login node
             return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
                     "ssh_failed": True, "error": err[:400]}
-        # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check
-        stopped = rc == 0 or (await self.cli.status(name)) == "configured"
+        # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check. A
+        # re-check that TIMES OUT proves nothing either way — report "unconfirmed" (None), never "still running".
+        stopped: bool | None
+        try:
+            stopped = rc == 0 or (await self.cli.status(name)) == "configured"
+        except TimeoutError:
+            stopped, err = None, (err or "").strip() + " (the status re-check timed out)"
         # `stop` kills the manager, but an ungraceful stop leaves Parsl's block holding the
         # allocation until walltime (no manager left to scale it in). Explicitly cancel this
         # endpoint's blocks so "teardown released the compute" actually holds.
         await self.cli.cancel_blocks(endpoint_id, self.profile.scheduler)
-        deleted = await self.cli.delete(name)  # the directory + registration — else the next connect re-adopts it
-        await self.cli.remove_uep_dirs(endpoint_id)
+        # A slow filesystem (Expanse: minutes) can time an SSH op out AFTER the stop succeeded: report what is known
+        # instead of letting the timeout escape as "nothing was removed, still running" (review 2026-10-05).
+        delete_error = ""
+        try:
+            deleted = await self.cli.delete(name)  # the directory + registration — else the next connect re-adopts it
+        except TimeoutError:
+            deleted, delete_error = False, "the delete timed out on the login node (it may still complete there)"
+        try:
+            await self.cli.remove_uep_dirs(endpoint_id)
+        except TimeoutError:
+            pass  # leftover uep.* dirs are inert; the next teardown or a manual rm clears them
         wiped = False
         if wipe_credentials and self._seeded_by_us():
-            wiped = await self.cli.wipe_storage_db()
+            try:
+                wiped = await self.cli.wipe_storage_db()
+            except TimeoutError:
+                wiped = False
         if deleted and self.store is not None and self.alias is not None:
             self.store.remove(alias=self.alias, name=name)  # no endpoint, no pin, no seeded-flag to carry
         # `ssh_closed`: the tool's notice says so, else the agent infers the connection is "still open" (it did,
         # live 2026-09-04) and tells the user something false about what is left on their machine.
         ssh_closed = bool(await self.cli.close())  # drop the shared SSH master; the endpoint is gone
         return {"stopped": stopped, "deleted": deleted, "credentials_wiped": wiped, "ssh_closed": ssh_closed,
-                "ssh_failed": False, "error": "" if stopped else err[:400]}
+                "ssh_failed": False, "error": "" if stopped else (err or "")[:400], "delete_error": delete_error}
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Read-only login-node command for discovery — no block, no allocation (delegates

@@ -153,7 +153,9 @@ def _idle_window_text(app: AppCtx) -> str:
     """The idle-release window as the agent should relay it: a number only when it is KNOWN. A facility endpoint's
     window is the facility's (its template), and hpc-bridge's own 600 s default is not it (review 2026-09-05 #6a)."""
     idle = _idle_release_s(app)
-    return f"~{idle}s" if idle is not None else "the facility's own idle window (not published to hpc-bridge)"
+    if idle is not None:
+        return f"~{idle}s"
+    return "the facility's own idle window (its template sets none hpc-bridge can read)"
 
 def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None = None) -> str:
     """The spend-floor notice. Names the free login shape as the alternative ONLY where one exists —

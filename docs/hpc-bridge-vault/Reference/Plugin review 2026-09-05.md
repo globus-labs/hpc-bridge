@@ -3,9 +3,11 @@
 Tree reviewed: `feat/mep-m1` == `origin/main` @ `0ca7f80` (#92, 0.1.5). Read-only; no live connects; nothing under `agentic/` was run. Local runs this pass: `python -m pytest -q` → **1 failed, 515 passed, 2 skipped**; `uv run ruff check .` clean; mypy clean (dimension runs). Line numbers refer to this tree.
 
 > [!success] Status 2026-10-05
-> Findings **3, 4, 5, 6(a)–(c)** and the **changed-host-key** low item are fixed in **0.1.18** (tests in
-> `tests/test_plugin_review_fixes.py`). The `_CODE_RE` comment was reworded earlier. Still open: the Expanse seed's frozen
-> worker Python. #1, #2 and the licence were done in 0.1.6 (#93, #95).
+> Findings **3, 4, 5, 6(a)–(c)** are fixed in **0.1.18**, after two independent reviews of the first fix (tests in
+> `tests/test_plugin_review_fixes.py`). The **changed-host-key** low item is fixed in its wording (changed and revoked
+> keys are never coached as unknown); its third remedy — dropping the pin when the alias check fails on the one-time-code
+> path — is NOT done. The `_CODE_RE` comment was reworded earlier. Still open: the Expanse seed's frozen worker Python.
+> #1, #2 and the licence were done in 0.1.6 (#93, #95).
 
 ## Executive summary
 

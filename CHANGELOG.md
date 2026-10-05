@@ -6,29 +6,39 @@ installed plugin only when that version changes); git tags mark releases.
 ## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
 
 ### Fixed
-- **Teardown can no longer be retargeted or run twice.** `teardown_endpoint` now claims its slot and snapshots the
-  facility and endpoint under the server lock before its first await, and runs the release, the one-time-code gate and
-  the login-node ops as one task on that snapshot. Before, a `connect_facility` in the same tool batch could rebind
-  while teardown awaited, and the background task then ran `gce stop`/`delete`, removed the pin and wiped the token
-  store of the NEW facility; two overlapping calls ran the login-node ops twice. `connect_facility` now refuses to
-  rebind while a teardown is still running, and a rebind drops the previous binding's pending one-time-code handoff,
-  so `complete_preauth` can no longer open a connection to the old facility and send the agent back to it.
-- **An adopted endpoint keeps its login-node pin.** When bootstrap adopts an endpoint that is already running (the web
-  service had not reported it online yet, or `gce start` found another instance), the stored record keeps the node
-  pinned at launch instead of being rewritten with no node — which sent the next session's SSH to the round-robin
-  alias and orphaned the manager (a regression from 0.1.3).
-- **Credential seeding never overwrites a token store hpc-bridge did not create.** Seeding happens when
-  `globus-compute-endpoint whoami` fails on the login node, but that also happens when a store exists and the facility's
-  `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store is present, and
-  `connect_facility` says so with whoami's own error and what to fix. Before, hpc-bridge replaced the user's credential
-  and teardown later deleted the replacement.
+- **Teardown can no longer be retargeted, run twice, or replay a stale answer.** `teardown_endpoint` decides what it
+  tears down in one locked step with no await before it: an SSH endpoint's teardown is claimed and snapshotted there
+  and runs (release, one-time-code gate, login-node ops) as one task on that facility and endpoint; a facility
+  endpoint is detached there outright. Before, a `connect_facility` in the same tool batch could rebind while
+  teardown awaited, and the background task then ran `gce stop`/`delete`, removed the pin and wiped the token store of
+  the NEW facility (and on a facility endpoint, the detach wiped the new binding); two overlapping calls ran the
+  login-node ops twice. `connect_facility` refuses to rebind while a teardown is still running, and a rebind drops the
+  previous binding's pending one-time-code handoff. A finished result is replayed only as the `down` of the same
+  endpoint — a code request already answered, or a `down` for an endpoint a later `run_shell` replaced, is not.
+- **What teardown says is what happened.** The interim `tearing_down` and the code request say whether the block
+  release went through, is still in progress, or was dispatched but not confirmed (a cold login channel) — not
+  "already went through" regardless. A login-node status check or delete that times out after a successful stop is
+  reported as unconfirmed, not as "nothing was removed, still running".
+- **An adopted endpoint keeps its login-node pin.** When bootstrap adopts an endpoint that is already running, the
+  stored record keeps the node pinned at launch (for the same endpoint id only) instead of being rewritten with no
+  node, which sent the next session's SSH to the round-robin alias and orphaned the manager (a regression since
+  0.1.1). The early record written while seeding credentials carries the pin too.
+- **Credential seeding never overwrites a token store hpc-bridge did not place.** Seeding happens when
+  `globus-compute-endpoint whoami` fails on the login node, but that also happens when a store exists and the
+  facility's `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store is
+  present — unless hpc-bridge's own record says it placed that store (a stale copy of ours is refreshed) — and
+  `connect_facility` says so with whoami's own error. The check-and-write runs in `sh` whatever the login shell is
+  (under tcsh the guard would have been skipped). Before, hpc-bridge replaced the user's credential and teardown later
+  deleted the replacement.
 - **The numbers the agent relays are the facility's.** On a facility multi-user endpoint the idle-release window is
-  read from the facility's published template (`max_idletime`), and when it is not published the notices say the
-  facility's own window instead of quoting hpc-bridge's 600 s default. Spend and the confirm-spend notice use the
-  block's own node count (and the notice names the walltime) instead of always assuming one node. An SSH teardown stops
-  the compute spend clock at the release, as `stop_endpoint` does, instead of after the login-node ops or never.
+  read from the facility's published template (`max_idletime`), and when the template sets none the notices say so
+  instead of quoting hpc-bridge's 600 s default. Spend and the confirm-spend notice use the block's own node count (and
+  the notice names the walltime) instead of always one node. An SSH teardown stops the compute spend clock at the
+  release, as `stop_endpoint` does, and a released block's spend now stays in every later result of the session (a
+  teardown resumed after its one-time code reported 0).
 - **A changed host key is not coached like an unknown one** in `complete_preauth`: it says the key differs from the
-  trusted one, not to accept it until the facility confirms the fingerprint, and coaches the pin-aware command.
+  trusted one, not to accept it until the facility confirms the fingerprint, and names the `known_hosts` entry exactly
+  as OpenSSH reports it. A revoked host key is refused outright.
 - **Skill:** the session's working directory and environment survive a new block (they live on the shared
   filesystem) — the `block_reaped_resume` scenario caught an agent telling the user the opposite.
 
