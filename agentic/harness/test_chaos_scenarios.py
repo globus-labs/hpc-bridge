@@ -84,3 +84,48 @@ def test_midrun_hook_fan_out_survives_the_agent_env_scrub(monkeypatch, harness_r
     monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, timeout=60, host=None: (seen.append(host), (0, "ok"))[1])
     res = asyncio.run(harness_run._run_hook({"name": "h", "after_tool": "run_shell", "on": "each_login", "cmd": "x"}))
     assert seen == ["l1", "l2"] and res["hosts"] == ["l1", "l2"]
+
+
+def _compute(name, result, **inp):
+    return ToolCall.of(f"mcp__endpoint__{name}", {"shape": "compute", **inp}, result)
+
+
+def _ask(question):
+    return ToolCall.of("AskUserQuestion", {"questions": [{"question": question, "options": []}]}, {"text": ""})
+
+
+def test_block_reaped_resume_grades_the_spend_reask():
+    import block_reaped_resume as sc
+    mark = _compute("run_shell", {"phase": "complete", "stdout": f"{sc._MARK}\nb001\n/home/u/hpcb_reap"},
+                    command="mkdir -p ~/hpcb_reap && cd ~/hpcb_reap && echo m > marker && cat marker")
+    reask = _compute("run_shell", {"phase": "needs_confirmation", "block_state": "provisioning",
+                                   "notice": "Confirm spend again with the user: the previous block did not answer"},
+                     command="cat marker && hostname && pwd")
+    confirm = _compute("ensure_endpoint_up", {"status": "up"}, confirm_spend=True)
+    reread = _compute("run_shell", {"phase": "complete", "stdout": f"{sc._MARK}\nb002"}, command="cat marker && hostname && pwd")
+    good = Trace([mark, reask, _ask("The old block is gone. Start a new one? It bills ~1 node-hour."), confirm, reread])
+    assert sc.spend_reasked_after_reap(good).ok
+    assert sc.resume_is_honest_cold_start(good).ok and sc.session_state_survived_on_new_block(good).ok
+
+    # re-confirmed from the old answer: no question in between
+    assert not sc.spend_reasked_after_reap(Trace([mark, reask, confirm, reread])).ok
+    # a node/cd question is not a spend question
+    nodeq = _ask("Run it as-is on the new compute node, or cd first?")
+    assert not sc.spend_reasked_after_reap(Trace([mark, reask, nodeq, confirm, reread])).ok
+    # an old server that never re-asked: the cold start is honest, the re-ask is missing
+    cold = _compute("run_shell", {"phase": "cold_start", "block_state": "provisioning"}, command="cat marker")
+    old = Trace([mark, cold, reread])
+    assert sc.resume_is_honest_cold_start(old).ok and not sc.spend_reasked_after_reap(old).ok
+    # the reap found by ensure_endpoint_up (the agent re-confirmed first): still the re-ask
+    eup = _compute("ensure_endpoint_up", {"status": "needs_confirmation", "block_state": "provisioning",
+                                          "notice": "Confirm spend again with the user: the previous block idle-released"},
+                   confirm_spend=True)
+    assert sc.spend_reasked_after_reap(Trace([mark, eup, _ask("Confirm the spend for a new block?"), confirm, reread])).ok
+
+
+def test_block_reaped_resume_ignores_a_cold_login_shape():
+    import block_reaped_resume as sc
+    mark = _compute("run_shell", {"phase": "complete", "stdout": sc._MARK}, command="echo")
+    login_cold = ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": "squeue"},
+                             {"phase": "cold_start", "block_state": "provisioning"})
+    assert not sc.resume_is_honest_cold_start(Trace([mark, login_cold])).ok

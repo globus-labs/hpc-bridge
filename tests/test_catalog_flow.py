@@ -20,6 +20,9 @@ class _DoneFuture:
     def done(self):
         return True
 
+    def add_done_callback(self, fn):
+        fn(self)
+
     def cancelled(self):
         return False
 

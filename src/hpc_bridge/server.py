@@ -300,11 +300,11 @@ async def _ensure_endpoint_up(
                 account=active_account,
                 notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
             )
-        if block == "needs_confirmation":  # the deterministic spend floor — nothing was started
+        if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             where = f" on {active_partition!r}" if active_partition else ""
             return EndpointStatus(
                 status="needs_confirmation",
-                block_state="cold",
+                block_state="provisioning" if rt.reap_kicked else "cold",
                 endpoint_id=app.state.endpoint_id,
                 partition=active_partition,
                 account=active_account,
@@ -661,7 +661,9 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
     # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
     rt_pre = app.shapes.get(DEFAULT_SHAPE)
-    expect_block = rt_pre is not None and rt_pre.spend_confirmed and rt_pre.warm_confirmed_at is None
+    # A reap found by a canary voided the acknowledgement, but that canary may itself have requested the pilot.
+    expect_block = (rt_pre is not None and (rt_pre.spend_confirmed or rt_pre.reap_kicked)
+                    and rt_pre.warm_confirmed_at is None)
     # Cancel the scheduler block over the login shape (AMQP) — no SSH.
     confirmed, detail = await scheduler_ops._release_blocks_over_login(
         app, eid, _login_runner(app), expect_block=expect_block)
@@ -1035,22 +1037,28 @@ async def login_shell(command: str, ctx: Context) -> LoginShellResult:
     return await _login_shell(ctx.request_context.lifespan_context, command)
 
 
-async def _ready_session(app: AppCtx, shape: str, session_id: str) -> tuple[GlobusRunner, Session] | ShellOutcome:
+async def _ready_session(
+    app: AppCtx, shape: str, session_id: str
+) -> tuple[GlobusRunner, Session, ShapeRuntime] | ShellOutcome:
     """The shared preamble of run_shell and reset_session: reject an unsupported shape, validate the
     session id, provision + bind the runner atomically under app.lock, and refuse to dispatch when
-    the block is cold, the spend is unconfirmed, or a live task owns the session. Returns the runner
-    and session, or the outcome to hand back."""
+    the block is cold, the spend is unconfirmed, or a live task owns the session. Returns the runner,
+    session and shape state — with the dispatch counted in `rt.inflight` under the lock, which the caller
+    MUST undo when its sync-wait ends — or the outcome to hand back."""
     if reject := _shape_reject(app, shape):
         return _shape_reject_outcome(reject)
     session = Session(session_id, app.scratch_root)  # validates session_id before provisioning
     busy = None
     async with app.lock:  # provision + bind the runner atomically (no race with a concurrent stop)
         not_warm = await _ensure_warm_runner(app, shape)
-        runner = _shape_runtime(app, shape).runner
+        rt = _shape_runtime(app, shape)
+        runner = rt.runner
         if not_warm is None:
             busy = _busy_session(app, shape, session_id)
+            if busy is None:
+                rt.inflight += 1  # the worker is about to be busy with this: a canary meanwhile is not a reap probe
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
-        return _needs_confirmation_outcome(app, _shape_runtime(app, shape))
+        return _needs_confirmation_outcome(app, rt)
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _needs_account_outcome(app)
     if not_warm is not None:
@@ -1058,7 +1066,7 @@ async def _ready_session(app: AppCtx, shape: str, session_id: str) -> tuple[Glob
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
         return _busy_session_outcome(busy, shape, session_id)
     assert runner is not None  # _ensure_warm_runner returns None only after binding the runner
-    return runner, session
+    return runner, session, rt
 
 
 async def _run_shell(
@@ -1067,24 +1075,33 @@ async def _run_shell(
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
-    runner, session = ready
-    wrapped = session_shell.wrap(command, session)
-    fut = runner.submit(wrapped)  # submit; wait a bounded time OFF the lock, else hand back a handle
+    runner, session, rt = ready
+    counted: ShapeRuntime | None = rt  # the in-flight count _ready_session took, until it is handed back
     try:
-        res = await asyncio.to_thread(fut.result, runner.timeout)
-    except TimeoutError:  # still running past the sync-wait -> a poll handle, NOT a kill
+        wrapped = session_shell.wrap(command, session)
+        fut = runner.submit(wrapped)  # submit; wait a bounded time OFF the lock, else hand back a handle
+        try:
+            res = await asyncio.to_thread(fut.result, runner.timeout)
+        except TimeoutError:  # still running past the sync-wait -> a poll handle, NOT a kill
+            async with app.lock:
+                rt.inflight -= 1  # the handle takes over as the liveness signal, in the same locked step
+                counted = None
+                task_id = _register_task(app, shape, session_id, command, fut, runner.walltime)
+                out = _running_outcome(app, task_id, runner.walltime)
+                _note_dispatch(_shape_runtime(app, shape), out)  # the worker took our task -> it's alive
+                return out
+        except Exception as exc:  # noqa: BLE001 - translate ALL dispatch failures to a structured outcome
+            out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
+        else:
+            out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
         async with app.lock:
-            task_id = _register_task(app, shape, session_id, command, fut, runner.walltime)
-            out = _running_outcome(app, task_id, runner.walltime)
-            _note_dispatch(_shape_runtime(app, shape), out)  # the worker took our task -> it's alive
-            return out
-    except Exception as exc:  # noqa: BLE001 - translate ALL dispatch failures to a structured outcome
-        out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
-    else:
-        out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
-    async with app.lock:
-        _note_dispatch(_shape_runtime(app, shape), out)
-        return _with_spend(app, out)
+            rt.inflight -= 1
+            counted = None
+            _note_dispatch(_shape_runtime(app, shape), out)
+            return _with_spend(app, out)
+    finally:
+        if counted is not None:  # an exception escaped before the count was handed back (e.g. a cancelled call)
+            counted.inflight -= 1
 
 
 async def _reset_session(
@@ -1093,11 +1110,14 @@ async def _reset_session(
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
-    runner, session = ready
-    cmd = session_shell.reset_command(session)
-    out = await dispatch.execute(
-        cmd, runner, block_state="warm", max_output_chars=app.max_output_chars
-    )
+    runner, session, rt = ready
+    try:
+        cmd = session_shell.reset_command(session)
+        out = await dispatch.execute(
+            cmd, runner, block_state="warm", max_output_chars=app.max_output_chars
+        )
+    finally:
+        rt.inflight -= 1
     async with app.lock:
         _note_dispatch(_shape_runtime(app, shape), out)
     return out

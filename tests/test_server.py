@@ -35,6 +35,9 @@ class _DoneFuture:
     def done(self):
         return True
 
+    def add_done_callback(self, fn):
+        fn(self)
+
     def cancelled(self):
         return False
 
@@ -53,9 +56,21 @@ class _PendingFuture:
         self._exc = None
         self._done = False
         self._cancelled = False
+        self._callbacks = []
 
     def done(self):
         return self._done or self._cancelled
+
+    def add_done_callback(self, fn):
+        if self.done():
+            fn(self)
+        else:
+            self._callbacks.append(fn)
+
+    def _resolved(self):
+        for fn in self._callbacks:
+            fn(self)
+        self._callbacks = []
 
     def cancelled(self):
         return self._cancelled
@@ -73,12 +88,15 @@ class _PendingFuture:
 
     def finish(self, res):
         self._res, self._done = res, True
+        self._resolved()
 
     def fail(self, exc):
         self._exc, self._done = exc, True
+        self._resolved()
 
     def cancel(self):
         self._cancelled = True
+        self._resolved()
 
 
 class _FakeRunner:

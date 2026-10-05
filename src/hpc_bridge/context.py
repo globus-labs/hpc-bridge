@@ -64,6 +64,9 @@ class ShapeRuntime:
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
+    # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
+    # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
+    inflight: int = 0
 
 
 @dataclass
@@ -78,6 +81,9 @@ class TaskHandle:
     command: str
     submitted_at: float
     ceiling_s: float
+    # When the future resolved (stamped by a done-callback), so a poll long after the task ended does not pass
+    # for recent activity on the idle clock (0.1.18).
+    done_at: float | None = None
 
 
 @dataclass
