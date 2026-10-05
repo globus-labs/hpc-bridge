@@ -352,6 +352,10 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if live:
         return (f"can't change partition to {partition!r}: a task is still running "
                 f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+    # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
+    if rt.inflight:
+        return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
+                "(inside run_shell's wait). Let it return, then change it.")
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["partition"] = partition
     rt.runner_stale = True
@@ -374,6 +378,10 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if live:
         return (f"can't change account to {account!r}: a task is still running "
                 f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+    # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
+    if rt.inflight:
+        return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
+                "(inside run_shell's wait). Let it return, then change it.")
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["account"] = account
     rt.runner_stale = True
@@ -445,7 +453,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
-        if handle.done_at is None:
+        if handle.done_at is None and not fut.cancelled():  # a cancel (teardown) is not activity on the block
             handle.done_at = time.monotonic()
 
     fut.add_done_callback(_stamp)  # an already-done future calls it at once

@@ -289,3 +289,26 @@ async def test_just_past_the_idle_window_the_block_is_not_yet_presumed_gone():
     app, rt, _runner = await _warm_app()
     rt.warm_confirmed_at -= app.profile.max_idletime_s + 5
     assert _presumed_reaped(app, "compute", rt) is None
+
+
+async def test_a_switch_is_refused_while_a_synchronous_command_runs():
+    # the in-flight count is the OLD block's work: it must not vouch for the new partition's block as warm
+    app, rt, _runner = await _warm_app()
+    rt.inflight = 1
+    assert "still running" in (_apply_partition(app, "compute", rt, "other") or "")
+    assert rt.user_endpoint_config.get("partition") != "other"
+    res = await _ensure_endpoint_up(app, partition="other")  # reports the OLD, busy block — unchanged
+    assert res.partition != "other" and "still running" in res.notice and runner_untouched(rt)
+
+
+def runner_untouched(rt):
+    return rt.runner_stale is False and rt.block_since is not None
+
+
+def test_a_cancelled_task_is_not_activity():
+    from hpc_bridge.warmth import _register_task
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    fut: Future = Future()
+    tid = _register_task(app, "compute", "default", "sleep 1", fut, 60.0)
+    fut.cancel()
+    assert app.tasks[tid].done_at is None
