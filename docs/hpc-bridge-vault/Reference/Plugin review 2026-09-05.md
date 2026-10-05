@@ -73,7 +73,7 @@ Tree reviewed: `feat/mep-m1` == `origin/main` @ `0ca7f80` (#92, 0.1.5). Read-onl
 
 ### Before tagging
 
-- **Add a LICENSE.** `git ls-files | grep -i licen` → nothing; no `license` in `pyproject.toml`, `.claude-plugin/plugin.json` or `marketplace.json`; `gh api repos/ryanchard/hpc-bridge` → `license: null`, public. Users installing via `/plugin marketplace add ryanchard/hpc-bridge` (README.md:12) have no grant to use or modify it. Pick with the maintainers (Globus Labs code is typically Apache-2.0); add `LICENSE`, `license = "Apache-2.0"` in `[project]`, and `"license"` in both manifests (`claude plugin validate .` passes with it).
+- **Add a LICENSE.** `git ls-files | grep -i licen` → nothing; no `license` in `pyproject.toml`, `.claude-plugin/plugin.json` or `marketplace.json`; `gh api repos/globus-labs/hpc-bridge` → `license: null`, public. Users installing via `/plugin marketplace add globus-labs/hpc-bridge` (README.md:12) have no grant to use or modify it. Pick with the maintainers (Globus Labs code is typically Apache-2.0); add `LICENSE`, `license = "Apache-2.0"` in `[project]`, and `"license"` in both manifests (`claude plugin validate .` passes with it).
 - **`README.md:55`** says "Public beta (0.1.2, tag `v0.1.2-beta.1`)"; `plugin.json:4` and `pyproject.toml:3` are 0.1.5 and the only tag locally and on origin is `v0.1.1-beta.1`. Either cut the tag or stop naming one.
 
 ## Dependencies

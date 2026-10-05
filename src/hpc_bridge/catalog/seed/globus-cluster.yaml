@@ -9,7 +9,7 @@
 - id: globus-labs                 # renamed from `globus1` 2026-09-04 (the id names the facility, not a host)
   facility_key: globus
   facility: "Globus Labs cluster"
-  description: "lab DGX Spark cluster (3x GB10, ARM, Slurm `main`, 2-day walltime) via its multi-user endpoint — zero SSH"
+  description: "lab DGX Spark cluster (4 compute nodes spark1-4, GB10, ARM, Slurm `main`, 2-day walltime) via its multi-user endpoint — zero SSH"
   display_name: "Globus Labs cluster (MEP)"
   aliases: [globus1, globus-cluster-mep, globus1-mep]   # bundled-loader lookups only; the registry resolves the id
   compute_mep_uuid: da3df250-4013-4d69-942c-eef1568f860c

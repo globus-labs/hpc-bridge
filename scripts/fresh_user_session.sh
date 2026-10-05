@@ -42,7 +42,7 @@ if [[ "$MODE" == "marketplace" ]]; then
   mkdir -p "$CLAUDE_CONFIG_DIR"
   if ! claude plugin list 2>/dev/null | grep -q "hpc-bridge@hpc-bridge"; then
     echo "installing the plugin from the marketplace into $CLAUDE_CONFIG_DIR …"
-    claude plugin marketplace add ryanchard/hpc-bridge
+    claude plugin marketplace add globus-labs/hpc-bridge
     claude plugin install hpc-bridge@hpc-bridge
   fi
   echo "plugin:      marketplace install (GitHub main) in a fresh Claude Code config: $CLAUDE_CONFIG_DIR"

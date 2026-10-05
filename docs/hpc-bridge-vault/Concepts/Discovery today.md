@@ -17,7 +17,7 @@
 
 The remaining discovery-channel machinery — per-channel **ablation flags** and a **resolution trace** — is **planned**, not built (the **login-node probe** channel itself is now built — see above). Seed-emission/write-back (offering a validated facility for curation) is deferred. See [[Discovery channel model]] (the frame) and [[Globus index discovery channel]] (the thread).
 
-> [!note] Superseded (2026-07, [#27](https://github.com/ryanchard/hpc-bridge/issues/27)): session facilities *do* persist
+> [!note] Superseded (2026-07, [#27](https://github.com/globus-labs/hpc-bridge/issues/27)): session facilities *do* persist
 > An earlier version of this note said session-local entries don't survive a restart. A **confirmed** `details=` with an `ssh_host` is now written to `facilities.json` ([[state]] `FacilityStore`, keyed by `ssh_host`) and a later session resolves it with **no SSH probe** — the local-discovery cache. Only the in-memory `AppCtx.session_facilities` dict is per-process.
 
 > [!note] Scope

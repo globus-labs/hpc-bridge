@@ -9,7 +9,7 @@ Agents SDK, and others. Each host has its own way to *add a server*, but the com
 Point your host's MCP configuration at this stdio command:
 
 ```
-uvx --from git+https://github.com/ryanchard/hpc-bridge hpc-bridge
+uvx --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
 ```
 
 The only prerequisite is [`uv`](https://docs.astral.sh/uv/) on your PATH (it fetches Python itself). `uvx` builds and
@@ -35,7 +35,7 @@ explicitly — your home directory (for the Globus login and SSH config) and a w
 hermes mcp add hpc-bridge \
   --command uvx \
   --env HOME=$HOME HPC_BRIDGE_USER_DIR=$HOME/.hpc-bridge \
-  --args --from git+https://github.com/ryanchard/hpc-bridge hpc-bridge
+  --args --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
 ```
 
 Answer *yes* to enable the tools, then `hermes mcp list` to confirm. Choosing the model hermes runs is a hermes matter
@@ -50,7 +50,7 @@ The shape is identical — give the host the same command; only the "add a serve
 |---|---|
 | **Claude Desktop** | `claude_desktop_config.json` → `mcpServers` (stdio: the command + args above) |
 | **Cursor** | `.cursor/mcp.json` → `mcpServers` |
-| **OpenAI Agents SDK** | `MCPServerStdio(command="uvx", args=["--from", "git+https://github.com/ryanchard/hpc-bridge", "hpc-bridge"])` |
+| **OpenAI Agents SDK** | `MCPServerStdio(command="uvx", args=["--from", "git+https://github.com/globus-labs/hpc-bridge", "hpc-bridge"])` |
 
 If a host filters the environment like hermes does, include `HOME` (and a writable `HPC_BRIDGE_USER_DIR`) in its env
 allowlist. Everything after that — facilities, the Globus login, costs and stopping — works the same as in the

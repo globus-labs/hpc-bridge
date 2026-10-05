@@ -246,12 +246,12 @@ manifest version moves) and to add the facilities validated in the ACCESS campai
 hpc-bridge lets Claude Code work on a supercomputer for you: it finds the facility, logs you in to Globus once, starts
 a one-node scheduler job (asking before it spends anything), runs your commands on that node, and releases it. This is
 the first release offered to test users. Expect rough edges, and please report them at
-https://github.com/ryanchard/hpc-bridge/issues. (0.1.0 was the pre-release the marketplace served during development;
+https://github.com/globus-labs/hpc-bridge/issues. (0.1.0 was the pre-release the marketplace served during development;
 the version moves so existing installs update.)
 
 ### What's in it
 - **Install from Claude Code** — the repository is its own plugin marketplace: `/plugin marketplace add
-  ryanchard/hpc-bridge`, `/plugin install hpc-bridge@hpc-bridge`. Eleven tools, a skill the agent follows on its own,
+  globus-labs/hpc-bridge`, `/plugin install hpc-bridge@hpc-bridge`. Eleven tools, a skill the agent follows on its own,
   and the `/hpc-bridge:hpc-connect` command. The server is launched through a small script that finds `uv` even
   from the desktop app or an IDE, whose PATH lacks the usual install locations. (#52, #74)
 - **Public facility registry** — "What HPC facilities can I use?" answers from a curated Globus Search index, read

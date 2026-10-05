@@ -9,7 +9,7 @@ Aurora is reached via `bastion.alcf.anl.gov` (a pass-through) → a login node (
 
 ## The management-hostname pin (fixed)
 
-Aurora's `hostname -f` is `aurora-uan-0009.**hostmgmt.cm**.aurora.alcf.anl.gov` — a **management-plane** name not routable through the bastion. Pinning it would break teardown/reconnect, so `_routable_pin` ([[facility-remote]]) now drops management labels (`hostmgmt`/`cm`/`mgmt`/`ipmi`/`bmc`) and falls back to the alias ([#33](https://github.com/ryanchard/hpc-bridge/pull/33)).
+Aurora's `hostname -f` is `aurora-uan-0009.**hostmgmt.cm**.aurora.alcf.anl.gov` — a **management-plane** name not routable through the bastion. Pinning it would break teardown/reconnect, so `_routable_pin` ([[facility-remote]]) now drops management labels (`hostmgmt`/`cm`/`mgmt`/`ipmi`/`bmc`) and falls back to the alias ([#33](https://github.com/globus-labs/hpc-bridge/pull/33)).
 
 ## The discovered config
 
@@ -25,12 +25,12 @@ Aurora's `hostname -f` is `aurora-uan-0009.**hostmgmt.cm**.aurora.alcf.anl.gov` 
 
 ## Proven vs pending
 
-- **Proven live** (2026-07): the two-hop MFA bootstrap, ControlMaster reuse, `globus-compute-endpoint` install on the UAN, the PBS provisioning attempt, and a clean stop (no leaked pilot). The [#32](https://github.com/ryanchard/hpc-bridge/issues/32) pilot-rejection observability was *surfaced* here — a `qsub` rejected with `No active allocation found for project … and resource aurora` now shows up in the `provisioning` notice instead of a silent "allocating nodes…".
+- **Proven live** (2026-07): the two-hop MFA bootstrap, ControlMaster reuse, `globus-compute-endpoint` install on the UAN, the PBS provisioning attempt, and a clean stop (no leaked pilot). The [#32](https://github.com/globus-labs/hpc-bridge/issues/32) pilot-rejection observability was *surfaced* here — a `qsub` rejected with `No active allocation found for project … and resource aurora` now shows up in the `provisioning` notice instead of a silent "allocating nodes…".
 - **Pending an allocation**: the compute pilot never runs (the test project has no active Aurora compute), so `interface=hsn0` is unvalidated live — one `account=` swap + rerun when an allocation lands. If it stays cold *with* an allocation, the interface is wrong (try `hsn1`, then a `bond0`).
 
 ## Testing it as a new user
 
-`agentic/clean-session.sh` launches a pristine Claude Code session — no `~/.claude` priors, an **isolated** `HPC_BRIDGE_STATE_DIR` sandbox, and **nothing forced** (no `HPC_BRIDGE_SSH_HOST` override — see [#35](https://github.com/ryanchard/hpc-bridge/issues/35)) — so a cold agent drives Aurora exactly as a real user would (discover → propose → confirm), not from leaked cache.
+`agentic/clean-session.sh` launches a pristine Claude Code session — no `~/.claude` priors, an **isolated** `HPC_BRIDGE_STATE_DIR` sandbox, and **nothing forced** (no `HPC_BRIDGE_SSH_HOST` override — see [#35](https://github.com/globus-labs/hpc-bridge/issues/35)) — so a cold agent drives Aurora exactly as a real user would (discover → propose → confirm), not from leaked cache.
 
 ## See also
 [[facility-remote]] · [[MFA and interactive SSH auth]] · [[Standing up the endpoint]] · [[MEP & templated endpoints]] · [[Cost control]] · [[Facility catalog]]

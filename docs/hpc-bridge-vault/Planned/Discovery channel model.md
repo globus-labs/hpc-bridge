@@ -1,7 +1,7 @@
 # Discovery channel model
 
 > [!warning] Planned · the conceptual frame
-> The target model for *where* hpc-bridge learns what a facility is, and what the user must supply versus what Claude can discover. **Mostly built** — the facility shape comes from the [[Facility catalog|public registry]] (anonymous, built-in id), the login-probe and human fallbacks are wired ([[discovery]]), and the local client cache persists confirmed BYO facilities; what remains is per-channel **ablation flags** and the **resolution trace**. The concrete build is [[Globus index discovery channel]]. Tracking: [#7](https://github.com/ryanchard/hpc-bridge/issues/7). Absorbs the former `docs/design/discovery-channels.md`.
+> The target model for *where* hpc-bridge learns what a facility is, and what the user must supply versus what Claude can discover. **Mostly built** — the facility shape comes from the [[Facility catalog|public registry]] (anonymous, built-in id), the login-probe and human fallbacks are wired ([[discovery]]), and the local client cache persists confirmed BYO facilities; what remains is per-channel **ablation flags** and the **resolution trace**. The concrete build is [[Globus index discovery channel]]. Tracking: [#7](https://github.com/globus-labs/hpc-bridge/issues/7). Absorbs the former `docs/design/discovery-channels.md`.
 
 ## One abstraction — the human is terminal
 
@@ -17,8 +17,8 @@ Selection rule: **per-fact happiest-path** — for each fact, the *cheapest chan
 | Channel | Covers (its strength) | Cost / auth | How it's called | Status |
 |---|---|---|---|---|
 | **Globus index** (ours) | the **static bootstrap shape**: `ssh_host`, `interface`, `env_setup`, `scheduler`, `auth_method`, scratch pattern, defaults, allocation command+parser | free · instant · **anonymous** | `globus_sdk.SearchClient` | live (Anvil entry) |
-| **Login-node probe** | **live state**: partitions+idle, balance, `$SCRATCH`, account/QOS, interface *candidates*, gce version | post-endpoint: login-shape AMQP · **pre-endpoint: raw SSH** (the config sweep) | `run_shell(shape="login")` · `discover_facility_details` ([[discovery]]) | **built** ([#13](https://github.com/ryanchard/hpc-bridge/pull/13)) |
-| [[state\|Local client]] | Globus identity, owned endpoint UUIDs, local SDK/dill/Python versions, platform | the Globus login already done | `globus_sdk` / `get_endpoints` | **built** ([#12](https://github.com/ryanchard/hpc-bridge/pull/12)) |
+| **Login-node probe** | **live state**: partitions+idle, balance, `$SCRATCH`, account/QOS, interface *candidates*, gce version | post-endpoint: login-shape AMQP · **pre-endpoint: raw SSH** (the config sweep) | `run_shell(shape="login")` · `discover_facility_details` ([[discovery]]) | **built** ([#13](https://github.com/globus-labs/hpc-bridge/pull/13)) |
+| [[state\|Local client]] | Globus identity, owned endpoint UUIDs, local SDK/dill/Python versions, platform | the Globus login already done | `globus_sdk` / `get_endpoints` | **built** ([#12](https://github.com/globus-labs/hpc-bridge/pull/12)) |
 | **Human (Socratic)** | **everything** — secrets (key, login name) + the unpublished + the un-probeable | slow · effortful · always available | `AskUserQuestion` + dialogue | **built** — the gates, `needs_facility_details` elicitation, the propose→confirm loop, and the `needs_preauth` / `needs_login` hand-offs |
 
 > [!note] Deferred: external catalogs
@@ -53,8 +53,8 @@ The load-bearing reference. "→ human" is the implicit terminal fallback everyw
 | walltime / QOS caps | login node (`sacctmgr`) | — | T3 (live) |
 | **balance** | login node (named parser, e.g. `mybalance`) | human | T3 (live) |
 | GPU / accelerators | login node (`sinfo`) | index `defaults` | T3 (live) |
-| run shape (nodes/blocks) | defaults · user override ([#2](https://github.com/ryanchard/hpc-bridge/issues/2)) | — | choice/default |
-| `amqp_port` / `endpoint_name` | safe default (443 / `hpc-bridge-<id>` curated, `hpc-bridge-<ssh_host>` session — never the bare `hpc-bridge`, [#27](https://github.com/ryanchard/hpc-bridge/issues/27)) | index override | default |
+| run shape (nodes/blocks) | defaults · user override ([#2](https://github.com/globus-labs/hpc-bridge/issues/2)) | — | choice/default |
+| `amqp_port` / `endpoint_name` | safe default (443 / `hpc-bridge-<id>` curated, `hpc-bridge-<ssh_host>` session — never the bare `hpc-bridge`, [#27](https://github.com/globus-labs/hpc-bridge/issues/27)) | index override | default |
 | Globus identity · endpoint UUID | local (`get_endpoints`) | — | T3 (local) |
 | gce version (skew) | login node (live) | — | T3 (live) |
 

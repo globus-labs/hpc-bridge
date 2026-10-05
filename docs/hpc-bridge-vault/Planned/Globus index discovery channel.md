@@ -1,7 +1,7 @@
 # Globus index discovery channel
 
 > [!warning] Planned · transient
-> **Plans 1–2 (catalog data layer + agentic selection flow) are merged**, as is the **discover-first sweep + persistent SSH** (this note's "built" sections). Tracking: [#7](https://github.com/ryanchard/hpc-bridge/issues/7). This note is the spec + status; it churns as the work lands — remaining: seed-emission / write-back.
+> **Plans 1–2 (catalog data layer + agentic selection flow) are merged**, as is the **discover-first sweep + persistent SSH** (this note's "built" sections). Tracking: [#7](https://github.com/globus-labs/hpc-bridge/issues/7). This note is the spec + status; it churns as the work lands — remaining: seed-emission / write-back.
 
 ## Goal
 
@@ -40,11 +40,11 @@ A machine the index can't resolve is **no longer a hard failure**. `connect_faci
 
 - **Trust:** the session-local entry holds executable config (`env_setup`, `ssh_host`) but it's **user-supplied** (Tier-1, like credentials), **never written to the index** (curator-only writes stay the boundary). The agent is a conduit for the user's answers; it must not *invent* config — it **proposes discovered facts** for the user to confirm. SSH user + key come from `~/.ssh/config` (read live; optional env overrides), never a boot-env var the running server can't see.
 - **Isolated endpoint name:** a session facility registers as `hpc-bridge-<facility>` (e.g. `hpc-bridge-globus`), never the bare `hpc-bridge`. Globus Compute keys endpoints by *identity + name*, so a shared name lets `find_online_endpoint` reuse another facility's (or a stale "online") registration — stranding a canary that can never warm. `_entry_from_details` derives it for session facilities; curated seeds set it explicitly (e.g. `hpc-bridge-anvil`). **The standard is `hpc-bridge-<facility>` everywhere — the bare `hpc-bridge` is banned.**
-  > [!note] Superseded ([#27](https://github.com/ryanchard/hpc-bridge/issues/27)): session names key on the **SSH host**
+  > [!note] Superseded ([#27](https://github.com/globus-labs/hpc-bridge/issues/27)): session names key on the **SSH host**
   > `_session_endpoint_name` ([[server]]) now derives `hpc-bridge-<ssh_host slug>` — the canonical per-cluster identity — so different facility ids for the same host (`midway`, `midway3`) share one registration instead of sprawling. Curated seeds keep `hpc-bridge-<id>`; the bare name stays banned. `HPC_BRIDGE_ENDPOINT_NAME` is the harness's per-run override.
 - **Also covers index-down:** if `make_catalog()` errors, the same fallback fires (supply `details` to proceed) rather than a hard fail — after the local cache has been tried ([[Facility catalog]] precedence).
 - **Deferred:** write-back / seed-emission for curation; parsers beyond `mybalance`; non-Slurm/PBS.
-  > [!note] Superseded ([#27](https://github.com/ryanchard/hpc-bridge/issues/27)): session facilities *do* persist
+  > [!note] Superseded ([#27](https://github.com/globus-labs/hpc-bridge/issues/27)): session facilities *do* persist
   > "Persisting session facilities across restarts" was on this deferred list. A confirmed `details=` is now cached to `facilities.json` ([[state]] `FacilityStore`) and a later session reconnects from it with no SSH probe.
 
 ### Discover-first — built (this branch)
@@ -59,7 +59,7 @@ From [[Discovery channel model]], not in the catalog yet: per-channel **ablation
 
 ## Status
 
-- **Merged:** Plan 1 (catalog data layer · catalog-driven `make_facility` · `hpc-bridge-catalog` ingest, [#15](https://github.com/ryanchard/hpc-bridge/pull/15)) **and** Plan 2 (`list_facilities` + `connect_facility` + `mybalance` parser + account-from-selection, [#17](https://github.com/ryanchard/hpc-bridge/pull/17)).
+- **Merged:** Plan 1 (catalog data layer · catalog-driven `make_facility` · `hpc-bridge-catalog` ingest, [#15](https://github.com/globus-labs/hpc-bridge/pull/15)) **and** Plan 2 (`list_facilities` + `connect_facility` + `mybalance` parser + account-from-selection, [#17](https://github.com/globus-labs/hpc-bridge/pull/17)).
 - **Built + merged:** the **Socratic fallback** + **discover-first sweep** above — `connect_facility(ssh_host=…)` → `proposed_facility_details` → confirm → session-local `connect_facility(details=…)` — plus persistent SSH ([[facility-remote]], ControlMaster). Validated live on the globus1 cluster.
 - **Deferred:** ACCESS MCP / Operations API channels; the ablation/trace extras; seed-emission/write-back (see [[Discovery channel model]]).
 

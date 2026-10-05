@@ -11,7 +11,7 @@ Run with **--no-skill** (`HPCB_NO_SKILL=1`): the skill exists precisely to steer
 Item 2 (submit/poll) makes detaching UNNECESSARY — a long *foreground* task keeps the block busy and is
 retrieved via poll_task (see `long_task_via_handle`) — but it does NOT make a *detached* process safe:
 a backgrounded job is still not a Compute task, so this scenario still reproduces the kill.
-See issue #21 (https://github.com/ryanchard/hpc-bridge/issues/21).
+See issue #21 (https://github.com/globus-labs/hpc-bridge/issues/21).
 """
 from invariants import Result, Trace
 

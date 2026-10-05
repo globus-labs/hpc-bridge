@@ -18,7 +18,7 @@ Each shape has its own [[server|`ShapeRuntime`]] — its own Executor, canary, a
 > A facility multi-user endpoint ([[facility-mep]]) declares `supported_shapes = ("compute",)`; the server reads it via `_supported_shapes` and **`_shape_reject` runs before any `ShapeRuntime` is built** at every shape entry point (`ensure_endpoint_up`, `run_shell`, `reset_session`, and `login_shell`), because a submit the facility's schema refuses would shut the SDK Executor down. No login shape also means: every shape is billed (the `needs_confirmation` notice no longer points at a free `login` alternative — `_needs_confirmation_notice`), discovery runs on the warm compute block, and stop is draining-only ([[Cost control]]).
 
 > [!warning] `compute` is a boolean, not a string
-> `shape_config` sets `compute: True/False`; the template branches on that bool. It must *not* compare a string like `provider_type == "SlurmProvider"`, because the manager's `_sanitize_user_json` JSON-quotes every string and the comparison silently fails — dropping the provider block ([#5](https://github.com/ryanchard/hpc-bridge/issues/5)). See [[MEP & templated endpoints]].
+> `shape_config` sets `compute: True/False`; the template branches on that bool. It must *not* compare a string like `provider_type == "SlurmProvider"`, because the manager's `_sanitize_user_json` JSON-quotes every string and the comparison silently fails — dropping the provider block ([#5](https://github.com/globus-labs/hpc-bridge/issues/5)). See [[MEP & templated endpoints]].
 
 ## The spend floor
 

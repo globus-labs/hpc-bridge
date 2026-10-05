@@ -13,13 +13,13 @@ anything), runs your commands on that node, and releases it when you are done.
 Two commands inside Claude Code; the repository is its own plugin marketplace.
 
 ```
-/plugin marketplace add ryanchard/hpc-bridge
+/plugin marketplace add globus-labs/hpc-bridge
 /plugin install hpc-bridge@hpc-bridge
 ```
 
 Then ask *"What HPC facilities can I use?"* — that first answer needs no login and no configuration.
 
-**Another MCP host?** hpc-bridge is a standard MCP server — point hermes-agent, Claude Desktop, Cursor, or the OpenAI Agents SDK at `uvx --from git+https://github.com/ryanchard/hpc-bridge hpc-bridge`. See **[other MCP hosts](docs/user/other-hosts.md)**.
+**Another MCP host?** hpc-bridge is a standard MCP server — point hermes-agent, Claude Desktop, Cursor, or the OpenAI Agents SDK at `uvx --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge`. See **[other MCP hosts](docs/user/other-hosts.md)**.
 
 ## What you bring, what's included
 
@@ -57,12 +57,12 @@ endpoint needs no SSH at all. Design, tool reference and module notes: the **[va
 - **[User guide](docs/user/README.md)** — install, quickstart, facilities, the Globus login, costs and stopping, troubleshooting.
 - **[Adding a facility to the registry](docs/adding-a-facility.md)** — for facility staff and contributors.
 - **[Vault](docs/hpc-bridge-vault/Home.md)** — how it is built.
-- **Bugs and questions:** [GitHub issues](https://github.com/ryanchard/hpc-bridge/issues).
+- **Bugs and questions:** [GitHub issues](https://github.com/globus-labs/hpc-bridge/issues).
 
 ## Status and security
 
 **Public beta** (0.1.6, Apache-2.0): tested live on six clusters, security-reviewed, and now in the hands
-of test users — expect rough edges and please [report them](https://github.com/ryanchard/hpc-bridge/issues). In the
+of test users — expect rough edges and please [report them](https://github.com/globus-labs/hpc-bridge/issues). In the
 registry: **Purdue Anvil** (multi-user endpoint), **NCSA Delta** (multi-user endpoint), **SDSC Expanse**
 (SSH with a one-time code) and Globus Labs' cluster; also proven live through the bring-your-own path on **Midway**
 (Slurm) and **ALCF Polaris** (PBS). Slurm and PBS are the supported schedulers.
