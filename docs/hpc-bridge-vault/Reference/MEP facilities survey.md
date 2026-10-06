@@ -168,10 +168,16 @@ knobs (qos, cores_per_node, scheduler_options…). Driver: `agentic/mep_live_che
   … too many values to unpack (expected 2)`. The facility rebuilds the user endpoint's venv at every start and had
   pulled parsl **2026.10.05** (released the day before); our worker venv, built earlier and only re-checked for gce,
   still had parsl **2026.08.10**. `--upgrade` in the entry's worker_init makes the worker resolve the same latest
-  dependencies; re-run: worker on a000 as `x-amcsweeneyel` in ~180 s. Lesson: on a MEP whose UEP env floats, the
+  dependencies (`worker_env.strategy: float`, 0.1.19); re-run: worker on a000 as `x-amcsweeneyel` in ~180 s. Lesson: on a MEP whose UEP env floats, the
   worker must float the same way (or pin parsl to the UEP's) — pinning gce alone is not enough.
-- **Delta** — **FAIL, facility side, unresolved.** The MEP is online and now reports **v4.16.0** (4.15.0 on
-  2026-09-04); its template accepts our keys (`additionalProperties: true`, our worker_init is used). But every task
-  sat in `waiting-for-ep` for 15 min (web service `get_task`): no user endpoint was ever started for us, so no Slurm job
-  and nothing billed. Needs a look at `~/.globus_compute/` on Delta (password + Duo) or NCSA support.
+- **Delta** — **FAIL, the same skew in the OTHER direction** (first misread as facility-side: the web service showed
+  every task `waiting-for-ep`, but on Delta the user endpoint HAD started, run the canaries, and its blocks had
+  registered workers). Delta's endpoint runs the MEP's own fixed install — gce 4.16.0, **parsl 2026.08.10**, py3.13.13
+  (its log) — while a fresh worker venv picks the newest parsl (2026.10.05; also what `--upgrade` does). The workers ran
+  the tasks (`Completed executor task`) but no result arrived, and because the tasks stayed queued, BOTH of the day's
+  user endpoints kept relaunching 15-minute A40 blocks (`idle_heartbeats_hard` = 48 h; hpc-bridge has no cancel channel
+  on a MEP, and `stop_endpoint` on a UEP id is `ENDPOINT_NOT_FOUND` to the user). ~1.7 GPU-h before it was stopped: a
+  temporary `~/.config/uv/uv.toml` `constraint-dependencies = ["parsl==2026.8.10"]` on Delta pinned the worker venv, the
+  queued tasks completed (21 success, 3 failed on cancelled blocks), and the endpoints released their blocks.
+  Fix (0.1.19): Delta's entry pins `"parsl==2026.8.10"` in its install, `worker_env.strategy: pin`.
 - **Expanse** — pending (needs the user's one-time code).

@@ -105,6 +105,7 @@ class MEPFacility:
         # because the server writes the user's confirmed `account`/`partition` into it AFTER construction
         # (warmth._apply_account / _apply_partition) and the account floor reads `account` from it.
         self.key_map: dict[str, str] = {}
+        self.worker_env = None  # entry.compute.worker_env: the worker strategy + the version it was proven with
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -141,6 +142,7 @@ class MEPFacility:
         )
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"
         fac.key_map = dict(getattr(c, "key_map", None) or {})
+        fac.worker_env = getattr(c, "worker_env", None)
         return fac
 
     def _pinned_gce_version(self) -> str | None:
@@ -201,6 +203,20 @@ class MEPFacility:
         self.schema = md.get("user_config_schema") or None
         self.endpoint_version = str(md.get("endpoint_version") or "") or None
         self.display_name = md.get("display_name") or None
+        if note := self.stale_worker_note():
+            self._note(note)
+
+    def stale_worker_note(self) -> str | None:
+        """When the facility's live endpoint version differs from the one the registry entry was proven with:
+        the facility upgraded since, so the packages its endpoint runs may have moved and the worker pool the
+        entry installs may no longer match — a block that starts and bills while every result is dropped."""
+        verified = getattr(self.worker_env, "verified_with", None)
+        if not verified or not self.endpoint_version or self.endpoint_version == verified:
+            return None
+        return (f"STALE ENTRY: this facility's endpoint now runs v{self.endpoint_version}, but the registry entry "
+                f"was verified with v{verified} — the facility upgraded since, and the worker it installs may no "
+                "longer match its endpoint. If a block starts but never answers, that is the likely cause: stop, "
+                "tell the user, and report it to the hpc-bridge registry curator")
 
     def sanitize_uec(self, uec: dict) -> dict:
         """The final user_endpoint_config for a submit, made to fit the FACILITY's contract:

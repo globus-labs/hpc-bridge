@@ -19,11 +19,14 @@
   compute:
     scheduler: slurm
     interface: eth1                 # informational: the facility template pins its own address
-    # --upgrade: the facility builds the USER endpoint's environment fresh at each start, so its dependencies
-    # (parsl above all) track the latest release; a worker venv built earlier and only re-checked for gce
-    # keeps the old parsl, and the interchange then drops every result ("too many values to unpack") —
-    # Anvil, live 2026-10-06: UEP parsl 2026.10.05 vs worker 2026.08.10, block RUNNING, canary never answered.
-    env_setup: 'export PATH="$HOME/.local/bin:$PATH"; command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; V=$HOME/hpc-bridge/gce-venv-{gce_version}-py{python_version}; [ -d $V ] || uv venv $V --python {python_version}; . $V/bin/activate; uv pip install -q --upgrade "globus-compute-endpoint=={gce_version}"'
+    # Delta's user endpoint runs the MEP's own FIXED install (gce 4.16.0, parsl 2026.08.10, py3.13.13 — its log,
+    # 2026-10-06). The worker must run the same parsl: a fresh venv resolves the newest (2026.10.05 that day), and
+    # the endpoint then dropped every result while the block billed and relaunched. Re-pin when Delta upgrades
+    # (the attach warns when its endpoint version leaves `verified_with`).
+    env_setup: 'export PATH="$HOME/.local/bin:$PATH"; command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; V=$HOME/hpc-bridge/gce-venv-{gce_version}-py{python_version}; [ -d $V ] || uv venv $V --python {python_version}; . $V/bin/activate; uv pip install -q "globus-compute-endpoint=={gce_version}" "parsl==2026.8.10"'
+    worker_env:
+      strategy: pin
+      verified_with: "4.16.0"
     scratch_root: "$HOME/.hpc-bridge"
     endpoint_name: ncsa-delta-mep
   defaults:

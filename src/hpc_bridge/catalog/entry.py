@@ -34,6 +34,36 @@ MEP_RENAMEABLE_KEYS = frozenset({
 })
 
 
+_VERSION = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,31}$")
+
+
+class WorkerEnv(BaseModel):
+    """Facility-MEP entries: how the worker pool's Python packages are kept in step with the facility's USER
+    endpoint process. parsl's interchange<->worker protocol changes between releases without compatibility, and
+    globus-compute-endpoint only sets a parsl FLOOR — so the same endpoint version can run different parsl, and a
+    skew makes the block run (and bill) while every result is dropped (2026-10-06: Anvil's UEP floated to a
+    newer parsl than our worker; Delta's fixed install sat on an older one than a fresh worker venv picks).
+
+    The install itself stays in `env_setup` (literal pins / `--upgrade`), so EVERY plugin version reading the
+    registry gets a working worker — a new placeholder there would reach older plugins unresolved. This records
+    the strategy and what the entry was proven against."""
+
+    # "pin": the facility runs a FIXED install; env_setup pins the worker's packages to it (e.g. parsl==…).
+    # "float": the facility rebuilds the UEP's environment at the latest versions at every start; env_setup
+    # installs with --upgrade so the worker resolves the same.
+    strategy: Literal["pin", "float"]
+    # The facility endpoint version (`endpoint_version` in its metadata) the entry was last proven against. At
+    # attach, a different live version means the facility upgraded since — its packages may have moved.
+    verified_with: str | None = None
+
+    @field_validator("verified_with")
+    @classmethod
+    def _version(cls, v: str | None) -> str | None:
+        if v is not None and not _VERSION.match(v):
+            raise ValueError("verified_with must be a version string like 4.16.0")
+        return v
+
+
 class Compute(BaseModel):
     """Machine-invariant facts the plugin PINS — the user/agent cannot override these.
 
@@ -78,6 +108,18 @@ class Compute(BaseModel):
     # See docs/hpc-bridge-vault/Reference/MEP facilities survey.md and .../Planned/Endpoint reuse and MEP
     # integration.md (M3: "curate the allowed user_endpoint_config in the entry").
     key_map: dict[str, str] = Field(default_factory=dict)
+    worker_env: WorkerEnv | None = None  # facility-MEP entries: see WorkerEnv
+
+    @model_validator(mode="after")
+    def _worker_env_matches_install(self) -> Compute:
+        # The strategy is a claim about env_setup's install line; keep them from drifting apart.
+        if self.worker_env is not None:
+            upgrades = "--upgrade" in self.env_setup or " -U " in f" {self.env_setup} "
+            if self.worker_env.strategy == "float" and not upgrades:
+                raise ValueError("worker_env.strategy 'float' needs `--upgrade` in env_setup's install")
+            if self.worker_env.strategy == "pin" and upgrades:
+                raise ValueError("worker_env.strategy 'pin' must not `--upgrade` in env_setup (it would float)")
+        return self
 
     @field_validator("key_map")
     @classmethod

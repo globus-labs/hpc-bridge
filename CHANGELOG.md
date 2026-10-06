@@ -3,6 +3,28 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.19 — 2026-10-06 — worker environments that match each facility's endpoint
+
+### Added
+- **Registry entries say how their worker keeps pace with the facility.** A facility-endpoint entry carries
+  `compute.worker_env`: `strategy` `pin` (the facility runs a fixed install, and the entry's worker install pins
+  its packages to it) or `float` (the facility rebuilds at the latest versions at every start, and the worker
+  installs with `--upgrade`), checked against the install line, plus `verified_with`, the facility endpoint version
+  the entry was proven against. The install stays literal in `env_setup`, so plugins older than this one, reading
+  the same registry, also get a working worker.
+- **An upgraded facility is flagged at attach.** When the facility's live endpoint version differs from the one the
+  entry was verified with, `connect_facility` says so (STALE ENTRY): its packages may have moved, and a block that
+  starts but never answers is then the likely result.
+
+### Fixed
+- **Anvil and Delta run again.** Re-proving the registry on 0.1.18 found both broken by the same skew, in opposite
+  directions: parsl's interchange↔worker protocol changes between releases and `globus-compute-endpoint` only sets a
+  parsl floor. Anvil rebuilds its user endpoint at the latest versions and had moved to parsl 2026.10.05 while our
+  worker venv kept 2026.08.10; Delta's fixed install runs 2026.08.10 while a fresh worker venv picks 2026.10.05.
+  Either way the block ran and billed while the endpoint dropped every result, and on Delta the endpoint kept
+  relaunching GPU blocks for its queued tasks. Anvil's entry now floats (`--upgrade`), Delta's pins
+  `parsl==2026.8.10`; `globus-labs` records its verified version.
+
 ## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
 
 ### Changed
@@ -21,11 +43,6 @@ installed plugin only when that version changes); git tags mark releases.
   command still inside its synchronous wait is not read as a reap, and local dev's held block never is.
 
 ### Fixed
-- **Anvil's registry entry runs again.** The facility rebuilds its user endpoint's environment at every start and had
-  moved to a parsl released the day before; the worker venv hpc-bridge's entry builds kept the older parsl, and the
-  facility's endpoint then dropped every result, so the block ran and billed while every check timed out. The Anvil
-  and Delta entries now install the worker with `--upgrade`, so it resolves the same dependencies (live-verified on
-  Anvil 2026-10-06).
 - **Teardown can no longer be retargeted, run twice, or replay a stale answer.** `teardown_endpoint` decides what it
   tears down in one locked step with no await before it: an SSH endpoint's teardown is claimed and snapshotted there
   and runs (release, one-time-code gate, login-node ops) as one task on that facility and endpoint; a facility
