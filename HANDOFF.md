@@ -1,7 +1,7 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-06. `main` carries **plugin 0.1.18** (#164, 2026-10-06); the latest tag is **`v0.1.13-beta.1`**
-(2026-09-05) — 0.1.14–0.1.18 are untagged, and the next tag is **on hold until connectivity to each registry facility is
+_Snapshot: 2026-10-06. `main` carries **plugin 0.1.20** (#167, 2026-10-06); the latest tag is **`v0.1.13-beta.1`**
+(2026-09-05) — 0.1.14–0.1.20 are untagged, and the next tag is **on hold until connectivity to each registry facility is
 re-proven** (maintainer's call). The repository moved to **`globus-labs/hpc-bridge`** (2026-09-16; the old
 `ryanchard/hpc-bridge` URLs redirect). Design rationale lives in `docs/hpc-bridge-vault/`; this file is the live state +
 how-to-run + gotchas on top._
@@ -21,19 +21,24 @@ hostile`) that is now the main regression backbone; the lab cluster is the real-
 
 ## Where it stands (2026-10-06)
 
-**Registry re-prove (2026-10-06) — 3 of 4 done; finish, then tag.**
-- `globus-labs` passed on 0.1.18 (the client's Python 3.13 vs the workers' 3.12 is only a warning).
-- **Anvil and Delta both failed from a parsl skew** between the facility's user endpoint and our worker: Anvil's
-  endpoint floats to the latest parsl, and Delta's fixed install sits on 2026.08.10. The block ran and billed
-  while every result was dropped, and Delta's endpoint kept relaunching A40 blocks (about 1.7 GPU-h, stopped by
-  hand).
-- **0.1.19 fixes it** (PR #165): per-facility `compute.worker_env` (pin | float), a STALE-entry check at attach,
-  one canary in flight, and a five-minute notice that names the silent billing block. Anvil and Delta re-proved
-  from the 0.1.19 seeds (each run sent 2 tasks).
-- **After #165 merges:** re-ingest `anvil`, `delta` and `globus-labs` (the fix reaches every installed plugin
-  through the registry), then run Expanse (needs the maintainer's one-time code), then tag.
-- **Follow-ups:** report upstream to Globus Compute (pin parsl exactly / reject a mismatched worker at
-  registration / publish endpoint runtime); reuse the endpoint's own venv for `float` facilities.
+**Registry re-proven (2026-10-06) — all four pass on main (0.1.20); next: tag.**
+- `globus-labs` passed (the client's Python 3.13 vs the workers' 3.12 is only a warning).
+- **Anvil and Delta** broke on a parsl skew between the facility's user endpoint and our worker, in opposite
+  directions. **0.1.19** (#165) fixed it: per-facility `compute.worker_env` (pin | float), a STALE-entry check at
+  attach, one canary in flight, and a five-minute notice naming the silent billing block. Delta's endpoint had
+  kept relaunching A40 blocks for queued canaries (about 1.7 GPU-h, stopped by hand).
+- **Expanse** had only ever run its login shape. Parsl's default `--exclusive` asked `shared` (127 CPUs per job on
+  128-core nodes) for a whole node, so blocks pended forever. **0.1.20** (#167) lets entries set
+  `defaults.exclusive`; the Expanse entry sets false. It passed after a teardown and a fresh bootstrap.
+- **Follow-ups:**
+  - Report upstream to Globus Compute: pin parsl exactly, reject a mismatched worker at registration, publish the
+    endpoint runtime.
+  - Reuse the endpoint's own venv for `float` facilities.
+  - A template change never reaches an endpoint already running on a facility (provision reuses it as-is):
+    detect the drift.
+  - BYO `FacilityDetails` has no `exclusive` yet.
+  - The live-check driver for a catalogued SSH facility with a one-time code (`expanse_check.py`, scratch) could
+    join `agentic/`.
 
 **Open on GitHub:** issues **#2** (agent-specified resources), **#3** (SSH bootstrap under MFA), **#7** (ACCESS
 discovery channel) — all from July. No open PRs once this one merges.
