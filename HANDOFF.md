@@ -1,7 +1,7 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-05. `main` carries **plugin 0.1.17** (#153, 2026-09-17); the latest tag is **`v0.1.13-beta.1`**
-(2026-09-05) — 0.1.14–0.1.17 are untagged, and the next tag is **on hold until connectivity to each registry facility is
+_Snapshot: 2026-10-06. `main` carries **plugin 0.1.18** (#164, 2026-10-06); the latest tag is **`v0.1.13-beta.1`**
+(2026-09-05) — 0.1.14–0.1.18 are untagged, and the next tag is **on hold until connectivity to each registry facility is
 re-proven** (maintainer's call). The repository moved to **`globus-labs/hpc-bridge`** (2026-09-16; the old
 `ryanchard/hpc-bridge` URLs redirect). Design rationale lives in `docs/hpc-bridge-vault/`; this file is the live state +
 how-to-run + gotchas on top._
@@ -15,31 +15,33 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **552 passed, 2 skipped**; agentic harness hermetic tests **299 passed** (78 of them grader tests). The live tier has
+Unit tier **626 passed, 2 skipped**; agentic harness hermetic tests **305 passed** (78 of them grader tests). The live tier has
 **46 scenarios** and a local **fake cluster with 10 profiles** (`default site mep totp pbs lmod f2b polaris internal
 hostile`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
-## Where it stands (2026-10-05)
+## Where it stands (2026-10-06)
 
-**Open on GitHub:** PR **#160** — vault scoping note *Facility self-description via Compute* (registry-less discovery:
-facilities describe themselves through the MEP metadata they already publish). Issues **#2** (agent-specified
-resources), **#3** (SSH bootstrap under MFA), **#7** (ACCESS discovery channel) — all from July.
+**Next step: re-prove each registry facility on 0.1.18, then tag `v0.1.18-beta.1`.** Four entries: `globus-labs` (the
+lab MEP — rebuilt 2026-10-01, maps to `glabs-gc`, needs a Python 3.12 client while the plugin env resolves to 3.13; NOT
+re-proven since the rebuild, the likeliest break), `expanse` (SSH), `delta` and `anvil` (facility MEPs, billed to
+CIS250223 — ask before running).
 
-**Known product bugs, not yet fixed** — from the 2026-09-05 plugin review (vault `Reference/Plugin review
-2026-09-05.md`), all still present in 0.1.17:
-- **#3** teardown's unlocked window (a parallel `connect_facility` can retarget the background teardown; two calls
-  run it twice; a stale one-time-code handoff survives a re-bind);
-- **#4** adopting an already-running endpoint overwrites the stored login-node pin with `None`;
-- **#5** credential seeding can overwrite a pre-existing remote `storage.db` (and later delete the replacement);
-- **#6** numbers the agent relays are wrong: the MEP idle window (hpc-bridge's 600 s default, not the facility's), the
-  block's node count (spend and the confirm notice assume 1), spend during an SSH teardown (the clock keeps running);
-- low: a CHANGED host key is coached like an unknown one in `complete_preauth`; `_CODE_RE` admits password-shaped
-  strings (the askpass prompt refusal is the real guard).
+**Open on GitHub:** issues **#2** (agent-specified resources), **#3** (SSH bootstrap under MFA), **#7** (ACCESS
+discovery channel) — all from July. No open PRs once this one merges.
+
+**The 2026-09-05 plugin review is closed in 0.1.18** (#164; vault `Reference/Plugin review 2026-09-05.md`): #3 teardown
+window, #4 pin overwrite, #5 credential seeding (a store with tokens is never replaced; an EMPTY one — what `whoami`
+itself creates where nobody logged in — is), #6 relayed numbers, the changed/revoked host-key wording. Its third
+host-key remedy (drop a reachable pin) was **declined** (2026-10-06): it would send control-plane SSH to the round-robin
+alias and orphan the manager.
+
+**Known follow-ups, not yet fixed:**
+- A tool call cancelled mid sync-wait leaves its command running untracked (on a one-worker block the next canary can
+  read as a reap); `stop_endpoint` is not refused during a sync-wait, and the returning dispatch recreates the shape.
+- A MEP teardown with a live task still drops the task handles (`stop_endpoint` refuses; teardown should too).
+- The Expanse seed's frozen worker Python.
 
 **Product questions waiting on a decision:**
-- Should the server re-require `confirm_spend` after a detected reap? Today the acknowledgement persists for the
-  session; `block_reaped_resume` (#158) showed a second billed block starts on return without a server-side re-ask (the
-  agent asked anyway, both runs).
 - A side-effect-free status tool: `ensure_endpoint_up` always forces the canary, which can re-kick a billed block — a
   read-only `endpoint_status` (report the in-memory runtime, submit nothing) would serve hosts that show status.
 - "Provisioning" is inferred (manager online + canary timeout). The web service's per-task status (`get_task`:
@@ -57,19 +59,18 @@ resources), **#3** (SSH bootstrap under MFA), **#7** (ACCESS discovery channel) 
   interaction benchmark.md`). Run bundles live in the gitignored `agentic/runs/`.
 - **Facility key renames** (#155, building on external PR #149): `compute.key_map`, applied only at the wire
   (`dispatch_uec`); the runtime config keeps hpc-bridge's names.
-- **`block_reaped_resume`** (#158): block reaped under an idle session → honest `cold_start`, the session cwd survives
-  the block, work completes on a new block. Its first run caught the agent claiming the cwd died with the block —
-  worth a line in `SKILL.md` / the cold-start notice (not yet written).
+- **0.1.18 (#164):** the plugin review's fixes, plus **spend is asked again once a block is gone** — `confirm_spend`
+  covers one block; a reap is presumed from the clock (idle window + 60 s, walltime) before any submit, or found by a
+  canary to a block confirmed warm; the next call answers `needs_confirmation` with the reason. Live-verified on fake
+  (`block_reaped_resume`, `byo_teardown_clean`, `draining_restop`, `stop_while_running`); the first live run caught the
+  empty-token-store bug above before it shipped. The harness now clears the pool user's token store before each cell.
+- **`block_reaped_resume`** (#158, regraded in #164): block reaped under an idle session → the spend re-ask naming the
+  reap, the session cwd survives the block (now said in `SKILL.md`), work completes on a new block.
 - Housekeeping: `agentic/sweep_endpoints.py` (#157) sweeps stale harness endpoint records under the shared identity.
 
 **Remaining V1 items** (plan of record `docs/hpc-bridge-vault/Planned/V1 release.md`): a purpose-named production
 registry index + curator of record (today's index is named `hpc-bridge-test`); re-prove each registry facility, then
 tag; retire `docs/design/*.md` into the vault. Aurora stays blocked on an allocation. (Some finished items in `V1 release.md` are still unticked — its narrative, not its boxes, is current.)
-
-**A loose branch:** `origin/feat/catalog-allocation-flow` (PR #17, merged in June) carries two later skill-wording
-commits that never reached `main` (`917cbdb`, `f5964f2`: "a wait only happens if you END YOUR TURN" / "stop encoding
-wait cadence"). The second matches the standing rule that the skill teaches domain, not harness plumbing; decide
-whether either is still wanted, then delete the branch.
 
 ## Building project context — start with the vault
 
@@ -100,6 +101,7 @@ The vault holds the *why* (design rationale, decisions, the reading order); this
 - **Hosts beyond Claude Code (#125–#148, #150, #151, #154):** guidance over MCP (0.1.15/0.1.16), hermes-agent and ALCF as a second
   operator, the ACP benchmark driver.
 - **0.1.17 (#153):** the account floor; scheduler rejections as a terminal `down`.
+- **0.1.18 (#164):** the plugin review closed; spend re-asked after a reap.
 
 **The one design idea to internalize:** a facility MEP has **no login shape** (its schema rejects our `LocalProvider`/`compute:false`). `MEPFacility` declares `supported_shapes = ("compute",)` and the server *derives* everything else from that one fact via `getattr(app.facility, "supported_shapes", …)`: no login shape ⇒ no free channel for the allocation listing / the #32 pilot query / the scancel release ⇒ **stop is draining-only, teardown is a detach, every shape is billed.** `SlurmFacility`/`LocalFacility` are untouched (they get the default = every shape).
 
@@ -114,10 +116,10 @@ The vault holds the *why* (design rationale, decisions, the reading order); this
 
 ```bash
 # Unit tests (fast, hermetic, no cluster) — the default gate.
-python -m pytest -q                                  # 552 passed, 2 skipped
+python -m pytest -q                                  # 626 passed, 2 skipped
 
 # Agentic harness graders (also hermetic — proves the graders, not the product).
-python -m pytest agentic/harness/test_invariants.py -q   # 78 passed (all harness tests: 299)
+python -m pytest agentic/harness/test_invariants.py -q   # 78 passed (all harness tests: 305)
 
 # Try it AS A FRESH USER (scratch Globus tokens + hpc-bridge state; launched outside the repo so no
 # repo-local config applies; the built-in registry is what gets exercised). Then say: connect me to globus-labs
@@ -162,9 +164,9 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 ## Open decisions / observations
 
-- **The `globus-labs` seed's `interface: enP7s7` is now inert** — the rebuilt MEP ignores `interface`. The entry schema requires the field, so keep it, but fix its "every node" comment at the next re-ingest.
+- **The `globus-labs` seed's `interface: enP7s7` is now inert** — the rebuilt MEP ignores `interface`. The entry schema requires the field, so it stays; its comment says so. The live registry entry was re-ingested 2026-10-05 with the 4-node description.
 - **`HPC_BRIDGE_USER_DIR` does not relocate the SDK's token storage** — only the *local* endpoint daemon's dir. The MCP process's tokens live at the SDK's `GLOBUS_COMPUTE_USER_DIR` (default `~/.globus_compute`); the harness and `fresh_user_session.sh` set both. An installed plugin therefore shares `~/.globus_compute/storage.db` with any other Globus Compute use on the machine (found in the vault audit; by design so far, but worth a docs line).
-- **Login-node pins:** a pin is dropped only on the registry/cached bootstrap path, only when a pin is in use, only after a connect fails with `CANNOT REACH` / `UNKNOWN HOST KEY`, and only if the facility's canonical host still answers (`connect._drop_dead_pin`); otherwise it is kept and the reset is deleting `~/.hpc-bridge/endpoints.json` by hand.
+- **Login-node pins:** a pin is dropped only on the registry/cached bootstrap path, only when a pin is in use, only after a connect fails with `CANNOT REACH` / `UNKNOWN HOST KEY`, and only if the facility's canonical host still answers (`connect._drop_dead_pin`); otherwise it is kept and the reset is deleting `~/.hpc-bridge/endpoints.json` by hand. Dropping a pin that still answers was considered and declined (2026-10-06).
 
 ## Gotchas (things that cost us time)
 
