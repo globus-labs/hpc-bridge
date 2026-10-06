@@ -171,12 +171,14 @@ class GlobusRunner:
             fut.add_done_callback(_stamp)
         try:
             res = await asyncio.to_thread(fut.result, timeout)
-        except TimeoutError as exc:
-            if fut.done() and not fut.cancelled() and fut.exception() is exc:
-                # the TASK failed with a TimeoutError — a result, not "still queued": hand it back and ask afresh
+        except TimeoutError:
+            task_exc = fut.exception() if fut.done() and not fut.cancelled() else None
+            if isinstance(task_exc, TimeoutError):
+                # the TASK failed with a TimeoutError — a result, not "still queued": hand it back and ask afresh.
+                # (By type, not identity: 3.11's asyncio re-creates a concurrent TimeoutError on the way out.)
                 if self._canary_fut is fut:
                     self._canary_fut = None
-                return CanaryResult(ok=False, error=dispatch_error_text(exc))
+                return CanaryResult(ok=False, error=dispatch_error_text(task_exc))
             return CanaryResult(ok=False, error="timeout")  # still queued: the NEXT probe waits on the same task
         except (CancelledError, asyncio.CancelledError):  # asyncio.to_thread raises asyncio's for a cancelled Future
             if not fut.cancelled():
