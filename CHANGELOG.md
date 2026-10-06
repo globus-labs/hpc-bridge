@@ -16,6 +16,16 @@ installed plugin only when that version changes); git tags mark releases.
   entry was verified with, `connect_facility` says so (STALE ENTRY): its packages may have moved, and a block that
   starts but never answers is then the likely result.
 
+### Changed
+- **One worker check in flight at a time.** Every probe of a cold block used to submit a new check task (24 in one
+  15-minute wait), and a facility endpoint keeps relaunching billed blocks for as long as any task is queued — on
+  Delta for up to 48 hours, with no way for the client to cancel. A pending check is now waited on again instead of
+  resubmitted.
+- **A long wait on a facility endpoint names the silent, billing case.** Still "allocating" after five minutes, the
+  notice now says it may be a block that is running while its worker cannot return results, which the facility
+  keeps relaunching; it tells the agent to stop and have the user check and cancel their jobs on the facility, and
+  repeats the attach's stale-entry note when there is one.
+
 ### Fixed
 - **Anvil and Delta run again.** Re-proving the registry on 0.1.18 found both broken by the same skew, in opposite
   directions: parsl's interchange↔worker protocol changes between releases and `globus-compute-endpoint` only sets a

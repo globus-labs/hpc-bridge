@@ -340,7 +340,9 @@ async def _ensure_endpoint_up(
             if rt.provisioning_since is None:  # start the grace clock on the first cold poll
                 rt.provisioning_since = time.monotonic()
             provisioning_elapsed = time.monotonic() - rt.provisioning_since
-            notice = _allocating_notice(active_partition, provisioning_elapsed, facility_mep=not _has_login_shape(app))
+            stale = getattr(app.facility, "stale_worker_note", lambda: None)()
+            notice = _allocating_notice(active_partition, provisioning_elapsed, facility_mep=not _has_login_shape(app),
+                                        stale=stale)
             if rt.transient_conflicts >= TRANSIENT_CONFLICT_LIMIT:
                 rt.provisioning_since = None
                 return EndpointStatus(

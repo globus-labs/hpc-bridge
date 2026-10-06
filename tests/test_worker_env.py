@@ -86,3 +86,15 @@ async def test_no_verified_version_means_no_staleness_claim():
     fac = MEPFacility.from_entry(entry, client_factory=lambda: _Client("9.9.9"))
     await fac.load_template()
     assert fac.stale_worker_note() is None
+
+
+def test_a_long_allocation_on_a_facility_endpoint_names_the_silent_block_and_the_stale_entry():
+    from hpc_bridge.notices import _allocating_notice
+
+    late = _allocating_notice("gpuA40x4", 480, facility_mep=True)
+    assert "RUNNING and billing" in late and "stop_endpoint" in late and "squeue" in late
+    assert "scheduler_options" in late  # the rejection case is still named
+    stale = "STALE ENTRY: this facility's endpoint now runs v4.17.0"
+    assert stale in _allocating_notice("gpuA40x4", 480, facility_mep=True, stale=stale)
+    assert "RUNNING" not in _allocating_notice("gpuA40x4", 120, facility_mep=True)  # not before five minutes
+    assert "RUNNING" not in _allocating_notice("main", 480, facility_mep=False)    # our own endpoints can stop

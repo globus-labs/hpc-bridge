@@ -79,11 +79,35 @@ class _ShellRes:
 
 
 class _CanaryFuture:
-    def __init__(self, result=None, exc=None):
+    """A resolved future (result or exception) — or, with pending=True, one still queued: result() times out
+    until resolve()/fail() is called."""
+
+    def __init__(self, result=None, exc=None, *, pending=False):
         self._r = result
         self._exc = exc
+        self._pending = pending
+        self._callbacks = []
+
+    def done(self):
+        return not self._pending
+
+    def cancelled(self):
+        return False
+
+    def add_done_callback(self, fn):
+        if self._pending:
+            self._callbacks.append(fn)
+        else:
+            fn(self)
+
+    def resolve(self, result=None, exc=None):
+        self._r, self._exc, self._pending = result, exc, False
+        for fn in self._callbacks:
+            fn(self)
 
     def result(self, timeout=None):
+        if self._pending:
+            raise TimeoutError()
         if self._exc is not None:
             raise self._exc
         return self._r
@@ -170,3 +194,61 @@ async def test_canary_survives_shutdown_executor():
     res = await r.canary(timeout=0.5)
     assert res.ok is False
     assert "shutdown" in (res.error or "").lower()
+
+
+
+class _QueueExecutor:
+    """Each submit hands back the next future from `futures` (pending ones simulate a cold block)."""
+
+    def __init__(self, *futures):
+        self.futures = list(futures)
+        self.submitted = []
+
+    def submit(self, fn):
+        self.submitted.append(fn)
+        return self.futures.pop(0)
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+async def test_a_pending_canary_is_waited_on_again_not_resubmitted():
+    # every probe used to submit a NEW canary: 24 queued in one cold-start wait on Delta, and a facility endpoint
+    # keeps relaunching billed blocks while any task is queued (2026-10-06)
+    pytest.importorskip("globus_compute_sdk")
+    pending = _CanaryFuture(pending=True)
+    ex = _QueueExecutor(pending)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    for _ in range(3):
+        assert (await r.canary(timeout=0.1)).error == "timeout"
+    assert len(ex.submitted) == 1
+    pending.resolve(_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 b001\n"))  # the block came up between probes
+    res = await r.canary(timeout=0.1)
+    assert res.ok and res.worker_host == "b001" and len(ex.submitted) == 1
+
+
+async def test_a_stale_answer_is_replaced_and_a_failure_is_not_reused(monkeypatch):
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge import runner as runner_mod
+
+    first = _CanaryFuture(pending=True)
+    second = _CanaryFuture(exc=RuntimeError("Executor is shutdown"))
+    third = _CanaryFuture(result=_ShellRes("HPCB_CANARY\n"))
+    ex = _QueueExecutor(first, second, third)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    await r.canary(timeout=0.1)
+    first.resolve(_ShellRes("HPCB_CANARY\n"))
+    monkeypatch.setattr(runner_mod, "_CANARY_FRESH_S", -1.0)  # that answer is now too old to vouch for the block
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and "Executor is shutdown" in res.error and len(ex.submitted) == 2
+    monkeypatch.setattr(runner_mod, "_CANARY_FRESH_S", 30.0)
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 3  # the failed one was not kept
+
+
+async def test_closing_the_runner_forgets_the_pending_canary():
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(pending=True), _CanaryFuture(result=_ShellRes("HPCB_CANARY\n")))
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    await r.canary(timeout=0.1)
+    r.close()
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2

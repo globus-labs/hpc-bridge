@@ -369,16 +369,27 @@ def _no_account_notice(app: AppCtx | None, error: str | None, identity: str | No
         "ask the facility's support, quoting that identity. Do not call ensure_endpoint_up again until they have."
     )
 
-def _allocating_notice(partition: str | None, elapsed_s: float, *, facility_mep: bool) -> str:
+def _allocating_notice(partition: str | None, elapsed_s: float, *, facility_mep: bool,
+                       stale: str | None = None) -> str:
     """The provisioning notice. After five minutes on a facility-run endpoint, say what the client cannot
     see: a scheduler REJECTION there looks exactly like an endless allocation (Anvil gpu-debug, live
-    2026-09-04: every sbatch failed the QOS policy — no GPU request — while the client saw 'allocating')."""
+    2026-09-04: every sbatch failed the QOS policy — no GPU request — while the client saw 'allocating'), and so
+    does a block that IS running but whose worker cannot hand results back (a package mismatch with the
+    facility's endpoint, Anvil and Delta 2026-10-06) — which bills, and which the facility keeps relaunching while
+    a task stays queued. `stale`: the attach's STALE ENTRY note, the likeliest cause of the latter."""
     notice = f"allocating nodes on {partition!r}…" if partition else "allocating nodes…"
     if facility_mep and elapsed_s >= 300:
-        notice += (f" Still allocating after {int(elapsed_s)}s. On a facility-run endpoint a scheduler rejection is "
-                   "invisible from here and looks exactly like this: check the account, the partition, and whether "
-                   "the partition needs a resource request (a GPU partition usually needs scheduler_options like "
-                   "'#SBATCH --gpus-per-node=1'); or try the facility's default partition.")
+        notice += (f" Still allocating after {int(elapsed_s)}s. On a facility-run endpoint the scheduler is invisible "
+                   "from here, so two different failures look exactly like this. (1) A scheduler rejection: check "
+                   "the account, the partition, and whether the partition needs a resource request (a GPU partition "
+                   "usually needs scheduler_options like '#SBATCH --gpus-per-node=1'); or try the facility's default "
+                   "partition. (2) A block that is RUNNING and billing while its worker cannot return results (a "
+                   "package mismatch with the facility's endpoint): the facility keeps relaunching blocks while the "
+                   "check task stays queued, and hpc-bridge cannot cancel them. Do not keep polling indefinitely: "
+                   "call stop_endpoint, and ask the user to check their jobs on the facility (e.g. squeue) and "
+                   "cancel any left running, or contact the facility.")
+        if stale:
+            notice += f" Likely here — {stale}."
     return notice
 
 
