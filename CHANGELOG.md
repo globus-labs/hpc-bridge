@@ -46,7 +46,8 @@ installed plugin only when that version changes); git tags mark releases.
   holding tokens is present — unless hpc-bridge's own record, for the same SSH login, says it placed that store (a
   stale copy of ours is refreshed; the flag is cleared when a wipe ran but the delete did not). A store with no tokens
   is replaced: `whoami` itself creates one on a node where nobody has logged in, and the first fake-cluster run of
-  this change refused every first bring-up on it. When it refuses,
+  this change refused every first bring-up on it. The check runs with the endpoint environment's `python3`; where
+  no python3 with sqlite3 exists, the connect says it could not check instead of guessing. When it refuses,
   `connect_facility` says so with whoami's own error. The check-and-write runs in `sh` whatever the login shell is
   (under tcsh the guard would have been skipped). Before, hpc-bridge replaced the user's credential and teardown later
   deleted the replacement.

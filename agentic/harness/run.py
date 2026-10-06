@@ -265,13 +265,26 @@ def _world_cmds(entries) -> list[tuple[str, str | None]]:
     return out
 
 
-def _preclean_token_store() -> None:
+def _is_pool_user(user: str | None = None) -> bool:
+    """The run's SSH user is one of the harness' own pool accounts (`hpcbridge-test`, `hpcbridge-test-NN`) — the only
+    accounts whose Globus token store the harness may delete. A recipe that runs as a REAL user (aurora_pbs_bringup:
+    HPC_BRIDGE_SSH_USER=<you>) must never lose that user's own login."""
+    user = user if user is not None else os.environ.get("HPC_BRIDGE_SSH_USER", "hpcbridge-test")
+    return user == "hpcbridge-test" or user.startswith("hpcbridge-test-")
+
+
+def _preclean_token_store(scen) -> None:
     """Remove the pool user's login-node token store BEFORE the agent starts, as the teardown does after. Every cell
     starts from a fresh jail with no endpoint record, so the plugin can never prove a store already on the node is its
     own — since 0.1.18 it then refuses to replace it (review 2026-09-05 #5). A cell that died before its teardown
     (Ctrl-C, a crashed run) left one, and the next cell on that pool user failed its first connect (live 2026-10-06:
     `whoami` "Please log in again" on a stale store). Runs before SETUP, so a scenario can still place a store on
-    purpose. Best-effort: the run's own connect reports a store that survives this."""
+    purpose. Skipped for a scenario that keeps the host key UNTRUSTED (the harness ssh would trust it first — its
+    accept-new writes the known_hosts the plugin reads) and for a non-pool user. Best-effort."""
+    if not getattr(scen, "TRUST_HOST_KEY", True) or not _is_pool_user():
+        print("pre-run: token store left alone (untrusted-host-key scenario, or not a harness pool user)",
+              file=sys.stderr, flush=True)
+        return
     rc, out = _ssh_run(token_store_cleanup_cmd(), timeout=60)
     print(f"pre-run: {out.strip()[:120] if rc == 0 else f'token store cleanup rc={rc}'}", file=sys.stderr, flush=True)
 
@@ -521,7 +534,8 @@ def _teardown(scen, res=None) -> str:
     )
     print(f"teardown: endpoint {name or '<unknown>'}; cancelling blocks of uuid(s) {eids or 'none'} …",
           file=sys.stderr, flush=True)
-    rc, out = _ssh_run(f"{delete}; {scoped_cancel_cmd(scheduler, eids)}; {uep_dirs_cleanup_cmd(eids)}; {token_store_cleanup_cmd()}",
+    store = token_store_cleanup_cmd() if _is_pool_user() else 'echo "token store left: not a harness pool user"'
+    rc, out = _ssh_run(f"{delete}; {scoped_cancel_cmd(scheduler, eids)}; {uep_dirs_cleanup_cmd(eids)}; {store}",
                        timeout=90)
     tag = "ok" if rc == 0 else f"rc={rc}"
     print(f"teardown: {tag} — {out.strip().replace(chr(10), ' ')[:200]}", file=sys.stderr, flush=True)
@@ -671,7 +685,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
-        _preclean_token_store()
+        _preclean_token_store(scen)
         if not _setup(scen) or not _local_setup(scen):
             print("RESULT: SETUP FAILED — scenario not run (world precondition unmet)")
             rc = 2

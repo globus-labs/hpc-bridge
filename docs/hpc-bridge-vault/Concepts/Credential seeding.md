@@ -6,8 +6,11 @@
 > node itself if `~/.globus_compute/storage.db` exists and holds tokens, unless the endpoint record says hpc-bridge
 > placed it (a stale copy of ours is refreshed), and the connect explains whoami's error instead. A store with NO tokens
 > is replaced: `whoami` creates exactly that (an empty SQLite store) on a node where nobody has logged in — the first
-> live run of 0.1.18 (2026-10-06) refused every first bring-up on it. The emptiness test is a read-only `python3`
-> sqlite count in the same `sh -c` as the write; no python3, an unreadable file or a missing table keep the store. The check-and-write runs under `sh -c`
+> live run of 0.1.18 (2026-10-06) refused every first bring-up on it. The emptiness test is a read-only sqlite count in
+> the same `sh -c` as the write, run by the gce environment's `python3` (noted by `whoami`) and then the plain PATH's;
+> an unreadable file or a missing table keeps the store, and with no python3 that has sqlite3 the connect says it
+> could not check (`HPCB_UNCHECKED`) rather than "has tokens". The check and the `rm` are not atomic: a store being
+> created by a hand-run `globus-compute-endpoint login` in that instant could be replaced (it holds no tokens yet). The check-and-write runs under `sh -c`
 > (the login shell may be tcsh or fish). Only a store hpc-bridge placed is marked `seeded_credentials` and wiped.
 
 > [!abstract] In one line

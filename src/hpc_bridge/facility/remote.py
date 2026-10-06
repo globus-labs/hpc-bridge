@@ -55,11 +55,15 @@ class RemoteTokenStoreExists(RuntimeError):
 
 
 # Exit 0 when the SQLite token store at argv[1] holds NO tokens — the empty store `globus-compute-endpoint whoami`
-# itself creates when nobody has logged in. Opened read-only; a missing table, an unreadable file or no python3 all
-# exit non-zero, which keeps the store. No `!`, `$` or double quotes: it rides inside a double-quoted `sh -c` argument
-# through any login shell (tcsh history-expands `!` even in single quotes).
-_EMPTY_STORE_PY = ("import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); "
+# itself creates when nobody has logged in; 1 when it holds tokens or cannot be read (a missing table, a lock, not
+# SQLite); 3 when this interpreter has no sqlite3, so the caller tries the next one. Opened read-only, the path
+# URI-escaped. No `!`, `$` or double quotes: it rides inside a double-quoted `sh -c` argument through any login shell
+# (tcsh history-expands `!` even in single quotes).
+_EMPTY_STORE_PY = ("import sys,importlib.util,urllib.parse; "
+                   "importlib.util.find_spec('_sqlite3') is None and sys.exit(3); import sqlite3; "
+                   "c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1])+'?mode=ro',uri=True); "
                    "sys.exit(0 if c.execute('select count(*) from token_storage').fetchone()[0]==0 else 1)")
+_PY_SENTINEL = "HPCB_PY="
 
 
 @dataclass(frozen=True)
@@ -402,6 +406,7 @@ class RemoteEndpointCLI:
     def __init__(self, target: SshTarget, env_setup: str, *, remote_dir: str = "$HOME/.globus_compute") -> None:
         self.target = target
         self.last_whoami_error: str | None = None  # the remote's words when `whoami` last failed
+        self.gce_python: str | None = None  # python3 inside the gce environment, seen by whoami (it has sqlite3)
         self.env_setup = env_setup
         self.remote_dir = remote_dir
 
@@ -518,11 +523,28 @@ class RemoteEndpointCLI:
         # that still runs the write (a silent overwrite), and fish cannot parse it at all. `set -C` (noclobber) closes
         # the check-then-write race too. stdin passes through `sh -c` to `base64 -d`.
         # A store with NO tokens holds no credential to protect: it is what `whoami` itself leaves on a node where
-        # nobody has logged in (live 2026-10-06 — refusing it broke every first SSH bring-up), so it is replaced.
+        # nobody has logged in (live 2026-10-06 — refusing it broke every first SSH bring-up), so it is replaced. The
+        # check tries the gce environment's python3 first (the plain PATH may have none with sqlite3), then python3.
+        # Not atomic with the rm: a store being CREATED in that instant (a `globus-compute-endpoint login` run by hand
+        # at the same moment, which writes an empty store before it asks for the code) can be replaced — accepted, as
+        # it holds no tokens yet; `set -C` still closes the race between the rm and our write.
+        pys = " ".join(shlex.quote(c) for c in dict.fromkeys(x for x in (self.gce_python, "python3") if x))
         inner = (f'db="{db_path}"; ' + ('' if replace_ours else
-                 f'if [ -e "$db" ]; then if python3 -c "{_EMPTY_STORE_PY}" "$db" 2>/dev/null; then rm -f "$db"; '
-                 'else echo HPCB_EXISTS; exit 3; fi; fi; set -C; ') + 'base64 -d > "$db"')
+                 f'if [ -e "$db" ]; then r=9; for py in {pys}; do if command -v "$py" >/dev/null 2>&1; then '
+                 f'"$py" -c "{_EMPTY_STORE_PY}" "$db" 2>/dev/null; r=$?; [ "$r" -le 1 ] && break; fi; done; '
+                 'if [ "$r" -eq 0 ]; then rm -f "$db" "$db-wal" "$db-shm" "$db-journal"; '
+                 'elif [ "$r" -eq 1 ]; then echo HPCB_EXISTS; exit 3; else echo HPCB_UNCHECKED; exit 4; fi; fi; '
+                 'set -C; ') + 'base64 -d > "$db"')
         rc, out, err = await ssh_exec(self.target, f"sh -c {shlex.quote(inner)}", stdin=payload)
+        if "HPCB_UNCHECKED" in (out or ""):
+            why = (self.last_whoami_error or "no output").strip()
+            raise RemoteTokenStoreExists(
+                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db) and "
+                "hpc-bridge could not check whether it holds tokens (no python3 with sqlite3 on the login node), so "
+                f"it will not replace it. `globus-compute-endpoint whoami` failed there: {why[-300:]}. If nobody has "
+                "logged in there, it is the empty store whoami leaves: remove it, or run `globus-compute-endpoint "
+                "login` there yourself, then call connect_facility again. Nothing was started or billed."
+            )
         if "HPCB_EXISTS" in (out or ""):
             why = (self.last_whoami_error or "no output").strip()
             raise RemoteTokenStoreExists(
@@ -728,8 +750,19 @@ class RemoteEndpointCLI:
 
     async def whoami(self) -> bool:
         """True if the remote endpoint can authenticate (storage.db usable). On failure the remote's own words are
-        kept in `last_whoami_error` — seed_storage_db quotes them if it then finds a store it must not replace."""
-        rc, out, err = await self._gce("whoami", timeout=_BOOTSTRAP_SSH_S)  # the first env_setup run lands here
+        kept in `last_whoami_error` — seed_storage_db quotes them if it then finds a store it must not replace. Also
+        notes the gce environment's python3 (`gce_python`): the interpreter seed_storage_db tries first to check
+        whether a store holds tokens, since the login node's plain PATH may have none with sqlite3."""
+        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix()}{{ command -v python3 >/dev/null 2>&1 && "
+                 f'echo "{_PY_SENTINEL}$(command -v python3)"; globus-compute-endpoint whoami; }}')
+        rc, out, err = await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=_BOOTSTRAP_SSH_S)
+        kept = []
+        for line in (out or "").splitlines():
+            if line.startswith(_PY_SENTINEL):
+                self.gce_python = line[len(_PY_SENTINEL):].strip() or None
+            else:
+                kept.append(line)
+        out = "\n".join(kept)
         self.last_whoami_error = None if rc == 0 else ((err or out or "").strip() or f"rc={rc}")
         return rc == 0
 

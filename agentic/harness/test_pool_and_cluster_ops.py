@@ -130,5 +130,20 @@ def test_every_cell_starts_without_a_token_store(monkeypatch, harness_run):
     from cluster_ops import token_store_cleanup_cmd
     seen = []
     monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, timeout=60, host=None: (seen.append(cmd), (0, "token store removed"))[1])
-    harness_run._preclean_token_store()
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "hpcbridge-test-03")
+    harness_run._preclean_token_store(object())
     assert seen == [token_store_cleanup_cmd()]
+
+
+def test_the_preclean_spares_an_untrusted_host_key_and_a_real_user(monkeypatch, harness_run):
+    # unknown_host_key needs the jail's known_hosts EMPTY in phase 1 (the harness ssh's accept-new would fill it), and
+    # a recipe run as a real user (aurora_pbs_bringup) must never lose that user's own Globus login
+    seen = []
+    monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, timeout=60, host=None: (seen.append(cmd), (0, ""))[1])
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "hpcbridge-test-00")
+    harness_run._preclean_token_store(type("S", (), {"TRUST_HOST_KEY": False})())
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "jdoe")
+    harness_run._preclean_token_store(object())
+    assert seen == []
+    assert harness_run._is_pool_user("hpcbridge-test") and harness_run._is_pool_user("hpcbridge-test-12")
+    assert not harness_run._is_pool_user("hpcbridge-tester") and not harness_run._is_pool_user("jdoe")

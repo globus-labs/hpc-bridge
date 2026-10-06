@@ -117,7 +117,7 @@ async def test_someone_elses_store_is_refused_and_never_marked_ours(tmp_path, mo
     assert store.get(alias=ALIAS, name=fac.profile.endpoint_name) is None and fac._seeded_by_us() is False
 
 
-async def _seed_command(monkeypatch, tmp_path, *, replace_ours: bool) -> str:
+async def _seed_command(monkeypatch, tmp_path, *, replace_ours: bool, gce_python: str | None = None) -> str:
     calls = []
 
     async def fake_ssh_exec(target, cmd, *, stdin=None, timeout=None):
@@ -126,6 +126,7 @@ async def _seed_command(monkeypatch, tmp_path, *, replace_ours: bool) -> str:
 
     monkeypatch.setattr(remote, "ssh_exec", fake_ssh_exec)
     cli = RemoteEndpointCLI(SshTarget(host="h", user="u"), "true")
+    cli.gce_python = gce_python
     await cli.seed_storage_db(_src_db(tmp_path), replace_ours=replace_ours)
     return next(c for c in calls if "base64 -d" in c)
 
@@ -191,6 +192,53 @@ async def test_an_empty_store_left_by_whoami_is_replaced_and_one_with_tokens_is_
     store.write_text("not sqlite")  # unreadable as a store: kept, never guessed empty
     out = run(guarded, "cmVwbGFjZWQ=\n")
     assert out.returncode == 3 and store.read_text() == "not sqlite"
+
+
+@pytest.mark.parametrize("shell", ["/bin/sh", "/bin/tcsh"])
+async def test_the_emptiness_check_uses_the_gce_python_and_says_when_it_cannot_check(shell, tmp_path, monkeypatch):
+    # the login node's plain PATH may have no python3 with sqlite3 (review of the fix): the check tries the gce
+    # environment's python3 first, and with none at all it refuses as UNCHECKED, not as "has tokens"
+    if not shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    home = tmp_path / "home"
+    (home / ".globus_compute").mkdir(parents=True)
+    tools = tmp_path / "bin"  # base64 (in /usr/bin on macOS) without the python3 that sits beside it
+    tools.mkdir()
+    (tools / "base64").symlink_to(shutil.which("base64"))
+    env = {"HOME": str(home), "PATH": f"{tools}:/bin"}  # no python3 here
+    store = home / ".globus_compute" / "storage.db"
+
+    def run(cmd, data):
+        return subprocess.run([shell, "-c", cmd], input=data, capture_output=True, text=True, env=env, check=False)
+
+    _sqlite_store(store, tokens=0)
+    plain = await _seed_command(monkeypatch, tmp_path, replace_ours=False)
+    out = run(plain, "cmVwbGFjZWQ=\n")
+    assert out.returncode == 4 and "HPCB_UNCHECKED" in out.stdout and store.read_bytes() != b"replaced"
+    via_gce = await _seed_command(monkeypatch, tmp_path, replace_ours=False, gce_python=sys.executable)
+    out = run(via_gce, "cmVwbGFjZWQ=\n")
+    assert out.returncode == 0 and store.read_bytes() == b"replaced", out.stderr + out.stdout
+
+
+async def test_an_unchecked_store_is_refused_with_its_own_reason(monkeypatch, tmp_path):
+    async def fake_ssh_exec(target, cmd, *, stdin=None, timeout=None):
+        return (4, "HPCB_UNCHECKED\n", "") if "base64" in cmd else (0, "", "")
+
+    monkeypatch.setattr(remote, "ssh_exec", fake_ssh_exec)
+    cli = RemoteEndpointCLI(SshTarget(host="login.example.edu", user="u"), "true")
+    with pytest.raises(RemoteTokenStoreExists) as err:
+        await cli.seed_storage_db(_src_db(tmp_path))
+    assert "could not check whether it holds tokens" in str(err.value)
+
+
+async def test_whoami_notes_the_gce_python_and_keeps_it_out_of_the_error(monkeypatch):
+    async def fake_ssh_exec(target, cmd, *, stdin=None, timeout=None):
+        return 1, "HPCB_PY=/home/u/venv/bin/python3\nError: Please log in again.\n", ""
+
+    monkeypatch.setattr(remote, "ssh_exec", fake_ssh_exec)
+    cli = RemoteEndpointCLI(SshTarget(host="h", user="u"), "true")
+    assert await cli.whoami() is False
+    assert cli.gce_python == "/home/u/venv/bin/python3" and cli.last_whoami_error == "Error: Please log in again."
 
 
 async def test_the_refusal_names_the_failed_whoami(monkeypatch, tmp_path):
