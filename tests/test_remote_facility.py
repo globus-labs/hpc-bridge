@@ -1297,3 +1297,32 @@ def test_pbs_template_omits_an_empty_account():
     assert _render_pbs('"cis250223"')["account"] == "cis250223"                # the facility default
     assert _render_pbs('""', account='"proj"')["account"] == "proj"             # the agent's choice
     assert _render_pbs('"cis250223"')["queue"] == "debug"
+
+
+def test_a_shared_partition_entry_can_ask_for_a_non_exclusive_block():
+    # Parsl's SlurmProvider defaults exclusive=True (`#SBATCH --exclusive`, a whole node): on Expanse `shared` (QOS
+    # max 127 CPUs/job, 128-core nodes) the block pended forever as QOSMaxCpuPerJobLimit (2026-10-06)
+    import dataclasses
+
+    f = SlurmFacility(dataclasses.replace(_profile(), exclusive=False), cli=None)
+    tmpl, defaults = f.config_template(Profile(mode="interactive"))
+    prov = _render(tmpl, {**defaults, **shape_config("compute")})["engine"]["provider"]
+    assert prov["exclusive"] is False
+    # unset: no key, so Parsl's own default stands (no change for every other facility)
+    tmpl, defaults = SlurmFacility(_profile(), cli=None).config_template(Profile(mode="interactive"))
+    assert "exclusive" not in _render(tmpl, {**defaults, **shape_config("compute")})["engine"]["provider"]
+    # a PBS facility has no such knob: it is never passed
+    pbs = dataclasses.replace(_profile(), exclusive=False, scheduler="pbs")
+    assert "exclusive" not in SlurmFacility(pbs, cli=None).config_template(Profile(mode="interactive"))[1]
+
+
+def test_the_expanse_entry_asks_for_a_non_exclusive_block():
+    from pathlib import Path
+
+    from hpc_bridge.catalog.bundled import BundledCatalog
+    from hpc_bridge.facility.remote import profile_from_catalog_entry
+
+    seeds = Path(remote.__file__).resolve().parents[1] / "catalog" / "seed"
+    entry = next(e for e in BundledCatalog(seeds / "sdsc-expanse.yaml").entries() if e.id == "expanse")
+    assert entry.defaults.exclusive is False
+    assert profile_from_catalog_entry(entry, user="u", account="chi152").exclusive is False

@@ -139,7 +139,7 @@ def test_profile_kwargs_maps_every_machineprofile_field():
         "name", "endpoint_name", "display_name", "env_setup", "interface",
         "partition", "walltime", "max_workers_per_node", "nodes_per_block",
         "max_blocks", "available_accelerators", "amqp_port", "scheduler_options",
-        "scratch_root", "scheduler", "cpus_per_node",
+        "scratch_root", "scheduler", "cpus_per_node", "exclusive",
     }
     assert set(kw) == expected
     assert "account" not in kw

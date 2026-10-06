@@ -3,6 +3,16 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.20 — 2026-10-06 — a block on a shared partition no longer asks for a whole node
+
+### Fixed
+- **Expanse's `shared` partition can run a block.** Parsl's Slurm provider defaults to `--exclusive`, which asks
+  for a whole node; Expanse's `shared` partition caps a job at 127 CPUs on 128-core nodes, so every hpc-bridge block
+  there pended forever (`QOSMaxCpuPerJobLimit`). Entries can now set `defaults.exclusive`, passed to the Slurm
+  provider only when set (every other facility keeps Parsl's default), and the Expanse entry sets `false`. Found
+  re-proving the registry: Expanse had only ever been run on its login node. An endpoint already running on a
+  facility keeps the template it was started with until it is torn down and bootstrapped again.
+
 ## 0.1.19 — 2026-10-06 — worker environments that match each facility's endpoint
 
 ### Added

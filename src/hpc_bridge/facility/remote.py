@@ -334,6 +334,7 @@ class MachineProfile:
     scratch_root: str | None = None  # session-shell root on the shared filesystem
     scheduler: Literal["slurm", "pbs"] = "slurm"  # "slurm" | "pbs" — selects the config_template branch
     cpus_per_node: int | None = None  # PBS: emitted as PBSProProvider.cpus_per_node; Slurm: unused
+    exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
 
 
 def profile_from_catalog_entry(
@@ -825,6 +826,9 @@ engine:
     init_blocks: {{ init_blocks | default(@@EAGER@@) }}
     min_blocks: 0
     max_blocks: {{ max_blocks | default(@@MAXBLK@@) }}
+{% if exclusive is defined and exclusive is not none %}
+    exclusive: {{ 'true' if exclusive else 'false' }}
+{% endif %}
 {% if scheduler_options is defined and scheduler_options %}
     scheduler_options: {{ scheduler_options }}
 {% endif %}
@@ -971,6 +975,8 @@ class SlurmFacility:
             defaults["available_accelerators"] = p.available_accelerators
         if p.cpus_per_node is not None:
             defaults["cpus_per_node"] = p.cpus_per_node
+        if p.exclusive is not None and p.scheduler == "slurm":
+            defaults["exclusive"] = p.exclusive
         return template, defaults
 
     async def bootstrap(self, hpc: Profile) -> EndpointHandle:
