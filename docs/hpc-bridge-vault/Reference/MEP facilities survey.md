@@ -159,3 +159,25 @@ knobs (qos, cores_per_node, scheduler_options…). Driver: `agentic/mep_live_che
 | **NCSA Delta** (`4a266c83…`, v4.15.0) | **PASS** | account `bgta-delta-gpu`, partition `gpuA40x4` + `#SBATCH --gpus-per-node=1`; block up in ~80 s; worker on gpub082 (py3.13.15, gce 4.15.0 pinned); `hostname; whoami` → `amcsweeneyellerm`; stop → draining. Facility stderr: "Task sandboxing will not work due to endpoint misconfiguration" (their template). Seed `ncsa-delta.yaml`. |
 | **Purdue Anvil MEP** (`5aafb4c1…`, manager v4.12.0, UEP v4.16.0; registry id `anvil` since 2026-09-04 — the SSH entry was retired) | **PASS** (after `worker_version: client`) | `gusellerm@uchicago.edu` mapped to `x-amcsweeneyel` (UEP started by the facility); strict schema satisfied after the drop; `shared` never scheduled in 15 min; `debug` block up in ~160 s, worker a006 (py3.13.12, gce 4.16.0 pinned to the CLIENT version — the UEP runs the client's SDK version, not the manager's 4.12.0; pinning 4.12 failed `--logconf`). `cis250223-gpu` on gpu-debug was REJECTED by QOS (GPU partitions need a GPU request) — proof the account reaches Slurm. Seed `anvil-mep` in `anvil.yaml`, ingested 2026-09-04. |
 | **SDSC Expanse** (SSH, TOTP at every login) | **PASS** (login shape) | the pre-auth handoff exercised for real: probe refused under BatchMode → NeedsPreauth → the user opened the ControlMaster with the plugin's command (one code) → probe over it proposed ib0/debug → bootstrap self-provisioned uv + gce 4.16.0 at py3.13 (system python 3.6; first install >120 s → the 900 s bootstrap timeout) → login shape up in ~55 s (login02) → teardown (delete had to wait for stop to land). Seed `sdsc-expanse.yaml` (mfa-otp), ingested 2026-09-04. No compute block run yet. |
+
+**Re-prove on 0.1.18 (2026-10-06)**, `agentic/mep_live_check.py`, identity `gusellerm@uchicago.edu`:
+- **globus-labs** (lab MEP, rebuilt 2026-10-01) — **PASS**: worker on spark2 as `glabs-gc` in ~80 s. The client is
+  Python 3.13.12 and the workers 3.12.3: the SDK only warns, and the shell function crosses fine.
+- **Anvil** — **FAIL, then PASS after a seed fix.** The block ran (job 21135790, a004) and the canary EXECUTED (its
+  stdout is in the UEP's `tasks_working_dir`), but the interchange dropped the result: `Failed to read manager message
+  … too many values to unpack (expected 2)`. The facility rebuilds the user endpoint's venv at every start and had
+  pulled parsl **2026.10.05** (released the day before); our worker venv, built earlier and only re-checked for gce,
+  still had parsl **2026.08.10**. `--upgrade` in the entry's worker_init makes the worker resolve the same latest
+  dependencies (`worker_env.strategy: float`, 0.1.19); re-run: worker on a000 as `x-amcsweeneyel` in ~180 s. Lesson: on a MEP whose UEP env floats, the
+  worker must float the same way (or pin parsl to the UEP's) — pinning gce alone is not enough.
+- **Delta** — **FAIL, the same skew in the OTHER direction** (first misread as facility-side: the web service showed
+  every task `waiting-for-ep`, but on Delta the user endpoint HAD started, run the canaries, and its blocks had
+  registered workers). Delta's endpoint runs the MEP's own fixed install — gce 4.16.0, **parsl 2026.08.10**, py3.13.13
+  (its log) — while a fresh worker venv picks the newest parsl (2026.10.05; also what `--upgrade` does). The workers ran
+  the tasks (`Completed executor task`) but no result arrived, and because the tasks stayed queued, BOTH of the day's
+  user endpoints kept relaunching 15-minute A40 blocks (`idle_heartbeats_hard` = 48 h; hpc-bridge has no cancel channel
+  on a MEP, and `stop_endpoint` on a UEP id is `ENDPOINT_NOT_FOUND` to the user). ~1.7 GPU-h before it was stopped: a
+  temporary `~/.config/uv/uv.toml` `constraint-dependencies = ["parsl==2026.8.10"]` on Delta pinned the worker venv, the
+  queued tasks completed (21 success, 3 failed on cancelled blocks), and the endpoints released their blocks.
+  Fix (0.1.19): Delta's entry pins `"parsl==2026.8.10"` in its install, `worker_env.strategy: pin`.
+- **Expanse** — pending (needs the user's one-time code).

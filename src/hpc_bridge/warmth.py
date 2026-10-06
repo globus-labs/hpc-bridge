@@ -143,7 +143,9 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     result = await runner.canary(timeout=CANARY_TIMEOUT_S)
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
     if result.ok:
-        rt.warm_confirmed_at = now
+        # dated from when the worker actually answered (it can predate this call by up to the runner's freshness
+        # window), so the TTL, the idle clock and the reap estimate all measure from real proof
+        rt.warm_confirmed_at = min(now, result.answered_at) if result.answered_at else now
         rt.transient_conflicts = 0
         rt.provisioning_since = None  # warm by any route: a later cold start must not inherit a stale clock
         return "warm"

@@ -79,11 +79,38 @@ class _ShellRes:
 
 
 class _CanaryFuture:
-    def __init__(self, result=None, exc=None):
+    """A resolved future (result or exception) — or, with pending=True, one still queued: result() times out
+    until resolve()/fail() is called."""
+
+    def __init__(self, result=None, exc=None, *, pending=False):
         self._r = result
         self._exc = exc
+        self._pending = pending
+        self._callbacks = []
+
+    def done(self):
+        return not self._pending
+
+    def cancelled(self):
+        return False
+
+    def exception(self, timeout=None):
+        return None if self._pending else self._exc
+
+    def add_done_callback(self, fn):
+        if self._pending:
+            self._callbacks.append(fn)
+        else:
+            fn(self)
+
+    def resolve(self, result=None, exc=None):
+        self._r, self._exc, self._pending = result, exc, False
+        for fn in self._callbacks:
+            fn(self)
 
     def result(self, timeout=None):
+        if self._pending:
+            raise TimeoutError()
         if self._exc is not None:
             raise self._exc
         return self._r
@@ -115,7 +142,7 @@ async def test_canary_ok_parses_worker_versions():
 async def test_canary_timeout_reports_not_ok():
     # No worker answered within the budget -> not warm (block still cold-starting), NOT an exception.
     pytest.importorskip("globus_compute_sdk")
-    ex = _CanaryExecutor(exc=TimeoutError())
+    ex = _QueueExecutor(_CanaryFuture(pending=True))
     r = GlobusRunner("eid", executor_factory=lambda: ex)
     res = await r.canary(timeout=0.5)
     assert res.ok is False and res.error == "timeout"
@@ -170,3 +197,149 @@ async def test_canary_survives_shutdown_executor():
     res = await r.canary(timeout=0.5)
     assert res.ok is False
     assert "shutdown" in (res.error or "").lower()
+
+
+
+class _QueueExecutor:
+    """Each submit hands back the next future from `futures` (pending ones simulate a cold block)."""
+
+    def __init__(self, *futures):
+        self.futures = list(futures)
+        self.submitted = []
+
+    def submit(self, fn):
+        self.submitted.append(fn)
+        return self.futures.pop(0)
+
+    def shutdown(self, wait=True, cancel_futures=False):
+        pass
+
+
+async def test_a_pending_canary_is_waited_on_again_not_resubmitted():
+    # every probe used to submit a NEW canary: 24 queued in one cold-start wait on Delta, and a facility endpoint
+    # keeps relaunching billed blocks while any task is queued (2026-10-06)
+    pytest.importorskip("globus_compute_sdk")
+    pending = _CanaryFuture(pending=True)
+    ex = _QueueExecutor(pending)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    for _ in range(3):
+        assert (await r.canary(timeout=0.1)).error == "timeout"
+    assert len(ex.submitted) == 1
+    pending.resolve(_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 b001\n"))  # the block came up between probes
+    res = await r.canary(timeout=0.1)
+    assert res.ok and res.worker_host == "b001" and len(ex.submitted) == 1
+
+
+async def test_a_stale_answer_is_replaced_and_a_failure_is_not_reused(monkeypatch):
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge import runner as runner_mod
+
+    first = _CanaryFuture(pending=True)
+    second = _CanaryFuture(exc=RuntimeError("Executor is shutdown"))
+    third = _CanaryFuture(result=_ShellRes("HPCB_CANARY\n"))
+    ex = _QueueExecutor(first, second, third)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    await r.canary(timeout=0.1)
+    first.resolve(_ShellRes("HPCB_CANARY\n"))
+    monkeypatch.setattr(runner_mod, "_CANARY_FRESH_S", -1.0)  # that answer is now too old to vouch for the block
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and "Executor is shutdown" in res.error and len(ex.submitted) == 2
+    monkeypatch.setattr(runner_mod, "_CANARY_FRESH_S", 30.0)
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 3  # the failed one was not kept
+
+
+async def test_closing_the_runner_forgets_the_pending_canary():
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(pending=True), _CanaryFuture(result=_ShellRes("HPCB_CANARY\n")))
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    await r.canary(timeout=0.1)
+    r.close()
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2
+
+
+async def test_a_canary_pending_past_the_max_wait_is_abandoned_for_a_fresh_one(monkeypatch):
+    # an endpoint that restarts can drop a task it had accepted: waiting on it forever wedged the shape (review)
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge import runner as runner_mod
+
+    lost, fresh = _CanaryFuture(pending=True), _CanaryFuture(result=_ShellRes("HPCB_CANARY\n"))
+    ex = _QueueExecutor(lost, fresh)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    assert (await r.canary(timeout=0.1)).error == "timeout"
+    assert (await r.canary(timeout=0.1)).error == "timeout" and len(ex.submitted) == 1  # still within the wait
+    monkeypatch.setattr(runner_mod, "_CANARY_MAX_WAIT_S", -1.0)
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2
+
+
+async def test_a_failure_that_arrived_unwatched_is_handed_back_whatever_its_age(monkeypatch):
+    # a no-account verdict resolving between probes must reach the caller (it is terminal), not be discarded as
+    # stale and replaced by a resubmit into a shut-down Executor (review)
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge import runner as runner_mod
+
+    verdict = _CanaryFuture(pending=True)
+    ex = _QueueExecutor(verdict, _CanaryFuture(result=_ShellRes("HPCB_CANARY\n")))
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    await r.canary(timeout=0.1)
+    verdict.resolve(exc=RuntimeError("Identity failed to map to a local user name"))
+    monkeypatch.setattr(runner_mod, "_CANARY_FRESH_S", -1.0)
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and "Identity failed to map" in res.error and len(ex.submitted) == 1
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2  # handed back once, then a fresh ask
+
+
+async def test_a_cancelled_canary_is_replaced():
+    pytest.importorskip("globus_compute_sdk")
+    from concurrent.futures import Future
+
+    cancelled: Future = Future()
+    cancelled.cancel()
+    ok: Future = Future()
+    ok.set_result(_ShellRes("HPCB_CANARY\n"))
+    ex = _QueueExecutor(cancelled, ok)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and "cancelled" in res.error
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2
+
+
+async def test_warmth_is_dated_from_when_the_worker_answered():
+    # an answer that arrived while nobody was waiting is up to _CANARY_FRESH_S old: the 45 s TTL, the idle clock
+    # and the reap estimate must measure from it, not from when it was read (review)
+    pytest.importorskip("globus_compute_sdk")
+    import time
+
+    from hpc_bridge.profile import Profile
+    from hpc_bridge.server import AppCtx, _ensure_endpoint_up, _shape_runtime
+    from tests.fakes import FakeFacility
+
+    pending = _CanaryFuture(pending=True)
+    ex = _QueueExecutor(pending)
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    other = _QueueExecutor(*[_CanaryFuture(result=_ShellRes("")) for _ in range(5)])  # the login shape's pilot query
+
+    def factory(eid, user_endpoint_config=None, **kw):
+        mine = ex if (user_endpoint_config or {}).get("compute") else other
+        return GlobusRunner(eid, executor_factory=lambda: mine)
+
+    app.runner_factory = factory
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    pending.resolve(_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 b001\n"))
+    runner = _shape_runtime(app, "compute").runner
+    runner._canary_done_at = time.monotonic() - 20  # it answered 20 s before the next probe
+    assert (await _ensure_endpoint_up(app)).status == "up"
+    rt = _shape_runtime(app, "compute")
+    assert time.monotonic() - rt.warm_confirmed_at >= 19.9  # the real answer time, not when it was read
+    assert len(ex.submitted) == 1                            # and the pending canary was reused, not resubmitted
+
+
+async def test_a_task_that_failed_with_a_timeout_error_is_a_failure_not_pending():
+    # a done future whose exception IS a TimeoutError used to read as "still queued" forever (verification)
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(exc=TimeoutError("worker walltime")), _CanaryFuture(result=_ShellRes("HPCB_CANARY\n")))
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and res.error != "timeout" and "worker walltime" in res.error
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2

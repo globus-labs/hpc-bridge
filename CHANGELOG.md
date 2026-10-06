@@ -3,6 +3,49 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.19 — 2026-10-06 — worker environments that match each facility's endpoint
+
+### Added
+- **Registry entries say how their worker keeps pace with the facility.** A facility-endpoint entry carries
+  `compute.worker_env`: `strategy` `pin` (the facility runs a fixed install, and the entry's worker install pins
+  its packages to it) or `float` (the facility rebuilds at the latest versions at every start, and the worker
+  installs with `--upgrade`), checked against the install line, plus `verified_with`, the facility endpoint version
+  the entry was proven against. The install stays literal in `env_setup`, so plugins older than this one, reading
+  the same registry, also get a working worker. Clients read `worker_env` leniently: an unknown strategy or a
+  garbled block costs the staleness check, never the facility. The strict check (a `pin` names its `parsl==`, a
+  `float` upgrades the endpoint install itself, `verified_with` is set) runs when the curator ingests.
+- **An upgraded facility is flagged at attach.** When the facility's live endpoint version differs from the one the
+  entry was verified with, `connect_facility` says so (STALE ENTRY): its packages may have moved, and a block that
+  starts but never answers is then the likely result.
+
+### Changed
+- **One worker check in flight at a time.** Every probe of a cold block used to submit a new check task (24 in one
+  15-minute wait), and a facility endpoint keeps relaunching billed blocks for as long as any task is queued — on
+  Delta for up to 48 hours, with no way for the client to cancel. A pending check is now waited on again instead of
+  resubmitted; one still pending after five minutes is abandoned for a single fresh one (an endpoint that restarts
+  can drop a task), and warmth is dated from when the worker actually answered.
+- **A long wait on a facility endpoint names the silent, billing case.** Still "allocating" after five minutes, the
+  notice names the three things it can be — a long queue, a scheduler rejection, or a block running while its
+  worker cannot return results, which the facility keeps relaunching — and how the user's `squeue` tells them apart
+  (PENDING, no job, RUNNING), and repeats the attach's stale-entry note when there is one. The facility stop notice
+  no longer implies a queued check task can't keep blocks coming.
+
+### Fixed
+- **Anvil and Delta run again.** Re-proving the registry on 0.1.18 found both broken by the same skew, in opposite
+  directions: parsl's interchange↔worker protocol changes between releases and `globus-compute-endpoint` only sets a
+  parsl floor. Anvil rebuilds its user endpoint at the latest versions and had moved to parsl 2026.10.05 while our
+  worker venv kept 2026.08.10; Delta's fixed install runs 2026.08.10 while a fresh worker venv picks 2026.10.05.
+  Either way the block ran and billed while the endpoint dropped every result, and on Delta the endpoint kept
+  relaunching GPU blocks for its queued tasks. Anvil's entry now floats (`--upgrade`), Delta's pins
+  `parsl==2026.8.10`; `globus-labs` states the parsl its gce version pins. **These reach installed plugins
+  through the live registry**, so they take effect once the entries are re-ingested, whatever plugin version is
+  installed. A `float` facility can still skew if its endpoint process stays up across a parsl release (weekly)
+  and then starts a new block; reusing the facility endpoint's own venv would close that, and is a follow-up.
+- **A failed status call no longer drops the worker pin.** When the facility's status API failed, the template
+  was never read, the worker setup lost its version and was dropped, and the facility's own default (no parsl pin
+  on Delta) ran instead. The template is read regardless, and an unreadable version falls back to the one the
+  entry was verified with.
+
 ## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
 
 ### Changed

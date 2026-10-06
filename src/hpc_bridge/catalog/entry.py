@@ -34,6 +34,100 @@ MEP_RENAMEABLE_KEYS = frozenset({
 })
 
 
+_VERSION = re.compile(r"^v?[0-9][0-9A-Za-z.+-]{0,31}$")
+WORKER_STRATEGIES = ("pin", "float")
+
+
+class WorkerEnv(BaseModel):
+    """Facility-MEP entries: how the worker pool's Python packages are kept in step with the facility's USER
+    endpoint process. parsl's interchange<->worker protocol changes between releases without compatibility, and
+    globus-compute-endpoint only sets a parsl FLOOR (4.16.0: parsl>=2026.7.27) — so the same endpoint version can
+    run different parsl, and a skew makes the block run (and bill) while every result is dropped (2026-10-06:
+    Anvil's UEP floated to a newer parsl than our worker; Delta's fixed install sat on an older one than a fresh
+    worker venv picks).
+
+    The install itself stays in `env_setup` (literal pins / `--upgrade`), so EVERY plugin version reading the
+    registry gets a working worker — a new placeholder there would reach older plugins unresolved. This records
+    the strategy and what the entry was proven against.
+
+    Read LENIENTLY: every installed plugin parses registry entries, so a strategy a later curator adds must not
+    make this version drop the facility. `worker_env_problems` is the strict check, run at ingest."""
+
+    # "pin": the facility runs a FIXED install; env_setup pins the worker's packages to it (explicit parsl==…).
+    # "float": the facility rebuilds the UEP's environment at the latest versions at every start; env_setup
+    # installs with --upgrade so the worker resolves the same (racy across a parsl release while a UEP lives).
+    strategy: str
+    # The facility endpoint version (`endpoint_version` in its metadata) the entry was last proven against. At
+    # attach, a different live version means the facility upgraded since — its packages may have moved. Also the
+    # `{gce_version}` fallback when the live version can't be read.
+    verified_with: str | None = None
+
+    @field_validator("verified_with")
+    @classmethod
+    def _version(cls, v: str | None) -> str | None:
+        v = (v or "").strip()
+        return v.lstrip("vV") if _VERSION.match(v) else None  # unusable -> no claim, never a broken entry
+
+
+def _install_segments(env_setup: str) -> list[str]:
+    """The `… pip install …` commands in an env_setup line that install globus-compute-endpoint."""
+    parts = re.split(r";|&&|\|\||\n", env_setup)
+    return [p for p in parts if "pip install" in p and "globus-compute-endpoint" in p]
+
+
+def _upgrades(segment: str) -> bool:
+    """Whether a pip/uv install command upgrades every package: `--upgrade`, or `-U` in a short-flag cluster
+    (`-qU`). `-P`/`--upgrade-package X` upgrades only X — not a float."""
+    for tok in segment.split():
+        if tok == "--upgrade" or (tok.startswith("-") and not tok.startswith("--") and "U" in tok[1:]):
+            return True
+    return False
+
+
+def worker_env_raw_problems(raw: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `compute.worker_env`, before the lenient parse can forgive it: a block
+    the client would silently drop (a list, a missing strategy, an unquoted `verified_with: 4.16` YAML float) must
+    be refused at ingest, not published as null — that would quietly remove the entry's verified-version fallback."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return [f"worker_env must be a mapping, got {type(raw).__name__}"]
+    problems = []
+    if not isinstance(raw.get("strategy"), str):
+        problems.append("worker_env.strategy must be a string (pin | float)")
+    vw = raw.get("verified_with")
+    if not isinstance(vw, str) or not _VERSION.match(vw.strip()):
+        problems.append(f"worker_env.verified_with must be a quoted version string like \"4.16.0\", got {vw!r}")
+    unknown = sorted(set(raw) - {"strategy", "verified_with"})
+    if unknown:
+        problems.append(f"worker_env has unknown key(s) {unknown}")
+    return problems
+
+
+def worker_env_problems(compute: Compute) -> list[str]:
+    """The curator's strict check of `worker_env` against env_setup (run at ingest; clients read leniently)."""
+    we = compute.worker_env
+    if we is None:
+        return []
+    problems = []
+    if we.strategy not in WORKER_STRATEGIES:
+        problems.append(f"worker_env.strategy {we.strategy!r} is not one of {list(WORKER_STRATEGIES)}")
+    if we.verified_with is None:
+        problems.append("worker_env.verified_with is missing (the facility endpoint version the entry was proven with)")
+    segs = _install_segments(compute.env_setup)
+    if not segs:
+        problems.append("env_setup has no `pip install … globus-compute-endpoint…` command for worker_env to describe")
+    elif we.strategy == "float" and not any(_upgrades(s) for s in segs):
+        problems.append("worker_env.strategy 'float' needs `--upgrade` (or -U) on the globus-compute-endpoint install")
+    elif we.strategy == "pin":
+        if any(_upgrades(s) for s in segs):
+            problems.append("worker_env.strategy 'pin' must not upgrade the install (it would float)")
+        if not any(re.search(r"parsl==[0-9]", s) for s in segs):
+            problems.append("worker_env.strategy 'pin' needs an explicit parsl==… on the install "
+                            "(gce sets only a floor)")
+    return problems
+
+
 class Compute(BaseModel):
     """Machine-invariant facts the plugin PINS — the user/agent cannot override these.
 
@@ -78,6 +172,16 @@ class Compute(BaseModel):
     # See docs/hpc-bridge-vault/Reference/MEP facilities survey.md and .../Planned/Endpoint reuse and MEP
     # integration.md (M3: "curate the allowed user_endpoint_config in the entry").
     key_map: dict[str, str] = Field(default_factory=dict)
+    worker_env: WorkerEnv | None = None  # facility-MEP entries: see WorkerEnv
+
+    @field_validator("worker_env", mode="wrap")
+    @classmethod
+    def _lenient_worker_env(cls, v: Any, handler: Any) -> WorkerEnv | None:
+        # A malformed worker_env costs this facility its staleness check, never the whole entry.
+        try:
+            return handler(v)
+        except (ValueError, TypeError):
+            return None
 
     @field_validator("key_map")
     @classmethod
