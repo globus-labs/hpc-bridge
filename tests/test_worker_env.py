@@ -218,3 +218,18 @@ def test_the_pin_note_says_when_the_version_came_from_the_entry():
     fac = MEPFacility.from_entry(_seed("ncsa-delta.yaml", "delta"))
     fac.sanitize_uec(fac.config_template(None)[1])  # live version never read (the startup-pinned path)
     assert any("verified with" in n and "not read" in n for n in fac.template_notes)
+
+
+def test_ingest_takes_a_seed_directory(tmp_path):
+    # `hpc-bridge-catalog <index> <dir>` ingests every *.yaml in it; the raw worker_env check must read the same set
+    from hpc_bridge.catalog.ingest import ingest
+
+    sent = []
+
+    class _Search:
+        def ingest(self, index, doc):
+            sent.append(doc)
+
+    for name in ("ncsa-delta.yaml", "anvil.yaml", "globus-cluster.yaml"):
+        (tmp_path / name).write_text((SEEDS / name).read_text())
+    assert ingest("idx", tmp_path, _Search()) == 3 and len(sent) == 1
