@@ -202,10 +202,13 @@ async def test_the_emptiness_check_uses_the_gce_python_and_says_when_it_cannot_c
         pytest.skip(f"{shell} not installed")
     home = tmp_path / "home"
     (home / ".globus_compute").mkdir(parents=True)
-    tools = tmp_path / "bin"  # base64 (in /usr/bin on macOS) without the python3 that sits beside it
+    # a PATH holding only what the command runs (no python3): /bin is not enough — on merged-/usr systems (Ubuntu
+    # CI) it IS /usr/bin, python3 included
+    tools = tmp_path / "bin"
     tools.mkdir()
-    (tools / "base64").symlink_to(shutil.which("base64"))
-    env = {"HOME": str(home), "PATH": f"{tools}:/bin"}  # no python3 here
+    for tool in ("sh", "rm", "base64"):
+        (tools / tool).symlink_to(shutil.which(tool))
+    env = {"HOME": str(home), "PATH": str(tools)}
     store = home / ".globus_compute" / "storage.db"
 
     def run(cmd, data):
