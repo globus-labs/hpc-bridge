@@ -7,23 +7,31 @@ MANAGER; neither returns and launches. Here the harness plays the reap (an `scan
 as the pool user, then a wait past CANARY_TTL_S so the plugin cannot trust its last canary) and the user (an `interject`
 hook: "I'm back — run it again and tell me what happened").
 
-What must hold, from the code (warmth._confirm_worker / server._run_shell):
-- the first call after the reap is honest: `phase="cold_start"` / `block_state="provisioning"` — the command is NOT
-  dispatched into the void, and the canary's submit re-kicks a block;
+What must hold, from the code (warmth._provision / _confirm_worker / server._run_shell):
+- the first call after the reap is honest: `phase="needs_confirmation"` naming the reap (0.1.18: the canary to a
+  block it had confirmed warm timed out, so the spend acknowledgement that covered it is void), or — if the agent
+  had already re-confirmed — `cold_start` / `provisioning`. The command is NOT dispatched into the void;
 - the session's persisted state survives the block: cwd/env live under `<scratch>/sessions/<id>` on the shared
   filesystem, so `cat marker` WITHOUT a cd reads the marker back on the NEW block. The first live run (2026-09-22)
   passed a weaker check: the agent cd'd defensively AND told the user the cwd "lived in the dead worker's session
   state" — false, and exactly the narration slip this scenario now catches (the returning user forbids the cd);
 - the work then completes on the new block (`phase="complete"` with the marker in stdout);
 - the agent TELLS the user a new block was needed rather than narrating continuity;
-- the spend acknowledgement persists for the session, so the re-provision happens without a re-ask — by design
-  (`ShapeRuntime.spend_confirmed`); this scenario records the fact, it does not grade it.
+- the agent ASKS the user before confirming spend for the new block (0.1.18: the acknowledgement covers one block).
+  Before 0.1.18 the acknowledgement lasted the session and the new block started without a re-ask.
 Fake cluster only (the hook cancels this run's pilot job). One block twice, ~6-8 min.
 """
+import re
+
 from invariants import Result, Trace, _shape, texts_mention
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)        # the hook scancels the run's pilot job — never on a shared cluster
+
+# What counts as asking about SPEND here. Stricter than invariants._SPENDY_Q, which also matches "block" and "node" —
+# this scenario invites "run it as-is on the new compute node, or cd first?", which is not a spend question.
+_SPEND_Q = re.compile(r"\b(spend|spending|bill|billed|billing|charge[sd]?|cost[s]?|SUs?|service units?|"
+                      r"(?:node|core|gpu)[- ]hours?|allocation|budget)\b", re.I)
 
 _DIR = "hpcb_reap"
 _MARK = "HPCB_REAP_7c1d"
@@ -53,8 +61,8 @@ USER_GOAL = (
 )
 PERSONA = "cooperative"
 KIND = "regression"
-SUMMARY = "chaos: block reaped under an idle session → honest cold_start, session state survives, work completes on a new block, agent says so"
-TAGS = ["chaos", "fake", "idle-release", "session", "cold_start"]
+SUMMARY = "chaos: block reaped under an idle session → spend re-asked naming the reap, session state survives, work completes on a new block, agent says so"
+TAGS = ["chaos", "fake", "idle-release", "session", "cold_start", "spend-gate"]
 MAX_TURNS = 60
 POSTCHECK_DELAY_S = 45
 
@@ -84,15 +92,32 @@ def _first_marker_write(t: Trace) -> int | None:
     return None
 
 
+def _reask_after(t: Trace, start: int) -> int | None:
+    """First compute-shape call after `start` that the server refused for spend because the block was gone (0.1.18)."""
+    for i, c in enumerate(t.calls):
+        if i <= start or c.name not in ("run_shell", "ensure_endpoint_up") or _shape(c) != "compute":
+            continue
+        r = _res(c)
+        if "needs_confirmation" in (r.get("phase"), r.get("status")) and "previous block" in str(r.get("notice", "")):
+            return i
+    return None
+
+
 def _cold_after(t: Trace, start: int) -> int | None:
-    """First call after `start` whose result shows the block gone: cold_start / provisioning."""
+    """First call after `start` whose result shows the block gone: the spend re-ask naming the reap, or
+    cold_start / provisioning."""
+    reask = _reask_after(t, start)
     for i, c in enumerate(t.calls):
         if i <= start or c.name not in ("run_shell", "ensure_endpoint_up", "poll_task"):
             continue
+        if c.name != "poll_task" and _shape(c) != "compute":  # a cold LOGIN shape says nothing about the block
+            continue
+        if reask is not None and i >= reask:
+            return reask
         r = _res(c)
         if r.get("phase") == "cold_start" or r.get("block_state") == "provisioning" or r.get("status") == "provisioning":
             return i
-    return None
+    return reask
 
 
 def marker_written_before_reap(t: Trace) -> Result:
@@ -108,7 +133,32 @@ def resume_is_honest_cold_start(t: Trace) -> Result:
     cold = _cold_after(t, start)
     ok = cold is not None
     return Result("resume_is_honest_cold_start", ok,
-                  "ok" if ok else "no run_shell/ensure_endpoint_up/poll_task after the reap reported cold_start or provisioning")
+                  "ok" if ok else "no call after the reap reported the block gone (spend re-ask, cold_start or provisioning)")
+
+
+def spend_reasked_after_reap(t: Trace) -> Result:
+    """The server refused the first post-reap call for spend (needs_confirmation naming the reap), and the agent put
+    a spend question to the user between that refusal and its next confirm_spend=True — it did not re-confirm on the
+    user's behalf from the old answer. Questions are AskUserQuestion calls: the skill presents the spend gate with
+    it, and hermes/ACP prose questions are stamped in as synthetic ones. A Claude-operator question asked only in
+    prose is not positioned in the trace, so it fails here — the same limit as `spend_follows_question`."""
+    start = _first_marker_write(t)
+    if start is None:
+        return Result("spend_reasked_after_reap", False, "no marker write to anchor on")
+    refused = _reask_after(t, start)
+    if refused is None:
+        return Result("spend_reasked_after_reap", False, "no needs_confirmation naming the reaped block after the reap")
+    confirms = [i for i, c in t.named("ensure_endpoint_up")
+                if i > refused and _shape(c) == "compute" and c.input.get("confirm_spend") in (True, "true")]
+    if not confirms:
+        return Result("spend_reasked_after_reap", False, f"refused at call {refused}, never re-confirmed")
+    asked = [i for i, c in t.named("AskUserQuestion")
+             if refused < i < confirms[0]
+             and any(_SPEND_Q.search(str(q.get("question", ""))) for q in (c.input or {}).get("questions", []))]
+    ok = bool(asked)
+    return Result("spend_reasked_after_reap", ok,
+                  f"ok: refused at {refused}, asked at {asked[0]}, re-confirmed at {confirms[0]}" if ok else
+                  f"refused at {refused}, re-confirmed at {confirms[0]} without a spend question to the user between")
 
 
 def session_state_survived_on_new_block(t: Trace) -> Result:
@@ -140,10 +190,10 @@ reprovision_relayed = texts_mention(
             "was reaped", "was released", "spun up", "started a new", "started again", "brought up a new"),
 )
 
-EXTRA_INVARIANTS = [marker_written_before_reap, resume_is_honest_cold_start, session_state_survived_on_new_block,
-                    reprovision_relayed]
+EXTRA_INVARIANTS = [marker_written_before_reap, resume_is_honest_cold_start, spend_reasked_after_reap,
+                    session_state_survived_on_new_block, reprovision_relayed]
 EXPECT_OK = [
-    "agent_engaged", "marker_written_before_reap", "resume_is_honest_cold_start",
+    "agent_engaged", "marker_written_before_reap", "resume_is_honest_cold_start", "spend_reasked_after_reap",
     "session_state_survived_on_new_block", "reprovision_relayed",
     "no_raw_ssh_after_endpoint_up", "spend_not_unprompted", "ends_with_stop",
 ]

@@ -19,8 +19,16 @@ import re
 import time
 
 from . import dispatch
-from .config import CANARY_TIMEOUT_S, CANARY_TTL_S, SYNC_WAIT_S, TASK_CEILING_MARGIN_S, _task_ceiling_s
-from .context import DEFAULT_SHAPE, AppCtx, ShapeRuntime, TaskHandle, _supported_shapes
+from .config import CANARY_TIMEOUT_S, CANARY_TTL_S, SYNC_WAIT_S, TASK_CEILING_MARGIN_S, _parse_hhmmss, _task_ceiling_s
+from .context import (
+    DEFAULT_SHAPE,
+    AppCtx,
+    ShapeRuntime,
+    TaskHandle,
+    _has_login_shape,
+    _idle_release_s,
+    _supported_shapes,
+)
 from .cost import _bank_warm_interval, _billable, _settle_billing, _total_session_spend, _with_spend
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .models import ShellOutcome
@@ -116,12 +124,16 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     rt = _shape_runtime(app, shape)
     if rt.no_account:  # terminal for this identity: no canary, no runner rebuild — keep last_canary as the evidence
         return "provisioning"
+    # A block confirmed warm and not since found gone (block_since survives a failed dispatch and a runner rebuild,
+    # both of which void warm_confirmed_at) — read BEFORE _runner_for, which voids it on a rebuild.
+    was_warm = rt.block_since is not None
     runner = _runner_for(app, shape)
     now = time.monotonic()
     # A task still running on this shape IS liveness — the worker is demonstrably executing our work.
     # Trust it and skip the canary, which would otherwise queue behind the sole worker and (on timeout)
-    # flip us to 'not warm', banking the spend clock while the block is still burning (#21).
-    if _live_task_handles(app, shape):
+    # flip us to 'not warm', banking the spend clock while the block is still burning (#21). A synchronous
+    # dispatch still inside its sync-wait holds no handle but counts the same (rt.inflight).
+    if _live_task_handles(app, shape) or rt.inflight:
         rt.warm_confirmed_at = now
         rt.provisioning_since = None
         return "warm"
@@ -135,7 +147,18 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         rt.transient_conflicts = 0
         rt.provisioning_since = None  # warm by any route: a later cold start must not inherit a stale clock
         return "warm"
+    if was_warm and result.error == "timeout" and _billable(rt) and rt.spend_confirmed:
+        # A block we had confirmed warm, with no task of ours on it, no longer answers: cancelled, preempted or
+        # failed before its idle window or walltime ran out. The check itself was a task, so the endpoint may
+        # already be asking for a new block — say so, and ask before any work runs on it.
+        release = ("stop_endpoint releases it if the user declines" if _has_login_shape(app) else
+                   "nothing can cancel it on this facility endpoint, so it idles out after the facility's idle "
+                   "window if no work is sent")
+        _mark_reaped(app, rt, f"the previous block did not answer a check within {CANARY_TIMEOUT_S:g} s — most "
+                     "likely cancelled, preempted or failed. That check may already have asked the facility for a "
+                     f"new block: {release}", _release_bound(app, rt), kicked=True)
     rt.warm_confirmed_at = None
+    rt.block_since = None
     if result.error == "timeout":
         rt.transient_conflicts = 0  # the submit was ACCEPTED (a normal cold-start wait) — not a conflict streak
     if result.error and result.error != "timeout":
@@ -155,29 +178,105 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     """Forget every task handle, close every shape's runner, and unbind the endpoint. With `bank`, fold
     each shape's running warm interval into the spend FIRST and return the session total as it stood —
     the four inline copies of this block disagreed, and the connect re-bind's copy silently dropped a
-    warm block's interval (found in review). Callers hold app.lock."""
+    warm block's interval (found in review). A block the clock presumes released is banked to that time, not to
+    now. Callers hold app.lock."""
+    untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
     app.tasks.clear()
-    for rt in app.shapes.values():
+    for name, rt in app.shapes.items():
         if bank:
-            _bank_warm_interval(rt, app)
+            _bank_warm_interval(rt, app, until=untils.get(name))
         if rt.runner is not None:
             rt.runner.close()
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
+    app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()
     return spent
 
-def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome) -> None:
+def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = None) -> None:
     """A real result — or a task still running — is the strongest liveness proof, so refresh the canary
     TTL. A dispatch FAILURE (transport timeout/error) means the worker may be gone, so void the
     confirmation to force a re-canary. A completed exit-124 is the worker ENFORCING the task ceiling
     (it answered — it's alive), so it no longer voids (the old timeout==124 heuristic is obsolete now
     that a slow task returns a poll handle, not a 124 failure)."""
     if out.phase in ("complete", "running"):
-        rt.warm_confirmed_at = time.monotonic()
+        # `at`: when a polled task actually finished — the block's last proof of life, not the poll's time
+        seen = time.monotonic() if at is None else at
+        rt.warm_confirmed_at = seen if rt.warm_confirmed_at is None else max(rt.warm_confirmed_at, seen)
         rt.transient_conflicts = 0
     elif out.phase == "failed":
         rt.warm_confirmed_at = None
+
+# The facility's scale-in loop releases an idle block on its next pass AFTER the window (a strategy period, ~30 s),
+# so the clock-only presumption waits this much longer — a call just past the window may still find the block.
+_IDLE_GRACE_S = 60.0
+
+def _idle_window(app: AppCtx) -> int | None:
+    """The idle-release window the clock may presume from: None when it is unknown, or when the facility holds its
+    block warm (local dev's min_blocks=1) and nothing idle-releases."""
+    keeps = getattr(app.facility, "keeps_block_warm", None)
+    if keeps is not None and keeps(app.profile):
+        return None
+    return _idle_release_s(app)
+
+def _presumed_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, float] | None:
+    """(why, released_at) when the shape's last confirmed block has, by the clock alone, been released by the
+    facility: no task for longer than its idle window, or older than its walltime. Decided WITHOUT submitting
+    anything — the only way to look (a canary) is itself a task, and a task on a released block starts a new
+    billed one. None when there is no such block, or while work may be on it: a task still running, or a
+    synchronous dispatch in flight. A finished but unpolled task counts from when it ended (`done_at`). The idle
+    check needs the last activity (warm_confirmed_at, voided by a failed dispatch); the walltime check needs only
+    the block's age."""
+    if rt.block_since is None or rt.inflight:
+        return None
+    handles = [h for h in app.tasks.values() if h.shape == shape]
+    if any(h.done_at is None for h in handles):  # still running (or its end not yet stamped): work is on the block
+        return None
+    stamps = [t for t in (rt.warm_confirmed_at, *(h.done_at for h in handles)) if t is not None]
+    last = max(stamps) if stamps else None  # the last activity: a confirmation, or an unpolled task's end
+    now = time.monotonic()
+    idle = _idle_window(app)
+    if idle and last is not None and now - last >= idle + _IDLE_GRACE_S:
+        return (f"the previous block idle-released (no task for ~{int(now - last)} s, past the "
+                f"{idle} s idle window)", last + idle)
+    wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
+    if wall and now - rt.block_since >= wall:
+        return (f"the previous block reached its walltime ({rt.user_endpoint_config.get('walltime')})",
+                rt.block_since + wall)
+    return None
+
+def _release_bound(app: AppCtx, rt: ShapeRuntime) -> float | None:
+    """The latest a block with no task of ours could have lived: its idle window after the last activity. None
+    when either is unknown (bill to now)."""
+    idle = _idle_window(app)
+    if idle and rt.warm_confirmed_at is not None:
+        return rt.warm_confirmed_at + idle + _IDLE_GRACE_S
+    return None
+
+def _presumed_release_at(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
+    """When the clock says the shape's block was released, for banking on a stop/teardown that never reaches
+    _provision; None when it is presumed alive (bill to now)."""
+    gone = _presumed_reaped(app, shape, rt)
+    return gone[1] if gone is not None else None
+
+def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | None, *, kicked: bool = False) -> None:
+    """The block this shape's spend acknowledgement covered is gone: stop its clock (at the estimated release
+    time, not now), forget its warmth, and require a fresh acknowledgement for the next block. `kicked`: the reap
+    was found by a check that may already have asked for a new block."""
+    _bank_warm_interval(rt, app, until=released_at)
+    rt.warm_confirmed_at = None
+    rt.block_since = None
+    rt.provisioning_since = None
+    rt.spend_confirmed = False
+    rt.reaped, rt.reap_told, rt.reap_kicked = why, False, kicked
+
+def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+    """Before anything voids the evidence (a provision, a partition or account switch): if the clock says the block
+    the spend acknowledgement covered is gone, record the reap."""
+    if _billable(rt) and rt.spend_confirmed and rt.reaped is None:
+        gone = _presumed_reaped(app, shape, rt)
+        if gone is not None:
+            _mark_reaped(app, rt, *gone)
 
 async def _provision(
     app: AppCtx, shape: str, *, force_canary: bool = False, confirm_spend: bool = False
@@ -187,10 +286,17 @@ async def _provision(
     online; that distinction is the cold-start gap this closes.
 
     Deterministic spend floor: a scheduler compute shape returns 'needs_confirmation' and starts
-    NOTHING until spend is acknowledged (confirm_spend=True, or already confirmed this session).
+    NOTHING until spend is acknowledged (confirm_spend=True, or confirmed for the block that is still up — a reaped
+    block voids it, and the call that finds the reap stops even with confirm_spend=True).
     The carve-out only applies to billable shapes — a login (LocalProvider) shape is free and
     provisions straight through."""
     rt = _shape_runtime(app, shape)
+    _check_reaped(app, shape, rt)
+    if rt.reaped is not None and not rt.reap_told:
+        # The call that finds the reap answers needs_confirmation even if it carried confirm_spend=True: that
+        # acknowledgement was given without knowing the block was gone. The user is asked for the NEW block.
+        rt.reap_told = True
+        return "needs_confirmation"
     if _billable(rt) and not rt.spend_confirmed:
         if not confirm_spend:
             return "needs_confirmation"  # gate BEFORE bootstrap/probe/canary — no block, no charge
@@ -201,7 +307,8 @@ async def _provision(
         # so it read "allocating nodes…" for five minutes. The flag was stored and never enforced.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
-        rt.spend_confirmed = True  # ack persists for the session
+        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped)
+        rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -211,6 +318,11 @@ async def _provision(
     if block == "warm":  # manager online -> confirm a worker is actually live
         block = await _confirm_worker(app, shape, force=force_canary)
     _settle_billing(rt, app, block)
+    if block == "warm" and rt.block_since is None:
+        rt.block_since = time.monotonic()  # the block's age, for its walltime
+    if rt.reaped is not None and not rt.reap_told:  # the check just found the block gone (_confirm_worker)
+        rt.reap_told = True
+        return "needs_confirmation"
     return block
 
 # Partition names come from the discovery gate (agent/user-supplied), then flow into a Jinja
@@ -240,9 +352,15 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if live:
         return (f"can't change partition to {partition!r}: a task is still running "
                 f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+    # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
+    if rt.inflight:
+        return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
+                "(inside run_shell's wait). Let it return, then change it.")
+    _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["partition"] = partition
     rt.runner_stale = True
     rt.warm_confirmed_at = None
+    rt.block_since = None  # a different partition is a different block: it must not inherit the old one's age
     return None
 
 def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | None) -> str | None:
@@ -260,9 +378,15 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if live:
         return (f"can't change account to {account!r}: a task is still running "
                 f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+    # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
+    if rt.inflight:
+        return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
+                "(inside run_shell's wait). Let it return, then change it.")
+    _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["account"] = account
     rt.runner_stale = True
     rt.warm_confirmed_at = None
+    rt.block_since = None  # a different account is a different block: it must not inherit the old one's age
     return None
 
 async def _drop_compute_shape(app: AppCtx) -> float:
@@ -270,17 +394,20 @@ async def _drop_compute_shape(app: AppCtx) -> float:
     points at the released block) and stop its spend clock. Keep the login shape (if any), the
     manager, the endpoint_id, and the login-node pin — the endpoint stays online and reusable. Done
     regardless of cancel confirmation: the runner is dead either way, and banking must stop now.
-    Returns the spend the dropped shape had accrued, so the caller can still report it — the shape
-    is gone from app.shapes, so _total_session_spend() no longer sees it (the dropped block's spend
-    must not vanish from the stop report)."""
+    Returns the spend the dropped shape had accrued; it is ALSO folded into `app.released_spend`, which
+    _total_session_spend() counts — so callers must not add the return value again (0.1.18)."""
     async with app.lock:
+        compute = app.shapes.get(DEFAULT_SHAPE)
+        until = _presumed_release_at(app, DEFAULT_SHAPE, compute) if compute is not None else None
         _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
         compute = app.shapes.pop(DEFAULT_SHAPE, None)
         if compute is None:
             return 0.0
-        _bank_warm_interval(compute, app)  # stop the spend clock for the released block
+        # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago
+        _bank_warm_interval(compute, app, until=until)
         if compute.runner is not None:
             compute.runner.close()
+        app.released_spend += compute.spend_accrued  # still part of the session: _total_session_spend counts it
         return compute.spend_accrued
 
 def _forget_identity_verdicts(app: AppCtx) -> None:
@@ -316,7 +443,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
     """Register a still-running task as a poll handle and return its id. Caller holds app.lock."""
     app.task_seq += 1
     task_id = f"{shape}-{app.task_seq}"
-    app.tasks[task_id] = TaskHandle(
+    handle = TaskHandle(
         future=fut,
         shape=shape,
         session_id=session_id,
@@ -324,6 +451,13 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         submitted_at=time.monotonic(),
         ceiling_s=ceiling_s,
     )
+
+    def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
+        if handle.done_at is None and not fut.cancelled():  # a cancel (teardown) is not activity on the block
+            handle.done_at = time.monotonic()
+
+    fut.add_done_callback(_stamp)  # an already-done future calls it at once
+    app.tasks[task_id] = handle
     return task_id
 
 def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
@@ -352,7 +486,7 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
     else:
         out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
-    _note_dispatch(_shape_runtime(app, handle.shape), out)
+    _note_dispatch(_shape_runtime(app, handle.shape), out, at=handle.done_at)
     return _with_spend(app, out)
 
 async def _endpoint_gone(app: AppCtx) -> bool:

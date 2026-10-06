@@ -52,9 +52,21 @@ class ShapeRuntime:
     # wedged — the 'call again' hint must stop (a model sweep showed Sonnet retrying 7× on it).
     transient_conflicts: int = 0
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
-    # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). Persists for the
-    # session once given (no re-nagging); cleared on stop/reset when the shape state is dropped.
+    # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
+    # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
+    # the block is reaped (idle-release, walltime, or found gone) so the NEXT block is asked for again (0.1.18).
     spend_confirmed: bool = False
+    # When the current block was first confirmed warm (for its walltime), and why it is presumed or known gone.
+    # `reap_told`: the agent has been handed that reason once — the call that detects a reap always answers
+    # needs_confirmation, even if it carried confirm_spend=True, so the user is asked AFTER learning of the reap.
+    # `reap_kicked`: the reap was found by a check (a task), which may already have asked for a new block.
+    block_since: float | None = None
+    reaped: str | None = None
+    reap_told: bool = False
+    reap_kicked: bool = False
+    # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
+    # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
+    inflight: int = 0
 
 
 @dataclass
@@ -69,6 +81,9 @@ class TaskHandle:
     command: str
     submitted_at: float
     ceiling_s: float
+    # When the future resolved (stamped by a done-callback), so a poll long after the task ended does not pass
+    # for recent activity on the idle clock (0.1.18).
+    done_at: float | None = None
 
 
 @dataclass
@@ -110,6 +125,15 @@ class AppCtx:
     # A teardown whose login-node ops (gce stop + delete over SSH) outlived one tool call's wait: the ops run on in
     # this task; the next teardown_endpoint call reports its result (or waits again). See server._teardown_endpoint.
     teardown_task: asyncio.Task[Any] | None = None
+    # The endpoint `teardown_task` was started for, and how its block release went (None = still releasing,
+    # True = confirmed, False = dispatched but NOT confirmed) — a finished result is replayed only for the endpoint
+    # it belongs to, and the interim `tearing_down` notice says what is true of the release (review 2026-10-05).
+    teardown_eid: str | None = None
+    teardown_release: bool | None = None
+    # Spend of blocks already RELEASED on this binding: their shapes are gone from `shapes`, so without this every
+    # later result (a teardown resumed after its one-time code, a retry) under-reported the session. Cleared with
+    # the binding (`warmth._drop_all_shapes`).
+    released_spend: float = 0.0
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
@@ -126,7 +150,13 @@ def _supported_shapes(app: AppCtx) -> tuple[str, ...]:
 def _has_login_shape(app: AppCtx) -> bool:
     return "login" in _supported_shapes(app)
 
-def _idle_release_s(app: AppCtx) -> int:
-    """The block's idle-release window: the facility's own (a MEP's template), else our profile's.
+def _idle_release_s(app: AppCtx) -> int | None:
+    """The block's idle-release window in seconds, or None when it is the FACILITY's and unknown.
+    A facility that declares the attribute (a MEP) owns the window: its template's value when hpc-bridge could read
+    it, else None — never our profile's 600 s, which is what we WRITE into our own endpoints' templates, not theirs
+    (review 2026-09-05 #6a). Every other facility runs the template we wrote, so the profile value is the truth.
     One source — the warm-block bounds note and the MEP stop notice used to read different ones."""
-    return int(getattr(app.facility, "max_idletime_s", None) or app.profile.max_idletime_s)
+    if hasattr(app.facility, "max_idletime_s"):
+        val = app.facility.max_idletime_s
+        return int(val) if val else None
+    return int(app.profile.max_idletime_s)

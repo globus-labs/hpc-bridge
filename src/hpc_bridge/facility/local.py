@@ -15,13 +15,18 @@ class LocalFacility:
         self.cli = cli
         self.endpoint_name = endpoint_name
 
+    def keeps_block_warm(self, profile: Profile) -> bool:
+        """The interactive profile holds its LocalProvider block (min_blocks=1): it never idle-releases, so the
+        clock alone must never presume it gone."""
+        return profile.mode == "interactive"
+
     def config_template(self, profile: Profile) -> dict:
         # The per-user-process (UEP) template content. In globus-compute-endpoint 4.x
         # the engine lives here, not in the manager config.yaml. The interactive profile
         # holds a warm block (min_blocks>=1) — a LocalProvider block costs no allocation, so
         # unlike SlurmFacility (which forces min_blocks=0 + an idle timer to avoid leaking
         # SU) we keep it warm for snappy local dev; batch scales to zero.
-        warm = profile.mode == "interactive"
+        warm = self.keeps_block_warm(profile)
         return {
             "engine": {
                 "type": "GlobusComputeEngine",

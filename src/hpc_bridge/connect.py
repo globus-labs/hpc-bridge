@@ -214,6 +214,19 @@ async def _connect_facility(
             notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
         )
     async with app.lock:  # switch facilities: drop the old shapes/endpoint, bind the new one
+        if app.teardown_task is not None and not app.teardown_task.done():
+            # The teardown runs on the facility it snapshotted, but re-binding under it would drop the shapes its
+            # spend report and state-clearing read — finish it first (review 2026-09-05 #3).
+            return ConnectFacilityResult(
+                phase="failed", facility=facility,
+                notice=("a teardown of the current endpoint is still running on its login node. Call "
+                        "teardown_endpoint to wait for it (it reports 'down' when done), then connect_facility again."),
+            )
+        app.teardown_task = None  # a FINISHED teardown's result belongs to the endpoint this connect replaces
+        # A pending one-time-code handoff belongs to the previous binding: complete_preauth must not open a
+        # connection to it and tell the agent to re-connect there, dropping this facility (review 2026-09-05 #3).
+        app.pending_preauth = None
+        app.preauth_resume = None
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's blocks/handles are gone
         app.facility = fac
         app.machine = facility
@@ -382,6 +395,7 @@ async def _propose_or_ask(
     except NeedsPreauth as pre:  # host wants an interactive login (password/MFA) — hand off to the user
         if app is not None:
             app.pending_preauth = (facility, pre.target)  # what complete_preauth(code) will open
+            app.preauth_resume = f"connect_facility({facility!r})"  # never a stale "teardown_endpoint()"
         return _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
     except Exception as exc:  # noqa: BLE001 - probe/connect/creds failure -> structured result
         # The same first-contact explanation the bootstrap gives (stranger's walk): a refused SSH is

@@ -10,8 +10,8 @@ comes at the first command.
 
 ## What a block costs
 
-A block is a scheduler job of one node, held for as long as you are active plus the facility's idle
-timeout. Its walltime is the facility's default unless you ask for another. The agent reports a
+A block is a scheduler job — one node on every facility in the registry today — held for as long as you are active
+plus the facility's idle timeout (the agent quotes it when the facility publishes it, and says so when it does not). Its walltime is the facility's default unless you ask for another. The agent reports a
 session spend estimate; it is a real number only if you have set `HPC_BRIDGE_CHARGE_FACTOR` to your
 allocation's service-unit rate per node-hour (hpc-bridge does not know your facility's rates), and reads
 as zero otherwise, as it always does on unmetered machines such as Globus Labs' cluster. Zero does not

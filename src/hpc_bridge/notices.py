@@ -57,6 +57,8 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     account or key on the facility must instead hear WHICH host and login name were tried, where the
     name came from, and the two remedies (found on the stranger's walk, 2026-09-03)."""
     raw = str(exc)
+    if type(exc).__name__ == "RemoteTokenStoreExists":  # already says what to do; its quoted whoami text could
+        return raw                                       # otherwise be misread as an SSH denial or a network error
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -80,6 +82,11 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
             "connect_facility again; on a multi-factor facility, pre-open a session in your own terminal "
             f"first. The login name came from {src}. Nothing was started or billed."
         )
+    if "revoked" in low and ("host key" in low or "revoked by file" in low):
+        # never "not in known_hosts yet, connect and accept": the key is on a revocation list (known_hosts @revoked
+        # or RevokedHostKeys) — a stolen-key signature. Not prefixed UNKNOWN HOST KEY, so the pin is not dropped.
+        return (f"REVOKED HOST KEY for {host}: the key it presents is on your revocation list ({ssh_line[:160]}). "
+                "Do NOT connect; contact the facility. Nothing was started or billed.")
     if _HOST_KEY_UNKNOWN.search(raw):
         who = f"{user}@{host}" if user else host
         changed = "identification has changed" in low or ("host key for" in low and "changed" in low)
@@ -141,19 +148,39 @@ def _billed_bounds_note(app: AppCtx, rt: ShapeRuntime) -> str:
     NOT cut at ~110s any more. The block idle-releases after `max_idletime` once nothing is running or
     queued, so keep long work in the FOREGROUND (a running task holds the block); a detached process
     is not a Compute task and would be idle-released out from under itself."""
-    idle = _idle_release_s(app)
     ceiling = int(_task_ceiling_s(rt.user_endpoint_config))
     return (f"billed block bounds — a task runs up to ~{ceiling}s (the block walltime); one that "
             f"outlives the ~{int(SYNC_WAIT_S)}s sync-wait returns a poll handle (poll_task), it is NOT "
-            f"cut. The block idle-releases after ~{idle}s once nothing runs or is queued, so run long "
-            "work as a foreground task — don't detach it (a detached process isn't a Compute task).")
+            f"cut. The block idle-releases after {_idle_window_text(app)} once nothing runs or is queued, so run "
+            "long work as a foreground task — don't detach it (a detached process isn't a Compute task).")
 
-def _needs_confirmation_notice(app: AppCtx, where: str) -> str:
+def _idle_window_text(app: AppCtx) -> str:
+    """The idle-release window as the agent should relay it: a number only when it is KNOWN. A facility endpoint's
+    window is the facility's (its template), and hpc-bridge's own 600 s default is not it (review 2026-09-05 #6a)."""
+    idle = _idle_release_s(app)
+    if idle is not None:
+        return f"~{idle}s"
+    return "the facility's own idle window (its template sets none hpc-bridge can read)"
+
+def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None = None) -> str:
     """The spend-floor notice. Names the free login shape as the alternative ONLY where one exists —
-    on a compute-only facility every shape is billed, so pointing at shape='login' is a dead-end."""
-    head = (f"scheduler compute block{where} ({app.profile.nodes_per_block} node(s)): spend "
-            "not yet confirmed. ")
-    return head + _spend_floor_guidance(app)
+    on a compute-only facility every shape is billed, so pointing at shape='login' is a dead-end. The size is the
+    block's own (its config), not the never-set profile default (review 2026-09-05 #6b)."""
+    from .cost import _block_nodes
+
+    uec = rt.user_endpoint_config if rt is not None else {}
+    size = f"{_block_nodes(rt, app) if rt is not None else app.profile.nodes_per_block} node(s)"
+    if uec.get("walltime"):
+        size += f" × walltime {uec['walltime']}"
+    head = f"scheduler compute block{where} ({size}): spend not yet confirmed. "
+    return _reap_prefix(rt) + head + _spend_floor_guidance(app)
+
+def _reap_prefix(rt: ShapeRuntime | None) -> str:
+    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone."""
+    if rt is None or rt.reaped is None:
+        return ""
+    return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; a new "
+            "block bills again. ")
 
 def _spend_floor_guidance(app: AppCtx | None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -390,13 +417,15 @@ def _needs_account_outcome(app: AppCtx | None = None) -> ShellOutcome:
     )
 
 
-def _needs_confirmation_outcome(app: AppCtx | None = None) -> ShellOutcome:
+def _needs_confirmation_outcome(app: AppCtx | None = None, rt: ShapeRuntime | None = None) -> ShellOutcome:
     """A billed shape whose spend wasn't acknowledged: the command is NOT dispatched and no
-    block is started. The agent must run the budget gate and confirm via ensure_endpoint_up."""
+    block is started by it. The agent must run the budget gate and confirm via ensure_endpoint_up.
+    After a reap found by a check, that check may already be bringing a block up — say so in block_state."""
     return ShellOutcome(
         phase="needs_confirmation",
-        block_state="cold",
-        notice="scheduler compute shape: spend not confirmed, so nothing ran. " + _spend_floor_guidance(app),
+        block_state="provisioning" if rt is not None and rt.reap_kicked else "cold",
+        notice=_reap_prefix(rt) + "scheduler compute shape: spend not confirmed, so nothing ran. "
+        + _spend_floor_guidance(app),
     )
 
 def _busy_session_outcome(task_id: str, shape: str, session_id: str) -> ShellOutcome:
