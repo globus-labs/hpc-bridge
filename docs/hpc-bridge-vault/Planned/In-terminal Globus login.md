@@ -3,7 +3,7 @@
 > [!abstract] In one line
 > Replace the manual prerequisite (`globus-compute-endpoint login` in a terminal, before first use) with a **Cloudflare-shaped OAuth login that the agent surfaces and the browser completes** — a `needs_login` phase carrying an authorize URL; the browser redirects back to a loopback listener inside the server and the session continues; paste-back as the fallback. One consent covers every scope hpc-bridge needs. It rides the **Compute SDK's own `UserApp`** (same client id, same `storage.db`) so endpoint credential seeding keeps working unchanged. Tier-2 item B of [[V1 release]]; the same mechanism later carries a MEP's consent (M2).
 
-> [!success] Built and merged — 2026-09-03, [PR #48](https://github.com/ryanchard/hpc-bridge/issues/48)
+> [!success] Built and merged — 2026-09-03, [PR #48](https://github.com/globus-labs/hpc-bridge/issues/48)
 > This note is the design record and its live findings. The implementation is documented as ground truth in [[login]] (`LoginFlow`, the wait-and-continue, `globus_identity_label`) and [[login_flow_manager]] (the quiet loopback manager, paste-back); the tools and phases in [[The MCP tools]] / [[models]]; the gate's position in [[server]]. `HPC_BRIDGE_LOGIN_WAIT_S` in [[Configuration]].
 
 ## Why

@@ -1,7 +1,7 @@
 # login.py
 
 > [!abstract] Role
-> The **in-terminal Globus login** — surfaced as a *phase* (`needs_login`), never a prompt. `LoginFlow` arms one OAuth login per server process (a browser loopback flow, or paste-back for headless sessions), riding the Compute SDK's **own** client id and `storage.db` so the credential it stores is the one a started endpoint can refresh. Design record + live findings: [[In-terminal Globus login]] (Tier-2 B of [[V1 release]], [#48](https://github.com/ryanchard/hpc-bridge/issues/48)).
+> The **in-terminal Globus login** — surfaced as a *phase* (`needs_login`), never a prompt. `LoginFlow` arms one OAuth login per server process (a browser loopback flow, or paste-back for headless sessions), riding the Compute SDK's **own** client id and `storage.db` so the credential it stores is the one a started endpoint can refresh. Design record + live findings: [[In-terminal Globus login]] (Tier-2 B of [[V1 release]], [#48](https://github.com/globus-labs/hpc-bridge/issues/48)).
 
 ## What it does
 

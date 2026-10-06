@@ -53,7 +53,7 @@ Modules add a short **code-anchor** style: cite the symbol with its line, e.g. `
 - **Mermaid:** use a `mermaid` fenced block when a *flow* beats prose (architecture, lifecycle). Don't diagram what a sentence covers.
 - **Voice:** present tense, active, factual. Describe what the code *does*, not what it *should* do — opinions and plans go in `Planned/`.
 - **Issues & PRs — link them, don't just number them.** A bare `#5` is *not* a clickable link in Obsidian (and not a valid tag either, so it's inert there); GitHub auto-links it but Obsidian doesn't. Use a full markdown link so it works in both:
-  `[#5](https://github.com/ryanchard/hpc-bridge/issues/5)` — the `/issues/N` path also resolves a PR `N`, so one form covers both. Cite one when:
+  `[#5](https://github.com/globus-labs/hpc-bridge/issues/5)` — the `/issues/N` path also resolves a PR `N`, so one form covers both. Cite one when:
     - a `[!warning]` invariant **defends against a real bug** → link the issue/PR that found or fixed it, so the note carries its own provenance;
     - a statement is **designed-not-built** → link the tracking issue;
     - a `Planned/` note exists for the work → link its issue as the single source of churn.

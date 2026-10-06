@@ -3,7 +3,7 @@
 Inside Claude Code:
 
 ```
-/plugin marketplace add ryanchard/hpc-bridge
+/plugin marketplace add globus-labs/hpc-bridge
 /plugin install hpc-bridge@hpc-bridge
 ```
 
@@ -75,7 +75,7 @@ there holds its Python environment and can be deleted after), then delete `~/.hp
 ## From a clone (developers)
 
 ```bash
-git clone https://github.com/ryanchard/hpc-bridge.git
+git clone https://github.com/globus-labs/hpc-bridge.git
 cd hpc-bridge
 claude --plugin-dir .            # start Claude Code with this checkout loaded as the plugin
 ```

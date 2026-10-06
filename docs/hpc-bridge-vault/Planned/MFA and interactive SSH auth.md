@@ -3,13 +3,13 @@
 > [!abstract] In one line
 > Extend SSH auth beyond key-only to **Duo/MFA** and **password** facilities (NERSC, Midway) **without the agent ever handling a secret** — passwords and passcodes ride a side-channel (a pre-opened ControlMaster, `SSH_ASKPASS`, or a password manager) that bypasses the LLM; the agent only orchestrates the flow and relays *non-secret* challenges (a Duo "push" selection). The ControlMaster "authenticate once" property (already shipped) makes any handshake a **one-time, per-session** cost, not per-call.
 
-> [!success] The pre-open path is BUILT ([#27](https://github.com/ryanchard/hpc-bridge/issues/27)) — the push relay is not
+> [!success] The pre-open path is BUILT ([#27](https://github.com/globus-labs/hpc-bridge/issues/27)) — the push relay is not
 > `is_interactive_auth_failure` + `NeedsPreauth` + `SshTarget.preauth_command()` ([[facility-remote]]) and `_needs_preauth_result` ([[server]]) implement the "pre-open a ControlMaster in your own terminal" hand-off: `connect_facility` returns `phase="needs_preauth"` with the exact `ssh -fN -o ControlMaster=yes …` line on the server's `%C` ControlPath (the ControlPath-alignment detail below is settled that way), the user authenticates there, and the next call multiplexes. Validated live on Aurora (two MFA passcodes). Requires multiplexing on (`HPC_BRIDGE_SSH_CONTROL_PERSIST` > 0 — else the result says so). The agent-relayed Duo **push** tier (`needs_2fa`, a parked non-`BatchMode` handshake) remains designed-not-built. The sibling Globus-side hand-off — `needs_login` — is [[login]].
 
 ## Context
 Today `SshTarget.argv` ([[facility-remote]], `remote.py:66`) uses **`BatchMode=yes`** — it *fails fast* on any password or keyboard-interactive prompt. Key-only facilities (globus1, Anvil) work; Duo/password facilities dead-end without the pre-open hand-off above. Two things make MFA tractable rather than a per-call tax:
 - **SSH is already a one-time bootstrap.** The reuse keystone (`find_online_endpoint`, [[Standing up the endpoint]]) + the ControlMaster mean a session authenticates **once**, then rides AMQP / the multiplexed master. So an interactive handshake happens at most once per session — the whole leverage.
-- **Real targets:** NERSC (**key + Duo**), Midway (**password + Duo** — the harder case, and a facility the maintainer can reach for a live spot-check). Tracking: [#3](https://github.com/ryanchard/hpc-bridge/issues/3).
+- **Real targets:** NERSC (**key + Duo**), Midway (**password + Duo** — the harder case, and a facility the maintainer can reach for a live spot-check). Tracking: [#3](https://github.com/globus-labs/hpc-bridge/issues/3).
 
 ## The load-bearing security invariant
 > [!warning] The agent NEVER handles a secret

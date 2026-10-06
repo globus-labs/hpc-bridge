@@ -5,7 +5,7 @@
 
 ## What it does
 
-- **`EndpointState`** (`lifecycle.py:13`) — the minimal endpoint identity: `endpoint_id` (`None` until provisioned/seeded) and `reused` (carried up from the handle so `connect_facility` can surface a zero-SSH reattach — [[models]], [#20](https://github.com/ryanchard/hpc-bridge/issues/20)).
+- **`EndpointState`** (`lifecycle.py:13`) — the minimal endpoint identity: `endpoint_id` (`None` until provisioned/seeded) and `reused` (carried up from the handle so `connect_facility` can surface a zero-SSH reattach — [[models]], [#20](https://github.com/globus-labs/hpc-bridge/issues/20)).
 - **`probe(facility, state)`** (`:17`) — `None` endpoint → `cold`; else `manager_online` ⇒ `warm`, else `provisioning`.
 - **`ensure_warm(facility, profile, state)`** (`:23`) — provision the endpoint if `endpoint_id is None`, then `probe`. Returns `(block_state, state)`.
 

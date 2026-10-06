@@ -2,7 +2,7 @@
 
 Most problems announce themselves in the agent's own words. This page says what each one means and
 what to do. The phrases in bold are the ones hpc-bridge itself uses, so you can match them. Anything
-not covered here: [open an issue](https://github.com/ryanchard/hpc-bridge/issues).
+not covered here: [open an issue](https://github.com/globus-labs/hpc-bridge/issues).
 
 ## First contact
 
@@ -85,5 +85,5 @@ hour. Fix the key before retrying rather than retrying in a loop.
 ## The agent asked me for a password
 
 It should never. Do not provide one; end the session and
-[report it](https://github.com/ryanchard/hpc-bridge/issues). Every credential hpc-bridge
+[report it](https://github.com/globus-labs/hpc-bridge/issues). Every credential hpc-bridge
 uses is entered by you in a browser or in your own terminal.

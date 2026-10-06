@@ -5,8 +5,8 @@
   "author": {
     "name": "hpc-bridge"
   },
-  "homepage": "https://github.com/ryanchard/hpc-bridge",
-  "repository": "https://github.com/ryanchard/hpc-bridge",
+  "homepage": "https://github.com/globus-labs/hpc-bridge",
+  "repository": "https://github.com/globus-labs/hpc-bridge",
   "keywords": [
     "hpc",
     "slurm",

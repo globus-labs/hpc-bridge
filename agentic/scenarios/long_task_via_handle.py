@@ -10,7 +10,7 @@ which observed the cut.
 Deterministic on purpose (the prompt dictates the exact command + shape). Run with **--no-skill**
 (`HPCB_NO_SKILL=1`) so the agent follows the literal instruction rather than skill-driven choices; the
 `run_shell` "running" notice itself points at poll_task, so the handle path completes even without the
-skill. One short billed block. See issue #21 (https://github.com/ryanchard/hpc-bridge/issues/21).
+skill. One short billed block. See issue #21 (https://github.com/globus-labs/hpc-bridge/issues/21).
 """
 from invariants import Result, Trace
 

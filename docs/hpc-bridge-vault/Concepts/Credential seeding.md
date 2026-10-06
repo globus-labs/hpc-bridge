@@ -30,7 +30,7 @@ A started endpoint needs tokens for exactly two resource servers:
 > [!warning] Validate `manage_projects` *before* shipping
 > A plain SDK `Client` login only gets `openid` on `auth.globus.org`, **not** `manage_projects`. A started manager registers `manage_projects` as a hard requirement; without it `login_required()` is True, the detached daemon tries an interactive login, and **dies silently**. `build_minimal_storage_db` checks scope adequacy locally and raises `MissingCredentials` with a clear remediation (run `globus-compute-endpoint login`) — learned live on Anvil.
 >
-> > [!note] Superseded as the *user-facing* path (2026-09-03, [#48](https://github.com/ryanchard/hpc-bridge/issues/48))
+> > [!note] Superseded as the *user-facing* path (2026-09-03, [#48](https://github.com/globus-labs/hpc-bridge/issues/48))
 > > A user no longer runs that CLI: the `needs_login` gate in `connect_facility` catches a missing/under-scoped credential first and obtains one with the right scopes in-terminal ([[login]]). The check here stays as the last line of defence (an under-scoped db that slipped past the gate), and its message is still the CLI fallback.
 
 > [!warning] Refresh tokens are mandatory
