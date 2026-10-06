@@ -18,6 +18,17 @@ PYTHON_VERSION_TOKEN = "{python_version}"
 INTERNAL_KEYS = frozenset({"compute"})
 
 
+def _same_version(a: str, b: str) -> bool:
+    """`4.16` == `4.16.0` == `v4.16.0 `: compare the numeric release parts, trailing zeros ignored."""
+    def norm(v: str) -> tuple:
+        parts = v.strip().lstrip("vV").split(".")
+        out = [int(p) if p.isdigit() else p for p in parts]
+        while out and out[-1] == 0:
+            out.pop()
+        return tuple(out)
+    return norm(a) == norm(b)
+
+
 _IDLE_RE = re.compile(
     r"^\s*max_idletime:\s*(?:(?P<lit>\d+(?:\.\d+)?)|\{\{\s*max_idletime\s*\|\s*default\(\s*(?P<dflt>\d+(?:\.\d+)?)\s*\)\s*\}\})\s*(?:#.*)?$",
     re.MULTILINE,
@@ -149,7 +160,8 @@ class MEPFacility:
         """The version the worker pool must run — the facility's USER endpoint's, per the entry's
         `worker_version`: the manager's (metadata), this client's SDK, or an explicit string."""
         if self.worker_version == "manager":
-            return self.endpoint_version
+            # unreadable live version: the version the registry entry was proven with, rather than no pin at all
+            return self.endpoint_version or getattr(self.worker_env, "verified_with", None)
         if self.worker_version == "client":
             try:
                 from importlib.metadata import version
@@ -179,7 +191,9 @@ class MEPFacility:
         except Exception:  # noqa: BLE001 - the canary is the real signal; a status hiccup must not read as offline
             # Best-effort: the MEP is administered infrastructure and the dispatch canary is the real
             # liveness check — a status-API error (or a foreign-endpoint read we can't see) must not
-            # condemn a live endpoint to 'provisioning'.
+            # condemn a live endpoint to 'provisioning'. The template is still read: without it the worker
+            # pin below would have no version to resolve to.
+            await self.load_template()
             return True
         await self.load_template()  # the attach is the moment to learn the facility's contract
         return status.get("status", "online") == "online"
@@ -211,7 +225,7 @@ class MEPFacility:
         the facility upgraded since, so the packages its endpoint runs may have moved and the worker pool the
         entry installs may no longer match — a block that starts and bills while every result is dropped."""
         verified = getattr(self.worker_env, "verified_with", None)
-        if not verified or not self.endpoint_version or self.endpoint_version == verified:
+        if not verified or not self.endpoint_version or _same_version(self.endpoint_version, verified):
             return None
         return (f"STALE ENTRY: this facility's endpoint now runs v{self.endpoint_version}, but the registry entry "
                 f"was verified with v{verified} — the facility upgraded since, and the worker it installs may no "

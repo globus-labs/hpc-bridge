@@ -21,10 +21,19 @@ hostile`) that is now the main regression backbone; the lab cluster is the real-
 
 ## Where it stands (2026-10-06)
 
-**Next step: re-prove each registry facility on 0.1.18, then tag `v0.1.18-beta.1`.** Four entries: `globus-labs` (the
-lab MEP — rebuilt 2026-10-01, maps to `glabs-gc`, needs a Python 3.12 client while the plugin env resolves to 3.13; NOT
-re-proven since the rebuild, the likeliest break), `expanse` (SSH), `delta` and `anvil` (facility MEPs, billed to
-CIS250223 — ask before running).
+**Registry re-prove (2026-10-06) — 3 of 4 done; finish, then tag.**
+- `globus-labs` passed on 0.1.18 (the client's Python 3.13 vs the workers' 3.12 is only a warning).
+- **Anvil and Delta both failed from a parsl skew** between the facility's user endpoint and our worker: Anvil's
+  endpoint floats to the latest parsl, and Delta's fixed install sits on 2026.08.10. The block ran and billed
+  while every result was dropped, and Delta's endpoint kept relaunching A40 blocks (about 1.7 GPU-h, stopped by
+  hand).
+- **0.1.19 fixes it** (PR #165): per-facility `compute.worker_env` (pin | float), a STALE-entry check at attach,
+  one canary in flight, and a five-minute notice that names the silent billing block. Anvil and Delta re-proved
+  from the 0.1.19 seeds (each run sent 2 tasks).
+- **After #165 merges:** re-ingest `anvil`, `delta` and `globus-labs` (the fix reaches every installed plugin
+  through the registry), then run Expanse (needs the maintainer's one-time code), then tag.
+- **Follow-ups:** report upstream to Globus Compute (pin parsl exactly / reject a mismatched worker at
+  registration / publish endpoint runtime); reuse the endpoint's own venv for `float` facilities.
 
 **Open on GitHub:** issues **#2** (agent-specified resources), **#3** (SSH bootstrap under MFA), **#7** (ACCESS
 discovery channel) — all from July. No open PRs once this one merges.

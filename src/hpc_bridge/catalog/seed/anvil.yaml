@@ -27,8 +27,9 @@
     # to parsl 2026.10.05 the day it was released): the worker installs with --upgrade to resolve the same. A worker
     # venv only re-checked for gce kept parsl 2026.08.10, and the endpoint dropped every result (2026-10-06).
     env_setup: 'export PATH="$HOME/.local/bin:$PATH"; command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; V=$HOME/hpc-bridge/gce-venv-{gce_version}-py{python_version}; [ -d $V ] || uv venv $V --python {python_version}; . $V/bin/activate; uv pip install -q --upgrade "globus-compute-endpoint=={gce_version}"'
-    # Anvil's template builds the USER endpoint's environment at the CLIENT's SDK version (its UEP logged
-    # 4.16.0 while the manager metadata says 4.12.0): the worker pool must match the UEP, i.e. the client.
+    # Anvil's template builds the USER endpoint's environment at the CLIENT's SDK version (2026-09-04 its UEP logged
+    # 4.16.0 while the manager said 4.12.0; by 2026-10-06 the manager reports 4.16.0 too): the worker pool must
+    # match the UEP, i.e. the client.
     worker_version: client
     worker_env:
       strategy: float

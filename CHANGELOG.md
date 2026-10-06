@@ -11,7 +11,9 @@ installed plugin only when that version changes); git tags mark releases.
   its packages to it) or `float` (the facility rebuilds at the latest versions at every start, and the worker
   installs with `--upgrade`), checked against the install line, plus `verified_with`, the facility endpoint version
   the entry was proven against. The install stays literal in `env_setup`, so plugins older than this one, reading
-  the same registry, also get a working worker.
+  the same registry, also get a working worker. Clients read `worker_env` leniently: an unknown strategy or a
+  garbled block costs the staleness check, never the facility. The strict check (a `pin` names its `parsl==`, a
+  `float` upgrades the endpoint install itself, `verified_with` is set) runs when the curator ingests.
 - **An upgraded facility is flagged at attach.** When the facility's live endpoint version differs from the one the
   entry was verified with, `connect_facility` says so (STALE ENTRY): its packages may have moved, and a block that
   starts but never answers is then the likely result.
@@ -33,7 +35,14 @@ installed plugin only when that version changes); git tags mark releases.
   worker venv kept 2026.08.10; Delta's fixed install runs 2026.08.10 while a fresh worker venv picks 2026.10.05.
   Either way the block ran and billed while the endpoint dropped every result, and on Delta the endpoint kept
   relaunching GPU blocks for its queued tasks. Anvil's entry now floats (`--upgrade`), Delta's pins
-  `parsl==2026.8.10`; `globus-labs` records its verified version.
+  `parsl==2026.8.10`; `globus-labs` states the parsl its gce version pins. **These reach installed plugins
+  through the live registry**, so they take effect once the entries are re-ingested, whatever plugin version is
+  installed. A `float` facility can still skew if its endpoint process stays up across a parsl release (weekly)
+  and then starts a new block; reusing the facility endpoint's own venv would close that, and is a follow-up.
+- **A failed status call no longer drops the worker pin.** When the facility's status API failed, the template
+  was never read, the worker setup lost its version and was dropped, and the facility's own default (no parsl pin
+  on Delta) ran instead. The template is read regardless, and an unreadable version falls back to the one the
+  entry was verified with.
 
 ## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
 

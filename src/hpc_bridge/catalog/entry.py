@@ -34,34 +34,78 @@ MEP_RENAMEABLE_KEYS = frozenset({
 })
 
 
-_VERSION = re.compile(r"^[0-9][0-9A-Za-z.+-]{0,31}$")
+_VERSION = re.compile(r"^v?[0-9][0-9A-Za-z.+-]{0,31}$")
+WORKER_STRATEGIES = ("pin", "float")
 
 
 class WorkerEnv(BaseModel):
     """Facility-MEP entries: how the worker pool's Python packages are kept in step with the facility's USER
     endpoint process. parsl's interchange<->worker protocol changes between releases without compatibility, and
-    globus-compute-endpoint only sets a parsl FLOOR — so the same endpoint version can run different parsl, and a
-    skew makes the block run (and bill) while every result is dropped (2026-10-06: Anvil's UEP floated to a
-    newer parsl than our worker; Delta's fixed install sat on an older one than a fresh worker venv picks).
+    globus-compute-endpoint only sets a parsl FLOOR (4.16.0: parsl>=2026.7.27) — so the same endpoint version can
+    run different parsl, and a skew makes the block run (and bill) while every result is dropped (2026-10-06:
+    Anvil's UEP floated to a newer parsl than our worker; Delta's fixed install sat on an older one than a fresh
+    worker venv picks).
 
     The install itself stays in `env_setup` (literal pins / `--upgrade`), so EVERY plugin version reading the
     registry gets a working worker — a new placeholder there would reach older plugins unresolved. This records
-    the strategy and what the entry was proven against."""
+    the strategy and what the entry was proven against.
 
-    # "pin": the facility runs a FIXED install; env_setup pins the worker's packages to it (e.g. parsl==…).
+    Read LENIENTLY: every installed plugin parses registry entries, so a strategy a later curator adds must not
+    make this version drop the facility. `worker_env_problems` is the strict check, run at ingest."""
+
+    # "pin": the facility runs a FIXED install; env_setup pins the worker's packages to it (explicit parsl==…).
     # "float": the facility rebuilds the UEP's environment at the latest versions at every start; env_setup
-    # installs with --upgrade so the worker resolves the same.
-    strategy: Literal["pin", "float"]
+    # installs with --upgrade so the worker resolves the same (racy across a parsl release while a UEP lives).
+    strategy: str
     # The facility endpoint version (`endpoint_version` in its metadata) the entry was last proven against. At
-    # attach, a different live version means the facility upgraded since — its packages may have moved.
+    # attach, a different live version means the facility upgraded since — its packages may have moved. Also the
+    # `{gce_version}` fallback when the live version can't be read.
     verified_with: str | None = None
 
     @field_validator("verified_with")
     @classmethod
     def _version(cls, v: str | None) -> str | None:
-        if v is not None and not _VERSION.match(v):
-            raise ValueError("verified_with must be a version string like 4.16.0")
-        return v
+        v = (v or "").strip()
+        return v if _VERSION.match(v) else None  # unusable -> no claim, never a broken entry
+
+
+def _install_segments(env_setup: str) -> list[str]:
+    """The `… pip install …` commands in an env_setup line that install globus-compute-endpoint."""
+    parts = re.split(r";|&&|\|\||\n", env_setup)
+    return [p for p in parts if "pip install" in p and "globus-compute-endpoint" in p]
+
+
+def _upgrades(segment: str) -> bool:
+    """Whether a pip/uv install command upgrades every package: `--upgrade`, or `-U` in a short-flag cluster
+    (`-qU`). `-P`/`--upgrade-package X` upgrades only X — not a float."""
+    for tok in segment.split():
+        if tok == "--upgrade" or (tok.startswith("-") and not tok.startswith("--") and "U" in tok[1:]):
+            return True
+    return False
+
+
+def worker_env_problems(compute: Compute) -> list[str]:
+    """The curator's strict check of `worker_env` against env_setup (run at ingest; clients read leniently)."""
+    we = compute.worker_env
+    if we is None:
+        return []
+    problems = []
+    if we.strategy not in WORKER_STRATEGIES:
+        problems.append(f"worker_env.strategy {we.strategy!r} is not one of {list(WORKER_STRATEGIES)}")
+    if we.verified_with is None:
+        problems.append("worker_env.verified_with is missing (the facility endpoint version the entry was proven with)")
+    segs = _install_segments(compute.env_setup)
+    if not segs:
+        problems.append("env_setup has no `pip install … globus-compute-endpoint…` command for worker_env to describe")
+    elif we.strategy == "float" and not any(_upgrades(s) for s in segs):
+        problems.append("worker_env.strategy 'float' needs `--upgrade` (or -U) on the globus-compute-endpoint install")
+    elif we.strategy == "pin":
+        if any(_upgrades(s) for s in segs):
+            problems.append("worker_env.strategy 'pin' must not upgrade the install (it would float)")
+        if not any(re.search(r"parsl==[0-9]", s) for s in segs):
+            problems.append("worker_env.strategy 'pin' needs an explicit parsl==… on the install "
+                            "(gce sets only a floor)")
+    return problems
 
 
 class Compute(BaseModel):
@@ -110,16 +154,14 @@ class Compute(BaseModel):
     key_map: dict[str, str] = Field(default_factory=dict)
     worker_env: WorkerEnv | None = None  # facility-MEP entries: see WorkerEnv
 
-    @model_validator(mode="after")
-    def _worker_env_matches_install(self) -> Compute:
-        # The strategy is a claim about env_setup's install line; keep them from drifting apart.
-        if self.worker_env is not None:
-            upgrades = "--upgrade" in self.env_setup or " -U " in f" {self.env_setup} "
-            if self.worker_env.strategy == "float" and not upgrades:
-                raise ValueError("worker_env.strategy 'float' needs `--upgrade` in env_setup's install")
-            if self.worker_env.strategy == "pin" and upgrades:
-                raise ValueError("worker_env.strategy 'pin' must not `--upgrade` in env_setup (it would float)")
-        return self
+    @field_validator("worker_env", mode="wrap")
+    @classmethod
+    def _lenient_worker_env(cls, v: Any, handler: Any) -> WorkerEnv | None:
+        # A malformed worker_env costs this facility its staleness check, never the whole entry.
+        try:
+            return handler(v)
+        except (ValueError, TypeError):
+            return None
 
     @field_validator("key_map")
     @classmethod

@@ -24,9 +24,9 @@
     # the endpoint's exact globus-compute-endpoint version UNCONDITIONALLY: the MEP runs 4.15.0 and
     # a version-skewed worker fails every job with a cryptic `process_worker_pool.py: -P/--port`
     # error. (No `command -v … ||` guard — that silently keeps a wrong-version venv.)
-    env_setup: "[ -d $HOME/hpc-bridge/gce-venv ] || uv venv $HOME/hpc-bridge/gce-venv; . $HOME/hpc-bridge/gce-venv/bin/activate; uv pip install -q globus-compute-endpoint==4.15.0"
+    env_setup: "[ -d $HOME/hpc-bridge/gce-venv ] || uv venv $HOME/hpc-bridge/gce-venv; . $HOME/hpc-bridge/gce-venv/bin/activate; uv pip install -q globus-compute-endpoint==4.15.0 parsl==2026.4.20"
     worker_env:
-      strategy: pin                 # the MEP's own fixed install; env_setup pins gce 4.15.0 (parsl follows the venv)
+      strategy: pin                 # the MEP's own fixed install; gce 4.15.0 itself pins parsl==2026.4.20 (stated)
       verified_with: "4.15.0"
     scratch_root: "$HOME/.hpc-bridge"   # worker-side form: we can't know the mapped local user client-side
     endpoint_name: globus-cluster-mep
