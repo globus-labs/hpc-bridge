@@ -3,8 +3,11 @@
 > [!warning] Never over a store we did not place (0.1.18)
 > Seeding runs when `globus-compute-endpoint whoami` fails on the login node — but it also fails when a store IS there
 > and the facility's `env_setup`, PATH, the tokens' scopes or the node's network are broken. The write refuses on the
-> node itself if `~/.globus_compute/storage.db` exists, unless the endpoint record says hpc-bridge placed it (a stale
-> copy of ours is refreshed), and the connect explains whoami's error instead. The check-and-write runs under `sh -c`
+> node itself if `~/.globus_compute/storage.db` exists and holds tokens, unless the endpoint record says hpc-bridge
+> placed it (a stale copy of ours is refreshed), and the connect explains whoami's error instead. A store with NO tokens
+> is replaced: `whoami` creates exactly that (an empty SQLite store) on a node where nobody has logged in — the first
+> live run of 0.1.18 (2026-10-06) refused every first bring-up on it. The emptiness test is a read-only `python3`
+> sqlite count in the same `sh -c` as the write; no python3, an unreadable file or a missing table keep the store. The check-and-write runs under `sh -c`
 > (the login shell may be tcsh or fish). Only a store hpc-bridge placed is marked `seeded_credentials` and wiped.
 
 > [!abstract] In one line

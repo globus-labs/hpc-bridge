@@ -122,3 +122,13 @@ def test_token_store_cleanup_removes_only_the_pool_users_seeded_store():
     cmd = token_store_cleanup_cmd()
     assert '"$HOME/.globus_compute/storage.db"' in cmd and "rm -f" in cmd and "token store removed" in cmd
     assert "uep." not in cmd and "rm -rf" not in cmd   # the store only — never a directory sweep
+
+
+def test_every_cell_starts_without_a_token_store(monkeypatch, harness_run):
+    # a cell that died before its teardown leaves the pool user's store; the plugin cannot prove it its own and (since
+    # 0.1.18) refuses to replace it — so the harness clears it BEFORE the agent too, not only after (live 2026-10-06)
+    from cluster_ops import token_store_cleanup_cmd
+    seen = []
+    monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, timeout=60, host=None: (seen.append(cmd), (0, "token store removed"))[1])
+    harness_run._preclean_token_store()
+    assert seen == [token_store_cleanup_cmd()]

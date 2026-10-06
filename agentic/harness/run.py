@@ -265,6 +265,17 @@ def _world_cmds(entries) -> list[tuple[str, str | None]]:
     return out
 
 
+def _preclean_token_store() -> None:
+    """Remove the pool user's login-node token store BEFORE the agent starts, as the teardown does after. Every cell
+    starts from a fresh jail with no endpoint record, so the plugin can never prove a store already on the node is its
+    own — since 0.1.18 it then refuses to replace it (review 2026-09-05 #5). A cell that died before its teardown
+    (Ctrl-C, a crashed run) left one, and the next cell on that pool user failed its first connect (live 2026-10-06:
+    `whoami` "Please log in again" on a stale store). Runs before SETUP, so a scenario can still place a store on
+    purpose. Best-effort: the run's own connect reports a store that survives this."""
+    rc, out = _ssh_run(token_store_cleanup_cmd(), timeout=60)
+    print(f"pre-run: {out.strip()[:120] if rc == 0 else f'token store cleanup rc={rc}'}", file=sys.stderr, flush=True)
+
+
 def _setup(scen) -> bool:
     """Precondition the world (scenario SETUP commands, run as the test user BEFORE the agent
     starts — e.g. saturate the partition). A failed setup aborts the run: grading an agent
@@ -660,6 +671,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
+        _preclean_token_store()
         if not _setup(scen) or not _local_setup(scen):
             print("RESULT: SETUP FAILED — scenario not run (world precondition unmet)")
             rc = 2

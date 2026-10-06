@@ -8,6 +8,7 @@ import dataclasses
 import shutil
 import stat
 import subprocess
+import sys
 import time
 from pathlib import Path
 from types import SimpleNamespace
@@ -151,6 +152,45 @@ async def test_the_no_clobber_write_holds_in_any_login_shell(shell, tmp_path, mo
     assert second.returncode == 3 and "HPCB_EXISTS" in second.stdout and store.read_text() == "original"
     third = run(replacing, "cmVwbGFjZWQ=\n")
     assert third.returncode == 0 and store.read_text() == "replaced", third.stderr
+
+
+
+def _sqlite_store(path, tokens: int) -> None:
+    import sqlite3
+    path.unlink(missing_ok=True)
+    c = sqlite3.connect(path)
+    c.execute("create table token_storage (namespace text, resource_server text, token_data_json text)")
+    c.execute("create table sdk_storage_adapter_internal (attribute text, value text)")
+    c.executemany("insert into token_storage values (?, ?, ?)", [("DEFAULT", f"rs{i}", "{}") for i in range(tokens)])
+    c.commit()
+    c.close()
+
+
+@pytest.mark.parametrize("shell", ["/bin/sh", "/bin/tcsh", "/bin/zsh"])
+async def test_an_empty_store_left_by_whoami_is_replaced_and_one_with_tokens_is_not(shell, tmp_path, monkeypatch):
+    # `globus-compute-endpoint whoami` on a node where nobody has logged in CREATES an empty storage.db and fails; the
+    # no-clobber check then refused every first SSH bring-up (live 2026-10-06). An empty store holds no credential.
+    if not shutil.which(shell):
+        pytest.skip(f"{shell} not installed")
+    guarded = await _seed_command(monkeypatch, tmp_path, replace_ours=False)
+    home = tmp_path / "home"
+    (home / ".globus_compute").mkdir(parents=True)
+    env = {"HOME": str(home), "PATH": f"{Path(sys.executable).parent}:/usr/bin:/bin"}
+    store = home / ".globus_compute" / "storage.db"
+
+    def run(cmd, data):
+        return subprocess.run([shell, "-c", cmd], input=data, capture_output=True, text=True, env=env, check=False)
+
+    _sqlite_store(store, tokens=0)
+    out = run(guarded, "cmVwbGFjZWQ=\n")
+    assert out.returncode == 0 and store.read_bytes() == b"replaced", out.stderr + out.stdout
+    _sqlite_store(store, tokens=1)
+    before = store.read_bytes()
+    out = run(guarded, "cmVwbGFjZWQ=\n")
+    assert out.returncode == 3 and "HPCB_EXISTS" in out.stdout and store.read_bytes() == before
+    store.write_text("not sqlite")  # unreadable as a store: kept, never guessed empty
+    out = run(guarded, "cmVwbGFjZWQ=\n")
+    assert out.returncode == 3 and store.read_text() == "not sqlite"
 
 
 async def test_the_refusal_names_the_failed_whoami(monkeypatch, tmp_path):

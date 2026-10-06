@@ -50,8 +50,16 @@ _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")  # endpoint names 
 
 
 class RemoteTokenStoreExists(RuntimeError):
-    """The login node already holds a Globus token store, yet `globus-compute-endpoint whoami` failed there.
-    hpc-bridge will not replace (and later delete) a credential it did not create (review 2026-09-05 #5)."""
+    """The login node already holds a Globus token store WITH tokens in it, yet `globus-compute-endpoint whoami` failed
+    there. hpc-bridge will not replace (and later delete) a credential it did not create (review 2026-09-05 #5)."""
+
+
+# Exit 0 when the SQLite token store at argv[1] holds NO tokens — the empty store `globus-compute-endpoint whoami`
+# itself creates when nobody has logged in. Opened read-only; a missing table, an unreadable file or no python3 all
+# exit non-zero, which keeps the store. No `!`, `$` or double quotes: it rides inside a double-quoted `sh -c` argument
+# through any login shell (tcsh history-expands `!` even in single quotes).
+_EMPTY_STORE_PY = ("import sqlite3,sys; c=sqlite3.connect('file:'+sys.argv[1]+'?mode=ro',uri=True); "
+                   "sys.exit(0 if c.execute('select count(*) from token_storage').fetchone()[0]==0 else 1)")
 
 
 @dataclass(frozen=True)
@@ -490,7 +498,8 @@ class RemoteEndpointCLI:
         bearer credential. Raises RuntimeError on any remote step failure.
 
         A store already on the node is replaced only with `replace_ours` — when OUR record says hpc-bridge placed
-        it (a copy of ours whose tokens went stale); otherwise RemoteTokenStoreExists (review 2026-09-05 #5)."""
+        it (a copy of ours whose tokens went stale) — or when it holds no tokens at all; otherwise
+        RemoteTokenStoreExists (review 2026-09-05 #5)."""
         payload = base64.b64encode(Path(local_db).read_bytes()).decode("ascii")
         db_path = f"{self.remote_dir}/storage.db"
         rc, out, err = await ssh_exec(
@@ -508,13 +517,17 @@ class RemoteEndpointCLI:
         # Run the check-and-write in `sh`, not the user's login shell: under tcsh the `if [ … ]` line is a syntax error
         # that still runs the write (a silent overwrite), and fish cannot parse it at all. `set -C` (noclobber) closes
         # the check-then-write race too. stdin passes through `sh -c` to `base64 -d`.
+        # A store with NO tokens holds no credential to protect: it is what `whoami` itself leaves on a node where
+        # nobody has logged in (live 2026-10-06 — refusing it broke every first SSH bring-up), so it is replaced.
         inner = (f'db="{db_path}"; ' + ('' if replace_ours else
-                 'if [ -e "$db" ]; then echo HPCB_EXISTS; exit 3; fi; set -C; ') + 'base64 -d > "$db"')
+                 f'if [ -e "$db" ]; then if python3 -c "{_EMPTY_STORE_PY}" "$db" 2>/dev/null; then rm -f "$db"; '
+                 'else echo HPCB_EXISTS; exit 3; fi; fi; set -C; ') + 'base64 -d > "$db"')
         rc, out, err = await ssh_exec(self.target, f"sh -c {shlex.quote(inner)}", stdin=payload)
         if "HPCB_EXISTS" in (out or ""):
             why = (self.last_whoami_error or "no output").strip()
             raise RemoteTokenStoreExists(
-                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db), but "
+                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db) and "
+                "is not empty (or could not be read), but "
                 f"`globus-compute-endpoint whoami` failed there: {why[-300:]}. hpc-bridge will not replace a "
                 "credential it did not create. Fix what whoami reports (the facility's env_setup, gce on PATH, the "
                 "login node's network to auth.globus.org), or run `globus-compute-endpoint login` there yourself, "

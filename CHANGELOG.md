@@ -42,9 +42,11 @@ installed plugin only when that version changes); git tags mark releases.
   0.1.1). The early record written while seeding credentials carries the pin too.
 - **Credential seeding never overwrites a token store hpc-bridge did not place.** Seeding happens when
   `globus-compute-endpoint whoami` fails on the login node, but that also happens when a store exists and the
-  facility's `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store is
-  present — unless hpc-bridge's own record, for the same SSH login, says it placed that store (a stale copy of ours is
-  refreshed; the flag is cleared when a wipe ran but the delete did not) — and
+  facility's `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store
+  holding tokens is present — unless hpc-bridge's own record, for the same SSH login, says it placed that store (a
+  stale copy of ours is refreshed; the flag is cleared when a wipe ran but the delete did not). A store with no tokens
+  is replaced: `whoami` itself creates one on a node where nobody has logged in, and the first fake-cluster run of
+  this change refused every first bring-up on it. When it refuses,
   `connect_facility` says so with whoami's own error. The check-and-write runs in `sh` whatever the login shell is
   (under tcsh the guard would have been skipped). Before, hpc-bridge replaced the user's credential and teardown later
   deleted the replacement.
