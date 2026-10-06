@@ -204,6 +204,10 @@ class Defaults(BaseModel):
     max_workers_per_node: int = 2
     nodes_per_block: int = 1
     cpus_per_node: int | None = None  # PBSProProvider.cpus_per_node; Slurm ignores it
+    # SlurmProvider.exclusive (Parsl defaults it to True: `#SBATCH --exclusive`, a WHOLE node). On a per-core
+    # partition that is a node's worth of cores, which a per-job CPU cap can refuse forever — Expanse `shared`
+    # (QOS max 127 CPUs/job, 128-core nodes): PENDING QOSMaxCpuPerJobLimit, 2026-10-06. None = Parsl's default.
+    exclusive: bool | None = None
     init_blocks: int = 0  # blocks to pre-spawn; 0 = lazy (block on first task). A MEP entry sets 1 for a warm, low-latency block (its login-shape replacement)  # noqa: E501
     max_blocks: int = 1
     available_accelerators: int | list[str] | None = None
@@ -391,4 +395,5 @@ class CatalogEntry(BaseModel):
             "scratch_root": self.compute.scratch_root,
             "scheduler": self.compute.scheduler,
             "cpus_per_node": self.defaults.cpus_per_node,
+            "exclusive": self.defaults.exclusive,
         }

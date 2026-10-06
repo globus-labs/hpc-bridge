@@ -23,6 +23,8 @@
     endpoint_name: hpc-bridge-expanse
   defaults:
     partition: shared               # per-core charging; `debug` for short tests (30 min max); `compute` = whole node
+    exclusive: false                # `shared` is per-core with a 127-CPU/job QOS cap on 128-core nodes: Parsl's default
+                                    # --exclusive asks for the whole node and pends forever (QOSMaxCpuPerJobLimit)
     walltime: "00:30:00"
     max_workers_per_node: 2
     nodes_per_block: 1
