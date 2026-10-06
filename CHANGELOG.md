@@ -21,6 +21,11 @@ installed plugin only when that version changes); git tags mark releases.
   command still inside its synchronous wait is not read as a reap, and local dev's held block never is.
 
 ### Fixed
+- **Anvil's registry entry runs again.** The facility rebuilds its user endpoint's environment at every start and had
+  moved to a parsl released the day before; the worker venv hpc-bridge's entry builds kept the older parsl, and the
+  facility's endpoint then dropped every result, so the block ran and billed while every check timed out. The Anvil
+  and Delta entries now install the worker with `--upgrade`, so it resolves the same dependencies (live-verified on
+  Anvil 2026-10-06).
 - **Teardown can no longer be retargeted, run twice, or replay a stale answer.** `teardown_endpoint` decides what it
   tears down in one locked step with no await before it: an SSH endpoint's teardown is claimed and snapshotted there
   and runs (release, one-time-code gate, login-node ops) as one task on that facility and endpoint; a facility
