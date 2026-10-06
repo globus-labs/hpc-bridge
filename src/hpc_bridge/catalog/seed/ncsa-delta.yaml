@@ -40,4 +40,4 @@
       cores_per_node: 1
       scheduler_options: "#SBATCH --gpus-per-node=1"   # Delta's GPU partitions require a GPU request
   provenance: curated
-  last_validated: 2026-09-04
+  last_validated: 2026-10-06
