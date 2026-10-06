@@ -6,8 +6,6 @@ import json
 import sys
 from pathlib import Path
 
-import yaml
-
 from .bundled import BundledCatalog
 from .entry import worker_env_problems, worker_env_raw_problems
 
@@ -22,7 +20,7 @@ def ingest(index_id: str, seed_path: str | Path, client) -> int:
     # Clients read worker_env leniently (a newer strategy must not drop the facility for older plugins): the strict
     # check is the curator's, here, before anything reaches the index.
     raw = {row.get("id"): (row.get("compute") or {}).get("worker_env")
-           for row in (yaml.safe_load(Path(seed_path).read_text()) or []) if isinstance(row, dict)}
+           for row in BundledCatalog._load_raw(Path(seed_path)) if isinstance(row, dict)}
     bad = {e.id: probs for e in catalog.entries()
            if (probs := worker_env_raw_problems(raw.get(e.id)) + worker_env_problems(e.compute))}
     if bad:
