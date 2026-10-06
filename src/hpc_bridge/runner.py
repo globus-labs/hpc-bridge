@@ -15,6 +15,9 @@ class CanaryResult:
     worker_dill: str | None = None
     worker_host: str | None = None
     error: str | None = None
+    # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
+    # while nobody was waiting; warmth is dated from it, not from when it was read.
+    answered_at: float | None = None
 
 
 # A worker that runs this proves the compute block is live (manager_online cannot). A result
@@ -23,6 +26,10 @@ class CanaryResult:
 _CANARY_SENTINEL = "HPCB_CANARY"
 # How recent a canary answer that arrived while nobody was waiting must be to count as "a worker is live now".
 _CANARY_FRESH_S = 30.0
+# How long a pending canary is waited on before it is abandoned for a fresh one: an endpoint that restarts can drop
+# a task it had accepted, and a canary that will never resolve must not wedge the shape. Long enough that a slow
+# queue costs a handful of canaries, not one per probe.
+_CANARY_MAX_WAIT_S = 300.0
 _CANARY_CMD = (
     f"echo {_CANARY_SENTINEL}; "
     'python -c "import platform,dill,socket;'
@@ -44,26 +51,6 @@ def _escape_for_shellfunction(command: str) -> str:
     """ShellFunction runs cmd.format(**kwargs); double literal braces so arbitrary
     shell (brace groups, ${VAR}) survives the format pass as single braces."""
     return command.replace("{", "{{").replace("}", "}}")
-
-
-async def _probe_executor(executor, *, timeout: float, command: str = _CANARY_CMD) -> tuple[bool, str]:
-    """Submit `command` to `executor` and await a result within `timeout`, NEVER raising.
-
-    Returns (True, stdout) if a worker answered, else (False, "<reason>"). The submit itself is
-    INSIDE the guard: a shut-down or broken Executor raises `RuntimeError: Executor is shutdown`
-    at `.submit()`, which we map to (False, …) instead of letting it propagate — every caller
-    (the warmth canary; the reuse liveness gate) treats any failure as 'no live worker' (#37)."""
-    from globus_compute_sdk import ShellFunction
-
-    fn = ShellFunction(_escape_for_shellfunction(command), walltime=max(timeout - 1.0, 2.0))
-    try:
-        fut = executor.submit(fn)
-        res = await asyncio.to_thread(fut.result, timeout)
-    except TimeoutError:
-        return False, "timeout"
-    except Exception as exc:  # noqa: BLE001 - shutdown Executor / broken dispatch path, not a crash
-        return False, dispatch_error_text(exc)
-    return True, getattr(res, "stdout", "") or ""
 
 
 def dispatch_error_text(exc: BaseException, limit: int = 600) -> str:
@@ -112,6 +99,7 @@ class GlobusRunner:
         # waited on again, never resubmitted.
         self._canary_fut = None
         self._canary_done_at: float | None = None
+        self._canary_submitted_at: float | None = None
 
     def _default_factory(self):
         from globus_compute_sdk import Executor
@@ -151,20 +139,30 @@ class GlobusRunner:
         the submit kicks a cold block). At most ONE canary is in flight: a still-pending one is waited on
         again rather than resubmitted (see `_canary_fut`); one that answered long ago proves nothing about now
         and is replaced."""
+        # Not re-entrant: the only caller (warmth._confirm_worker) runs under app.lock, so one coroutine at a time
+        # owns this runner's canary state.
+        from concurrent.futures import CancelledError
+
         from globus_compute_sdk import ShellFunction
 
+        now = time.monotonic()
         fut = self._canary_fut
-        if fut is not None and fut.done():
-            fresh = self._canary_done_at is not None and time.monotonic() - self._canary_done_at <= _CANARY_FRESH_S
-            if fut.cancelled() or not fresh:
-                fut = self._canary_fut = None  # cancelled with its Executor, or a stale answer: ask again
+        if fut is not None:
+            if fut.done():
+                fresh = self._canary_done_at is not None and now - self._canary_done_at <= _CANARY_FRESH_S
+                # a FAILURE is handed back once whatever its age (its text is the diagnosis — a no-account verdict
+                # is terminal); a stale SUCCESS proves nothing about now and is replaced
+                if fut.cancelled() or (not fresh and fut.exception() is None):
+                    fut = self._canary_fut = None
+            elif self._canary_submitted_at is not None and now - self._canary_submitted_at > _CANARY_MAX_WAIT_S:
+                fut = self._canary_fut = None  # waited long enough: the endpoint may have lost it; ask once more
         if fut is None:
             fn = ShellFunction(_escape_for_shellfunction(_CANARY_CMD), walltime=max(timeout - 1.0, 2.0))
             try:
                 fut = self.executor().submit(fn)
             except Exception as exc:  # noqa: BLE001 - shutdown Executor / broken dispatch path, not a crash
                 return CanaryResult(ok=False, error=dispatch_error_text(exc))
-            self._canary_fut, self._canary_done_at = fut, None
+            self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
 
             def _stamp(f, runner=self):  # runs on the SDK's thread; only for the canary still current
                 if runner._canary_fut is f:
@@ -175,14 +173,21 @@ class GlobusRunner:
             res = await asyncio.to_thread(fut.result, timeout)
         except TimeoutError:
             return CanaryResult(ok=False, error="timeout")  # still queued: the NEXT probe waits on the same task
+        except (CancelledError, asyncio.CancelledError):  # 3.13 raises asyncio's from a cancelled Future
+            if not fut.cancelled():
+                raise  # this coroutine was cancelled, not the task
+            if self._canary_fut is fut:
+                self._canary_fut = None
+            return CanaryResult(ok=False, error="canary task was cancelled")
         except Exception as exc:  # noqa: BLE001 - the task failed or the dispatch path broke
             if self._canary_fut is fut:
                 self._canary_fut = None
             return CanaryResult(ok=False, error=dispatch_error_text(exc))
+        answered_at = self._canary_done_at or time.monotonic()
         if self._canary_fut is fut:
             self._canary_fut = None
         py, dill_v, host = _parse_canary(getattr(res, "stdout", "") or "")
-        return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host)
+        return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host, answered_at=answered_at)
 
     def close(self) -> None:
         if self._ex is not None:
@@ -192,4 +197,4 @@ class GlobusRunner:
             # wait, and cancel anything not yet registered with the web service.
             self._ex.shutdown(wait=False, cancel_futures=True)
             self._ex = None
-        self._canary_fut, self._canary_done_at = None, None
+        self._canary_fut, self._canary_done_at, self._canary_submitted_at = None, None, None

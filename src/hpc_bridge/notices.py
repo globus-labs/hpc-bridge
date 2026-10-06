@@ -380,14 +380,16 @@ def _allocating_notice(partition: str | None, elapsed_s: float, *, facility_mep:
     notice = f"allocating nodes on {partition!r}…" if partition else "allocating nodes…"
     if facility_mep and elapsed_s >= 300:
         notice += (f" Still allocating after {int(elapsed_s)}s. On a facility-run endpoint the scheduler is invisible "
-                   "from here, so two different failures look exactly like this. (1) A scheduler rejection: check "
-                   "the account, the partition, and whether the partition needs a resource request (a GPU partition "
-                   "usually needs scheduler_options like '#SBATCH --gpus-per-node=1'); or try the facility's default "
-                   "partition. (2) A block that is RUNNING and billing while its worker cannot return results (a "
-                   "package mismatch with the facility's endpoint): the facility keeps relaunching blocks while the "
-                   "check task stays queued, and hpc-bridge cannot cancel them. Do not keep polling indefinitely: "
-                   "call stop_endpoint, and ask the user to check their jobs on the facility (e.g. squeue) and "
-                   "cancel any left running, or contact the facility.")
+                   "from here, so three different situations look exactly like this: (1) a long queue (a busy GPU "
+                   "partition can take longer); (2) a scheduler rejection — wrong account or partition, or a missing "
+                   "resource request (a GPU partition usually needs scheduler_options like '#SBATCH "
+                   "--gpus-per-node=1'); (3) a block that is RUNNING and billing while its worker cannot return "
+                   "results "
+                   "(a package mismatch with the facility's endpoint), which the facility keeps relaunching while our "
+                   "check task stays queued — hpc-bridge cannot cancel either. Don't poll indefinitely: ask the user "
+                   "to check their jobs on the facility (squeue -u $USER). PENDING = (1), keep waiting or try a less "
+                   "busy partition; no job at all = (2); a RUNNING job that never answers = (3): call stop_endpoint, "
+                   "have the user scancel it, and if blocks keep reappearing, contact the facility.")
         if stale:
             notice += f" Likely here — {stale}."
     return notice

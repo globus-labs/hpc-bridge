@@ -22,11 +22,13 @@ installed plugin only when that version changes); git tags mark releases.
 - **One worker check in flight at a time.** Every probe of a cold block used to submit a new check task (24 in one
   15-minute wait), and a facility endpoint keeps relaunching billed blocks for as long as any task is queued — on
   Delta for up to 48 hours, with no way for the client to cancel. A pending check is now waited on again instead of
-  resubmitted.
+  resubmitted; one still pending after five minutes is abandoned for a single fresh one (an endpoint that restarts
+  can drop a task), and warmth is dated from when the worker actually answered.
 - **A long wait on a facility endpoint names the silent, billing case.** Still "allocating" after five minutes, the
-  notice now says it may be a block that is running while its worker cannot return results, which the facility
-  keeps relaunching; it tells the agent to stop and have the user check and cancel their jobs on the facility, and
-  repeats the attach's stale-entry note when there is one.
+  notice names the three things it can be — a long queue, a scheduler rejection, or a block running while its
+  worker cannot return results, which the facility keeps relaunching — and how the user's `squeue` tells them apart
+  (PENDING, no job, RUNNING), and repeats the attach's stale-entry note when there is one. The facility stop notice
+  no longer implies a queued check task can't keep blocks coming.
 
 ### Fixed
 - **Anvil and Delta run again.** Re-proving the registry on 0.1.18 found both broken by the same skew, in opposite
