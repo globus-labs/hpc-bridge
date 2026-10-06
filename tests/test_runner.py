@@ -142,7 +142,7 @@ async def test_canary_ok_parses_worker_versions():
 async def test_canary_timeout_reports_not_ok():
     # No worker answered within the budget -> not warm (block still cold-starting), NOT an exception.
     pytest.importorskip("globus_compute_sdk")
-    ex = _CanaryExecutor(exc=TimeoutError())
+    ex = _QueueExecutor(_CanaryFuture(pending=True))
     r = GlobusRunner("eid", executor_factory=lambda: ex)
     res = await r.canary(timeout=0.5)
     assert res.ok is False and res.error == "timeout"
@@ -333,3 +333,13 @@ async def test_warmth_is_dated_from_when_the_worker_answered():
     rt = _shape_runtime(app, "compute")
     assert time.monotonic() - rt.warm_confirmed_at >= 19.9  # the real answer time, not when it was read
     assert len(ex.submitted) == 1                            # and the pending canary was reused, not resubmitted
+
+
+async def test_a_task_that_failed_with_a_timeout_error_is_a_failure_not_pending():
+    # a done future whose exception IS a TimeoutError used to read as "still queued" forever (verification)
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(exc=TimeoutError("worker walltime")), _CanaryFuture(result=_ShellRes("HPCB_CANARY\n")))
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    res = await r.canary(timeout=0.1)
+    assert res.ok is False and res.error != "timeout" and "worker walltime" in res.error
+    assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2

@@ -616,9 +616,10 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
             "stopped submitting; the block is DRAINING. On a facility multi-user endpoint hpc-bridge "
             "has no cancel channel, so the block cannot be released or confirmed from here — the "
             f"facility's idle-release reclaims it after {idle} of no tasks (or at walltime) — unless a task of "
-            "ours is still queued there (a check that never got an answer counts): the facility may then "
-            "relaunch blocks for it, which only the user (scancel on the facility) or the facility can stop. "
-            f"Spend may accrue for up to that tail. 'draining' is FINAL on this facility: do NOT "
+            "ours is still queued there (a check that never got an answer counts): the facility may then keep "
+            "relaunching blocks for it, up to its own hard limit; the user can scancel each block on the facility, "
+            "and only the facility can stop the relaunching. Spend may accrue for that tail, or longer in that case. "
+            "'draining' is FINAL on this facility: do NOT "
             "re-poll stop_endpoint waiting for 'down'. The endpoint stays available (it's the facility's)."
         ),
     )

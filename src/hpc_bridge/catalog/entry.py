@@ -66,7 +66,7 @@ class WorkerEnv(BaseModel):
     @classmethod
     def _version(cls, v: str | None) -> str | None:
         v = (v or "").strip()
-        return v if _VERSION.match(v) else None  # unusable -> no claim, never a broken entry
+        return v.lstrip("vV") if _VERSION.match(v) else None  # unusable -> no claim, never a broken entry
 
 
 def _install_segments(env_setup: str) -> list[str]:
@@ -82,6 +82,26 @@ def _upgrades(segment: str) -> bool:
         if tok == "--upgrade" or (tok.startswith("-") and not tok.startswith("--") and "U" in tok[1:]):
             return True
     return False
+
+
+def worker_env_raw_problems(raw: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `compute.worker_env`, before the lenient parse can forgive it: a block
+    the client would silently drop (a list, a missing strategy, an unquoted `verified_with: 4.16` YAML float) must
+    be refused at ingest, not published as null — that would quietly remove the entry's verified-version fallback."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return [f"worker_env must be a mapping, got {type(raw).__name__}"]
+    problems = []
+    if not isinstance(raw.get("strategy"), str):
+        problems.append("worker_env.strategy must be a string (pin | float)")
+    vw = raw.get("verified_with")
+    if not isinstance(vw, str) or not _VERSION.match(vw.strip()):
+        problems.append(f"worker_env.verified_with must be a quoted version string like \"4.16.0\", got {vw!r}")
+    unknown = sorted(set(raw) - {"strategy", "verified_with"})
+    if unknown:
+        problems.append(f"worker_env has unknown key(s) {unknown}")
+    return problems
 
 
 def worker_env_problems(compute: Compute) -> list[str]:

@@ -387,9 +387,12 @@ def _allocating_notice(partition: str | None, elapsed_s: float, *, facility_mep:
                    "results "
                    "(a package mismatch with the facility's endpoint), which the facility keeps relaunching while our "
                    "check task stays queued — hpc-bridge cannot cancel either. Don't poll indefinitely: ask the user "
-                   "to check their jobs on the facility (squeue -u $USER). PENDING = (1), keep waiting or try a less "
-                   "busy partition; no job at all = (2); a RUNNING job that never answers = (3): call stop_endpoint, "
-                   "have the user scancel it, and if blocks keep reappearing, contact the facility.")
+                   "to check their jobs on the facility (squeue -u $USER, with the REASON column). PENDING for "
+                   "Priority/Resources = (1), keep waiting or try a less busy partition (a policy reason, e.g. an "
+                   "exhausted allocation, will not clear by waiting); no job at all = most likely (2), or a worker "
+                   "that crashes at start; a RUNNING job that never answers = (3): call stop_endpoint and have the "
+                   "user scancel it — that ends the current block, but while our check stays queued the facility may "
+                   "start another, so if blocks keep reappearing, contact the facility.")
         if stale:
             notice += f" Likely here — {stale}."
     return notice

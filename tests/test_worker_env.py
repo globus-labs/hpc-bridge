@@ -190,3 +190,31 @@ async def test_the_stale_note_reaches_the_connect_notice(monkeypatch):
     monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: fac)
     res = await server._connect_facility(app, "delta")
     assert "STALE ENTRY" in res.notice and "v4.17.0" in res.notice
+
+
+def test_ingest_refuses_a_worker_env_the_client_would_quietly_drop(tmp_path):
+    # the lenient client parse turns these into worker_env=None; ingest must refuse them, not publish null (which
+    # silently removes the entry's verified-version fallback)
+    from hpc_bridge.catalog.ingest import ingest
+
+    class _Search:
+        def ingest(self, index, doc):
+            raise AssertionError("nothing must reach the index")
+
+    for garble in ({"strategy": "pin", "verified_with": 4.16}, {"verified_with": "4.16.0"}, ["pin"]):
+        rows = yaml.safe_load((SEEDS / "ncsa-delta.yaml").read_text())
+        rows[0]["compute"]["worker_env"] = garble
+        seed = tmp_path / "seed.yaml"
+        seed.write_text(yaml.safe_dump(rows))
+        with pytest.raises(ValueError, match="worker_env"):
+            ingest("idx", seed, _Search())
+
+
+def test_a_v_prefixed_verified_version_is_stored_bare():
+    assert _compute(_INSTALL, worker_env={"strategy": "pin", "verified_with": "v4.16.0"}).worker_env.verified_with == "4.16.0"
+
+
+def test_the_pin_note_says_when_the_version_came_from_the_entry():
+    fac = MEPFacility.from_entry(_seed("ncsa-delta.yaml", "delta"))
+    fac.sanitize_uec(fac.config_template(None)[1])  # live version never read (the startup-pinned path)
+    assert any("verified with" in n and "not read" in n for n in fac.template_notes)

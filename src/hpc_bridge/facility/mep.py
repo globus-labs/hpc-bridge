@@ -22,7 +22,7 @@ def _same_version(a: str, b: str) -> bool:
     """`4.16` == `4.16.0` == `v4.16.0 `: compare the numeric release parts, trailing zeros ignored."""
     def norm(v: str) -> tuple:
         parts = v.strip().lstrip("vV").split(".")
-        out = [int(p) if p.isdigit() else p for p in parts]
+        out = [int(p) if p.isdecimal() else p for p in parts]
         while out and out[-1] == 0:
             out.pop()
         return tuple(out)
@@ -249,7 +249,11 @@ class MEPFacility:
                 py = f"{sys.version_info.major}.{sys.version_info.minor}"
                 out["worker_init"] = (wi.replace(GCE_VERSION_TOKEN, gce or "")
                                       .replace(PYTHON_VERSION_TOKEN, py))
-                self._note(f"worker pool pinned to globus-compute-endpoint {gce} ({self.worker_version} version), "
+                live = self.worker_version != "manager" or self.endpoint_version
+                source = (f"{self.worker_version} version" if live
+                          else "the version this registry entry was verified with — the facility's live version "
+                               "was not read")
+                self._note(f"worker pool pinned to globus-compute-endpoint {gce} ({source}), "
                            f"python {py}")
         sc = self.schema or {}
         if sc.get("additionalProperties") is False:
