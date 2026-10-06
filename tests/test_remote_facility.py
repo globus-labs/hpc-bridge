@@ -335,8 +335,9 @@ class _BootstrapCLI(_FakeRemoteCLI):
     async def whoami(self):
         return self.remote_db_present
 
-    async def seed_storage_db(self, local_db):
+    async def seed_storage_db(self, local_db, *, replace_ours=False):
         self.seeded = local_db
+        self.replaced_ours = replace_ours
         self.remote_db_present = True
 
     async def hostname_fqdn(self):

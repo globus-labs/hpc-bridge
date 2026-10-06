@@ -114,8 +114,13 @@ def bundles_from(path: Path) -> tuple[list[Path], dict]:
     manifest = path / "manifest.json"
     if manifest.exists():
         m = json.loads(manifest.read_text())
+        cells = [c["bundle"] for c in m.get("cells", []) if c.get("bundle")]
         root = Path(m.get("repo_root") or HERE.parent)
-        return [(root / c["bundle"]) for c in m.get("cells", []) if c.get("bundle")], m
+        # The manifest records the ABSOLUTE checkout it ran in; after the checkout moves (a removed worktree, a
+        # fresh clone) its bundles live beside this tool instead — the repo-relative `bundle` paths still hold.
+        if cells and not (root / cells[0]).exists() and (HERE.parent / cells[0]).exists():
+            root = HERE.parent
+        return [root / b for b in cells], m
     return sorted(p for p in path.iterdir() if p.is_dir()), {}
 
 

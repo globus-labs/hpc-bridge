@@ -3,6 +3,67 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.18 — 2026-10-05 — fixes from the 2026-09-05 plugin review: teardown, pins, credentials, the numbers the agent relays
+
+### Changed
+- **Spend is asked again after a block is gone.** The `confirm_spend` acknowledgement used to last the whole session,
+  so a block that idle-released, ran out its walltime, or was cancelled was silently replaced by a new billed one on
+  the next call. It now covers one block. The server presumes a block gone by the clock alone (no task for longer
+  than the known idle window plus a minute's grace, or older than the walltime) before submitting anything — also
+  before a partition or account switch — or learns it when a check of a block it had confirmed warm goes unanswered
+  (including after a failed task or a runner rebuild). Either way the next call returns `needs_confirmation` with the
+  reason — even one that passes `confirm_spend=True`, which was given before the reap was known. When a check found
+  the block gone, `run_shell` and `ensure_endpoint_up` report `block_state="provisioning"` because that check may
+  already be bringing up a new block; `stop_endpoint` waits for that pilot and cancels it on an SSH facility, while
+  on a facility endpoint the notice says it idles out. A block the clock presumes released is billed to that time,
+  on the next call and on `stop_endpoint`/teardown, not to whenever the agent came back; a task polled long after
+  it ended counts from when it ended. A check queued behind a
+  command still inside its synchronous wait is not read as a reap, and local dev's held block never is.
+
+### Fixed
+- **Teardown can no longer be retargeted, run twice, or replay a stale answer.** `teardown_endpoint` decides what it
+  tears down in one locked step with no await before it: an SSH endpoint's teardown is claimed and snapshotted there
+  and runs (release, one-time-code gate, login-node ops) as one task on that facility and endpoint; a facility
+  endpoint is detached there outright. Before, a `connect_facility` in the same tool batch could rebind while
+  teardown awaited, and the background task then ran `gce stop`/`delete`, removed the pin and wiped the token store of
+  the NEW facility (and on a facility endpoint, the detach wiped the new binding); two overlapping calls ran the
+  login-node ops twice. `connect_facility` refuses to rebind while a teardown is still running, and a rebind drops the
+  previous binding's pending one-time-code handoff. A finished result is replayed only as a `down` whose state is
+  still cleared — a code request already answered, or a `down` followed by a `run_shell` that bound an endpoint again
+  (even under the same id), starts a fresh teardown.
+- **What teardown says is what happened.** The interim `tearing_down` and the code request say whether the block
+  release went through, is still in progress, or was dispatched but not confirmed (a cold login channel) — not
+  "already went through" regardless. A login-node `stop`, status check or delete that times out is reported as
+  unconfirmed — with what the report says was done (the token copy removed, the connection closed), and as `down`
+  when the delete went through — not as "nothing was removed, still running".
+- **An adopted endpoint keeps its login-node pin.** When bootstrap adopts an endpoint that is already running, the
+  stored record keeps the node pinned at launch (for the same endpoint id only) instead of being rewritten with no
+  node, which sent the next session's SSH to the round-robin alias and orphaned the manager (a regression since
+  0.1.1). The early record written while seeding credentials carries the pin too.
+- **Credential seeding never overwrites a token store hpc-bridge did not place.** Seeding happens when
+  `globus-compute-endpoint whoami` fails on the login node, but that also happens when a store exists and the
+  facility's `env_setup`, PATH, scopes or network are broken. The write now refuses on the node itself if a store
+  holding tokens is present — unless hpc-bridge's own record, for the same SSH login, says it placed that store (a
+  stale copy of ours is refreshed; the flag is cleared when a wipe ran but the delete did not). A store with no tokens
+  is replaced: `whoami` itself creates one on a node where nobody has logged in, and the first fake-cluster run of
+  this change refused every first bring-up on it. The check runs with the endpoint environment's `python3`; where
+  no python3 with sqlite3 exists, the connect says it could not check instead of guessing. When it refuses,
+  `connect_facility` says so with whoami's own error. The check-and-write runs in `sh` whatever the login shell is
+  (under tcsh the guard would have been skipped). Before, hpc-bridge replaced the user's credential and teardown later
+  deleted the replacement.
+- **The numbers the agent relays are the facility's.** On a facility multi-user endpoint the idle-release window is
+  read from the facility's published template (`max_idletime`), and when the template sets none the notices say so
+  instead of quoting hpc-bridge's 600 s default. Spend and the confirm-spend notice use the block's own node count (and
+  the notice names the walltime) instead of always one node. An SSH teardown stops the compute spend clock at the
+  release, as `stop_endpoint` does, and a released block's spend now stays in every later result of the session (a
+  teardown resumed after its one-time code reported 0).
+- **A changed host key is not coached like an unknown one** in `complete_preauth`: it says the key differs from the
+  trusted one, not to accept it until the facility confirms the fingerprint, and names the `known_hosts` entry exactly
+  as OpenSSH reports it. A revoked host key (`known_hosts` `@revoked` or `RevokedHostKeys`) is refused outright, in
+  `complete_preauth` and on the connect path (where it also no longer drops the login-node pin).
+- **Skill:** the session's working directory and environment survive a new block (they live on the shared
+  filesystem) — the `block_reaped_resume` scenario caught an agent telling the user the opposite.
+
 ## 0.1.17 — 2026-09-09 — the account floor: an account-required facility starts nothing without an account
 
 ### Fixed

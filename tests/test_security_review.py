@@ -445,7 +445,7 @@ async def test_teardown_deletes_the_endpoint_and_its_worker_dirs_and_reports(tmp
     assert kinds.index("stop") < kinds.index("delete") and ("delete", "hpc-bridge") in cli.calls
     assert ("remove_uep_dirs", "eid-1") in cli.calls and ("wipe", "hpc-bridge") in cli.calls
     assert report == {"stopped": True, "deleted": True, "credentials_wiped": True, "ssh_closed": True,
-                      "ssh_failed": False, "error": ""}  # every word measured (fake: stop rc 0, wipe ok, close ok)
+                      "ssh_failed": False, "error": "", "delete_error": ""}  # every word measured (fake: stop rc 0, wipe ok, close ok)
     assert store.get(alias="a", name="hpc-bridge") is None  # the record goes with the endpoint
 
 

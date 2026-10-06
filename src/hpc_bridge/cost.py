@@ -27,11 +27,22 @@ def cap_output(text: str, max_chars: int) -> str:
 
 # --- the session spend clock (split step 4, 2026-09-03: it belonged with estimate_spend) ---
 
-def _bank_warm_interval(rt: ShapeRuntime, app: AppCtx) -> None:
-    """Fold the elapsed warm interval into accrued spend and stop the clock."""
+def _block_nodes(rt: ShapeRuntime, app: AppCtx) -> int:
+    """How many nodes this shape's block holds: its own config (what the scheduler is asked for), not the
+    never-set `Profile` default — a 4-node block billed as 1 under-reported spend 4x (review 2026-09-05 #6b)."""
+    try:
+        return max(1, int(rt.user_endpoint_config.get("nodes_per_block") or app.profile.nodes_per_block or 1))
+    except (TypeError, ValueError):
+        return max(1, int(app.profile.nodes_per_block or 1))
+
+def _bank_warm_interval(rt: ShapeRuntime, app: AppCtx, *, until: float | None = None) -> None:
+    """Fold the elapsed warm interval into accrued spend and stop the clock. `until` (monotonic) ends the
+    interval earlier than now — when the block is known to have been released at an estimated time (its idle
+    window or walltime ran out while nobody was calling), so the gap after it is not billed."""
     if rt.warm_since is not None:
+        end = time.monotonic() if until is None else min(time.monotonic(), until)
         rt.spend_accrued += estimate_spend(
-            time.monotonic() - rt.warm_since, app.profile.nodes_per_block, app.charge_factor
+            max(0.0, end - rt.warm_since), _block_nodes(rt, app), app.charge_factor
         )
         rt.warm_since = None
 
@@ -55,13 +66,14 @@ def _session_spend(rt: ShapeRuntime, app: AppCtx) -> float:
     spent = rt.spend_accrued
     if rt.warm_since is not None:
         spent += estimate_spend(
-            time.monotonic() - rt.warm_since, app.profile.nodes_per_block, app.charge_factor
+            time.monotonic() - rt.warm_since, _block_nodes(rt, app), app.charge_factor
         )
     return spent
 
 def _total_session_spend(app: AppCtx) -> float:
-    """Total spend across every shape — the cost the agent sees on outcomes/status."""
-    return sum(_session_spend(rt, app) for rt in app.shapes.values())
+    """Total spend across every shape, plus the blocks already released on this binding — the cost the agent sees
+    on outcomes/status."""
+    return sum(_session_spend(rt, app) for rt in app.shapes.values()) + getattr(app, "released_spend", 0.0)
 
 def _with_spend(app: AppCtx, out: ShellOutcome) -> ShellOutcome:
     out.session_spend = _total_session_spend(app)

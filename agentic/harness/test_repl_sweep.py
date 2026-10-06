@@ -272,3 +272,22 @@ def test_slide_svg_is_drawn_at_the_slides_content_width(tmp_path):
     height = int(re.match(r'<svg [^>]*viewBox="0 0 1136 (\d+)"', svg).group(1))
     assert height <= 500                               # fits between the slide title and its footer band at 1:1
     assert 'font-size:18px' in svg and 'x="0" y="18">Where a REPL turn' in svg   # projector type; headings on the left edge
+
+
+def test_a_manifest_from_a_moved_checkout_resolves_bundles_here(tmp_path):
+    # A sweep manifest records the ABSOLUTE checkout it ran in (`repo_root`). After that checkout moves (a removed
+    # worktree, 2026-09-17) the repo-relative bundle paths must resolve beside this tool, not fail.
+    sweep = tmp_path / "repl-sweep-x"
+    sweep.mkdir()
+    (sweep / "manifest.json").write_text(json.dumps(
+        {"repo_root": str(tmp_path / "gone"), "cells": [{"bundle": "agentic/harness"}]}))
+    bundles, _m = plot.bundles_from(sweep)
+    assert bundles == [plot.HERE.parent / "agentic/harness"] and bundles[0].exists()
+
+
+def test_a_manifest_whose_checkout_still_exists_is_honoured(tmp_path):
+    (tmp_path / "agentic" / "b1").mkdir(parents=True)
+    sweep = tmp_path / "s"
+    sweep.mkdir()
+    (sweep / "manifest.json").write_text(json.dumps({"repo_root": str(tmp_path), "cells": [{"bundle": "agentic/b1"}]}))
+    assert plot.bundles_from(sweep)[0] == [tmp_path / "agentic" / "b1"]

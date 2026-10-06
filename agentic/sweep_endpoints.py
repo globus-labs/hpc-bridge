@@ -19,13 +19,13 @@ Dry-run by default: prints exactly what it would do. `--apply` executes. Run fro
 from __future__ import annotations
 
 import argparse
+import re
+import shlex
 import subprocess
 import sys
 
 KEEP = {"globus-cluster-mep", "hpc-bridge-anvil", "hpc-bridge-aurora", "hpc-bridge-globus1", "hpc-bridge-midway3"}
 FAKE_LOGIN_CONTAINERS = ("hpcb-fake-login-1", "hpcb-fake-login02-1")
-# what a run leaves under a pool user's ~/.globus_compute in the fake login containers
-FAKE_DIR_GLOBS = "/home/*/.globus_compute/hpc-bridge-fake-* /home/*/.globus_compute/uep.*"
 
 
 def _harness_record(name: str) -> bool:
@@ -37,23 +37,40 @@ def _docker(container: str, script: str) -> tuple[int, str]:
     return p.returncode, (p.stdout + p.stderr).strip()
 
 
+def _manager_name(args: str) -> str | None:
+    """The endpoint name from a manager's process title: `Globus Compute Endpoint *(<uuid>, <name>) [...]`."""
+    m = re.search(r"Globus Compute Endpoint \*?\(\s*[0-9a-f-]{36}\s*,\s*([^)]+?)\s*\)", args)
+    return m.group(1) if m else None
+
+
 def sweep_fake_managers(apply: bool) -> None:
+    """Kill orphaned HARNESS managers in the fake login containers — by PID, and only those whose endpoint name is a
+    harness record. The `mep` profile runs two root facility MEPs (`hpcb-mep-strict`, `hpcb-mep-open`) in the same
+    container for its whole life; a blanket `pkill -f 'Globus Compute Endpoint'` killed them too (2026-09-22)."""
     print("== fake login containers: orphan endpoint managers ==")
     for c in FAKE_LOGIN_CONTAINERS:
-        rc, ps = _docker(c, "ps -eo pid,user,etime,args | grep 'Globus Compute Endpoint' | grep -v grep")
+        rc, ps = _docker(c, "ps -eo pid=,user=,etime=,args= | grep 'Globus Compute Endpoint' | grep -v grep")
         if rc not in (0, 1):
             print(f"  {c}: not reachable ({ps[:80]}) — skipped")
             continue
-        procs = [line for line in ps.splitlines() if line.strip()]
-        print(f"  {c}: {len(procs)} manager process(es)")
-        for line in procs:
-            print(f"    {line[:150]}")
-        if apply:
-            # graceful first, then hard; then the endpoint dirs (the record deletion below makes them useless)
-            _docker(c, "pkill -f 'Globus Compute Endpoint' || true; sleep 3; pkill -9 -f 'Globus Compute Endpoint' || true")
-            rc, out = _docker(c, f"rm -rf {FAKE_DIR_GLOBS}; ls -d {FAKE_DIR_GLOBS} 2>/dev/null | wc -l")
-            _, left = _docker(c, "ps -eo args | grep 'Globus Compute Endpoint' | grep -v grep | wc -l")
-            print(f"    -> killed; {left.strip()} manager(s) left, {out.strip()} endpoint dir(s) left")
+        harness, kept = [], []
+        for line in (ln for ln in ps.splitlines() if ln.strip()):
+            pid, _user, _etime, args = line.split(None, 3)
+            name = _manager_name(args)
+            (harness if name and _harness_record(name) else kept).append((pid, name, line))
+        print(f"  {c}: {len(harness)} harness manager(s), {len(kept)} kept")
+        for _pid, name, line in kept:
+            print(f"    keep    {name or '?':40} {line[:90]}")
+        for _pid, name, line in harness:
+            print(f"    {'kill' if apply else 'would kill'} {name:40} {line[:90]}")
+        if apply and harness:
+            pids = " ".join(pid for pid, _n, _l in harness)
+            names = " ".join(f"/home/*/.globus_compute/{shlex.quote(n)}" for _p, n, _l in harness)
+            _docker(c, f"kill {pids} 2>/dev/null; sleep 3; kill -9 {pids} 2>/dev/null; true")
+            # only the harness endpoints' own dirs and the POOL users' user-endpoint dirs — never the MEP accounts'
+            rc, out = _docker(c, f"rm -rf {names} /home/hpcbridge-test*/.globus_compute/uep.*; "
+                                 f"ls -d {names} 2>/dev/null | wc -l")
+            print(f"    -> killed {len(harness)}; {out.strip()} endpoint dir(s) left")
 
 
 def sweep_records(apply: bool) -> None:

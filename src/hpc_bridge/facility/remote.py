@@ -49,6 +49,23 @@ _UUID_RE = re.compile(r"^[0-9a-fA-F-]{36}$")
 _SAFE_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")  # endpoint names spliced into remote shell paths
 
 
+class RemoteTokenStoreExists(RuntimeError):
+    """The login node already holds a Globus token store WITH tokens in it, yet `globus-compute-endpoint whoami` failed
+    there. hpc-bridge will not replace (and later delete) a credential it did not create (review 2026-09-05 #5)."""
+
+
+# Exit 0 when the SQLite token store at argv[1] holds NO tokens — the empty store `globus-compute-endpoint whoami`
+# itself creates when nobody has logged in; 1 when it holds tokens or cannot be read (a missing table, a lock, not
+# SQLite); 3 when this interpreter has no sqlite3, so the caller tries the next one. Opened read-only, the path
+# URI-escaped. No `!`, `$` or double quotes: it rides inside a double-quoted `sh -c` argument through any login shell
+# (tcsh history-expands `!` even in single quotes).
+_EMPTY_STORE_PY = ("import sys,importlib.util,urllib.parse; "
+                   "importlib.util.find_spec('_sqlite3') is None and sys.exit(3); import sqlite3; "
+                   "c=sqlite3.connect('file:'+urllib.parse.quote(sys.argv[1])+'?mode=ro',uri=True); "
+                   "sys.exit(0 if c.execute('select count(*) from token_storage').fetchone()[0]==0 else 1)")
+_PY_SENTINEL = "HPCB_PY="
+
+
 @dataclass(frozen=True)
 class SshTarget:
     host: str
@@ -388,6 +405,8 @@ class RemoteEndpointCLI:
 
     def __init__(self, target: SshTarget, env_setup: str, *, remote_dir: str = "$HOME/.globus_compute") -> None:
         self.target = target
+        self.last_whoami_error: str | None = None  # the remote's words when `whoami` last failed
+        self.gce_python: str | None = None  # python3 inside the gce environment, seen by whoami (it has sqlite3)
         self.env_setup = env_setup
         self.remote_dir = remote_dir
 
@@ -476,12 +495,16 @@ class RemoteEndpointCLI:
         if rc != 0:
             raise RuntimeError(f"remote write {path} failed: {(err or out).strip()}")
 
-    async def seed_storage_db(self, local_db: Path) -> None:
+    async def seed_storage_db(self, local_db: Path, *, replace_ours: bool = False) -> None:
         """Ship a (trimmed) storage.db to the remote ~/.globus_compute/storage.db.
 
         The db is binary SQLite, so it rides stdin base64-encoded and is decoded
         remotely. The directory is created 0700 and the file chmod'd 0600 — this is a
-        bearer credential. Raises RuntimeError on any remote step failure."""
+        bearer credential. Raises RuntimeError on any remote step failure.
+
+        A store already on the node is replaced only with `replace_ours` — when OUR record says hpc-bridge placed
+        it (a copy of ours whose tokens went stale) — or when it holds no tokens at all; otherwise
+        RemoteTokenStoreExists (review 2026-09-05 #5)."""
         payload = base64.b64encode(Path(local_db).read_bytes()).decode("ascii")
         db_path = f"{self.remote_dir}/storage.db"
         rc, out, err = await ssh_exec(
@@ -492,9 +515,46 @@ class RemoteEndpointCLI:
             raise RuntimeError(
                 f"seed storage.db (mkdir) failed: {(err or out).strip()}"
             )
-        rc, out, err = await ssh_exec(
-            self.target, f'base64 -d > "{db_path}"', stdin=payload
-        )
+        # No-clobber, decided ON the login node in the same command as the write: `whoami` failing does not mean
+        # there is no store (env_setup broke, gce is not on PATH, the tokens lack a scope, auth.globus.org is
+        # unreachable from the node) — overwriting would destroy the user's credential, and teardown would then
+        # delete our replacement (review 2026-09-05 #5).
+        # Run the check-and-write in `sh`, not the user's login shell: under tcsh the `if [ … ]` line is a syntax error
+        # that still runs the write (a silent overwrite), and fish cannot parse it at all. `set -C` (noclobber) closes
+        # the check-then-write race too. stdin passes through `sh -c` to `base64 -d`.
+        # A store with NO tokens holds no credential to protect: it is what `whoami` itself leaves on a node where
+        # nobody has logged in (live 2026-10-06 — refusing it broke every first SSH bring-up), so it is replaced. The
+        # check tries the gce environment's python3 first (the plain PATH may have none with sqlite3), then python3.
+        # Not atomic with the rm: a store being CREATED in that instant (a `globus-compute-endpoint login` run by hand
+        # at the same moment, which writes an empty store before it asks for the code) can be replaced — accepted, as
+        # it holds no tokens yet; `set -C` still closes the race between the rm and our write.
+        pys = " ".join(shlex.quote(c) for c in dict.fromkeys(x for x in (self.gce_python, "python3") if x))
+        inner = (f'db="{db_path}"; ' + ('' if replace_ours else
+                 f'if [ -e "$db" ]; then r=9; for py in {pys}; do if command -v "$py" >/dev/null 2>&1; then '
+                 f'"$py" -c "{_EMPTY_STORE_PY}" "$db" 2>/dev/null; r=$?; [ "$r" -le 1 ] && break; fi; done; '
+                 'if [ "$r" -eq 0 ]; then rm -f "$db" "$db-wal" "$db-shm" "$db-journal"; '
+                 'elif [ "$r" -eq 1 ]; then echo HPCB_EXISTS; exit 3; else echo HPCB_UNCHECKED; exit 4; fi; fi; '
+                 'set -C; ') + 'base64 -d > "$db"')
+        rc, out, err = await ssh_exec(self.target, f"sh -c {shlex.quote(inner)}", stdin=payload)
+        if "HPCB_UNCHECKED" in (out or ""):
+            why = (self.last_whoami_error or "no output").strip()
+            raise RemoteTokenStoreExists(
+                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db) and "
+                "hpc-bridge could not check whether it holds tokens (no python3 with sqlite3 on the login node), so "
+                f"it will not replace it. `globus-compute-endpoint whoami` failed there: {why[-300:]}. If nobody has "
+                "logged in there, it is the empty store whoami leaves: remove it, or run `globus-compute-endpoint "
+                "login` there yourself, then call connect_facility again. Nothing was started or billed."
+            )
+        if "HPCB_EXISTS" in (out or ""):
+            why = (self.last_whoami_error or "no output").strip()
+            raise RemoteTokenStoreExists(
+                f"a Globus token store already exists on {self.target.host} (~/.globus_compute/storage.db) and "
+                "is not empty (or could not be read), but "
+                f"`globus-compute-endpoint whoami` failed there: {why[-300:]}. hpc-bridge will not replace a "
+                "credential it did not create. Fix what whoami reports (the facility's env_setup, gce on PATH, the "
+                "login node's network to auth.globus.org), or run `globus-compute-endpoint login` there yourself, "
+                "then call connect_facility again. Nothing was started or billed."
+            )
         if rc != 0:
             raise RuntimeError(
                 f"seed storage.db (write) failed: {(err or out).strip()}"
@@ -689,8 +749,21 @@ class RemoteEndpointCLI:
         raise RuntimeError(f"could not find endpoint {name!r} in `list` output")
 
     async def whoami(self) -> bool:
-        """True if the remote endpoint can authenticate (storage.db usable)."""
-        rc, _out, _err = await self._gce("whoami", timeout=_BOOTSTRAP_SSH_S)  # the first env_setup run lands here
+        """True if the remote endpoint can authenticate (storage.db usable). On failure the remote's own words are
+        kept in `last_whoami_error` — seed_storage_db quotes them if it then finds a store it must not replace. Also
+        notes the gce environment's python3 (`gce_python`): the interpreter seed_storage_db tries first to check
+        whether a store holds tokens, since the login node's plain PATH may have none with sqlite3."""
+        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix()}{{ command -v python3 >/dev/null 2>&1 && "
+                 f'echo "{_PY_SENTINEL}$(command -v python3)"; globus-compute-endpoint whoami; }}')
+        rc, out, err = await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=_BOOTSTRAP_SSH_S)
+        kept = []
+        for line in (out or "").splitlines():
+            if line.startswith(_PY_SENTINEL):
+                self.gce_python = line[len(_PY_SENTINEL):].strip() or None
+            else:
+                kept.append(line)
+        out = "\n".join(kept)
+        self.last_whoami_error = None if rc == 0 else ((err or out or "").strip() or f"rc={rc}")
         return rc == 0
 
     def rebind(self, host: str) -> None:
@@ -916,6 +989,13 @@ class SlurmFacility:
         reused = await self.find_online_endpoint(self.profile.endpoint_name)
         if reused is not None:
             return EndpointHandle(endpoint_id=reused, name=self.profile.endpoint_name, reused=True)
+        store, alias = self.store, self.alias
+        # ONE read of what an earlier run recorded, before anything below rewrites it: who placed the remote token
+        # store, and which node the endpoint was pinned to (review 2026-10-05).
+        prior = (store.get(alias=alias, name=self.profile.endpoint_name)
+                 if store is not None and alias is not None else None)
+        # an earlier run of ours placed the store — for THIS login (a record is keyed by alias + endpoint name only)
+        ours = bool(prior is not None and prior.seeded_credentials and prior.user == self.cli.target.user)
         seeded = False
         if not await self.cli.whoami():
             with tempfile.TemporaryDirectory() as tmp:
@@ -924,29 +1004,38 @@ class SlurmFacility:
                     dst_path=Path(tmp) / "storage.db",
                     namespace=_resolve_namespace(),
                 )
-                await self.cli.seed_storage_db(trimmed)
+                # our OWN stale copy is refreshed (a logout, a scope change); anyone else's store is refused
+                await self.cli.seed_storage_db(trimmed, replace_ours=ours)
             seeded = True
-            if self.store is not None and self.alias is not None:
+            if store is not None and alias is not None:
                 # Record the seed NOW: a bootstrap that dies before provision completes (a first-connect
                 # install past the ssh timeout — Expanse, live 2026-09-04) must not orphan a store we placed.
-                self.store.put(EndpointRecord(
-                    endpoint_id="", login_host=None, alias=self.alias, user=self.cli.target.user,
+                # Carry the prior endpoint id and pin: this write must not erase them before provision runs.
+                store.put(EndpointRecord(
+                    endpoint_id=prior.endpoint_id if prior is not None else "",
+                    login_host=prior.login_host if prior is not None else None,
+                    alias=alias, user=self.cli.target.user,
                     key_path=self.cli.target.key_path, name=self.profile.endpoint_name,
                     provisioned_at=datetime.now(UTC).isoformat(), seeded_credentials=True,
                 ))
-        elif self.store is not None and self.alias is not None:
-            prior = self.store.get(alias=self.alias, name=self.profile.endpoint_name)
-            seeded = bool(prior is not None and prior.seeded_credentials)  # an earlier run of ours seeded it
+        else:
+            seeded = ours
         self._seeded_credentials = seeded  # remembered for teardown in THIS process; the store keeps it across sessions
         handle = await self.provision(hpc)
         if self.store is not None and self.alias is not None:
             # written even with no routable pin (login_host None): the record also carries WHO seeded the
             # remote token store, which teardown in a later call/session needs (live 2026-09-04: the flag
             # lived on a facility object connect rebuilds every call, so teardown never wiped)
+            # An ADOPTED endpoint (already running: provision's reuse branch, or start()'s "another instance") has no
+            # fresh node to report (login_host None) — keep the node we pinned when we launched it, or the next
+            # session's control-plane SSH goes to the round-robin alias and orphans it (review 2026-09-05 #4; the
+            # guard #79 removed when it made this write unconditional).
+            # ...but only for the SAME endpoint: a re-registered one must not inherit the old one's node.
+            same = prior is not None and prior.endpoint_id == handle.endpoint_id
             self.store.put(
                 EndpointRecord(
                     endpoint_id=handle.endpoint_id,
-                    login_host=handle.login_host,
+                    login_host=handle.login_host or (prior.login_host if prior is not None and same else None),
                     alias=self.alias,
                     user=self.cli.target.user,
                     key_path=self.cli.target.key_path,
@@ -1026,28 +1115,55 @@ class SlurmFacility:
         seeded-flag) is kept so a later teardown can still do the job. The record is dropped only
         when the delete actually happened."""
         name = self.profile.endpoint_name
-        rc, err = await self.cli.stop(name)
+        try:
+            rc, err = await self.cli.stop(name)
+        except TimeoutError:  # a slow filesystem: the stop may be finishing there — the status re-check below decides
+            rc, err = None, "the stop timed out on the login node"
         if rc == 255:  # ssh itself failed: nothing ran on the login node
             return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
                     "ssh_failed": True, "error": err[:400]}
-        # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check
-        stopped = rc == 0 or (await self.cli.status(name)) == "configured"
+        # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check. A
+        # re-check that TIMES OUT proves nothing either way — report "unconfirmed" (None), never "still running".
+        stopped: bool | None
+        try:
+            stopped = rc == 0 or (await self.cli.status(name)) == "configured"
+        except TimeoutError:
+            stopped, err = None, (err or "").strip() + " (the status re-check timed out)"
         # `stop` kills the manager, but an ungraceful stop leaves Parsl's block holding the
         # allocation until walltime (no manager left to scale it in). Explicitly cancel this
         # endpoint's blocks so "teardown released the compute" actually holds.
         await self.cli.cancel_blocks(endpoint_id, self.profile.scheduler)
-        deleted = await self.cli.delete(name)  # the directory + registration — else the next connect re-adopts it
-        await self.cli.remove_uep_dirs(endpoint_id)
+        # A slow filesystem (Expanse: minutes) can time an SSH op out AFTER the stop succeeded: report what is known
+        # instead of letting the timeout escape as "nothing was removed, still running" (review 2026-10-05).
+        delete_error = ""
+        try:
+            deleted = await self.cli.delete(name)  # the directory + registration — else the next connect re-adopts it
+        except TimeoutError:
+            deleted, delete_error = False, "the delete timed out on the login node (it may still complete there)"
+        try:
+            await self.cli.remove_uep_dirs(endpoint_id)
+        except TimeoutError:
+            pass  # leftover uep.* dirs are inert; the next teardown or a manual rm clears them
         wiped = False
         if wipe_credentials and self._seeded_by_us():
-            wiped = await self.cli.wipe_storage_db()
+            try:
+                wiped = await self.cli.wipe_storage_db()
+            except TimeoutError:
+                wiped = False
         if deleted and self.store is not None and self.alias is not None:
             self.store.remove(alias=self.alias, name=name)  # no endpoint, no pin, no seeded-flag to carry
+        elif wiped and self.store is not None and self.alias is not None:
+            # the record outlives a failed delete, but the store we placed is gone: never let a later bootstrap
+            # believe a store found there is ours to replace (review 2026-10-05)
+            rec = self.store.get(alias=self.alias, name=name)
+            if rec is not None and rec.seeded_credentials:
+                self.store.put(replace(rec, seeded_credentials=False))
+            self._seeded_credentials = False
         # `ssh_closed`: the tool's notice says so, else the agent infers the connection is "still open" (it did,
         # live 2026-09-04) and tells the user something false about what is left on their machine.
         ssh_closed = bool(await self.cli.close())  # drop the shared SSH master; the endpoint is gone
         return {"stopped": stopped, "deleted": deleted, "credentials_wiped": wiped, "ssh_closed": ssh_closed,
-                "ssh_failed": False, "error": "" if stopped else err[:400]}
+                "ssh_failed": False, "error": "" if stopped else (err or "")[:400], "delete_error": delete_error}
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Read-only login-node command for discovery — no block, no allocation (delegates

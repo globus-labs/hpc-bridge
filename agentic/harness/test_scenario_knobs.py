@@ -51,7 +51,7 @@ def test_node_need_is_derived_for_every_block_bringing_scenario():
         rc, k = _knobs(s)
         assert rc == 0 and k.get("HPCB_KNOB_NEEDS_NODE") == need, (s, k)
     for s in ("mep_compute_only", "stranger_mep_walk"):
-        assert _knobs(s)[1].get("HPCB_KNOB_WARM_BLOCK_USER") == "glabs", s
+        assert _knobs(s)[1].get("HPCB_KNOB_WARM_BLOCK_USER") == "glabs-gc", s
     for s in ("zero_config_list", "needs_login_paste", "registry_over_cache", "spend_refusal", "session_persistence"):
         assert "HPCB_KNOB_NEEDS_NODE" not in _knobs(s)[1], s  # no block, no gate
     rc, k = _knobs("saturation")
@@ -105,7 +105,7 @@ def test_gate_warm_block_satisfies_a_mep_cell_without_an_idle_node(monkeypatch):
     gate, _clock = _gate(mod, [0], monkeypatch, warm_seq=[True])
 
     async def go():
-        assert await gate.admit("mep", 1, "glabs", asyncio.Event(), 3600) == -1  # unguarded: reusing the warm block
+        assert await gate.admit("mep", 1, "glabs-gc", asyncio.Event(), 3600) == -1  # unguarded: reusing the warm block
     asyncio.run(go())
 
 

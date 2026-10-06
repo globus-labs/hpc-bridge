@@ -76,7 +76,7 @@ def main(argv: list[str]) -> int:
             print(f"    {s}")
     has_search = any("search" in rs for rs in held)
     print(f"\ncatalog (Search scope): {'yes' if has_search else 'NO - run hpc-bridge-catalog once'}")
-    print("MEP mapping: the facility must map the identity above (globus-cluster-mep maps gusellerm@uchicago.edu -> glabs)")
+    print("MEP mapping: the facility must map the identity above (globus-cluster-mep maps gusellerm@uchicago.edu -> glabs-gc)")
     return 0
 
 

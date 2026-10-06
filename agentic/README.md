@@ -120,14 +120,14 @@ python3 agentic/run_suite.py --scenarios happy_path --repeat 3 --concurrency 3  
 python3 agentic/run_suite.py --scenarios gated_provision --repeat 2   # the spend gate (interactive)
 HPCB_NO_SKILL=1 ./agentic/run_smoke.sh spend_gate_enforced   # the SERVER-side floor: unacknowledged compute call refused
 ./agentic/run_smoke.sh session_persistence    # session shell: cwd/env persist across calls, reset clears (login-only, free)
-HPCB_TARGET=fake ./agentic/run_smoke.sh block_reaped_resume   # chaos: block reaped under an idle session, user returns — honest cold_start, session cwd survives, work completes on a new block (fake only, ~8 min)
+HPCB_TARGET=fake ./agentic/run_smoke.sh block_reaped_resume   # chaos: block reaped under an idle session, user returns — spend re-asked naming the reap, session cwd survives, work completes on a new block (fake only, ~8 min)
 ./agentic/run_smoke.sh repl_baseline_local    # REPL benchmark reference: the 10-step protocol on the agent's local Bash tool (no HPC)
 ./agentic/run_smoke.sh repl_interaction       # REPL benchmark on a warm compute block: P1/P3/P4/P5 gated, turn latency reported
 python agentic/repl_report.py agentic/runs    # side-by-side properties + latency, and the hpc-bridge / local ratio
 python3 agentic/repl_sweep.py --repeat 5 --dry-run   # REPL sweep: 5 alternating local/hpc-bridge rounds on fake, then the graph (plan + estimate)
 python3 agentic/repl_sweep.py --repeat 5             # run it; writes agentic/runs/repl-sweep-<id>/{manifest.json,logs/,repl-sweep.html}
 python3 agentic/repl_sweep.py --repeat 6 --targets fake,globus1   # add the lab cluster: waits for an idle node, records its load per cell
-./agentic/run_smoke.sh mep_compute_only     # facility MEP: zero-SSH attach, compute-only run as glabs, draining-only stop (the registry id is built in — no index env needed)
+./agentic/run_smoke.sh mep_compute_only     # facility MEP: zero-SSH attach, compute-only run as glabs-gc, draining-only stop (the registry id is built in — no index env needed)
 ./agentic/run_smoke.sh byo_teardown_clean   # BYO bring-up + full teardown on the login shape only (no node needed); world-checks the login node is clean
 ./agentic/run_smoke.sh unknown_host_key     # the host-key boundary, both halves: refused + explained on an unknown key (phase 1), succeeds once trusted (phase 2)
 ```
@@ -176,7 +176,7 @@ in once as an identity globus1 does not map (e.g. a personal Google identity) vi
 #    (mep_no_account, stranger_mep_walk — one Globus identity each) are serialised by run_suite itself.
 python3 agentic/run_suite.py --scenarios zero_config_list,needs_login_paste,mep_no_account,no_ssh_access,registry_over_cache \
   --models claude-opus-5,claude-sonnet-5,claude-haiku-4-5-20251001 --repeat 2 --concurrency 3 --stagger 20
-# 2. block tier — every MEP run maps to glabs; SERIAL keeps them one at a time
+# 2. block tier — every MEP run maps to glabs-gc; SERIAL keeps them one at a time
 python3 agentic/run_suite.py --scenarios stranger_mep_walk --models claude-opus-5,claude-sonnet-5,claude-haiku-4-5-20251001 --repeat 2 --concurrency 1
 # 3. the SSH-path classics on the weaker models (3 pool users)
 python3 agentic/run_suite.py --scenarios happy_path,gated_provision --models claude-sonnet-5,claude-haiku-4-5-20251001 --repeat 2 --concurrency 3 --stagger 20 --node-wait-s 86400
@@ -224,7 +224,7 @@ CLEANUP = ["scancel -n hpcb-sat"]  # optional: undo what SETUP created (run afte
 NEEDS_COMPUTE_NODE = True        # nodes the cell occupies (True=1, an int, False=0). DERIVED when absent: 1 if
                                  #   `compute_ran` is gated. run_suite's NodeGate admits a cell only when idle nodes
                                  #   minus blocks claimed by launches in the last 300 s cover the need.
-WARM_BLOCK_USER = "glabs"        # optional: a facility MEP's running block (that user's) satisfies the need instead
+WARM_BLOCK_USER = "glabs-gc"        # optional: a facility MEP's running block (that user's) satisfies the need instead
 SERIAL = True                    # one cell at a time (a shared facility identity, or a cell that holds every node)
 TARGETS = ("fake",)              # optional: only these targets (chaos scenarios kill things)
 REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matched against the target/profile manifest)
