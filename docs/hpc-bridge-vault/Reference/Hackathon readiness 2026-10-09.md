@@ -13,9 +13,9 @@
 endpoint with what its entry was proven against (endpoint version, Python, template and config digests), parsl
 releases with the floating facility's worker, SSH login hosts, and what a fresh `uvx --from git+…` install resolves.
 Run 2026-10-09: **all OK** — Delta, Anvil and globus-labs online and unchanged since their 4.18-client re-prove,
-Expanse's host answers, parsl unchanged. `scripts/registry_monitor.sh install` runs it hourly (launchd) — **not yet
-installed**: where it runs is the maintainer's call. Expanse still carries its 0.1.20 proof on the 4.16 client (its
-re-prove needs a one-time code).
+Expanse's host answers, parsl unchanged. It is run **on demand** as the facility-drift check, not on a schedule
+(when and how: [[Registry health]]). Expanse still carries its 0.1.20 proof on the 4.16 client; its re-prove is
+parked.
 
 ## Install: does each harness end up with hpc-bridge?
 
