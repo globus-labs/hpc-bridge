@@ -1,9 +1,9 @@
 # Registry health
 
 > [!abstract] In one line
-> The registry is only as good as its last proof. Two tiers keep it honest: a **free check** every hour (does the
-> index serve the seeds; is each facility still what its entry was proven against; what does a fresh install get)
-> and a **paid re-prove** (a real block per facility) on a slower cadence and before any event.
+> The registry is only as good as its last proof. Two tiers keep it honest: a **free drift check**, run on demand
+> (does the index serve the seeds; is each facility still what its entry was proven against; what does a fresh install
+> get), and a **paid re-prove** (a real block per facility) when the check finds drift and before any event.
 
 ## Why (2026-10-06)
 Re-proving the four registry facilities found three broken in ways no entry could see: Anvil's endpoint floated to
@@ -16,9 +16,16 @@ because `uvx` ignores `uv.lock` — every Pi / Hermes / Codex user ran an untest
 ## The free tier — `hpc-bridge-registry-health`
 `src/hpc_bridge/catalog/health.py`; exit 0 ok / 1 warn / 2 fail; `--state` remembers findings and alerts only on new
 ones (keyed on the whole finding, so an escalation re-alerts); `--notify` posts a desktop notification (the text is
-passed as an argument, never spliced into AppleScript). Scheduled on a Mac by `scripts/registry_monitor.sh install
-[MIN]`, which runs **main's** build through `uvx --refresh` — so the seeds it compares are main's, whatever branch a
-checkout is on. A missing or expired Globus login is a `fail` finding (the other checks still run), not a crash.
+passed as an argument, never spliced into AppleScript). A missing or expired Globus login is a `fail` finding (the
+other checks still run), not a crash.
+
+**Run it on demand — it is not scheduled** (maintainer's decision, 2026-10-09). When to run it: before an event or a
+demo, when a facility announces an upgrade or maintenance, when a session fails in a way the entry should have
+prevented, and after any re-ingest. How: from anywhere, against main's seeds,
+`uvx --refresh --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge-registry-health`; from a checkout on
+main, `uv run hpc-bridge-registry-health`. It needs a Globus login with the Search scope (the same one
+`hpc-bridge-catalog` uses). `scripts/registry_monitor.sh install [MIN]` would schedule it as a launchd job (main's
+build via `uvx --refresh`, alerting on new findings) if that is ever wanted.
 
 | check | what it compares | catches |
 |---|---|---|
@@ -53,8 +60,9 @@ Cost per run: one block for a few minutes (≈0.05 GPU-h on Delta, ≈0.05 SU on
 
 ## Event runbook (a hackathon, a demo)
 1. **T−1 day:** re-prove every facility (`--record`), commit, ingest; `hpc-bridge-registry-health` all ok.
-2. **During:** the monitor every 30–60 min. If a Monday falls inside the event, re-prove the `float` facilities
-   (Anvil) after Monday's parsl release (~22:45 UTC).
+2. **During:** run the drift check at the start of each session block and whenever a participant hits something
+   odd. If a Monday falls inside the event, re-prove the `float` facilities (Anvil) after Monday's parsl release
+   (~22:45 UTC).
 3. **A facility goes red:** read the finding. Version/Python/template moved → re-prove it; if the worker no longer
    answers, fix its `worker_env`/`env_setup` in the seed, re-prove, ingest — users get it on their next connect. Tell
    anyone mid-session to `connect_facility` again. A facility you cannot fix in time: say so to participants (the
