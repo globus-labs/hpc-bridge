@@ -3,6 +3,33 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.21 — 2026-10-09 — registry health: drift is checked, recorded, and a fresh install gets the tested client
+
+### Added
+- **`hpc-bridge-registry-health`**, a zero-cost check meant to run on a schedule (`scripts/registry_monitor.sh` installs
+  it as a launchd job that runs main's build via `uvx`): the live index serves main's seeds field for field; each
+  facility endpoint is online and still what its entry was proven against (endpoint version, Python, template and
+  manager-config digests — a field missing on either side is reported, never read as a match); SSH login hosts answer;
+  a parsl newer than the one a floating facility's worker was proven on; and what a fresh `uvx --from git+…` install
+  resolves against the lock. Exit 0/1/2; alerts only on new findings (an escalation is new); a missing Globus login is
+  a finding, not a crash.
+- **Entries record what they were proven against** (`verification`: date, versions, digests, and what the worker
+  reported). `agentic/registry_reprove.py ENTRY --record` runs one real block and writes it into the seed; it stops the
+  endpoint whatever happens from the first submit on (an error, a timeout, Ctrl-C) and, on a run that did not pass,
+  warns that a check task may still be queued at the facility. Read leniently by the plugin; checked strictly at
+  ingest (a facility-endpoint block must carry at least its date and endpoint version).
+- **The worker check reports the worker's parsl and globus-compute-endpoint**, parsl shown in the warm notice — the
+  version that must match the facility's endpoint and that no facility publishes.
+
+### Changed
+- **The client SDK is pinned to the version the facilities were proven with** (`globus-compute-sdk==4.18.0`) and the
+  lock moves to it. `uvx --from git+…` (the Pi / Hermes / Codex install) ignores `uv.lock`, so it was resolving SDK
+  4.18.0 against a 4.16.0 lock — every such user ran an untested client. The three facility endpoints (Delta, Anvil,
+  globus-labs) were re-proven on 4.18 (2026-10-09); Expanse (SSH, one-time code) still carries its 0.1.20 proof on
+  the 4.16 client.
+- **The stale-entry note at connect also fires when a facility's Python (major.minor) or user template changed**
+  since the entry was verified, not only its endpoint version.
+
 ## 0.1.20 — 2026-10-06 — a block on a shared partition no longer asks for a whole node
 
 ### Fixed

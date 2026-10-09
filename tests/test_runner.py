@@ -343,3 +343,26 @@ async def test_a_task_that_failed_with_a_timeout_error_is_a_failure_not_pending(
     res = await r.canary(timeout=0.1)
     assert res.ok is False and res.error != "timeout" and "worker walltime" in res.error
     assert (await r.canary(timeout=0.1)).ok and len(ex.submitted) == 2
+
+
+def test_the_canary_reports_the_workers_parsl():
+    from hpc_bridge.runner import _parse_canary, _parse_canary_parsl
+
+    out = "HPCB_CANARY\n3.13.12 0.3.9 a000\nHPCB_PARSL 2026.10.5\n"
+    assert _parse_canary(out) == ("3.13.12", "0.3.9", "a000")  # the first line is unchanged
+    assert _parse_canary_parsl(out) == "2026.10.5"
+    assert _parse_canary_parsl("HPCB_CANARY\n3.13.12 0.3.9 a000\n") is None  # no parsl on the worker: no line
+
+
+async def test_a_canary_answer_carries_the_parsl_into_the_result():
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(result=_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 a000\nHPCB_PARSL 2026.8.10\n")))
+    res = await GlobusRunner("eid", executor_factory=lambda: ex).canary(timeout=0.1)
+    assert res.ok and res.worker_parsl == "2026.8.10"
+
+
+def test_the_canary_reports_the_workers_endpoint_version():
+    from hpc_bridge.runner import _CANARY_GCE, _parse_canary_tagged
+
+    out = "HPCB_CANARY\n3.13.12 0.3.9 a007\nHPCB_PARSL 2026.10.5\nHPCB_GCE 4.18.0\n"
+    assert _parse_canary_tagged(out, _CANARY_GCE) == "4.18.0"

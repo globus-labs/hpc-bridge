@@ -7,7 +7,7 @@ import sys
 from pathlib import Path
 
 from .bundled import BundledCatalog
-from .entry import worker_env_problems, worker_env_raw_problems
+from .entry import verification_problems, verification_raw_problems, worker_env_problems, worker_env_raw_problems
 
 
 def ingest(index_id: str, seed_path: str | Path, client) -> int:
@@ -19,12 +19,17 @@ def ingest(index_id: str, seed_path: str | Path, client) -> int:
     catalog = BundledCatalog(Path(seed_path))  # construction re-validates every entry
     # Clients read worker_env leniently (a newer strategy must not drop the facility for older plugins): the strict
     # check is the curator's, here, before anything reaches the index.
-    raw = {row.get("id"): (row.get("compute") or {}).get("worker_env")
-           for row in BundledCatalog._load_raw(Path(seed_path)) if isinstance(row, dict)}
+    rows = {row.get("id"): row for row in BundledCatalog._load_raw(Path(seed_path)) if isinstance(row, dict)}
+
+    def raw_problems(eid: str) -> list[str]:
+        row = rows.get(eid) or {}
+        return (worker_env_raw_problems((row.get("compute") or {}).get("worker_env"))
+                + verification_raw_problems(row.get("verification")))
+
     bad = {e.id: probs for e in catalog.entries()
-           if (probs := worker_env_raw_problems(raw.get(e.id)) + worker_env_problems(e.compute))}
+           if (probs := raw_problems(e.id) + worker_env_problems(e.compute) + verification_problems(e))}
     if bad:
-        raise ValueError("refusing to ingest — worker_env problems: "
+        raise ValueError("refusing to ingest — entry problems (worker_env / verification): "
                          + "; ".join(f"{eid}: {', '.join(probs)}" for eid, probs in bad.items()))
     gmeta = [
         {

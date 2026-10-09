@@ -134,6 +134,7 @@ def _worker_notice(canary: CanaryResult | None) -> str | None:
     vers = [v for v in (
         f"py{canary.worker_python}" if canary.worker_python else None,
         f"dill{canary.worker_dill}" if canary.worker_dill else None,
+        f"parsl{canary.worker_parsl}" if getattr(canary, "worker_parsl", None) else None,
     ) if v]
     note = head + (f" ({', '.join(vers)})" if vers else "")
     local = _local_dill()

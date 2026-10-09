@@ -38,4 +38,11 @@
     init_blocks: 1                  # pre-spawn one block so the first call doesn't pay the queue
     max_blocks: 1
   provenance: curated
-  last_validated: 2026-10-06
+  last_validated: 2026-10-09
+  verification:                    # written by agentic/registry_reprove.py — what the live run met
+    verified_on: 2026-10-09
+    endpoint_version: "4.15.0"
+    python_version: "3.12.3"
+    template_sha256: "0f821f5bf04d59571b9db72181d22f1f92523d9d93f165e3eb508b6efccc3734"
+    config_sha256: "0080e7748e6e3007437372e742822766e6e8f1fde9c1b2fd5ce63bbfb266dd3f"
+    worker: "py3.12.3 dill0.3.9 parsl2026.4.20 on spark4"
