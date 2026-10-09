@@ -26,6 +26,11 @@ agentic/
     human_sim.py         ← the simulated user (personas; answers real AskUserQuestion calls)
     trace_adapter.py     ← SDK message stream → normalised Trace (chain phase stamped per call)
     runner.py            ← drive the headless agent (autonomous query / interactive ClaudeSDKClient)
+    cli_runner.py        ← drive Codex / Pi / Hermes (latest) headless — `HPCB_OPERATOR=codex|pi|hermes21`, the
+                           harness configured as docs/user/other-hosts.md says, the model on ALCF; trace = the
+                           harness's own event stream (order + its shell/read calls) + hpc-bridge's tool-call journal
+    responses_relay.py   ← lets Codex use ALCF: replays an unstreamed Responses answer as SSE, flattens Codex's
+                           `namespace` / `custom` tools to plain functions and restores them on the way back
     run.py               ← per-scenario orchestration: SETUP → agent → invariants → WORLD POSTCHECKS → teardown
     provenance.py        ← per-run provenance bundle writer (see runs/)
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
@@ -60,6 +65,12 @@ python3 agentic/run_suite.py --scenarios happy_path,gated_provision \
 ```
 Every run writes a provenance bundle to `agentic/runs/<runid>-<scenario>/` — start with its
 `transcript.md`. Env knobs per run: `HPCB_MODEL`, `HPCB_EFFORT`, `HPCB_PERSONA`, `HPCB_NO_SKILL`.
+
+**Other harnesses.** `HPCB_OPERATOR=codex|pi|hermes21 ./agentic/run_smoke.sh <scenario>` runs the scenario under
+Codex, Pi or Hermes at the versions pinned in the Dockerfile, on the ALCF model (`HPCB_ALCF_*` in `.env`; the token is
+minted on the host). Autonomous scenarios only — a persona or a mid-run hook is reported SKIPPED, not graded. The
+bundle's `messages.jsonl` holds the harness's own calls (`native`), hpc-bridge's journal rows and, for Codex, the
+relay's per-request log. `agentic/install_check/` is the separate clean-container check of the install recipes.
 
 **Targets.** `--target globus1` (default) is the lab cluster; `--target fake` is `agentic/fakecluster/` — a local compose
 Slurm cluster the suite brings up itself (`--reset-cluster` wipes it first). Every SSH scenario runs on either; the

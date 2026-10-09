@@ -947,6 +947,9 @@ def test_listing_graders():
     g = texts_mention("facilities_and_access_relayed", "anvil", "globus1", any_of=("zero ssh", "identity"))
     assert g(Trace([], ["anvil needs SSH; globus1 is zero SSH."])).ok
     assert not g(Trace([], ["anvil needs SSH."])).ok
+    labs = texts_mention("relayed", "globus-labs", any_of=("zero ssh",))
+    assert labs(Trace([], ["The Globus\u202fLabs cluster is Zero\u2011SSH."])).ok  # gpt-oss typography, display name
+    assert not labs(Trace([], ["globuslabs is zero ssh"])).ok
     assert not no_ssh_workaround(Trace([ToolCall.of("Bash", {"command": "ssh me@host hostname"})])).ok
     assert no_ssh_workaround(Trace([ToolCall.of("Bash", {"command": "ls -la"})])).ok
 

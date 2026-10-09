@@ -38,7 +38,7 @@ def _first_line(d: Path) -> dict:
 
 def bundle_trace(d: Path, rec: dict) -> Trace:
     """Rebuild the graded Trace from a bundle, whichever operator wrote it — sniffed from messages.jsonl's shape:
-    the SDK dict-form (`__type__`, Claude-SDK operator), hermes' state.db rows (`role` + `tool_calls`), or Claude
+    the SDK dict-form (`__type__`, Claude-SDK operator), the cli_runner record (`harness`), hermes' state.db rows (`role` + `tool_calls`), or Claude
     Code's native CLI transcript (`sessionId` + `type`, the Claude-over-ACP operator). A hermes ACP bundle also
     re-stamps the human-sim's prose exchanges from the record's dialogue (message-order correlation, as live), so
     the interactive gates replay; a hermes transcript-replay (`-z`) bundle cannot (each turn was its own session
@@ -46,6 +46,10 @@ def bundle_trace(d: Path, rec: dict) -> Trace:
     first = _first_line(d)
     if "__type__" in first:
         return trace_from_bundle(d)
+    if "harness" in first and "rc" in first:  # the Codex / Pi / Hermes-latest operator (cli_runner)
+        from cli_runner import trace_from_bundle_messages
+        return trace_from_bundle_messages(
+            [json.loads(line) for line in (d / "messages.jsonl").read_text().splitlines() if line.strip()])
     from claude_transcript import exchanges_from_transcript, load_lines, looks_like_transcript, trace_from_transcript
     if looks_like_transcript(first):
         lines = load_lines(d / "messages.jsonl")

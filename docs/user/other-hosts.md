@@ -54,6 +54,10 @@ default_tools_approval_mode = "approve"   # see below
   is still gated: hpc-bridge itself refuses to start a billed block until the agent confirms it with you.
 - **SSH facilities.** Codex passes the server only a small set of environment variables. If your SSH key lives in an
   agent, add `env_vars = ["SSH_AUTH_SOCK"]` to the same section.
+- **Model provider.** Codex speaks only the streamed Responses API and sends its tools grouped (`namespace`). OpenAI
+  serves both; some OpenAI-compatible gateways (vLLM-based ones) don't, and Codex then retries with "We're currently
+  experiencing high demand" — that is the gateway refusing the request, not hpc-bridge. Pi or Hermes work with such
+  gateways over chat completions.
 
 ## Pi
 
