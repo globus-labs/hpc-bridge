@@ -59,10 +59,17 @@ def record_verification(text: str, entry_id: str, block: dict, on: datetime.date
     # next entry, or the end — keeping only trailing blank lines (the separator before the next entry)
     vi = next((i for i, ln in enumerate(body) if re.match(r"^  verification:", ln)), None)
     if vi is not None:
-        vj = next((j for j in range(vi + 1, len(body)) if re.match(r"^  [A-Za-z_]", body[j])), len(body))
-        while vj > vi + 1 and not body[vj - 1].strip():
-            vj -= 1
-        del body[vi:vj]
+        # the block = its key plus every line indented deeper than the entry's keys, with any blank lines or comments
+        # BETWEEN such lines; it ends at the first line that is neither (a sibling key, a comment before the next
+        # key or entry, a separator) — those, and trailing blanks, are kept
+        last = vi
+        for j in range(vi + 1, len(body)):
+            ln = body[j]
+            if ln.startswith("    ") and ln.strip():
+                last = j
+            elif ln.strip() and not ln.lstrip().startswith("#"):
+                break
+        del body[vi:last + 1]
 
     ver = block.get("endpoint_version")
     if ver:
@@ -136,16 +143,17 @@ def main(argv: list[str]) -> int:
         if res.phase not in ("needs_account", "connected", "provisioning"):
             return result
         t0 = time.monotonic()
-        while True:
-            kw: dict = {"shape": "compute", "confirm_spend": True}
-            if a.account:
-                kw["account"] = a.account
-            st = await _ensure_endpoint_up(app, **kw)
-            print(f"  +{int(time.monotonic() - t0)}s {st.status}: {(st.notice or '')[:160]}", flush=True)
-            if st.status in ("up", "down", "needs_account") or time.monotonic() - t0 > a.wait_s:
-                break
-            await asyncio.sleep(30)
-        try:
+        st = None
+        try:  # from the FIRST submit on: the wait loop is where the billed check goes out (and where Ctrl-C lands)
+            while True:
+                kw: dict = {"shape": "compute", "confirm_spend": True}
+                if a.account:
+                    kw["account"] = a.account
+                st = await _ensure_endpoint_up(app, **kw)
+                print(f"  +{int(time.monotonic() - t0)}s {st.status}: {(st.notice or '')[:160]}", flush=True)
+                if st.status in ("up", "down", "needs_account") or time.monotonic() - t0 > a.wait_s:
+                    break
+                await asyncio.sleep(30)
             canary = _shape_runtime(app, "compute").last_canary
             if st.status == "up":
                 out = await _run_shell(app, "hostname; whoami; echo SLURM_JOB_ID=$SLURM_JOB_ID", shape="compute")
@@ -159,15 +167,19 @@ def main(argv: list[str]) -> int:
                     f"gce{canary.worker_gce}" if canary.worker_gce else "",
                     f"on {canary.worker_host}" if canary.worker_host else "") if x)
         finally:
-            stp = await _stop_endpoint(app)  # always, even on an error or a timeout
-            print(f"  stop: {stp.status} — {(stp.notice or '')[:400]}", flush=True)
-            if not result["pass"]:
-                # On a facility endpoint stop only drains: a check task still queued there can keep the facility
-                # starting (billed) blocks — up to its own hard limit (Delta: 48 h; the 2026-10-06 runaway).
-                print("  WARNING: the run did not pass. A check task may still be queued at the facility, which can "
-                      "keep starting billed blocks for it. Check the facility's queue for your user (e.g. "
-                      "`squeue -u $USER`) and cancel any hpc-bridge (parsl) jobs; if they keep reappearing, contact "
-                      "the facility.", flush=True)
+            try:
+                stp = await _stop_endpoint(app)  # always: an error, a timeout, Ctrl-C
+                print(f"  stop: {stp.status} — {(stp.notice or '')[:400]}", flush=True)
+            except BaseException as exc:  # noqa: BLE001 - the warning below must still be printed
+                print(f"  stop FAILED: {type(exc).__name__}: {exc}", flush=True)
+            finally:
+                if not result["pass"]:
+                    # On a facility endpoint stop only drains: a check task still queued there can keep the facility
+                    # starting (billed) blocks — up to its own hard limit (Delta: 48 h; the 2026-10-06 runaway).
+                    print("  WARNING: the run did not pass. A check task may still be queued at the facility, which "
+                          "can keep starting billed blocks for it. Check the facility's queue for your user (e.g. "
+                          "`squeue -u $USER`) and cancel any hpc-bridge (parsl) jobs; if they keep reappearing, "
+                          "contact the facility.", flush=True)
         after = facility_fingerprint(await asyncio.to_thread(Client().get_endpoint_metadata, entry.compute_mep_uuid))
         if after != before:  # the facility changed during the run: the proof is of neither state
             print("  the facility's metadata changed during the run — not recording", flush=True)

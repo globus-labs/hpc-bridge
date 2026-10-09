@@ -36,9 +36,10 @@ One real block through hpc-bridge's real functions (connect → confirm spend �
 On a pass, `--record` writes the entry's `verification` block (date, versions, digests, and what the worker reported:
 Python, dill, **parsl**, node) and bumps `last_validated` and `worker_env.verified_with`, editing the seed text in
 place (comments kept; the edit is dry-run before the paid block). Then commit, PR, ingest. It refuses to record if
-the facility's metadata changed during the run, always stops (even on an error or a timeout), and on a run that did
-not pass warns that a check task may still be queued at the facility, starting billed blocks — check its queue.
-Ingest refuses a facility-endpoint entry whose block is incomplete. Facility endpoints only; Expanse (one-time code) is re-proven by hand with the user present.
+the facility's metadata changed during the run, stops the endpoint whatever happens from the first submit on (an
+error, a timeout, Ctrl-C), and on a run that did not pass warns that a check task may still be queued at the facility,
+starting billed blocks — check its queue. Ingest refuses a facility-endpoint block without its date and endpoint
+version; a field the facility does not publish is left out and reported by the health check as `incomplete`. Facility endpoints only; Expanse (one-time code) is re-proven by hand with the user present.
 
 Cost per run: one block for a few minutes (≈0.05 GPU-h on Delta, ≈0.05 SU on Anvil, free on the lab cluster).
 

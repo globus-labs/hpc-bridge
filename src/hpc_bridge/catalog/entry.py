@@ -92,7 +92,9 @@ def verification_problems(entry: Any) -> list[str]:
     ver = getattr(entry, "verification", None)
     if ver is None or not getattr(entry, "compute_mep_uuid", None):
         return []
-    fields = ("verified_on", "endpoint_version", "python_version", "template_sha256")
+    # only what every facility endpoint publishes and the client relies on: a field a facility does not publish must
+    # not block its entry for good (the health check reports the gap as "incomplete" instead)
+    fields = ("verified_on", "endpoint_version")
     missing = [f for f in fields if getattr(ver, f) is None]
     if not missing:
         return []

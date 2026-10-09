@@ -14,8 +14,10 @@ installed plugin only when that version changes); git tags mark releases.
   resolves against the lock. Exit 0/1/2; alerts only on new findings (an escalation is new); a missing Globus login is
   a finding, not a crash.
 - **Entries record what they were proven against** (`verification`: date, versions, digests, and what the worker
-  reported). `agentic/registry_reprove.py ENTRY --record` runs one real block and writes it into the seed. Read
-  leniently by the plugin; checked strictly at ingest.
+  reported). `agentic/registry_reprove.py ENTRY --record` runs one real block and writes it into the seed; it stops the
+  endpoint whatever happens from the first submit on (an error, a timeout, Ctrl-C) and, on a run that did not pass,
+  warns that a check task may still be queued at the facility. Read leniently by the plugin; checked strictly at
+  ingest (a facility-endpoint block must carry at least its date and endpoint version).
 - **The worker check reports the worker's parsl and globus-compute-endpoint**, parsl shown in the warm notice — the
   version that must match the facility's endpoint and that no facility publishes.
 

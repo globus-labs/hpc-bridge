@@ -313,3 +313,66 @@ def test_ingest_requires_a_complete_verification_block_for_a_facility_endpoint()
     partial = CatalogEntry.model_validate({**delta.model_dump(mode="json"), "verification": {"worker": "x"}})
     assert verification_problems(partial) and "verified_on" in verification_problems(partial)[0]
     assert verification_problems(_entry("expanse")) == []  # SSH entries are proven by hand
+
+
+def test_the_seed_edit_keeps_what_follows_the_block():
+    import datetime
+
+    rp = _reprove_module()
+    text = (SEEDS / "anvil.yaml").read_text().rstrip("\n") + "\n"
+    once = rp.record_verification(text, "anvil", {"endpoint_version": "4.16.0", "worker": "A"}, datetime.date(2026, 10, 1))
+    two = once + "\n# --- a separator comment ---\n- id: anvil-next\n  facility_key: purdue\n"
+    out = rp.record_verification(two, "anvil", {"endpoint_version": "4.16.0", "worker": "B"}, datetime.date(2026, 10, 9))
+    assert "# --- a separator comment ---" in out and "- id: anvil-next" in out and 'worker: "B"' in out
+    assert 'worker: "A"' not in out
+
+
+def test_the_reprove_stops_even_when_the_wait_loop_fails(monkeypatch):
+    import globus_compute_sdk
+
+    from hpc_bridge import login, server
+
+    rp = _reprove_module()
+    calls = []
+
+    class _Client:
+        def get_endpoint_metadata(self, eid):
+            return _MD
+
+    async def connect(app, eid, **kw):
+        calls.append("connect")
+        return server.ConnectFacilityResult(phase="needs_account", facility=eid)
+
+    async def ensure(app, **kw):
+        calls.append("ensure")
+        if calls.count("ensure") == 2:
+            raise RuntimeError("the Compute web service went away")
+        return server.EndpointStatus(status="provisioning", block_state="provisioning")
+
+    async def stop(app):
+        calls.append("stop")
+        return server.EndpointStatus(status="draining", block_state="cold")
+
+    async def no_sleep(s):
+        return None
+
+    monkeypatch.setattr(login.LoginFlow, "login_required", lambda self: False)
+    monkeypatch.setattr(login, "globus_identity_label", lambda *a, **k: "tester")
+    monkeypatch.setattr(globus_compute_sdk, "Client", _Client)
+    monkeypatch.setattr(server, "_connect_facility", connect)
+    monkeypatch.setattr(server, "_ensure_endpoint_up", ensure)
+    monkeypatch.setattr(server, "_stop_endpoint", stop)
+    monkeypatch.setattr(rp.asyncio, "sleep", no_sleep)
+    with pytest.raises(RuntimeError, match="went away"):
+        rp.main(["delta", "--account", "x"])
+    assert calls == ["connect", "ensure", "ensure", "stop"]
+
+
+def test_an_install_check_error_is_the_same_text_every_run(monkeypatch):
+    texts = set()
+    for _ in range(2):
+        try:
+            health._fresh("this is not toml [[[", "3.13", ("dill",))
+        except RuntimeError as exc:
+            texts.add(str(exc))
+    assert len(texts) == 1 and "/var/folders" not in next(iter(texts)) and "/tmp" not in next(iter(texts))

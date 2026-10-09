@@ -143,7 +143,7 @@ def check_facility(entry: CatalogEntry, compute) -> list[Finding]:
     ver = entry.verification
     out: list[Finding] = []
     # A field the facility does not publish cannot be compared — say so; never let a missing value read as a match.
-    unpublished = [f for f in _COMPARED if live[f] is None]
+    unpublished = [f for f in (*_COMPARED, "config_sha256") if live[f] is None]
     if unpublished:
         out.append(Finding(entry.id, "facility", "warn",
                            f"unpublished: the facility's metadata has no {', '.join(unpublished)} — not compared"))
@@ -157,7 +157,7 @@ def check_facility(entry: CatalogEntry, compute) -> list[Finding]:
         out.append(Finding(entry.id, "facility", "warn",
                            "unbaselined: the entry has no `verification` block — run the re-prove to record one"))
     else:
-        missing = [f for f in ("verified_on", *_COMPARED) if getattr(ver, f) is None]
+        missing = [f for f in ("verified_on", *_COMPARED, "config_sha256") if getattr(ver, f) is None]
         if missing:
             out.append(Finding(entry.id, "facility", "warn",
                                f"incomplete: the verification block lacks {', '.join(missing)} — those are not "
@@ -275,13 +275,15 @@ def _locked(lock_text: str, names: tuple[str, ...]) -> dict[str, str]:
 
 def _fresh(pyproject_text: str, python: str, names: tuple[str, ...]) -> dict[str, str]:
     with tempfile.TemporaryDirectory() as d:
-        pp = Path(d) / "pyproject.toml"
-        pp.write_text(pyproject_text)
+        (Path(d) / "pyproject.toml").write_text(pyproject_text)
         uv = os.environ.get("UV") or shutil.which("uv")  # `uv run` sets UV; launchd's PATH may not hold uv
         if not uv:
             raise RuntimeError("uv not found (not on PATH, and UV unset)")
-        res = subprocess.run([uv, "pip", "compile", str(pp), "--python-version", python, "--quiet", "--no-header"],
-                             capture_output=True, text=True, timeout=180, check=False)
+        try:  # cwd + a RELATIVE path: no random temp path in an error (alert keys must be stable run to run)
+            res = subprocess.run([uv, "pip", "compile", "pyproject.toml", "--python-version", python, "--quiet",
+                                  "--no-header"], cwd=d, capture_output=True, text=True, timeout=180, check=False)
+        except subprocess.TimeoutExpired:
+            raise RuntimeError("uv pip compile timed out after 180 s") from None
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip()[-300:] or f"uv pip compile rc={res.returncode}")
     out = {}

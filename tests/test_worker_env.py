@@ -77,7 +77,7 @@ def test_ingest_refuses_an_entry_whose_worker_env_does_not_check(tmp_path):
         def ingest(self, index, doc):
             raise AssertionError("nothing must reach the index")
 
-    with pytest.raises(ValueError, match="worker_env problems"):
+    with pytest.raises(ValueError, match="worker_env"):
         ingest("idx", bad, _Search())
 
 

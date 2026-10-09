@@ -29,7 +29,7 @@ def ingest(index_id: str, seed_path: str | Path, client) -> int:
     bad = {e.id: probs for e in catalog.entries()
            if (probs := raw_problems(e.id) + worker_env_problems(e.compute) + verification_problems(e))}
     if bad:
-        raise ValueError("refusing to ingest — worker_env problems: "
+        raise ValueError("refusing to ingest — entry problems (worker_env / verification): "
                          + "; ".join(f"{eid}: {', '.join(probs)}" for eid, probs in bad.items()))
     gmeta = [
         {
