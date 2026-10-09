@@ -24,7 +24,7 @@ else
 fi
 
 # 2. the server itself, over MCP, with the documented command
-out=$(uvx --with mcp python mcp_probe.py direct "${CMD[@]}" 2>/dev/null | tail -1)
+out=$(uvx --with 'mcp>=1.28,<2' python mcp_probe.py direct "${CMD[@]}" 2>/dev/null | tail -1)
 say "    $out"
 n=$(jq -r '.tools | length' <<<"$out" 2>/dev/null || echo 0)
 [[ "$n" == "$EXPECT" ]] && pass "server: $n tools" || fail "server: $n tools (want $EXPECT)"
@@ -54,11 +54,16 @@ grep -q "connected, $EXPECT tools" <<<"$pl" && pass "pi: connected, $EXPECT tool
 printf 'y\n' | hermes mcp add hpc-bridge --connect-timeout 180 --env 'SSH_AUTH_SOCK=${SSH_AUTH_SOCK}' \
     --command uvx --args --python 3.13 --from "$SRC" hpc-bridge >/dev/null 2>&1 \
   || fail "hermes: mcp add"
-ht=$(hermes mcp test hpc-bridge 2>&1 | tail -15)
-say "$(sed 's/^/    /' <<<"$ht")"
-if grep -qiE "(connected|success|ok)" <<<"$ht" && grep -qE "\b$EXPECT\b" <<<"$ht"; then pass "hermes: connected, $EXPECT tools"
-else fail "hermes: mcp test did not report $EXPECT tools"; fi
-hermes skills list 2>/dev/null | grep -q driving-hpc && pass "hermes: skill driving-hpc listed" || say "WARN  hermes: skill not listed by 'hermes skills list'"
+ht=$(hermes mcp test hpc-bridge 2>&1)
+say "$(head -8 <<<"$ht" | sed 's/^/    /')"
+found=0
+for t in ensure_endpoint_up authenticate complete_login complete_preauth list_facilities connect_facility stop_endpoint \
+         teardown_endpoint login_shell run_shell poll_task reset_session; do
+  grep -qE "\b$t\b" <<<"$ht" && found=$((found + 1))
+done
+[[ "$found" == "$EXPECT" ]] && pass "hermes: mcp test lists all $EXPECT tools" || fail "hermes: mcp test lists $found of $EXPECT tools"
+sl=$(hermes skills list 2>&1)
+grep -E "driving-hpc.*enabled" <<<"$sl" >/dev/null && pass "hermes: skill driving-hpc installed and enabled" || fail "hermes: skill driving-hpc not enabled"
 
 # 5. Codex: add, then the settings an unattended or first run needs (30 s startup; approval for every tool call)
 codex mcp add hpc-bridge -- "${CMD[@]}" >/dev/null 2>&1 || fail "codex: mcp add"
@@ -70,7 +75,7 @@ extra = 'startup_timeout_sec = 180\ntool_timeout_sec = 600\ndefault_tools_approv
 t = re.sub(r'(\[mcp_servers\.hpc-bridge\]\n(?:[^\[]*\n)?)', lambda m: m.group(1) + extra, t, count=1)
 p.write_text(t)
 PY
-co=$(uvx --with mcp python mcp_probe.py codex hpc-bridge 2>/dev/null | tail -1)
+co=$(uvx --with 'mcp>=1.28,<2' python mcp_probe.py codex hpc-bridge 2>/dev/null | tail -1)
 say "    $co"
 nc=$(jq -r '.tools | length' <<<"$co" 2>/dev/null || echo 0)
 [[ "$nc" == "$EXPECT" ]] && pass "codex: app-server reports $nc tools" || fail "codex: app-server reports $nc tools (want $EXPECT)"
