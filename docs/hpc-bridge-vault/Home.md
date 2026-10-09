@@ -32,7 +32,8 @@ This vault has two halves:
 - [[The MCP tools]] — the agent-facing surface (eleven tools)
 - [[Plugin packaging]] — `.mcp.json` · `plugin.json` · the `driving-hpc` skill · `hpc-connect` · the fresh-user script
 - [[Configuration]] — environment variables
-- [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the user recipe + config gotchas
+- [[Hackathon readiness 2026-10-09]] — **is it ready for the hackathon**: the registry checked against its facilities, the install and simulated jobs under the latest Codex / Pi / Hermes (15/18, failures all the open model's), how the grading stays honest
+- [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the 2026-09 recipe + config gotchas (current recipes: `docs/user/other-hosts.md`)
 - [[Cross-harness study - gpt-oss-120b vs Claude]] — the first weaker-model study (2026-09-06) and its confound analysis: the OPERATOR dominated the model signal; why those interactive numbers are not a model comparison
 - [[Cross-harness benchmark - sonnet-4.6 core pair 2026-09-09]] — **the harness-axis result**: claude-sonnet-4.6 through hermes vs through Claude Code (both over ACP, same client/sim/graders/guidance): 30/30, identical dialogue shape and call counts; process metrics, validity notes, next steps
 - [[Handoff - ACP cross-harness 2026-09-07]] — archived thread handoff from the ACP driver's landing (#148): what shipped, the two bugs, the run recipe and gotchas; its blocker was resolved by #150

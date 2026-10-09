@@ -1,5 +1,10 @@
 # Using hpc-bridge with hermes-agent
 
+> [!note] Superseded for users (2026-10-09)
+> The tested, current recipe for Hermes (v0.21.6), Codex and Pi is **`docs/user/other-hosts.md`**. This page keeps
+> the 2026-09 history (hermes 0.21.0 from git, the ALCF model block); the cross-harness test operators are described in
+> [[Hackathon readiness 2026-10-09]].
+
 > [!abstract] In one line
 > hpc-bridge is a standard MCP server, so any MCP host can drive it — not just Claude Code. This is the recipe for **NousResearch hermes-agent**, including using **ALCF's inference service** (or any model) as the operator, verified live 2026-09-05 (gpt-oss-120b on ALCF called `list_facilities` and got back `delta, globus-labs, anvil, expanse`). See [[Cross-harness portability]] for the design behind this.
 

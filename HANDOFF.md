@@ -1,10 +1,9 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-06. `main` carries **plugin 0.1.20** (#167, 2026-10-06); the latest tag is **`v0.1.13-beta.1`**
-(2026-09-05) — 0.1.14–0.1.20 are untagged, and the next tag is **on hold until connectivity to each registry facility is
-re-proven** (maintainer's call). The repository moved to **`globus-labs/hpc-bridge`** (2026-09-16; the old
-`ryanchard/hpc-bridge` URLs redirect). Design rationale lives in `docs/hpc-bridge-vault/`; this file is the live state +
-how-to-run + gotchas on top._
+_Snapshot: 2026-10-09. `main` carries **plugin 0.1.21** (#169, registry health); branch **`feat/harness-compat`** carries
+**0.1.22** (Codex / Pi / Hermes recipes, progress on long calls, the cross-harness test operators) in review. The latest
+tag is **`v0.1.20-beta.1`** (2026-10-06, pre-release). The repository is **`globus-labs/hpc-bridge`**. Design rationale
+lives in `docs/hpc-bridge-vault/`; this file is the live state + how-to-run + gotchas on top._
 
 ## TL;DR
 
@@ -15,9 +14,29 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **626 passed, 2 skipped**; agentic harness hermetic tests **305 passed** (78 of them grader tests). The live tier has
+Unit tier **692 passed, 2 skipped**; agentic harness hermetic tests **333 passed**. The live tier has
 **46 scenarios** and a local **fake cluster with 10 profiles** (`default site mep totp pbs lmod f2b polaris internal
 hostile`) that is now the main regression backbone; the lab cluster is the real-hardware check.
+
+## Where it stands (2026-10-09) — hackathon readiness
+
+Summary page: vault `Reference/Hackathon readiness 2026-10-09.md`.
+- **The registry is checked against its facilities** (0.1.21, #169): `hpc-bridge-registry-health` compares the live
+  index with main's seeds and each facility endpoint with what its entry was proven against, and checks parsl
+  releases, SSH hosts and a fresh install's resolution. Run 2026-10-09: all OK. **`scripts/registry_monitor.sh install`
+  (hourly launchd job) is NOT installed** — the maintainer picks where it runs. Expanse still carries its 4.16-client
+  proof; its re-prove on 4.18 needs a one-time code.
+- **Codex 0.162.0, Pi 1.1.0, Hermes v0.21.6** (0.1.22, `feat/harness-compat`):
+  - Recipes are in `docs/user/other-hosts.md`. `agentic/install_check/` follows them in a clean container; all three
+    end up with 12 tools and the skill.
+  - Test operators: `HPCB_OPERATOR=codex|pi|hermes21 ./agentic/run_smoke.sh <scenario>`, model gpt-oss-120b on ALCF.
+    The final pass scored **15/18**; the three failures are all the open model's own behaviour.
+  - Codex on ALCF needs `agentic/harness/responses_relay.py`: ALCF's vLLM gateway does not speak OpenAI's Responses
+    API in full.
+- **Follow-ups:**
+  - Interactive (persona) cells under these harnesses, which need each harness's long-lived mode.
+  - An account switch on a warm block took minutes to warm (Hermes run, 2026-10-09).
+  - Report the Codex/vLLM gaps upstream if useful.
 
 ## Where it stands (2026-10-06)
 

@@ -68,9 +68,14 @@ Every run writes a provenance bundle to `agentic/runs/<runid>-<scenario>/` — s
 
 **Other harnesses.** `HPCB_OPERATOR=codex|pi|hermes21 ./agentic/run_smoke.sh <scenario>` runs the scenario under
 Codex, Pi or Hermes at the versions pinned in the Dockerfile, on the ALCF model (`HPCB_ALCF_*` in `.env`; the token is
-minted on the host). Autonomous scenarios only — a persona or a mid-run hook is reported SKIPPED, not graded. The
-bundle's `messages.jsonl` holds the harness's own calls (`native`), hpc-bridge's journal rows and, for Codex, the
-relay's per-request log. `agentic/install_check/` is the separate clean-container check of the install recipes.
+minted on the host). Autonomous scenarios only — a persona, a multi-phase chain (`PHASES`) or a mid-run hook is
+reported SKIPPED, not graded. The graded trace merges the harness's own record (Codex: the relay's log of the model's
+wire; Pi: `--mode json` events; Hermes: state.db) — the order of every call and the agent's own shell/read calls —
+with hpc-bridge's journal (what each hpc-bridge tool received and returned), aligned in start order;
+`harness:trace_complete` gates on every journal row being accounted for. The bundle's `messages.jsonl` holds all of
+it (`native`, `text`, `final`, `journal`, `relay`), so `regrade.py` replays it. The server runs from this checkout
+(`uv run`); the users' `uvx --from git+…` path is covered by `agentic/install_check/`, the clean-container check of the
+install recipes.
 
 **Targets.** `--target globus1` (default) is the lab cluster; `--target fake` is `agentic/fakecluster/` — a local compose
 Slurm cluster the suite brings up itself (`--reset-cluster` wipes it first). Every SSH scenario runs on either; the
