@@ -101,3 +101,34 @@ def test_the_skill_frontmatter_is_strict_yaml():
     assert text.startswith("---\n")
     meta = yaml.safe_load(text.split("---")[1])
     assert meta["name"] == "driving-hpc" and 0 < len(meta["description"]) <= 1024
+
+
+async def test_the_journal_records_each_call_and_redacts_codes(tmp_path, monkeypatch):
+    import json
+
+    journal = tmp_path / "journal.jsonl"
+    monkeypatch.setenv("HPC_BRIDGE_JOURNAL", str(journal))
+
+    async def no_facilities(query=""):
+        return []
+
+    monkeypatch.setattr(server, "_list_facilities", no_facilities)
+    await server.mcp.call_tool("list_facilities", {"query": "delta"})
+    with pytest.raises(Exception):  # noqa: B017 - no request context here; the point is what was recorded
+        await server.mcp.call_tool("complete_preauth", {"code": "123456"})
+    rows = [json.loads(line) for line in journal.read_text().splitlines()]
+    assert [r["tool"] for r in rows] == ["list_facilities", "complete_preauth"]
+    assert rows[0]["args"] == {"query": "delta"} and rows[0]["result"] == [] and rows[0]["ms"] >= 0
+    assert rows[1]["args"] == {"code": "<redacted>"} and "error" in rows[1] and "123456" not in journal.read_text()
+    assert oct(journal.stat().st_mode & 0o777) == "0o600"
+
+
+async def test_no_journal_unless_asked(tmp_path, monkeypatch):
+    monkeypatch.delenv("HPC_BRIDGE_JOURNAL", raising=False)
+
+    async def no_facilities(query=""):
+        return []
+
+    monkeypatch.setattr(server, "_list_facilities", no_facilities)
+    assert await server.mcp.call_tool("list_facilities", {}) is not None
+    assert list(tmp_path.iterdir()) == []

@@ -1,12 +1,14 @@
 from __future__ import annotations
 
 import asyncio
+import json
+import os
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal, TypeVar
+from typing import Any, Literal, TypeVar
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -236,6 +238,58 @@ def _server_instructions() -> str | None:
 # tools as plugin:<plugin>:<server>, so matching names would read the doubled plugin:hpc-bridge:hpc-bridge.
 # Keep in sync with the mcpServers key in .mcp.json — CC namespaces by that key, this name just mirrors it.
 mcp = FastMCP("endpoint", lifespan=lifespan, instructions=_server_instructions())
+
+
+# The tool-call journal (opt-in: HPC_BRIDGE_JOURNAL=<path>). One JSON line per call — tool, arguments, the result the
+# host received, duration — written by the SERVER, so it is the same record whatever MCP host drives it (Codex, Pi,
+# Hermes, Claude Code…). Grading a host from its own session format meant one fragile reader per host; this is also
+# what to ask a user for when a session went wrong. One-time codes are redacted; the file is created 0600.
+_JOURNAL_REDACT = {"complete_preauth": ("code",), "complete_login": ("code",)}
+
+
+def _journal_result(res: Any) -> Any:
+    if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+        res = res[1]  # (content, structured): the structured payload is the tool's own model
+    if isinstance(res, dict):
+        return res.get("result", res) if set(res) == {"result"} else res
+    texts = [getattr(b, "text", None) for b in (res or [])]
+    return "\n".join(t for t in texts if t)
+
+
+def _journal_write(path: str, record: dict) -> None:
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except OSError as exc:  # the journal is a record, never a reason a call fails
+        print(f"hpc-bridge: journal write failed ({exc})", file=sys.stderr)
+
+
+def _install_journal(server: FastMCP) -> None:
+    tm = server._tool_manager
+    inner = tm.call_tool
+
+    async def call_tool(name: str, arguments: dict, *args: Any, **kwargs: Any) -> Any:
+        path = os.environ.get("HPC_BRIDGE_JOURNAL", "").strip()
+        if not path:
+            return await inner(name, arguments, *args, **kwargs)
+        safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+        t0 = time.monotonic()
+        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": name, "args": safe}
+        try:
+            res = await inner(name, arguments, *args, **kwargs)
+        except BaseException as exc:
+            record.update(error=f"{type(exc).__name__}: {exc}"[:1000], ms=int((time.monotonic() - t0) * 1000))
+            _journal_write(path, record)
+            raise
+        record.update(result=_journal_result(res), ms=int((time.monotonic() - t0) * 1000))
+        _journal_write(path, record)
+        return res
+
+    tm.call_tool = call_tool  # type: ignore[method-assign]
+
+
+_install_journal(mcp)
 
 
 @mcp.resource(_GUIDANCE_URI, name="driving-hpc operational guidance", mime_type="text/markdown")
