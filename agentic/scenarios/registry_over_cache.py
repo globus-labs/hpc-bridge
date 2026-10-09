@@ -34,7 +34,8 @@ SUMMARY = "a stale cached SSH config for a catalogued id must NOT shadow the reg
 TAGS = ["registry", "cache", "mep", "zero-ssh", "cheap"]
 MAX_TURNS = 10
 
-reach_reported = texts_mention("reach_reported", any_of=("multi-user", "zero ssh", "attached", "facility-run"))
+reach_reported = texts_mention("reach_reported", any_of=("multi-user", "multi user", "zero ssh", "zero-ssh", "attached",
+                                                                   "facility-run"))
 EXTRA_INVARIANTS = [mep_zero_ssh, calls_bounded("ensure_endpoint_up", 0), no_ssh_workaround, reach_reported]
 EXPECT_OK = ["agent_engaged", "mep_zero_ssh", "ensure_endpoint_up_calls_le_0", "no_ssh_workaround", "reach_reported"]
 TEARDOWN = "delete"

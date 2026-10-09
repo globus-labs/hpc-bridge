@@ -493,7 +493,8 @@ def _secret_material() -> dict[str, list[str]]:
         toks = _tokens_from_storage_db(Path(user_dir) / "storage.db")
         if toks:
             out["globus token"] = toks
-    for label, var in (("oauth token", "CLAUDE_CODE_OAUTH_TOKEN"), ("api key", "ANTHROPIC_API_KEY")):
+    for label, var in (("oauth token", "CLAUDE_CODE_OAUTH_TOKEN"), ("api key", "ANTHROPIC_API_KEY"),
+                       ("alcf token", "ALCF_INFERENCE_TOKEN")):
         v = os.environ.get(var, "").strip()
         if len(v) >= 16:
             out[label] = [v]
@@ -606,7 +607,22 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # Operator dispatch: `hermes` drives the SAME scenario + graders with an ALCF-hosted model (guidance over MCP).
     # Autonomous AND interactive (persona) scenarios are supported; refuse only what it can't yet drive rather than
     # grade it vacuously.
-    if operator in ("hermes", "claude-acp"):
+    if operator in ("codex", "pi", "hermes21"):
+        # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
+        # say; graded from hpc-bridge's own tool-call journal (cli_runner). Autonomous scenarios only for now.
+        reason = ("an interactive persona" if (persona or getattr(scen, "PERSONA", None)) else
+                  "cross-restart chains (PHASES)" if phases else
+                  "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
+        if reason:
+            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
+            return 2
+        import functools
+
+        from cli_runner import run_scenario as _cli_run
+
+        _run_scenario = functools.partial(_cli_run, harness=operator)
+        model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")
+    elif operator in ("hermes", "claude-acp"):
         reason = ("cross-restart chains (PHASES)" if phases else
                   "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
         if reason:
@@ -782,6 +798,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                               "force-fed SKILL.md in the system prompt (Claude-SDK operator)" if operator == "claude"
                               else ("fetched the MCP guidance resource" if guidance_fetched(res.trace)
                                     else "did NOT fetch the MCP guidance resource (this run ran guidance-lighter)")))
+        # The Codex / Pi / Hermes-latest operator merges the harness's own record with hpc-bridge's journal: a journal
+        # row no harness event accounts for is a reader blind spot (e.g. a sub-agent the reader cannot see) and the
+        # trace's ORDER is then unsound — every order-based grader could pass falsely. Gated.
+        stats = (res.messages[0] if res.messages and isinstance(res.messages[0], dict) else {}).get("trace_stats")
+        if isinstance(stats, dict):
+            unplaced = int(stats.get("journal_unplaced") or 0)
+            results.append(Result("harness:trace_complete", unplaced == 0,
+                                  ", ".join(f"{k}={v}" for k, v in stats.items())
+                                  + (f" — {unplaced} hpc-bridge call(s) the harness's record does not account for"
+                                     if unplaced else "")))
         # ACP operators: does the client's own event log agree with the graded trace on the hpc-bridge calls made?
         # An instrument check (REPORT-ONLY until it has proven clean across runs): a mismatch means the post-run
         # trace source (state.db / the CLI transcript) lagged, truncated or picked the wrong session.
@@ -797,6 +823,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             critical.add("harness:prose_followups")
         if getattr(scen, "MIDRUN_HOOKS", None):
             critical.add("harness:midrun_hooks")
+        if any(r.name == "harness:trace_complete" for r in results):
+            critical.add("harness:trace_complete")
         # Benchmark mode: operator-preference graders (login_shell vs run_shell, prose phrasing) are REPORT-ONLY —
         # they'd unfairly penalise a harness for behaving differently, not worse (2026-09-06 review). Safety +
         # liveness graders still gate. The regression suite (no HPCB_BENCHMARK_MODE) keeps them gating as before.
@@ -899,9 +927,10 @@ def main() -> None:
     ap.add_argument("--no-skill", action="store_true",
                     help="ablation: withhold SKILL.md from the system prompt (measure the guidance's value)")
     ap.add_argument("--operator", default=os.environ.get("HPCB_OPERATOR") or "claude",
-                    choices=["claude", "hermes", "claude-acp"],
+                    choices=["claude", "hermes", "claude-acp", "codex", "pi", "hermes21"],
                     help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model; "
-                         "claude-acp = Claude Code over ACP via Zed's adapter)")
+                         "claude-acp = Claude Code over ACP via Zed's adapter; codex / pi / hermes21 = those harnesses "
+                         "at their latest release, headless, on the ALCF model, graded from the server's journal)")
     args = ap.parse_args()
     sys.exit(asyncio.run(_main(args)))
 

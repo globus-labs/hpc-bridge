@@ -20,8 +20,8 @@ TAGS = ["stranger", "registry", "cheap", "no-cluster"]
 MAX_TURNS = 8
 
 facilities_and_access_relayed = texts_mention(
-    "facilities_and_access_relayed", "anvil", "globus-labs", "ssh",
-    any_of=("zero ssh", "multi-user", "identity", "no ssh"),
+    "facilities_and_access_relayed", "anvil", ("globus-labs", "globus labs"), "ssh",
+    any_of=("zero ssh", "zero-ssh", "multi-user", "multi user", "identity", "no ssh", "no-ssh"),
 )
 EXTRA_INVARIANTS = [no_connect_unprompted, facilities_and_access_relayed]
 EXPECT_OK = ["agent_engaged", "no_connect_unprompted", "facilities_and_access_relayed"]

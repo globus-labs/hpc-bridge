@@ -1,14 +1,18 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
+import json
+import os
 import sys
 import time
-from collections.abc import AsyncIterator
+from collections.abc import AsyncIterator, Awaitable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Literal
+from typing import Any, Literal, TypeVar
 
 from mcp.server.fastmcp import Context, FastMCP
+from mcp.types import ToolAnnotations
 
 from . import binding, config, connect, dispatch, login_gate, scheduler_ops, session_shell, warmth
 from .binding import (  # noqa: F401 - re-exported for imports; PATCH binding.<name>, not server.<name>
@@ -237,6 +241,64 @@ def _server_instructions() -> str | None:
 mcp = FastMCP("endpoint", lifespan=lifespan, instructions=_server_instructions())
 
 
+# The tool-call journal (opt-in: HPC_BRIDGE_JOURNAL=<path>). One JSON line per call — tool, arguments, the result the
+# host received, duration — written by the SERVER, so it is the same record whatever MCP host drives it (Codex, Pi,
+# Hermes, Claude Code…). Grading a host from its own session format meant one fragile reader per host; this is also
+# what to ask a user for when a session went wrong. One-time codes are redacted; the file is created 0600.
+_JOURNAL_REDACT = {"complete_preauth": ("code",), "complete_login": ("code",)}
+
+
+def _journal_result(res: Any) -> Any:
+    if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
+        res = res[1]  # (content, structured): the structured payload is the tool's own model
+    if isinstance(res, dict):
+        return res.get("result", res) if set(res) == {"result"} else res
+    texts = [getattr(b, "text", None) for b in (res or [])]
+    return "\n".join(t for t in texts if t)
+
+
+def _journal_write(path: str, record: dict) -> None:
+    try:
+        fd = os.open(path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o600)
+        with os.fdopen(fd, "a") as fh:
+            fh.write(json.dumps(record, default=str) + "\n")
+    except OSError as exc:  # the journal is a record, never a reason a call fails
+        print(f"hpc-bridge: journal write failed ({exc})", file=sys.stderr)
+
+
+_JOURNAL_SEQ = itertools.count(1)
+
+
+def _install_journal(server: FastMCP) -> None:
+    tm = server._tool_manager
+    inner = tm.call_tool
+
+    async def call_tool(name: str, arguments: dict, *args: Any, **kwargs: Any) -> Any:
+        path = os.environ.get("HPC_BRIDGE_JOURNAL", "").strip()
+        if not path:
+            return await inner(name, arguments, *args, **kwargs)
+        safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+        t0 = time.monotonic()
+        # `ts` / `seq` order calls by when they STARTED (the line is written when the call ends, and concurrent calls
+        # finish out of order); `ts` also orders rows from several server processes sharing one journal
+        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ts": round(time.time(), 6),
+                                  "seq": next(_JOURNAL_SEQ), "pid": os.getpid(), "tool": name, "args": safe}
+        try:
+            res = await inner(name, arguments, *args, **kwargs)
+        except BaseException as exc:
+            record.update(error=f"{type(exc).__name__}: {exc}"[:1000], ms=int((time.monotonic() - t0) * 1000))
+            _journal_write(path, record)
+            raise
+        record.update(result=_journal_result(res), ms=int((time.monotonic() - t0) * 1000))
+        _journal_write(path, record)
+        return res
+
+    tm.call_tool = call_tool  # type: ignore[method-assign]
+
+
+_install_journal(mcp)
+
+
 @mcp.resource(_GUIDANCE_URI, name="driving-hpc operational guidance", mime_type="text/markdown")
 def _operations_guidance() -> str:
     """The full hpc-bridge operating guidance (the driving-hpc skill) — how to select → discover → gate → provision →
@@ -409,6 +471,35 @@ async def _ensure_endpoint_up(
     )
 
 
+_T = TypeVar("_T")
+# How often a long tool call reports progress. Pi's MCP client gives EVERY request 60 s and restarts that timer on a
+# progress notification for it (pi-mcp client.js handleProgress); without one, a 120 s run_shell sync-wait or a
+# first SSH bootstrap was cut off by default. Other clients (Codex, Hermes) send no progress token or only log it —
+# for them `report_progress` is a no-op.
+_HEARTBEAT_S = 15.0
+
+
+async def _heartbeat(ctx: Context, work: Awaitable[_T], label: str) -> _T:
+    """Await `work`, sending an MCP progress notification every `_HEARTBEAT_S` while it runs. A cancelled call still
+    cancels the work (the semantics of awaiting it directly)."""
+    task = asyncio.ensure_future(work)
+    t0 = time.monotonic()
+    beats = 0
+    try:
+        while True:
+            done, _ = await asyncio.wait({task}, timeout=_HEARTBEAT_S)
+            if done:
+                return task.result()
+            beats += 1
+            try:
+                await ctx.report_progress(beats, None, f"{label}: still working ({int(time.monotonic() - t0)} s)")
+            except Exception:  # noqa: BLE001 - progress is a courtesy; it must never fail the call
+                pass
+    except asyncio.CancelledError:
+        task.cancel()
+        raise
+
+
 @mcp.tool()
 async def ensure_endpoint_up(
     ctx: Context,
@@ -433,9 +524,9 @@ async def ensure_endpoint_up(
     block is gone (idle-released, past its walltime, or cancelled) the next call returns needs_confirmation
     with the reason — even one that passes confirm_spend=True — so the user is asked again for the new block.
     Not needed for shape="login" (free)."""
-    return await _ensure_endpoint_up(
+    return await _heartbeat(ctx, _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account
-    )
+    ), "ensure_endpoint_up")
 
 
 def _registry_transport_error(exc: BaseException) -> bool:
@@ -471,7 +562,8 @@ async def authenticate(ctx: Context, force: bool = False, mode: LoginMode | None
     `login_mode="paste"` (remote/headless sessions): Globus shows a one-time code — ask the user to
     paste it and call complete_login(code). `mode="paste"` forces paste mode (e.g. no browser on this
     machine). Never ask for a Globus password."""
-    return await login_gate._authenticate(ctx.request_context.lifespan_context, force=force, mode=mode)
+    return await _heartbeat(ctx, login_gate._authenticate(ctx.request_context.lifespan_context, force=force, mode=mode),
+                            "authenticate (waiting for the Globus login)")
 
 
 @mcp.tool()
@@ -489,7 +581,7 @@ async def complete_preauth(code: str, ctx: Context) -> PreauthStatus:
     code from their authenticator and pass it here; it is single-use and expires in seconds. NEVER pass a
     password: this tool refuses password prompts and then the user opens the session in their own terminal
     with the preauth_command. On success, call connect_facility again."""
-    return await _complete_preauth(ctx.request_context.lifespan_context, code)
+    return await _heartbeat(ctx, _complete_preauth(ctx.request_context.lifespan_context, code), "complete_preauth")
 
 
 async def _complete_preauth(app: AppCtx, code: str) -> PreauthStatus:
@@ -522,7 +614,14 @@ async def _complete_preauth(app: AppCtx, code: str) -> PreauthStatus:
     return PreauthStatus(phase="failed", preauth_command=target.preauth_command(), notice=why)
 
 
-@mcp.tool()
+# MCP tool annotations. Codex lets a tool skip its approval prompt only when it is read-only (or non-destructive AND
+# closed-world, which no hpc-bridge tool is: they all reach a remote facility). Only the two that just read say so;
+# the spend gate is enforced by the server regardless of a host's approvals.
+_READ_ONLY = ToolAnnotations(readOnlyHint=True, openWorldHint=True)
+_DESTRUCTIVE = ToolAnnotations(readOnlyHint=False, destructiveHint=True, openWorldHint=True)
+
+
+@mcp.tool(annotations=_READ_ONLY)
 async def list_facilities(query: str = "") -> list[CatalogSummary]:
     """List the HPC machines hpc-bridge can stand up, from the public facility registry (a Globus
     Search index, read anonymously — works with no login). Empty query lists all; a query filters by
@@ -572,7 +671,8 @@ async def connect_facility(
     interactive login (password/MFA) — relay its `preauth_command` for the user to run in THEIR OWN
     terminal; never handle the secret. neither ssh_host nor details ⇒ needs_facility_details."""
     app = ctx.request_context.lifespan_context
-    return await _connect_facility(app, facility, ssh_host=ssh_host, details=details)
+    return await _heartbeat(ctx, _connect_facility(app, facility, ssh_host=ssh_host, details=details),
+                            "connect_facility")
 
 
 async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
@@ -720,7 +820,7 @@ async def stop_endpoint(ctx: Context) -> EndpointStatus:
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a
     later reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint
     down. Call when you're done with a compute block."""
-    return await _stop_endpoint(ctx.request_context.lifespan_context)
+    return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context), "stop_endpoint")
 
 
 # How long ONE teardown_endpoint call waits for the login-node ops (gce stop + delete over SSH) before handing
@@ -986,7 +1086,7 @@ async def _teardown_preauth_gate(app: AppCtx, eid: str, *, fac=None, machine: st
     )
 
 
-@mcp.tool()
+@mcp.tool(annotations=_DESTRUCTIVE)
 async def teardown_endpoint(ctx: Context) -> EndpointStatus:
     """FULLY tear down the login-node endpoint (gce stop + delete over SSH) — the rare 'destroy it'
     operation. **Normally do NOT call this.** The login endpoint is DESIGNED to stay online for
@@ -996,7 +1096,7 @@ async def teardown_endpoint(ctx: Context) -> EndpointStatus:
     The login-node ops can take a few minutes on a slow filesystem: a `tearing_down` status means they are
     still running — call teardown_endpoint again in about a minute to confirm `down`; call nothing else
     meanwhile. On a one-time-code facility the first call may instead ask for a code (`complete_preauth`)."""
-    return await _teardown_endpoint(ctx.request_context.lifespan_context)
+    return await _heartbeat(ctx, _teardown_endpoint(ctx.request_context.lifespan_context), "teardown_endpoint")
 
 
 async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
@@ -1039,7 +1139,7 @@ async def login_shell(command: str, ctx: Context) -> LoginShellResult:
     on an MFA facility can force a re-auth. SSH is meant to be a one-time bootstrap, not a
     channel. Only available for an SSH facility (a catalog machine via HPC_BRIDGE_MACHINE or
     connect_facility), not local dev."""
-    return await _login_shell(ctx.request_context.lifespan_context, command)
+    return await _heartbeat(ctx, _login_shell(ctx.request_context.lifespan_context, command), "login_shell")
 
 
 async def _ready_session(
@@ -1184,14 +1284,14 @@ async def run_shell(
     block warm while it runs, so it won't be cut or idle-released — but a *detached* process is not a
     task, so the block would idle-release out from under it (issue #21)."""
     try:
-        return await _run_shell(
+        return await _heartbeat(ctx, _run_shell(
             ctx.request_context.lifespan_context, command, session_id, shape
-        )
+        ), "run_shell")
     except Exception as exc:  # noqa: BLE001
         return _error_outcome(exc)
 
 
-@mcp.tool()
+@mcp.tool(annotations=_READ_ONLY)
 async def poll_task(task_id: str, ctx: Context, wait: float = 0.0) -> ShellOutcome:
     """Retrieve the result of a long task that run_shell returned as phase="running" (with a task_id).
 
@@ -1202,7 +1302,7 @@ async def poll_task(task_id: str, ctx: Context, wait: float = 0.0) -> ShellOutco
     task_id returns a failed outcome explaining why (already retrieved, or the block was
     stopped/repointed)."""
     try:
-        return await _poll_task(ctx.request_context.lifespan_context, task_id, wait)
+        return await _heartbeat(ctx, _poll_task(ctx.request_context.lifespan_context, task_id, wait), "poll_task")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
 
@@ -1213,9 +1313,9 @@ async def reset_session(
 ) -> ShellOutcome:
     """Clear a session's persisted working directory and environment (fresh slate)."""
     try:
-        return await _reset_session(
+        return await _heartbeat(ctx, _reset_session(
             ctx.request_context.lifespan_context, session_id, shape
-        )
+        ), "reset_session")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
 

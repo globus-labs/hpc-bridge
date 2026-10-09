@@ -3,6 +3,29 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.22 — 2026-10-09 — Codex, Pi and Hermes: tested recipes, and long calls that survive their timeouts
+
+### Added
+- **Tested recipes for Codex, Pi and Hermes** (`docs/user/other-hosts.md`), at their latest releases (Codex 0.162.0,
+  Pi 1.1.0, Hermes v0.21.6): the settings each needs (Codex: a startup timeout and, for `codex exec`, the tool
+  approval mode; Pi: `--exposure direct` and a 300 s timeout; Hermes: `--connect-timeout 180`), the skill install for
+  all three, `--python 3.13`, and how to update a `uvx` build. `agentic/install_check/` follows them in a clean
+  container and checks each harness ends up with the 12 tools and the skill.
+- **`HPC_BRIDGE_JOURNAL=<path>`**: the server appends one JSON line per tool call (tool, arguments, the result the
+  host received, duration, and a sequence number in the order calls started), whatever host drives it; one-time codes
+  are redacted and the file is private (0600).
+
+### Changed
+- **Long tool calls report progress every 15 s.** Pi gives an MCP request 60 s and restarts the clock on progress; a
+  `run_shell` sync-wait or a first SSH bring-up was cut off. A host that sends no progress token sees no change, and
+  a cancelled call still cancels the work.
+- **Tool annotations**: `list_facilities` and `poll_task` are read-only (Codex no longer asks before them),
+  `teardown_endpoint` is destructive.
+
+### Fixed
+- **The skill's frontmatter is strict YAML.** An unquoted `bootstrap: stand up` made it invalid; Pi dropped the
+  skill without a word. A regression test parses it strictly.
+
 ## 0.1.21 — 2026-10-09 — registry health: drift is checked, recorded, and a fresh install gets the tested client
 
 ### Added

@@ -1,46 +1,90 @@
 # Other MCP hosts
 
 Claude Code is the simplest way to use hpc-bridge — the [plugin](install.md) carries everything. But hpc-bridge is a
-**standard MCP server**, so any MCP host can run it: NousResearch hermes-agent, Claude Desktop, Cursor, the OpenAI
-Agents SDK, and others. Each host has its own way to *add a server*, but the command is the same everywhere.
+**standard MCP server**, so any MCP host can run it. This page has tested recipes for **Codex**, **Pi** and
+**Hermes**, and the general shape for any other host.
 
 ## The one command
 
-Point your host's MCP configuration at this stdio command:
+Every host runs the same stdio command:
 
 ```
-uvx --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
+uvx --python 3.13 --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
 ```
 
-The only prerequisite is [`uv`](https://docs.astral.sh/uv/) on your PATH (it fetches Python itself). `uvx` builds and
-runs hpc-bridge in its own environment — nothing to clone. *(Once hpc-bridge is published to PyPI this shortens to
-`uvx hpc-bridge`.)*
+The only prerequisite is [`uv`](https://docs.astral.sh/uv/) on your PATH (it fetches Python itself). `--python 3.13`
+matters: the facilities in the registry were proven with a Python 3.13 client, and on a facility that builds its
+workers to match your Python, a different one is untested. The **first start builds hpc-bridge (about a minute)** —
+longer than some hosts wait by default, which is why each recipe below raises a timeout.
 
 What you bring is the same as for Claude Code — a Globus login and access to a facility; see [Install](install.md) and
-[Facilities](facilities.md). The Globus browser login happens on first use, from whichever host you run.
+[Facilities](facilities.md). The Globus login happens on first use: the agent hands you a link to open.
 
-## Guidance comes with it
+## Give the agent the guidance (all hosts)
 
-Claude Code loads a skill that teaches the agent how to drive HPC well. Hosts without a skill system get the same
-guidance **over MCP**: the server offers it as the resource `hpcbridge://guidance/operations` and points the agent to
-read it before it provisions or spends. There is nothing extra to install — a capable model will consult it on its own,
-and each tool's description is the fallback.
+hpc-bridge's operating guidance is a skill (`driving-hpc`). Codex, Pi and Hermes all read Agent Skills — install it
+once, and the agent knows the spend gate, the waits, and how to stop:
 
-## Example: hermes-agent
-
-hermes filters the environment for stdio servers (it does not inherit your shell), so pass what hpc-bridge needs
-explicitly — your home directory (for the Globus login and SSH config) and a writable state dir:
-
-```
-hermes mcp add hpc-bridge \
-  --command uvx \
-  --env HOME=$HOME HPC_BRIDGE_USER_DIR=$HOME/.hpc-bridge \
-  --args --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
+```bash
+# Codex and Pi read ~/.agents/skills; Hermes reads ~/.hermes/skills
+for d in ~/.agents/skills/driving-hpc ~/.hermes/skills/driving-hpc; do
+  mkdir -p "$d" && curl -fsSL https://raw.githubusercontent.com/globus-labs/hpc-bridge/main/skills/driving-hpc/SKILL.md -o "$d/SKILL.md"
+done
 ```
 
-Answer *yes* to enable the tools, then `hermes mcp list` to confirm. Choosing the model hermes runs is a hermes matter
-(`hermes model`); if you want to drive it with a facility inference service such as ALCF, the maintainer notes have a
-worked setup in the [vault guide](../hpc-bridge-vault/Reference/Using%20hpc-bridge%20with%20hermes-agent.md).
+Without it the server still offers the same text as the MCP resource `hpcbridge://guidance/operations`, but most hosts
+truncate or hide it — the skill is the reliable path.
+
+## Codex
+
+```bash
+codex mcp add hpc-bridge -- uvx --python 3.13 --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
+```
+
+Then add three lines under `[mcp_servers.hpc-bridge]` in `~/.codex/config.toml`:
+
+```toml
+startup_timeout_sec = 180                 # the first start builds hpc-bridge; Codex's default is 30 s
+tool_timeout_sec = 600
+default_tools_approval_mode = "approve"   # see below
+```
+
+- **Approvals.** Codex asks before every MCP tool call that is not read-only. Interactively you can approve each one;
+  `codex exec` (non-interactive) *refuses* them instead, so set `default_tools_approval_mode = "approve"` there. Spend
+  is still gated: hpc-bridge itself refuses to start a billed block until the agent confirms it with you.
+- **SSH facilities.** Codex passes the server only a small set of environment variables. If your SSH key lives in an
+  agent, add `env_vars = ["SSH_AUTH_SOCK"]` to the same section.
+- **Model provider.** Codex speaks only the streamed Responses API and sends its tools grouped (`namespace`). OpenAI
+  serves both; some OpenAI-compatible gateways (vLLM-based ones) don't, and Codex then retries with "We're currently
+  experiencing high demand" — that is the gateway refusing the request, not hpc-bridge. Pi or Hermes work with such
+  gateways over chat completions.
+
+## Pi
+
+```bash
+pi mcp add hpc-bridge --exposure direct -- uvx --python 3.13 --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
+```
+
+Then add `"timeout": 300` to the `hpc-bridge` entry in `~/.pi/agent/mcp.json` (Pi's default is 60 s, and the first
+start takes about a minute). `pi mcp list` should show `hpc-bridge: connected, 12 tools`.
+
+- **`--exposure direct` matters.** Pi's default exposure (`codemode`) keeps MCP tools away from the model.
+- Long calls stay alive: hpc-bridge reports progress every 15 s, and Pi shows it.
+
+## Hermes
+
+```bash
+hermes mcp add hpc-bridge --connect-timeout 180 --env 'SSH_AUTH_SOCK=${SSH_AUTH_SOCK}' \
+  --command uvx --args --python 3.13 --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge
+```
+
+Answer *y* to enable the tools, then `hermes mcp test hpc-bridge` to confirm. `--args` must come last.
+
+- **`--connect-timeout 180`** — Hermes waits 60 s by default; the first start takes about a minute.
+- Hermes filters the environment it gives the server; `SSH_AUTH_SOCK` passes an SSH agent through (drop it if you
+  don't use one).
+- Choosing the model is a Hermes matter (`hermes model`). On a minimal Linux box, Hermes' installer needs
+  `libatomic1` (`apt-get install -y libatomic1`) — it says so if missing.
 
 ## Any other host
 
@@ -50,8 +94,14 @@ The shape is identical — give the host the same command; only the "add a serve
 |---|---|
 | **Claude Desktop** | `claude_desktop_config.json` → `mcpServers` (stdio: the command + args above) |
 | **Cursor** | `.cursor/mcp.json` → `mcpServers` |
-| **OpenAI Agents SDK** | `MCPServerStdio(command="uvx", args=["--from", "git+https://github.com/globus-labs/hpc-bridge", "hpc-bridge"])` |
+| **OpenAI Agents SDK** | `MCPServerStdio(command="uvx", args=["--python", "3.13", "--from", "git+https://github.com/globus-labs/hpc-bridge", "hpc-bridge"])` |
 
-If a host filters the environment like hermes does, include `HOME` (and a writable `HPC_BRIDGE_USER_DIR`) in its env
-allowlist. Everything after that — facilities, the Globus login, costs and stopping — works the same as in the
-[Quickstart](quickstart.md).
+Check three things on any host: a **startup/connect timeout of a few minutes** (the first build), a **per-call timeout
+of at least 5 minutes** (some calls wait on a scheduler), and that the host **passes `HOME`** to the server (the Globus
+login and your SSH config live there).
+
+## Updating
+
+`uvx` keeps the build it made on first use. To pick up a newer hpc-bridge, run the command once with `--refresh`
+(`uvx --refresh --python 3.13 --from git+https://github.com/globus-labs/hpc-bridge hpc-bridge`), or restart your host
+after `uv cache clean hpc-bridge`. The facility registry needs no update — hpc-bridge reads it live.

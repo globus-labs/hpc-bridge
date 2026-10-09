@@ -37,11 +37,11 @@ fi
 # `claude-acp` (Claude Code over ACP via Zed's adapter — the subscription token, like `claude`).
 OPERATOR="${HPCB_OPERATOR:-claude}"
 AUTH_ARGS=()
-if [ "$OPERATOR" = "hermes" ]; then
-  # hermes drives the scenario with an ALCF-hosted model — no Claude/Anthropic auth needed. Mint the ALCF
+if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "pi" ] || [ "$OPERATOR" = "hermes21" ]; then
+  # hermes / codex / pi / hermes21 drive the scenario with an ALCF-hosted model — no Claude/Anthropic auth needed. Mint the ALCF
   # inference token ON THE HOST (a short-lived bearer minted from the maintainer's Globus login — never the
   # Globus creds themselves) and pass only that in. Base URL + model default to Sophia/gpt-oss-120b.
-  echo "operator: hermes (ALCF-hosted model) — no Anthropic auth needed"
+  echo "operator: $OPERATOR (ALCF-hosted model) — no Anthropic auth needed"
   ALCF_INFERENCE_TOKEN="${ALCF_INFERENCE_TOKEN:-$(uv run --directory "$REPO_ROOT" --extra integration \
     python "$REPO_ROOT/agentic/harness/inference_auth_token.py" get_access_token 2>/dev/null || true)}"
   [ -n "$ALCF_INFERENCE_TOKEN" ] || { echo "ERROR: could not mint an ALCF inference token — run once: uv run --extra integration python agentic/harness/inference_auth_token.py authenticate"; exit 1; }
@@ -148,6 +148,11 @@ if [ "$OPERATOR" = "hermes" ]; then
   # When the operator's model endpoint is a tunnel on the HOST (e.g. argo-proxy at host.docker.internal), the jail —
   # which runs on the fake-cluster docker network — needs a route to the host gateway to reach it.
   case "${HPCB_ALCF_BASE_URL:-}" in *host.docker.internal*) ARGS+=( --add-host=host.docker.internal:host-gateway ) ;; esac
+fi
+if [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "pi" ] || [ "$OPERATOR" = "hermes21" ]; then
+  # the latest Codex / Pi / Hermes, headless (cli_runner): the ALCF bearer + model knobs; the trace is the server's journal
+  ARGS+=( -e HPCB_OPERATOR="$OPERATOR" -e ALCF_INFERENCE_TOKEN -e HPCB_ALCF_BASE_URL -e HPCB_ALCF_MODEL )
+  [ -n "${HPCB_CLI_TURN_TIMEOUT_S:-}" ] && ARGS+=( -e HPCB_CLI_TURN_TIMEOUT_S )
 fi
 if [ "$OPERATOR" = "claude-acp" ]; then
   # Claude Code driven over ACP (Zed's claude-agent-acp, in the image): the subscription token is already in
