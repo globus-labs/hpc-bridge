@@ -361,3 +361,53 @@ def test_the_relay_resolves_vllms_mcp_call_items_to_the_offered_tool():
     assert out[0]["call_id"] == "mcp_1" and out[0]["arguments"] == "{\"command\": \"hostname\"}"
     calls, _ = responses_relay.model_calls({"output": out})
     assert [c["name"] for c in calls] == ["run_shell", "stop_endpoint", "nonsense"]
+
+
+def test_arguments_a_harness_coerced_still_match():
+    rows = [{"ts": 1, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "provisioning"}},
+            {"ts": 2, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "up"}},
+            {"ts": 3, "tool": "stop_endpoint", "args": {}, "result": {"status": "down"}}]
+    events = [cli_runner.Native("ensure_endpoint_up", {"confirm_spend": "true"}, hpcb=True),  # the model's raw string
+              cli_runner.Native("ensure_endpoint_up", {"confirm_spend": True}, hpcb=True),
+              cli_runner.Native("stop_endpoint", {}, hpcb=True)]
+    trace, stats = cli_runner.build_trace(rows, events, [])
+    assert [c.result["status"] for c in trace.calls] == ["provisioning", "up", "down"]
+    assert stats["journal_unplaced"] == 0 and stats["hpcb_not_reaching_server"] == 0
+
+
+def test_an_unmarked_refusal_does_not_take_a_later_identical_calls_row():
+    rows = [{"ts": 1, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "up"}},
+            {"ts": 2, "tool": "run_shell", "args": {"command": "hostname"}, "result": {"phase": "complete"}}]
+    events = [cli_runner.Native("run_shell", {"command": "hostname"}, hpcb=True),   # refused; nothing said so
+              cli_runner.Native("ensure_endpoint_up", {"confirm_spend": True}, hpcb=True),
+              cli_runner.Native("run_shell", {"command": "hostname"}, hpcb=True)]
+    trace, stats = cli_runner.build_trace(rows, events, [])
+    assert trace.calls[0].result["is_error"] and trace.calls[2].result == {"phase": "complete"}
+    assert stats == {"native": 0, "hpcb_matched": 2, "harness_rejected": 0, "hpcb_not_reaching_server": 1,
+                     "journal_unplaced": 0}
+
+
+def test_rows_from_two_server_processes_are_ordered_by_start_time():
+    rows = [{"pid": 1, "seq": 1, "ts": 10.0, "tool": "list_facilities", "args": {}, "result": {"value": []}},
+            {"pid": 1, "seq": 2, "ts": 30.0, "tool": "stop_endpoint", "args": {}, "result": {"status": "down"}},
+            {"pid": 2, "seq": 1, "ts": 20.0, "tool": "run_shell", "args": {"command": "x"}, "result": {"phase": "c"}}]
+    trace, _ = cli_runner.build_trace(rows, [], [])
+    assert [c.name for c in trace.calls] == ["list_facilities", "run_shell", "stop_endpoint"]
+
+
+def test_hermes_keeps_a_text_the_agent_repeated_in_one_session(tmp_path):
+    import sqlite3
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
+                "tool_calls TEXT, tool_call_id TEXT)")
+    for sess, text in (("s", "polling"), ("s", "polling"), ("child", "polling")):
+        con.execute("INSERT INTO messages (session_id, role, content) VALUES (?,?,?)", (sess, "assistant", text))
+    con.commit()
+    con.close()
+    assert cli_runner.hermes_events(db)[1] == ["polling", "polling"]
+
+
+def test_a_long_output_keeps_its_head_for_the_floor():
+    text = "SECRET-AT-START " + "x" * 50000
+    assert "SECRET-AT-START" in cli_runner._clip(text) and len(cli_runner._clip(text)) < 17000

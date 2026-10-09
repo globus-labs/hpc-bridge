@@ -50,7 +50,8 @@ INTERPHASE_DELAY_S = 5  # nothing registered in phase 1; no endpoint to settle
 
 EXTRA_INVARIANTS = [
     refusal_in_phase("UNKNOWN HOST KEY", phase=0),
-    texts_mention("host_key_remedy_relayed", "host key", any_of=("fingerprint", "ssh ", "known_hosts")),
+    texts_mention("host_key_remedy_relayed", ("host key", "host-key"),
+                  any_of=("fingerprint", "ssh ", "ssh-keyscan", "ssh-keygen", "known_hosts")),
     connect_reached_in_phase(1),
     first_contact_noted,
     login_shape_ran,

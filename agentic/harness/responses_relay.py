@@ -163,7 +163,7 @@ def _log(record: dict) -> None:
 
 
 _LOG_LOCK = threading.Lock()
-_OUT_MAX = 8000
+_OUT_MAX = 32000
 
 
 def _output_text(out: Any) -> str:
@@ -177,10 +177,14 @@ def new_outputs(req: dict, seen: set[str]) -> list[dict]:
     out = []
     for it in req.get("input") or []:
         if isinstance(it, dict) and it.get("type") in ("function_call_output", "custom_tool_call_output"):
-            cid = str(it.get("call_id"))
-            if cid not in seen:
-                seen.add(cid)
-                out.append({"call_id": cid, "output": _output_text(it.get("output"))[-_OUT_MAX:]})
+            cid = it.get("call_id")
+            if cid is None or str(cid) not in seen:
+                if cid is not None:
+                    seen.add(str(cid))
+                text = _output_text(it.get("output"))
+                if len(text) > _OUT_MAX:  # head and tail: a secret printed early must still be in the record
+                    text = text[:_OUT_MAX // 2] + "\n…\n" + text[-_OUT_MAX // 2:]
+                out.append({"call_id": cid, "output": text})
     return out
 
 
@@ -252,7 +256,7 @@ class _Handler(BaseHTTPRequestHandler):
             if isinstance(req, dict):  # which history shapes the endpoint saw, to find the one it refused
                 record["input_shapes"] = sorted({f"{i.get('type', '-')}/{i.get('role', '-')}" for i in
                                                  req.get("input") or [] if isinstance(i, dict)})
-        elif tools is not None:
+        elif path.rstrip("/").endswith("/responses"):  # recorded even when the request went unadapted
             try:
                 resp = adapt_response(json.loads(data), names)
             except ValueError:

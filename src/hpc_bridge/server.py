@@ -279,10 +279,10 @@ def _install_journal(server: FastMCP) -> None:
             return await inner(name, arguments, *args, **kwargs)
         safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
         t0 = time.monotonic()
-        # `seq` orders calls by when they STARTED (the line is written when the call ends): concurrent calls finish
-        # out of order
-        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seq": next(_JOURNAL_SEQ),
-                                  "pid": os.getpid(), "tool": name, "args": safe}
+        # `ts` / `seq` order calls by when they STARTED (the line is written when the call ends, and concurrent calls
+        # finish out of order); `ts` also orders rows from several server processes sharing one journal
+        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "ts": round(time.time(), 6),
+                                  "seq": next(_JOURNAL_SEQ), "pid": os.getpid(), "tool": name, "args": safe}
         try:
             res = await inner(name, arguments, *args, **kwargs)
         except BaseException as exc:
