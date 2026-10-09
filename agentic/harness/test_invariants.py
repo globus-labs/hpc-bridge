@@ -947,9 +947,14 @@ def test_listing_graders():
     g = texts_mention("facilities_and_access_relayed", "anvil", "globus1", any_of=("zero ssh", "identity"))
     assert g(Trace([], ["anvil needs SSH; globus1 is zero SSH."])).ok
     assert not g(Trace([], ["anvil needs SSH."])).ok
-    labs = texts_mention("relayed", "globus-labs", any_of=("zero ssh",))
+    labs = texts_mention("relayed", ("globus-labs", "globus labs"), any_of=("zero-ssh",))
     assert labs(Trace([], ["The Globus\u202fLabs cluster is Zero\u2011SSH."])).ok  # gpt-oss typography, display name
-    assert not labs(Trace([], ["globuslabs is zero ssh"])).ok
+    assert labs(Trace([], ["globus\u2011labs is zero-ssh"])).ok
+    assert not labs(Trace([], ["globuslabs is zero-ssh"])).ok
+    # typography only — hyphen, space and underscore stay distinct (review: no false passes on other graders)
+    assert not texts_mention("r", "re-provision")(Trace([], ["the nodes are provisioned"])).ok
+    assert not texts_mention("r", "facility-run")(Trace([], ["This facility runs PBS"])).ok
+    assert not texts_mention("r", "ssh key")(Trace([], ["run ssh-keygen"])).ok
     assert not no_ssh_workaround(Trace([ToolCall.of("Bash", {"command": "ssh me@host hostname"})])).ok
     assert no_ssh_workaround(Trace([ToolCall.of("Bash", {"command": "ls -la"})])).ok
 

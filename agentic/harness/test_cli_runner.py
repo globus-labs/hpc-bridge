@@ -156,7 +156,8 @@ def test_codex_events_order_shell_calls_among_hpc_bridge_calls():
     assert [c.name for c in trace.calls] == ["list_facilities", "Bash", "run_shell"]
     assert trace.calls[1].input["command"] == "bash -lc 'ssh x'" and trace.calls[1].result["exit_code"] == 255
     assert trace.calls[2].result["stdout"] == "l1\n"  # hpc-bridge's own record, not the harness's rendering
-    assert stats == {"native": 1, "hpcb_matched": 2, "hpcb_not_reaching_server": 0, "journal_unplaced": 0}
+    assert stats == {"native": 1, "hpcb_matched": 2, "harness_rejected": 0, "hpcb_not_reaching_server": 0,
+                     "journal_unplaced": 0}
     assert texts == ["done"]
     from invariants import no_ssh_workaround
     assert not no_ssh_workaround(trace).ok  # the agent's own ssh is now visible to the graders
@@ -164,8 +165,9 @@ def test_codex_events_order_shell_calls_among_hpc_bridge_calls():
 
 def test_pi_events_map_its_own_tools_and_prefixed_mcp_names():
     lines = [
-        {"type": "tool_execution_start", "toolCallId": "a", "toolName": "hpc-bridge_list_facilities", "args": {}},
-        {"type": "tool_execution_end", "toolCallId": "a", "toolName": "hpc-bridge_list_facilities", "result": {}},
+        {"type": "tool_execution_start", "toolCallId": "a", "toolName": "mcp__hpc-bridge__list_facilities", "args": {}},
+        {"type": "tool_execution_end", "toolCallId": "a", "toolName": "mcp__hpc-bridge__list_facilities", "result": {},
+         "durationMs": 40},
         {"type": "tool_execution_start", "toolCallId": "b", "toolName": "read", "args": {"path": "agentic/x.py"}},
         {"type": "tool_execution_end", "toolCallId": "b", "toolName": "read",
          "result": {"content": [{"type": "text", "text": "body"}]}, "isError": False},
@@ -186,8 +188,8 @@ def test_hermes_events_unwrap_the_dispatcher_and_skip_compaction_summaries(tmp_p
     con = sqlite3.connect(db)
     con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT, tool_calls TEXT, "
                 "tool_call_id TEXT, _compressed_summary INTEGER DEFAULT 0)")
-    batch = {"calls": [{"name": "mcp_hpc_bridge_list_facilities", "arguments": {}},
-                       {"name": "mcp_hpc_bridge_run_shell", "arguments": {"command": "hostname"}}]}
+    batch = {"calls": [{"name": "mcp__hpc_bridge__list_facilities", "arguments": {}},
+                       {"name": "mcp__hpc_bridge__run_shell", "arguments": {"command": "hostname"}}]}
     rows = [
         ("assistant", "", json.dumps([{"id": "t1", "function": {"name": "tool_call", "arguments": json.dumps(batch)}}]),
          None, 0),
@@ -226,3 +228,114 @@ def test_a_bundle_regrades_to_the_live_trace():
     again = cli_runner.trace_from_bundle_messages(msgs)
     assert [(c.name, c.input, c.result) for c in again.calls] == [(c.name, c.input, c.result) for c in live.calls]
     assert again.texts == live.texts
+
+
+
+def test_text_typed_into_a_running_shell_is_a_shell_command():
+    from invariants import Trace, no_password_handling, no_ssh_workaround
+    hermes = cli_runner._native_call(cli_runner.Native("process", {"action": "submit",
+                                                                   "data": "sshpass -p hunter2 ssh u@h"}))
+    codex = cli_runner._native_call(cli_runner.Native("write_stdin", {"session_id": 1, "chars": "ssh u@h\n"}))
+    assert hermes.name == codex.name == "Bash" and "hunter2" in hermes.input["command"]
+    assert not no_ssh_workaround(Trace([codex])).ok
+    assert not no_password_handling(Trace([hermes])).ok
+
+
+def test_the_relay_record_carries_every_model_call_and_its_output():
+    hops = [
+        {"outputs": [], "calls": [{"call_id": "a", "name": "list_facilities", "namespace": "mcp__hpc_bridge__",
+                                   "arguments": "{}"},
+                                  {"call_id": "b", "name": "exec_command", "namespace": None,
+                                   "arguments": json.dumps({"cmd": "ssh x"})}], "texts": ["looking"]},
+        {"outputs": [{"call_id": "a", "output": "[...]"}, {"call_id": "b", "output": "denied"}],
+         "calls": [{"call_id": "c", "name": "write_stdin", "arguments": json.dumps({"chars": "pw\n"})},
+                   {"call_id": "d", "name": "apply_patch", "input": "*** Begin Patch"}], "texts": []},
+        {"outputs": [{"call_id": "c", "output": "ok"}], "calls": [], "texts": ["done"]},
+    ]
+    events, texts = cli_runner.relay_events(hops)
+    trace, stats = cli_runner.build_trace(_J[:1], events, texts)
+    assert [c.name for c in trace.calls] == ["list_facilities", "Bash", "Bash", "Edit"]
+    assert trace.calls[1].result == {"text": "denied"} and trace.calls[2].input["command"] == "pw\n"
+    assert trace.calls[3].input == {"input": "*** Begin Patch"} and texts == ["looking", "done"]
+    assert stats["journal_unplaced"] == 0
+
+
+def test_a_call_the_harness_refused_takes_no_journal_row():
+    rows = [{"seq": 1, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "up"}},
+            {"seq": 2, "tool": "run_shell", "args": {"command": "hostname"}, "result": {"phase": "complete"}}]
+    events = [cli_runner.Native("run_shell", {}, hpcb=True, ran=False),
+              cli_runner.Native("ensure_endpoint_up", {"confirm_spend": True}, hpcb=True),
+              cli_runner.Native("run_shell", {"command": "hostname"}, hpcb=True)]
+    trace, stats = cli_runner.build_trace(rows, events, [])
+    assert [c.name for c in trace.calls] == ["run_shell", "ensure_endpoint_up", "run_shell"]
+    assert trace.calls[0].result["is_error"] and trace.calls[2].result == {"phase": "complete"}
+    assert stats["harness_rejected"] == 1 and stats["journal_unplaced"] == 0
+    # unknown whether it ran, but a LATER call has the row's exact arguments: this one never reached the server
+    events[0].ran = None
+    trace, stats = cli_runner.build_trace(rows, events, [])
+    assert trace.calls[2].result == {"phase": "complete"} and stats["hpcb_not_reaching_server"] == 1
+
+
+def test_rows_are_matched_by_arguments_in_start_order():
+    rows = [{"seq": 2, "tool": "run_shell", "args": {"command": "fast"}, "result": {"stdout": "f"}},   # ended first
+            {"seq": 1, "tool": "run_shell", "args": {"command": "slow"}, "result": {"stdout": "s"}}]
+    events = [cli_runner.Native("run_shell", {"command": "slow"}, hpcb=True),
+              cli_runner.Native("run_shell", {"command": "fast"}, hpcb=True)]
+    trace, _ = cli_runner.build_trace(rows, events, [])
+    assert [c.result["stdout"] for c in trace.calls] == ["s", "f"]
+
+
+def test_hermes_compaction_copies_are_not_counted_twice(tmp_path):
+    import sqlite3
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, session_id TEXT, role TEXT, content TEXT, "
+                "tool_calls TEXT, tool_call_id TEXT, _compressed_summary INTEGER DEFAULT 0)")
+    call = json.dumps([{"id": "t1", "function": {"name": "mcp__hpc_bridge__run_shell",
+                                                 "arguments": json.dumps({"command": "hostname"})}}])
+    for sess in ("parent", "child"):  # compaction copies the kept tail into the child session
+        con.execute("INSERT INTO messages (session_id, role, content, tool_calls) VALUES (?,?,?,?)",
+                    (sess, "assistant", "running it", call))
+        con.execute("INSERT INTO messages (session_id, role, content, tool_call_id) VALUES (?,?,?,?)",
+                    (sess, "tool", "c1", "t1"))
+    con.commit()
+    con.close()
+    events, texts = cli_runner.hermes_events(db)
+    assert [e.name for e in events] == ["run_shell"] and texts == ["running it"]
+
+
+def test_hermes_not_invoked_marks_the_call_refused(tmp_path):
+    import sqlite3
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT, tool_calls TEXT, "
+                "tool_call_id TEXT)")
+    batch = {"calls": [{"name": "mcp__hpc_bridge__run_shell", "arguments": {}}]}
+    con.execute("INSERT INTO messages (role, content, tool_calls) VALUES (?,?,?)",
+                ("assistant", "", json.dumps([{"id": "t1", "function": {"name": "tool_call",
+                                                                        "arguments": json.dumps(batch)}}])))
+    con.execute("INSERT INTO messages (role, content, tool_call_id) VALUES (?,?,?)",
+                ("tool", '{"error": "missing command. The tool was NOT invoked."}', "t1"))
+    con.commit()
+    con.close()
+    events, _ = cli_runner.hermes_events(db)
+    assert events[0].hpcb and events[0].ran is False
+
+
+def test_jsonl_splits_records_on_lf_only():
+    cmd = "sshpass -p hunter2 ssh x #  tail"
+    line = json.dumps({"type": "tool_execution_start", "toolCallId": "a", "toolName": "bash",
+                       "args": {"command": cmd}}, ensure_ascii=False)
+    events, _ = cli_runner.pi_events(line + "\n")
+    assert [e.args["command"] for e in events] == [cmd]
+
+
+def test_another_servers_tool_is_not_hpc_bridges():
+    assert cli_runner._hpcb_name("mcp__other__run_shell") is None
+    assert cli_runner._hpcb_name("mcp__hpc-bridge__run_shell") == "run_shell"
+    assert cli_runner._hpcb_name("run_shell") == "run_shell"
+
+
+def test_regrade_falls_back_to_the_final_message_like_live():
+    msgs = [{"harness": "hermes21", "rc": 0}, {"final": "all done"}, {"journal": _J[0]}]
+    assert cli_runner.trace_from_bundle_messages(msgs).texts == ["all done"]

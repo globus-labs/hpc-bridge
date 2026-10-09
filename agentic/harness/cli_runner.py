@@ -1,12 +1,16 @@
 """Drive a non-Claude agent HARNESS — Codex, Pi, or Hermes at its latest release — through a scenario, headlessly, and
-grade it from hpc-bridge's OWN tool-call journal (HPC_BRIDGE_JOURNAL): one JSON line per call, written by the server,
-so the trace is the same whatever host drives it (no per-harness session-format reader to drift).
+grade the run. The graded trace has two sources: the harness's OWN record of the run (Codex: the relay's log of the
+model's wire; Pi: `--mode json` events; Hermes: its state.db) fixes the order of every call and carries the agent's
+own shell / read / search calls, and hpc-bridge's tool-call journal (HPC_BRIDGE_JOURNAL, written by the server)
+carries exactly what each hpc-bridge tool received and returned.
 
-Each harness is configured the way docs/user/other-hosts.md tells a user to (Codex: startup timeout + approval mode;
+Each harness is configured with the settings docs/user/other-hosts.md gives (Codex: startup timeout + approval mode;
 Pi: `exposure: direct` + a 300 s timeout; Hermes: a long connect timeout, the env it filters passed explicitly), the
 `driving-hpc` skill installed where it looks, and the model pointed at the ALCF OpenAI-compatible endpoint
 (HPCB_ALCF_BASE_URL, bearer ALCF_INFERENCE_TOKEN) — the same open model under every harness, so a difference is the
-harness's, not the model's. The run happens in a neutral working directory (no CLAUDE.md/AGENTS.md of ours leaks in).
+harness's, not the model's. The server itself runs from this checkout (`uv run`), not the users' `uvx --from git+…`
+— that install path is what agentic/install_check/ covers. The agent works in an empty directory (no
+CLAUDE.md/AGENTS.md of ours leaks in), beside — not inside — the record that grades it.
 
 AUTONOMOUS scenarios only for now (one turn: the prompt authorizes the spend). A persona'd scenario needs the harness's
 long-lived session mode (an MCP server that lives across turns, as in real use) — raised as unsupported.
@@ -16,6 +20,7 @@ from __future__ import annotations
 import asyncio
 import json
 import os
+import re
 import shutil
 import subprocess
 import tempfile
@@ -120,22 +125,24 @@ def setup_hermes21(work: Path, repo: str, env: dict[str, str]) -> dict[str, str]
     return {"HERMES_HOME": str(home)}
 
 
-def _turn_argv(harness: str, prompt: str, work: Path, session: str) -> list[str]:
+def _turn_argv(harness: str, prompt: str, ws: Path, rec: Path, session: str) -> list[str]:
     _, model = _model()
     if harness == "codex":
-        return ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "danger-full-access", "-C", str(work),
-                "-o", str(work / "last-message.txt"), prompt]
+        return ["codex", "exec", "--json", "--skip-git-repo-check", "-s", "danger-full-access", "-C", str(ws),
+                "-o", str(rec / "last-message.txt"), prompt]
     if harness == "pi":
         return ["pi", "--mode", "json", "--provider", "alcf", "--model", model, "--session-dir",
-                str(work / "pi-sessions"), "--session-id", session, prompt]
+                str(rec / "pi-sessions"), "--session-id", session, prompt]
     return [os.environ.get("HPCB_HERMES21_BIN", str(Path.home() / ".local/bin/hermes")), "-z", prompt, "--yolo"]
 
 
-def _native(harness: str, work: Path, env: dict[str, str], stdout: str) -> tuple[list[Native], list[str], str]:
+def _native(harness: str, rec: Path, env: dict[str, str], stdout: str,
+            hops: list[dict]) -> tuple[list[Native], list[str], str]:
     """(the harness's own calls in order, the agent's prose, its final message)."""
     if harness == "codex":
-        events, texts = codex_events(stdout)
-        f = work / "last-message.txt"
+        # the relay saw the model's whole wire; `exec --json` omits write_stdin, sub-agents and patch content
+        events, texts = relay_events(hops) if any("calls" in h for h in hops) else codex_events(stdout)
+        f = rec / "last-message.txt"
         return events, texts, f.read_text().strip() if f.exists() else (texts[-1] if texts else "")
     if harness == "pi":
         events, texts = pi_events(stdout)
@@ -147,7 +154,7 @@ def _native(harness: str, work: Path, env: dict[str, str], stdout: str) -> tuple
 # ---------------------------------------------------------------- the trace: native order + the journal's record
 
 # hpc-bridge's tools (test_cli_runner checks this against the server). A native call whose name ENDS with one of them
-# is an hpc-bridge call under the harness's own prefix (Codex mcp_tool_call, Pi `hpc-bridge_…`, Hermes `mcp_hpc_bridge_…`).
+# is an hpc-bridge call under the harness's own prefix (Pi `mcp__hpc-bridge__…`, Hermes `mcp__hpc_bridge__…`).
 HPCB_TOOLS = ("authenticate", "complete_login", "complete_preauth", "connect_facility", "ensure_endpoint_up",
               "list_facilities", "login_shell", "poll_task", "reset_session", "run_shell", "stop_endpoint",
               "teardown_endpoint")
@@ -160,6 +167,10 @@ _NATIVE = {
     "grep": "Grep", "search_files": "Grep", "find": "Glob", "ls": "Glob",
     "write": "Write", "write_file": "Write", "edit": "Edit", "patch": "Edit", "apply_patch": "Edit",
 }
+# what reaches a shell, under each harness's key: Codex exec_command `cmd` / write_stdin `chars`, Hermes
+# execute_code `code` / process(action=write|submit) `data`
+_SHELL_TEXT_KEYS = ("cmd", "code", "chars", "data", "input")
+_NOT_INVOKED = "The tool was NOT invoked"  # Hermes, when it refuses a deferred tool's arguments itself
 
 
 @dataclass
@@ -169,21 +180,29 @@ class Native:
     args: dict[str, Any]
     result: dict[str, Any] | None = None
     hpcb: bool = False
+    ran: bool | None = None   # False: the harness says the tool never ran (refused before dispatch); None: unknown
+    call_id: str | None = None
 
 
 def _hpcb_name(name: str) -> str | None:
-    return next((t for t in HPCB_TOOLS if name == t or name.endswith(("_" + t, "__" + t, "." + t))), None)
+    if name in HPCB_TOOLS:
+        return name
+    if not re.search(r"hpc[-_]bridge", name):  # another server's `…_run_shell` is not ours
+        return None
+    return next((t for t in HPCB_TOOLS if name.endswith(("_" + t, "." + t))), None)
 
 
 def _native_call(n: Native) -> ToolCall:
-    """A harness's own call, under the grader's name; a shell call's text lands in `command` (Codex's `cmd`,
-    Hermes' `code` for execute_code) so _command_of reads it."""
+    """A harness's own call, under the grader's name. For a shell-like call, every piece of text that reaches the shell
+    lands in `command` (what _command_of and the floor read), whatever key the harness used."""
     graded = _NATIVE.get(n.name, n.name)
     args = dict(n.args)
-    if graded == "Bash" and "command" not in args:
-        args["command"] = str(args.get("cmd") or args.get("code") or args.get("chars") or "")
-    if isinstance(args.get("command"), list):
-        args["command"] = " ".join(map(str, args["command"]))
+    if graded == "Bash":
+        cmd = args.get("command")
+        if isinstance(cmd, list):
+            cmd = " ".join(map(str, cmd))
+        parts = [cmd, *(args.get(k) for k in _SHELL_TEXT_KEYS)]
+        args["command"] = " ".join(p for p in parts if isinstance(p, str) and p)
     return ToolCall.of(graded, args, n.result)
 
 
@@ -204,31 +223,52 @@ def _journal_call(row: dict) -> ToolCall:
     return ToolCall.of(f"mcp__hpc-bridge__{row.get('tool')}", row.get("args") or {}, result)
 
 
+def _same_args(native: dict, row: dict) -> bool:
+    got = row.get("args") or {}
+    return all(native.get(k) == got.get(k) for k in set(native) | set(got) if got.get(k) != "<redacted>")
+
+
 def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tuple[Trace, dict[str, int]]:
     """The harness's own event stream fixes the ORDER of every call; hpc-bridge's journal is the record of what its
-    tools received and returned. The k-th native call to tool X takes the k-th journal row for X. A native hpc-bridge
-    call with no row never reached the server (the harness refused or failed it) and is kept as an error; journal rows
-    no native event accounts for (a reader blind spot) are appended, and counted, rather than silently dropped."""
+    tools received and returned. Rows are taken in the order the calls STARTED (the journal's `seq`; a row is written
+    when its call ends). A native call to tool X takes the queued X row with the same arguments, else the first X row —
+    unless a LATER native X call has exactly that row's arguments (then this call never reached the server). A call the
+    harness itself refused (`ran is False`) takes no row. A native hpc-bridge call with no row is kept as an error;
+    rows no native event accounts for (a reader blind spot) are appended and counted — run.py GATES on that count."""
+    ordered = sorted(rows, key=lambda r: (r.get("seq") is None, r.get("seq") or 0))
     queues: dict[str, list[dict]] = {}
-    for r in rows:
+    for r in ordered:
         queues.setdefault(str(r.get("tool")), []).append(r)
     calls: list[ToolCall] = []
-    stats = {"native": 0, "hpcb_matched": 0, "hpcb_not_reaching_server": 0, "journal_unplaced": 0}
-    for ev in events:
-        if ev.hpcb:
-            q = queues.get(ev.name)
-            if q:
-                calls.append(_journal_call(q.pop(0)))
-                stats["hpcb_matched"] += 1
-            else:
-                calls.append(ToolCall.of(f"mcp__hpc-bridge__{ev.name}", ev.args,
-                                         {"text": "the call never reached hpc-bridge (no journal row)",
-                                          "is_error": True, **(ev.result or {})}))
-                stats["hpcb_not_reaching_server"] += 1
-        else:
+    stats = {"native": 0, "hpcb_matched": 0, "harness_rejected": 0, "hpcb_not_reaching_server": 0,
+             "journal_unplaced": 0}
+
+    def unreached(ev: Native, why: str) -> ToolCall:
+        return ToolCall.of(f"mcp__hpc-bridge__{ev.name}", ev.args,
+                           {**(ev.result or {}), "text": why, "is_error": True})
+
+    for i, ev in enumerate(events):
+        if not ev.hpcb:
             calls.append(_native_call(ev))
             stats["native"] += 1
-    left = sorted((r for q in queues.values() for r in q), key=rows.index)
+            continue
+        if ev.ran is False:
+            calls.append(unreached(ev, "refused by the harness; the call never reached hpc-bridge"))
+            stats["harness_rejected"] += 1
+            continue
+        q = queues.get(ev.name) or []
+        pick = next((j for j, r in enumerate(q) if _same_args(ev.args, r)), None)
+        if pick is None and q:
+            later = [e for e in events[i + 1:] if e.hpcb and e.name == ev.name and e.ran is not False]
+            if not any(_same_args(e.args, q[0]) for e in later):
+                pick = 0
+        if pick is None:
+            calls.append(unreached(ev, "the call never reached hpc-bridge (no journal row)"))
+            stats["hpcb_not_reaching_server"] += 1
+        else:
+            calls.append(_journal_call(q.pop(pick)))
+            stats["hpcb_matched"] += 1
+    left = [r for r in ordered if any(r is x for q in queues.values() for x in q)]
     calls.extend(_journal_call(r) for r in left)
     stats["journal_unplaced"] = len(left)
     return Trace(calls, texts), stats
@@ -236,34 +276,35 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tup
 
 def trace_from_journal(path: Path, texts: list[str]) -> Trace:
     """The journal alone (no native events): hpc-bridge's calls, in the order the server saw them."""
-    rows = _journal_rows(path)
-    return build_trace(rows, [], texts)[0]
+    return build_trace(_journal_rows(path), [], texts)[0]
+
+
+def _bundle_native(n: Native) -> dict:
+    return {"name": n.name, "hpcb": n.hpcb, "args": n.args, "result": n.result, "ran": n.ran, "call_id": n.call_id}
 
 
 def trace_from_bundle_messages(messages: list[dict]) -> Trace:
-    """Rebuild the graded Trace from a bundle this operator wrote (regrade.py): the `native`, `text` and `journal`
-    entries are exactly what build_trace was given live."""
+    """Rebuild the graded Trace from a bundle this operator wrote (regrade.py): the `native`, `text`, `final` and
+    `journal` entries are exactly what build_trace was given live."""
     events = [Native(m["native"]["name"], m["native"].get("args") or {}, m["native"].get("result"),
-                     bool(m["native"].get("hpcb"))) for m in messages if "native" in m]
+                     bool(m["native"].get("hpcb")), m["native"].get("ran"), m["native"].get("call_id"))
+              for m in messages if "native" in m]
     texts = [m["text"] for m in messages if "text" in m]
-    return build_trace([m["journal"] for m in messages if "journal" in m], events, texts)[0]
+    final = next((m["final"] for m in messages if "final" in m), "")
+    return build_trace([m["journal"] for m in messages if "journal" in m], events,
+                       texts or ([final] if final else []))[0]
 
 
 def _journal_rows(path: Path) -> list[dict]:
-    rows = []
-    if path.exists():
-        for line in path.read_text().splitlines():
-            try:
-                rows.append(json.loads(line))
-            except ValueError:
-                continue
-    return rows
+    return _jsonl(path.read_text()) if path.exists() else []
 
 
 def _jsonl(text: str) -> list[dict]:
+    """Strict JSONL: records end at LF only — str.splitlines() would also split on U+2028/U+2029/U+0085, which
+    JSON encoders leave raw inside strings, and silently drop the record (a command with one hides from the floor)."""
     out = []
-    for line in text.splitlines():
-        line = line.strip()
+    for line in text.split("\n"):
+        line = line.strip("\r").strip()
         if line.startswith("{"):
             try:
                 out.append(json.loads(line))
@@ -272,9 +313,40 @@ def _jsonl(text: str) -> list[dict]:
     return out
 
 
+def relay_events(hops: list[dict]) -> tuple[list[Native], list[str]]:
+    """Codex, from the relay's record of the model's own wire (responses_relay): every call the model asked for, in
+    order — write_stdin, sub-agents' calls and patch contents included — with the output Codex returned for each."""
+    events: list[Native] = []
+    by_id: dict[str, Native] = {}
+    texts: list[str] = []
+    for h in hops:
+        for o in h.get("outputs") or []:  # this request's new outputs answer calls from earlier responses
+            n = by_id.get(str(o.get("call_id")))
+            if n is not None and n.result is None:
+                n.result = {"text": str(o.get("output") or "")}
+        for c in h.get("calls") or []:
+            name, ns = str(c.get("name") or ""), str(c.get("namespace") or "")
+            if "input" in c:
+                args: Any = {"input": c.get("input")}
+            else:
+                try:
+                    args = json.loads(c.get("arguments") or "{}")
+                except ValueError:
+                    args = {"arguments": c.get("arguments")}
+            if not isinstance(args, dict):
+                args = {"value": args}
+            hp = name if ns.startswith("mcp__hpc_bridge") and name in HPCB_TOOLS else None
+            n = Native(hp or name, args, hpcb=hp is not None, call_id=str(c.get("call_id")))
+            events.append(n)
+            by_id[str(n.call_id)] = n
+        texts += [t for t in h.get("texts") or [] if t]
+    return events, texts
+
+
 def codex_events(stdout: str) -> tuple[list[Native], list[str]]:
-    """`codex exec --json`: item.started / item.completed for command_execution, mcp_tool_call, file_change, …;
-    agent_message items are the agent's prose."""
+    """`codex exec --json` (the fallback when there is no relay record): item.started / item.completed for
+    command_execution, mcp_tool_call, file_change; agent_message items are the agent's prose. It does NOT report
+    write_stdin or a sub-agent's items — the relay record does."""
     order: list[str] = []
     by_id: dict[str, Native] = {}
     texts: list[str] = []
@@ -295,7 +367,8 @@ def codex_events(stdout: str) -> tuple[list[Native], list[str]]:
             hp = item.get("server") == "hpc-bridge" and tool in HPCB_TOOLS
             n = by_id.get(iid) or Native(tool, item.get("arguments") or {}, hpcb=hp)
             if ev["type"] == "item.completed" and item.get("error"):
-                n.result = {"text": str(item["error"]), "is_error": True}
+                err = item["error"]
+                n.result = {"text": str(err.get("message") if isinstance(err, dict) else err), "is_error": True}
         elif kind == "file_change":
             n = by_id.get(iid) or Native("apply_patch", {"changes": item.get("changes") or []})
         else:
@@ -313,7 +386,8 @@ def _content_text(content: Any) -> str:
 
 
 def pi_events(stdout: str) -> tuple[list[Native], list[str]]:
-    """`pi --mode json`: tool_execution_start/end per call; message_end carries each assistant message."""
+    """`pi --mode json`: tool_execution_start/end per call (an end without `durationMs` = the tool never ran);
+    message_end carries each assistant message."""
     order: list[str] = []
     by_id: dict[str, Native] = {}
     texts: list[str] = []
@@ -324,11 +398,12 @@ def pi_events(stdout: str) -> tuple[list[Native], list[str]]:
             hp = _hpcb_name(name)
             cid = str(ev.get("toolCallId"))
             if cid not in by_id:
-                by_id[cid] = Native(hp or name, ev.get("args") or {}, hpcb=hp is not None)
+                by_id[cid] = Native(hp or name, ev.get("args") or {}, hpcb=hp is not None, call_id=cid)
                 order.append(cid)
         elif kind == "tool_execution_end":
             n = by_id.get(str(ev.get("toolCallId")))
-            if n is not None and not n.hpcb:
+            if n is not None:
+                n.ran = "durationMs" in ev
                 res = ev.get("result") or {}
                 n.result = {"text": _content_text(res.get("content"))[-4000:], "is_error": bool(ev.get("isError"))}
         elif kind == "message_end":
@@ -340,8 +415,10 @@ def pi_events(stdout: str) -> tuple[list[Native], list[str]]:
 
 def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
     """Hermes' state.db, in row order: assistant rows carry tool_calls (a deferred tool may go through the `tool_call`
-    dispatcher, `{"calls": [{name, arguments}, …]}`, or its legacy single form); tool rows carry results. A compaction
-    summary row is Hermes' own text, not the agent's, and is skipped."""
+    dispatcher, `{"calls": [{name, arguments}, …]}`, or its legacy single form); tool rows carry results ("The tool was
+    NOT invoked" = Hermes refused it itself). A compaction summary row is Hermes' text, not the agent's, and is skipped;
+    compaction also copies the kept tail into a child session, so a call id (or a text) seen before is not counted
+    twice."""
     if not db.exists():
         return [], []
     import sqlite3
@@ -355,6 +432,7 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
         con.close()
     events: list[Native] = []
     by_id: dict[str, Native] = {}
+    seen_ids: set[str] = set()
     texts: list[str] = []
     for r in rows:
         if r.get("role") == "assistant":
@@ -363,13 +441,17 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
             except ValueError:
                 tcs = []
             for tc in tcs if isinstance(tcs, list) else []:
+                tid = str(tc.get("id") or tc.get("call_id") or "")
+                if tid and tid in seen_ids:
+                    continue
+                seen_ids.add(tid)
                 fn = tc.get("function") or {}
                 try:
                     args = json.loads(fn.get("arguments") or "{}")
                 except ValueError:
                     args = {}
                 name = str(fn.get("name") or "")
-                inner = [name and (name, args)]
+                inner: list[tuple[str, Any]] = [(name, args)] if name else []
                 if name == "tool_call" and isinstance(args, dict):
                     raw = args.get("calls")
                     if isinstance(raw, str):
@@ -382,18 +464,27 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
                         raw = [{"name": args.get("name"), "arguments": args.get("arguments")}]
                     inner = [(str(c.get("name") or ""), c.get("arguments") or {}) for c in raw or []
                              if isinstance(c, dict)]
-                for nm, a in [x for x in inner if x]:
+                for nm, a in inner:
+                    if isinstance(a, str):
+                        try:
+                            a = json.loads(a)
+                        except ValueError:
+                            a = {"value": a}
                     hp = _hpcb_name(nm)
-                    n = Native(hp or nm, a if isinstance(a, dict) else {"value": a}, hpcb=hp is not None)
+                    n = Native(hp or nm, a if isinstance(a, dict) else {"value": a}, hpcb=hp is not None,
+                               call_id=tid or None)
                     events.append(n)
-                    if tc.get("id") and len(inner) == 1:
-                        by_id[str(tc["id"])] = n
-            if (t := (r.get("content") or "").strip()):
+                    if tid and len(inner) == 1:
+                        by_id[tid] = n
+            if (t := (r.get("content") or "").strip()) and t not in texts:
                 texts.append(t)
         elif r.get("role") == "tool":
             n = by_id.get(str(r.get("tool_call_id")))
-            if n is not None and not n.hpcb:
-                n.result = {"text": str(r.get("content") or "")[-4000:]}
+            if n is not None and n.result is None:
+                content = str(r.get("content") or "")
+                n.result = {"text": content[-4000:]}
+                if _NOT_INVOKED in content:
+                    n.ran = False
     return events, texts
 
 
@@ -412,11 +503,14 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
         raise ValueError(f"unknown harness {harness!r}")
     from runner import RunResult  # jail-only import chain (the Claude Agent SDK); kept off module import
     repo = str(repo_root)
-    # under HOME, not /tmp: Codex refuses to put its helper binaries under a temporary dir
+    # under HOME, not /tmp: Codex refuses to put its helper binaries under a temporary dir. The RECORD (journal, relay
+    # log, harness configs) lives in `rec`; the agent works in the empty `ws` beside it, not on top of what grades it.
     runs = Path.home() / ".hpcb-cli-runs"
     runs.mkdir(parents=True, exist_ok=True)
-    work = Path(tempfile.mkdtemp(prefix=f"{harness}-", dir=runs))
-    journal = work / "journal.jsonl"
+    rec = Path(tempfile.mkdtemp(prefix=f"{harness}-", dir=runs))
+    ws = rec / "ws"
+    ws.mkdir()
+    journal = rec / "journal.jsonl"
     env = dict(os.environ)
     env.update({k: v for k, v in (extra_env or {}).items() if v is not None})
     env["HPC_BRIDGE_JOURNAL"] = str(journal)
@@ -424,22 +518,22 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
         env["HPC_BRIDGE_OMIT_INSTRUCTIONS"] = "1"
     relay = None
     if harness == "codex":  # Codex speaks only streamed Responses with namespaced tools; ALCF serves neither
-        os.environ["HPCB_RELAY_LOG"] = str(work / "relay.jsonl")
+        os.environ["HPCB_RELAY_LOG"] = str(rec / "relay.jsonl")
         relay = start_relay(_model()[0])
-        env.update(setup_codex(work, repo, env, base_url=relay.base_url))
+        env.update(setup_codex(rec, repo, env, base_url=relay.base_url))
     else:
-        env.update({"pi": setup_pi, "hermes21": setup_hermes21}[harness](work, repo, env))
+        env.update({"pi": setup_pi, "hermes21": setup_hermes21}[harness](rec, repo, env))
     if not ablate_skill:  # where each looks: ~/.agents/skills (Codex, Pi), $HERMES_HOME/skills (Hermes)
         _install_skill(repo_root, Path.home() / ".agents" / "skills",
-                       Path(env.get("HERMES_HOME", work / "hermes")) / "skills")
+                       Path(env.get("HERMES_HOME", rec / "hermes")) / "skills")
     for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):  # the operator runs on the open model only
         env.pop(k, None)
 
-    argv = _turn_argv(harness, prompt, work, str(uuid.uuid4()))
+    argv = _turn_argv(harness, prompt, ws, rec, str(uuid.uuid4()))
     print(f"  → {harness}: {' '.join(a if len(a) < 80 else a[:77] + '…' for a in argv[:8])} …", flush=True)
     t0 = time.monotonic()
     try:
-        proc = await asyncio.to_thread(subprocess.run, argv, cwd=work, env=env, stdin=subprocess.DEVNULL,
+        proc = await asyncio.to_thread(subprocess.run, argv, cwd=ws, env=env, stdin=subprocess.DEVNULL,
                                        capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
         rc, out, err = proc.returncode, proc.stdout, proc.stderr
     except subprocess.TimeoutExpired as exc:
@@ -448,9 +542,10 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     finally:
         if relay:
             relay.shutdown()
-    (work / "harness-stdout.txt").write_text(out or "")
-    (work / "harness-stderr.txt").write_text(err or "")
-    events, texts, text = _native(harness, work, env, out or "")
+    (rec / "harness-stdout.txt").write_text(out or "")
+    (rec / "harness-stderr.txt").write_text(err or "")
+    hops = _journal_rows(rec / "relay.jsonl")
+    events, texts, text = _native(harness, rec, env, out or "", hops)
     print(f"  ← {harness}: rc={rc} in {time.monotonic() - t0:.0f}s; final: {text[:240]!r}", flush=True)
     if rc != 0:
         print(f"  stderr tail: {(err or '').strip()[-600:]}", flush=True)
@@ -458,12 +553,9 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     trace, stats = build_trace(rows, events, texts or ([text] if text else []))
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     final = CliFinal(result=text or (err or "")[-400:], is_error=rc != 0)
-    # the per-run dir dies with the jail: carry the journal, the harness's own record and the relay log into the bundle
-    relayed = work / "relay.jsonl"
-    hops = _journal_rows(relayed)
+    # the run dir dies with the jail: carry the journal, the harness's own record and the relay log into the bundle
     messages = [{"harness": harness, "argv": argv[:6], "rc": rc, "seconds": round(time.monotonic() - t0, 1),
                  "trace_stats": stats, "stdout_tail": (out or "")[-4000:], "stderr_tail": (err or "")[-4000:]},
-                *({"native": {"name": n.name, "hpcb": n.hpcb, "args": n.args, "result": n.result}} for n in events),
-                *({"text": t} for t in texts),
+                *({"native": _bundle_native(n)} for n in events), *({"text": t} for t in texts), {"final": text},
                 *({"journal": r} for r in rows), *({"relay": h} for h in hops)]
     return RunResult(trace=trace, final=final, messages=messages)

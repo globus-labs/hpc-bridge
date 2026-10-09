@@ -121,6 +121,7 @@ async def test_the_journal_records_each_call_and_redacts_codes(tmp_path, monkeyp
     assert rows[0]["args"] == {"query": "delta"} and rows[0]["result"] == [] and rows[0]["ms"] >= 0
     assert rows[1]["args"] == {"code": "<redacted>"} and "error" in rows[1] and "123456" not in journal.read_text()
     assert oct(journal.stat().st_mode & 0o777) == "0o600"
+    assert rows[0]["seq"] < rows[1]["seq"]  # start order, whatever order the calls end in
 
 
 async def test_no_journal_unless_asked(tmp_path, monkeypatch):

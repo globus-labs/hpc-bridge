@@ -5,14 +5,20 @@ ALCF inference gateway (vLLM), which answers it NON-streamed and knows only plai
   with `"stream": false` and replays the complete response as the server-sent events Codex's parser consumes
   (codex-rs/codex-api/src/sse/responses.rs): `response.created`, one `response.output_item.done` per output item,
   then `response.completed` (or `response.incomplete`).
+- An assistant message in the history is refused unless it carries an id, a status and annotations, which Codex
+  doesn't send back: it is resent in the plain `{role, content}` form.
 - "tool type namespace not supported" — Codex 0.16x groups tools into `namespace` tools (MCP servers, its own
   `functions`) and offers freeform `custom` tools (apply_patch). The relay flattens every one into a plain function
   tool (a custom tool takes one string, `input`), translates the conversation history the same way, and restores
   Codex's shape on the way back: a call to a flattened name returns as `{name, namespace}`, a call to a custom tool as
   a `custom_tool_call`. Tool types vLLM cannot run at all (web_search, tool_search) are dropped.
 
-So the model sees the same tools under readable names (`mcp__hpc-bridge__list_facilities`), and Codex's own MCP
+So the model sees the names Codex itself would show it (`mcp__hpc_bridge__list_facilities`), and Codex's own MCP
 dispatch, approvals and tool handling run unchanged — only the wire format is adapted.
+
+The relay is also the run's most complete RECORD of the agent (its log, $HPCB_RELAY_LOG): every call the model asked
+for — including the ones `codex exec --json` never reports (typing into a running command with `write_stdin`, a
+sub-agent's calls, a patch's content) — and every output Codex sent back, once each. cli_runner grades from it.
 
     relay = start_relay("https://inference-api.alcf.anl.gov/resource_server/sophia/vllm/v1")
     base_url = relay.base_url   # http://127.0.0.1:<port>/v1
@@ -27,7 +33,7 @@ import time
 import urllib.error
 import urllib.request
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
-from typing import Any
+from typing import Any, ClassVar
 
 _DEFAULT_NS = "functions"  # codex_protocol::DEFAULT_FUNCTION_NAMESPACE — its own tools, unprefixed
 _DROP_KEYS = ("client_metadata", "include", "prompt_cache_key")  # OpenAI-only request fields
@@ -82,6 +88,10 @@ def adapt_request(req: dict) -> tuple[dict, dict[str, tuple[str | None, str, str
                       "name": _flat(it.get("namespace"), it["name"]), "arguments": json.dumps({"input": it["input"]})}
             elif kind in ("function_call_output", "custom_tool_call_output"):
                 it = {"type": "function_call_output", "call_id": it.get("call_id"), "output": it.get("output")}
+            elif kind == "message" and it.get("role") == "assistant":
+                # vLLM validates an assistant message as OpenAI's output message (id, status, annotations required)
+                # and Codex replays it without them; the plain {role, content} form carries the same text
+                it = {"role": "assistant", "content": _output_text(it.get("content"))}
             conv.append(it)
         out["input"] = conv
     return out, names
@@ -116,8 +126,9 @@ def replay_as_events(resp: dict) -> bytes:
     out = [_sse("response.created", {"response": {"id": resp.get("id")}})]
     for item in resp.get("output") or []:
         out.append(_sse("response.output_item.done", {"item": item}))
-    completed = {k: resp.get(k) for k in ("id", "usage", "status", "incomplete_details") if k in resp}
-    kind = "response.incomplete" if resp.get("status") == "incomplete" else "response.completed"
+    completed = {k: resp.get(k) for k in ("id", "usage", "status", "incomplete_details", "error") if k in resp}
+    kind = {"incomplete": "response.incomplete", "failed": "response.failed"}.get(resp.get("status") or "",
+                                                                                   "response.completed")
     out.append(_sse(kind, {"response": completed}))
     return b"".join(out)
 
@@ -127,12 +138,53 @@ def _log(record: dict) -> None:
     the endpoint said, so a refusal is diagnosable rather than Codex's generic "high demand" retry message."""
     path = os.environ.get("HPCB_RELAY_LOG")
     if path:
-        with open(path, "a") as fh:
+        with _LOG_LOCK, open(path, "a") as fh:  # sub-agents make concurrent requests
             fh.write(json.dumps(record, default=str) + "\n")
+
+
+_LOG_LOCK = threading.Lock()
+_OUT_MAX = 8000
+
+
+def _output_text(out: Any) -> str:
+    if isinstance(out, list):  # structured content items
+        return "\n".join(str(x.get("text") or "") for x in out if isinstance(x, dict))
+    return out if isinstance(out, str) else json.dumps(out, default=str)
+
+
+def new_outputs(req: dict, seen: set[str]) -> list[dict]:
+    """The tool outputs Codex sends back for the first time in this request (each request carries the whole history)."""
+    out = []
+    for it in req.get("input") or []:
+        if isinstance(it, dict) and it.get("type") in ("function_call_output", "custom_tool_call_output"):
+            cid = str(it.get("call_id"))
+            if cid not in seen:
+                seen.add(cid)
+                out.append({"call_id": cid, "output": _output_text(it.get("output"))[-_OUT_MAX:]})
+    return out
+
+
+def model_calls(resp: dict) -> tuple[list[dict], list[str]]:
+    """(the tool calls the model asked for, in Codex's shapes; its prose) from one adapted response."""
+    calls, texts = [], []
+    for it in resp.get("output") or []:
+        if not isinstance(it, dict):
+            continue
+        if it.get("type") == "function_call":
+            calls.append({"call_id": it.get("call_id"), "name": it.get("name"), "namespace": it.get("namespace"),
+                          "arguments": it.get("arguments")})
+        elif it.get("type") == "custom_tool_call":
+            calls.append({"call_id": it.get("call_id"), "name": it.get("name"), "namespace": it.get("namespace"),
+                          "input": it.get("input")})
+        elif it.get("type") == "message":
+            texts += [str(c.get("text")) for c in it.get("content") or []
+                      if isinstance(c, dict) and c.get("type") == "output_text" and c.get("text")]
+    return calls, texts
 
 
 class _Handler(BaseHTTPRequestHandler):
     upstream = ""
+    seen: ClassVar[set[str]] = set()  # replaced per relay (start_relay)
 
     def log_message(self, *args) -> None:  # quiet
         pass
@@ -141,7 +193,8 @@ class _Handler(BaseHTTPRequestHandler):
         length = int(self.headers.get("Content-Length") or 0)
         body = self.rfile.read(length) if length else b""
         path = self.path.split("/v1", 1)[-1] if "/v1" in self.path else self.path
-        streamed, names, tools = False, {}, None
+        streamed, names, tools, outputs, problem = False, {}, None, [], None
+        req: Any = None
         if method == "POST" and path.rstrip("/").endswith("/responses") and body:
             try:
                 req = json.loads(body)
@@ -149,9 +202,13 @@ class _Handler(BaseHTTPRequestHandler):
                 req = None
             if isinstance(req, dict):
                 streamed = bool(req.get("stream"))
-                req, names = adapt_request(req)
+                try:
+                    outputs = new_outputs(req, self.seen)
+                    req, names = adapt_request(req)
+                    tools = sorted(names)
+                except Exception as e:  # noqa: BLE001 - forward unadapted; the endpoint's refusal is then logged
+                    problem = f"adapt_request: {type(e).__name__}: {e}"
                 req["stream"] = False
-                tools = sorted(names)
                 body = json.dumps(req).encode()
         headers = {k: v for k, v in self.headers.items() if k.lower() in ("authorization", "openai-beta")}
         headers["Content-Type"] = "application/json"
@@ -167,18 +224,29 @@ class _Handler(BaseHTTPRequestHandler):
         except Exception as e:  # noqa: BLE001 - surface it to Codex as an HTTP error
             status, data, ctype = 502, json.dumps({"error": {"message": f"relay: {e}"}}).encode(), "application/json"
         record: dict[str, Any] = {"t": t0, "s": round(time.time() - t0, 1), "method": method, "path": path,
-                                  "status": status, "tools": tools}
+                                  "status": status, "tools": tools, "outputs": outputs}
+        if problem:
+            record["problem"] = problem
         if status >= 400:
             record["error"] = data[:1500].decode(errors="replace")
-        elif names is not None and tools is not None:
+            if isinstance(req, dict):  # which history shapes the endpoint saw, to find the one it refused
+                record["input_shapes"] = sorted({f"{i.get('type', '-')}/{i.get('role', '-')}" for i in
+                                                 req.get("input") or [] if isinstance(i, dict)})
+        elif tools is not None:
             try:
                 resp = adapt_response(json.loads(data), names)
-                record["output"] = [o.get("type") for o in resp.get("output") or []]
+            except ValueError:
+                resp = None
+            if not isinstance(resp, dict):
+                status, ctype = 502, "application/json"
+                record["error"] = "relay: the endpoint's answer was not a JSON object: " + data[:300].decode(errors="replace")
+                data = json.dumps({"error": {"message": record["error"]}}).encode()
+            else:
+                record["output"] = [o.get("type") for o in resp.get("output") or [] if isinstance(o, dict)]
+                record["calls"], record["texts"] = model_calls(resp)
                 data = json.dumps(resp).encode()
                 if streamed:
                     data, ctype = replay_as_events(resp), "text/event-stream"
-            except ValueError:
-                pass
         _log(record)
         self.send_response(status)
         self.send_header("Content-Type", ctype)
@@ -204,7 +272,7 @@ class Relay:
 
 
 def start_relay(upstream: str) -> Relay:
-    handler = type("Handler", (_Handler,), {"upstream": upstream})
+    handler = type("Handler", (_Handler,), {"upstream": upstream, "seen": set()})
     server = ThreadingHTTPServer(("127.0.0.1", 0), handler)
     threading.Thread(target=server.serve_forever, daemon=True).start()
     return Relay(server)

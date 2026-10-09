@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import itertools
 import json
 import os
 import sys
@@ -265,6 +266,9 @@ def _journal_write(path: str, record: dict) -> None:
         print(f"hpc-bridge: journal write failed ({exc})", file=sys.stderr)
 
 
+_JOURNAL_SEQ = itertools.count(1)
+
+
 def _install_journal(server: FastMCP) -> None:
     tm = server._tool_manager
     inner = tm.call_tool
@@ -275,7 +279,10 @@ def _install_journal(server: FastMCP) -> None:
             return await inner(name, arguments, *args, **kwargs)
         safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
         t0 = time.monotonic()
-        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "tool": name, "args": safe}
+        # `seq` orders calls by when they STARTED (the line is written when the call ends): concurrent calls finish
+        # out of order
+        record: dict[str, Any] = {"t": time.strftime("%Y-%m-%dT%H:%M:%S%z"), "seq": next(_JOURNAL_SEQ),
+                                  "pid": os.getpid(), "tool": name, "args": safe}
         try:
             res = await inner(name, arguments, *args, **kwargs)
         except BaseException as exc:
