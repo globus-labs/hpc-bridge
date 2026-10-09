@@ -339,3 +339,25 @@ def test_another_servers_tool_is_not_hpc_bridges():
 def test_regrade_falls_back_to_the_final_message_like_live():
     msgs = [{"harness": "hermes21", "rc": 0}, {"final": "all done"}, {"journal": _J[0]}]
     assert cli_runner.trace_from_bundle_messages(msgs).texts == ["all done"]
+
+
+
+def test_the_relay_resolves_vllms_mcp_call_items_to_the_offered_tool():
+    import responses_relay
+    req = {"tools": [{"type": "namespace", "name": "mcp__hpc_bridge__", "tools": [
+        {"type": "function", "name": "run_shell", "parameters": {"type": "object"}},
+        {"type": "function", "name": "stop_endpoint", "parameters": {"type": "object"}}]},
+        {"type": "function", "name": "exec_command", "parameters": {"type": "object"}}]}
+    _, names = responses_relay.adapt_request(req)
+    resp = {"output": [
+        {"type": "mcp_call", "id": "mcp_1", "server_label": "mcp__hpc_bridge__", "name": "run_shell",
+         "arguments": "{\"command\": \"hostname\"}"},
+        {"type": "mcp_call", "id": "mcp_2", "server_label": "stop_endpoint", "name": "stop_endpoint", "arguments": "{}"},
+        {"type": "mcp_call", "id": "mcp_3", "server_label": "nonsense", "name": "nonsense", "arguments": "{}"}]}
+    out = responses_relay.adapt_response(resp, names)["output"]
+    assert [(o["type"], o["name"], o.get("namespace")) for o in out] == [
+        ("function_call", "run_shell", "mcp__hpc_bridge__"), ("function_call", "stop_endpoint", "mcp__hpc_bridge__"),
+        ("function_call", "nonsense", None)]
+    assert out[0]["call_id"] == "mcp_1" and out[0]["arguments"] == "{\"command\": \"hostname\"}"
+    calls, _ = responses_relay.model_calls({"output": out})
+    assert [c["name"] for c in calls] == ["run_shell", "stop_endpoint", "nonsense"]

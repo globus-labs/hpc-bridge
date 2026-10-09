@@ -7,6 +7,9 @@ ALCF inference gateway (vLLM), which answers it NON-streamed and knows only plai
   then `response.completed` (or `response.incomplete`).
 - An assistant message in the history is refused unless it carries an id, a status and annotations, which Codex
   doesn't send back: it is resent in the plain `{role, content}` form.
+- A tool call the model addresses in a form vLLM doesn't recognise as a function (gpt-oss sometimes writes
+  `mcp__hpc_bridge__.run_shell`) comes back as an `mcp_call` item, which Codex ignores — ending the turn mid-task.
+  It is resolved to the offered tool it meant and returned as a function call.
 - "tool type namespace not supported" — Codex 0.16x groups tools into `namespace` tools (MCP servers, its own
   `functions`) and offers freeform `custom` tools (apply_patch). The relay flattens every one into a plain function
   tool (a custom tool takes one string, `input`), translates the conversation history the same way, and restores
@@ -97,11 +100,28 @@ def adapt_request(req: dict) -> tuple[dict, dict[str, tuple[str | None, str, str
     return out, names
 
 
+def _resolve(item: dict, names: dict[str, tuple[str | None, str, str]]) -> str:
+    """The offered tool an `mcp_call` meant. vLLM files any tool-call recipient that isn't a known function name under
+    `mcp_call`, split at the dot ("mcp__hpc_bridge__.run_shell" → server_label "mcp__hpc_bridge__", name "run_shell";
+    a bare "run_shell" → both "run_shell"). Unresolvable or ambiguous: the bare name, which Codex answers as an
+    unknown tool — the model hears about it instead of the turn silently ending."""
+    name, label = str(item.get("name") or ""), str(item.get("server_label") or "")
+    for cand in (name, label + name, f"{label}__{name}", f"{label}.{name}"):
+        if cand in names:
+            return cand
+    tail = [flat for flat, (_, inner, _) in names.items() if inner == name]
+    return tail[0] if len(tail) == 1 else name
+
+
 def adapt_response(resp: dict, names: dict[str, tuple[str | None, str, str]]) -> dict:
     """vLLM's response → Codex's item shapes: a flattened call returns under its namespace, a custom tool's call as a
-    `custom_tool_call` carrying the raw input."""
+    `custom_tool_call` carrying the raw input, an `mcp_call` (vLLM's filing of a call it didn't recognise) as the call
+    to the offered tool it meant."""
     output = []
     for it in resp.get("output") or []:
+        if isinstance(it, dict) and it.get("type") == "mcp_call":
+            it = {"type": "function_call", "id": it.get("id"), "call_id": it.get("id"), "name": _resolve(it, names),
+                  "arguments": it.get("arguments") or "{}", "status": "completed"}
         if isinstance(it, dict) and it.get("type") == "function_call" and it.get("name") in names:
             ns, name, kind = names[it["name"]]
             if kind == "custom":

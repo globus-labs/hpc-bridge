@@ -12,7 +12,8 @@ installed plugin only when that version changes); git tags mark releases.
   all three, `--python 3.13`, and how to update a `uvx` build. `agentic/install_check/` follows them in a clean
   container and checks each harness ends up with the 12 tools and the skill.
 - **`HPC_BRIDGE_JOURNAL=<path>`**: the server appends one JSON line per tool call (tool, arguments, the result the
-  host received, duration), whatever host drives it; one-time codes are redacted and the file is private (0600).
+  host received, duration, and a sequence number in the order calls started), whatever host drives it; one-time codes
+  are redacted and the file is private (0600).
 
 ### Changed
 - **Long tool calls report progress every 15 s.** Pi gives an MCP request 60 s and restarts the clock on progress; a
