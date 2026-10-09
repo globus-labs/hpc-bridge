@@ -1,11 +1,11 @@
 [project]
 name = "hpc-bridge"
-version = "0.1.20"
+version = "0.1.21"
 description = "Extend AI coding agents into HPC via Globus Compute"
 requires-python = ">=3.11"
 license = "Apache-2.0"
 license-files = ["LICENSE"]
-dependencies = ["mcp>=1.28.1,<2", "pydantic>=2", "pyyaml>=6", "globus-sdk>=4.4,<5", "globus-compute-sdk>=4.15"]  # the SDK is imported at module load (credentials/remote): core, not optional  # mcp<2: 2.x renames FastMCP/MCPServer + the import path (planned migration); >=1.28.1 = the WebSocket advisory fix
+dependencies = ["mcp>=1.28.1,<2", "pydantic>=2", "pyyaml>=6", "globus-sdk>=4.4,<5", "globus-compute-sdk>=4.18,<4.19"]  # the SDK is imported at module load (credentials/remote): core, not optional; capped to the minor the registry facilities were proven with — `uvx --from git+…` ignores uv.lock, so an uncapped SDK reached every such user untested (4.18 vs a 4.16 lock, 2026-10-09); hpc-bridge-registry-health flags the gap  # mcp<2: 2.x renames FastMCP/MCPServer + the import path (planned migration); >=1.28.1 = the WebSocket advisory fix
 
 [project.optional-dependencies]
 dev = ["pytest>=8.4", "pytest-asyncio>=0.23", "jinja2>=3", "ruff>=0.16",

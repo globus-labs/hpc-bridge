@@ -90,8 +90,12 @@ def test_a_facility_matching_its_verification_is_ok_and_drift_fails():
     assert health.check_facility(delta, _Compute(status="offline"))[0].detail.startswith("offline")
 
 
+def _unbaselined(eid):
+    return CatalogEntry.model_validate({**_entry(eid).model_dump(mode="json"), "verification": None})
+
+
 def test_an_unbaselined_facility_warns_and_an_ssh_entry_has_no_facility_check():
-    findings = health.check_facility(_entry("anvil"), _Compute())
+    findings = health.check_facility(_unbaselined("anvil"), _Compute())
     assert [f.level for f in findings] == ["warn"] and "unbaselined" in findings[0].detail
     assert health.check_facility(_entry("expanse"), _Compute()) == []
 
@@ -117,7 +121,7 @@ def test_ssh_reachability():
 def test_a_parsl_release_after_a_float_entry_was_proven_warns():
     pypi = {"releases": {"2026.10.5": [{"upload_time_iso_8601": "2026-10-05T22:45:00Z"}],
                          "2026.10.12": [{"upload_time_iso_8601": "2026-10-12T22:45:00Z"}]}}
-    anvil = _entry("anvil")
+    anvil = CatalogEntry.model_validate({**_unbaselined("anvil").model_dump(mode="json"), "last_validated": "2026-10-06"})
     findings = health.check_releases([anvil, _entry("delta")], pypi=lambda pkg: pypi)
     assert [f.entry for f in findings] == ["anvil"]  # delta pins parsl: a release does not move its worker
     assert findings[0].level == "warn" and "2026.10.12" in findings[0].detail
