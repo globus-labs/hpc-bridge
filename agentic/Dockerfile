@@ -9,7 +9,7 @@ FROM python:3.11-slim
 # dependency audit 2026-09-03).
 RUN apt-get update && apt-get install -y --no-install-recommends \
         openssh-client git curl ca-certificates \
-        build-essential python3-dev \
+        build-essential python3-dev libatomic1 xz-utils \
     && rm -rf /var/lib/apt/lists/*
 
 # uv (hpc-bridge launches its MCP server via `uv run`) — pinned: a floating `latest` made builds drift by the day
@@ -41,6 +41,21 @@ RUN curl -fsSL https://deb.nodesource.com/setup_22.x | bash - \
     && apt-get install -y --no-install-recommends nodejs && rm -rf /var/lib/apt/lists/* \
     && npm install -g --no-audit --no-fund @zed-industries/claude-agent-acp@0.23.1 \
     && claude-agent-acp --version >/dev/null 2>&1 || true
+# Codex and Pi at their latest releases — the `codex` / `pi` operators (agentic/harness/cli_runner.py) drive them
+# headless on the ALCF model, configured as docs/user/other-hosts.md tells a user to.
+ARG CODEX_VERSION=0.162.0
+ARG PI_VERSION=1.1.0
+RUN npm install -g --no-audit --no-fund "@openai/codex@${CODEX_VERSION}" "@earendil-works/pi-coding-agent@${PI_VERSION}"
+# The non-root user exists BEFORE the code layers so the latest Hermes (the `hermes21` operator) installs as that user,
+# with its official installer (it brings its own Python 3.14 + Node; libatomic1 above is for that Node), in a layer
+# that code edits do not invalidate. The older pinned hermes (`hermes` operator) stays the pip install above.
+RUN useradd --create-home --uid 1000 agent
+ARG HERMES_REF=v0.21.6
+USER agent
+RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
+        | bash -s -- --skip-setup --skip-browser --skip-computer-use --branch "${HERMES_REF}" \
+    && /home/agent/.local/bin/hermes --version
+USER root
 
 # The hpc-bridge repo (plugin + MCP server + skill + harness). Build context is the
 # repo root (run_smoke.sh builds from there); .dockerignore trims it.
@@ -63,8 +78,7 @@ RUN echo "$GIT_DESCRIBE" > /work/hpc-bridge/BUILD_INFO
 
 # Non-root user — Claude Code refuses --dangerously-skip-permissions (bypassPermissions)
 # under root/sudo. Own the repo + venv so `uv run` can use it as this user.
-RUN useradd --create-home --uid 1000 agent \
-    && chmod +x /work/hpc-bridge/agentic/entrypoint.sh \
+RUN chmod +x /work/hpc-bridge/agentic/entrypoint.sh \
     && chown -R agent:agent /work/hpc-bridge
 USER agent
 # Harness modules are flat (invariants / trace_adapter / runner import each other).

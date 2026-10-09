@@ -606,7 +606,22 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # Operator dispatch: `hermes` drives the SAME scenario + graders with an ALCF-hosted model (guidance over MCP).
     # Autonomous AND interactive (persona) scenarios are supported; refuse only what it can't yet drive rather than
     # grade it vacuously.
-    if operator in ("hermes", "claude-acp"):
+    if operator in ("codex", "pi", "hermes21"):
+        # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
+        # say; graded from hpc-bridge's own tool-call journal (cli_runner). Autonomous scenarios only for now.
+        reason = ("an interactive persona" if (persona or getattr(scen, "PERSONA", None)) else
+                  "cross-restart chains (PHASES)" if phases else
+                  "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
+        if reason:
+            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
+            return 2
+        import functools
+
+        from cli_runner import run_scenario as _cli_run
+
+        _run_scenario = functools.partial(_cli_run, harness=operator)
+        model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")
+    elif operator in ("hermes", "claude-acp"):
         reason = ("cross-restart chains (PHASES)" if phases else
                   "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
         if reason:
@@ -899,9 +914,10 @@ def main() -> None:
     ap.add_argument("--no-skill", action="store_true",
                     help="ablation: withhold SKILL.md from the system prompt (measure the guidance's value)")
     ap.add_argument("--operator", default=os.environ.get("HPCB_OPERATOR") or "claude",
-                    choices=["claude", "hermes", "claude-acp"],
+                    choices=["claude", "hermes", "claude-acp", "codex", "pi", "hermes21"],
                     help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model; "
-                         "claude-acp = Claude Code over ACP via Zed's adapter)")
+                         "claude-acp = Claude Code over ACP via Zed's adapter; codex / pi / hermes21 = those harnesses "
+                         "at their latest release, headless, on the ALCF model, graded from the server's journal)")
     args = ap.parse_args()
     sys.exit(asyncio.run(_main(args)))
 
