@@ -21,6 +21,7 @@ integration = [
 [project.scripts]
 hpc-bridge = "hpc_bridge.server:main"
 hpc-bridge-catalog = "hpc_bridge.catalog.ingest:main"
+hpc-bridge-registry-health = "hpc_bridge.catalog.health:main"
 
 [build-system]
 requires = ["hatchling>=1.27,<2"]

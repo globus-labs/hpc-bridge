@@ -117,6 +117,8 @@ class MEPFacility:
         # (warmth._apply_account / _apply_partition) and the account floor reads `account` from it.
         self.key_map: dict[str, str] = {}
         self.worker_env = None  # entry.compute.worker_env: the worker strategy + the version it was proven with
+        self.verification = None  # entry.verification: what the facility looked like when the entry was proven live
+        self.live_fingerprint: dict | None = None  # the same, read from the facility's metadata at attach
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -154,6 +156,7 @@ class MEPFacility:
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"
         fac.key_map = dict(getattr(c, "key_map", None) or {})
         fac.worker_env = getattr(c, "worker_env", None)
+        fac.verification = getattr(entry, "verification", None)
         return fac
 
     def _pinned_gce_version(self) -> str | None:
@@ -217,6 +220,9 @@ class MEPFacility:
         self.schema = md.get("user_config_schema") or None
         self.endpoint_version = str(md.get("endpoint_version") or "") or None
         self.display_name = md.get("display_name") or None
+        from ..catalog.entry import facility_fingerprint
+
+        self.live_fingerprint = facility_fingerprint(md)
         if note := self.stale_worker_note():
             self._note(note)
 
@@ -225,12 +231,21 @@ class MEPFacility:
         the facility upgraded since, so the packages its endpoint runs may have moved and the worker pool the
         entry installs may no longer match — a block that starts and bills while every result is dropped."""
         verified = getattr(self.worker_env, "verified_with", None)
-        if not verified or not self.endpoint_version or _same_version(self.endpoint_version, verified):
+        ver, live = self.verification, self.live_fingerprint or {}
+        moved = []
+        if verified and self.endpoint_version and not _same_version(self.endpoint_version, verified):
+            moved.append(f"its endpoint now runs v{self.endpoint_version} (verified with v{verified})")
+        vpy, lpy = getattr(ver, "python_version", None), live.get("python_version")
+        if vpy and lpy and not _same_version(lpy, vpy):
+            moved.append(f"it now runs Python {lpy} (verified with {vpy}) — a redeploy")
+        vt, lt = getattr(ver, "template_sha256", None), live.get("template_sha256")
+        if vt and lt and vt != lt:
+            moved.append("its user template changed")
+        if not moved:
             return None
-        return (f"STALE ENTRY: this facility's endpoint now runs v{self.endpoint_version}, but the registry entry "
-                f"was verified with v{verified} — the facility upgraded since, and the worker it installs may no "
-                "longer match its endpoint. If a block starts but never answers, that is the likely cause: stop, "
-                "tell the user, and report it to the hpc-bridge registry curator")
+        return ("STALE ENTRY: since the registry entry was verified, " + "; ".join(moved) + " — the worker it "
+                "installs may no longer match the facility's endpoint. If a block starts but never answers, that is "
+                "the likely cause: stop, tell the user, and report it to the hpc-bridge registry curator")
 
     def sanitize_uec(self, uec: dict) -> dict:
         """The final user_endpoint_config for a submit, made to fit the FACILITY's contract:

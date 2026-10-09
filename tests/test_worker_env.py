@@ -233,3 +233,26 @@ def test_ingest_takes_a_seed_directory(tmp_path):
     for name in ("ncsa-delta.yaml", "anvil.yaml", "globus-cluster.yaml"):
         (tmp_path / name).write_text((SEEDS / name).read_text())
     assert ingest("idx", tmp_path, _Search()) == 3 and len(sent) == 1
+
+
+async def test_the_stale_note_names_a_python_or_template_change_too():
+    from hpc_bridge.catalog.entry import CatalogEntry, facility_fingerprint
+
+    md = {"endpoint_version": "4.16.0", "python_version": "3.13.13", "user_config_template": "engine: {}\n",
+          "user_config_schema": {"type": "object"}, "display_name": "Delta"}
+
+    class _MD:
+        def __init__(self, md):
+            self.md = md
+
+        def get_endpoint_metadata(self, endpoint_id):
+            return self.md
+
+    base = _seed("ncsa-delta.yaml", "delta").model_dump(mode="json")
+    entry = CatalogEntry.model_validate({**base, "verification": {"verified_on": "2026-10-09", **facility_fingerprint(md)}})
+    for live, says in ((md, None), (dict(md, python_version="3.13.14"), "Python 3.13.14"),
+                       (dict(md, user_config_template="engine: {x: 1}\n"), "template changed")):
+        fac = MEPFacility.from_entry(entry, client_factory=lambda live=live: _MD(live))
+        await fac.load_template()
+        note = fac.stale_worker_note()
+        assert (note is None) if says is None else (says in note and note.startswith("STALE ENTRY")), live

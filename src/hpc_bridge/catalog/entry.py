@@ -2,6 +2,8 @@
 from __future__ import annotations
 
 import datetime
+import hashlib
+import json
 import re
 import uuid
 from typing import Any, Literal
@@ -82,6 +84,26 @@ def _upgrades(segment: str) -> bool:
         if tok == "--upgrade" or (tok.startswith("-") and not tok.startswith("--") and "U" in tok[1:]):
             return True
     return False
+
+
+def verification_raw_problems(raw: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `verification` block, before the lenient parse can forgive it: every
+    field given must survive the parse (an unquoted version, a short digest, a bare `on:` key would be dropped)."""
+    if raw is None:
+        return []
+    if not isinstance(raw, dict):
+        return [f"verification must be a mapping, got {type(raw).__name__}"]
+    known = set(Verification.model_fields)
+    unknown = sorted(str(k) for k in set(raw) - known)
+    problems = [f"verification has unknown key(s) {unknown}"] if unknown else []
+    try:
+        parsed = Verification.model_validate({k: v for k, v in raw.items() if k in known})
+    except (ValueError, TypeError) as exc:
+        return problems + [f"verification does not parse: {exc}"[:200]]
+    for k in known & set(raw):
+        if raw[k] is not None and getattr(parsed, k) is None:
+            problems.append(f"verification.{k} = {raw[k]!r} is not usable (quote versions; 64-hex digests; a date)")
+    return problems
 
 
 def worker_env_raw_problems(raw: Any) -> list[str]:
@@ -236,6 +258,60 @@ class CatalogSummary(BaseModel):
 
 
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # the derived endpoint name is hpc-bridge-<id>
+_SHA256 = re.compile(r"^[0-9a-f]{64}$")
+
+
+def facility_fingerprint(metadata: dict) -> dict[str, str | None]:
+    """What a facility multi-user endpoint publishes about itself, reduced to what a registry entry is proven
+    against: its endpoint and Python versions, and digests of its user template (+ schema) and its manager config.
+    The manager's parsl is NOT published — a change there shows only in a live block (the re-prove), though a
+    redeploy usually moves one of these too (2026-10-06: Delta's manager reports python 3.13.13, its UEP log the
+    same)."""
+    md = metadata or {}
+    tmpl = str(md.get("user_config_template") or "")
+    schema = json.dumps(md.get("user_config_schema") or {}, sort_keys=True, separators=(",", ":"))
+    config = str(md.get("endpoint_config") or "")
+
+    def digest(text: str) -> str | None:
+        return hashlib.sha256(text.encode()).hexdigest() if text.strip() else None
+
+    return {
+        "endpoint_version": str(md.get("endpoint_version") or "").strip() or None,
+        "python_version": str(md.get("python_version") or "").strip() or None,
+        "template_sha256": digest(tmpl + "\n" + schema) if (tmpl.strip() or schema != "{}") else None,
+        "config_sha256": digest(config),
+    }
+
+
+class Verification(BaseModel):
+    """What the facility looked like when this entry was last proven live (a block ran and answered): the
+    registry health check compares the facility's live metadata against it, and an attach warns when it moved.
+    Facility-MEP entries; written by the re-prove tool, not by hand. Read LENIENTLY, like WorkerEnv."""
+
+    verified_on: datetime.date | None = None  # (not `on`: YAML 1.1 reads a bare `on:` key as boolean true)
+    endpoint_version: str | None = None
+    python_version: str | None = None
+    template_sha256: str | None = None
+    config_sha256: str | None = None
+    # what the worker reported on that run (free text, for the record), e.g. "py3.13.12 dill0.3.9 on a000"
+    worker: str | None = None
+
+    @field_validator("endpoint_version", "python_version")
+    @classmethod
+    def _version(cls, v: str | None) -> str | None:
+        v = (v or "").strip()
+        return v.lstrip("vV") if _VERSION.match(v) else None
+
+    @field_validator("template_sha256", "config_sha256")
+    @classmethod
+    def _sha(cls, v: str | None) -> str | None:
+        v = (v or "").strip().lower()
+        return v if _SHA256.match(v) else None
+
+    @field_validator("worker")
+    @classmethod
+    def _short(cls, v: str | None) -> str | None:
+        return (v or "").strip()[:200] or None
 
 
 class CatalogEntry(BaseModel):
@@ -267,6 +343,16 @@ class CatalogEntry(BaseModel):
     # trust / provenance
     provenance: Literal["curated", "community", "scraped", "plugin-validated", "session"] = "curated"
     last_validated: datetime.date
+    verification: Verification | None = None  # facility-MEP entries: see Verification
+
+    @field_validator("verification", mode="wrap")
+    @classmethod
+    def _lenient_verification(cls, v: Any, handler: Any) -> Verification | None:
+        # A malformed block costs this facility its drift check, never the whole entry (every plugin reads these).
+        try:
+            return handler(v)
+        except (ValueError, TypeError):
+            return None
 
     @field_validator("ssh_host")
     @classmethod
