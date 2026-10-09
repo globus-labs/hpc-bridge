@@ -236,7 +236,9 @@ class MEPFacility:
         if verified and self.endpoint_version and not _same_version(self.endpoint_version, verified):
             moved.append(f"its endpoint now runs v{self.endpoint_version} (verified with v{verified})")
         vpy, lpy = getattr(ver, "python_version", None), live.get("python_version")
-        if vpy and lpy and not _same_version(lpy, vpy):
+        # major.minor only here: every connecting agent sees this note, and an OS patch (3.13.13 → 3.13.14) must not
+        # tell a whole room to stop — the registry health check still compares the full version
+        if vpy and lpy and lpy.split(".")[:2] != vpy.split(".")[:2]:
             moved.append(f"it now runs Python {lpy} (verified with {vpy}) — a redeploy")
         vt, lt = getattr(ver, "template_sha256", None), live.get("template_sha256")
         if vt and lt and vt != lt:

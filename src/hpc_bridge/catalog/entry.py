@@ -86,6 +86,19 @@ def _upgrades(segment: str) -> bool:
     return False
 
 
+def verification_problems(entry: Any) -> list[str]:
+    """A facility-endpoint entry's verification block, if present, must be COMPLETE: a field left out is a comparison
+    the health check silently skips (review of 0.1.21)."""
+    ver = getattr(entry, "verification", None)
+    if ver is None or not getattr(entry, "compute_mep_uuid", None):
+        return []
+    fields = ("verified_on", "endpoint_version", "python_version", "template_sha256")
+    missing = [f for f in fields if getattr(ver, f) is None]
+    if not missing:
+        return []
+    return [f"verification lacks {', '.join(missing)} (re-prove with agentic/registry_reprove.py --record)"]
+
+
 def verification_raw_problems(raw: Any) -> list[str]:
     """The curator's check of a seed row's RAW `verification` block, before the lenient parse can forgive it: every
     field given must survive the parse (an unquoted version, a short digest, a bare `on:` key would be dropped)."""

@@ -17,6 +17,7 @@ class CanaryResult:
     # the worker's parsl (read from package metadata, no import): it must match the facility endpoint's parsl, which
     # nothing publishes — the skew that ran Anvil's and Delta's blocks while dropping every result (2026-10-06)
     worker_parsl: str | None = None
+    worker_gce: str | None = None  # the worker's globus-compute-endpoint (a `client` facility builds it at ours)
     error: str | None = None
     # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
     # while nobody was waiting; warmth is dated from it, not from when it was read.
@@ -34,22 +35,30 @@ _CANARY_FRESH_S = 30.0
 # queue costs a handful of canaries, not one per probe.
 _CANARY_MAX_WAIT_S = 300.0
 _CANARY_PARSL = "HPCB_PARSL"
+_CANARY_GCE = "HPCB_GCE"
 _CANARY_CMD = (
     f"echo {_CANARY_SENTINEL}; "
     'python -c "import platform,dill,socket;'
     'print(platform.python_version(),dill.__version__,socket.gethostname())" '
     "2>/dev/null || true; "
-    f"python -c \"import importlib.metadata as m;print('{_CANARY_PARSL}',m.version('parsl'))\" 2>/dev/null || true"
+    f"python -c \"import importlib.metadata as m;print('{_CANARY_PARSL}',m.version('parsl'))\" 2>/dev/null || true; "
+    f"python -c \"import importlib.metadata as m;print('{_CANARY_GCE}',m.version('globus-compute-endpoint'))\" "
+    "2>/dev/null || true"
 )
+
+
+def _parse_canary_tagged(stdout: str, tag: str) -> str | None:
+    """A version from canary stdout's `<TAG> <version>` line, or None."""
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == tag and parts[1][:1].isdigit():
+            return parts[1]
+    return None
 
 
 def _parse_canary_parsl(stdout: str) -> str | None:
     """The worker's parsl version from canary stdout (the `HPCB_PARSL <version>` line), or None."""
-    for line in stdout.splitlines():
-        parts = line.split()
-        if len(parts) == 2 and parts[0] == _CANARY_PARSL and parts[1][:1].isdigit():
-            return parts[1]
-    return None
+    return _parse_canary_tagged(stdout, _CANARY_PARSL)
 
 
 def _parse_canary(stdout: str) -> tuple[str | None, str | None, str | None]:
@@ -210,7 +219,8 @@ class GlobusRunner:
         stdout = getattr(res, "stdout", "") or ""
         py, dill_v, host = _parse_canary(stdout)
         return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host,
-                            worker_parsl=_parse_canary_parsl(stdout), answered_at=answered_at)
+                            worker_parsl=_parse_canary_parsl(stdout),
+                            worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE), answered_at=answered_at)
 
     def close(self) -> None:
         if self._ex is not None:

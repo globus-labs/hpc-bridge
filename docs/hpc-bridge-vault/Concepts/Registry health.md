@@ -15,14 +15,17 @@ because `uvx` ignores `uv.lock` — every Pi / Hermes / Codex user ran an untest
 
 ## The free tier — `hpc-bridge-registry-health`
 `src/hpc_bridge/catalog/health.py`; exit 0 ok / 1 warn / 2 fail; `--state` remembers findings and alerts only on new
-ones; `--notify` posts a desktop notification. Scheduled on a Mac by `scripts/registry_monitor.sh install [MIN]`.
+ones (keyed on the whole finding, so an escalation re-alerts); `--notify` posts a desktop notification (the text is
+passed as an argument, never spliced into AppleScript). Scheduled on a Mac by `scripts/registry_monitor.sh install
+[MIN]`, which runs **main's** build through `uvx --refresh` — so the seeds it compares are main's, whatever branch a
+checkout is on. A missing or expired Globus login is a `fail` finding (the other checks still run), not a crash.
 
 | check | what it compares | catches |
 |---|---|---|
 | `index` | every seed vs the live index, field for field (as the client parses it); subjects with no seed | a forgotten re-ingest, a retired entry still listed |
 | `facility` | a facility endpoint's status and published metadata vs the entry's `verification` block: endpoint version, Python, template+schema digest, manager-config digest | an upgrade, a redeploy, a template change, an outage |
 | `ssh` | the login host answers TCP :22 | a renamed or retired login host (a login needs the user) |
-| `releases` | parsl releases since a `float` entry was proven | the window where a floating endpoint and our worker disagree |
+| `releases` | the latest parsl vs the parsl the worker reported when a `float` entry was proven (by date if none recorded) | the window where a floating endpoint and our worker disagree |
 | `install` | what `uv pip compile` resolves from main's pyproject today (py3.13, py3.12) vs main's `uv.lock` | an SDK or dill a fresh install would get untested |
 
 What it cannot see: the facility endpoint's **parsl** (not published — only a live block shows it; the canary now
@@ -32,8 +35,10 @@ reports the worker's), a partition's QOS rules, an SSH facility past its login p
 One real block through hpc-bridge's real functions (connect → confirm spend → worker answers → `hostname` → stop).
 On a pass, `--record` writes the entry's `verification` block (date, versions, digests, and what the worker reported:
 Python, dill, **parsl**, node) and bumps `last_validated` and `worker_env.verified_with`, editing the seed text in
-place (comments kept). Then commit, PR, ingest. It refuses to record if the facility's metadata changed during the
-run. Facility endpoints only; Expanse (one-time code) is re-proven by hand with the user present.
+place (comments kept; the edit is dry-run before the paid block). Then commit, PR, ingest. It refuses to record if
+the facility's metadata changed during the run, always stops (even on an error or a timeout), and on a run that did
+not pass warns that a check task may still be queued at the facility, starting billed blocks — check its queue.
+Ingest refuses a facility-endpoint entry whose block is incomplete. Facility endpoints only; Expanse (one-time code) is re-proven by hand with the user present.
 
 Cost per run: one block for a few minutes (≈0.05 GPU-h on Delta, ≈0.05 SU on Anvil, free on the lab cluster).
 
@@ -42,8 +47,8 @@ Cost per run: one block for a few minutes (≈0.05 GPU-h on Delta, ≈0.05 SU on
   only serves when the index is unreachable). Re-ingest is the fast path.
 - **Plugin code fixes do not**: `uvx` reuses its cached environment after the first run (uv docs, "Tool versions"),
   so a participant needs `uvx --refresh …` once; Claude Code users need the plugin to update (the manifest version).
-- **The client SDK is capped** (`globus-compute-sdk>=4.18,<4.19`) to the minor the facilities were proven with, so a
-  fresh install cannot drift to an untested one; moving the cap means a re-prove first.
+- **The client SDK is pinned** (`globus-compute-sdk==4.18.0`) to the version the facilities were proven with, so a
+  fresh install cannot drift to an untested one; moving the pin means a re-prove first.
 
 ## Event runbook (a hackathon, a demo)
 1. **T−1 day:** re-prove every facility (`--record`), commit, ingest; `hpc-bridge-registry-health` all ok.

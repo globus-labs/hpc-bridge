@@ -570,7 +570,7 @@ integration = [
 requires-dist = [
     { name = "agent-client-protocol", marker = "extra == 'dev'", specifier = "==0.9.0" },
     { name = "globus-compute-endpoint", marker = "sys_platform == 'linux' and extra == 'integration'", specifier = ">=4.15" },
-    { name = "globus-compute-sdk", specifier = ">=4.18,<4.19" },
+    { name = "globus-compute-sdk", specifier = "==4.18.0" },
     { name = "globus-sdk", specifier = ">=4.4,<5" },
     { name = "jinja2", marker = "extra == 'dev'", specifier = ">=3" },
     { name = "mcp", specifier = ">=1.28.1,<2" },

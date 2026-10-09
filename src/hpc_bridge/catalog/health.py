@@ -22,6 +22,9 @@ from __future__ import annotations
 import argparse
 import datetime
 import json
+import os
+import re
+import shutil
 import socket
 import subprocess
 import sys
@@ -55,7 +58,8 @@ class Finding:
 
     @property
     def key(self) -> str:
-        return f"{self.entry}:{self.check}:{self.detail.split(':', 1)[0]}"
+        # the WHOLE detail: an escalation (4.17 → 4.18 still unresolved, a second parsl release) is a new finding
+        return f"{self.entry}:{self.check}:{self.detail}"
 
 
 # ---------------------------------------------------------------- index ↔ seeds
@@ -112,9 +116,12 @@ def check_index(seeds: list[CatalogEntry], search, index_id: str) -> list[Findin
 
 # ---------------------------------------------------------------- facility endpoints
 
-def _same(a: str | None, b: str | None) -> bool:
+def _same(a: str, b: str) -> bool:
     from ..facility.mep import _same_version
-    return a is None or b is None or _same_version(a, b)
+    return _same_version(a, b)
+
+
+_COMPARED = ("endpoint_version", "python_version", "template_sha256")
 
 
 def check_facility(entry: CatalogEntry, compute) -> list[Finding]:
@@ -135,29 +142,40 @@ def check_facility(entry: CatalogEntry, compute) -> list[Finding]:
                         f"metadata: unreadable ({type(exc).__name__}) — online, unverified")]
     ver = entry.verification
     out: list[Finding] = []
+    # A field the facility does not publish cannot be compared — say so; never let a missing value read as a match.
+    unpublished = [f for f in _COMPARED if live[f] is None]
+    if unpublished:
+        out.append(Finding(entry.id, "facility", "warn",
+                           f"unpublished: the facility's metadata has no {', '.join(unpublished)} — not compared"))
     verified_with = getattr(entry.compute.worker_env, "verified_with", None) or (ver.endpoint_version if ver else None)
-    if not _same(live["endpoint_version"], verified_with):
+    ev = live["endpoint_version"]
+    if ev and verified_with and not _same(ev, verified_with):
         out.append(Finding(entry.id, "facility", "fail",
-                           f"version: the endpoint now runs {live['endpoint_version']}, the entry was proven with "
-                           f"{verified_with} — re-prove before anyone uses it"))
+                           f"version: the endpoint now runs {ev}, the entry was proven with {verified_with} — "
+                           "re-prove before anyone uses it"))
     if ver is None:
         out.append(Finding(entry.id, "facility", "warn",
                            "unbaselined: the entry has no `verification` block — run the re-prove to record one"))
     else:
-        if not _same(live["python_version"], ver.python_version):
+        missing = [f for f in ("verified_on", *_COMPARED) if getattr(ver, f) is None]
+        if missing:
+            out.append(Finding(entry.id, "facility", "warn",
+                               f"incomplete: the verification block lacks {', '.join(missing)} — those are not "
+                               "compared; re-prove to record them"))
+        py = live["python_version"]
+        if py and ver.python_version and not _same(py, ver.python_version):
             out.append(Finding(entry.id, "facility", "fail",
-                               f"python: the endpoint now runs Python {live['python_version']} (proven with "
-                               f"{ver.python_version}) — a redeploy; its packages may have moved: re-prove"))
-        if ver.template_sha256 and live["template_sha256"] != ver.template_sha256:
+                               f"python: the endpoint now runs Python {py} (proven with {ver.python_version}) — a "
+                               "redeploy; its packages may have moved: re-prove"))
+        if live["template_sha256"] and ver.template_sha256 and live["template_sha256"] != ver.template_sha256:
             out.append(Finding(entry.id, "facility", "fail",
                                "template: the facility changed its user template or schema since the entry was proven "
                                "— re-prove (a key the entry sends may now be refused, or the worker setup changed)"))
-        if ver.config_sha256 and live["config_sha256"] != ver.config_sha256:
+        if live["config_sha256"] and ver.config_sha256 and live["config_sha256"] != ver.config_sha256:
             out.append(Finding(entry.id, "facility", "warn",
                                "config: the facility changed its manager config since the entry was proven"))
     if not out:
-        out.append(Finding(entry.id, "facility", "ok",
-                           f"online; v{live['endpoint_version']} py{live['python_version']}; template unchanged"))
+        out.append(Finding(entry.id, "facility", "ok", f"online; v{ev} py{live['python_version']}; template unchanged"))
     return out
 
 
@@ -194,10 +212,22 @@ def _released_after(info: dict, since: datetime.date) -> list[str]:
     return sorted(out)
 
 
+def _version_key(v: str) -> tuple[int, ...]:
+    return tuple(int(x) for x in re.findall(r"\d+", v))
+
+
+def _recorded_parsl(entry: CatalogEntry) -> str | None:
+    """The parsl the worker reported on the run that proved the entry (`verification.worker`: "… parsl2026.10.5 …")."""
+    m = re.search(r"\bparsl(\d[\w.]*)", (entry.verification.worker or "") if entry.verification else "")
+    return m.group(1) if m else None
+
+
 def check_releases(entries: list[CatalogEntry], *, pypi: Callable[[str], dict] = _pypi) -> list[Finding]:
     """A `float` facility's endpoint picks up a new parsl at its next start, while a user endpoint that was already
-    running keeps the old one — the window in which our worker (which also floats) and the endpoint disagree. A
-    release after the entry was proven means: re-prove, and expect the race until the facility's endpoints cycle."""
+    running keeps the old one — the window in which our worker (which also floats) and the endpoint disagree. A parsl
+    newer than the one the entry was proven with means: re-prove, and expect the race until the facility's endpoints
+    cycle. Compared against the parsl the worker REPORTED (a release later the same day as the re-prove counts); by
+    date when no worker parsl was recorded."""
     out: list[Finding] = []
     floats = [e for e in entries if getattr(e.compute.worker_env, "strategy", None) == "float"]
     if not floats:
@@ -206,14 +236,23 @@ def check_releases(entries: list[CatalogEntry], *, pypi: Callable[[str], dict] =
         parsl = pypi("parsl")
     except Exception as exc:  # noqa: BLE001
         return [Finding("*", "releases", "warn", f"pypi: could not read parsl releases ({type(exc).__name__})")]
+    latest = str((parsl.get("info") or {}).get("version") or "")
     for e in floats:
+        recorded = _recorded_parsl(e)
+        if recorded and latest:
+            if _version_key(latest) > _version_key(recorded):
+                out.append(Finding(e.id, "releases", "warn",
+                                   f"parsl: {latest} is released; the entry was proven with the worker on {recorded} — "
+                                   "this facility's endpoint floats: re-prove"))
+            else:
+                out.append(Finding(e.id, "releases", "ok", f"parsl {recorded} is still the latest"))
+            continue
         since = e.verification.verified_on if e.verification and e.verification.verified_on else e.last_validated
         newer = _released_after(parsl, since)
         if newer:
             out.append(Finding(e.id, "releases", "warn",
                                f"parsl: released since the entry was proven ({', '.join(newer[-3:])}) — this "
-                               "facility's "
-                               "endpoint floats; re-prove"))
+                               "facility's endpoint floats; re-prove"))
         else:
             out.append(Finding(e.id, "releases", "ok", f"no parsl release since {since}"))
     return out
@@ -238,7 +277,10 @@ def _fresh(pyproject_text: str, python: str, names: tuple[str, ...]) -> dict[str
     with tempfile.TemporaryDirectory() as d:
         pp = Path(d) / "pyproject.toml"
         pp.write_text(pyproject_text)
-        res = subprocess.run(["uv", "pip", "compile", str(pp), "--python-version", python, "--quiet", "--no-header"],
+        uv = os.environ.get("UV") or shutil.which("uv")  # `uv run` sets UV; launchd's PATH may not hold uv
+        if not uv:
+            raise RuntimeError("uv not found (not on PATH, and UV unset)")
+        res = subprocess.run([uv, "pip", "compile", str(pp), "--python-version", python, "--quiet", "--no-header"],
                              capture_output=True, text=True, timeout=180, check=False)
     if res.returncode != 0:
         raise RuntimeError(res.stderr.strip()[-300:] or f"uv pip compile rc={res.returncode}")
@@ -324,11 +366,12 @@ def changes(findings: list[Finding], state_file: Path | None) -> list[Finding]:
 
 
 def notify(title: str, message: str) -> None:
-    """A desktop notification (macOS); silently nothing elsewhere."""
+    """A desktop notification (macOS); silently nothing elsewhere. The text travels as an argument, never inside the
+    AppleScript source — findings carry facility-published strings, and a backslash or quote must not break it."""
     if sys.platform == "darwin":
-        msg = message.replace('"', "'")[:240]
-        subprocess.run(["osascript", "-e", f'display notification "{msg}" with title "{title}"'],
-                       capture_output=True, check=False, timeout=10)
+        subprocess.run(["osascript", "-e", "on run argv", "-e",
+                        "display notification (item 1 of argv) with title (item 2 of argv)", "-e", "end run",
+                        message[:240], title], capture_output=True, check=False, timeout=10)
 
 
 def main(argv: list[str] | None = None) -> int:
@@ -345,15 +388,29 @@ def main(argv: list[str] | None = None) -> int:
     seeds = list(BundledCatalog(Path(a.seeds)).entries())
 
     search = compute = None
+    pre: list[Finding] = []
     if "index" not in skip:
         import globus_sdk
 
         search = globus_sdk.SearchClient()  # anonymous, as every installed plugin reads it
     if "facility" not in skip:
-        from globus_compute_sdk import Client
+        # Facility metadata needs an identity: the curator's own Globus login. Never let a missing/expired login (or a
+        # web-service hiccup building the client) kill the run — the other checks still matter, and say why.
+        try:
+            from globus_compute_sdk import Client
 
-        compute = Client()  # the curator's own Globus login (facility endpoint metadata needs an identity)
-    findings = run_checks(seeds, index_id=a.index, search=search, compute=compute, skip=skip, ref=a.ref)
+            from ..login import LoginFlow
+
+            if LoginFlow().login_required():
+                pre.append(Finding("*", "facility", "fail",
+                                   "login: no valid Globus login in the SDK's store — facility endpoints not checked; "
+                                   "run `globus-compute-endpoint login` (or any hpc-bridge login) interactively"))
+            else:
+                compute = Client()
+        except Exception as exc:  # noqa: BLE001
+            pre.append(Finding("*", "facility", "fail",
+                               f"login: could not build the Compute client ({type(exc).__name__}: {exc})"[:300]))
+    findings = pre + run_checks(seeds, index_id=a.index, search=search, compute=compute, skip=skip, ref=a.ref)
     new = changes(findings, Path(a.state).expanduser() if a.state else None)
     level = worst(findings)
     if a.json:

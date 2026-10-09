@@ -237,3 +237,79 @@ def test_ingest_refuses_a_verification_block_the_client_would_drop(tmp_path):
     seed.write_text(yaml.safe_dump(rows))
     with pytest.raises(ValueError, match="verification"):
         ingest("idx", seed, _Search())
+
+
+# --- the review of 0.1.21 -------------------------------------------------------------------------------------------
+
+def test_an_escalation_re_alerts(tmp_path):
+    state = tmp_path / "s.json"
+    first = [health.Finding("delta", "facility", "fail", "version: the endpoint now runs 4.17.0, …")]
+    assert len(health.changes(first, state)) == 1
+    again = [health.Finding("delta", "facility", "fail", "version: the endpoint now runs 4.18.0, …")]
+    assert len(health.changes(again, state)) == 1  # same check, new detail: a new alert
+
+
+def test_a_missing_field_is_reported_never_read_as_a_match():
+    delta = _verified(_entry("delta"))
+    md = dict(_MD)
+    md.pop("python_version")
+    findings = health.check_facility(delta, _Compute(md))
+    assert any(f.level == "warn" and f.detail.startswith("unpublished") and "python_version" in f.detail for f in findings)
+    assert not any(f.level == "ok" for f in findings)
+    partial = CatalogEntry.model_validate({**delta.model_dump(mode="json"),
+                                           "verification": {"worker": "py3.13.15 parsl2026.8.10"}})
+    findings = health.check_facility(partial, _Compute(dict(_MD, python_version="3.99.0")))
+    assert any(f.detail.startswith("incomplete") for f in findings)
+
+
+def test_a_parsl_release_the_same_day_as_the_proof_is_caught():
+    anvil = _verified(_entry("anvil"), worker="py3.13.12 dill0.3.9 parsl2026.10.5 on a007")
+    same_day = {"info": {"version": "2026.10.12"},
+                "releases": {"2026.10.12": [{"upload_time_iso_8601": f"{anvil.verification.verified_on}T22:45:00Z"}]}}
+    findings = health.check_releases([anvil], pypi=lambda pkg: same_day)
+    assert findings[0].level == "warn" and "2026.10.12" in findings[0].detail and "2026.10.5" in findings[0].detail
+    current = {"info": {"version": "2026.10.5"}, "releases": {}}
+    assert health.check_releases([anvil], pypi=lambda pkg: current)[0].level == "ok"
+
+
+def test_no_login_is_a_finding_not_a_crash(monkeypatch, capsys):
+    from hpc_bridge import login
+
+    monkeypatch.setattr(login.LoginFlow, "login_required", lambda self: True)
+    monkeypatch.setattr(health, "run_checks", lambda seeds, **kw: [])
+    assert health.main(["--skip", "index,ssh,releases,install"]) == 2
+    assert "login: no valid Globus login" in capsys.readouterr().out
+
+
+def test_the_notification_text_travels_as_an_argument(monkeypatch):
+    seen = {}
+    monkeypatch.setattr(health.sys, "platform", "darwin")
+    monkeypatch.setattr(health.subprocess, "run", lambda argv, **kw: seen.setdefault("argv", argv))
+    health.notify("title", 'a "quoted" \\d back\\slash')
+    argv = seen["argv"]
+    assert argv[0] == "osascript" and 'a "quoted" \\d back\\slash' in argv  # never spliced into the script source
+    assert not any("quoted" in a for a in argv if a.startswith(("display", "on run")))
+
+
+def test_record_verification_replaces_a_block_with_blank_lines_and_comments():
+    import datetime
+
+    rp = _reprove_module()
+    text = (SEEDS / "anvil.yaml").read_text()
+    noisy = rp.record_verification(text, "anvil", {"endpoint_version": "4.16.0", "worker": "OLD"}, datetime.date(2026, 10, 1))
+    noisy = noisy.replace('    worker: "OLD"\n', '\n  # a stray comment\n    worker: "OLD"\n')
+    out = rp.record_verification(noisy, "anvil", {"endpoint_version": "4.16.0", "worker": "NEW"}, datetime.date(2026, 10, 9))
+    entry = next(e for e in BundledCatalog(_write(out, "anvil.yaml")).entries() if e.id == "anvil")
+    assert entry.verification.worker == "NEW" and "OLD" not in out
+    quoted = text.replace("- id: anvil", '- id: "anvil"', 1)
+    assert "verified_on: 2026-10-09" in rp.record_verification(quoted, "anvil", {"worker": "x"}, datetime.date(2026, 10, 9))
+
+
+def test_ingest_requires_a_complete_verification_block_for_a_facility_endpoint():
+    from hpc_bridge.catalog.entry import verification_problems
+
+    delta = _entry("delta")
+    assert verification_problems(delta) == []  # the recorded seed is complete
+    partial = CatalogEntry.model_validate({**delta.model_dump(mode="json"), "verification": {"worker": "x"}})
+    assert verification_problems(partial) and "verified_on" in verification_problems(partial)[0]
+    assert verification_problems(_entry("expanse")) == []  # SSH entries are proven by hand

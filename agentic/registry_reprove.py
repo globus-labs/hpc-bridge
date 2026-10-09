@@ -45,30 +45,24 @@ def seed_file_for(entry_id: str, seed_dir: Path = SEED_DIR) -> Path:
 
 def record_verification(text: str, entry_id: str, block: dict, on: datetime.date) -> str:
     """Rewrite one entry of a seed file's TEXT: `last_validated` → `on`, `worker_env.verified_with` → the endpoint
-    version, and a fresh `verification:` block (replacing any old one) right after `last_validated`. Everything
-    else — other entries, comments, key order — is left byte-for-byte."""
+    version, and a fresh `verification:` block (replacing any old one, blank lines and comments inside it included)
+    right after `last_validated`. Everything else — other entries, comments, key order — is left byte-for-byte."""
     lines = text.splitlines(keepends=True)
-    start = next((i for i, ln in enumerate(lines) if re.match(rf"^- id:\s*{re.escape(entry_id)}(\s|$)", ln)), None)
+    id_re = re.compile(rf"""^- id:\s*["']?{re.escape(entry_id)}["']?\s*(#.*)?$""")
+    start = next((i for i, ln in enumerate(lines) if id_re.match(ln.rstrip("\r\n"))), None)
     if start is None:
-        raise ValueError(f"no `- id: {entry_id}` in the seed")
+        raise ValueError(f"no `- id: {entry_id}` line (the id must be the entry's first key) in the seed")
     end = next((i for i in range(start + 1, len(lines)) if lines[i].startswith("- ")), len(lines))
     body = lines[start:end]
 
-    # drop an existing verification block (the key at entry indent, plus its deeper-indented lines)
-    out: list[str] = []
-    skipping = False
-    for ln in body:
-        if re.match(r"^  verification:", ln):
-            skipping = True
-            continue
-        if skipping and (ln.startswith("    ") or not ln.strip()):
-            if not ln.strip():
-                skipping = False
-                out.append(ln)
-            continue
-        skipping = False
-        out.append(ln)
-    body = out
+    # drop an existing verification block: from its key to the next sibling key (2-space indent, not a comment), the
+    # next entry, or the end — keeping only trailing blank lines (the separator before the next entry)
+    vi = next((i for i, ln in enumerate(body) if re.match(r"^  verification:", ln)), None)
+    if vi is not None:
+        vj = next((j for j in range(vi + 1, len(body)) if re.match(r"^  [A-Za-z_]", body[j])), len(body))
+        while vj > vi + 1 and not body[vj - 1].strip():
+            vj -= 1
+        del body[vi:vj]
 
     ver = block.get("endpoint_version")
     if ver:
@@ -127,6 +121,8 @@ def main(argv: list[str]) -> int:
         print("no Globus login in the selected store")
         return 2
     print(f"identity: {globus_identity_label()}  entry: {entry.subject} ({seed.name})", flush=True)
+    if a.record:  # fail BEFORE the paid run if the seed cannot be edited
+        record_verification(seed.read_text(), entry.id, {"endpoint_version": "0"}, datetime.date.today())
 
     async def run() -> dict:
         from globus_compute_sdk import Client
@@ -149,19 +145,29 @@ def main(argv: list[str]) -> int:
             if st.status in ("up", "down", "needs_account") or time.monotonic() - t0 > a.wait_s:
                 break
             await asyncio.sleep(30)
-        canary = _shape_runtime(app, "compute").last_canary
-        if st.status == "up":
-            out = await _run_shell(app, "hostname; whoami; echo SLURM_JOB_ID=$SLURM_JOB_ID", shape="compute")
-            print(f"  run_shell: {out.phase} exit={out.exit_code} stdout={out.stdout!r}", flush=True)
-            result["pass"] = out.phase == "complete" and out.exit_code == 0
-        if canary is not None and canary.ok:
-            result["worker"] = " ".join(x for x in (
-                f"py{canary.worker_python}" if canary.worker_python else "",
-                f"dill{canary.worker_dill}" if canary.worker_dill else "",
-                f"parsl{canary.worker_parsl}" if canary.worker_parsl else "",
-                f"on {canary.worker_host}" if canary.worker_host else "") if x)
-        stp = await _stop_endpoint(app)
-        print(f"  stop: {stp.status}", flush=True)
+        try:
+            canary = _shape_runtime(app, "compute").last_canary
+            if st.status == "up":
+                out = await _run_shell(app, "hostname; whoami; echo SLURM_JOB_ID=$SLURM_JOB_ID", shape="compute")
+                print(f"  run_shell: {out.phase} exit={out.exit_code} stdout={out.stdout!r}", flush=True)
+                result["pass"] = out.phase == "complete" and out.exit_code == 0
+            if canary is not None and canary.ok:
+                result["worker"] = " ".join(x for x in (
+                    f"py{canary.worker_python}" if canary.worker_python else "",
+                    f"dill{canary.worker_dill}" if canary.worker_dill else "",
+                    f"parsl{canary.worker_parsl}" if canary.worker_parsl else "",
+                    f"gce{canary.worker_gce}" if canary.worker_gce else "",
+                    f"on {canary.worker_host}" if canary.worker_host else "") if x)
+        finally:
+            stp = await _stop_endpoint(app)  # always, even on an error or a timeout
+            print(f"  stop: {stp.status} — {(stp.notice or '')[:400]}", flush=True)
+            if not result["pass"]:
+                # On a facility endpoint stop only drains: a check task still queued there can keep the facility
+                # starting (billed) blocks — up to its own hard limit (Delta: 48 h; the 2026-10-06 runaway).
+                print("  WARNING: the run did not pass. A check task may still be queued at the facility, which can "
+                      "keep starting billed blocks for it. Check the facility's queue for your user (e.g. "
+                      "`squeue -u $USER`) and cancel any hpc-bridge (parsl) jobs; if they keep reappearing, contact "
+                      "the facility.", flush=True)
         after = facility_fingerprint(await asyncio.to_thread(Client().get_endpoint_metadata, entry.compute_mep_uuid))
         if after != before:  # the facility changed during the run: the proof is of neither state
             print("  the facility's metadata changed during the run — not recording", flush=True)

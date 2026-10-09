@@ -6,32 +6,35 @@
 #   scripts/registry_monitor.sh run                 # one run now, in this terminal
 #   scripts/registry_monitor.sh uninstall
 #
-# What runs: `hpc-bridge-registry-health --state ~/.hpc-bridge/registry-health.json --notify` from this checkout,
-# with the Globus login in the SDK's default store (~/.globus_compute — facility metadata needs an identity; the
-# index is read anonymously). It submits nothing and costs nothing. The paid tier — a real block per facility — is
+# What runs: `hpc-bridge-registry-health --state ~/.hpc-bridge/registry-health.json --notify`, built by uvx from
+# GitHub main (REF) — so the seeds it holds the live index to are main's, whatever branch this checkout is on — with
+# the Globus login in the SDK's default store (~/.globus_compute: facility metadata needs an identity; the index is
+# read anonymously). It submits nothing and costs nothing. The paid tier — a real block per facility — is
 # agentic/registry_reprove.py, run by hand or on a slower cadence.
 set -euo pipefail
 
-REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 LABEL="org.globus-labs.hpc-bridge.registry-health"
 PLIST="$HOME/Library/LaunchAgents/$LABEL.plist"
 STATE="$HOME/.hpc-bridge/registry-health.json"
 LOG="$HOME/.hpc-bridge/registry-health.log"
 UV="$(command -v uv || true)"
+UVX="$(command -v uvx || true)"
+REF="${REF:-main}"
+SRC="git+https://github.com/globus-labs/hpc-bridge@${REF}"
 
 run_once() {
   mkdir -p "$(dirname "$STATE")"
-  "$UV" run --project "$REPO" -q hpc-bridge-registry-health --state "$STATE" --notify
+  "$UVX" -q --refresh --from "$SRC" hpc-bridge-registry-health --state "$STATE" --notify
 }
 
 case "${1:-status}" in
   run)
-    [[ -n "$UV" ]] || { echo "uv is not on PATH" >&2; exit 1; }
+    [[ -n "$UVX" ]] || { echo "uvx is not on PATH" >&2; exit 1; }
     run_once
     ;;
   install)
     [[ "$(uname)" == "Darwin" ]] || { echo "launchd is macOS-only; on Linux put '$0 run' in cron" >&2; exit 1; }
-    [[ -n "$UV" ]] || { echo "uv is not on PATH" >&2; exit 1; }
+    [[ -n "$UVX" && -n "$UV" ]] || { echo "uv/uvx are not on PATH" >&2; exit 1; }
     minutes="${2:-60}"
     mkdir -p "$(dirname "$PLIST")" "$(dirname "$LOG")"
     cat > "$PLIST" <<EOF
@@ -40,14 +43,17 @@ case "${1:-status}" in
 <plist version="1.0"><dict>
   <key>Label</key><string>$LABEL</string>
   <key>ProgramArguments</key><array>
-    <string>$UV</string><string>run</string><string>--project</string><string>$REPO</string><string>-q</string>
+    <string>$UVX</string><string>-q</string><string>--refresh</string><string>--from</string><string>$SRC</string>
     <string>hpc-bridge-registry-health</string><string>--state</string><string>$STATE</string><string>--notify</string>
   </array>
   <key>StartInterval</key><integer>$((minutes * 60))</integer>
   <key>RunAtLoad</key><true/>
   <key>StandardOutPath</key><string>$LOG</string>
   <key>StandardErrorPath</key><string>$LOG</string>
-  <key>EnvironmentVariables</key><dict><key>HOME</key><string>$HOME</string></dict>
+  <key>EnvironmentVariables</key><dict>
+    <key>HOME</key><string>$HOME</string>
+    <key>PATH</key><string>$(dirname "$UV"):/usr/local/bin:/opt/homebrew/bin:/usr/bin:/bin</string>
+  </dict>
 </dict></plist>
 EOF
     launchctl bootout "gui/$(id -u)/$LABEL" 2>/dev/null || true
