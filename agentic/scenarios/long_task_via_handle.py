@@ -68,22 +68,27 @@ def completed_via_handle(t: Trace) -> Result:
     )
 
 
+# A probe the server never started is not a cut: the block wasn't up yet, or the spend / account gate held it.
+_NOT_STARTED = ("cold_start", "needs_confirmation", "needs_account")
+
+
 def not_cut_at_cap(t: Trace) -> Result:
-    """Regression guard: no compute probe result is a bare cut — i.e. a phase that is neither complete
-    nor running, or an exit 124 (the old ~110s per-task guillotine)."""
+    """Regression guard: no compute probe result is a bare cut — a probe that STARTED and then ended in neither
+    complete nor running, or an exit 124 (the old ~110s per-task guillotine). A run_shell sent while the block was
+    still allocating honestly answers `cold_start` without running anything (Codex did, 2026-10-09)."""
     runs = [
         c for _, c in t.named("run_shell")
         if c.input.get("shape") in (None, "compute") and _MARK in str(c.input.get("command", ""))
     ]
     cut = [
         str(c.input.get("command", ""))[:40] for c in runs
-        if str((c.result or {}).get("phase")) not in ("complete", "running")
+        if str((c.result or {}).get("phase")) not in ("complete", "running", *_NOT_STARTED)
         or (c.result or {}).get("exit_code") == 124
     ]
     ok = not cut
     return Result("not_cut_at_cap", ok,
                   "ok: no compute probe was cut at a per-task cap" if ok else
-                  f"a compute probe looks CUT (phase not complete/running, or exit 124): {cut}")
+                  f"a compute probe looks CUT (it started, then neither completed nor kept running; or exit 124): {cut}")
 
 
 EXTRA_INVARIANTS = [completed_via_handle, not_cut_at_cap]

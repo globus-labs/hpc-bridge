@@ -1177,3 +1177,13 @@ def test_needs_account_is_not_a_billed_start():
     assert _billed_start_idxs(t) == [1]
     t2 = Trace([t.calls[0]], [])
     assert ends_with_stop(t2).ok            # nothing billed → nothing to stop
+
+
+def test_long_task_cut_grader_ignores_a_probe_that_never_started():
+    scen = _scenario("long_task_via_handle")
+    cmd = {"command": f"python3 -c \"print('{scen._MARK} start')\"", "shape": "compute"}
+    early = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "cold_start", "exit_code": None})
+    later = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "running", "task_id": "compute-1"})
+    assert scen.not_cut_at_cap(Trace([early, later])).ok
+    cut = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "failed", "exit_code": 124})
+    assert not scen.not_cut_at_cap(Trace([cut])).ok
