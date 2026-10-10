@@ -240,19 +240,22 @@ def _needs_login_result(facility: str, start: LoginStart, flow_error: str | None
         notice=_login_notice(start, flow_error, facility=facility, waited_s=waited_s),
     )
 
+def _multiplexing_off_notice(host: str, resume: str = "connect_facility") -> str:
+    """A host that wants an interactive login while SSH multiplexing is off: no pre-opened master can be shared, so
+    neither a one-time code (complete_preauth) nor the user's own `ssh -fN` helps — enabling multiplexing does. One
+    sentence for the connect result and the no-facility notice."""
+    return (f"{host} needs an interactive login (password/MFA), but SSH multiplexing is "
+            "off. Set HPC_BRIDGE_SSH_CONTROL_PERSIST (e.g. 3600) so a pre-opened master is reusable, "
+            f"then call {resume} again.")
+
 def _needs_preauth_result(facility: str, target, *, otp_ok: bool = False) -> ConnectFacilityResult:
     """Surface a one-time interactive-auth handoff (password / MFA / Duo). The user opens a
     ControlMaster in THEIR OWN terminal (entering the secret there); hpc-bridge then multiplexes
     over it. The agent relays the command and NEVER handles the secret — see the credential-handling
     policy in the vault (`Planned/MFA and interactive SSH auth`)."""
     if not getattr(target, "control_dir", None):  # multiplexing off -> a pre-opened master can't be shared
-        return ConnectFacilityResult(
-            phase="needs_preauth",
-            facility=facility,
-            notice=f"{target.host} needs an interactive login (password/MFA), but SSH multiplexing is "
-            "off. Set HPC_BRIDGE_SSH_CONTROL_PERSIST (e.g. 3600) so a pre-opened master is reusable, "
-            "then call connect_facility again.",
-        )
+        return ConnectFacilityResult(phase="needs_preauth", facility=facility,
+                                     notice=_multiplexing_off_notice(target.host))
     cmd = target.preauth_command()
     pinned = ""
     alias = getattr(target, "host_key_alias", None)
@@ -607,6 +610,39 @@ def _with_submission_notice(out: ShellOutcome, sub: Submission | None, shape: st
 
 def _shape_reject_outcome(notice: str) -> ShellOutcome:
     return ShellOutcome(phase="failed", block_state="cold", exit_code=None, notice=notice)
+
+def _no_facility_notice(app: AppCtx) -> str:
+    """No facility is bound (context._no_facility_bound): the ONE wording for every tool that needs one — login_shell,
+    run_shell, reset_session, ensure_endpoint_up. Where the last connect_facility stopped short of a bind it is named,
+    so the agent finishes THAT step: a PROPOSED config (the probe's draft) is finished with details=…; a pending
+    one-time login (needs_preauth) with complete_preauth or the user's own terminal (the exact command is given) — a
+    fresh connect_facility would try the SSH login again, and repeated failed logins can get the address banned
+    (fail2ban). With SSH multiplexing off neither works; the notice then says what the connect result says."""
+    if app.proposed_facility:
+        proposed = app.proposed_facility
+        return (f"No facility connected yet: connect_facility({proposed!r}) only PROPOSED a config "
+                "(proposed_facility_details) — nothing is bound until you finish it. Review the draft WITH THE USER, "
+                f"then call connect_facility({proposed!r}, details=…) with the confirmed config. Nothing was started.")
+    if app.pending_preauth is not None:
+        facility, target = app.pending_preauth
+        resume = app.preauth_resume or f"connect_facility({facility!r})"
+        head = (f"No facility connected yet: connect_facility({facility!r}) is waiting on a one-time login to its host "
+                "(needs_preauth). ")
+        if not getattr(target, "control_dir", None):  # multiplexing off: no master to share — no code, no command
+            return head + _multiplexing_off_notice(target.host, resume) + " Nothing was started."
+        return head + ("Finish that step, not a new connect: a one-time code goes to complete_preauth(code) — ask the "
+                       "USER for the current code from their authenticator, never a password — otherwise the user "
+                       f"runs this in THEIR OWN terminal:\n    {target.preauth_command()}\nThen call {resume} again. "
+                       "Calling connect_facility before that tries the SSH login again, and repeated failed logins "
+                       "can get the address banned. Nothing was started.")
+    return ("No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — it's "
+            "the entry point: for a facility you've used before it reuses the endpoint over the web "
+            "with ZERO SSH (no re-auth), and it decides whether SSH is even needed. Don't reach for "
+            "login_shell or a manual SSH before that. Nothing was started. (Or pin one via HPC_BRIDGE_MACHINE=<id>.)")
+
+def _no_facility_outcome(app: AppCtx) -> ShellOutcome:
+    """run_shell / reset_session with no facility bound: nothing dispatched, no endpoint stood up anywhere."""
+    return ShellOutcome(phase="failed", block_state="cold", exit_code=None, notice=_no_facility_notice(app))
 
 def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
     return _with_spend(app, ShellOutcome(

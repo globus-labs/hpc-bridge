@@ -59,6 +59,7 @@ from .context import (  # noqa: F401 - re-exported: tools + tests import them fr
     TaskHandle,
     _has_login_shape,
     _idle_release_s,
+    _no_facility_bound,
     _supported_shapes,
 )
 from .cost import (  # noqa: F401 - re-exported
@@ -69,8 +70,6 @@ from .cost import (  # noqa: F401 - re-exported
     _total_session_spend,
     _with_spend,
 )
-from .endpoint import EndpointCLI
-from .facility.local import LocalFacility
 from .lifecycle import EndpointState
 from .login import LoginFlow, LoginMode
 from .login_gate import (  # noqa: F401 - re-exported for imports
@@ -113,6 +112,8 @@ from .notices import (  # noqa: F401 - re-exported
     _never_sent_outcome,
     _no_account_failure,
     _no_account_notice,
+    _no_facility_notice,
+    _no_facility_outcome,
     _orphaned_outcome,
     _past_ceiling_outcome,
     _released_under_outcome,
@@ -166,21 +167,23 @@ from .warmth import (  # noqa: F401 - re-exported for imports; PATCH warmth._pro
 async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
     try:
         facility = await binding.make_facility()
+        endpoint_id = _env_endpoint_id()  # HPC_BRIDGE_ENDPOINT_ID: dispatch to that endpoint, never provision one
     except Exception as exc:  # noqa: BLE001 - a config error must NOT brick the MCP server at boot
-        # (a startup crash = the agent silently sees no tools). Start unbound/local and let the
+        # (a startup crash = the agent silently sees no tools). Start unbound and let the
         # catalog tools surface/bind: list_facilities / connect_facility.
         print(
             f"hpc-bridge: facility setup failed at startup ({type(exc).__name__}: {exc}); starting "
             "unbound — use list_facilities / connect_facility to bind a machine.",
             file=sys.stderr,
         )
-        user_dir = config.user_dir()
-        facility = LocalFacility(EndpointCLI(user_dir=user_dir))
+        # Unbound means unbound: no facility AND no endpoint. HPC_BRIDGE_ENDPOINT_ID may be the very UUID the failed pin
+        # refused (a MEP entry's conflict) — dispatching to it, or stop/teardown acting on it, would be a silent guess.
+        facility, endpoint_id = binding._default_local_facility(unbound=True), None
     scratch = binding._resolve_scratch_root(facility)
     app = AppCtx(
         facility=facility,
         profile=Profile(mode=_env_mode()),  # type: ignore[arg-type]
-        state=EndpointState(endpoint_id=_env_endpoint_id()),
+        state=EndpointState(endpoint_id=endpoint_id),
         scratch_root=scratch,
         charge_factor=config.charge_factor(),
         login_flow=LoginFlow(),
@@ -320,6 +323,9 @@ async def _ensure_endpoint_up(
     confirm_spend: bool = False,
     account: str | None = None,
 ) -> EndpointStatus:
+    if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
+        return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
+                              notice=_no_facility_notice(app))
     if reject := _shape_reject(app, shape):  # compute-only facility: never build a login runtime
         return EndpointStatus(
             status="down", block_state="cold", endpoint_id=app.state.endpoint_id, notice=reject,
@@ -1223,13 +1229,7 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
             "AMQP). Use run_shell(shape='compute') — the block stays warm between calls.",
         )
     if login_exec is None:
-        return LoginShellResult(
-            exit_code=1,
-            notice="No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — it's "
-            "the entry point: for a facility you've used before it reuses the endpoint over the web "
-            "with ZERO SSH (no re-auth), and it decides whether SSH is even needed. Don't reach for "
-            "login_shell or a manual SSH before that. (Or pin one via HPC_BRIDGE_MACHINE=<id>.)",
-        )
+        return LoginShellResult(exit_code=1, notice=_no_facility_notice(app))
     sub = await _detect_submission(command, "login")  # the same login node, over SSH: a job submitted here is billed
     try:
         rc, out, err = await login_exec(command)
@@ -1266,7 +1266,10 @@ async def _ready_session(
     session id, provision + bind the runner atomically under app.lock, and refuse to dispatch when
     the block is cold, the spend is unconfirmed, or a live task owns the session. Returns the runner,
     session and shape state — with the dispatch counted in `rt.inflight` under the lock, which the caller
-    MUST undo when its sync-wait ends — or the outcome to hand back."""
+    MUST undo when its sync-wait ends — or the outcome to hand back. With no facility bound it refuses first:
+    the implicit local default must never be provisioned in place of the facility the agent forgot to connect."""
+    if _no_facility_bound(app):
+        return _no_facility_outcome(app)
     if reject := _shape_reject(app, shape):
         return _shape_reject_outcome(reject)
     session = Session(session_id, app.scratch_root)  # validates session_id before provisioning

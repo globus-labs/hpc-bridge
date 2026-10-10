@@ -1,5 +1,5 @@
-"""The server's runtime state (split step 1, 2026-09-03): data plus the three derived reads on it
-(`_supported_shapes`, `_has_login_shape`, `_idle_release_s`).
+"""The server's runtime state (split step 1, 2026-09-03): data plus the derived reads on it
+(`_supported_shapes`, `_has_login_shape`, `_no_facility_bound`, `_idle_release_s`).
 
 `AppCtx` is the one object every tool call shares (installed by the server's lifespan); a `ShapeRuntime`
 per resource shape carries that shape's Executor, warmth/canary state and spend clock; a `TaskHandle`
@@ -127,6 +127,10 @@ class AppCtx:
     # BYO configs supplied this session but not yet PROVEN (login-shape canary answered) — written to
     # facilities.json only then (decision 2026-09-03: "proven", not "accepted"): facility id -> (ssh_host, details)
     pending_facility_cache: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    # The facility id the LAST connect_facility answered with proposed_facility_details (a draft config, nothing bound).
+    # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
+    # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.
+    proposed_facility: str | None = None
     # Facilities THIS session bootstrapped over SSH (a fresh start, not a reattach). The very next connect
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).
@@ -172,6 +176,12 @@ def _supported_shapes(app: AppCtx) -> tuple[str, ...]:
 
 def _has_login_shape(app: AppCtx) -> bool:
     return "login" in _supported_shapes(app)
+
+def _no_facility_bound(app: AppCtx) -> bool:
+    """Nothing is bound: the facility is the server's IMPLICIT local default (no machine pinned or connected, local
+    dev not opted into — binding._default_local_facility marks it). Read from that mark, never from the facility's
+    type: an explicitly chosen LocalFacility (local dev, the tests) is bound and works as before."""
+    return getattr(app.facility, "implicit", False) is True
 
 def _idle_release_s(app: AppCtx) -> int | None:
     """The block's idle-release window in seconds, or None when it is the FACILITY's and unknown.

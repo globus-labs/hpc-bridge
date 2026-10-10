@@ -38,6 +38,13 @@ connect continues with no further prompts.
 **The login link fails when opened**. It is single-use: if the page already said you could return,
 the login has completed and you can just carry on. If it has expired, the agent issues a fresh one.
 
+**"No facility connected"**. The agent tried to run a command, start a block or read the login node
+before connecting to a facility. Nothing was started. It should call `connect_facility` first; if the
+message says a connect only *proposed* a configuration, review that proposal with the agent and let
+it finish the connect. If it says a connect is **waiting on a one-time login**, finish that first: give
+the agent the current one-time code, or run the `ssh` command it shows in your own terminal, then let
+it connect again. Connecting again before that only repeats the failed login.
+
 ## While a block is starting
 
 **"allocating nodes"** is a normal queue wait; the agent polls. Two variants are not:

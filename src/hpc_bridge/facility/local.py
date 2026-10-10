@@ -11,9 +11,13 @@ from .base import EndpointHandle
 class LocalFacility:
     name = "local"
 
-    def __init__(self, cli, endpoint_name: str = "hpc-bridge-dev") -> None:
+    def __init__(self, cli, endpoint_name: str = "hpc-bridge-dev", *, implicit: bool = False) -> None:
         self.cli = cli
         self.endpoint_name = endpoint_name
+        # True when nothing CHOSE this facility: the server's default when no machine is pinned and local dev is not
+        # opted into, or when a pin failed at boot (binding._default_local_facility). The tools that would stand up or
+        # use an endpoint refuse on it with "No facility connected" rather than start a local endpoint on the MCP host.
+        self.implicit = implicit
 
     def keeps_block_warm(self, profile: Profile) -> bool:
         """The interactive profile holds its LocalProvider block (min_blocks=1): it never idle-releases, so the
@@ -44,6 +48,11 @@ class LocalFacility:
         }
 
     async def provision(self, profile: Profile) -> EndpointHandle:
+        """Stand up a personal endpoint on THIS host. The server's boot path no longer reaches it: an implicit facility
+        is refused before provisioning, and HPC_BRIDGE_ENDPOINT_ID seeds the endpoint so ensure_warm dispatches to it
+        instead. What still calls it: a LocalFacility built directly (tests/integration/test_local_endpoint.py), and a
+        local-dev session whose endpoint state teardown_endpoint cleared (a known gap: the next run_shell provisions).
+        """
         # configure() forces --multi-user false (personal, no identity-mapping);
         # then write our engine into the UEP template, leaving config.yaml as the
         # engine-free manager config that `start` requires.

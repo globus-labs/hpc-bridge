@@ -119,5 +119,7 @@ The full reference, including developer and testing knobs, is the vault's
 - **macOS and Linux** are supported for every path above.
 - **Windows** is untested. The SSH-bootstrap path relies on OpenSSH connection multiplexing, which
   Windows OpenSSH does not support; the zero-SSH path may work.
-- Running an endpoint *on your own machine* rather than on a facility needs Linux (the Globus Compute
-  endpoint daemon is Linux-only). Normal use never needs this.
+- Local development against an endpoint on your own machine: run the endpoint yourself (the Globus
+  Compute endpoint daemon is Linux-only: a container, WSL or a login node) and set
+  `HPC_BRIDGE_ENDPOINT_ID=<uuid>`. hpc-bridge dispatches to it from any OS rather than starting one.
+  Normal use never needs this.

@@ -38,9 +38,9 @@ class EndpointCLI:
         if sys.platform != "linux":
             raise RuntimeError(
                 f"globus-compute-endpoint runs only on Linux (this host is {sys.platform!r}); "
-                "it cannot provision a local endpoint here. Set HPC_BRIDGE_ENDPOINT_ID=<uuid> "
-                "to dispatch to an existing endpoint, or run hpc-bridge on Linux "
-                "(container/WSL/HPC login node)."
+                "it cannot provision a local endpoint here. For local development run an endpoint "
+                "yourself (on Linux: a container, WSL or a login node) and set "
+                "HPC_BRIDGE_ENDPOINT_ID=<uuid> to dispatch to it."
             )
         proc = await asyncio.create_subprocess_exec(
             "globus-compute-endpoint",

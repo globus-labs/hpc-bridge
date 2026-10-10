@@ -145,11 +145,13 @@ def _env_mode(default: str = "batch") -> str:
     return mode
 
 def _env_endpoint_id() -> str | None:
-    """An existing endpoint UUID to dispatch to instead of provisioning a local one.
+    """An existing endpoint UUID to dispatch to — the local-dev opt-in, on every OS.
 
-    Set HPC_BRIDGE_ENDPOINT_ID to skip local provisioning entirely. Required on
-    macOS/Windows, where globus-compute-endpoint (the local endpoint daemon) cannot
-    run — the SDK dispatch path still reaches a remote/Linux endpoint by UUID.
+    With no machine pinned, HPC_BRIDGE_ENDPOINT_ID is the ONLY local-dev path: the server
+    dispatches to that endpoint (one you run yourself, e.g. in a Linux container) instead of
+    provisioning one. Unset, the unpinned server is unbound: the tools that need a facility
+    answer "No facility connected" until connect_facility binds one (binding._default_local_facility).
+    A HPC_BRIDGE_MACHINE pin that fails at boot ignores it: that boot is unbound, endpoint included.
     """
     eid = os.environ.get("HPC_BRIDGE_ENDPOINT_ID", "").strip()
     return eid or None
