@@ -50,6 +50,13 @@ from the login node with `sbatch` or `qsub` and check on it later.
   timeout reclaims the block, about ten minutes on `globus-labs`. Spend can accrue for that tail. The
   agent should not keep polling for "down" here, and there is nothing of yours to tear down.
 
+A stop is refused while a command of yours is still running on the block, because releasing the block
+would not end it: the endpoint would start another block to finish it. Interrupting a long command
+(Esc in Claude Code) cancels the agent's call, not the command. The command keeps running on the block
+as a task, and the stop is refused until it ends or the agent polls it to completion. On an SSH-bootstrap
+facility a teardown abandons it. On a facility-run endpoint nothing can end it early, and the stop waits
+for it unless it has had no result long after its time limit. It is then presumed lost and abandoned.
+
 ## If you walk away
 
 Idle blocks release themselves after the facility's timeout. A session that ends without a stop

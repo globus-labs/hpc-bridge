@@ -75,7 +75,8 @@ async def test_run_shell_goes_through_the_heartbeat(monkeypatch):
         seen.append(label)
         return await work
 
-    async def fake_run_shell(app, command, session_id, shape):
+    async def fake_run_shell(app, command, session_id, shape, *, agent_call=False):
+        assert agent_call  # the tool's own call: a client cancel keeps its command tracked
         return server.ShellOutcome(phase="complete", block_state="warm", exit_code=0, stdout=command)
 
     class _Req:

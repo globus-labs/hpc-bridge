@@ -1,3 +1,4 @@
+import time
 from pathlib import Path
 
 from hpc_bridge import binding
@@ -1576,7 +1577,7 @@ async def test_stop_endpoint_drains_task_registry(monkeypatch):
     )
     app.tasks["compute-1"] = TaskHandle(
         future=_PendingFuture(), shape="compute", session_id="default",
-        command="sleep 999", submitted_at=0.0, ceiling_s=1780.0,
+        command="sleep 999", submitted_at=time.monotonic(), ceiling_s=1780.0,
     )
 
     async def fake_run_shell(a, command, session_id="default", shape="compute"):
@@ -1801,7 +1802,7 @@ async def test_ssh_stop_refuses_while_a_task_runs_and_keeps_its_handle(monkeypat
     app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True, "walltime": "00:30:00"},
                                          runner=_FakeRunner("eid-1", _Res(0, "", "")))
     app.tasks["compute-1"] = TaskHandle(future=Future(), shape="compute", session_id="default", command="sleep 180",
-                                        submitted_at=0.0, ceiling_s=1780.0)  # not done: still RUNNING
+                                        submitted_at=time.monotonic(), ceiling_s=1780.0)  # not done: still RUNNING
 
     released = []
 
