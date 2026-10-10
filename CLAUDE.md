@@ -22,7 +22,7 @@ uv run --with mypy python -m mypy                      # types — CI-enforced; 
 
 ## Conventions
 
-- End commit messages with: `Co-Authored-By: Claude Opus 4.8 <noreply@anthropic.com>`
+- End commit messages with: `Co-Authored-By: Claude Opus 5.5 <noreply@anthropic.com>`
 - End PR bodies with: `🤖 Generated with [Claude Code](https://claude.com/claude-code)`
 - Work on a branch and open a PR (squash-merged into `main`); don't commit to `main` directly.
 - `agentic/.env` and `.claude/settings.local.json` are gitignored — never commit secrets.
