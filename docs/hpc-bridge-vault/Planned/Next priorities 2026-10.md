@@ -9,6 +9,90 @@
 5 = nearly every session, costly without it; 1 = a rare edge. "Verified" = checked against the code (file:line) or
 reproduced hermetically by the reviewer; the rest is marked.
 
+## Status — where development stopped (2026-10-10)
+
+Built overnight 2026-10-09/10, one item at a time. Each item had an implementer working in its own worktree and two
+adversarial reviewers (bugs, style) per round, 3–5 rounds per item. Fixes were proven with throwaway tests and mutation
+checks; live checks ran on the fake cluster with the free ALCF operators. Each PR is one commit and passes CI. None has
+a version bump or CHANGELOG entry: those are batched into one release PR (0.1.23) after the merges. A session will pick
+this up again in the week of 2026-10-12.
+
+| Item | PR | State |
+|---|---|---|
+| 1 strategy tick (+ reap/age/billing follow-ons) | #173 | open, ready |
+| 2 output truncation | #174 | open, ready |
+| 3 Esc/stop honesty | #175 | open, ready |
+| 5 sbatch spend hole | #176 | open, ready |
+| 4 walltime, 6 switch/reconnect, 10 long-poll | — | **deferred until #173 and #175 merge** (they rewrite the same functions in warmth/server/connect) |
+| 7 actionable NO ACCOUNT | — | **not started**: its implementer was cut off by the account's weekly usage limit before committing anything |
+| 15 parsl check at attach | — | not started |
+| 3b quick commands unseen by parsl | — | design question; item 1's shelved redesign is on branch `wip/3b-option-c-jobid` |
+
+**Merge order.** Merge #173, then #175, then #174 and #176, rebasing the later PRs after each merge. #173 and #175
+overlap in `warmth.py`, `server.py` and `notices.py`. Before merging #173, run `block_reaped_resume` (below).
+
+**Open decision.** CLAUDE.md pins the commit trailer to "Claude Opus 4.8"; the overnight commits use "Claude Opus
+5.5", the model that actually ran.
+
+**Leftover worktrees.** `.claude/worktrees/agent-*` hold the four branches; remove them once their PRs merge.
+
+### How validated each one is
+
+Legend: **H** hermetic tests (mutation-checked), **L** live on the fake cluster, **—** not exercised.
+
+**#173: scaling pass, idle presumption, block identity, spend bound**
+- L **First-result latency.** `happy_path` ran ×6, with first results at 36.7–44.9 s against 95–114 s before.
+- L **The scheduler job id is real.** A parsl worker under `slurmstepd` carries `SLURM_JOB_ID`, and an `sbatch`+`srun`
+  probe prints `HPCB_JOB <id>`.
+- L **Normal flows still work.** `session_persistence`, `fake_mep_compute` and `long_task_via_handle` passed. Every
+  failure was gpt-oss skipping its final stop, and the graders caught it each time.
+- H Idle-presumption grace, billing upper bound, block dating by job id after a presumption, the replaced-block (kicked)
+  reap, and the `max_blocks == 1` gate: `tests/test_reap_reask.py`, `tests/test_runner.py`.
+- **— Gaps:**
+  - `block_reaped_resume` exists (chaos: scancel + interject) and is the closest live check of the replaced-block
+    reap. It needs the Claude operator (paid), so it was not run. **Run it before merging.**
+  - No scenario returns just past the idle window. The window is fixed at 600 s with no knob to shorten it (Profile
+    default), so such a scenario needs either ~10 minutes or a test-only knob.
+  - Reuse of an endpoint configured before this change (still on 30 s) has not been exercised.
+  - No real facility: the change affects real SSH endpoints (Expanse, BYO). A BYO `happy_path` on globus1 with an ALCF
+    operator is the cheap real-hardware check.
+
+**#174: output cut at the agent boundary**
+- H The cut itself, the marker, the whole-line rule, the internal consumers (pilot probe, mybalance), the oversize
+  report, and exception text keeping its head and tail.
+- H An end-to-end run of the real SDK `ShellFunction`, locally: 1,500 lines come back whole and 40,000 come back as a
+  marked tail. A real-serializer test keeps a full two-stream result under 10 MiB for lines up to ~1.9 KB.
+- L Normal flows only (×5). No scenario produces long or oversized output.
+- **— Gap:** a `long_output` scenario on the fake cluster, autonomous, so the free CLI operators can run it. It should
+  `cat` a 50k-line file (check the marker and that the agent redirects and reads ranges), and produce a ~12 MB result
+  (check the honest "ran, exit code unknown" report).
+
+**#175: Esc and stop**
+- H `tests/test_cancel_stop_honesty.py`, using real blocking futures: cancel mid-run, stop during a sync-wait, the race
+  with a teardown and a re-bind, internal-session isolation, the MEP lost-task rule, and reset as a poll handle. 52/52
+  mutations caught.
+- L Normal flows ×13: `long_task_via_handle`, `session_persistence`, `fake_mep_compute`, `spend_gate_enforced`,
+  `happy_path`.
+- **— Gaps:**
+  - `stop_while_running` (stop while a polled task runs) is the scenario for the refusal path. It is autonomous and
+    runnable now, but was not run on this branch. **Run it.**
+  - `orphaned_task` (chaos) is related to the lost-task rule and needs the Claude operator.
+  - There is no Esc mid-run scenario. It needs a harness hook that fires *during* a tool call (today's hooks fire
+    after one).
+
+**#176: a hand-submitted batch job is spend**
+- H The product detector and the grader detector are held to one shared 138-row corpus. Also covered: the notice per
+  outcome and the four spend graders. A regrade of all 684 stored bundles flips only `long_job_30m`'s ungated
+  `spend_follows_question`; none of the 681 stored questions changes class. Decline semantics and the human-sim are
+  unchanged from main.
+- L Normal flows only (×3). No scenario run submits a batch job.
+- **— Gaps:**
+  - An autonomous scenario on the fake cluster where the agent is authorised to submit a short `sbatch`. Check that
+    the notice appears and is relayed, and that the job is cancelled at the end. Free operators can run it.
+  - A persona scenario where the work exceeds the walltime and the agent must ask before submitting (human-sim; the
+    Claude operator or Hermes over ACP).
+  - `long_job_30m` (~20 min) not re-run.
+
 ## The order
 
 | # | Item | Area | Effort | Use |
