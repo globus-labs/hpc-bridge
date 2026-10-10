@@ -209,8 +209,10 @@ def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = No
     elif out.phase == "failed":
         rt.warm_confirmed_at = None
 
-# The facility's scale-in loop releases an idle block on its next pass AFTER the window (a strategy period, ~30 s),
-# so the clock-only presumption waits this much longer — a call just past the window may still find the block.
+# The facility's scale-in loop releases an idle block up to two passes AFTER the window (its idle timer starts on the
+# first pass that sees no task; the cancel comes on the first pass past it), so the clock-only presumption waits this
+# much longer — a call just past the window may still find the block. A pass is 5 s on the endpoints hpc-bridge
+# configures (facility/remote.py); a facility MEP's is its own and unknown here (the fake MEP's is 15 s), hence 60.
 _IDLE_GRACE_S = 60.0
 
 def _idle_window(app: AppCtx) -> int | None:
