@@ -92,7 +92,8 @@ def test_parse_probe_globus_uv_bootstrap_no_scratch_no_alloc():
     assert draft.interface == "enP7s7"  # lo excluded, single real NIC
     assert draft.partition == "main"  # only partition (default-marked)
     assert draft.scratch_root == "/home/{user}/.hpc-bridge"  # no $SCRATCH -> $HOME, user templated
-    assert "uv venv {venv}" in draft.env_setup and "uv pip install" in draft.env_setup  # uv-bootstrap
+    assert draft.env_setup == discovery._UV_ENV_SETUP  # the verified uv venv (tests/test_env_setup.py runs it)
+    assert 'uv venv -q "$__hb_venv"' in draft.env_setup and "uv pip install" in draft.env_setup
     assert draft.allocation_command is None and draft.allocation_parser is None
     joined = " ".join(notes)  # interface/env_setup/scratch flagged for confirmation
     assert "interface" in joined and "env_setup" in joined and "scratch_root" in joined
@@ -125,7 +126,7 @@ def test_parse_probe_flags_missing_toolchain_and_scheduler():
     j = " ".join(notes)
     assert "scheduler" in j and "sbatch" in j  # non-Slurm flagged
     # neither gce nor uv -> the self-provisioning line (install uv, then the endpoint), flagged for the user
-    assert "astral.sh/uv/install.sh" in draft.env_setup and "uv venv {venv}" in draft.env_setup
+    assert draft.env_setup == discovery._BOOTSTRAP_UV_ENV_SETUP and "astral.sh/uv/install.sh" in draft.env_setup
     assert any("module load" in n for n in notes)
 
 
@@ -185,7 +186,7 @@ def test_probe_script_looks_for_a_module_system():
 def test_parse_probe_prefers_the_sites_uv_module_over_the_curl_bootstrap():
     draft, notes = parse_probe(_LMOD, ssh_host="login")
     assert draft.env_setup.startswith("type module >/dev/null 2>&1 || . /etc/profile.d/lmod.sh; module load uv/0.12.9; ")
-    assert "uv venv {venv}" in draft.env_setup and "astral.sh" not in draft.env_setup
+    assert draft.env_setup.endswith(discovery._UV_ENV_SETUP) and "astral.sh" not in draft.env_setup
     assert any("module load uv/0.12.9" in n for n in notes)
 
 
@@ -193,8 +194,9 @@ def test_parse_probe_uses_a_python_module_matching_this_client():
     py = discovery._client_python()
     stdout = _LMOD.replace("MODULE=uv/0.12.9\n", "").replace("MODULE=uv/\n", "").replace("MODULE=python/3.11", f"MODULE=python/{py}")
     draft, notes = parse_probe(stdout, ssh_host="login")
-    assert f"module load python/{py}; [ -d {{venv}} ] || python3 -m venv {{venv}}" in draft.env_setup
-    assert "pip install -q" in draft.env_setup and "astral.sh" not in draft.env_setup
+    assert f'module load python/{py}; __hb_base="{{venv}}"; __hb_venv="$__hb_base-endpoint-' in draft.env_setup
+    assert 'python3 -m venv "$__hb_venv" && "$__hb_venv/bin/python" -m pip install -q' in draft.env_setup
+    assert "astral.sh" not in draft.env_setup
     assert any(f"python/{py}" in n and "matches this client" in n for n in notes)
 
 
@@ -219,3 +221,67 @@ def test_module_env_setup_reinitialises_module_for_batch_scripts():
     # Lmod's terse `avail` prints directory rows too ("uv/"): never `module load uv/`
     assert discovery._module_env_setup(["uv/", "python/"], "/etc/profile.d/lmod.sh") is None
     assert "module load uv/0.12.9;" in discovery._module_env_setup(["uv/", "uv/0.12.9"], None)[0]
+
+
+# ---- an existing install is checked, not trusted (globus1, 2026-10-10) ------------------------------------------
+
+def _with(stdout: str, **lines: str) -> str:
+    extra = "".join(f"{k}={v}\n" for k, v in lines.items())
+    return stdout.replace("HPCB_PROBE_END", extra + "HPCB_PROBE_END")
+
+
+def test_a_broken_install_on_path_is_passed_over_for_our_own_venv():
+    # the probe found a gce whose CLI fails at import (globus-sdk drifted under it): never propose activating it
+    out = _with(_ANVIL, GCE_STATE="ImportError: cannot import name 'X' from 'globus_sdk'")
+    draft, notes = parse_probe(out, ssh_host="anvil")
+    assert draft.env_setup == discovery._UV_ENV_SETUP  # uv is there: hpc-bridge's own, verified venv
+    env = next(n for n in notes if n.startswith("env_setup"))
+    assert "BROKEN" in env and "cannot import name 'X'" in env and "not used" in env
+
+
+def test_an_install_on_path_with_another_python_is_passed_over():
+    out = _with(_ANVIL, GCE_STATE="3.9 4.16.0")
+    draft, notes = parse_probe(out, ssh_host="anvil")
+    assert draft.env_setup == discovery._UV_ENV_SETUP
+    assert any("runs Python 3.9" in n and "not used" in n for n in notes)
+
+
+def test_a_working_install_on_path_is_used_and_its_version_named():
+    py = discovery._client_python()
+    draft, notes = parse_probe(_with(_ANVIL, GCE_STATE=f"{py} 4.13.0"), ssh_host="anvil")
+    assert draft.env_setup == "source /home/{user}/hpc-bridge/gce-venv/bin/activate"
+    assert any(f"globus-compute-endpoint 4.13.0 (Python {py}) already at" in n for n in notes)
+
+
+@pytest.mark.parametrize(("state", "says"), [
+    ("{py} {gce}", "is reused"),
+    ("{py} 4.13.0", "the first connect rebuilds it (that directory only)"),
+    ("3.12 {gce}", "the first connect rebuilds it (that directory only)"),
+    ("ModuleNotFoundError: No module named 'globus_compute_endpoint'", "is BROKEN (ModuleNotFoundError"),
+    ("not a venv", "is NOT a venv: hpc-bridge will not replace it"),
+])
+def test_the_proposal_says_what_happens_to_an_existing_hpc_bridge_venv(state, says):
+    py, gce = discovery._client_python(), discovery._gce_version() or "4.18.0"
+    if py == "3.12" and state.startswith("3.12"):
+        pytest.skip("that Python is this client's")
+    out = _with(_GLOBUS, VENV="/home/glabs/hpc-bridge/gce-venv", VENV_STATE=state.format(py=py, gce=gce))
+    _draft, notes = parse_probe(out, ssh_host="globus1")
+    env = next(n for n in notes if n.startswith("env_setup"))
+    assert "/home/glabs/hpc-bridge/gce-venv" in env and says in env, env
+
+
+def test_no_venv_no_note():
+    _draft, notes = parse_probe(_GLOBUS, ssh_host="globus1")
+    assert not any("hpc-bridge venv" in n for n in notes)
+
+
+def test_the_probe_checks_the_venv_the_bootstrap_will_use(monkeypatch):
+    monkeypatch.delenv("HPC_BRIDGE_REMOTE_VENV", raising=False)
+    monkeypatch.setattr(discovery, "_gce_version", lambda: "4.18.0")
+    monkeypatch.setattr(discovery, "_client_python", lambda: "3.13")
+    assert "V=/home/$(whoami)/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13\n" in discovery._probe_script()  # keyed
+    monkeypatch.setenv("HPC_BRIDGE_REMOTE_VENV", "/scratch/me/gce")
+    assert "V=/scratch/me/gce-endpoint-4.18.0-py3.13\n" in discovery._probe_script()
+    assert "@@VENV@@" not in discovery._probe_script()
+    assert "export PYTHONDONTWRITEBYTECODE=1" in discovery._PROBE  # the probe writes nothing, not even bytecode
+    assert ' version 2>&1' in discovery._PROBE and "import globus_compute_endpoint.cli" not in discovery._PROBE

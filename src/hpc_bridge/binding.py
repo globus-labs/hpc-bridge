@@ -263,6 +263,8 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
     machine not in the catalog. provenance="session"; never written to the shared index. Identity is
     defaulted from the id; the transfer endpoint is omitted (compute-only); the allocation block is
     set only when a listing command + a parser were given (else the human supplies the account)."""
+    from .discovery import migrate_env_setup
+
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)
@@ -286,7 +288,9 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
         compute=Compute(
             scheduler=details.scheduler,
             interface=details.interface,
-            env_setup=details.env_setup,
+            # a line discovery generated up to 0.1.22 (a cached facilities.json, never re-probed) becomes the current
+            # one; any other env_setup is used exactly as given
+            env_setup=migrate_env_setup(details.env_setup),
             scratch_root=details.scratch_root,
             endpoint_name=ep_name,
             amqp_port=details.amqp_port,

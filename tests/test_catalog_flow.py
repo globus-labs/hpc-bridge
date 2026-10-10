@@ -238,6 +238,25 @@ async def test_connect_facility_signals_reuse_when_endpoint_already_online(monke
     assert res.notice and "reused" in res.notice.lower()  # and narrated for the agent
 
 
+async def test_connect_facility_says_when_a_reused_endpoint_runs_its_old_environment(monkeypatch):
+    # an edited env_setup does not reach a reused endpoint's blocks (they run the one it was started with): the connect
+    # result says so and how to apply it, instead of the agent editing again after every failed block
+    from hpc_bridge import server
+
+    f = FakeFacility()
+    f.workers = 1
+    f.reused = True
+    f.worker_init_note = "this endpoint runs with the environment it was started with: teardown_endpoint, then … "
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, MYBALANCE, ""))
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")])
+    )
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: f)
+
+    res = await server._connect_facility(app, "anvil")
+    assert "runs with the environment it was started with" in (res.notice or "")
+
+
 async def test_connect_facility_unknown_returns_needs_facility_details(monkeypatch):
     # Not in the catalog -> the Socratic fallback: ask for the facility's config via details=,
     # not a dead-end. (The agent then elicits and calls again with details.)

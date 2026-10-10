@@ -224,6 +224,11 @@ async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elaps
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
         return notice
     suffix = status[1] if status else ""
+    note = getattr(app.facility, "worker_init_note", "")
+    if status and status[0] == "finished" and isinstance(note, str) and note:
+        # a worker that died on a REUSED endpoint whose env_setup was edited: the blocks run the endpoint's own one,
+        # so editing it again changes nothing — say so instead of letting the agent loop on the edit
+        suffix += " " + note.rstrip()
     return f"{notice} {suffix}" if suffix else notice
 
 

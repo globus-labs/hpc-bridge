@@ -67,14 +67,24 @@ To make a cluster available to everyone, add it to the registry: see
 
 Read-only first: the probe runs a short shell script on the login node that prints the hostname, which
 scheduler is present (`sbatch` or `qsub`), the partitions or queues, the network interfaces, the scratch
-variables, and whether `uv` and Globus Compute are already installed. Nothing is written.
+variables, and whether `uv` and Globus Compute are already installed (and whether an install it finds
+actually works). Nothing is written.
 
 Then, only after you confirm the proposed settings, the bootstrap installs `uv` if needed and creates a
-Python environment at `~/hpc-bridge/gce-venv` in your home directory there with `globus-compute-endpoint`
-in it, writes the endpoint's configuration under `~/.globus_compute/hpc-bridge-<host>/`, copies a trimmed
-Globus token store there (mode 600) so the endpoint can register, and starts the endpoint. The process you
-will see in `ps` is `globus-compute-endpoint`; it stays running on the login node between sessions so the
-next connect needs no SSH. If your facility's policy forbids persistent user processes on login nodes, ask
-the agent for a *teardown* at the end of each session; it stops and removes the endpoint. To remove
-everything, tear down, then delete `~/hpc-bridge/` and `~/.globus_compute/` there.
+Python environment with `globus-compute-endpoint` in it under `~/hpc-bridge/` in your home directory
+there (named for the endpoint version and Python, e.g. `gce-venv-endpoint-4.18.0-py3.13`), writes the endpoint's
+configuration under `~/.globus_compute/hpc-bridge-<host>/`, copies a trimmed Globus token store there
+(mode 600) so the endpoint can register, and starts the endpoint. The process you will see in `ps` is
+`globus-compute-endpoint`; it stays running on the login node between sessions so the next connect needs
+no SSH.
+
+Each time hpc-bridge starts the endpoint it checks that environment and rebuilds it if it is broken; a
+failed rebuild puts the old one back. A newer endpoint version or Python gets a new environment beside the
+old ones, which are not deleted, since an endpoint may still be running from them; remove the ones you no
+longer use if your home quota is tight. Compute nodes only check the environment, and end the job with a
+message saying why when they cannot use it.
+
+If your facility's policy forbids persistent user processes on login nodes, ask the agent for a
+*teardown* at the end of each session; it stops and removes the endpoint. To remove everything, tear
+down, then delete `~/hpc-bridge/` and `~/.globus_compute/` there.
 

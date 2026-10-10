@@ -33,7 +33,10 @@ POSTCHECK_DELAY_S = 90     # the block's worker pool exits once its manager is g
 
 MIDRUN_HOOKS = [
     {"name": "kill_manager", "after_tool": "poll_task", "nth": 1,
-     "cmd": "$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped"},
+     # the endpoint's venv is keyed by version (gce-venv-endpoint-<gce>-py<X.Y>); plugins up to 0.1.22 used gce-venv
+     "cmd": ('"$(ls -d "$HOME"/hpc-bridge/gce-venv-endpoint-*/bin/globus-compute-endpoint '
+             '"$HOME"/hpc-bridge/gce-venv/bin/globus-compute-endpoint 2>/dev/null | head -n 1)" '
+             "stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped")},
 ]
 
 

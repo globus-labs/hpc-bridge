@@ -37,7 +37,7 @@ from ..state import EndpointRecord, LoginNodeStore
 
 if TYPE_CHECKING:
     from ..catalog.entry import CatalogEntry
-from .base import EndpointHandle
+from .base import EndpointHandle, endpoint_metadata
 
 # A Globus endpoint UUID — scopes the per-UEP pidfile-cleanup glob to one endpoint, and refuses to
 # build a remote glob from anything that isn't a plain UUID.
@@ -337,6 +337,18 @@ class MachineProfile:
     exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
 
 
+# The remote globus-compute-endpoint venv `{venv}` resolves to (HPC_BRIDGE_REMOTE_VENV overrides it). The env_setup
+# that discovery proposes keeps hpc-bridge's venvs beside it, one per endpoint version and Python
+# (`{venv}-<gce>-py<X.Y>`, discovery.keyed_venv), and builds or rebuilds only those.
+DEFAULT_REMOTE_VENV = "/home/{user}/hpc-bridge/gce-venv"
+
+# Prefixed to env_setup on every gce call: `1` on the bring-up calls (whoami, configure, start: the long bootstrap
+# timeout), `0` on the rest (list, stop, delete). The env_setup that discovery proposes builds a venv only on `1`, so
+# teardown's 30 s calls never start a build that gets killed half-way. A plain shell variable, NOT exported: the
+# manager `start` launches, and the blocks it submits, must not carry it.
+_ENV_REPAIR = "HPCB_ENV_REPAIR={}; "
+
+
 def profile_from_catalog_entry(
     entry: CatalogEntry,
     *,
@@ -355,7 +367,7 @@ def profile_from_catalog_entry(
     Substitution uses ``str.replace`` (not ``str.format``) so literal shell braces in ``env_setup``
     are left untouched.
     """
-    venv = venv or f"/home/{user}/hpc-bridge/gce-venv"
+    venv = venv or DEFAULT_REMOTE_VENV.replace("{user}", user)
 
     def _resolve(template: str) -> str:
         # Accept the plugin template ({user}/{venv}) AND the natural shell idiom ($USER/${USER}) —
@@ -411,16 +423,19 @@ class RemoteEndpointCLI:
         self.env_setup = env_setup
         self.remote_dir = remote_dir
 
-    async def _gce(self, *args: str, timeout: float = 120.0) -> tuple[int, str, str]:
-        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix()}globus-compute-endpoint "
+    async def _gce(self, *args: str, timeout: float = 120.0, repair: bool = False) -> tuple[int, str, str]:
+        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix(repair=repair)}globus-compute-endpoint "
                  + " ".join(shlex.quote(a) for a in args))
         return await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=timeout)
 
-    def _env_prefix(self) -> str:
+    def _env_prefix(self, *, repair: bool = False) -> str:
         """`<env_setup> && ` — or nothing when the entry has no env_setup (a bare `&& gce …` is a shell
-        syntax error; an Expanse probe with neither uv nor gce proposed "" — live 2026-09-04)."""
+        syntax error; an Expanse probe with neither uv nor gce proposed "" — live 2026-09-04). `repair` (the
+        bring-up calls) lets a self-provisioning env_setup build or rebuild its venv (`_ENV_REPAIR`)."""
         es = (self.env_setup or "").strip()
-        return f"{es} && " if es else ""
+        if not es:
+            return ""
+        return f"{_ENV_REPAIR.format(1 if repair else 0)}{es} && "
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Run a read-only command on the login node over SSH for facility discovery
@@ -432,7 +447,7 @@ class RemoteEndpointCLI:
         # Force --multi-user false (personal endpoint): the default auto-selects from
         # POSIX caps and can silently create an identity-mapping MEP — see endpoint.py.
         rc, out, err = await self._gce("configure", "--multi-user", "true" if multi_user else "false", name,
-                                       timeout=_BOOTSTRAP_SSH_S)
+                                       timeout=_BOOTSTRAP_SSH_S, repair=True)
         if rc != 0:
             msg = (err or out).strip()
             if "already" in msg.lower() or "configexists" in msg.lower():  # dir exists -> fine
@@ -574,7 +589,7 @@ class RemoteEndpointCLI:
         # …and the ADDRESS this connection reached ($SSH_CONNECTION's server field): routable by construction, it is
         # the pin when the node's own name is not (internal names — Midway's *.rcc.local, a `.int.` domain).
         inner = (
-            f"{self._env_prefix()}globus-compute-endpoint start {shlex.quote(name)} "
+            f"{self._env_prefix(repair=True)}globus-compute-endpoint start {shlex.quote(name)} "
             "--detach && echo HPCB_HOST=$(hostname -f) "
             "&& echo \"HPCB_ADDR=$(echo \"$SSH_CONNECTION\" | awk '{print $3}')\""
         )
@@ -754,8 +769,9 @@ class RemoteEndpointCLI:
         kept in `last_whoami_error` — seed_storage_db quotes them if it then finds a store it must not replace. Also
         notes the gce environment's python3 (`gce_python`): the interpreter seed_storage_db tries first to check
         whether a store holds tokens, since the login node's plain PATH may have none with sqlite3."""
-        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix()}{{ command -v python3 >/dev/null 2>&1 && "
-                 f'echo "{_PY_SENTINEL}$(command -v python3)"; globus-compute-endpoint whoami; }}')
+        inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix(repair=True)}"
+                 f'{{ command -v python3 >/dev/null 2>&1 && echo "{_PY_SENTINEL}$(command -v python3)"; '
+                 "globus-compute-endpoint whoami; }")
         rc, out, err = await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=_BOOTSTRAP_SSH_S)
         kept = []
         for line in (out or "").splitlines():
@@ -894,6 +910,35 @@ engine:
 """
 
 
+# Our template's worker_init line; its default literal is the endpoint's own worker_init as configured (one JSON
+# encoding from plugins up to 0.1.22, two since).
+_WORKER_INIT_LINE = re.compile(r"^\s*worker_init: \{\{ worker_init \| default\((.+)\) \}\}\s*$", re.M)
+
+
+def configured_worker_init(template: object) -> str | None:
+    """The worker_init an endpoint was configured with, read from its published UEP template (`get_endpoint_metadata`
+    → `user_config_template`), or None when that is not one of ours or cannot be read. A single-encoded value that is
+    itself a quoted JSON string would read as double-encoded; no generated line looks like that."""
+    if not isinstance(template, str):
+        return None
+    m = _WORKER_INIT_LINE.search(template)
+    if m is None:
+        return None
+    try:
+        value = json.loads(m.group(1))
+    except ValueError:
+        return None
+    if not isinstance(value, str):
+        return None
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            inner = json.loads(value)
+        except ValueError:
+            return value
+        return inner if isinstance(inner, str) else value
+    return value
+
+
 # ---------------------------------------------------------------- the facility
 
 
@@ -919,10 +964,41 @@ class SlurmFacility:
         # The catalog entry's `auth_method` ("ssh-key" | "mfa-otp"): the ops that MUST SSH (bootstrap, teardown)
         # consult it to raise the one-time-code handoff BEFORE a failing attempt, instead of after one.
         self.auth_method = auth_method
+        # The endpoint's own configured worker_init (adopt_endpoint), sent with every task in place of the profile's:
+        # its blocks keep the environment its manager was started with. None ⇒ unknown, the profile's is sent.
+        self.endpoint_worker_init: str | None = None
+        self.worker_init_note = ""  # set when the endpoint's own differs from this facility's env_setup
+        self._adopted: str | None = None
 
     @property
     def scratch_root(self) -> str | None:
         return self.profile.scratch_root
+
+    async def adopt_endpoint(self, endpoint_id: str) -> None:
+        """Learn the bound endpoint's own worker_init from its published template, once per endpoint (best-effort:
+        unreadable ⇒ the profile's is sent, as before). An edited env_setup does not reach a reused endpoint's blocks
+        — its manager and its UEP template still run the old one — so the note says how to apply it."""
+        if endpoint_id == self._adopted:
+            return
+        self._adopted, self.endpoint_worker_init, self.worker_init_note = endpoint_id, None, ""
+        try:
+            md = await endpoint_metadata(self._client_factory, endpoint_id)
+        except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback
+            return
+        own = configured_worker_init(md.get("user_config_template"))
+        if own is None:
+            return
+        self.endpoint_worker_init = own
+        if own != self.profile.worker_init:
+            self.worker_init_note = (
+                "this endpoint runs with the environment it was started with (its env_setup differs from this "
+                "facility's): teardown_endpoint, then connect_facility, to apply the new one. ")
+
+    def dispatch_uec(self, uec: dict) -> dict:
+        """The config sent with a task: the endpoint's own worker_init when known (see adopt_endpoint)."""
+        if self.endpoint_worker_init is None or "worker_init" not in uec:
+            return uec
+        return {**uec, "worker_init": self.endpoint_worker_init}
 
     def config_template(self, hpc: Profile) -> tuple[str, dict]:
         """Return (jinja_template_str, default_user_opts) for the UEP template.
@@ -956,13 +1032,19 @@ class SlurmFacility:
             "@@PARTITION@@": json.dumps(p.partition),
             "@@ACCOUNT@@": json.dumps(p.account),
             "@@WALLTIME@@": json.dumps(p.walltime),
-            "@@WORKER_INIT@@": json.dumps(p.worker_init),
+            # Encoded twice, so the default reaches the YAML as a quoted scalar, as a sanitized UEC value does (a plain
+            # one breaks on the `: ` that a discovery-proposed env_setup contains). It is the fallback for a task whose
+            # config carries no worker_init; `configured_worker_init` reads it back (either encoding).
+            "@@WORKER_INIT@@": json.dumps(json.dumps(p.worker_init)),
             "@@EAGER@@": str(eager),
             "@@NODES@@": str(p.nodes_per_block),
             "@@MAXBLK@@": str(p.max_blocks),
         }
         for token, value in subs.items():
             template = template.replace(token, value)
+        # These ride every task's user_endpoint_config. `worker_init` is the profile's here; `dispatch_uec` sends the
+        # endpoint's OWN configured one instead once `adopt_endpoint` has read it (a reused endpoint keeps the
+        # environment it was started with).
         defaults: dict = {
             "interface": p.interface,
             "partition": p.partition,

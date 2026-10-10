@@ -18,7 +18,51 @@
   compute:
     scheduler: slurm
     interface: ib0
-    env_setup: 'export PATH="$HOME/.local/bin:$PATH"; command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; [ -d {venv} ] || uv venv {venv} --python 3.13; . {venv}/bin/activate; command -v globus-compute-endpoint >/dev/null 2>&1 || uv pip install -q "globus-compute-endpoint==4.16.0"'
+    # discovery.uv_env_setup(python="3.13", gce="4.16.0", sdk="4.9.1", bootstrap=True), folded (`>-` joins the
+    # lines with one space; tests/test_env_setup.py checks it is exactly that). hpc-bridge's venv here is
+    # {venv}-endpoint-4.16.0-py3.13: checked each time hpc-bridge starts the endpoint and built when it fails;
+    # compute workers only check it. A plugin up to 0.1.22 reading this line keeps the unkeyed {venv} it used.
+    # globus-sdk 4.9.1: what a fresh gce 4.16.0 venv resolved on 2026-10-10, and its entry point runs with it; a full
+    # Expanse run on it is not yet proven (the next re-prove covers it). The registry changes only when this seed is
+    # ingested again.
+    env_setup: >-
+      export PATH="$HOME/.local/bin:$PATH"; __hb_base="{venv}"; __hb_venv="$__hb_base-endpoint-4.16.0-py3.13";
+      __hb_runs() { "$1/bin/globus-compute-endpoint" version >/dev/null 2>&1; }; __hb_free() { __hb_f="$1.$$"; while [
+      -e "$__hb_f" ]; do __hb_f="${__hb_f}x"; done; }; __hb_ok() { __hb_why=$("$1/bin/globus-compute-endpoint" version
+      2>&1) || { __hb_why=$(printf '%s\n' "$__hb_why" | tail -n 1); return 1; }; case $__hb_why in *"version: 4.16.0")
+      ;; *) __hb_why="it reports ${__hb_why##*: }, not 4.16.0"; return 1;; esac; "$1/bin/python" -c "import
+      sys;sys.exit(sys.version_info[:2]!=(3,13))" || { __hb_why="its python is not 3.13"; return 1; }; { uname -m
+      >"$1/.hpcb-arch"; } 2>/dev/null; return 0; }; __hb_undo() { if [ -n "$__hb_mine" ] && [ -e "$__hb_venv" ]; then
+      __hb_free "$__hb_venv.failed"; mv "$__hb_venv" "$__hb_f" && rm -rf "$__hb_f" 2>/dev/null; fi; [ -z "$__hb_old" ]
+      || [ -e "$__hb_venv" ] || mv "$__hb_old" "$__hb_venv"; rmdir "$__hb_venv.lock" 2>/dev/null; }; __hb_build() {
+      mkdir -p "${__hb_venv%/*}" || { echo "hpc-bridge: cannot create ${__hb_venv%/*}" >&2; return 1; }; __hb_n=0;
+      until __hb_e=$(mkdir "$__hb_venv.lock" 2>&1); do [ -d "$__hb_venv.lock" ] || { echo "hpc-bridge: cannot create
+      $__hb_venv.lock: ${__hb_e##*: }" >&2; return 1; }; [ -n "$(find "$__hb_venv.lock" -prune -mmin +15 2>/dev/null)"
+      ] && rmdir "$__hb_venv.lock" 2>/dev/null && continue; __hb_n=$((__hb_n+1)); [ "$__hb_n" -le 200 ] || { echo
+      "hpc-bridge: $__hb_venv.lock is held by another build; one older than 15 minutes is taken over automatically"
+      >&2; return 1; }; sleep 2; done; trap '' PIPE; __hb_old=; __hb_mine=; __hb_r=; if __hb_ok "$__hb_venv"; then
+      __hb_r=0; elif [ -e "$__hb_venv" ] && [ ! -f "$__hb_venv/pyvenv.cfg" ]; then echo "hpc-bridge: $__hb_venv exists
+      and is not a venv: move it away" >&2; __hb_r=1; else echo "hpc-bridge: building $__hb_venv ($__hb_why)" >&2;
+      __hb_nc=; trap '__hb_undo; exit 1' HUP INT TERM; if [ -e "$__hb_venv" ]; then __hb_free "$__hb_venv.old";
+      __hb_old=$__hb_f; __hb_nc=--no-cache; mv "$__hb_venv" "$__hb_old" || { echo "hpc-bridge: cannot move $__hb_venv
+      aside" >&2; __hb_old=; __hb_r=1; }; fi; if [ -z "$__hb_r" ]; then __hb_why=; __hb_mine=1; if { command -v uv
+      >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; } && uv venv -q "$__hb_venv" --python 3.13
+      && uv pip install -q --python "$__hb_venv/bin/python" $__hb_nc 'globus-compute-endpoint==4.16.0'
+      'globus-sdk==4.9.1' && __hb_ok "$__hb_venv"; then __hb_r=0; trap - HUP INT TERM; [ -z "$__hb_old" ] || rm -rf
+      "$__hb_old" 2>/dev/null; else __hb_r=1; echo "hpc-bridge: could not build globus-compute-endpoint 4.16.0 (Python
+      3.13) in $__hb_venv${__hb_why:+: $__hb_why}" >&2; __hb_undo; fi; fi; fi; trap - PIPE HUP INT TERM; rmdir
+      "$__hb_venv.lock" 2>/dev/null; return $__hb_r; }; if [ -n "${SLURM_JOB_ID:-}${PBS_JOBID:-}" ]; then if [ ! -e
+      "$__hb_venv" ] && __hb_runs "$__hb_base"; then __hb_venv=$__hb_base; else
+      "$__hb_venv/bin/globus-compute-endpoint" version >/dev/null || { echo "hpc-bridge: the endpoint venv $__hb_venv
+      (built on $(cat "$__hb_venv/.hpcb-arch" 2>/dev/null || echo unknown)) does not run on $(hostname) ($(uname -m));
+      see the error above" >&2; exit 1; }; fi; elif [ "${HPCB_ENV_REPAIR:-}" = 0 ]; then [ -x
+      "$__hb_venv/bin/globus-compute-endpoint" ] || { for __hb_d in "$__hb_base" $(find "${__hb_base%/*}" -maxdepth 1
+      -name "${__hb_base##*/}-endpoint-*" ! -name "*.old.*" ! -name "*.failed.*" ! -name "*.lock" 2>/dev/null | sort);
+      do __hb_runs "$__hb_d" && { __hb_venv=$__hb_d; break; }; done; [ -x "$__hb_venv/bin/globus-compute-endpoint" ]
+      || { echo "hpc-bridge: no working hpc-bridge venv beside $__hb_base (one is built when hpc-bridge starts the
+      endpoint)" >&2; false; }; }; elif [ "${HPCB_ENV_REPAIR:-}" = 1 ]; then __hb_ok "$__hb_venv" || __hb_build; else
+      __hb_ok "$__hb_venv" || { [ ! -e "$__hb_venv" ] && __hb_runs "$__hb_base" && __hb_venv=$__hb_base; } ||
+      __hb_build; fi && . "$__hb_venv/bin/activate"
     scratch_root: "/expanse/lustre/scratch/{user}/temp_project/.hpc-bridge"
     endpoint_name: hpc-bridge-expanse
   defaults:

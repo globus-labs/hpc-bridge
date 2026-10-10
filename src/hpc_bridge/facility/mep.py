@@ -5,7 +5,7 @@ import re
 import sys
 
 from ..profile import Profile
-from .base import EndpointHandle
+from .base import EndpointHandle, endpoint_metadata
 
 # Tokens a MEP entry's env_setup (→ worker_init) may carry; resolved at attach from the facility's
 # published metadata / this client. `{gce_version}` = the facility endpoint's own version (a worker
@@ -207,14 +207,11 @@ class MEPFacility:
         if self.schema is not None or self.endpoint_version is not None:
             return
         try:
-            md = await asyncio.to_thread(
-                lambda: self._client_factory().get_endpoint_metadata(self.endpoint_id)
-            )
+            md = await endpoint_metadata(self._client_factory, self.endpoint_id)
         except Exception as exc:  # noqa: BLE001 - metadata is a courtesy; the canary still decides
             self.template_notes.append(
                 f"facility template not readable ({type(exc).__name__}): sending the entry's config as-is")
             return
-        md = md or {}
         if self.max_idletime_s is None:  # a curated value wins; otherwise the facility's own template says
             self.max_idletime_s = _template_idle_s(md.get("user_config_template"))
         self.schema = md.get("user_config_schema") or None

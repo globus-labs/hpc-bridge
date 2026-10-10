@@ -13,7 +13,8 @@ KEY="${HPCB_TEST_SSH_KEY:-$HPCB_T_KEY_DEFAULT}"
 # host-side reach: globus1's FQDN, or the fake cluster's published sshd (localhost:port, unpinned host key)
 if [ "$TARGET" = fake ]; then HOST=localhost; SSH_EXTRA=(-p "${HPCB_FAKE_SSH_PORT:-2222}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR); else HOST="${HPC_BRIDGE_SSH_HOST:-globus1.cs.uchicago.edu}"; SSH_EXTRA=(); fi
 CLAIMS="${HPCB_POOL_CLAIMS_DIR:-$REPO_ROOT/agentic/runs/.pool-claims}"
-GCE='$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint'
+# the endpoint venvs are keyed by version (gce-venv-endpoint-<gce>-py<X.Y>); plugins up to 0.1.22 used gce-venv
+GCE='"$(ls -d "$HOME"/hpc-bridge/gce-venv-endpoint-*/bin/globus-compute-endpoint "$HOME"/hpc-bridge/gce-venv/bin/globus-compute-endpoint 2>/dev/null | head -n 1)"'
 REMOTE="for ep in \$(ls ~/.globus_compute/ 2>/dev/null | grep '^hpc-bridge-'); do $GCE stop \"\$ep\" >/dev/null 2>&1; $GCE delete \"\$ep\" --yes >/dev/null 2>&1; echo \"deleted \$ep\"; done; scancel -u \"\$(whoami)\" 2>/dev/null; n=\$(ls -d ~/.globus_compute/uep.* 2>/dev/null | wc -l); rm -rf ~/.globus_compute/uep.* 2>/dev/null; echo \"uep dirs removed: \$n\"; rm -f ~/.globus_compute/storage.db; echo \"token store removed\"; echo \"jobs left: \$(squeue -u \"\$(whoami)\" -h | wc -l)\""
 echo "sweeping $USER_@$HOST: all hpc-bridge-* endpoints + ALL uep.* dirs + ALL jobs of this user …"
 # The claim (flock) is HELD for the whole sweep: taking it in a throwaway check and releasing it before the ssh

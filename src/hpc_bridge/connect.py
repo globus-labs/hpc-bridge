@@ -273,7 +273,9 @@ async def _connect_facility(
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
         if block == "warm":
             _commit_proven_facility(app, facility)
-    reuse_note = login_note + _reuse_note(app, facility, app.state.reused, fac)
+    wi_note = getattr(fac, "worker_init_note", "")  # an edited env_setup that a reused endpoint does not run
+    reuse_note = (login_note + _reuse_note(app, facility, app.state.reused, fac)
+                  + (wi_note if isinstance(wi_note, str) else ""))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities

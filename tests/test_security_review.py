@@ -229,14 +229,13 @@ def test_mcp_launch_is_locked():
 def test_remote_endpoint_install_is_pinned_to_the_sdk_version():
     from hpc_bridge import discovery
 
-    pin = discovery._gce_pin()
     try:
         from importlib.metadata import version
 
         expected = f"'globus-compute-endpoint=={version('globus-compute-sdk')}'"
     except Exception:  # noqa: BLE001 - hermetic env without the SDK
-        expected = "globus-compute-endpoint"
-    assert pin == expected and pin in discovery._UV_ENV_SETUP
+        expected = " globus-compute-endpoint "
+    assert expected in discovery._UV_ENV_SETUP
 
 
 # ---- the identity that landed is named (B-02) -------------------------------------------------------------------

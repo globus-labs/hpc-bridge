@@ -15,7 +15,10 @@ from __future__ import annotations
 
 import shlex
 
-GCE = "$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint"
+# hpc-bridge's endpoint venvs are keyed by version (`gce-venv-endpoint-<gce>-py<X.Y>`, discovery.keyed_venv); plugins
+# up to 0.1.22 used the unkeyed `gce-venv`. Any of them can stop/delete an endpoint: the first one present.
+GCE = ('"$(ls -d "$HOME"/hpc-bridge/gce-venv-endpoint-*/bin/globus-compute-endpoint '
+       '"$HOME"/hpc-bridge/gce-venv/bin/globus-compute-endpoint 2>/dev/null | head -n 1)"')
 
 
 def endpoint_uuid_cmd(endpoint_name: str) -> str:
