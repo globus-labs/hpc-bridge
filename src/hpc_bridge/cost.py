@@ -14,14 +14,68 @@ def estimate_spend(elapsed_s: float, nodes: int, charge_factor: float) -> float:
     return (elapsed_s / 3600.0) * nodes * charge_factor
 
 
-def cap_output(text: str, max_chars: int) -> str:
-    """Bound a stdout/stderr snippet (Globus has a hard 10 MB result limit)."""
-    if len(text) <= max_chars:
-        return text
-    dropped = len(text) - max_chars
-    return text[:max_chars] + (
-        f"\n…[truncated {dropped} chars; redirect verbose output to a file"
-        " and read it back in bounded chunks]"
+def _line_count(text: str) -> int:
+    """Lines as the SDK's `readlines()` counts them: one per newline, plus an unterminated last line."""
+    return text.count("\n") + (1 if text and not text.endswith("\n") else 0)
+
+
+def _n(count: int, unit: str) -> str:
+    """`1 line`, `2,001 lines`."""
+    return f"{count:,} {unit}" + ("" if count == 1 else "s")
+
+
+def cut_output(text: str, max_chars: int, *, stream: str = "output", sdk_lines: int | None = None) -> tuple[str, bool]:
+    """Bound one output stream for the agent: (the text to hand back, whether any of it was dropped).
+
+    Keeps the END: errors, tracebacks and summaries land there, and the SDK's own silent cut (`sdk_lines`, its
+    `snippet_lines`: past it only the last lines come back) keeps the end too, so the two compose into the true tail.
+    The kept part starts at a whole line when that still keeps half the cap; otherwise (a long line just before a
+    short last one: a one-line JSON result, then a trailer) it starts mid-line and says so. A cut is never silent: the
+    text opens with a marker line naming the stream and what was dropped — counted "at least" when the received text
+    is `sdk_lines` long, because the SDK may already have dropped lines it does not report."""
+    sdk_cut = sdk_lines is not None and _line_count(text) >= sdk_lines
+    if len(text) <= max_chars and not sdk_cut:
+        return text, False
+    start = max(len(text) - max_chars, 0)
+    if start and text[start - 1] != "\n":  # mid-line: begin at the next whole line, if that keeps half the cap
+        nl = text.find("\n", start)
+        if nl >= 0 and len(text) - (nl + 1) >= max_chars // 2:
+            start = nl + 1
+    kept = text[start:]
+    n_kept, n_dropped = _line_count(kept), text.count("\n", 0, start)  # `start` chars precede the kept part
+    them = "it" if n_kept == 1 else "them"
+    least = "at least " if sdk_cut else ""
+    if start and text[start - 1] != "\n":  # the first kept line is shown from its middle
+        first = "starting mid-line" if n_kept == 1 else "the first starting mid-line"
+        shown = f"its last {_n(len(kept), 'char')} ({_n(n_kept, 'line')}, {first})"
+        was = "was" if start == 1 else "were"
+        gone = f"{least}{_n(start, 'char')} before {them} {was} dropped"
+    elif start:
+        shown = f"its last {_n(n_kept, 'line')} ({_n(len(kept), 'char')})"
+        was = "was" if n_dropped == 1 else "were"
+        gone = f"{least}{_n(n_dropped, 'line')} ({least}{_n(start, 'char')}) before {them} {was} dropped"
+    else:  # only the SDK's line limit cut it: how much it dropped is unknown
+        shown = f"its last {_n(n_kept, 'line')} ({_n(len(kept), 'char')})"
+        gone = (f"the worker returns at most {sdk_lines:,} lines, so earlier ones may have been dropped "
+                "(how many is unknown)")
+    return f"[hpc-bridge: {stream} too long — showing only {shown}; {gone}]\n{kept}", True
+
+
+def cut_streams(
+    stdout: str, stderr: str, max_chars: int, *, sdk_lines: int | None = None
+) -> tuple[str, str, str | None]:
+    """Bound both streams of a result: (stdout, stderr, the notice when either was cut, else None). The marker in a
+    cut stream says how much was dropped; the notice says how to read the whole output."""
+    out, out_cut = cut_output(stdout, max_chars, stream="stdout", sdk_lines=sdk_lines)
+    err, err_cut = cut_output(stderr, max_chars, stream="stderr", sdk_lines=sdk_lines)
+    cut = [name for name, was_cut in (("stdout", out_cut), ("stderr", err_cut)) if was_cut]
+    if not cut:
+        return out, err, None
+    return out, err, (
+        f"{' and '.join(cut)} too long for one result: only the end is kept (errors and summaries land there), "
+        "opening with a marker that says what was dropped. To read all of it, redirect it to a file on the "
+        "facility (`cmd > out.log 2>&1`; the file stays for later calls) and read it in ranges: `wc -l out.log`, "
+        "`head -n 100 out.log`, `sed -n '101,200p' out.log`, `tail -n 100 out.log`."
     )
 
 

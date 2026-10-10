@@ -3,7 +3,7 @@ from __future__ import annotations
 import re
 from typing import Literal
 
-from pydantic import BaseModel, Field, field_validator
+from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
 NodeHours = float
 
@@ -24,6 +24,9 @@ class ShellOutcome(BaseModel):
     # phase="running": poll for this task's result with poll_task(task_id). None for every other phase.
     task_id: str | None = None
     notice: str | None = None
+    # Internal, never serialized: a `failed` outcome the worker itself answered (a result over Compute's size limit:
+    # it ran the command) — a liveness proof, so warmth must not void the block's confirmation for it.
+    _worker_answered: bool = PrivateAttr(default=False)
 
 
 class EndpointStatus(BaseModel):
