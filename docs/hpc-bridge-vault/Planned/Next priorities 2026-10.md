@@ -93,6 +93,22 @@ Legend: **H** hermetic tests (mutation-checked), **L** live on the fake cluster,
     Claude operator or Hermes over ACP).
   - `long_job_30m` (~20 min) not re-run.
 
+### Validation runs, 2026-10-10 (after the overnight build)
+
+| Run | PR | Result |
+|---|---|---|
+| `stop_while_running` (Pi) | #175 | **OK**: the stop refused and named the live task; `down` once the task completed; no pilot left |
+| `block_reaped_resume` (Claude operator) | #173 | **not run**: the Claude subscription's weekly limit (resets 2026-10-12 21:00 CT). Run it before merging #173, or with API credits |
+| `happy_path` on **globus1** (Pi) | #173 | **blocked by the environment**: the pool user's `~/hpc-bridge/gce-venv` (py3.12) has a broken `globus_compute_endpoint` (ImportError), and `env_setup`'s `command -v globus-compute-endpoint` guard never repairs it. It needs that venv removed (the maintainer's call, on a shared cluster). The product follow-up: check that the install works and matches the pin, not just that a binary exists |
+| `long_output` (new, Pi) | #174 | the product held on all three checks: a marked tail of 666 lines with 49,334 dropped, ranges read whole, and 16.2 MB reported as "RAN… over the limit… exit code unknown". The cell failed on the model using `login_shell`; the prompt and grader were fixed |
+| `long_output` (new, Codex) | #174 | **OK** |
+| `hand_batch_job` (new, Pi) | #176 | **OK**: the real notice on "Submitted batch job 83"; the job was cancelled; nothing left on the cluster; the ungated `spend_follows_question` flagged the unasked submission |
+| `hand_batch_job` (new, Hermes) | #176 | **OK** (re-graded once a too-strict any-`ensure_endpoint_up` check was replaced by `no_compute_block`) |
+
+Found along the way, pre-existing and not fixed: a `run_shell` sent before `connect_facility` has finished answers
+with raw internals ("FileNotFoundError … endpoint.json", "configure failed: Traceback…"), not "connect a facility
+first".
+
 ## The order
 
 | # | Item | Area | Effort | Use |
