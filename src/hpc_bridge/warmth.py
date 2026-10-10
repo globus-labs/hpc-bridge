@@ -209,11 +209,16 @@ def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = No
     elif out.phase == "failed":
         rt.warm_confirmed_at = None
 
-# The facility's scale-in loop releases an idle block up to two passes AFTER the window (its idle timer starts on the
-# first pass that sees no task; the cancel comes on the first pass past it), so the clock-only presumption waits this
-# much longer — a call just past the window may still find the block. A pass is 5 s on the endpoints hpc-bridge
-# configures (facility/remote.py); a facility MEP's is its own and unknown here (the fake MEP's is 15 s), hence 60.
-_IDLE_GRACE_S = 60.0
+# How long past the idle window the clock waits before presuming the block gone. parsl's scaling pass cancels an idle
+# block up to two passes after the window (its idle timer starts on the first pass that sees no task; the cancel comes
+# on the first pass past the window), and each pass's own work (a squeue/sacct poll once a minute, the scancel itself)
+# delays the next. A pass is 5 s on endpoints configured since 2026-10 (facility/remote.py): 2 × 5 s + 5 s for that
+# work. Too LATE is the costly side: a call between the release and the presumption sends a canary, and a canary to a
+# released block makes the endpoint submit a new billed block before the user is asked. Too EARLY is the safe side,
+# and it happens where the pass is slower: an endpoint configured earlier and still running keeps 30 s (reuse never
+# rewrites its template), and a facility MEP sets its own (the fake MEP's is 15 s). There the presumption can come
+# before the release, which costs an extra spend question, never spend without one.
+_IDLE_GRACE_S = 15.0
 
 def _idle_window(app: AppCtx) -> int | None:
     """The idle-release window the clock may presume from: None when it is unknown, or when the facility holds its
@@ -225,12 +230,12 @@ def _idle_window(app: AppCtx) -> int | None:
 
 def _presumed_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, float] | None:
     """(why, released_at) when the shape's last confirmed block has, by the clock alone, been released by the
-    facility: no task for longer than its idle window, or older than its walltime. Decided WITHOUT submitting
-    anything — the only way to look (a canary) is itself a task, and a task on a released block starts a new
-    billed one. None when there is no such block, or while work may be on it: a task still running, or a
-    synchronous dispatch in flight. A finished but unpolled task counts from when it ended (`done_at`). The idle
-    check needs the last activity (warm_confirmed_at, voided by a failed dispatch); the walltime check needs only
-    the block's age."""
+    facility (or, on a slower scaling pass than ours, is about to be — see _IDLE_GRACE_S): no task for longer than its
+    idle window, or older than its walltime. Decided WITHOUT submitting anything — the only way to look (a canary) is
+    itself a task, and a task on a released block starts a new billed one. None when there is no such block, or while
+    work may be on it: a task still running, or a synchronous dispatch in flight. A finished but unpolled task counts
+    from when it ended (`done_at`). The idle check needs the last activity (warm_confirmed_at, voided by a failed
+    dispatch); the walltime check needs only the block's age."""
     if rt.block_since is None or rt.inflight:
         return None
     handles = [h for h in app.tasks.values() if h.shape == shape]
@@ -241,8 +246,8 @@ def _presumed_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, fl
     now = time.monotonic()
     idle = _idle_window(app)
     if idle and last is not None and now - last >= idle + _IDLE_GRACE_S:
-        return (f"the previous block idle-released (no task for ~{int(now - last)} s, past the "
-                f"{idle} s idle window)", last + idle)
+        return (f"the previous block has been idle-released, or is about to be (no task for ~{int(now - last)} s, "
+                f"past the {idle} s idle window)", last + idle)
     wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
     if wall and now - rt.block_since >= wall:
         return (f"the previous block reached its walltime ({rt.user_endpoint_config.get('walltime')})",
@@ -250,8 +255,9 @@ def _presumed_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, fl
     return None
 
 def _release_bound(app: AppCtx, rt: ShapeRuntime) -> float | None:
-    """The latest a block with no task of ours could have lived: its idle window after the last activity. None
-    when either is unknown (bill to now)."""
+    """The latest a block with no task of ours could have lived: its idle window after the last activity, plus the
+    grace (a slower scaling pass can outlive it by a few tens of seconds; the bill is an estimate). None when either is
+    unknown (bill to now)."""
     idle = _idle_window(app)
     if idle and rt.warm_confirmed_at is not None:
         return rt.warm_confirmed_at + idle + _IDLE_GRACE_S

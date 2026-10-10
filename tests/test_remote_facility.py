@@ -888,22 +888,18 @@ def test_rebind_points_cli_at_a_specific_host():
     assert cli.target.key_path == "k"  # other fields preserved
 
 
-def test_template_max_idletime_is_float_with_strategy_period():
+def test_template_max_idletime_is_float():
     f = SlurmFacility(_profile(), cli=None)
     tmpl, defaults = f.config_template(Profile(mode="interactive"))
     cfg = _render(tmpl, {**defaults, **shape_config("compute")})
     jsk = cfg["engine"]["job_status_kwargs"]
     assert isinstance(jsk["max_idletime"], float) and jsk["max_idletime"] == 600.0
-    assert jsk["strategy_period"] == 5
 
 
 @pytest.mark.parametrize("profile", [_profile, _pbs_profile], ids=["slurm", "pbs"])
 @pytest.mark.parametrize("shape", ["login", "compute"])
 def test_template_scaling_pass_is_5s_for_first_result_latency(profile, shape):
-    # A new user endpoint cannot scale out before its first scaling pass, one strategy_period after it starts, and a
-    # first SSH result starts two (login, then compute). At 30 s each paid ~30 s (UEP start → first scale-out 30.5 s
-    # fake cluster, 30.9–31.0 s globus1, vs ≤ 5 s sbatch → worker). Not a scheduler-load knob: parsl's Slurm/PBS
-    # providers poll at most every 60 s whatever the period. See the comment above remote._SLURM_TEMPLATE.
+    # the first scale-out waits one pass, paid twice per first SSH result (30 s → ~31 s each, measured 2026-10)
     f = SlurmFacility(profile(), cli=None)
     tmpl, defaults = f.config_template(Profile(mode="batch"))
     cfg = _render(tmpl, {**defaults, **shape_config(shape)})

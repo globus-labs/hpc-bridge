@@ -795,14 +795,9 @@ class RemoteEndpointCLI:
             return False
 
 
-# `strategy_period: 5` (both templates) is how often parsl's scaling pass runs; 5 s is Globus Compute's own default.
-# A new user endpoint cannot scale out before its first pass, which comes one period after it starts (parsl starts the
-# pass timer before the engine registers its executor), and a first SSH result starts two of them: the login shape,
-# then compute. At the 30 s this used to be, each paid ~30 s: UEP start → first scale-out measured 30.5 s on the fake
-# cluster and 30.9–31.0 s on globus1, against ≤ 5 s from sbatch to a worker answering (2026-10). The period is not the
-# scheduler query rate (parsl's Slurm/PBS providers run squeue/sacct/qstat at most every 60 s, a fixed
-# `status_polling_interval`), and idle-release still waits out `max_idletime`: the cancel lands within two passes of
-# the window, ~10 s instead of ~60.
+# `strategy_period: 5` (both templates; 30 until 2026-10): a new user endpoint scales out only on its first scaling
+# pass, one period after it starts, and a first SSH result pays that wait twice (login shape, then compute). It is not
+# the scheduler query rate (parsl polls Slurm/PBS at most every 60 s). warmth._IDLE_GRACE_S is sized to this period.
 _SLURM_TEMPLATE = """\
 engine:
   type: GlobusComputeEngine

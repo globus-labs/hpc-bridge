@@ -258,8 +258,10 @@ nothing left queued.
   Compute service (the host's `storage.db` identity), so the cluster is local but the control plane
   isn't: endpoints you create here show up in your Globus account (the drivers tear theirs down).
 - **Timing is not globus1's.** Block scheduling is instant (idle nodes, no queue), so "wait for the
-  queue" behaviour needs the saturation recipe above to reproduce; cold-start is ~1–2 min (UEP fork
-  + Parsl strategy period + worker import), not ARM-DGX-with-NFS timing.
+  queue" behaviour needs the saturation recipe above to reproduce. The first compute result takes
+  ≈ 40 s (pi operator, `happy_path`, 2026-10-09; 95–114 s while the endpoint template's Parsl
+  strategy period was 30 s rather than 5 s): UEP fork + one strategy pass per user endpoint (login
+  shape, then compute) + worker import. Not ARM-DGX-with-NFS timing.
 - **Version skew is possible:** the login node installs whatever `globus-compute-endpoint` PyPI
   serves (4.16.0 today) while the jail's SDK is lock-pinned (4.13.0). Pin it in `env_setup` if that
   ever bites (globus1's MEP seed does exactly this).

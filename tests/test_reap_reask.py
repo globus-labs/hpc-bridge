@@ -7,20 +7,35 @@ found dead by a check — the next call answers `needs_confirmation` with the re
 import time
 from concurrent.futures import Future
 
+import pytest
+
 from hpc_bridge import scheduler_ops
 from hpc_bridge.context import ShapeRuntime, TaskHandle
 from hpc_bridge.cost import _block_nodes
 from hpc_bridge.facility.local import LocalFacility
+from hpc_bridge.facility.remote import SlurmFacility
 from hpc_bridge.models import ShellOutcome
 from hpc_bridge.profile import Profile
 from hpc_bridge.runner import CanaryResult
 from hpc_bridge.server import AppCtx, _ensure_endpoint_up, _reset_session, _run_shell, _shape_runtime, _stop_endpoint
-from hpc_bridge.warmth import _apply_partition, _drop_compute_shape, _idle_window, _note_dispatch, _presumed_reaped
+from hpc_bridge.shapes import shape_config
+from hpc_bridge.warmth import (
+    _IDLE_GRACE_S,
+    _apply_partition,
+    _drop_compute_shape,
+    _idle_window,
+    _note_dispatch,
+    _presumed_reaped,
+)
 from tests.fakes import FakeFacility
+from tests.test_remote_facility import _pbs_profile, _render
+from tests.test_remote_facility import _profile as _slurm_profile
 from tests.test_server import _FakeRunner, _Res
 
 _OK = CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9")
 _TIMEOUT = CanaryResult(ok=False, error="timeout")
+# a scaling pass's own work (a squeue/sacct poll, the scancel) delays the next pass; the grace must leave room for it
+_PASS_WORK_S = 5.0
 
 
 async def _warm_app(facility=None):
@@ -289,6 +304,29 @@ async def test_just_past_the_idle_window_the_block_is_not_yet_presumed_gone():
     app, rt, _runner = await _warm_app()
     rt.warm_confirmed_at -= app.profile.max_idletime_s + 5
     assert _presumed_reaped(app, "compute", rt) is None
+
+
+@pytest.mark.parametrize("past_window", [20, 30, 59])
+async def test_once_a_5s_pass_has_released_the_block_the_reap_is_presumed_without_a_canary(past_window):
+    # a 5 s scaling pass has cancelled the block by ~idle+10; with the old 60 s grace these calls sent a canary to the
+    # released endpoint, which submitted a NEW billed block before the user was asked (review of 49a942a)
+    app, rt, runner = await _warm_app()
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + past_window
+    runner._canary = _TIMEOUT  # what a check would find: nothing answers
+    canaries, commands = runner.canaries, len(runner.commands)
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and out.block_state == "cold" and "idle-released" in out.notice
+    assert runner.canaries == canaries and len(runner.commands) == commands and rt.reap_kicked is False
+
+
+@pytest.mark.parametrize("profile", [_slurm_profile, _pbs_profile], ids=["slurm", "pbs"])
+def test_the_idle_grace_covers_two_scaling_passes_of_the_templates_we_write(profile):
+    # raise strategy_period in facility/remote.py and this fails until _IDLE_GRACE_S follows: a grace shorter than
+    # the release lag sends canaries to released blocks (each one a new billed block before the user is asked)
+    tmpl, defaults = SlurmFacility(profile(), cli=None).config_template(Profile())
+    for shape in ("login", "compute"):
+        period = _render(tmpl, {**defaults, **shape_config(shape)})["engine"]["job_status_kwargs"]["strategy_period"]
+        assert 2 * period + _PASS_WORK_S <= _IDLE_GRACE_S
 
 
 async def test_a_switch_is_refused_while_a_synchronous_command_runs():
