@@ -44,6 +44,7 @@ This vault has two halves:
 - Code reviews 2026-09-03 — round 1: [[Review 2026-09-03 — bugs]], [[Review 2026-09-03 — code quality]], [[Review 2026-09-03 — dependencies]]; round 2: [[Review 2 2026-09-03 — bugs]], [[Review 2 2026-09-03 — static analysis]], [[Review 2 2026-09-03 — code quality]]
 
 ## Planned — design notes (core built; deferred extras remain)
+- [[Next priorities 2026-10]] — **the ordered work list after the hackathon push**: 18 items for UX, stability and usefulness, cheapest-for-the-value first (strategy tick, output truncation, honest Esc/stop, walltime …), each with effort, usefulness and the code evidence
 - [[V1 release]] — **the plan of record** for the sprint (scope, tiers, what's ticked); reorient here when a task runs long
 - [[ACP interactive benchmark driver]] — the cross-harness benchmark's plan of record: the agent-agnostic ACP driver, the human-sim turn policy, trace sources per harness, the Claude-Code-over-ACP operator, the refined objective (like models through a variety of harnesses) and the ordered next steps
 - [[Facility self-description via Compute]] — scoping (2026-09-22): can facilities describe themselves through their multi-user endpoint instead of the external index? Measured: `get_endpoints(role="any")` lists every public MEP (57), metadata (template, schema, config) is readable for any UUID, nobody uses `description`; design = standard JSON-Schema keywords + an `x-facility` block, a login-shape MEP for dynamic probes, the index demoted to cache/fallback
