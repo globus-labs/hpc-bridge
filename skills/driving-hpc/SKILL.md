@@ -65,7 +65,7 @@ This is a *policy gate*: discovery surfaces the options + the budget, the human 
 
 - **The spend floor is enforced, not advisory.** A billed `compute` shape **without** `confirm_spend=True` returns `needs_confirmation` and starts **nothing**. Only set `confirm_spend=True` *after* surfacing the balance to the user — it is your acknowledgement on their behalf, not a default to sprinkle on.
 - **Gate, not interrogation:** the consequential, cost-bearing choices are gated — the **allocation** (only when there's a real choice), the partition, and the spend confirmation; walltime/nodes are sensible-defaulted. Don't prompt for the unambiguous (a single allocation → just use it).
-- **Headless fallback (can't prompt):** stay on `shape="login"` (free, read-only) rather than spend unattended; only auto-confirm a billed block in autonomous mode with an explicit budget signal.
+- **Headless fallback (can't prompt):** stay on `shape="login"` (free, read-only — and submit no batch job from it) rather than spend unattended; only auto-confirm a billed block or job in autonomous mode with an explicit budget signal.
 
 ## Running compute work
 
@@ -73,7 +73,9 @@ Once the block is up, run work through `run_shell(shape="compute")`. **Long work
 
 **A `poll_task` result of `failed` saying the task is ORPHANED** means the endpoint behind it went offline or was torn down — the result can never arrive, so stop polling; if that wasn't you, `connect_facility` again and re-run. (A merely cold or relaunching block still reads `running` — keep polling that.)
 
-**Never background/detach long work** (`setsid`, `nohup … &`, a trailing `&`) to "escape" a timeout — a detached process is *not* a Compute task, so the block idle-releases out from under it and the work dies (issue #21). Run it in the foreground and poll instead. For work that must outlast the block walltime, submit a real batch job (`sbatch`/`qsub`) and watch the scheduler with `run_shell(shape="login")`.
+**Never background/detach long work** (`setsid`, `nohup … &`, a trailing `&`) to "escape" a timeout — a detached process is *not* a Compute task, so the block idle-releases out from under it and the work dies (issue #21). Run it in the foreground and poll instead.
+
+**Work longer than one block's walltime:** checkpoint it and resume on the next block, or submit it as a batch job (`sbatch`/`qsub`, from the login node or — on a compute-only facility, where there is no login shape — from inside the block, if the site allows it). A batch job is **billed to the user's allocation exactly like a compute block**, wherever it is submitted from, so ask for the same spend confirmation first (allocation, partition, size, walltime), and only then submit. hpc-bridge neither counts nor cancels it: `stop_endpoint` leaves it running, so cancel it yourself (`scancel`/`qdel <jobid>`) when the user wants it stopped. (`srun` inside a block is a step of the block's own job, not a new one.)
 
 **One task per session.** A `session_id` whose task is still running is busy — issue the next command in a **different `session_id`** (or `poll_task` the running one first); two commands can't share one session's cwd/env at once.
 

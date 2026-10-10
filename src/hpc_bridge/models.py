@@ -1,11 +1,22 @@
 from __future__ import annotations
 
 import re
+from dataclasses import dataclass
 from typing import Literal
 
 from pydantic import BaseModel, Field, field_validator
 
 NodeHours = float
+
+
+@dataclass(frozen=True)
+class Submission:
+    """A scheduler job the agent's own command starts by hand (scheduler_ops._submission) — billed to the allocation,
+    never seen by the spend floor."""
+
+    command: str     # the first one: sbatch / qsub / salloc, or srun outside a block
+    calls: int       # how many submit calls the command line makes
+    own_exit: bool   # the line's exit code is that one submission's own answer (last, only, direct, not --wait)
 
 
 class ShellOutcome(BaseModel):
@@ -53,7 +64,8 @@ class EndpointStatus(BaseModel):
 
 class LoginShellResult(BaseModel):
     """Result of a read-only login-node command (facility discovery) — a separate channel
-    from the compute-block `ShellOutcome`: no block, no allocation, no session spend."""
+    from the compute-block `ShellOutcome`: no block, no allocation, no session spend (unless the
+    command itself submits a scheduler job, which bills the allocation; the notice says so)."""
 
     exit_code: int
     stdout: str = ""

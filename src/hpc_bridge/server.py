@@ -87,6 +87,7 @@ from .models import (
     LoginStatus,
     PreauthStatus,
     ShellOutcome,
+    Submission,
 )
 from .notices import (  # noqa: F401 - re-exported
     _GLOBUS_USERNAME_RE,
@@ -113,11 +114,13 @@ from .notices import (  # noqa: F401 - re-exported
     _no_account_notice,
     _orphaned_outcome,
     _running_outcome,
+    _scheduler_submit_notice,
     _shape_reject_outcome,
     _spend_floor_guidance,
     _submit_rejected,
     _submit_rejected_notice,
     _transient_dispatch_failure,
+    _with_submission_notice,
     _worker_notice,
 )
 from .profile import Profile
@@ -1117,6 +1120,7 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
             "with ZERO SSH (no re-auth), and it decides whether SSH is even needed. Don't reach for "
             "login_shell or a manual SSH before that. (Or pin one via HPC_BRIDGE_MACHINE=<id>.)",
         )
+    sub = await _detect_submission(command, "login")  # the same login node, over SSH: a job submitted here is billed
     try:
         rc, out, err = await login_exec(command)
     except Exception as exc:  # noqa: BLE001 - never crash the tool; report structurally
@@ -1125,6 +1129,8 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
         exit_code=rc,
         stdout=cap_output(out, app.max_output_chars),
         stderr_snippet=cap_output(err, app.max_output_chars),
+        notice=(_scheduler_submit_notice(sub, inside_block=False, phase="complete", exit_code=rc, stdout=out)
+                if sub else None),
     )
 
 
@@ -1132,7 +1138,9 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
 async def login_shell(command: str, ctx: Context) -> LoginShellResult:
     """Run a READ-ONLY command on the HPC login node over a FRESH SSH connection — the
     cold-start discovery escape hatch (`sinfo`, `sacctmgr`, `echo $SCRATCH`) for when no
-    endpoint exists yet. It provisions nothing, starts no scheduler job, costs no allocation.
+    endpoint exists yet. It provisions nothing and costs no allocation — unless the command itself
+    submits a scheduler job (sbatch/qsub/srun/salloc), which bills the allocation like a block and
+    needs the user's spend confirmation first.
 
     Prefer `run_shell(command, shape="login")` once an endpoint is up: that runs the same
     login-node command THROUGH the endpoint (over the network), avoiding a fresh SSH — which
@@ -1174,6 +1182,17 @@ async def _ready_session(
     return runner, session, rt
 
 
+async def _detect_submission(command: str, shape: str) -> Submission | None:
+    """The scheduler job `command` starts by hand (sbatch/qsub/salloc, or srun outside a block), or None. The spend
+    floor never sees one: the login shape is free, and from inside a block it is a new job beside the block. Worked
+    out BEFORE the command is dispatched (never between the submit and its poll handle), off the event loop and
+    outside app.lock, and never raising — recognising a submission must not fail or stall the command."""
+    try:
+        return await asyncio.to_thread(scheduler_ops._submission, command, inside_job=shape != "login")
+    except Exception:  # noqa: BLE001 - advisory: a lexer surprise leaves the outcome as it was
+        return None
+
+
 async def _run_shell(
     app: AppCtx, command: str, session_id: str = "default", shape: str = DEFAULT_SHAPE
 ) -> ShellOutcome:
@@ -1183,6 +1202,7 @@ async def _run_shell(
     runner, session, rt = ready
     counted: ShapeRuntime | None = rt  # the in-flight count _ready_session took, until it is handed back
     try:
+        sub = await _detect_submission(command, shape)  # before the submit: nothing awaits between submit and register
         wrapped = session_shell.wrap(command, session)
         fut = runner.submit(wrapped)  # submit; wait a bounded time OFF the lock, else hand back a handle
         try:
@@ -1191,10 +1211,10 @@ async def _run_shell(
             async with app.lock:
                 rt.inflight -= 1  # the handle takes over as the liveness signal, in the same locked step
                 counted = None
-                task_id = _register_task(app, shape, session_id, command, fut, runner.walltime)
+                task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, submission=sub)
                 out = _running_outcome(app, task_id, runner.walltime)
                 _note_dispatch(_shape_runtime(app, shape), out)  # the worker took our task -> it's alive
-                return out
+                return _with_submission_notice(out, sub, shape)
         except Exception as exc:  # noqa: BLE001 - translate ALL dispatch failures to a structured outcome
             out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
         else:
@@ -1203,7 +1223,7 @@ async def _run_shell(
             rt.inflight -= 1
             counted = None
             _note_dispatch(_shape_runtime(app, shape), out)
-            return _with_spend(app, out)
+            return _with_spend(app, _with_submission_notice(out, sub, shape))
     finally:
         if counted is not None:  # an exception escaped before the count was handed back (e.g. a cancelled call)
             counted.inflight -= 1
@@ -1275,8 +1295,10 @@ async def run_shell(
 
     `shape` picks the execution target on the same endpoint: "compute" runs on a
     scheduler block (heavy compute, billed, idle-released); "login" runs on the login
-    node via a LocalProvider (lightweight, no allocation). Sessions (cwd/env) persist
-    per session_id within a shape.
+    node via a LocalProvider (lightweight, no allocation). A batch job submitted from either shape
+    (sbatch/qsub/salloc, or srun from the login node) bills the allocation like a block, outside
+    hpc-bridge's tracking, so it needs the user's spend confirmation first. Sessions (cwd/env)
+    persist per session_id within a shape.
 
     LONG WORK: run it as a normal (foreground) command — do NOT background/detach it. A command
     still running past the sync-wait comes back phase="running" with a task_id; poll it with

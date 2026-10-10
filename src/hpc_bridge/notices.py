@@ -17,8 +17,9 @@ from .context import AppCtx, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _with_spend
 from .lifecycle import BlockState
 from .login import LoginStart
-from .models import ConnectFacilityResult, ShellOutcome
+from .models import ConnectFacilityResult, ShellOutcome, Submission
 from .runner import CanaryResult
+from .scheduler_ops import _submission_refused
 
 # sshd's own denial lines — the method list in parentheses is the tell (a bare "Permission denied" is
 # usually the remote filesystem: `mkdir … : Permission denied` on an over-quota home, found in review).
@@ -462,10 +463,63 @@ def _running_outcome(app: AppCtx, task_id: str, ceiling_s: float) -> ShellOutcom
         task_id=task_id,
         notice=(f"still running past the ~{int(SYNC_WAIT_S)}s sync-wait — it was NOT cut. Poll for its "
                 f"result with poll_task({task_id!r}). It runs up to ~{int(ceiling_s)}s (the block "
-                "walltime) then is killed (exit 124); submit a batch job for anything longer. The "
-                "block stays warm while it runs."),
+                "walltime) then is killed (exit 124); for anything longer, checkpoint and resume across blocks, or "
+                "submit a batch job (billed to the allocation like a block, so only with the user's spend "
+                "confirmation). The block stays warm while it runs."),
     )
     return _with_spend(app, out)
+
+def _scheduler_submit_notice(sub: Submission, *, inside_block: bool, phase: str, exit_code: int | None,
+                             stdout: str = "") -> str:
+    """What a command that started a scheduler job BY HAND (sbatch/qsub/salloc, or srun outside a block) did to the
+    user's allocation, worded for what the result can actually show: sbatch/qsub refused (only when the scheduler's
+    own answer is the line's exit code and no job receipt was printed), submitted, possibly submitted (a non-zero exit
+    of a longer line), or still running; srun/salloc, which wait for their job, still running or over. The spend floor
+    never saw it — the login shape is free, and from inside a block it is a new job beside the block. Advisory, never a
+    refusal: the user may have asked for exactly this job."""
+    command = sub.command
+    where = "from inside the compute block (a new job beside this block)" if inside_block else "from the login node"
+    confirm = "Like a block, it needs the user's spend confirmation first (allocation, partition, size, walltime)"
+    queued = "qstat -u $USER" if command == "qsub" else "squeue -u $USER"
+    cancel = "qdel" if command == "qsub" else "scancel"
+    untracked = ("hpc-bridge neither tracks nor stops it (session_spend does not count it; stop_endpoint does not "
+                 "cancel it)")
+    if command in ("sbatch", "qsub"):
+        if phase == "complete" and _submission_refused(sub, exit_code, stdout):
+            return (f"`{command}` here exited {exit_code} with no job id in its output, so the scheduler refused the "
+                    "job: none was created and nothing is billed. A batch job bills the user's allocation like a "
+                    "compute block — confirm that spend with the user (allocation, partition, size, walltime) before "
+                    "submitting again.")
+        if phase == "running":
+            did = (f"`{command}` here submits (or has already submitted) a scheduler job {where} — the command is "
+                   "still running")
+        elif exit_code in (0, None):
+            did = f"`{command}` here submitted a scheduler job {where}"
+        else:
+            did = (f"`{command}` here may have submitted scheduler jobs {where} (the command exited {exit_code}, which "
+                   f"is not the scheduler's answer alone — `{queued}` lists what was queued)")
+        return (f"{did}: an accepted job bills the user's allocation like a compute block, but {untracked}. {confirm}: "
+                f"if they have not given it, tell them about this job now. Cancel it with `{cancel} <jobid>` when it "
+                "is no longer wanted.")
+    if phase == "running":
+        return (f"`{command}` here is running as a scheduler job {where}: it bills the user's allocation like a "
+                "compute block while it holds its nodes, and hpc-bridge neither tracks nor stops it (stop_endpoint "
+                f"does not cancel it). {confirm}: if they have not given it, tell them now, and cancel it with "
+                f"`scancel <jobid>` (`{queued}` lists it) if it is not wanted.")
+    ended = ("has finished" if exit_code in (0, None)
+             else f"has ended (exit {exit_code}; if the scheduler refused it, nothing was billed)")
+    return (f"`{command}` here ran as a scheduler job {where} and {ended}: it billed the user's allocation like a "
+            "compute block for as long as it held its nodes, outside hpc-bridge's spend tracking (session_spend did "
+            f"not count it). {confirm}: if they had not given it, tell them it ran.")
+
+def _with_submission_notice(out: ShellOutcome, sub: Submission | None, shape: str) -> ShellOutcome:
+    """Append the submission notice to an outcome whose command RAN (complete or running) — run_shell's, or a
+    finished task's on poll_task. Never a refusal: the user may have asked for exactly this job."""
+    if sub is not None and out.phase in ("complete", "running"):
+        note = _scheduler_submit_notice(sub, inside_block=shape != "login", phase=out.phase, exit_code=out.exit_code,
+                                        stdout=out.stdout)
+        out.notice = f"{out.notice} {note}" if out.notice else note
+    return out
 
 def _shape_reject_outcome(notice: str) -> ShellOutcome:
     return ShellOutcome(phase="failed", block_state="cold", exit_code=None, notice=notice)

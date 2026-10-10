@@ -5,8 +5,9 @@
 Connecting, listing facilities, and logging in are free. Discovery on an SSH-bootstrap facility runs
 on a free login-node worker. The first thing that costs allocation is a compute block, and the agent
 asks before starting one: which partition, which allocation account where one is needed, and your
-confirmation. On a facility-run, compute-only endpoint there is no free tier at all, so the question
-comes at the first command.
+confirmation. A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way,
+from wherever it is submitted, so it asks before that too. On a facility-run, compute-only endpoint
+there is no free tier at all, so the question comes at the first command.
 
 ## What a block costs
 
@@ -33,8 +34,12 @@ orphaned rather than left to poll forever.
 
 A task cannot outlive its block. When the block's walltime expires (30 minutes on Expanse by
 default, 15 on Anvil's facility endpoint), the task is killed with exit code 124 and you get the output it produced up to
-then; hpc-bridge does not resubmit it. For work longer than a block, ask the agent to submit a batch job
-from the login node with `sbatch` or `qsub` and check on it later.
+then; hpc-bridge does not resubmit it. For work longer than a block, either have it checkpoint and resume
+on the next block, or ask the agent to submit a batch job with `sbatch` or `qsub` and check on it later:
+from the login node, or, on a facility-run endpoint (which has no login node), from inside the block where
+the site allows it. That job is billed to your allocation like a block, so the agent asks before
+submitting it; hpc-bridge does not count it in the session spend and a stop does not cancel it, so ask for
+it to be cancelled (`scancel` or `qdel`) when you no longer want it.
 
 ## Stopping
 

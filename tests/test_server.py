@@ -1903,3 +1903,201 @@ async def test_reaped_block_under_a_live_session_reasks_spend_then_recovers():
     assert out.phase == "complete" and out.block_state == "warm"
     assert "HPCB_REAP" in out.stdout and len(runner.commands) == 2
     assert rt.warm_since is not None        # a fresh clock for the new block
+
+
+# --- a scheduler job submitted by hand (2026-10-10) ------------------------------------------------------------------
+# A job submitted from the free login shape, or from inside a compute block (a new job beside it), bills the
+# allocation, yet the spend floor never sees it; the result says so. The shared corpus (tests/submission_corpus.py)
+# holds the commands — the harness grader is held to the same one.
+
+
+def test_scheduler_submission_matches_the_shared_corpus():
+    from hpc_bridge.scheduler_ops import _scheduler_submission
+    from tests.submission_corpus import CORPUS, KNOWN_LIMITS
+
+    for cmd, inside_job, want in CORPUS:
+        assert _scheduler_submission(cmd, inside_job=inside_job) == want, (cmd, inside_job)
+    for cmd, inside_job in KNOWN_LIMITS:  # documented misses: if one starts matching, move it into the corpus
+        assert _scheduler_submission(cmd, inside_job=inside_job) is None, cmd
+
+
+def test_scheduler_submission_is_linear_and_bounded():
+    import time
+
+    from hpc_bridge.scheduler_ops import _scheduler_submission
+
+    for cmd in ("echo " + "A" * 1_000_000 + " | base64 -d > f", 'echo "' + "A" * 1_000_000 + '" > f',
+                'echo "' + "$(" * 20_000, 'echo "' + "`a" * 20_000 + '"', '"$(' * 2_000 + "sbatch x" + ')"' * 2_000):
+        t0 = time.perf_counter()
+        _scheduler_submission(cmd)  # nesting past the depth cap is not analysed; nothing raises
+        assert time.perf_counter() - t0 < 1.0, cmd[:40]
+
+
+def _login_app(res, *, pending=False):
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", res, pending=pending)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    return app
+
+
+async def test_login_shape_submission_says_it_bills_and_is_not_tracked():
+    app = _login_app(_Res(0, "Submitted batch job 42\n", ""))
+    out = await _run_shell(app, "cd ~/x && sbatch job.sh", shape="login")
+    assert out.phase == "complete" and out.stdout.startswith("Submitted")  # never blocked: the user may have asked
+    assert "submitted a scheduler job from the login node" in out.notice and "bills the user's allocation" in out.notice
+    assert "stop_endpoint does not cancel it" in out.notice and "spend confirmation" in out.notice
+    assert "`scancel <jobid>`" in out.notice
+    out = await _run_shell(app, "qsub -q debug job.pbs", shape="login")
+    assert "`qdel <jobid>`" in out.notice
+    assert (await _run_shell(app, "squeue -u $USER; command -v sbatch", shape="login")).notice is None  # a mention
+
+
+async def test_a_refused_submission_says_no_job_was_created():
+    app = _login_app(_Res(1, "", "sbatch: error: invalid partition specified: nope"))
+    out = await _run_shell(app, "cd run && sbatch -p nope job.sh", shape="login")
+    assert "exited 1 with no job id" in out.notice and "none was created and nothing is billed" in out.notice
+    assert "Cancel" not in out.notice and "spend" in out.notice
+
+
+async def test_a_nonzero_exit_claims_a_refusal_only_when_it_is_the_schedulers_own_answer():
+    # Review round 2 (2026-10-10): the line's exit code is the scheduler's answer only when the submit is the LAST
+    # command, prints no receipt, and does not wait for the job — else jobs may well be queued and billing.
+    for res, cmd in (
+        (_Res(1, "Submitted batch job 41\nSubmitted batch job 42\n", "sbatch: error: QOSMaxSubmitJobPerUserLimit"),
+         "for f in a.sh b.sh c.sh; do sbatch $f; done"),                       # two queued, the third refused
+        (_Res(1, "Submitted batch job 42\n", ""), "sbatch job.sh; squeue -u $USER | grep -q RUNNING"),
+        (_Res(3, "", ""), "sbatch --wait job.sh"),                              # the JOB's exit code
+        (_Res(2, "", ""), "qsub -W block=true job.pbs"),
+        (_Res(1, "", ""), "sbatch job.sh && tail -1 out.log"),                  # the exit code may be tail's
+        (_Res(123, "Submitted batch job 41\nSubmitted batch job 42\n", "sbatch: error: QOSMaxSubmitJobPerUserLimit"),
+         "ls *.sh | xargs -n1 sbatch"),                                         # last, but receipts were printed
+        # dependency chains: the first job's id is CAPTURED (no receipt in stdout) and only the second is refused
+        (_Res(1, "", "sbatch: error: Job dependency problem"),
+         "JID=$(sbatch --parsable a.sh); sbatch --dependency=afterok:$JID b.sh"),
+        (_Res(1, "", "sbatch: error: QOSMaxSubmitJobPerUserLimit"),
+         "sbatch --parsable a.sh > a.jid && sbatch -d afterok:$(cat a.jid) b.sh"),
+        (_Res(1, "", "qsub: illegal -W value"), "J1=$(qsub a.pbs); qsub -W depend=afterok:$J1 b.pbs"),
+        (_Res(124, "", ""), "timeout 60 sbatch job.sh"),                          # 124 is timeout's, not sbatch's
+    ):
+        out = await _run_shell(_login_app(res), cmd, shape="login")
+        assert "nothing is billed" not in out.notice and "may have submitted" in out.notice, cmd
+        assert "lists what was queued" in out.notice and "Cancel it with" in out.notice, cmd
+
+
+async def test_a_job_receipt_in_the_output_means_a_job_may_exist():
+    # The one direct submit exited non-zero but printed a receipt: Slurm --parsable prints the bare id, PBS its job id.
+    out = await _run_shell(_login_app(_Res(1, "4242\n", "")), "sbatch --parsable job.sh", shape="login")
+    assert "nothing is billed" not in out.notice and "`squeue -u $USER` lists what was queued" in out.notice
+    out = await _run_shell(_login_app(_Res(1, "12345.pbs01.example.org\n", "")), "qsub job.pbs", shape="login")
+    assert "nothing is billed" not in out.notice and "`qstat -u $USER` lists what was queued" in out.notice
+    assert "`qdel <jobid>`" in out.notice
+    out = await _run_shell(_login_app(_Res(1, "", "")), "qsub job.pbs", shape="login")
+    assert "nothing is billed" in out.notice     # no receipt, the only submit, its own exit: refused
+
+
+async def test_login_shell_reads_the_receipt_too():
+    from hpc_bridge.server import _login_shell
+
+    class _Ssh(FakeFacility):
+        async def login_exec(self, command):
+            return (1, "Submitted batch job 9\n", "sbatch: warning: something")
+
+    res = await _login_shell(AppCtx(facility=_Ssh(), profile=Profile()), "sbatch job.sh")
+    assert "nothing is billed" not in res.notice and "may have submitted" in res.notice
+
+
+async def test_the_submission_is_recognised_before_the_command_is_dispatched(monkeypatch):
+    # Detection must not sit between the submit and its poll handle (a cancel there would orphan a running task).
+    from hpc_bridge import scheduler_ops
+
+    events = []
+    real = scheduler_ops._submission
+
+    def spy(command, **kw):
+        events.append("detect")
+        return real(command, **kw)
+
+    monkeypatch.setattr(scheduler_ops, "_submission", spy)
+    app = _login_app(_Res(0, "", ""), pending=True)
+    runner = app.runner_factory("fake-eid")
+    submit = runner.submit
+    runner.submit = lambda cmd: (events.append("submit"), submit(cmd))[1]
+    out = await _run_shell(app, "sbatch job.sh", shape="login")
+    assert out.phase == "running" and events == ["detect", "submit"]
+
+
+async def test_a_finished_srun_is_reported_in_the_past_without_a_cancel():
+    app = _login_app(_Res(0, "c001\n", ""))
+    out = await _run_shell(app, "srun -N1 hostname", shape="login")
+    assert "ran as a scheduler job from the login node and has finished" in out.notice
+    assert "it billed the user's allocation" in out.notice and "Cancel" not in out.notice
+
+
+async def test_compute_shape_sbatch_is_a_new_job_but_srun_is_the_blocks_own_step():
+    app = _login_app(_Res(0, "Submitted batch job 77\n", ""))
+    _confirm_slurm(app)  # the user approved a block, not a 48 h job beside it
+    out = await _run_shell(app, "sbatch -t 48:00:00 long.sh")  # shape omitted -> compute
+    assert "from inside the compute block (a new job beside this block)" in out.notice
+    assert "stop_endpoint does not cancel it" in out.notice
+    assert (await _run_shell(app, "srun -n 4 ./mpi_app")).notice is None
+
+
+async def test_login_shape_submission_still_running_keeps_both_notices():
+    app = _login_app(_Res(0, "", ""), pending=True)
+    out = await _run_shell(app, "srun -N1 ./long", shape="login")
+    assert out.phase == "running" and "poll_task" in out.notice
+    assert "`srun` here is running as a scheduler job" in out.notice and "`scancel <jobid>`" in out.notice
+    out = await _run_shell(_login_app(_Res(0, "", ""), pending=True), "sleep 60; sbatch x.sh", shape="login")
+    assert "submits (or has already submitted) a scheduler job" in out.notice   # not "submitted" while it runs
+
+
+async def test_poll_task_result_carries_the_submission_notice():
+    from hpc_bridge.server import _poll_task
+
+    app = _login_app(_Res(0, "", ""), pending=True)
+    runner = app.runner_factory("fake-eid")
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    out = await _run_shell(app, "sleep 300; sbatch long.sh", shape="login")
+    assert out.phase == "running"
+    runner.futures[0].finish(_Res(0, "Submitted batch job 7\n", ""))
+    done = await _poll_task(app, out.task_id)
+    assert done.phase == "complete" and "submitted a scheduler job from the login node" in done.notice
+    assert "`scancel <jobid>`" in done.notice
+
+
+async def test_login_shell_submission_carries_the_notice():
+    from hpc_bridge.server import _login_shell
+
+    class _Ssh(FakeFacility):
+        async def login_exec(self, command):
+            return (0, "Submitted batch job 42\n", "")
+
+    app = AppCtx(facility=_Ssh(), profile=Profile())
+    res = await _login_shell(app, "sbatch -A lab job.sh")
+    assert res.exit_code == 0 and "from the login node" in res.notice and "bills the user's allocation" in res.notice
+    assert (await _login_shell(app, "sinfo -h")).notice is None
+
+
+async def test_submission_notice_never_fails_the_command(monkeypatch):
+    from hpc_bridge import scheduler_ops
+
+    def boom(_command, **_kw):
+        raise RecursionError("pathological input")
+
+    monkeypatch.setattr(scheduler_ops, "_submission", boom)
+    out = await _run_shell(_login_app(_Res(0, "ok", "")), "sbatch job.sh", shape="login")
+    assert out.phase == "complete" and out.stdout == "ok" and out.notice is None
+
+
+def test_long_work_advice_puts_the_spend_on_a_batch_job():
+    from hpc_bridge.dispatch import failure_outcome
+    from hpc_bridge.notices import _running_outcome
+
+    mep = FakeFacility()
+    mep.supported_shapes = ("compute",)  # a compute-only facility: a batch job comes from inside the block, same rule
+    for fac in (FakeFacility(), mep):
+        notice = _running_outcome(AppCtx(facility=fac, profile=Profile()), "compute-1", 1780).notice
+        assert "checkpoint and resume" in notice and "only with the user's spend confirmation" in notice
+    assert "spend confirmation" in failure_outcome(TimeoutError(), "warm", 1000).notice

@@ -11,6 +11,8 @@
 
 > [!note] Long work is a *task*, not a detached process ([#21](https://github.com/globus-labs/hpc-bridge/issues/21))
 > Idle-release keys off **Compute-task activity**, not node CPU. A long *foreground* task keeps the block busy, so it runs to completion (retrieved via [[The MCP tools|poll_task]] once it outlives the sync-wait) and is never released mid-run — its ceiling is the **block walltime** (the worker kills it at ~that, exit 124), optionally capped by `HPC_BRIDGE_MAX_TASK_S`. A **detached** process (`nohup … &`) is *not* a Compute task, so the block idle-releases out from under it — the classic footgun. `session_spend` accrues across the whole run: a running task keeps the warm clock ticking (the [[Warmth, the canary & cold-start|canary is short-circuited]] while it holds the worker).
+>
+> Work longer than the walltime either checkpoints and resumes across blocks, or runs as a batch job — submitted from the login node, or, on a facility MEP (no login node), from inside the block where the site allows it. A batch job sits **outside all three nets**: billed to the allocation like a block, but never gated, never on the spend clock, never cancelled by `stop_endpoint`. It is the user's to approve and to cancel; the run_shell / login_shell result says so ([[Resource shapes & the spend floor#The spend floor|the floor's blind spot]]).
 
 `stop_endpoint` means **stop spending, not destroy the endpoint**: it `scancel`s the billed block over the **login endpoint (AMQP, no SSH)** and **leaves the manager online**, so the next session reuses it with zero SSH ([[Standing up the endpoint|SSH-once]]). It drops the billed (`compute`) shape (a later run re-provisions a fresh block) and keeps the login shape, the manager, and the [[state|pin]].
 

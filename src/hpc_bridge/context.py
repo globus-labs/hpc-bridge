@@ -19,6 +19,7 @@ from .catalog.entry import CatalogEntry
 from .facility.base import Facility
 from .lifecycle import EndpointState
 from .login import LoginFlow
+from .models import Submission
 from .profile import Profile
 from .runner import CanaryResult, GlobusRunner
 from .shapes import SHAPES
@@ -84,6 +85,8 @@ class TaskHandle:
     # When the future resolved (stamped by a done-callback), so a poll long after the task ended does not pass
     # for recent activity on the idle clock (0.1.18).
     done_at: float | None = None
+    # The scheduler job the command submits by hand, if any — so the result poll_task hands back says so (2026-10-10).
+    submission: Submission | None = None
 
 
 @dataclass
