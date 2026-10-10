@@ -63,6 +63,39 @@ async def test_run_submits_shellfunction_and_returns_result():
     assert len(ex.submitted) == 1  # one ShellFunction submitted
 
 
+def test_submit_asks_the_sdk_for_snippet_lines():
+    # The SDK's ShellFunction silently keeps only the LAST snippet_lines lines of each stream (default 1000).
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge.runner import SNIPPET_LINES
+
+    ex = FakeExecutor()
+    GlobusRunner("eid", executor_factory=lambda: ex).submit("cat big")
+    (fn,) = ex.submitted
+    assert fn.snippet_lines == SNIPPET_LINES
+
+
+def test_snippet_lines_keeps_a_full_result_under_computes_size_limit():
+    """The trade-off SNIPPET_LINES pins: the endpoint fails a task whose SERIALIZED result is over 10 MiB, and then
+    nothing comes back, exit code included. With both streams at the SDK's line limit, lines up to ~1.9 KB must fit
+    (one stream: ~3.8 KB). 16,001 lines failed at ~243 B — a JSONL dump or a verbose build log. Measured with the
+    serializer the endpoint uses, on a result shaped as the worker returns it."""
+    pytest.importorskip("globus_compute_sdk")
+    from globus_compute_sdk.sdk.shell_function import ShellResult
+    from globus_compute_sdk.serialize import ComputeSerializer
+
+    from hpc_bridge.runner import SNIPPET_LINES
+
+    limit = 10 * 1024 * 1024  # the endpoint's _RESULT_SIZE_LIMIT (engines/helper.py)
+    cmd = "w" * 3000  # the session wrapper around a command
+
+    def size(width, both):  # distinct strings: pickling one object twice would be memoised to one copy
+        out, err = (("o" * (width - 1) + "\n") * SNIPPET_LINES, ("e" * (width - 1) + "\n") * SNIPPET_LINES)
+        return len(ComputeSerializer().serialize_from_list(ShellResult(cmd, out, err if both else "", 0), ()))
+
+    assert size(1_900, both=True) < limit and size(3_800, both=False) < limit
+    assert size(2_000, both=True) > limit  # the documented ~1,940 B bound is the real one, not a loose guess
+
+
 def test_parse_canary_extracts_versions():
     from hpc_bridge.runner import _parse_canary
 

@@ -23,6 +23,7 @@ from .catalog.entry import CatalogEntry
 from .catalog.parsers import PARSERS
 from .context import AppCtx, _has_login_shape
 from .discovery import discover_facility_details
+from .dispatch import for_agent
 from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
 from .lifecycle import EndpointState, ensure_warm
 from .models import ConnectFacilityResult, FacilityDetails, validate_host
@@ -299,7 +300,7 @@ async def _connect_facility(
             phase="failed",
             facility=facility,
             notice=f"allocation discovery ({entry.allocation.command!r}) failed: "
-            f"{out.notice or out.stderr_snippet or out.phase}",
+            f"{out.notice or for_agent(out).stderr_snippet or out.phase}",  # its stderr, cut as run_shell's
         )
     allocations = PARSERS[entry.allocation.parser](out.stdout)
     return ConnectFacilityResult(

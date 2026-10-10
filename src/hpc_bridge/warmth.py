@@ -200,8 +200,9 @@ def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = No
     TTL. A dispatch FAILURE (transport timeout/error) means the worker may be gone, so void the
     confirmation to force a re-canary. A completed exit-124 is the worker ENFORCING the task ceiling
     (it answered — it's alive), so it no longer voids (the old timeout==124 heuristic is obsolete now
-    that a slow task returns a poll handle, not a 124 failure)."""
-    if out.phase in ("complete", "running"):
+    that a slow task returns a poll handle, not a 124 failure). A result too big to come back is the worker
+    answering too (it ran the command), so it refreshes rather than voids."""
+    if out.phase in ("complete", "running") or out._worker_answered:
         # `at`: when a polled task actually finished — the block's last proof of life, not the poll's time
         seen = time.monotonic() if at is None else at
         rt.warm_confirmed_at = seen if rt.warm_confirmed_at is None else max(rt.warm_confirmed_at, seen)
@@ -485,9 +486,9 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
     try:
         res = fut.result()  # done -> returns at once (or raises the task's own exception)
     except Exception as exc:  # noqa: BLE001 - shape a failed task exactly as execute() would
-        out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
+        out = dispatch.failure_outcome(exc, "warm")
     else:
-        out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
+        out = dispatch.complete_outcome(res, "warm")
     _note_dispatch(_shape_runtime(app, handle.shape), out, at=handle.done_at)
     return _with_spend(app, out)
 

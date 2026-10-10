@@ -169,6 +169,54 @@ async def test_connect_facility_brings_up_login_and_lists_allocations(monkeypatc
     assert res.reused is False  # fresh bootstrap by default
 
 
+async def _connect_with_login_result(monkeypatch, res):
+    from hpc_bridge import server
+
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, res)
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")])
+    )
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: f)
+    return await server._connect_facility(app, "anvil")
+
+
+async def test_connect_facility_parses_a_long_allocation_listing_whole(monkeypatch):
+    # the parser needs the header rule at the TOP: hpc-bridge's own consumers read the login-shape result uncut
+    from hpc_bridge.runner import MAX_OUTPUT_CHARS
+
+    rows = "".join(f"proj{i:05d}      CPU     10001.0      1014.9      214.4      {i}.5\n" for i in range(300))
+    listing = MYBALANCE + rows
+    assert len(listing) > MAX_OUTPUT_CHARS
+    res = await _connect_with_login_result(monkeypatch, _Res(0, listing, ""))
+    assert res.phase == "needs_account" and len(res.allocations) == 302
+    assert res.allocations[0].account == "cis250223" and res.allocations[-1].balance == 299.5
+
+
+async def test_connect_facility_allocation_failure_shows_the_end_of_a_long_stderr(monkeypatch):
+    # the failure notice is agent-facing: a long stderr is bounded to its marked end, where the error is
+    from hpc_bridge.runner import MAX_OUTPUT_CHARS
+
+    err = "".join(f"warning {i}\n" for i in range(5000)) + "mybalance: account database unreachable\n"
+    res = await _connect_with_login_result(monkeypatch, _Res(1, "", err))
+    assert res.phase == "failed" and res.notice
+    assert res.notice.endswith("mybalance: account database unreachable\n")
+    assert "[hpc-bridge: stderr too long" in res.notice and len(res.notice) < MAX_OUTPUT_CHARS + 400
+
+
+async def test_connect_facility_allocation_failure_marks_an_sdk_cut_stderr(monkeypatch):
+    # a stderr exactly the SDK's line limit long may be its silent tail even within the char cap: marked, as run_shell's
+    from hpc_bridge.runner import MAX_OUTPUT_CHARS, SNIPPET_LINES
+
+    err = "".join(f"w{i}\n" for i in range(SNIPPET_LINES))
+    assert len(err) < MAX_OUTPUT_CHARS
+    res = await _connect_with_login_result(monkeypatch, _Res(1, "", err))
+    assert res.phase == "failed" and res.notice
+    assert f"[hpc-bridge: stderr too long — showing only its last {SNIPPET_LINES:,} lines" in res.notice
+    assert "earlier ones may have been dropped" in res.notice
+
+
 async def test_connect_facility_signals_reuse_when_endpoint_already_online(monkeypatch):
     # #20: reattaching to an already-online endpoint (find_online_endpoint / status=running) must be
     # SURFACED — the result carries reused=True (a zero-SSH reconnect), not silently swallowed as it

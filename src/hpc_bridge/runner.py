@@ -70,6 +70,23 @@ def _parse_canary(stdout: str) -> tuple[str | None, str | None, str | None]:
     return None, None, None
 
 
+# How much of each output stream a tool result hands the AGENT, in characters: its end, cut by `dispatch.for_agent`
+# with a marker saying what was dropped (hpc-bridge's own consumers — the pilot probe, the allocation parsers — read
+# the uncut text). Sized for what hosts put in front of the model (2026-10): Claude Code moves an MCP result over
+# 50,000 chars to a file (its own Bash keeps ~30,000 inline) and Hermes spills one over 50,000; Codex middle-cuts
+# past ~10,000 tokens by default and Pi past 20 KiB. One full stream plus the JSON around it (~17,500) fits all
+# four; both streams full (~34,500) fit all but Pi, which marks its own cut and saves the rest.
+MAX_OUTPUT_CHARS = 16_000
+# The SDK's ShellFunction keeps only the LAST `snippet_lines` lines of each stream (default 1000) and says nothing, so
+# `cat` of a longer file came back as its tail, passing for the whole file. The worker's whole result must also stay
+# under Globus Compute's 10 MiB limit, measured AFTER serialization (~1.35x the text): over it the task fails and
+# nothing comes back, exit code included. At 2,001 lines a result fails only once its lines average ~3,880 bytes on
+# one stream, ~1,940 with both full (16,001 lines would fail at ~485 / ~243: JSONL, wide CSV, VCF, build logs).
+# The cost: output averaging under 8 chars a line comes back as its last 2,001 lines, under 16,000 chars. Text that
+# reaches the limit may be the SDK's cut, so it is marked ("at least"); the +1 keeps a `head -n 2000` unmarked.
+SNIPPET_LINES = MAX_OUTPUT_CHARS // 8 + 1
+
+
 def _escape_for_shellfunction(command: str) -> str:
     """ShellFunction runs cmd.format(**kwargs); double literal braces so arbitrary
     shell (brace groups, ${VAR}) survives the format pass as single braces."""
@@ -144,7 +161,7 @@ class GlobusRunner:
         retrieve it. This is what lets a long task outlive the client sync-wait as a poll handle."""
         from globus_compute_sdk import ShellFunction
 
-        fn = ShellFunction(_escape_for_shellfunction(command), walltime=self.walltime)
+        fn = ShellFunction(_escape_for_shellfunction(command), walltime=self.walltime, snippet_lines=SNIPPET_LINES)
         return self.executor().submit(fn)
 
     async def run(self, command: str):

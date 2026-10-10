@@ -96,7 +96,6 @@ class AppCtx:
     state: EndpointState = field(default_factory=EndpointState)
     scratch_root: str = "~/.hpc-bridge"
     charge_factor: float = 0.0
-    max_output_chars: int = 1_000_000
     shapes: dict[str, ShapeRuntime] = field(default_factory=dict)
     # Live long-task handles (phase="running") keyed by task_id. The future lives on the shape's
     # Executor; poll_task resolves it. Drained when the block goes away (swap/stop/connect/teardown).
