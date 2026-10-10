@@ -16,6 +16,7 @@ reproduced hermetically by the reviewer; the rest is marked.
 | 1 | Endpoint strategy tick 30 s → 5 s | UX | S | 5 |
 | 2 | `run_shell` output silently keeps only the last 1000 lines | stability | S | 4 |
 | 3 | Esc and stop stay honest: a cancelled call stays tracked; stop refuses mid-call; MEP teardown refuses a live task | stability | S (M with a chaos scenario) | 4 |
+| 3b | A block used only by short commands can idle-release mid-session unseen; the next command silently starts a new billed block (found reviewing #1) | stability | M | 4 |
 | 4 | `walltime=` on `ensure_endpoint_up` (a change re-asks spend) | usefulness | S | 4 (5 on Anvil/Delta) |
 | 5 | Close the hand-rolled `sbatch` spend-gate hole in the skill | stability | S | 3 |
 | 6 | A partition/account switch re-asks spend and releases the old block; a same-facility reconnect keeps live work | stability | S | 3 |
@@ -56,6 +57,17 @@ canary queues behind it and reads as a false reap, and a second command can clob
 `rt.inflight` (`server.py:687`, `:748`); the returning dispatch rebuilds the shape — refuse while a call is in flight.
 (c) MEP teardown clears live task handles (`warmth.py:186`) — reuse `_stop_mep`'s refusal. Open: should Esc *kill* the
 command? That needs a channel (a sentinel on the shared filesystem; none on a MEP) — L.
+
+**3b. Short commands and idle-release (proven in simulation, 2026-10-09).** parsl resets a block's idle timer only
+when a scaling pass finds a task outstanding (`strategy.py:228-229`), and a command that starts and finishes between
+passes is never seen — canaries included. So a block used only for short commands idle-releases `max_idletime` after
+the last pass that saw work, even mid-session, while hpc-bridge's own clock (reset by every dispatch) and its 45 s
+canary trust still call it warm: the next command goes out with no canary, parsl starts a NEW billed block, and the
+user is never re-asked. Simulated with parsl's real `Strategy` (0.2 s commands every ~40 s, 15-minute sessions):
+released mid-session in 68 % of sessions at a 5 s period (93 % at 30 s), 63 % inside the trust window. Commands of
+≥ 1 s are mostly seen at 5 s (9 %). Fix options: make the work visible (a fire-and-forget `sleep period+1` touch after
+a short command, if the block has a spare worker), or have hpc-bridge's clock count only work parsl must have seen
+(tasks longer than a pass) and re-ask early otherwise. Design first.
 
 **4. Walltime (verified).** The only agent knobs are `partition`/`account` (`server.py:309-334`); walltime is already
 a per-submit template variable, so `walltime=` validated against a cap (an `_apply_walltime` beside
