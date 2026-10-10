@@ -14,7 +14,7 @@
 | `authenticate` | `_authenticate` | the Globus login gate as a tool: arm a login (browser loopback / paste), wait, report `LoginStatus` |
 | `complete_login` | `_complete_login` | finish a paste-mode login with the one-time auth code |
 | `ensure_endpoint_up` | `_ensure_endpoint_up` | provision/probe; report warm via the canary; thread account/partition; surface pilot state, dispatch failures, the terminal NO ACCOUNT |
-| `run_shell` | `_run_shell` | dispatch a command to the warm block / login shape; hand back a poll handle past the sync-wait |
+| `run_shell` | `_run_shell` | dispatch a command to the warm block / login shape; hand back a poll handle past the sync-wait. The wrapper — like `poll_task`'s, `reset_session`'s and `login_shell`'s — returns `dispatch.for_agent(…)`: each stream cut to its marked end for the agent, while `_run_shell`'s own callers (`_login_runner`: the pilot probe, allocations, the stop's release) read it uncut ([[dispatch]]) |
 | `poll_task` | `_poll_task` | retrieve a long task's result; ORPHANED when its endpoint is gone |
 | `reset_session` | `_reset_session` | clear a session's cwd/env |
 | `stop_endpoint` | `_stop_endpoint` / `_stop_mep` | release the block over AMQP and leave the manager online (SSH), or drain honestly (MEP) |

@@ -1,14 +1,14 @@
 ---
 name: driving-hpc
 description: >-
-  How to drive HPC well through hpc-bridge. SSH is a one-time bootstrap: stand up (or reuse) a Globus Compute endpoint on the login node ONCE, then do everything — discovery AND compute — THROUGH the endpoint via run_shell, never a fresh SSH (which can force a re-auth on MFA facilities). Flow to bring up a node: select the machine (list_facilities → connect_facility, which brings up the free login shape and lists your allocations) → discover partitions via run_shell(shape="login") → present an allocation+partition+budget gate → provision the billed `compute` block with account and confirm_spend=True → wait by polling the scheduler (squeue on Slurm, qstat on PBS) through the endpoint. Persistent per-session shell; 10 MB result cap; a cold first call means a worker is still warming.
+  How to drive HPC well through hpc-bridge. SSH is a one-time bootstrap: stand up (or reuse) a Globus Compute endpoint on the login node ONCE, then do everything — discovery AND compute — THROUGH the endpoint via run_shell, never a fresh SSH (which can force a re-auth on MFA facilities). Flow to bring up a node: select the machine (list_facilities → connect_facility, which brings up the free login shape and lists your allocations) → discover partitions via run_shell(shape="login") → present an allocation+partition+budget gate → provision the billed `compute` block with account and confirm_spend=True → wait by polling the scheduler (squeue on Slurm, qstat on PBS) through the endpoint. Persistent per-session shell; long output comes back cut to its end, marked; a cold first call means a worker is still warming.
 ---
 
 # Driving HPC with hpc-bridge
 
 - You have a **persistent session shell**: `cd` and relative paths carry across turns — **and across blocks**: the working directory and exported variables live on the facility's shared filesystem, not on the node, so a new block after an idle release or walltime picks the session up where it was (files on node-local disk do not survive). Call `reset_session` for a clean slate.
 - A call may be **cold** on first use — `ensure_endpoint_up`/`run_shell` reporting `provisioning`/`cold_start` means a worker is still warming (a compute block may be allocating, Slurm or PBS); retry shortly.
-- Results are capped at ~10 MB: for verbose commands, redirect to a file and read it back in bounded chunks.
+- **Expect a command to be verbose? Redirect it to a file up front** (`cmd > out.log 2>&1`) and read ranges (`wc -l`, `head -n 100`, `sed -n '101,200p'`, `tail -n 100`): a result over Globus Compute's size limit fails outright and its exit code is lost, and long output that fits comes back cut to its end (~16,000 characters per stream), opening with a marker that says what was dropped — never read a cut result as the whole.
 
 ## SSH once, then work through the endpoint
 

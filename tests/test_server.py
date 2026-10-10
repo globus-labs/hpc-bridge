@@ -1,5 +1,7 @@
 from pathlib import Path
 
+import pytest
+
 from hpc_bridge import binding
 from hpc_bridge.lifecycle import EndpointState
 from hpc_bridge.profile import Profile
@@ -346,6 +348,74 @@ async def test_run_shell_warm_returns_complete_outcome():
     assert out.phase == "complete"
     assert out.exit_code == 0 and out.stdout == "hi\n"
     assert out.block_state == "warm"
+
+
+class _Ctx:  # the slice of an MCP Context a tool wrapper reads
+    def __init__(self, app):
+        self.request_context = type("_Req", (), {"lifespan_context": app})()
+
+    async def report_progress(self, *a, **k):
+        pass
+
+
+def _warm_app(stdout, stderr="", rc=0):
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(rc, stdout, stderr))
+    _confirm_slurm(app)
+    return app
+
+
+async def test_run_shell_tool_hands_the_agent_the_marked_end_and_keeps_the_internal_result_whole():
+    from hpc_bridge import server
+    from hpc_bridge.runner import MAX_OUTPUT_CHARS
+
+    long = "".join(f"row {i}\n" for i in range(1, 5001))  # ~38,900 chars: over the cap
+    app = _warm_app(long, "boom\n", rc=1)
+    internal = await _run_shell(app, "cat rows")
+    assert internal.stdout == long and internal.notice is None  # what the pilot probe / allocation parsers read
+    out = await server.run_shell("cat rows", _Ctx(app))
+    assert out.phase == "complete" and out.exit_code == 1
+    assert out.stdout.startswith("[hpc-bridge: stdout too long — showing only its last ")
+    assert out.stdout.endswith("row 5000\n") and len(out.stdout) < MAX_OUTPUT_CHARS + 200
+    assert out.stderr_snippet == "boom\n"
+    assert out.notice and out.notice.startswith("stdout too long for one result")  # reaches the agent
+
+
+@pytest.mark.parametrize("tool,impl,args", [
+    ("poll_task", "_poll_task", ("t1",)), ("reset_session", "_reset_session", ()),
+])
+async def test_poll_task_and_reset_session_tools_hand_the_agent_the_marked_end(monkeypatch, tool, impl, args):
+    from hpc_bridge import server
+
+    long = "".join(f"row {i}\n" for i in range(1, 5001))
+
+    async def fake(app, *a, **k):
+        return server.ShellOutcome(phase="complete", exit_code=0, stdout=long, block_state="warm")
+
+    monkeypatch.setattr(server, impl, fake)
+    out = await getattr(server, tool)(*args, ctx=_Ctx(object()))
+    assert out.stdout.startswith("[hpc-bridge: stdout too long") and out.stdout.endswith("row 5000\n")
+    assert out.notice and out.notice.startswith("stdout too long for one result")
+
+
+async def test_pilot_probe_reads_a_long_scheduler_history_uncut():
+    # PBS `qstat -x` keeps finished jobs for weeks; a reused endpoint's leftover pilots (271 = our own release) pass
+    # 16,000 chars at ~115 rows. A cut result's marker line read as a LIVE pilot turned "rejected" into "queued".
+    from hpc_bridge import scheduler_ops, server
+    from hpc_bridge.runner import MAX_OUTPUT_CHARS
+
+    rows = "".join(f"F {6200000 + i}.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov 271 Job run at Mon Oct 05 at 14:02 "
+                   "on (x3005c0s37b1n0:ncpus=64:ngpus=4) and finished\n" for i in range(130))
+    assert len(rows) > MAX_OUTPUT_CHARS
+    app = _warm_app(rows)
+    cat, _ = await scheduler_ops._pilot_status_over_login(app, "eid", 10_000, server._login_runner(app))
+    assert cat == "rejected"  # no live pilot, past the grace
+    died = rows + "F 6300000.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov 1 Job run and failed\n"
+    app = _warm_app(died)
+    cat, _ = await scheduler_ops._pilot_status_over_login(app, "eid", 10, server._login_runner(app))
+    assert cat == "finished"
 
 
 async def test_run_shell_cold_returns_cold_start():
@@ -1332,6 +1402,23 @@ def test_note_dispatch_refreshes_on_complete_and_voids_on_timeout(monkeypatch):
     assert rt.warm_confirmed_at == 999.0  # a real result refreshes liveness
 
 
+def test_note_dispatch_counts_a_result_too_big_to_return_as_the_worker_answering(monkeypatch):
+    # the worker ran the command; only its result was over Compute's size limit — not a lost worker
+    from globus_compute_sdk.errors import TaskExecutionFailed
+
+    import hpc_bridge.server as srv
+    from hpc_bridge.dispatch import failure_outcome
+    from hpc_bridge.server import ShapeRuntime
+
+    rt = ShapeRuntime(user_endpoint_config={})
+    rt.warm_confirmed_at = 5.0
+    monkeypatch.setattr(srv.time, "monotonic", lambda: 999.0)
+    srv._note_dispatch(rt, failure_outcome(TaskExecutionFailed("MaxResultSizeExceeded(12000000, 10485760)"), "warm"))
+    assert rt.warm_confirmed_at == 999.0
+    srv._note_dispatch(rt, failure_outcome(TaskExecutionFailed("parsl...WorkerLost: worker died"), "warm"))
+    assert rt.warm_confirmed_at is None  # any other remote failure still forces a re-canary
+
+
 async def test_concurrent_run_shell_serializes_runner_creation():
     # The lock must serialize provision + runner-swap: two run_shells racing on a fresh app
     # create exactly ONE runner (without it, both could see app.runner is None and double up).
@@ -1363,6 +1450,19 @@ async def test_login_shell_runs_on_ssh_facility():
 
     res = await _login_shell(AppCtx(facility=_SshFacility(), profile=Profile()), "sinfo -h")
     assert res.exit_code == 0 and "shared" in res.stdout
+
+
+async def test_login_shell_tool_hands_the_agent_the_marked_end():
+    from hpc_bridge import server
+
+    class _SshFacility(FakeFacility):
+        async def login_exec(self, command):
+            return (0, "".join(f"job {i}\n" for i in range(1, 5001)), "")
+
+    res = await server.login_shell("squeue", _Ctx(AppCtx(facility=_SshFacility(), profile=Profile())))
+    assert res.stdout.startswith("[hpc-bridge: stdout too long") and res.stdout.endswith("job 5000\n")
+    assert "at least" not in res.stdout  # SSH output: no SDK line limit before ours
+    assert res.notice and res.notice.startswith("stdout too long for one result")
 
 
 async def test_login_shell_unavailable_on_local_facility():
