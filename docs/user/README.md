@@ -23,7 +23,7 @@ discovers). [Facilities](facilities.md) has the table and the registered machine
 
 **What it is not, yet:** it moves command output, not files (use Globus Transfer or `scp` for results);
 Slurm and PBS are the supported schedulers; it is interactive, though you can submit batch jobs from the login
-node through it.
+node through it (billed to your allocation like a block, so the agent asks first).
 
 The developer documentation (design, internals, the tool reference) lives in the
 [vault](../hpc-bridge-vault/Home.md).

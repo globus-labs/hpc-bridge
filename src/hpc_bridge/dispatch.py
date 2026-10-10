@@ -95,8 +95,9 @@ def failure_outcome(exc: Exception, block_state: BlockState) -> ShellOutcome:
             block_state=block_state,
             exit_code=124,
             notice=(
-                "Command or endpoint timed out. Run ensure_endpoint_up and retry, "
-                "or move long-running work into a batch job."
+                "Command or endpoint timed out. Run ensure_endpoint_up and retry, or move long-running work "
+                "into a batch job (billed to the allocation like a block, so only with the user's spend "
+                "confirmation)."
             ),
         )
     if (over := _result_over_limit(exc)) is not None:

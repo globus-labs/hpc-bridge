@@ -86,6 +86,7 @@ from .models import (
     LoginStatus,
     PreauthStatus,
     ShellOutcome,
+    Submission,
 )
 from .notices import (  # noqa: F401 - re-exported
     _CLIENT_CANCELLED,
@@ -117,11 +118,13 @@ from .notices import (  # noqa: F401 - re-exported
     _released_under_outcome,
     _reserved_session_outcome,
     _running_outcome,
+    _scheduler_submit_notice,
     _shape_reject_outcome,
     _spend_floor_guidance,
     _submit_rejected,
     _submit_rejected_notice,
     _transient_dispatch_failure,
+    _with_submission_notice,
     _worker_notice,
 )
 from .profile import Profile
@@ -1227,18 +1230,25 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
             "with ZERO SSH (no re-auth), and it decides whether SSH is even needed. Don't reach for "
             "login_shell or a manual SSH before that. (Or pin one via HPC_BRIDGE_MACHINE=<id>.)",
         )
+    sub = await _detect_submission(command, "login")  # the same login node, over SSH: a job submitted here is billed
     try:
         rc, out, err = await login_exec(command)
     except Exception as exc:  # noqa: BLE001 - never crash the tool; report structurally
         return LoginShellResult(exit_code=1, notice=f"login_shell error: {type(exc).__name__}: {exc}"[:300])
-    return LoginShellResult(exit_code=rc, stdout=out, stderr_snippet=err)
+    return LoginShellResult(
+        exit_code=rc, stdout=out, stderr_snippet=err,
+        notice=(_scheduler_submit_notice(sub, inside_block=False, phase="complete", exit_code=rc, stdout=out)
+                if sub else None),
+    )
 
 
 @mcp.tool()
 async def login_shell(command: str, ctx: Context) -> LoginShellResult:
     """Run a READ-ONLY command on the HPC login node over a FRESH SSH connection — the
     cold-start discovery escape hatch (`sinfo`, `sacctmgr`, `echo $SCRATCH`) for when no
-    endpoint exists yet. It provisions nothing, starts no scheduler job, costs no allocation.
+    endpoint exists yet. It provisions nothing and costs no allocation — unless the command itself
+    submits a scheduler job (sbatch/qsub/srun/salloc), which bills the allocation like a block and
+    needs the user's spend confirmation first.
 
     Prefer `run_shell(command, shape="login")` once an endpoint is up: that runs the same
     login-node command THROUGH the endpoint (over the network), avoiding a fresh SSH — which
@@ -1285,6 +1295,17 @@ async def _ready_session(
     return runner, session, rt
 
 
+async def _detect_submission(command: str, shape: str) -> Submission | None:
+    """The scheduler job `command` starts by hand (sbatch/qsub/salloc, or srun outside a block), or None. The spend
+    floor never sees one: the login shape is free, and from inside a block it is a new job beside the block. Worked
+    out BEFORE the command is dispatched (never between the submit and its poll handle), off the event loop and
+    outside app.lock, and never raising — recognising a submission must not fail or stall the command."""
+    try:
+        return await asyncio.to_thread(scheduler_ops._submission, command, inside_job=shape != "login")
+    except Exception:  # noqa: BLE001 - advisory: a lexer surprise leaves the outcome as it was
+        return None
+
+
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
     payload: Callable[[], str], *, agent_call: bool, reset: bool = False,
@@ -1313,11 +1334,15 @@ async def _dispatch_counted(
     submit is synchronous, so once anything was sent the future is in hand.)"""
     counted: ShapeRuntime | None = rt  # the in-flight count _ready_session took, until it is handed back
     fut: Any = None  # the SDK future, once sent
+    sub: Submission | None = None  # the scheduler job the command submits by hand, if any
 
     def tracked() -> bool:
         return rt.runner is runner and runner.endpoint_id == app.state.endpoint_id
 
     try:
+        # before the submit (a reset runs no command of the agent's): nothing awaits between the submit and
+        # its poll handle, and a cancel here propagates with nothing sent
+        sub = None if reset else await _detect_submission(command, shape)
         try:
             fut = runner.submit(payload())  # submit; wait a bounded time OFF the lock, else hand back a handle
             res = await asyncio.to_thread(fut.result, runner.timeout)
@@ -1337,10 +1362,11 @@ async def _dispatch_counted(
                     if not tracked():
                         return _released_under_outcome(app, None, runner.walltime)
                     task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, runtime=rt,
-                                             reset=reset)
+                                             reset=reset, submission=sub)
                     released = app.shapes.get(shape) is not rt
-                    out = _running_outcome(app, task_id, runner.walltime, reset=reset,
-                                           block_state="cold" if released else "warm")
+                    out = _with_submission_notice(
+                        _running_outcome(app, task_id, runner.walltime, reset=reset,
+                                         block_state="cold" if released else "warm"), sub, shape)
                     if released:  # released under the call: tracked, but don't revive the shape
                         return _released_under_outcome(app, out, runner.walltime)
                     _note_dispatch(rt, out)  # the worker took our task -> it's alive
@@ -1352,6 +1378,7 @@ async def _dispatch_counted(
         async with app.lock:
             rt.inflight -= 1
             counted = None
+            out = _with_submission_notice(out, sub, shape)  # the command ran (or may have): its job is spend
             if app.shapes.get(shape) is not rt:  # released under the call: say so, and don't revive the shape
                 sent = fut is not None and not fut.cancelled()
                 return _released_under_outcome(app, out, runner.walltime) if sent else _with_spend(app, out)
@@ -1363,7 +1390,7 @@ async def _dispatch_counted(
             counted = None
             if agent_call and fut is not None and not fut.done() and tracked():  # still running and reachable
                 _register_task(app, shape, session_id, command, fut, runner.walltime, client_cancelled=True,
-                               runtime=rt, reset=reset)
+                               runtime=rt, reset=reset, submission=sub)
         raise
     finally:
         if counted is not None:  # an exception escaped before the count was handed back
@@ -1462,8 +1489,10 @@ async def run_shell(
 
     `shape` picks the execution target on the same endpoint: "compute" runs on a
     scheduler block (heavy compute, billed, idle-released); "login" runs on the login
-    node via a LocalProvider (lightweight, no allocation). Sessions (cwd/env) persist
-    per session_id within a shape.
+    node via a LocalProvider (lightweight, no allocation). A batch job submitted from either shape
+    (sbatch/qsub/salloc, or srun from the login node) bills the allocation like a block, outside
+    hpc-bridge's tracking, so it needs the user's spend confirmation first. Sessions (cwd/env)
+    persist per session_id within a shape.
 
     LONG WORK: run it as a normal (foreground) command — do NOT background/detach it. A command
     still running past the sync-wait comes back phase="running" with a task_id; poll it with
