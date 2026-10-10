@@ -366,3 +366,40 @@ def test_the_canary_reports_the_workers_endpoint_version():
 
     out = "HPCB_CANARY\n3.13.12 0.3.9 a007\nHPCB_PARSL 2026.10.5\nHPCB_GCE 4.18.0\n"
     assert _parse_canary_tagged(out, _CANARY_GCE) == "4.18.0"
+
+
+def test_the_canary_reports_the_scheduler_job_it_ran_in():
+    # which BLOCK answered: after a block may have idle-released, the confirm's canary tells it from a new one
+    from hpc_bridge.runner import _CANARY_JOB, _parse_canary, _parse_canary_tagged
+
+    out = "HPCB_CANARY\n3.13.12 0.3.9 a007\nHPCB_PARSL 2026.10.5\nHPCB_GCE 4.18.0\nHPCB_JOB 4242\n"
+    assert _parse_canary(out) == ("3.13.12", "0.3.9", "a007")  # the version line is still found first
+    assert _parse_canary_tagged(out, _CANARY_JOB) == "4242"
+    assert _parse_canary_tagged("HPCB_JOB 77.polaris-pbs-01\n", _CANARY_JOB) == "77.polaris-pbs-01"
+    assert _parse_canary_tagged("HPCB_JOB \n", _CANARY_JOB) is None  # no scheduler job (a LocalProvider block)
+
+
+@pytest.mark.parametrize(("env", "job"), [({"SLURM_JOB_ID": "4242"}, "4242"), ({"PBS_JOBID": "77.pbs01"}, "77.pbs01"),
+                                          ({}, None)])
+def test_the_canary_command_names_the_job_under_the_shell_the_worker_uses(env, job):
+    # ShellFunction runs cmd.format(**kwargs) and then /bin/bash: the ${A:-${B:-}} braces must survive both
+    import os
+    import shutil
+    import subprocess
+
+    from hpc_bridge.runner import _CANARY_CMD, _CANARY_JOB, _parse_canary_tagged
+
+    bash = shutil.which("bash")
+    if bash is None:
+        pytest.skip("no bash")
+    base = {k: v for k, v in os.environ.items() if k not in ("SLURM_JOB_ID", "PBS_JOBID")}
+    cmd = _escape_for_shellfunction(_CANARY_CMD).format()
+    out = subprocess.run([bash, "-c", cmd], env={**base, **env}, capture_output=True, text=True, timeout=30).stdout
+    assert out.startswith("HPCB_CANARY") and _parse_canary_tagged(out, _CANARY_JOB) == job
+
+
+async def test_a_canary_answer_carries_the_job_into_the_result():
+    pytest.importorskip("globus_compute_sdk")
+    ex = _QueueExecutor(_CanaryFuture(result=_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 a000\nHPCB_JOB 4242\n")))
+    res = await GlobusRunner("eid", executor_factory=lambda: ex).canary(timeout=0.1)
+    assert res.ok and res.worker_job == "4242"

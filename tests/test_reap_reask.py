@@ -13,37 +13,38 @@ from hpc_bridge import scheduler_ops
 from hpc_bridge.context import ShapeRuntime, TaskHandle
 from hpc_bridge.cost import _block_nodes
 from hpc_bridge.facility.local import LocalFacility
-from hpc_bridge.facility.remote import SlurmFacility
 from hpc_bridge.models import ShellOutcome
 from hpc_bridge.profile import Profile
 from hpc_bridge.runner import CanaryResult
 from hpc_bridge.server import AppCtx, _ensure_endpoint_up, _reset_session, _run_shell, _shape_runtime, _stop_endpoint
-from hpc_bridge.shapes import shape_config
 from hpc_bridge.warmth import (
-    _IDLE_GRACE_S,
+    _CERTAIN_RELEASE_GRACE_S,
     _apply_partition,
     _drop_compute_shape,
     _idle_window,
+    _maybe_released,
     _note_dispatch,
     _presumed_reaped,
+    _release_bound,
 )
 from tests.fakes import FakeFacility
-from tests.test_remote_facility import _pbs_profile, _render
-from tests.test_remote_facility import _profile as _slurm_profile
 from tests.test_server import _FakeRunner, _Res
 
 _OK = CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9")
 _TIMEOUT = CanaryResult(ok=False, error="timeout")
-# a scaling pass's own work (a squeue/sacct poll, the scancel) delays the next pass; the grace must leave room for it
-_PASS_WORK_S = 5.0
 
 
-async def _warm_app(facility=None):
-    """A billed compute shape, spend confirmed, one command run on a warm block."""
+def _job(job):
+    """A canary answered from scheduler job `job` (None: the worker reported none)."""
+    return CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9", worker_job=job)
+
+
+async def _warm_app(facility=None, job=None):
+    """A billed compute shape, spend confirmed, one command run on a warm block (scheduler job `job`)."""
     f = facility or FakeFacility()
     f.workers = 1
     app = AppCtx(facility=f, profile=Profile())
-    runner = _FakeRunner("fake-eid", _Res(0, "ok", ""))
+    runner = _FakeRunner("fake-eid", _Res(0, "ok", ""), canary_result=_job(job) if job else None)
     app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
     rt = _shape_runtime(app, "compute")
     rt.spend_confirmed = True
@@ -299,34 +300,145 @@ def test_a_local_block_held_warm_never_idles_out():
     assert _idle_window(app) == app.profile.max_idletime_s
 
 
-async def test_just_past_the_idle_window_the_block_is_not_yet_presumed_gone():
-    # the facility releases on its next scale-in pass after the window, so a call right at the edge still checks
+async def test_just_past_the_idle_window_the_release_is_possible_but_not_certain():
+    # how soon after the window the facility releases depends on its scaling pass, which hpc-bridge cannot know
     app, rt, _runner = await _warm_app()
     rt.warm_confirmed_at -= app.profile.max_idletime_s + 5
-    assert _presumed_reaped(app, "compute", rt) is None
+    assert _presumed_reaped(app, "compute", rt) is None and _maybe_released(app, "compute", rt) is not None
 
 
-@pytest.mark.parametrize("past_window", [20, 30, 59])
-async def test_once_a_5s_pass_has_released_the_block_the_reap_is_presumed_without_a_canary(past_window):
-    # a 5 s scaling pass has cancelled the block by ~idle+10; with the old 60 s grace these calls sent a canary to the
-    # released endpoint, which submitted a NEW billed block before the user was asked (review of 49a942a)
+# -- past the idle window nothing is sent before spend is confirmed again (p01 review) --------------------------------
+# A canary to a block that has idle-released makes the endpoint submit a new billed block. When that happens depends on
+# the facility's scaling pass (5 s, 30 s on an older endpoint, a MEP's own), so from the window on the call asks first.
+
+async def test_past_the_idle_window_spend_is_asked_again_before_anything_is_sent():
     app, rt, runner = await _warm_app()
-    rt.warm_confirmed_at -= app.profile.max_idletime_s + past_window
-    runner._canary = _TIMEOUT  # what a check would find: nothing answers
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 1
+    runner._canary = _TIMEOUT  # what a check would find if the block were gone — and a check would kick a new one
+    since, warm_since, accrued = rt.block_since, rt.warm_since, rt.spend_accrued
     canaries, commands = runner.canaries, len(runner.commands)
+
     out = await _run_shell(app, "true")
-    assert out.phase == "needs_confirmation" and out.block_state == "cold" and "idle-released" in out.notice
-    assert runner.canaries == canaries and len(runner.commands) == commands and rt.reap_kicked is False
+    assert out.phase == "needs_confirmation" and out.block_state == "cold"
+    assert "has been or is about to be idle-released" in out.notice and "continues on the block" in out.notice
+    assert runner.canaries == canaries and len(runner.commands) == commands      # nothing submitted
+    assert rt.block_since == since and rt.warm_since == warm_since and rt.spend_accrued == accrued  # nothing banked
+    assert rt.reap_tentative is True and rt.reap_kicked is False and rt.spend_confirmed is False
 
 
-@pytest.mark.parametrize("profile", [_slurm_profile, _pbs_profile], ids=["slurm", "pbs"])
-def test_the_idle_grace_covers_two_scaling_passes_of_the_templates_we_write(profile):
-    # raise strategy_period in facility/remote.py and this fails until _IDLE_GRACE_S follows: a grace shorter than
-    # the release lag sends canaries to released blocks (each one a new billed block before the user is asked)
-    tmpl, defaults = SlurmFacility(profile(), cli=None).config_template(Profile())
-    for shape in ("login", "compute"):
-        period = _render(tmpl, {**defaults, **shape_config(shape)})["engine"]["job_status_kwargs"]["strategy_period"]
-        assert 2 * period + _PASS_WORK_S <= _IDLE_GRACE_S
+async def test_confirming_continues_on_the_same_block_when_its_job_answers():
+    app, rt, _runner = await _warm_app(job="101")
+    assert rt.block_job == "101"
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 1
+    since, warm_since, accrued = rt.block_since, rt.warm_since, rt.spend_accrued
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+
+    res = await _ensure_endpoint_up(app, confirm_spend=True)  # the block was still up: job 101 answers
+    assert res.status == "up" and res.block_state == "warm"
+    assert rt.block_since == since and rt.block_job == "101"                    # its walltime age kept
+    assert rt.warm_since == warm_since and rt.spend_accrued == accrued          # one continuous spend clock
+    assert rt.reaped is None and rt.reap_tentative is False
+    assert (await _run_shell(app, "true")).phase == "complete"
+
+
+async def test_confirming_after_the_release_bills_the_old_block_to_its_bound_and_starts_a_new_one():
+    app, rt, runner = await _warm_app(job="101")
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 1
+    since, warm_since = rt.block_since, rt.warm_since
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+
+    runner._canary = _job("202")  # a NEW block answered — the one this confirm brought up
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "up" and "did not answer a check" not in (res.notice or "")
+    assert rt.block_since > since and rt.block_job == "202"                      # the new block's own age
+    assert rt.warm_since > warm_since and rt.spend_accrued > 0                   # the old block's spend banked
+    assert rt.reaped is None and rt.reap_kicked is False and rt.spend_confirmed is True
+
+
+async def test_confirming_after_the_release_with_no_answer_is_a_consented_cold_start_not_a_kick():
+    app, rt, runner = await _warm_app(job="101")
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 1
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+
+    runner._canary = _TIMEOUT
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "provisioning"                                           # the confirmed block coming up
+    assert "did not answer a check" not in (res.notice or "") and "previous block" not in (res.notice or "")
+    assert rt.reaped is None and rt.reap_kicked is False and rt.spend_confirmed is True
+    assert rt.block_since is None and rt.block_job is None and rt.warm_since is None and rt.spend_accrued > 0
+
+
+@pytest.mark.parametrize(("old", "new"), [(None, "202"), ("101", None), (None, None)])
+async def test_an_unknown_job_id_counts_as_a_new_block_but_keeps_the_older_age(old, new):
+    # the walltime presumption then errs early (a question), never late (a canary to a block past its walltime)
+    app, rt, runner = await _warm_app(job=old)
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 1
+    since, warm_since = rt.block_since, rt.warm_since
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+    runner._canary = _job(new)
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "up" and rt.block_since == since and rt.block_job == new
+    assert rt.warm_since > warm_since and rt.spend_accrued > 0                   # billed as a new block
+
+
+async def test_past_the_certain_grace_the_reap_is_certain_as_before():
+    app, rt, runner = await _warm_app(job="101")
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + _CERTAIN_RELEASE_GRACE_S + 1
+    canaries = runner.canaries
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and "the previous block idle-released" in out.notice
+    assert runner.canaries == canaries and rt.block_since is None and rt.block_job is None and rt.warm_since is None
+    assert rt.reap_tentative is False
+
+
+async def test_a_question_left_unanswered_past_the_certain_grace_ends_the_old_block_without_asking_twice():
+    app, rt, _runner = await _warm_app(job="101")
+    app.charge_factor = 1.0
+    now = time.monotonic()
+    rt.warm_since = rt.block_since = now - 3600
+    rt.warm_confirmed_at = now - (app.profile.max_idletime_s + 1)
+    rt.spend_accrued = 0.0
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+    assert rt.spend_accrued == 0.0  # tentative: nothing banked
+    rt.warm_confirmed_at -= 120  # the user came back two minutes later
+    last, warm_since = rt.warm_confirmed_at, rt.warm_since
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and "the previous block idle-released" in out.notice
+    assert rt.block_since is None and rt.reap_tentative is False
+    expected = (last + app.profile.max_idletime_s - warm_since) / 3600 * _block_nodes(rt, app)
+    assert abs(rt.spend_accrued - expected) < 0.01                                # banked to the release, not now
+    res = await _ensure_endpoint_up(app, confirm_spend=True)                      # one confirmation is enough
+    assert res.status == "up" and rt.spend_confirmed is True
+
+
+async def test_the_release_bound_counts_an_unpolled_tasks_end():
+    app, rt, _runner = await _warm_app()
+    now = time.monotonic()
+    rt.warm_confirmed_at = now - 1300                 # the long task's dispatch
+    fut: Future = Future()
+    fut.set_result(None)
+    app.tasks["t1"] = TaskHandle(future=fut, shape="compute", session_id="default", command="sleep 1200",
+                                 submitted_at=now - 1300, ceiling_s=3600.0, done_at=now - 100)
+    assert _release_bound(app, "compute", rt) == now - 100 + app.profile.max_idletime_s + _CERTAIN_RELEASE_GRACE_S
+
+
+@pytest.mark.parametrize("past_window", [0, 1, 5, 12, 30, 59, 61, 600])
+async def test_nothing_is_sent_past_the_idle_window_until_spend_is_confirmed_again(past_window):
+    app, rt, runner = await _warm_app(job="101")
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + past_window
+    runner._canary = _TIMEOUT
+    canaries, commands = runner.canaries, len(runner.commands)
+    for _ in range(2):  # the call that finds it, and the one after
+        assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+        assert (await _ensure_endpoint_up(app)).status == "needs_confirmation"
+    assert runner.canaries == canaries and len(runner.commands) == commands
+    await _ensure_endpoint_up(app, confirm_spend=True)
+    assert runner.canaries > canaries  # only now, with the user's confirmation (+ the login shape's pilot probe)
 
 
 async def test_a_switch_is_refused_while_a_synchronous_command_runs():

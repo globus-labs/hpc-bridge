@@ -60,10 +60,15 @@ class ShapeRuntime:
     # `reap_told`: the agent has been handed that reason once — the call that detects a reap always answers
     # needs_confirmation, even if it carried confirm_spend=True, so the user is asked AFTER learning of the reap.
     # `reap_kicked`: the reap was found by a check (a task), which may already have asked for a new block.
+    # `reap_tentative`: the block is past its idle window and MAY be gone, so spend is asked again, but its age and
+    # spend clock are kept; the canary after the confirm decides, by `block_job` — the scheduler job id the block's
+    # canary reported when it was first confirmed warm (None: unknown).
     block_since: float | None = None
+    block_job: str | None = None
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
+    reap_tentative: bool = False
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0

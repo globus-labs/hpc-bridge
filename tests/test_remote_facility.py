@@ -16,6 +16,7 @@ from hpc_bridge.facility.remote import (
 )
 from hpc_bridge.profile import Profile
 from hpc_bridge.shapes import shape_config
+from hpc_bridge.warmth import _CERTAIN_RELEASE_GRACE_S
 
 
 def _profile():
@@ -903,7 +904,10 @@ def test_template_scaling_pass_is_5s_for_first_result_latency(profile, shape):
     f = SlurmFacility(profile(), cli=None)
     tmpl, defaults = f.config_template(Profile(mode="batch"))
     cfg = _render(tmpl, {**defaults, **shape_config(shape)})
-    assert cfg["engine"]["job_status_kwargs"]["strategy_period"] == 5
+    period = cfg["engine"]["job_status_kwargs"]["strategy_period"]
+    assert period == 5
+    # the clock takes an idle release as certain two of our slowest passes after the window (warmth)
+    assert 2 * period <= _CERTAIN_RELEASE_GRACE_S
 
 
 def test_template_idle_timeout_follows_profile():

@@ -797,7 +797,8 @@ class RemoteEndpointCLI:
 
 # `strategy_period: 5` (both templates; 30 until 2026-10): a new user endpoint scales out only on its first scaling
 # pass, one period after it starts, and a first SSH result pays that wait twice (login shape, then compute). It is not
-# the scheduler query rate (parsl polls Slurm/PBS at most every 60 s). warmth._IDLE_GRACE_S is sized to this period.
+# the scheduler query rate (parsl polls Slurm/PBS at most every 60 s). warmth._CERTAIN_RELEASE_GRACE_S assumes no
+# template of ours has a period over 30 s.
 _SLURM_TEMPLATE = """\
 engine:
   type: GlobusComputeEngine

@@ -18,6 +18,8 @@ class CanaryResult:
     # nothing publishes — the skew that ran Anvil's and Delta's blocks while dropping every result (2026-10-06)
     worker_parsl: str | None = None
     worker_gce: str | None = None  # the worker's globus-compute-endpoint (a `client` facility builds it at ours)
+    # the scheduler job (block) the worker runs in — tells a block that is still up from a new one (warmth)
+    worker_job: str | None = None
     error: str | None = None
     # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
     # while nobody was waiting; warmth is dated from it, not from when it was read.
@@ -36,6 +38,7 @@ _CANARY_FRESH_S = 30.0
 _CANARY_MAX_WAIT_S = 300.0
 _CANARY_PARSL = "HPCB_PARSL"
 _CANARY_GCE = "HPCB_GCE"
+_CANARY_JOB = "HPCB_JOB"
 _CANARY_CMD = (
     f"echo {_CANARY_SENTINEL}; "
     'python -c "import platform,dill,socket;'
@@ -43,12 +46,17 @@ _CANARY_CMD = (
     "2>/dev/null || true; "
     f"python -c \"import importlib.metadata as m;print('{_CANARY_PARSL}',m.version('parsl'))\" 2>/dev/null || true; "
     f"python -c \"import importlib.metadata as m;print('{_CANARY_GCE}',m.version('globus-compute-endpoint'))\" "
-    "2>/dev/null || true"
+    "2>/dev/null || true; "
+    # The scheduler job the worker runs in (Slurm's or PBS's job id; empty on a LocalProvider block): which BLOCK
+    # answered. After a block may have idle-released, the confirm's canary must tell the old block still up from a new
+    # one it brought up itself (warmth._confirm_worker). ShellFunction runs this through str.format, then /bin/bash.
+    f'echo "{_CANARY_JOB} ${{SLURM_JOB_ID:-${{PBS_JOBID:-}}}}"'
 )
 
 
 def _parse_canary_tagged(stdout: str, tag: str) -> str | None:
-    """A version from canary stdout's `<TAG> <version>` line, or None."""
+    """A value from canary stdout's `<TAG> <value>` line — a version, or a job id (Slurm's and PBS's start with a
+    digit) — or None, also when the value is empty."""
     for line in stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == tag and parts[1][:1].isdigit():
@@ -220,7 +228,8 @@ class GlobusRunner:
         py, dill_v, host = _parse_canary(stdout)
         return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host,
                             worker_parsl=_parse_canary_parsl(stdout),
-                            worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE), answered_at=answered_at)
+                            worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE),
+                            worker_job=_parse_canary_tagged(stdout, _CANARY_JOB), answered_at=answered_at)
 
     def close(self) -> None:
         if self._ex is not None:

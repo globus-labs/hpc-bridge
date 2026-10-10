@@ -177,9 +177,14 @@ def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None 
     return _reap_prefix(rt) + head + _spend_floor_guidance(app)
 
 def _reap_prefix(rt: ShapeRuntime | None) -> str:
-    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone."""
+    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone — or, just past its
+    idle window, may be (nothing is sent to find out: a check to a released block would start a new billed one)."""
     if rt is None or rt.reaped is None:
         return ""
+    if rt.reap_tentative:
+        return (f"Confirm spend again with the user: {rt.reaped}. Nothing was sent to check, because a check to a "
+                "released block would start a new billed one. Confirming continues on the block if it is still up, "
+                "or starts a new block, which bills again. ")
     return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; a new "
             "block bills again. ")
 

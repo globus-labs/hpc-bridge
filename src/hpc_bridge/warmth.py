@@ -125,8 +125,13 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     if rt.no_account:  # terminal for this identity: no canary, no runner rebuild — keep last_canary as the evidence
         return "provisioning"
     # A block confirmed warm and not since found gone (block_since survives a failed dispatch and a runner rebuild,
-    # both of which void warm_confirmed_at) — read BEFORE _runner_for, which voids it on a rebuild.
+    # both of which void warm_confirmed_at) — read BEFORE _runner_for, which voids it on a rebuild. So is the latest
+    # the block could have lived, which bills it if this check finds it gone.
     was_warm = rt.block_since is not None
+    bound = _release_bound(app, shape, rt)
+    # The confirm that follows "the block may have idle-released" (reap_tentative): this canary decides whether that
+    # block is still up. It was sent WITH the user's confirmation, so whatever it finds is never the kicked path below.
+    resuming = rt.reap_tentative and rt.spend_confirmed
     runner = _runner_for(app, shape)
     now = time.monotonic()
     # A task still running on this shape IS liveness — the worker is demonstrably executing our work.
@@ -136,12 +141,27 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     if _live_task_handles(app, shape) or rt.inflight:
         rt.warm_confirmed_at = now
         rt.provisioning_since = None
+        rt.reap_tentative = False
         return "warm"
-    if not force and rt.warm_confirmed_at is not None and now - rt.warm_confirmed_at < CANARY_TTL_S:
+    if not force and not resuming and rt.warm_confirmed_at is not None and now - rt.warm_confirmed_at < CANARY_TTL_S:
         rt.provisioning_since = None
         return "warm"
     result = await runner.canary(timeout=CANARY_TIMEOUT_S)
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
+    if resuming:
+        rt.reap_tentative = False
+        was_warm = False
+        if not (result.ok and result.worker_job is not None and result.worker_job == rt.block_job):
+            # Not the same scheduler job (a different one, no answer, or no way to tell): the block that may have
+            # idle-released is gone, and its spend ends at the latest it could have lived. A block that answers now
+            # is one this confirm brought up. Its own age starts now when the job ids differ; when either is unknown
+            # the older age is kept, so the walltime presumption errs early (a question), never late (a canary to a
+            # block past its walltime).
+            _bank_warm_interval(rt, app, until=bound)
+            if result.ok and result.worker_job is not None and rt.block_job is not None:
+                rt.block_since = None
+            rt.block_job = result.worker_job if result.ok else None
+        # else: the same job — the block was still up. Its age and its spend clock simply continue.
     if result.ok:
         # dated from when the worker actually answered (it can predate this call by up to the runner's freshness
         # window), so the TTL, the idle clock and the reap estimate all measure from real proof
@@ -158,9 +178,10 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
                    "window if no work is sent")
         _mark_reaped(app, rt, f"the previous block did not answer a check within {CANARY_TIMEOUT_S:g} s — most "
                      "likely cancelled, preempted or failed. That check may already have asked the facility for a "
-                     f"new block: {release}", _release_bound(app, rt), kicked=True)
+                     f"new block: {release}", bound, kicked=True)
     rt.warm_confirmed_at = None
     rt.block_since = None
+    rt.block_job = None
     if result.error == "timeout":
         rt.transient_conflicts = 0  # the submit was ACCEPTED (a normal cold-start wait) — not a conflict streak
     if result.error and result.error != "timeout":
@@ -209,16 +230,14 @@ def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = No
     elif out.phase == "failed":
         rt.warm_confirmed_at = None
 
-# How long past the idle window the clock waits before presuming the block gone. parsl's scaling pass cancels an idle
-# block up to two passes after the window (its idle timer starts on the first pass that sees no task; the cancel comes
-# on the first pass past the window), and each pass's own work (a squeue/sacct poll once a minute, the scancel itself)
-# delays the next. A pass is 5 s on endpoints configured since 2026-10 (facility/remote.py): 2 × 5 s + 5 s for that
-# work. Too LATE is the costly side: a call between the release and the presumption sends a canary, and a canary to a
-# released block makes the endpoint submit a new billed block before the user is asked. Too EARLY is the safe side,
-# and it happens where the pass is slower: an endpoint configured earlier and still running keeps 30 s (reuse never
-# rewrites its template), and a facility MEP sets its own (the fake MEP's is 15 s). There the presumption can come
-# before the release, which costs an extra spend question, never spend without one.
-_IDLE_GRACE_S = 15.0
+# Past its idle window a block MAY already be released. How soon after the window depends on the facility's scaling
+# pass (5 s on endpoints configured since 2026-10, 30 s on one configured earlier and still running — reuse never
+# rewrites the template — a facility MEP's own), and hpc-bridge cannot know which for a given endpoint. A canary to a
+# released block makes the endpoint submit a new billed one, so from the window on NOTHING is submitted until spend is
+# confirmed again. Up to this grace past the window the presumption is TENTATIVE: the block keeps its age and its
+# spend clock, and the canary after the confirm decides by the scheduler job id it reports (_confirm_worker). After
+# it, the release is taken as CERTAIN: two passes of 30 s, the slowest hpc-bridge has written into a template.
+_CERTAIN_RELEASE_GRACE_S = 60.0
 
 def _idle_window(app: AppCtx) -> int | None:
     """The idle-release window the clock may presume from: None when it is unknown, or when the facility holds its
@@ -228,39 +247,56 @@ def _idle_window(app: AppCtx) -> int | None:
         return None
     return _idle_release_s(app)
 
+def _work_on_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> bool:
+    """A task still running on the shape (or its end not yet stamped), or a synchronous dispatch in flight."""
+    return bool(rt.inflight) or any(h.done_at is None for h in app.tasks.values() if h.shape == shape)
+
+def _last_activity(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
+    """The block's last proof of work: its last confirmation (warm_confirmed_at, voided by a failed dispatch) or the
+    end of a task nobody has polled yet (`done_at`), whichever is later. One source for the presumptions and the
+    billing bound — the bound used to read the confirmation alone and bill a block short."""
+    stamps = [t for t in (rt.warm_confirmed_at, *(h.done_at for h in app.tasks.values() if h.shape == shape))
+              if t is not None]
+    return max(stamps) if stamps else None
+
 def _presumed_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, float] | None:
-    """(why, released_at) when the shape's last confirmed block has, by the clock alone, been released by the
-    facility (or, on a slower scaling pass than ours, is about to be — see _IDLE_GRACE_S): no task for longer than its
-    idle window, or older than its walltime. Decided WITHOUT submitting anything — the only way to look (a canary) is
-    itself a task, and a task on a released block starts a new billed one. None when there is no such block, or while
-    work may be on it: a task still running, or a synchronous dispatch in flight. A finished but unpolled task counts
-    from when it ended (`done_at`). The idle check needs the last activity (warm_confirmed_at, voided by a failed
-    dispatch); the walltime check needs only the block's age."""
-    if rt.block_since is None or rt.inflight:
+    """(why, released_at) when the shape's last confirmed block has, by the clock alone, CERTAINLY been released by
+    the facility: no task for longer than its idle window plus _CERTAIN_RELEASE_GRACE_S, or older than its walltime.
+    Decided WITHOUT submitting anything — the only way to look (a canary) is itself a task, and a task on a released
+    block starts a new billed one. None when there is no such block, or while work may be on it. The idle check needs
+    the last activity; the walltime check needs only the block's age."""
+    if rt.block_since is None or _work_on_block(app, shape, rt):
         return None
-    handles = [h for h in app.tasks.values() if h.shape == shape]
-    if any(h.done_at is None for h in handles):  # still running (or its end not yet stamped): work is on the block
-        return None
-    stamps = [t for t in (rt.warm_confirmed_at, *(h.done_at for h in handles)) if t is not None]
-    last = max(stamps) if stamps else None  # the last activity: a confirmation, or an unpolled task's end
+    last = _last_activity(app, shape, rt)
     now = time.monotonic()
     idle = _idle_window(app)
-    if idle and last is not None and now - last >= idle + _IDLE_GRACE_S:
-        return (f"the previous block has been idle-released, or is about to be (no task for ~{int(now - last)} s, "
-                f"past the {idle} s idle window)", last + idle)
+    if idle and last is not None and now - last >= idle + _CERTAIN_RELEASE_GRACE_S:
+        return (f"the previous block idle-released (no task for ~{int(now - last)} s, past the "
+                f"{idle} s idle window)", last + idle)
     wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
     if wall and now - rt.block_since >= wall:
         return (f"the previous block reached its walltime ({rt.user_endpoint_config.get('walltime')})",
                 rt.block_since + wall)
     return None
 
-def _release_bound(app: AppCtx, rt: ShapeRuntime) -> float | None:
-    """The latest a block with no task of ours could have lived: its idle window after the last activity, plus the
-    grace (a slower scaling pass can outlive it by a few tens of seconds; the bill is an estimate). None when either is
-    unknown (bill to now)."""
-    idle = _idle_window(app)
-    if idle and rt.warm_confirmed_at is not None:
-        return rt.warm_confirmed_at + idle + _IDLE_GRACE_S
+def _maybe_released(app: AppCtx, shape: str, rt: ShapeRuntime) -> str | None:
+    """Why the block MAY be gone: no task for at least its idle window, but not yet past the certain grace. None
+    otherwise, while work may be on it, or when the window is unknown (the canary decides, as before)."""
+    if rt.block_since is None or _work_on_block(app, shape, rt):
+        return None
+    last, idle = _last_activity(app, shape, rt), _idle_window(app)
+    quiet = time.monotonic() - last if last is not None else None
+    if not idle or quiet is None or quiet < idle:
+        return None
+    return (f"the previous block has had no task for ~{int(quiet)} s, past the {idle} s idle window, so it has been "
+            "or is about to be idle-released")
+
+def _release_bound(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
+    """The latest a block with no task of ours could have lived: its idle window plus the certain grace after its last
+    activity — an upper bound, the honest side of a spend estimate. None when either is unknown (bill to now)."""
+    idle, last = _idle_window(app), _last_activity(app, shape, rt)
+    if idle and last is not None:
+        return last + idle + _CERTAIN_RELEASE_GRACE_S
     return None
 
 def _presumed_release_at(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
@@ -269,24 +305,47 @@ def _presumed_release_at(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | N
     gone = _presumed_reaped(app, shape, rt)
     return gone[1] if gone is not None else None
 
+def _forget_block(app: AppCtx, rt: ShapeRuntime, released_at: float | None) -> None:
+    """The block is gone: stop its clock (at the estimated release time, not now) and forget its warmth and age."""
+    _bank_warm_interval(rt, app, until=released_at)
+    rt.warm_confirmed_at = None
+    rt.block_since = None
+    rt.block_job = None
+    rt.provisioning_since = None
+    rt.reap_tentative = False
+
 def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | None, *, kicked: bool = False) -> None:
     """The block this shape's spend acknowledgement covered is gone: stop its clock (at the estimated release
     time, not now), forget its warmth, and require a fresh acknowledgement for the next block. `kicked`: the reap
     was found by a check that may already have asked for a new block."""
-    _bank_warm_interval(rt, app, until=released_at)
-    rt.warm_confirmed_at = None
-    rt.block_since = None
-    rt.provisioning_since = None
+    _forget_block(app, rt, released_at)
     rt.spend_confirmed = False
     rt.reaped, rt.reap_told, rt.reap_kicked = why, False, kicked
 
 def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """Before anything voids the evidence (a provision, a partition or account switch): if the clock says the block
-    the spend acknowledgement covered is gone, record the reap."""
-    if _billable(rt) and rt.spend_confirmed and rt.reaped is None:
+    the spend acknowledgement covered is gone, record the reap — CERTAIN (forget the block) or, just past its idle
+    window, TENTATIVE (ask again, keep the block's age and spend clock; the confirm's canary decides)."""
+    if not _billable(rt):
+        return
+    if rt.reap_tentative:
+        gone = _presumed_reaped(app, shape, rt)
+        if gone is not None:
+            # Already asked whether to go on, and now the block is surely gone: end its spend and its age. The
+            # question is not asked twice, and a confirmation given after it stands (it covered a new block too).
+            _forget_block(app, rt, gone[1])
+            if rt.reaped is not None:
+                rt.reaped = gone[0]
+        return
+    if rt.spend_confirmed and rt.reaped is None:
         gone = _presumed_reaped(app, shape, rt)
         if gone is not None:
             _mark_reaped(app, rt, *gone)
+            return
+        why = _maybe_released(app, shape, rt)
+        if why is not None:
+            rt.spend_confirmed = False
+            rt.reaped, rt.reap_told, rt.reap_kicked, rt.reap_tentative = why, False, False, True
 
 async def _provision(
     app: AppCtx, shape: str, *, force_canary: bool = False, confirm_spend: bool = False
@@ -330,6 +389,8 @@ async def _provision(
     _settle_billing(rt, app, block)
     if block == "warm" and rt.block_since is None:
         rt.block_since = time.monotonic()  # the block's age, for its walltime
+        # ...and which scheduler job it is, so a later "may have idle-released" can tell it from a new block
+        rt.block_job = rt.last_canary.worker_job if rt.last_canary is not None and rt.last_canary.ok else None
     if rt.reaped is not None and not rt.reap_told:  # the check just found the block gone (_confirm_worker)
         rt.reap_told = True
         return "needs_confirmation"
@@ -371,6 +432,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     rt.runner_stale = True
     rt.warm_confirmed_at = None
     rt.block_since = None  # a different partition is a different block: it must not inherit the old one's age
+    rt.block_job, rt.reap_tentative = None, False  # nor be taken for the old block by the confirm's canary
     return None
 
 def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | None) -> str | None:
@@ -397,6 +459,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     rt.runner_stale = True
     rt.warm_confirmed_at = None
     rt.block_since = None  # a different account is a different block: it must not inherit the old one's age
+    rt.block_job, rt.reap_tentative = None, False  # nor be taken for the old block by the confirm's canary
     return None
 
 async def _drop_compute_shape(app: AppCtx) -> float:

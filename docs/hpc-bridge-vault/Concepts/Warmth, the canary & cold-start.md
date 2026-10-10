@@ -9,7 +9,7 @@
 
 ## The canary
 
-`_confirm_worker` ([[server]], `server.py:593`) submits a trivial `ShellFunction` through the *same* long-lived Executor real work uses ([[runner]], `GlobusRunner.canary`). The canary command echoes a sentinel plus the worker's host, Python, and dill versions:
+`_confirm_worker` ([[server]], `server.py:593`) submits a trivial `ShellFunction` through the *same* long-lived Executor real work uses ([[runner]], `GlobusRunner.canary`). The canary command echoes a sentinel plus the worker's host, Python, dill, parsl and gce versions, and the scheduler job it runs in (`HPCB_JOB`, from `$SLURM_JOB_ID` or `$PBS_JOBID`; none on a `LocalProvider` block). The job id is recorded as the block's `block_job` when it is first confirmed warm. After a call past the idle window has asked for spend again, the confirm's canary uses it to tell the old block, still up, from a new one ([[Cost control]]):
 
 - **returned result** ⇒ a worker is truly live ⇒ `warm`.
 - **timeout** (`CANARY_TIMEOUT_S = 8 s`, `config.py:170`) ⇒ still `provisioning` — and the submit has *kicked* the cold block.
