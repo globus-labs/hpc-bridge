@@ -69,6 +69,18 @@ released mid-session in 68 % of sessions at a 5 s period (93 % at 30 s), 63 % in
 a short command, if the block has a spare worker), or have hpc-bridge's clock count only work parsl must have seen
 (tasks longer than a pass) and re-ask early otherwise. Design first.
 
+*Learned building item 1 (2026-10-09, three adversarial review rounds):* hpc-bridge's idle clock (reset by every
+dispatch, `_last_activity`) and parsl's (reset only by a task a pass sees) disagree for quick commands, and every
+reap presumption rests on them agreeing. A full redesign was built and then shelved — branch
+`wip/3b-option-c-jobid` (9ace0df): past the idle window nothing is submitted until spend is re-confirmed
+(tentative until idle+60, then certain), and the canary reports the scheduler job id (`HPCB_JOB`
+`${SLURM_JOB_ID:-${PBS_JOBID:-}}`, verified live: the worker inherits it under `slurmstepd`) to tell the old
+block from a new one. Its review proved it needs this item first: the confirm's own canary is quick, so "same job →
+continue" keeps a block parsl scales in seconds later; a partition/account switch in the tentative window left the
+old spend clock running; and (pre-existing) a failed dispatch clears `warm_confirmed_at`, switching both presumptions
+off. Proofs: the round-3 throwaway tests and parsl `Strategy` simulations (kept with the branch's notes). Order:
+make activity visible to parsl (or measure what it sees) → then the ask-before-sending rule and the job id.
+
 **4. Walltime (verified).** The only agent knobs are `partition`/`account` (`server.py:309-334`); walltime is already
 a per-submit template variable, so `walltime=` validated against a cap (an `_apply_walltime` beside
 `_apply_partition`, `warmth.py:337`) is a day's work and works on SSH and MEP. Anvil and Delta blocks are 15 minutes —
