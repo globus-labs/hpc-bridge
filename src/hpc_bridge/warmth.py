@@ -8,8 +8,9 @@ still running past the sync-wait — are registered, resolved and drained here t
 rebuild and the canary consult them (a live task IS warmth), which is why steps 7 and 8 ship together.
 
 Every function here runs under `app.lock` held by the caller in `server` — except `_drop_compute_shape`, which
-takes the lock itself, and `_endpoint_gone`, a web call deliberately made OFF the lock (don't add one inside
-either). Tests patch
+takes the lock itself, `_endpoint_gone`, a web call deliberately made OFF the lock (don't add one inside
+either), and `_register_task` when a cancelled call registers its still-running command in one synchronous step
+without the lock (nothing can interleave without an await). Tests patch
 `warmth._provision` / `warmth._drop_compute_shape`; `server` calls those two through the module and
 re-exports every name for imports.
 """
@@ -73,9 +74,28 @@ def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
         app.shapes[shape] = rt
     return rt
 
+# A task's ceiling runs from when it STARTS on a worker; its handle's clock runs from the submit. So a pending task past
+# its ceiling (measured from the submit) may be lost — or only queued (behind a block relaunched at walltime, or behind
+# another task), and a relaunching block still reads `running` (Parsl relaunches it). Every guard keeps treating it as
+# live, with ONE exception: on a facility multi-user endpoint nothing can cancel a task and its manager stays online
+# (it is never ORPHANED), so stop and the detach would wait on a lost one forever. There, a task pending past its
+# ceiling plus this grace is presumed lost and no longer holds them (server._block_work); everything else still waits.
+_LOST_TASK_GRACE_S = 600.0
+
+def _past_ceiling(h: TaskHandle, now: float | None = None) -> bool:
+    """A task still pending past its ceiling, counted from its submit: queued (behind another task or a relaunching
+    block), or lost."""
+    now = time.monotonic() if now is None else now
+    return not h.future.done() and now - h.submitted_at > h.ceiling_s
+
+def _overdue(h: TaskHandle, now: float | None = None) -> bool:
+    """Pending past its ceiling plus _LOST_TASK_GRACE_S: presumed lost — for a facility endpoint's stop/detach only."""
+    now = time.monotonic() if now is None else now
+    return not h.future.done() and now - h.submitted_at > h.ceiling_s + _LOST_TASK_GRACE_S
+
 def _live_task_handles(app: AppCtx, shape: str) -> list[tuple[str, TaskHandle]]:
     """(task_id, handle) for this shape whose task is still RUNNING (future not yet done) — i.e. still
-    holding the block. The warmth signal and the swap/session-busy guards all key off this."""
+    holding the block. The warmth signal and the stop/swap/session-busy guards all key off this."""
     return [(tid, h) for tid, h in app.tasks.items() if h.shape == shape and not h.future.done()]
 
 def _drain_shape_tasks(app: AppCtx, shape: str) -> None:
@@ -93,10 +113,11 @@ def _runner_for(app: AppCtx, shape: str) -> GlobusRunner:
     rt = _shape_runtime(app, shape)
     eid = app.state.endpoint_id
     if rt.runner is None or rt.runner.endpoint_id != eid or rt.runner_stale:
-        if rt.runner is not None and rt.runner.endpoint_id == eid and _live_task_handles(app, shape):
+        if rt.runner is not None and rt.runner.endpoint_id == eid and (_live_task_handles(app, shape) or rt.inflight):
             # A credential/config-only swap (runner_stale, e.g. a new Globus login) must WAIT: closing
             # this Executor would drop the live task's future and poll_task would report "no task"
-            # (found in review). The rebuild happens once the task has been polled.
+            # (found in review). The rebuild happens once the task has been polled — or, for a call still
+            # inside its sync-wait, once it returns (its command must stay trackable on this runner).
             return rt.runner
         if rt.runner is not None:
             # A config-only swap (runner_stale) is barred while a task runs (see _apply_partition/
@@ -176,6 +197,14 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         rt.transient_conflicts = rt.transient_conflicts + 1 if _transient_dispatch_failure(result.error) else 0
     return "provisioning"
 
+def _retain_inflight(app: AppCtx, rt: ShapeRuntime | None) -> None:
+    """A compute runtime dropped while a dispatch is still inside its sync-wait on it: that command is on the endpoint,
+    so keep the runtime where a stop looks (`AppCtx.released_inflight`; server._block_work counts it while the endpoint
+    it was sent to is the bound one — after a teardown or a re-bind elsewhere it is abandoned, as its tasks are).
+    Runtimes whose calls have all returned are pruned here."""
+    app.released_inflight = [r for r in app.released_inflight if r.inflight] + (
+        [rt] if rt is not None and rt.inflight else [])
+
 def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     """Forget every task handle, close every shape's runner, and unbind the endpoint. With `bank`, fold
     each shape's running warm interval into the spend FIRST and return the session total as it stood —
@@ -184,6 +213,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     now. Callers hold app.lock."""
     untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
     app.tasks.clear()
+    _retain_inflight(app, app.shapes.get(DEFAULT_SHAPE))  # counted only if the same endpoint is bound again
     for name, rt in app.shapes.items():
         if bank:
             _bank_warm_interval(rt, app, until=untils.get(name))
@@ -353,7 +383,8 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     live = _live_task_handles(app, shape)
     if live:
         return (f"can't change partition to {partition!r}: a task is still running "
-                f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+                f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it to completion first (stop_endpoint "
+                "refuses while it runs).")
     # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
@@ -379,7 +410,8 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     live = _live_task_handles(app, shape)
     if live:
         return (f"can't change account to {account!r}: a task is still running "
-                f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it or stop_endpoint first.")
+                f"(task_id={live[0][0]!r}) on shape {shape!r}. poll_task it to completion first (stop_endpoint "
+                "refuses while it runs).")
     # a command inside its sync-wait: the swap would orphan it, and its count would vouch for the new block
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
@@ -399,18 +431,24 @@ async def _drop_compute_shape(app: AppCtx) -> float:
     Returns the spend the dropped shape had accrued; it is ALSO folded into `app.released_spend`, which
     _total_session_spend() counts — so callers must not add the return value again (0.1.18)."""
     async with app.lock:
-        compute = app.shapes.get(DEFAULT_SHAPE)
-        until = _presumed_release_at(app, DEFAULT_SHAPE, compute) if compute is not None else None
-        _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
-        compute = app.shapes.pop(DEFAULT_SHAPE, None)
-        if compute is None:
-            return 0.0
-        # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago
-        _bank_warm_interval(compute, app, until=until)
-        if compute.runner is not None:
-            compute.runner.close()
-        app.released_spend += compute.spend_accrued  # still part of the session: _total_session_spend counts it
-        return compute.spend_accrued
+        return _drop_compute_shape_locked(app)
+
+def _drop_compute_shape_locked(app: AppCtx) -> float:
+    """_drop_compute_shape for a caller that already holds app.lock — a stop that must check what holds the block and
+    drop it in ONE locked step, so no dispatch can be counted in between."""
+    compute = app.shapes.get(DEFAULT_SHAPE)
+    until = _presumed_release_at(app, DEFAULT_SHAPE, compute) if compute is not None else None
+    _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
+    compute = app.shapes.pop(DEFAULT_SHAPE, None)
+    _retain_inflight(app, compute)
+    if compute is None:
+        return 0.0
+    # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago
+    _bank_warm_interval(compute, app, until=until)
+    if compute.runner is not None:
+        compute.runner.close()
+    app.released_spend += compute.spend_accrued  # still part of the session: _total_session_spend counts it
+    return compute.spend_accrued
 
 def _forget_identity_verdicts(app: AppCtx) -> None:
     """A new Globus login may be a different identity: drop every sticky no-account verdict and make the
@@ -441,8 +479,12 @@ def _busy_session(app: AppCtx, shape: str, session_id: str) -> str | None:
             return tid
     return None
 
-def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, ceiling_s: float) -> str:
-    """Register a still-running task as a poll handle and return its id. Caller holds app.lock."""
+def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, ceiling_s: float, *,
+                   client_cancelled: bool = False, runtime: ShapeRuntime | None = None, reset: bool = False) -> str:
+    """Register a still-running task as a poll handle and return its id. Caller holds app.lock — or calls it in one
+    synchronous step with no await around it (a cancelled call, which must not wait for the lock), which nothing can
+    interleave with either. `runtime`: the shape runtime it was dispatched on (its result is noted there only while
+    that runtime is still the shape's — a released block's runtime is never rebuilt for it)."""
     app.task_seq += 1
     task_id = f"{shape}-{app.task_seq}"
     handle = TaskHandle(
@@ -452,6 +494,9 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         command=command,
         submitted_at=time.monotonic(),
         ceiling_s=ceiling_s,
+        client_cancelled=client_cancelled,
+        runtime=runtime,
+        reset=reset,
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
@@ -488,7 +533,12 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
     else:
         out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
-    _note_dispatch(_shape_runtime(app, handle.shape), out, at=handle.done_at)
+    current = app.shapes.get(handle.shape)
+    # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
+    if current is not None and (handle.runtime is None or handle.runtime is current):
+        _note_dispatch(current, out, at=handle.done_at)
+    else:
+        out.block_state = "cold"  # its block was released while it ran (a newer block's runtime is not its own)
     return _with_spend(app, out)
 
 async def _endpoint_gone(app: AppCtx) -> bool:

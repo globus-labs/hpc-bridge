@@ -445,27 +445,110 @@ def _needs_confirmation_outcome(app: AppCtx | None = None, rt: ShapeRuntime | No
         + _spend_floor_guidance(app),
     )
 
-def _busy_session_outcome(task_id: str, shape: str, session_id: str) -> ShellOutcome:
+# A task whose call the client cancelled: the agent never saw its id, so a notice naming one says where it came from.
+_CLIENT_CANCELLED = "the command of a call the client cancelled — cancelling a call does not stop its command"
+
+
+def _busy_session_outcome(task_id: str, shape: str, session_id: str, *, client_cancelled: bool = False,
+                          internal: bool = False) -> ShellOutcome:
+    if internal:  # hpc-bridge's own login session: nothing the agent chose or can poll its way around
+        return ShellOutcome(
+            phase="failed", block_state="warm", exit_code=None,
+            notice=(f"the login channel is busy, not cold: an earlier scheduler command of hpc-bridge's own "
+                    f"(task_id={task_id!r}) is still running in its login session. Try again in a little while."),
+        )
+    origin = f": {_CLIENT_CANCELLED}" if client_cancelled else ""
     return ShellOutcome(
         phase="failed",
         block_state="warm",
         exit_code=None,
         notice=(f"session {session_id!r} on shape {shape!r} still has a task running "
-                f"(task_id={task_id!r}); poll_task it, or run in a different session_id. Two commands "
+                f"(task_id={task_id!r}{origin}); poll_task it, or run in a different session_id. Two commands "
                 "can't share one session's cwd/env at once."),
     )
 
-def _running_outcome(app: AppCtx, task_id: str, ceiling_s: float) -> ShellOutcome:
-    out = ShellOutcome(
-        phase="running",
-        block_state="warm",
-        task_id=task_id,
-        notice=(f"still running past the ~{int(SYNC_WAIT_S)}s sync-wait — it was NOT cut. Poll for its "
-                f"result with poll_task({task_id!r}). It runs up to ~{int(ceiling_s)}s (the block "
-                "walltime) then is killed (exit 124); submit a batch job for anything longer. The "
-                "block stays warm while it runs."),
+def _reserved_session_outcome(session_id: str) -> ShellOutcome:
+    return ShellOutcome(
+        phase="failed", block_state="cold", exit_code=None,
+        notice=(f"session_id {session_id!r} is reserved for hpc-bridge's own scheduler commands (it would make them "
+                "wait on yours): use another session_id. Nothing was run."),
     )
+
+def _running_outcome(app: AppCtx, task_id: str, ceiling_s: float, *, client_cancelled: bool = False,
+                     reset: bool = False, block_state: BlockState = "warm") -> ShellOutcome:
+    """`block_state`: "cold" once the block it went to was released under it (the shape is gone)."""
+    state = "the reset is still queued or running" if reset else "still running"
+    why = f"({_CLIENT_CANCELLED})" if client_cancelled else f"past the ~{int(SYNC_WAIT_S)}s sync-wait"
+    tail = ("The session stays busy until it ends." if reset else
+            f"It runs up to ~{int(ceiling_s)}s (the block walltime) then is killed (exit 124); submit a batch job for "
+            "anything longer." + (" The block stays warm while it runs." if block_state == "warm" else ""))
+    return _with_spend(app, ShellOutcome(
+        phase="running", block_state=block_state, task_id=task_id,
+        notice=f"{state} {why} — it was NOT cut. Poll for its result with poll_task({task_id!r}). {tail}",
+    ))
+
+def _past_ceiling_outcome(app: AppCtx, task_id: str, ceiling_s: float, *, shape: str, session_id: str,
+                          facility_mep: bool, lost_in: float, block_state: BlockState = "warm") -> ShellOutcome:
+    """A task still pending past its ceiling, counted from its submit. Its ceiling runs from when it STARTS, so it may
+    only be queued (behind another task, or a relaunching block) — or lost. Still `running`: keep polling, or abandon
+    it, which depends on what it holds. A free login-shape task does not hold the stop, only its session and the login
+    worker. A compute task holds the SSH stop (teardown abandons it). On a facility endpoint, `lost_in` seconds on, a
+    compute task is presumed lost and no longer holds stop or the detach (warmth._overdue)."""
+    if shape != "compute":
+        abandon = (f"On the free {shape} shape it does not hold stop_endpoint, but it holds its session "
+                   f"({session_id!r}) and, while it runs or waits, the {shape} worker: the next {shape} command (and "
+                   "a stop's cancel) may queue behind it. To leave it, stop polling and run the next command in "
+                   "another session_id")
+    elif not facility_mep:
+        abandon = ("To abandon it, teardown_endpoint (stop_endpoint refuses while it is outstanding: releasing the "
+                   "block would not end it)")
+    elif lost_in > 0:
+        abandon = (f"Nothing here can cancel it; if no result arrives within ~{int(lost_in)}s it is presumed lost, and "
+                   "stop_endpoint / teardown_endpoint then abandon it")
+    else:
+        abandon = ("It is now presumed lost: stop_endpoint / teardown_endpoint no longer wait for it and would abandon "
+                   "it (its result is then no longer retrievable here)")
+    return _with_spend(app, ShellOutcome(
+        phase="running", block_state=block_state, task_id=task_id,
+        notice=(f"task {task_id!r} has no result past its ~{int(ceiling_s)}s ceiling — queued behind another task or a "
+                "relaunching block, or lost (the ceiling counts from when it starts). Keep polling: a relaunching "
+                f"block still reads running. {abandon}."),
+    ))
+
+def _released_under_outcome(app: AppCtx, out: ShellOutcome | None, ceiling_s: float) -> ShellOutcome:
+    """The call's block was released while it waited — by a teardown (its release step) or a re-bind; a stop looks
+    under the lock first and refuses. Nothing is noted on the dropped shape (rebuilding it would revive an unconfirmed
+    runtime), and the block it went to reads "cold". `out` is what the dispatch got: a result (it stays a real result,
+    on a block now gone), a `running` handle for a sent task still tracked (its endpoint is bound again or still), or
+    None for a command still running that nothing here can track (its endpoint is no longer the bound one)."""
+    if out is None:
+        return _with_spend(app, ShellOutcome(
+            phase="failed", block_state="cold", exit_code=None,
+            notice=("this command was still running when the endpoint it was sent to stopped being the bound one "
+                    "(teardown_endpoint or connect_facility ran while the call waited), so its result can no longer "
+                    "be retrieved here (no task_id was kept). If that endpoint is still up it may still run the "
+                    f"command — relaunching a block to do so (spend) — until it ends or reaches its ~{int(ceiling_s)}s "
+                    "ceiling. Tell the user; do not assume spend has stopped."),
+        ))
+    out.block_state = "cold"
+    if out.phase == "running":
+        note = ("its block was released while this call waited, by a teardown or a re-connect to the same endpoint; "
+                "the command had already been sent, so it stays tracked until it ends or a teardown abandons it, and "
+                "the endpoint may relaunch a block to run it meanwhile, which bills")
+    else:
+        note = ("its block was released while this call waited, by a teardown or re-connect: the next command starts "
+                "on a new block (a billed one asks for spend again)")
+    out.notice = f"{out.notice} ({note})" if out.notice else f"{note}."
     return _with_spend(app, out)
+
+def _never_sent_outcome(app: AppCtx) -> ShellOutcome:
+    """The SDK cancelled the task before sending it: its runner was closed under the call. Nothing ran."""
+    return _with_spend(app, ShellOutcome(
+        phase="failed", block_state="cold", exit_code=None,
+        notice=("this command never reached the endpoint: its runner was closed while the call waited (a teardown or "
+                "re-connect ran meanwhile, or the runner was rebuilt for a new endpoint) — nothing ran. Run it again "
+                "if it is still wanted."),
+    ))
 
 def _shape_reject_outcome(notice: str) -> ShellOutcome:
     return ShellOutcome(phase="failed", block_state="cold", exit_code=None, notice=notice)

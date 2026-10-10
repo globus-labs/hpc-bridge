@@ -84,6 +84,14 @@ class TaskHandle:
     # When the future resolved (stamped by a done-callback), so a poll long after the task ended does not pass
     # for recent activity on the idle clock (0.1.18).
     done_at: float | None = None
+    # The client cancelled the call that dispatched it, inside its sync-wait (Esc in Claude Code → MCP
+    # notifications/cancelled). Cancelling a call does not cancel the command — it runs on the block — so it is
+    # tracked like any running task; the flag only makes the notices say where a task id the agent never saw came from.
+    client_cancelled: bool = False
+    # The shape runtime it was dispatched on. A stop can release the block (and drop that runtime) while a sent task
+    # still runs; its result is then noted nowhere — never on a rebuilt or newer runtime. None: the shape's current one.
+    runtime: ShapeRuntime | None = field(default=None, repr=False, compare=False)
+    reset: bool = False  # a reset_session, not a command: its notices say so
 
 
 @dataclass
@@ -134,6 +142,10 @@ class AppCtx:
     # later result (a teardown resumed after its one-time code, a retry) under-reported the session. Cleared with
     # the binding (`warmth._drop_all_shapes`).
     released_spend: float = 0.0
+    # Compute runtimes dropped (a teardown's release step, a re-bind) while a dispatch was still inside its sync-wait on
+    # them: the dispatch's command is on the endpoint, so a stop must still see it — while that endpoint is the bound
+    # one (warmth._retain_inflight; server._block_work).
+    released_inflight: list[ShapeRuntime] = field(default_factory=list)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

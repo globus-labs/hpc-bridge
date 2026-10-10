@@ -44,6 +44,13 @@ def _release_cmd(scheduler: str, eid: str) -> str:
         '[ -n "$ids" ] && scancel $ids; echo "released ${ids:-none}"'
     )
 
+def _release_cmd_for(app: AppCtx, eid: str) -> str:
+    """The release one-liner for the bound facility's scheduler. The scheduler lives on the facility's MachineProfile
+    (SlurmFacility.profile.scheduler); a facility without one (LocalFacility/dev, or test doubles) has never spoken
+    anything but Slurm's squeue/scancel, so default there instead of assuming an attribute that isn't part of the
+    Facility protocol."""
+    return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid)
+
 async def _release_blocks_over_login(
     app: AppCtx, eid: str, run_login: LoginRunner, *, expect_block: bool = False
 ) -> tuple[bool, str]:
@@ -60,12 +67,7 @@ async def _release_blocks_over_login(
     unconfirmed cancel is still backstopped by idle-release (`min_blocks=0` + `max_idletime`), and
     re-calling stop (channel now warming) confirms it. Retry budget: HPC_BRIDGE_RELEASE_ATTEMPTS
     (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s)."""
-    # The scheduler lives on the facility's MachineProfile (SlurmFacility.profile.scheduler); a
-    # facility without one (LocalFacility/dev, or test doubles) has never spoken anything but
-    # Slurm's squeue/scancel, so default there instead of assuming an attribute that isn't part
-    # of the Facility protocol.
-    scheduler = getattr(getattr(app.facility, "profile", None), "scheduler", "slurm")
-    cmd = _release_cmd(scheduler, eid)
+    cmd = _release_cmd_for(app, eid)
     # `expect_block`: a block was requested but never confirmed running (stop-during-provisioning). Its sbatch may not
     # be in the scheduler yet, so a scancel that finds nothing ("released none") has NOT confirmed the block gone — the
     # pilot can land a moment later and burn (the spend_revoked race). Keep polling for it to appear (a longer budget),
