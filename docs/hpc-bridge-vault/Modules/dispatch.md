@@ -9,7 +9,7 @@
 
 | Failure | exit | notice |
 |---|---|---|
-| `TimeoutError` | 124 | "timed out — run ensure_endpoint_up and retry, or move to a batch job" |
+| `TimeoutError` | 124 | "timed out — run ensure_endpoint_up and retry, or move to a batch job (billed like a block, so only with the user's spend confirmation)" |
 | `MaxResultSizeExceeded` | 1 | "exceeded the 10 MB result limit — redirect to a file" |
 | `TaskExecutionFailed` | 1 | "the remote task failed to execute" |
 | other | 1 | "Dispatch error: \<type\>" |
