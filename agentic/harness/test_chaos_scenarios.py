@@ -118,7 +118,9 @@ def test_block_reaped_resume_grades_the_spend_reask():
     assert sc.resume_is_honest_cold_start(old).ok and not sc.spend_reasked_after_reap(old).ok
     # the reap found by ensure_endpoint_up (the agent re-confirmed first): still the re-ask
     eup = _compute("ensure_endpoint_up", {"status": "needs_confirmation", "block_state": "provisioning",
-                                          "notice": "Confirm spend again with the user: the previous block idle-released"},
+                                          "notice": "Confirm spend again with the user: the previous block did not "
+                                                    "answer a check within 8 s — most likely cancelled, preempted or "
+                                                    "failed."},
                    confirm_spend=True)
     assert sc.spend_reasked_after_reap(Trace([mark, eup, _ask("Confirm the spend for a new block?"), confirm, reread])).ok
 
