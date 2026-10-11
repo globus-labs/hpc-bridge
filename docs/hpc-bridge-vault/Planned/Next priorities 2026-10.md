@@ -31,8 +31,7 @@ this up again in the week of 2026-10-12.
 **Merge order.** Merge #173, then #175, then #174 and #176, rebasing the later PRs after each merge. #173 and #175
 overlap in `warmth.py`, `server.py` and `notices.py`. Before merging #173, run `block_reaped_resume` (below).
 
-**Open decision.** CLAUDE.md pins the commit trailer to "Claude Opus 4.8"; the overnight commits use "Claude Opus
-5.5", the model that actually ran.
+**Trailer.** Decided: commits use "Claude Opus 5.5". CLAUDE.md is pinned to it on this branch.
 
 **Leftover worktrees.** `.claude/worktrees/agent-*` hold the four branches; remove them once their PRs merge.
 
@@ -105,9 +104,80 @@ Legend: **H** hermetic tests (mutation-checked), **L** live on the fake cluster,
 | `hand_batch_job` (new, Pi) | #176 | **OK**: the real notice on "Submitted batch job 83"; the job was cancelled; nothing left on the cluster; the ungated `spend_follows_question` flagged the unasked submission |
 | `hand_batch_job` (new, Hermes) | #176 | **OK** (re-graded once a too-strict any-`ensure_endpoint_up` check was replaced by `no_compute_block`) |
 
-Found along the way, pre-existing and not fixed: a `run_shell` sent before `connect_facility` has finished answers
-with raw internals ("FileNotFoundError … endpoint.json", "configure failed: Traceback…"), not "connect a facility
-first".
+Found along the way, both pre-existing on main. Each is now a follow-up of its own (next section): a `run_shell` sent
+before `connect_facility` has finished answered with raw internals, and env_setup's `command -v` guard never repaired a
+broken install.
+
+### Follow-ups, 2026-10-10 (paused late that evening)
+
+**B — with no facility connected, the tools say so: PR #177, ready to merge.** Branch `fix/no-facility-connected`,
+one commit (b76978c). CI is green.
+- Shell tools return `failed` and `ensure_endpoint_up` returns `down`, each with a "No facility connected" notice. The
+  notice has variants for a connect that only proposed a config and for one waiting on a one-time login.
+- The boot fallback is always unbound, so the server never stands up a local endpoint; `HPC_BRIDGE_ENDPOINT_ID` is the
+  only local-dev path.
+- Reviewed three times; the last two delta reviews were READY. Live: Pi `happy_path` OK on this commit; on an earlier
+  cut, globus1 `zero_config_list` OK.
+- Known gap, not fixed: with `HPC_BRIDGE_ENDPOINT_ID`, `teardown_endpoint` on a `LocalFacility` says "deleted" and then
+  re-provisions `hpc-bridge-dev`.
+
+**A — the endpoint install is checked, not trusted: WIP, no PR yet.** Branch `fix/env-setup-verify-install`, pushed
+for safekeeping, one commit (839b02e, round 3). Worktree `.claude/worktrees/agent-ac4e16a6d5ae2acc1`.
+- *Design.*
+  - hpc-bridge's own venv is keyed by version: `{venv}-endpoint-<gce>-py<X.Y>`. A version or Python move builds a new
+    venv beside the old one and never replaces one a running manager uses.
+  - The check runs the venv's real entry point, `globus-compute-endpoint version`. It must report the pin, and the
+    venv's `python` must be the client's major.minor.
+  - Builds happen only on whoami, configure and start (`HPCB_ENV_REPAIR=1`). List, stop and delete (`=0`) never build;
+    they fall back to any working hpc-bridge venv.
+  - A build takes a `mkdir` lock, moves the old venv aside and restores it if the build fails.
+  - Workers only check. A venv built for another architecture ends the job with "built on x86_64 … does not run on
+    spark1 (aarch64)".
+  - Every task's `worker_init` is the endpoint's OWN configured one, read once per endpoint id from
+    `get_endpoint_metadata`. Blocks therefore match their manager, and an edited env_setup is reported ("teardown, then
+    connect, to apply it") rather than silently half-applied.
+  - Cached BYO lines that exactly match one we generated are migrated. Old plugins (≤0.1.22) reading the new text never
+    break an endpoint that worked.
+- *Review history.*
+  - Round 1 (9f133a7): two must-fix bugs. The check imported `globus_compute_endpoint.cli` under `python -c`, which
+    raises IndexError on every real install (`cli.py` reads `sys.argv[0]` at import), so every bring-up would have
+    failed. A repair could also `rm -rf` the venv under a live manager.
+  - Round 2 (5bd9b29): three must-fix bugs. Taking `worker_init` out of the per-task config broke endpoints configured
+    by ≤0.1.22 (their never-used default fails YAML) and ignored env_setup edits on reuse. A lock that couldn't be
+    created was treated as held for 400 s.
+  - Round 3 (839b02e) addresses all of these, plus the Anvil MEP path collision, harness paths, traps, the probe timeout
+    and every surviving mutant. 841 passed, ruff and mypy clean.
+  - **Round 3 has not been reviewed.** Three reviews (worker_init/compat, shell line, style) were stopped at the pause;
+    run them again.
+- *Live evidence (fake cluster, Pi).*
+  - 5bd9b29 built the keyed venv beside an old 4.16.0 one, left the old one untouched, and ran a block.
+  - 5bd9b29 repaired a broken keyed venv in place: rebuilt, no leftovers. Plant a break by replacing the file with
+    `mv`, not by appending: the venv's files are hardlinks into `~/.cache/uv`, so an in-place append corrupts the cache
+    too.
+  - **839b02e passed the upgrade path.** Main stood up an endpoint whose template carries the old single-encoded uv line
+    and kept it up. The branch, run with the same `HPCB_RUNID`, reused it over the web (`reused: true`), ran a compute
+    block on it, and reported the differing env_setup. Recipe: a scratch scenario with `TEARDOWN = "keep"` on a main
+    checkout, then `happy_path` on the branch with the same `HPCB_RUNID`.
+- *Still to do before the PR.*
+  1. The round-3 reviews.
+  2. Live on 839b02e on the fake cluster: a fresh build under the new `-endpoint-` stem (the upgrade run reused the
+     endpoint over the web, so it built nothing) and a planted repair.
+  3. globus1 `happy_path` as `hpcbridge-test` only (the one account whose venv the maintainer cleared): the block
+     should fail with the named architecture message. Login is x86_64, the compute nodes are aarch64 on a shared NFS
+     home, so compute stays blocked on globus1 until per-architecture venvs exist (described as a follow-up in the
+     vault). Don't touch the `hpcbridge-test-00..09` pool venvs without asking.
+- *Open points from the implementer.*
+  - The Expanse line is about 3.9 KB.
+  - Old venvs pile up against home quotas; there's no cleaner.
+  - The Expanse seed's `globus-sdk==4.9.1` co-pin is unproven by a full run.
+  - With no flag, a broken keyed venv next to a working unkeyed one builds, even inside an old plugin's 30 s stop.
+  - Don't re-ingest the Expanse seed into the registry before the release that carries this.
+
+Leftovers on the fake cluster from these runs, all under `hpcbridge-test`:
+- `~/hpc-bridge/gce-venv-4.18.0-py3.11`, built under round 2's stem, now an orphan.
+- `~/.globus_compute/hpc-bridge-fake-upg1791688461`, a directory with no process.
+- `ps` counted 23 processes running from `gce-venv/bin` across users after phase 1. Check for leaked managers before the
+  next sweep.
 
 ## The order
 
