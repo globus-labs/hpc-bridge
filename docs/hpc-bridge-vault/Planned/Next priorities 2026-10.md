@@ -176,8 +176,16 @@ for safekeeping, one commit (839b02e, round 3). Worktree `.claude/worktrees/agen
 Leftovers on the fake cluster from these runs, all under `hpcbridge-test`:
 - `~/hpc-bridge/gce-venv-4.18.0-py3.11`, built under round 2's stem, now an orphan.
 - `~/.globus_compute/hpc-bridge-fake-upg1791688461`, a directory with no process.
-- `ps` counted 23 processes running from `gce-venv/bin` across users after phase 1. Check for leaked managers before the
-  next sweep.
+- **Leaked managers (found before the cluster went down, 2026-10-11).** Under `hpcbridge-test`, 14
+  `hpc-bridge-fake-<runid> start --detach` managers (with their `uep.*` children) were still running, 19 h to about 2
+  days old. They came from runs whose teardown had "deleted" the endpoint; the oldest are 0.1.22 hackathon runs on
+  main, so this predates follow-ups A and B. The 839b02e upgrade run's endpoint did go away. Investigate on resume:
+  either the product's teardown or the harness's post-run delete-by-name doesn't always stop the manager. Their Globus
+  registrations remain, offline; `agentic/sweep_pool_user.sh` is the cleanup tool.
+
+**The fake cluster is DOWN** (2026-10-11): stopped with `down.sh --profile mep`, volumes KEPT. Bring it back with
+`HPCB_FAKE_PROFILE=mep ./agentic/fakecluster/bin/up.sh --profile mep` (the profile needs `HPCB_MEP_EMAIL`). Use
+`down.sh --profile mep --wipe` for a fresh cluster; it deregisters the MEPs first.
 
 ## The order
 
