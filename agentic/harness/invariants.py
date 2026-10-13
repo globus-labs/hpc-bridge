@@ -399,6 +399,16 @@ class Trace:
     # The agent's own words (assistant text blocks, in order) — for graders about what the agent TOLD
     # the user: never asked for a password, relayed the access notes, quoted the refused identity.
     texts: list[str] = field(default_factory=list)
+    # Parallel to `texts` when the operator's record orders them among the calls (the Claude SDK stream): how many
+    # calls came before each text. Empty when unknown — `texts_after` then reads every text.
+    text_at: list[int] = field(default_factory=list)
+
+    def texts_after(self, i: int) -> list[str]:
+        """The agent's words after call `i` (e.g. what it told the user after an Esc) — every text when the positions
+        are unknown."""
+        if len(self.text_at) != len(self.texts):
+            return list(self.texts)
+        return [x for x, at in zip(self.texts, self.text_at, strict=True) if at > i]
 
     def named(self, *names: str, phase: int | None = None) -> list[tuple[int, ToolCall]]:
         """(index, call) for every call whose logical name is in ``names`` — optionally only
@@ -759,6 +769,40 @@ def compute_ran(t: Trace) -> Result:
     ok = bool(_slurm_work_idxs(t))
     return Result("compute_ran", ok,
                   "ok" if ok else "no run_shell ever completed on the compute shape")
+
+
+def first_result_seconds(t: Trace) -> tuple[float | None, str]:
+    """Seconds from the first connect_facility call to the RESULT of the first run_shell that completed on the compute
+    shape — the first-result time #173 cut from 95–114 s to ~40 s (fake, 5 s scaling pass). Stamps: the Claude SDK's
+    arrival stamps (a call's message, its result's message), or for the CLI operators the server journal's own
+    (`ts` when the call started, `ts + ms` when it returned; cli_runner). Returns (seconds, detail); None when the run
+    has no such pair or no stamps (an old bundle, an ACP transcript)."""
+    connects = [(i, c) for i, c in t.named("connect_facility") if c.t_call is not None]
+    if not connects:
+        return None, ("no connect_facility call" if not t.named("connect_facility")
+                      else "unmeasured: the connect carries no stamp (this operator or bundle records none)")
+    i0, c0 = connects[0]
+    # the same session only: a PHASES chain's arrival stamps restart with each phase's session
+    work = [i for i in _slurm_work_idxs(t) if i > i0 and t.calls[i].phase == c0.phase]
+    if not work:
+        return None, f"no run_shell completed on the compute shape after the first connect (call {i0}) in its session"
+    i1, c1 = work[0], t.calls[work[0]]
+    if c1.t_result is None or c0.t_call is None:
+        return None, f"unmeasured: the compute result (call {i1}) carries no stamp"
+    secs = round(max(0.0, c1.t_result - c0.t_call), 1)
+    return secs, f"{secs:g} s from the first connect (call {i0}) to the first completed compute result (call {i1})"
+
+
+def first_result_s(t: Trace, *, bound_s: float | None = None) -> Result:
+    """REPORTED for now (no scenario gates it): the first-result time (`first_result_seconds`). With `bound_s` — once
+    a baseline exists, e.g. `functools.partial(first_result_s, bound_s=90)` on fake — it fails above the bound; without
+    one it fails only when the time could not be measured. run.py also records the number in the bundle's `metrics`
+    and on the RESULT line."""
+    secs, detail = first_result_seconds(t)
+    if secs is None:
+        return Result("first_result_s", False, detail)
+    ok = bound_s is None or secs <= bound_s
+    return Result("first_result_s", ok, detail + ("" if bound_s is None else f" (bound {bound_s:g} s)"))
 
 
 def stop_is_honest(t: Trace) -> Result:

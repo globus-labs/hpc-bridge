@@ -2,12 +2,11 @@
 agent must stop polling, say so, and release. Fake cluster only (the hook kills this run's endpoint manager).
 
 Flow: bring up compute → ONE long run_shell on the compute shape (outlives the sync wait → `running` + task_id) →
-the agent's first `poll_task` fires the hook (`globus-compute-endpoint stop <this run's endpoint>` as the pool user)
+the agent's first `poll_task` fires the hook (stop this run's endpoint manager where it runs, as the pool user)
 → the manager deregisters, the web reports it offline → the next poll_task must be phase=failed with "ORPHANED"
 (server._poll_task via warmth._endpoint_gone) → the agent reports it once, calls stop_endpoint (which answers
 OFFLINE/ORPHANED, down) and finishes. Before hooks (review 2026-09-05, N6) this verdict existed only hermetically.
 """
-from cluster_ops import GCE
 from invariants import Result, Trace, texts_mention
 
 _MARK = "HPCB_CHAOS"
@@ -33,9 +32,12 @@ TARGETS = ("fake",)        # kills this run's endpoint manager — never on a sh
 POSTCHECK_DELAY_S = 90     # the block's worker pool exits once its manager is gone; give Slurm time to reap the job
 
 MIDRUN_HOOKS = [
-    {"name": "kill_manager", "after_tool": "poll_task", "nth": 1,
-     # the endpoint's venv is keyed by version (gce-venv-endpoint-<gce>-py<X.Y>); GCE finds the one that runs
-     "cmd": f"{GCE} stop {{endpoint_name}} >/dev/null 2>&1; echo manager-stopped"},
+    # Stop THIS run's manager on the login node where it runs (run.py _run_hook → cluster_ops.stop_here_cmd on every
+    # login node, each acting only if the manager is in its own ps). It FAILS harness:midrun_hooks unless some node
+    # stopped it. The old hook — `gce stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped` to the round-robin
+    # alias — landed on the node without the manager and still said it worked; the task then completed normally
+    # (pi, live 2026-10-13).
+    {"name": "kill_manager", "after_tool": "poll_task", "nth": 1, "world": "stop_manager"},
 ]
 
 

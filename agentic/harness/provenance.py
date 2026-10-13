@@ -120,6 +120,11 @@ def _transcript_md(config: dict, messages: list[Any], dialogue: list[Any],
     return "\n".join(lines) + "\n"
 
 
+def _trigger(e: dict) -> str:
+    """A hook event's trigger as words (`after run_shell #1`, `during run_shell +10s`); older bundles carry none."""
+    return str(e.get("trigger") or f"after {e.get('after_tool')} #{e.get('nth')}")
+
+
 def write_run_record(
     runs_dir: Path,
     *,
@@ -135,6 +140,7 @@ def write_run_record(
     events: list[dict] | None = None,
     extra_jsonl: dict[str, list[Any]] | None = None,
     arrivals: list[float | None] | None = None,
+    metrics: dict[str, Any] | None = None,
 ) -> Path | None:
     """Write the bundle; never raises (best-effort provenance must not fail the run).
 
@@ -168,6 +174,7 @@ def write_run_record(
             "result": result,
             "failed": list(failed or []),
             "events": _jsonable(events or []),   # chaos hooks that fired (tool, nth, call index, rc, output)
+            "metrics": _jsonable(metrics or {}),  # measured numbers, e.g. first_result_s (run.py)
             "gating": sorted(gates),
             "grading": [{"name": r.name, "ok": r.ok, "detail": r.detail,
                          "gating": r.name in gates or r.name.startswith("world:")} for r in grading],
@@ -187,7 +194,7 @@ def write_run_record(
         md = _transcript_md(config, messages, dialogue, grading, rc, gating=sorted(gates), result=result, failed=failed)
         if events:
             md += "\n## Harness events (chaos hooks)\n\n" + "\n".join(
-                f"- **{e.get('name')}** after `{e.get('after_tool')}` #{e.get('nth')} at call {e.get('call_index')}: "
+                f"- **{e.get('name')}** {_trigger(e)} at call {e.get('call_index')}: "
                 f"rc={e.get('rc')} — {str(e.get('out', ''))[:200]}" for e in events) + "\n"
         (d / "transcript.md").write_text(md)
         return d

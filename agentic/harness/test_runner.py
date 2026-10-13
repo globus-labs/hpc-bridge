@@ -41,10 +41,12 @@ class ResultMessage:
 
 
 class _Client:
-    """Each `receive_response()` call yields the next scripted TURN: a list of messages, or an exception."""
+    """Each `receive_response()` call yields the next scripted TURN: a list of messages, or an exception. A number in a
+    turn is a pause (seconds) — a tool call in flight, for the during hooks."""
 
     turns: ClassVar[list] = []
     queries: ClassVar[list[str]] = []
+    interrupts: ClassVar[int] = 0
 
     def __init__(self, options=None):
         self._i = 0
@@ -58,12 +60,18 @@ class _Client:
     async def query(self, prompt):
         _Client.queries.append(prompt)
 
+    async def interrupt(self):
+        _Client.interrupts += 1
+
     async def receive_response(self):
         turn = _Client.turns[self._i] if self._i < len(_Client.turns) else []
         self._i += 1
         for m in turn:
             if isinstance(m, Exception):
                 raise m
+            if isinstance(m, int | float):
+                await asyncio.sleep(m)
+                continue
             yield m
 
 
@@ -71,6 +79,9 @@ async def _query(prompt, options=None):
     for m in _Client.turns[0]:
         if isinstance(m, Exception):
             raise m
+        if isinstance(m, int | float):
+            await asyncio.sleep(m)
+            continue
         yield m
 
 
@@ -94,6 +105,7 @@ def runner(monkeypatch):
 
     monkeypatch.setattr(mod.HumanSim, "reply", fake_reply)
     _Client.queries = []
+    _Client.interrupts = 0
     return mod
 
 
@@ -231,6 +243,64 @@ def test_run_scenario_executes_hooks_and_records_them(runner):
                                         hook_runner=fake_hook))
     assert ran == ["kill_manager"]
     assert [(h["name"], h["call_index"], h.get("rc")) for h in r.hooks_fired] == [("kill_manager", 0, 0), ("never", None, None)]
+
+
+_ESC_HOOK = {"name": "esc", "on_tool": "run_shell", "when_input": "MARK", "after_s": 0.05,
+             "interject": "Sorry, I hit Esc by accident. What happened to that command?"}
+_MARK_USE = ToolUseBlock("u1", "mcp__endpoint__run_shell", {"shape": "compute", "command": "sleep 60; echo MARK"})
+_INTERRUPTED = UserMessage([ToolResultBlock("u1", "[Request interrupted by user for tool use]")])
+
+
+def test_a_during_hook_presses_esc_while_the_call_is_in_flight_then_the_user_speaks(runner):
+    _Client.turns = [[AssistantMessage([_MARK_USE]), 0.3, _INTERRUPTED, ResultMessage(is_error=True)],   # 0.3 s in flight
+                     [AssistantMessage([TextBlock("It kept running on the node.")]), ResultMessage()]]
+    r = asyncio.run(runner.run_scenario("go", repo_root=HERE.parents[1], persona="cooperative", midrun_hooks=[_ESC_HOOK]))
+    assert _Client.interrupts == 1 and _Client.queries == ["go", _ESC_HOOK["interject"]]   # the same session goes on
+    (fired,) = r.hooks_fired
+    assert fired["name"] == "esc" and fired["call_index"] == 0 and fired["rc"] == 0
+    assert fired["trigger"] == "during run_shell +0.05s" and fired["on_tool"] == "run_shell"
+    assert [c.name for c in r.trace.calls] == ["run_shell", "user_interjection"]   # stamped right after the call it cut
+    assert r.final.is_error is False   # the interrupted turn's error result is the harness's doing, not the verdict
+
+
+def test_a_during_hook_does_not_fire_when_the_call_returned_first(runner):
+    done = UserMessage([ToolResultBlock("u1", '{"phase": "complete", "stdout": "MARK"}')])
+    _Client.turns = [[AssistantMessage([_MARK_USE]), done, 0.2, AssistantMessage([TextBlock("done.")]), ResultMessage()]]
+    r = asyncio.run(runner.run_scenario("go", repo_root=HERE.parents[1], persona="cooperative", midrun_hooks=[_ESC_HOOK]))
+    assert _Client.interrupts == 0 and r.hooks_fired[0]["out"] == "NEVER FIRED" and r.hooks_fired[0]["call_index"] is None
+
+
+def test_an_interrupt_only_hook_ends_the_run_as_the_harness_meant(runner):
+    esc_only = {"name": "esc", "on_tool": "run_shell", "after_s": 0.05, "action": "interrupt"}
+    _Client.turns = [[AssistantMessage([_MARK_USE]), 0.3, _INTERRUPTED, ResultMessage(is_error=True)]]
+    r = asyncio.run(runner.run_scenario("go", repo_root=HERE.parents[1], persona="cooperative", midrun_hooks=[esc_only]))
+    assert _Client.interrupts == 1 and _Client.queries == ["go"]        # nothing is said after the Esc
+    assert r.final.is_error is False and "Esc" in r.final.result and r.hooks_fired[0]["rc"] == 0
+
+
+def test_an_autonomous_run_runs_a_during_cmd_but_cannot_interrupt(runner):
+    ran = []
+
+    async def fake_hook(hook):
+        ran.append(hook["name"])
+        return {"rc": 0, "out": "killed"}
+
+    _Client.turns = [[AssistantMessage([_MARK_USE]), 0.3, UserMessage([ToolResultBlock("u1", '{"phase": "failed"}')]),
+                      ResultMessage()]]
+    kill = {"name": "kill", "on_tool": "run_shell", "after_s": 0.05, "cmd": "pkill -f worker"}
+    r = asyncio.run(runner.run_scenario("go", repo_root=HERE.parents[1], persona=None,
+                                        midrun_hooks=[kill, dict(_ESC_HOOK, after_s=0.1)], hook_runner=fake_hook))
+    assert ran == ["kill"] and _Client.interrupts == 0
+    by = {h["name"]: h for h in r.hooks_fired}
+    assert by["kill"]["rc"] == 0 and by["esc"]["rc"] == 1 and "interactive run" in by["esc"]["out"]
+
+
+def test_a_timer_still_waiting_when_the_run_ends_is_cancelled_and_reported_unfired(runner):
+    slow = dict(_ESC_HOOK, after_s=30)
+    _Client.turns = [[AssistantMessage([_MARK_USE]), ResultMessage()]]   # the stream ends with the call never answered
+    r = asyncio.run(asyncio.wait_for(runner.run_scenario("go", repo_root=HERE.parents[1], persona=None, midrun_hooks=[slow]),
+                                     timeout=5))
+    assert r.hooks_fired[0]["out"] == "NEVER FIRED"
 
 
 def test_postchecks_on_each_login_judge_raw_output_per_host(runner, monkeypatch):
@@ -421,6 +491,162 @@ def test_a_leaked_manager_after_teardown_fails_a_delete_cell_end_to_end(runner, 
     assert "harness:no_manager_after_teardown" in recorded["failed"]
     assert "harness:no_manager_after_teardown" in recorded["gating"]
     sys.modules.pop("scen_leak", None)
+
+
+def test_the_first_result_time_reaches_the_bundle_and_the_result_line(runner, monkeypatch, tmp_path, capsys):
+    import asyncio
+
+    sys.modules.pop("run", None)
+    import run as run_mod
+    from invariants import ToolCall, Trace
+
+    (tmp_path / "scen_timed.py").write_text('PROMPT = "x"\nEXPECT_OK = ["agent_engaged"]\nTEARDOWN = "keep"\n'
+                                            'TRUST_HOST_KEY = False\nPOSTCHECK_DELAY_S = 0\n')
+    monkeypatch.setattr(run_mod, "SCENARIOS_DIR", tmp_path)
+    real_sleep = asyncio.sleep
+    monkeypatch.setattr(run_mod.asyncio, "sleep", lambda s: real_sleep(0))
+    recorded = {}
+
+    async def fake_run_scenario(prompt, **kw):
+        connect = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"}, {"phase": "connected"})
+        run_ = ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname"}, {"phase": "complete", "stdout": "c1"})
+        connect.t_call, run_.t_result = 1.5, 42.9
+        return run_mod.RunResult(trace=Trace([connect, run_]), messages=[],
+                                 final=type("F", (), {"is_error": False, "total_cost_usd": 0.0})())
+
+    monkeypatch.setattr(run_mod, "run_scenario", fake_run_scenario)
+    monkeypatch.setattr(run_mod, "_ssh_run", lambda cmd, *, timeout=60, host=None: (0, ""))
+    monkeypatch.setattr(run_mod, "write_run_record", lambda runs_dir, **kw: recorded.update(kw))
+    rc = asyncio.run(run_mod._run("scen_timed", "m", None, None, False))
+    assert rc == 0 and recorded["metrics"] == {"first_result_s": 41.4}
+    assert "RESULT: OK  (first result 41.4 s)" in capsys.readouterr().out
+    sys.modules.pop("scen_timed", None)
+
+
+def test_an_operator_that_cannot_serve_a_scenarios_hooks_skips_the_cell(runner, monkeypatch, tmp_path, capsys):
+    import asyncio
+
+    sys.modules.pop("run", None)
+    import run as run_mod
+
+    (tmp_path / "scen_esc.py").write_text(
+        'PROMPT = "x"\nMIDRUN_HOOKS = [{"on_tool": "run_shell", "after_s": 10, "interject": "oops"}]\n')
+    (tmp_path / "scen_cmd.py").write_text('PROMPT = "x"\nMIDRUN_HOOKS = [{"after_tool": "run_shell", "cmd": "scancel"}]\n')
+    monkeypatch.setattr(run_mod, "SCENARIOS_DIR", tmp_path)
+    assert asyncio.run(run_mod._run("scen_esc", "m", None, None, False, operator="pi")) == 2
+    out = capsys.readouterr().out
+    assert "RESULT: SKIPPED — the pi operator does not support mid-run hooks that need during_tool, interject, interrupt" in out
+    assert asyncio.run(run_mod._run("scen_cmd", "m", None, None, False, operator="claude-acp")) == 2
+    assert "mid-run hooks that need cmd" in capsys.readouterr().out
+    for m in ("scen_esc", "scen_cmd"):
+        sys.modules.pop(m, None)
+
+
+# ---- world hooks report their REAL outcome (orphaned_task's blind `gce stop` to the alias, live 2026-10-13) ----------
+
+def _hook_world(run_mod, monkeypatch, outputs: dict):
+    """Two login nodes; `outputs` maps a host to what the hook's command printed there."""
+    monkeypatch.setattr(run_mod, "_LOGIN_HOSTS", ["l1", "l2"])
+    monkeypatch.setenv("HPC_BRIDGE_ENDPOINT_NAME", "hpc-bridge-fake-5-5-5")
+    sent = []
+
+    def ssh(cmd, *, timeout=60, host=None):
+        sent.append((host, cmd))
+        return outputs.get(host, (0, ""))
+
+    monkeypatch.setattr(run_mod, "_ssh_run", ssh)
+    return sent
+
+
+def test_a_stop_manager_hook_stops_it_where_it_runs_and_says_so(runner, monkeypatch):
+    import asyncio
+    sys.modules.pop("run", None)
+    import run as run_mod
+    sent = _hook_world(run_mod, monkeypatch, {"l1": (0, "HPCB_STOP login01 none\n"),
+                                              "l2": (0, "HPCB_STOP login02 rc=0 Endpoint is now stopped\n")})
+    res = asyncio.run(run_mod._run_hook({"name": "kill_manager", "after_tool": "poll_task", "world": "stop_manager"}))
+    assert [h for h, _ in sent] == ["l1", "l2"] and all("HPCB_STOP" in c and "hpc-bridge-fake-5-5-5" in c for _, c in sent)
+    assert res["rc"] == 0 and "[l1] no manager of it here" in res["out"] and "stopped on l2" in res["out"]
+
+
+def test_a_stop_manager_hook_that_stopped_nothing_fails(runner, monkeypatch):
+    import asyncio
+    sys.modules.pop("run", None)
+    import run as run_mod
+    _hook_world(run_mod, monkeypatch, {"l1": (0, "HPCB_STOP login01 none\n"), "l2": (255, "ssh: Connection refused")})
+    res = asyncio.run(run_mod._run_hook({"name": "kill_manager", "after_tool": "poll_task", "world": "stop_manager"}))
+    assert res["rc"] == 1 and "NOT stopped on any node" in res["out"] and "UNVERIFIABLE" in res["out"]
+    _hook_world(run_mod, monkeypatch, {"l2": (0, "HPCB_STOP login02 rc=1 Endpoint not running\n")})
+    res = asyncio.run(run_mod._run_hook({"name": "kill_manager", "after_tool": "poll_task", "world": "stop_manager"}))
+    assert res["rc"] == 1 and "gce stop rc=1" in res["out"]
+    monkeypatch.delenv("HPC_BRIDGE_ENDPOINT_NAME")
+    res = asyncio.run(run_mod._run_hook({"name": "kill_manager", "after_tool": "poll_task", "world": "stop_manager"}))
+    assert res["rc"] == 1 and "no endpoint of this run" in res["out"]
+
+
+def test_a_cmd_hook_with_expect_any_host_fails_unless_some_node_printed_it(runner, monkeypatch):
+    import asyncio
+    sys.modules.pop("run", None)
+    import run as run_mod
+    freeze = {"name": "freeze", "after_tool": "run_shell", "on": "each_login", "cmd": "pkill -STOP …; echo pkill-rc=$?",
+              "expect_any_host": "pkill-rc=0"}
+    _hook_world(run_mod, monkeypatch, {"l1": (0, "frozen pkill-rc=1"), "l2": (0, "frozen pkill-rc=0")})
+    assert asyncio.run(run_mod._run_hook(freeze))["rc"] == 0
+    _hook_world(run_mod, monkeypatch, {"l1": (0, "frozen pkill-rc=1"), "l2": (0, "frozen pkill-rc=1")})
+    res = asyncio.run(run_mod._run_hook(freeze))
+    assert res["rc"] == 1 and "expected 'pkill-rc=0' on some node" in res["out"]
+
+
+def test_the_hooks_row_wants_every_declared_hook_in_the_record(runner):
+    sys.modules.pop("run", None)
+    import run as run_mod
+    declared = [{"name": "cancel", "after_tool": "run_shell", "cmd": "x"}, {"after_tool": "stop_endpoint", "cmd": "y"}]
+    ok = run_mod._midrun_hooks_row(declared, [{"name": "cancel", "call_index": 3, "rc": 0},
+                                              {"name": "stop_endpoint", "call_index": 9, "rc": 0}])
+    assert ok.ok
+    # a hook whose action raised before it was recorded is in neither list (review P1): the row says so and fails
+    lost = run_mod._midrun_hooks_row(declared, [{"name": "stop_endpoint", "call_index": 9, "rc": 0}])
+    assert not lost.ok and "MISSING from the record: ['cancel']" in lost.detail
+    assert not run_mod._midrun_hooks_row(declared, [{"name": "cancel", "call_index": 3, "rc": 1},
+                                                    {"name": "stop_endpoint", "call_index": None, "rc": None}]).ok
+
+
+def test_an_after_hook_whose_runner_raises_is_recorded_failed_not_lost(runner):
+    use = ToolUseBlock("u1", "mcp__endpoint__poll_task", {"task_id": "t"})
+    _Client.turns = [[AssistantMessage([use]), UserMessage([ToolResultBlock("u1", '{"phase":"running"}')]),
+                      AssistantMessage([TextBlock("done.")]), ResultMessage()]]
+
+    async def broken(hook):
+        raise RuntimeError("ssh exploded")
+
+    r = asyncio.run(runner.run_scenario("go", repo_root=HERE.parents[1], persona=None, hook_runner=broken,
+                                        midrun_hooks=[{"name": "kill", "after_tool": "poll_task", "cmd": "x"}]))
+    (rec,) = r.hooks_fired
+    assert rec["name"] == "kill" and rec["rc"] == 1 and "ssh exploded" in rec["out"] and r.final.is_error is False
+
+
+def test_texts_keep_their_place_among_the_calls_and_an_interjection_moves_them(runner):
+    from trace_adapter import build_trace, insert_interjections
+    msgs = [AssistantMessage([TextBlock("Starting it.")]), AssistantMessage([_MARK_USE]), _INTERRUPTED,
+            AssistantMessage([TextBlock("It kept running.")])]
+    t = build_trace(msgs)
+    assert t.texts == ["Starting it.", "It kept running."] and t.text_at == [0, 1]
+    t = insert_interjections(t, [{"text": "oops", "call_index": 0}])
+    assert [c.name for c in t.calls] == ["run_shell", "user_interjection"] and t.text_at == [0, 2]
+    assert t.texts_after(1) == ["It kept running."]                 # what the agent said after the user spoke
+    from invariants import Trace
+    assert Trace([], ["a", "b"]).texts_after(5) == ["a", "b"]       # positions unknown (another operator): every text
+
+
+def test_a_chain_keeps_its_text_positions_across_phases(runner):
+    sys.modules.pop("run", None)
+    import run as run_mod
+    from invariants import ToolCall, Trace
+    one = run_mod.RunResult(trace=Trace([ToolCall.of("a"), ToolCall.of("b")], ["p1"], [2]), final=None, messages=[])
+    two = run_mod.RunResult(trace=Trace([ToolCall.of("c")], ["p2"], [0]), final=None, messages=[])
+    assert run_mod._combine([one, two]).trace.text_at == [2, 2]
+    blind = run_mod.RunResult(trace=Trace([ToolCall.of("c")], ["p2"]), final=None, messages=[])
+    assert run_mod._combine([one, blind]).trace.text_at == []      # one phase without positions: unknown for the chain
 
 
 _EID = "abcd1234-0000-4000-8000-000000000001"

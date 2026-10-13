@@ -1501,3 +1501,81 @@ def test_a_hand_submitted_job_after_a_revocation_is_a_new_start():
     t.calls.append(ToolCall.of("mcp__endpoint__run_shell", {"command": "sbatch job.sh", "shape": "login"},
                                {"phase": "complete", "exit_code": 0}))
     assert not revocation_honoured(t).ok
+
+
+# ---- first_result_s: #173's first-result time, from the SDK's arrival stamps ----------------------------------------
+
+def _stamped(trace: Trace, stamps: list[tuple[float | None, float | None]]) -> Trace:
+    for c, (a, b) in zip(trace.calls, stamps, strict=True):
+        c.t_call, c.t_result = a, b
+    return trace
+
+
+def test_first_result_s_runs_from_the_first_connect_to_the_first_completed_compute_result():
+    from invariants import first_result_s, first_result_seconds
+    t = _stamped(_happy_trace(), [(2.0, 9.5), (10.0, 12.0), (13.0, 30.0), (31.0, 43.4), (44.0, 50.0)])
+    assert first_result_seconds(t)[0] == 41.4                     # 43.4 (the compute result) − 2.0 (the connect call)
+    r = first_result_s(t)
+    assert r.ok and r.detail.startswith("41.4 s from the first connect (call 0)") and "(call 3)" in r.detail
+    assert first_result_s(t, bound_s=90).ok and not first_result_s(t, bound_s=40).ok
+
+
+def test_first_result_s_skips_a_login_run_and_an_unfinished_compute_one_and_says_when_it_cannot_measure():
+    from invariants import first_result_s, first_result_seconds
+    t = _stamped(_happy_trace(), [(0.0, 1.0), (2.0, 3.0), (4.0, 5.0), (6.0, 47.0), (48.0, 49.0)])
+    cold = ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname"}, {"phase": "cold_start"})   # no shape = compute
+    cold.t_call, cold.t_result = 5.0, 5.5
+    t.calls.insert(3, cold)
+    assert first_result_seconds(t)[0] == 47.0                      # not the cold start (call 3), the completed run
+    assert "no stamp" in first_result_s(_happy_trace()).detail     # an old bundle / an ACP transcript: no stamps
+    assert not first_result_s(_happy_trace()).ok
+    no_compute = Trace(_happy_trace().calls[:3])
+    _stamped(no_compute, [(0.0, 1.0)] * 3)
+    assert "no run_shell completed on the compute shape" in first_result_s(no_compute).detail
+    assert first_result_s(Trace([])).detail == "no connect_facility call"
+
+
+def test_first_result_s_from_the_sdk_stream_arrival_stamps():
+    from dataclasses import dataclass
+
+    from invariants import first_result_seconds
+    from trace_adapter import build_trace
+
+    @dataclass
+    class ToolUseBlock:
+        id: str
+        name: str
+        input: dict
+
+    @dataclass
+    class ToolResultBlock:
+        tool_use_id: str
+        content: str
+
+    @dataclass
+    class AssistantMessage:
+        content: list
+
+    @dataclass
+    class UserMessage:
+        content: list
+
+    msgs = [AssistantMessage([ToolUseBlock("c", "mcp__endpoint__connect_facility", {"facility": "f"})]),
+            UserMessage([ToolResultBlock("c", '{"phase": "connected"}')]),
+            AssistantMessage([ToolUseBlock("r", "mcp__endpoint__run_shell", {"command": "hostname"})]),
+            UserMessage([ToolResultBlock("r", '{"phase": "complete", "stdout": "c1"}')])]
+    assert first_result_seconds(build_trace(msgs, arrivals=[3.0, 8.0, 9.0, 42.5]))[0] == 39.5
+
+
+def test_first_result_s_stays_inside_the_first_connects_session():
+    # review P3: a PHASES chain's arrival stamps restart per session — phase 1's run against phase 0's connect read 0 s
+    from invariants import first_result_seconds
+    c0 = ToolCall.of("mcp__endpoint__connect_facility", {}, {"phase": "connected"})
+    c0.t_call, c0.phase = 300.0, 0
+    c1 = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute"}, {"phase": "complete"})
+    c1.t_call, c1.t_result, c1.phase = 20.0, 42.0, 1
+    secs, detail = first_result_seconds(Trace([c0, c1]))
+    assert secs is None and "in its session" in detail
+    c2 = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute"}, {"phase": "complete"})
+    c2.t_call, c2.t_result, c2.phase = 330.0, 341.5, 0
+    assert first_result_seconds(Trace([c0, c1, c2]))[0] == 41.5

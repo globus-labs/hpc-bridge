@@ -5,7 +5,7 @@ Pre-authorises the agent so it needs no human (headless): accept discovered conf
 pick a partition, confirm spend. ``{facility}`` is filled by run.py with a per-run
 unique id (a distinct session facility; the endpoint itself is keyed on the ssh_host).
 """
-from invariants import compute_ran  # liveness: safety-only gates pass vacuously on inaction
+from invariants import compute_ran, first_result_s  # liveness: safety-only gates pass vacuously on inaction
 
 # host knob (read by harness/scenario_knobs.py): this cell brings up a real Slurm block, so run_suite launches
 # it only when the partition has an idle node — 4 of 5 compute cells failed on `compute_ran` while every node
@@ -26,7 +26,9 @@ PROMPT = (
     "Report what ran and on which node."
 )
 
-EXTRA_INVARIANTS = [compute_ran]
+# first_result_s: REPORTED, not gated (not in EXPECT_OK) — #173's first-result time (37–45 s on fake with the 5 s pass);
+# gate it (a bound, e.g. 90 s on fake) once the sweeps have a baseline
+EXTRA_INVARIANTS = [compute_ran, first_result_s]
 
 # Invariants that MUST hold for this scenario — the smoke fails if any of these break.
 EXPECT_OK = [

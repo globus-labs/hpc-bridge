@@ -411,3 +411,127 @@ def test_hermes_keeps_a_text_the_agent_repeated_in_one_session(tmp_path):
 def test_a_long_output_keeps_its_head_for_the_floor():
     text = "SECRET-AT-START " + "x" * 50000
     assert "SECRET-AT-START" in cli_runner._clip(text) and len(cli_runner._clip(text)) < 17000
+
+
+# ---- the journal: timing stamps, and mid-run hooks for the one-shot operators -----------------------------------------
+
+def test_journal_calls_carry_the_servers_own_timing_and_first_result_s_reads_it():
+    from invariants import first_result_s, first_result_seconds
+    rows = [
+        {"tool": "connect_facility", "args": {"facility": "x"}, "result": {"phase": "connected"}, "ts": 1000.0, "ms": 4000},
+        {"tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "up"}, "ts": 1005.0, "ms": 30000},
+        {"tool": "run_shell", "args": {"command": "hostname"}, "result": {"phase": "complete", "stdout": "c1"},
+         "ts": 1036.0, "ms": 2500},
+    ]
+    events = [cli_runner.Native("Bash", {"command": "ls"}),
+              *(cli_runner.Native(r["tool"], r["args"], hpcb=True) for r in rows)]
+    trace, _ = cli_runner.build_trace(rows, events, [])
+    native, connect, _ensure, run = trace.calls
+    assert native.t_call is None and native.t_result is None          # a harness's own call: no clock we trust
+    assert (connect.t_call, connect.t_result) == (0.0, 4.0) and (run.t_call, run.t_result) == (36.0, 38.5)
+    assert first_result_seconds(trace)[0] == 38.5 and first_result_s(trace).ok
+    assert "38.5 s from the first connect (call 1)" in first_result_s(trace).detail
+    assert not first_result_s(trace, bound_s=30).ok                  # a bound, once a baseline exists
+    assert cli_runner.trace_from_bundle_messages([{"journal": r} for r in rows]).calls[2].t_result == 38.5   # regrade too
+
+
+def test_extra_env_reaches_a_server_whose_harness_filters_the_env(tmp_path, monkeypatch):
+    env = {**_env(monkeypatch), "HPC_BRIDGE_CANARY_TIMEOUT_S": "45"}
+    codex = cli_runner.setup_codex(tmp_path, "/work/hpc-bridge", env, extra=("HPC_BRIDGE_CANARY_TIMEOUT_S",))
+    srv = tomllib.loads((Path(codex["CODEX_HOME"]) / "config.toml").read_text())["mcp_servers"]["hpc-bridge"]
+    assert "HPC_BRIDGE_CANARY_TIMEOUT_S" in srv["env_vars"] and "UNRELATED" not in srv["env_vars"]
+    hermes = cli_runner.setup_hermes21(tmp_path, "/work/hpc-bridge", env, extra=("HPC_BRIDGE_CANARY_TIMEOUT_S",))
+    cfg = yaml.safe_load((Path(hermes["HERMES_HOME"]) / "config.yaml").read_text())
+    assert cfg["mcp_servers"]["hpc-bridge"]["env"]["HPC_BRIDGE_CANARY_TIMEOUT_S"] == "45"
+    # without the scenario asking, a stray variable still does not pass
+    plain = cli_runner.setup_hermes21(tmp_path / "p", "/work/hpc-bridge", env)
+    assert "HPC_BRIDGE_CANARY_TIMEOUT_S" not in yaml.safe_load((Path(plain["HERMES_HOME"]) / "config.yaml").read_text())[
+        "mcp_servers"]["hpc-bridge"]["env"]
+
+
+def _cli_jail(tmp_path, monkeypatch):
+    """The jail-only pieces stubbed: the agent SDK (runner's import), HOME, the ALCF model."""
+    import types
+    stub = types.ModuleType("claude_agent_sdk")
+    for name in ("ClaudeAgentOptions", "ClaudeSDKClient", "PermissionResultAllow"):
+        setattr(stub, name, type(name, (), {}))
+    stub.query = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", stub)
+    sys.modules.pop("runner", None)
+    monkeypatch.setenv("HOME", str(tmp_path))   # Path.home(): the run dirs and the installed skill land here
+    _env(monkeypatch)
+
+
+def test_a_cmd_hook_fires_from_the_journal_while_the_cli_turn_runs(tmp_path, monkeypatch):
+    import asyncio
+    _cli_jail(tmp_path, monkeypatch)
+    ran: list[str] = []
+    order: list[str] = []
+
+    async def fake_turn(argv, *, cwd, env, timeout_s):
+        j = Path(env["HPC_BRIDGE_JOURNAL"])
+        with j.open("a") as fh:
+            fh.write(json.dumps({"tool": "run_shell", "args": {"command": "echo HPCB_RR_9f3e"}, "ts": 1.0, "ms": 5,
+                                 "result": {"phase": "complete", "endpoint_id": "e1"}}) + "\n")
+        for _ in range(200):                       # the turn goes on only once the hook has acted: it fired DURING it
+            if ran:
+                break
+            await asyncio.sleep(0.02)
+        order.append("turn continues")
+        with j.open("a") as fh:
+            fh.write(json.dumps({"tool": "stop_endpoint", "args": {}, "result": {"status": "down"}, "ts": 2.0, "ms": 5}) + "\n")
+        return 0, "", ""
+
+    async def fake_hook(hook):
+        ran.append(hook["name"])
+        order.append("hook")
+        return {"rc": 0, "out": f"scancel for {hook['endpoint_ids']}"}
+
+    monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    hooks_ = [{"name": "cancel_block", "after_tool": "run_shell", "when_input": "HPCB_RR_9f3e", "when_phase": "complete",
+               "cmd": "scancel"},
+              {"name": "never", "after_tool": "teardown_endpoint", "cmd": "x"}]
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="pi", midrun_hooks=hooks_,
+                                            hook_runner=fake_hook))
+    assert ran == ["cancel_block"] and order == ["hook", "turn continues"]
+    by = {h["name"]: h for h in r.hooks_fired}
+    assert by["cancel_block"]["rc"] == 0 and by["cancel_block"]["call_index"] == 0 and "e1" in by["cancel_block"]["out"]
+    assert by["never"]["out"] == "NEVER FIRED"
+    assert [c.name for c in r.trace.calls] == ["run_shell", "stop_endpoint"]
+
+
+def test_a_hook_a_one_shot_turn_cannot_serve_is_refused(tmp_path, monkeypatch):
+    import asyncio
+
+    import pytest
+    _cli_jail(tmp_path, monkeypatch)
+    for hook in ({"on_tool": "run_shell", "after_s": 10, "interject": "oops"},      # a call in flight + a user message
+                 {"after_tool": "run_shell", "interject": "I'm back"}):            # a user message mid-turn
+        with pytest.raises(NotImplementedError, match="cannot serve"):
+            asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex", midrun_hooks=[hook]))
+
+
+def test_a_journal_hook_whose_runner_raises_is_recorded_failed_not_lost(tmp_path, monkeypatch):
+    # review P1: the action raised, the follower died, and the hook was in neither `fired` nor the never-fired list —
+    # harness:midrun_hooks then passed on an empty record
+    import asyncio
+    _cli_jail(tmp_path, monkeypatch)
+
+    async def fake_turn(argv, *, cwd, env, timeout_s):
+        with Path(env["HPC_BRIDGE_JOURNAL"]).open("a") as fh:
+            fh.write(json.dumps({"tool": "poll_task", "args": {"task_id": "t"}, "result": {"phase": "running"},
+                                 "ts": 1.0, "ms": 5}) + "\n")
+            fh.write(json.dumps({"tool": "stop_endpoint", "args": {}, "result": {"status": "down"}, "ts": 2.0, "ms": 5}) + "\n")
+        return 0, "", ""   # the turn ends at once: the final read after it still acts on both rows
+
+    async def broken(hook):
+        raise RuntimeError("ssh exploded")
+
+    monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="pi", hook_runner=broken,
+                                            midrun_hooks=[{"name": "kill_manager", "after_tool": "poll_task", "cmd": "x"},
+                                                          {"name": "after", "after_tool": "stop_endpoint", "cmd": "y"}]))
+    assert [(h["name"], h["rc"]) for h in r.hooks_fired] == [("kill_manager", 1), ("after", 1)]
+    assert "ssh exploded" in r.hooks_fired[0]["out"]

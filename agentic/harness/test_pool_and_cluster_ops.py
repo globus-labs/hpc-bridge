@@ -501,3 +501,72 @@ def test_the_sweep_script_restores_planted_entry_points_too():
 
     text = (Path(__file__).resolve().parents[1] / "sweep_pool_user.sh").read_text()
     assert f"RESTORE='{restore_planted_entry_points_cmd()}'" in text and 'REMOTE="$RESTORE; ' in text
+
+
+# ---- world checks over the run's pilot jobs (cluster_ops.parsl_jobs_since_cmd), against a fake `sacct` ------------------
+
+def _jobs_world(tmp_path, rows: list[str] | None, *, t0: str | None = "2026-10-13T10:00:00") -> tuple[int, str]:
+    """Run the postcheck command in bash with `sacct`/`whoami` stubbed and HOME holding the t0 stamp."""
+    import subprocess
+    import sys
+
+    from cluster_ops import parsl_jobs_since_cmd
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    (tmp_path / "sacct.out").write_text("".join(r + "\n" for r in rows or []))
+    (bin_ / "sacct").write_text(f'#!/bin/sh\necho "$@" > {tmp_path}/sacct.args\ncat {tmp_path}/sacct.out\n')
+    (bin_ / "whoami").write_text("#!/bin/sh\necho hpcbridge-test-03\n")
+    for f in ("sacct", "whoami"):
+        (bin_ / f).chmod(0o755)
+    if t0 is not None:
+        (tmp_path / ".t0").write_text(t0 + "\n")
+    py = bin_ / "python3"   # the login node's python3: this interpreter
+    py.write_text(f'#!/bin/sh\nexec "{sys.executable}" "$@"\n')
+    py.chmod(0o755)
+    env = {"HOME": str(tmp_path), "PATH": f"{bin_}:/usr/bin:/bin"}
+    r = subprocess.run(["bash", "-c", parsl_jobs_since_cmd("~/.t0")], capture_output=True, text=True, env=env, timeout=30)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_the_pilot_jobs_check_counts_cancels_and_overlaps(tmp_path):
+    old = "101|parsl.htex.block-0.1|CANCELLED by 1003|2026-10-13T10:01:00|2026-10-13T10:01:02|2026-10-13T10:03:00"
+    new = "102|parsl.htex.block-1.2|COMPLETED|2026-10-13T10:04:10|2026-10-13T10:04:12|2026-10-13T10:06:00"
+    other = "100|hpcb-handjob|COMPLETED|2026-10-13T10:00:30|2026-10-13T10:00:31|2026-10-13T10:00:40"
+    earlier = "99|parsl.htex.block-0.0|COMPLETED|2026-10-13T09:00:00|2026-10-13T09:00:01|2026-10-13T09:30:00"
+    rc, out = _jobs_world(tmp_path, [earlier, other, new, old])
+    assert rc == 0 and "parsl_jobs=2; overlap=0; old=CANCELLED; jobs=101:CANCELLED,102:COMPLETED" in out, out
+    args = (tmp_path / "sacct.args").read_text()
+    assert "-S 2026-10-13T10:00:00" in args and "-u hpcbridge-test-03" in args   # this user, since the stamp
+    # a replacement that started while the old block was still running is an overlap
+    racing = "102|parsl.htex.block-1.2|RUNNING|2026-10-13T10:02:00|2026-10-13T10:02:05|Unknown"
+    rc, out = _jobs_world(tmp_path, [old, racing])
+    assert "overlap=1;" in out and "parsl_jobs=2;" in out, out
+    # a block still running when the check runs, and a later one that never started, never overlap by themselves
+    pending = "103|parsl.htex.block-2.3|PENDING|2026-10-13T10:05:00|Unknown|Unknown"
+    rc, out = _jobs_world(tmp_path, ["101|parsl.b|RUNNING|2026-10-13T10:01:00|2026-10-13T10:01:02|Unknown", pending])
+    assert "parsl_jobs=2; overlap=0; old=RUNNING;" in out, out
+    rc, out = _jobs_world(tmp_path, [old])
+    assert "parsl_jobs=1;" in out and "parsl_jobs=11" not in out
+    rc, out = _jobs_world(tmp_path, [])
+    assert rc == 0 and "parsl_jobs=0; overlap=0; old=none; jobs=none" in out
+    # an empty (or failed) sacct never passes a check that wants the run's pilots (review P4)
+    assert "parsl_jobs=2; overlap=0;" not in out and "parsl_jobs=1;" not in out
+
+
+def test_the_pilot_jobs_check_fails_without_its_stamp(tmp_path):
+    rc, out = _jobs_world(tmp_path, ["101|parsl.b|COMPLETED|2026-10-13T10:01:00|2026-10-13T10:01:02|2026-10-13T10:02:00"], t0=None)
+    assert rc == 1 and "no t0 stamp" in out and "parsl_jobs" not in out   # never a vacuous pass
+
+
+def test_the_t0_stamp_is_in_sacct_format():
+    from cluster_ops import stamp_t0_cmd
+    assert stamp_t0_cmd("~/.t0") == "date +%Y-%m-%dT%H:%M:%S > ~/.t0"
+
+
+def test_a_stop_line_reads_as_stopped_only_where_gce_stop_succeeded():
+    from cluster_ops import stop_outcome
+    assert stop_outcome("HPCB_STOP login01 none\n") == ("none", "")
+    assert stop_outcome("x\nHPCB_STOP login02 rc=0 Endpoint <e> is now stopped\n") == ("rc=0", "Endpoint <e> is now stopped")
+    assert stop_outcome("HPCB_STOP login02 rc=1 no daemon.pid\n")[0] == "rc=1"
+    assert stop_outcome("ssh: connect to host login01 port 22: Connection refused") == (
+        "missing", "ssh: connect to host login01 port 22: Connection refused")

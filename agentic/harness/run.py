@@ -22,6 +22,7 @@ import signal
 import subprocess
 import sys
 import time
+from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
@@ -35,6 +36,7 @@ from cluster_ops import (
     restore_planted_entry_points_cmd,
     scoped_cancel_cmd,
     stop_here_cmd,
+    stop_outcome,
     token_store_cleanup_cmd,
     uep_dirs_cleanup_cmd,
 )
@@ -45,9 +47,11 @@ from invariants import (
     Trace,
     check_all,
     first_bring_up_had_details,
+    first_result_seconds,
     floor_graders,
     guidance_fetched,
 )
+from midrun_hooks import hook_label, operator_refusal
 from proctree import become_subreaper, stop_tree
 from provenance import write_run_record
 from runner import RunResult, run_scenario
@@ -82,19 +86,25 @@ def _combine(results: list[RunResult]) -> RunResult:
     phase index (`ToolCall.phase`) so chain graders can key on "phase 2's first connect" rather
     than infer the boundary from call order (`trace_adapter.trace_from_bundle` recovers the same
     stamp offline from the per-session `init` messages)."""
-    calls = []
+    calls, text_at = [], []
     for k, r in enumerate(results):
+        at = getattr(r.trace, "text_at", None) or []
+        if len(at) == len(r.trace.texts):   # positions, shifted past the earlier phases' calls
+            text_at += [len(calls) + n for n in at]
         for c in r.trace.calls:
             c.phase = k
             calls.append(c)
     texts = [x for r in results for x in getattr(r.trace, "texts", [])]  # the agent's words survive a chain too
+    if len(text_at) != len(texts):
+        text_at = []   # a phase without positions: unknown for the whole chain
     messages = [m for r in results for m in r.messages]
     # stamps restart per session (each phase is its own agent session); a result without stamps pads with None
     arrivals = [t for r in results for t in ((r.arrivals or []) + [None] * (len(r.messages) - len(r.arrivals or [])))]
     dialogue = [d for r in results for d in (r.dialogue or [])]
     errored = [r for r in results if r.final is None or getattr(r.final, "is_error", False)]
     final = (errored[0] if errored else results[-1]).final
-    return RunResult(trace=Trace(calls, texts), final=final, messages=messages, dialogue=dialogue, arrivals=arrivals)
+    return RunResult(trace=Trace(calls, texts, text_at), final=final, messages=messages, dialogue=dialogue,
+                     arrivals=arrivals)
 
 
 async def _run_chain(phase_prompts, scen, *, model, effort, persona, user_goal, no_skill):
@@ -428,22 +438,52 @@ def _run_endpoint_ids(res) -> list[str]:
 
 
 async def _run_hook(hook: dict) -> dict:
-    """Execute one chaos hook on the cluster as the test user (the harness' world channel), mid-run. `{endpoint_name}`
-    is this run's endpoint; `{eid}` the latest endpoint uuid the agent's tool results have shown."""
-    cmd = str(hook["cmd"]).replace("{endpoint_name}", os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", ""))
-    eids = hook.get("endpoint_ids") or []
-    cmd = cmd.replace("{eid}", eids[-1] if eids else "")
-    # "on": "each_login" runs the hook on EVERY login node of a round-robin pool — the default host is the alias, which
-    # may resolve to the node the endpoint is NOT on (the freeze hook of draining_restop hit the wrong node on the
-    # 2026-09-06 sweep's rerun and the chaos never happened). Manager-hosting node unknown ⇒ hit them all.
-    hosts = (_login_hosts() or [None]) if hook.get("on") == "each_login" else [None]
-    rc, outs = 0, []
+    """Execute one chaos hook on the cluster as the test user (the harness' world channel), mid-run, and report its
+    REAL outcome (rc 0 only when it did what it is for — `harness:midrun_hooks` gates on it). A `cmd`: `{endpoint_name}`
+    is this run's endpoint, `{eid}` the latest endpoint uuid the agent's tool results have shown; `expect_any_host`
+    fails it unless some node printed that text. `world: "stop_manager"`: stop this run's manager where it runs."""
+    name = os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip()
+    stop_manager = hook.get("world") == "stop_manager"
+    if stop_manager:
+        # On EVERY login node, each acting only if the manager is in its own ps (cluster_ops.stop_here_cmd, the
+        # teardown's fix): sent to the round-robin alias, a stop can land on the other node, act on the NFS-shared
+        # daemon.pid there and leave the manager running — orphaned_task's `gce stop … ; echo manager-stopped` did
+        # exactly that and still said it worked (live 2026-10-13).
+        try:
+            cmd = stop_here_cmd(name)
+        except ValueError as exc:
+            print(f"  💥 hook {hook_label(hook)}: no endpoint of this run to stop ({exc})", file=sys.stderr, flush=True)
+            return {"rc": 1, "out": f"no endpoint of this run to stop ({exc})", "cmd": "", "hosts": []}
+        hosts = _login_hosts() or [None]
+    else:
+        cmd = str(hook["cmd"]).replace("{endpoint_name}", name)
+        eids = hook.get("endpoint_ids") or []
+        cmd = cmd.replace("{eid}", eids[-1] if eids else "")
+        # With `"on": "each_login"` the hook runs on EVERY login node of a round-robin pool — the default host is the
+        # alias, which may resolve to the node the endpoint is NOT on (the freeze hook of draining_restop hit the wrong
+        # node on the 2026-09-06 sweep's rerun and the chaos never happened). Manager-hosting node unknown ⇒ hit them all.
+        hosts = (_login_hosts() or [None]) if hook.get("on") == "each_login" else [None]
+    rc, outs, raw = 0, [], []
     for h in hosts:
         rc_h, out_h = await asyncio.to_thread(_ssh_run, cmd, timeout=int(hook.get("timeout", 120)), host=h)
         rc = rc or rc_h
+        raw.append(out_h)
         outs.append(f"[{h}] {out_h.strip()}" if h else out_h.strip())
     out = " | ".join(outs)
-    print(f"  💥 hook {hook.get('name', hook['after_tool'])}: rc={rc} — {out[:160]}", file=sys.stderr, flush=True)
+    if stop_manager:
+        seen = [(h or "login", *stop_outcome(o)) for h, o in zip(hosts, raw, strict=True)]
+        stopped = [h for h, status, _ in seen if status == "rc=0"]
+        rc = 0 if stopped else 1
+        out = " · ".join(f"[{h}] " + ("no manager of it here" if status == "none" else
+                                       f"gce stop {status} {detail}".strip() if status != "missing" else
+                                       f"UNVERIFIABLE ({detail[:80]!r})")
+                         for h, status, detail in seen)
+        out += f" — stopped on {', '.join(stopped)}" if stopped else " — NOT stopped on any node"
+    expect = str(hook.get("expect_any_host") or "")
+    if expect and rc == 0 and not any(expect in o for o in raw):
+        rc = 1
+        out += f" — expected {expect!r} on some node: none printed it"
+    print(f"  💥 hook {hook_label(hook)}: rc={rc} — {out[:160]}", file=sys.stderr, flush=True)
     return {"rc": rc, "out": out[:400], "cmd": cmd[:300], "hosts": [h for h in hosts if h]}
 
 
@@ -812,6 +852,28 @@ def _deregister_in_project_env(eids: list[str], runner=None, *, timeout: int = 6
     return "; ".join(lines)
 
 
+def _midrun_hooks_row(declared: list[dict], record: list[dict]) -> Result:
+    """`harness:midrun_hooks`: a chaos scenario's premise is that its fault was injected. Every declared hook must be in
+    the record — fired or NEVER FIRED; one in neither was lost (its action raised before it was recorded) — and every
+    fired hook must have done its job (rc 0). A hook that never fired means the agent never reached the trigger, and
+    every grader would pass vacuously."""
+    need = Counter(hook_label(h) for h in declared)
+    missing = sorted((need - Counter(str(h.get("name")) for h in record)).elements())
+    unfired = [h["name"] for h in record if h.get("call_index") is None]
+    failed_hooks = [h["name"] for h in record if h.get("rc") not in (None, 0)]
+    return Result("harness:midrun_hooks", not unfired and not failed_hooks and not missing,
+                  ", ".join(f"{h['name']}@call{h['call_index']} rc={h.get('rc')}" for h in record if h.get("call_index") is not None)
+                  + (f"; NEVER FIRED: {unfired}" if unfired else "")
+                  + (f"; FAILED: {failed_hooks}" if failed_hooks else "")
+                  + (f"; MISSING from the record: {missing}" if missing else ""))
+
+
+def _metrics_tail(metrics: dict[str, float | None]) -> str:
+    """What the RESULT line adds after the verdict: the measured numbers, e.g. `  (first result 41 s)`."""
+    secs = metrics.get("first_result_s")
+    return f"  (first result {secs:g} s)" if secs is not None else ""
+
+
 def _resolve_scenario(name: str) -> str:
     """Forgive tab-completion and path forms: 'saturation.', 'saturation.py', and
     'agentic/scenarios/saturation.py' all resolve to 'saturation'."""
@@ -850,17 +912,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     user_goal = fill(getattr(scen, "USER_GOAL", ""))
 
     # Operator dispatch: `hermes` drives the SAME scenario + graders with an ALCF-hosted model (guidance over MCP).
-    # Autonomous AND interactive (persona) scenarios are supported; refuse only what it can't yet drive rather than
-    # grade it vacuously.
+    # What an operator cannot drive yet is SKIPPED, never graded vacuously (midrun_hooks.operator_refusal): the CLI
+    # operators are autonomous-only and serve `cmd` hooks through the server's journal; the ACP operators take
+    # personas but no PHASES and no hooks.
+    reason = operator_refusal(operator, persona=persona, phases=bool(phases), hooks=getattr(scen, "MIDRUN_HOOKS", None))
+    if reason:
+        print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
+        return 2
     if operator in ("codex", "pi", "hermes21"):
         # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
         # say; graded from hpc-bridge's own tool-call journal (cli_runner). Autonomous scenarios only for now.
-        reason = ("an interactive persona" if (persona or getattr(scen, "PERSONA", None)) else
-                  "cross-restart chains (PHASES)" if phases else
-                  "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
-        if reason:
-            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
-            return 2
         import functools
 
         from cli_runner import run_scenario as _cli_run
@@ -868,11 +929,6 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         _run_scenario = functools.partial(_cli_run, harness=operator)
         model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")
     elif operator in ("hermes", "claude-acp"):
-        reason = ("cross-restart chains (PHASES)" if phases else
-                  "mid-run chaos hooks" if getattr(scen, "MIDRUN_HOOKS", None) else None)
-        if reason:
-            print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
-            return 2
         if operator == "hermes":
             from hermes_runner import run_scenario as _run_scenario
             model = os.environ.get("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")   # provenance: the model hermes actually used
@@ -946,6 +1002,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     endpoint_logs = ""
     probe: tuple[list[str], list[str]] | None = None
     torn_down = checked_after_teardown = False
+    metrics: dict[str, float | None] = {}
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
@@ -989,6 +1046,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             print(f"  user INTERJECTED after call {e['call_index']}: {e['text'][:140]}")
 
         config["human_sim_model"] = getattr(res, "human_sim_model", None)
+        # Numbers a run is measured by (not graded unless a scenario gates their grader): kept in the bundle and shown on
+        # the RESULT line, so a sweep summary carries them. first_result_s: #173's first-result time.
+        metrics["first_result_s"] = first_result_seconds(res.trace)[0]
 
         print("\n=== INVARIANTS ===")
         # Universal trace invariants + the scenario's own bespoke graders (EXTRA_INVARIANTS).
@@ -1033,14 +1093,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                                   + (f"  [{kinds['correction']} genuine operator correction(s)]" if kinds.get("correction") else "")))
         hooks = list(getattr(res, "hooks_fired", None) or [])
         if getattr(scen, "MIDRUN_HOOKS", None):
-            # a chaos scenario's premise is that its fault was injected: a hook that never fired means the agent
-            # never reached the trigger, and every grader below would pass vacuously
-            unfired = [h["name"] for h in hooks if h.get("call_index") is None]
-            failed_hooks = [h["name"] for h in hooks if h.get("rc") not in (None, 0)]
-            results.append(Result("harness:midrun_hooks", not unfired and not failed_hooks,
-                                  ", ".join(f"{h['name']}@call{h['call_index']} rc={h.get('rc')}" for h in hooks if h.get("call_index") is not None)
-                                  + (f"; NEVER FIRED: {unfired}" if unfired else "")
-                                  + (f"; FAILED: {failed_hooks}" if failed_hooks else "")))
+            results.append(_midrun_hooks_row(scen.MIDRUN_HOOKS, hooks))
         # Guidance-delivery is NOT operator-neutral (study correction): log per run whether the operator pulled the
         # over-MCP guidance resource, so the asymmetry (Claude-SDK force-feeds SKILL.md; hermes gets a lazy pointer)
         # is visible. Non-gating.
@@ -1129,6 +1182,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         cost = getattr(res.final, "total_cost_usd", None)
         is_error = getattr(res.final, "is_error", None)
         print(f"\nfinal: is_error={is_error}  cost=${cost}  ({len(res.trace.calls)} calls)")
+        tail = _metrics_tail(metrics)
         # Rate-limit deaths are infrastructure, not behaviour: distinct rc so the suite can
         # HALT instead of burning the remaining queue (11 wasted launches in sweep 2).
         rate_limited = (
@@ -1143,10 +1197,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             print("RESULT: RATE_LIMITED — session/rate limit; run not graded, suite should halt")
         elif failed:
             result_label = "FAILED"
-            print(f"RESULT: FAILED — critical checks broke: {failed}")
+            print(f"RESULT: FAILED — critical checks broke: {failed}{tail}")
         else:
             result_label = "OK"
-            print("RESULT: OK")
+            print(f"RESULT: OK{tail}")
             rc = 0
     except asyncio.CancelledError:
         result_label = "INTERRUPTED"
@@ -1197,6 +1251,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
             extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
             arrivals=(getattr(res, "arrivals", None) if res else None),
+            metrics=metrics,
         )
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on

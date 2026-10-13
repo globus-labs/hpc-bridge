@@ -1106,3 +1106,67 @@ async def test_after_an_idle_presumption_a_failed_check_still_dates_the_answer_b
     runner._canary = _job(new)
     assert (await _ensure_endpoint_up(app)).status == "up" and rt.reaped is None and rt.spend_confirmed is True
     assert (abs(rt.block_since - (now - 1200)) < 1e-6) is kept and rt.block_job == new
+
+
+# -- the HPC_BRIDGE_CANARY_TIMEOUT_S test seam (config.canary_timeout_s) -----------------------------------------------
+# The agentic scenario `reap_replaced_block` lengthens the check so the block that replaced a cancelled one answers
+# INSIDE it — the job-id reap above, which on the fake cluster's 8 s default only a timeout ever found live.
+
+@pytest.mark.parametrize(("raw", "want", "said"), [
+    (None, 8.0, False), ("", 8.0, False), ("  ", 8.0, False), ("30", 30.0, False), (" 12.5 ", 12.5, False),
+    ("8", 8.0, False), ("120", 120.0, False),
+    ("abc", 8.0, False),                          # invalid: _env_float says so itself
+    ("0", 8.0, True), ("-5", 8.0, True), ("5", 8.0, True),    # shorter would read a live block as reaped
+    ("500", 120.0, True),                         # capped: the check holds app.lock
+    ("inf", 8.0, True), ("nan", 8.0, True)])
+def test_the_canary_timeout_seam_only_lengthens_the_wait_within_bounds(monkeypatch, capsys, raw, want, said):
+    from hpc_bridge import config
+    from hpc_bridge.config import CANARY_TIMEOUT_MAX_S, CANARY_TIMEOUT_S, canary_timeout_s
+    monkeypatch.setattr(config, "_CANARY_SEAM_NOTED", set())
+    if raw is None:
+        monkeypatch.delenv("HPC_BRIDGE_CANARY_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("HPC_BRIDGE_CANARY_TIMEOUT_S", raw)
+    assert (CANARY_TIMEOUT_S, CANARY_TIMEOUT_MAX_S) == (8.0, 120.0) and canary_timeout_s() == want
+    assert ("outside [8, 120] s" in capsys.readouterr().err) is said
+    canary_timeout_s()
+    assert "outside" not in capsys.readouterr().err   # said once, not at every check
+
+
+def _timed(runner):
+    """Record the timeout each canary was given."""
+    seen = []
+    inner = runner.canary
+
+    async def canary(timeout=8.0):
+        seen.append(timeout)
+        return await inner(timeout=timeout)
+
+    runner.canary = canary
+    return seen
+
+
+@pytest.mark.parametrize(("raw", "want"), [(None, 8.0), ("30", 30.0)])
+async def test_the_check_waits_as_long_as_the_seam_says(monkeypatch, raw, want):
+    app, rt, runner = await _warm_app(job="101")
+    seen = _timed(runner)
+    if raw is None:
+        monkeypatch.delenv("HPC_BRIDGE_CANARY_TIMEOUT_S", raising=False)
+    else:
+        monkeypatch.setenv("HPC_BRIDGE_CANARY_TIMEOUT_S", raw)
+    rt.warm_confirmed_at -= 55          # past the canary's trust window: the next call checks
+    runner._canary = _job("202")        # the block that replaced job 101 answers inside the (longer) check
+    out = await _run_shell(app, "cat marker")
+    assert seen == [want]
+    assert out.phase == "needs_confirmation" and "previous block (job 101) is gone" in out.notice and "job 202" in out.notice
+
+
+async def test_a_timeout_reap_names_the_wait_the_check_actually_had(monkeypatch):
+    app, rt, runner = await _warm_app(job="101")
+    seen = _timed(runner)
+    monkeypatch.setenv("HPC_BRIDGE_CANARY_TIMEOUT_S", "12.5")
+    rt.warm_confirmed_at -= 55
+    runner._canary = _TIMEOUT
+    out = await _run_shell(app, "true")
+    assert seen == [12.5] and out.phase == "needs_confirmation"
+    assert "did not answer a check within 12.5 s" in out.notice

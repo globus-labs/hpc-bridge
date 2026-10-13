@@ -13,7 +13,9 @@ harness's, not the model's. The server itself runs from this checkout (`uv run`)
 CLAUDE.md/AGENTS.md of ours leaks in), beside — not inside — the record that grades it.
 
 AUTONOMOUS scenarios only for now (one turn: the prompt authorizes the spend). A persona'd scenario needs the harness's
-long-lived session mode (an MCP server that lives across turns, as in real use) — raised as unsupported.
+long-lived session mode (an MCP server that lives across turns, as in real use) — raised as unsupported. MIDRUN_HOOKS
+that run a `cmd` after a tool result ARE served: the journal is tailed while the turn runs (midrun_hooks.follow_journal). A
+hook that needs a call in flight or a user message mid-turn is not (midrun_hooks.py says why).
 """
 from __future__ import annotations
 
@@ -26,12 +28,14 @@ import shutil
 import tempfile
 import time
 import uuid
+from collections.abc import Iterable
 from dataclasses import dataclass
 from pathlib import Path
 from typing import Any
 
 import yaml
 from invariants import ToolCall, Trace
+from midrun_hooks import HookWatcher, fired_record, follow_journal, hook_label, trigger_text, unsupported_hook_needs
 from proctree import kill_group
 from responses_relay import start_relay
 
@@ -72,6 +76,13 @@ _PASSTHROUGH = (
 TURN_TIMEOUT_S = float(os.environ.get("HPCB_CLI_TURN_TIMEOUT_S", "2700"))
 
 
+def _server_env_names(env: dict[str, str], extra: Iterable[str] = ()) -> list[str]:
+    """The env the hpc-bridge server gets, for a harness that filters its child's env (Codex, Hermes): the fixed
+    passthrough plus the scenario's EXTRA_ENV keys (e.g. the HPC_BRIDGE_CANARY_TIMEOUT_S seam) — which the filter
+    otherwise dropped silently."""
+    return sorted({k for k in (*_PASSTHROUGH, *extra) if k in env})
+
+
 @dataclass
 class CliFinal:
     """The run's last word, shaped like the SDK ResultMessage the graders read (`result`, `is_error`)."""
@@ -101,12 +112,13 @@ def _model() -> tuple[str, str]:
 
 # ---------------------------------------------------------------- per-harness setup + one turn
 
-def setup_codex(work: Path, repo: str, env: dict[str, str], base_url: str | None = None) -> dict[str, str]:
+def setup_codex(work: Path, repo: str, env: dict[str, str], base_url: str | None = None, *,
+                extra: Iterable[str] = ()) -> dict[str, str]:
     base, model = _model()
     base = base_url or base  # the local relay (responses_relay) when the endpoint cannot stream Responses
     home = work / "codex"
     home.mkdir(parents=True, exist_ok=True)
-    names = sorted(k for k in _PASSTHROUGH if k in env)
+    names = _server_env_names(env, extra)
     lines = [
         f"model = {json.dumps(model)}", 'model_provider = "alcf"', 'approval_policy = "never"',
         'sandbox_mode = "danger-full-access"', "tool_output_token_limit = 20000", "",
@@ -121,7 +133,8 @@ def setup_codex(work: Path, repo: str, env: dict[str, str], base_url: str | None
     return {"CODEX_HOME": str(home)}
 
 
-def setup_pi(work: Path, repo: str, env: dict[str, str]) -> dict[str, str]:
+def setup_pi(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str] = ()) -> dict[str, str]:
+    # Pi hands its own environment to the server it spawns: `extra` (EXTRA_ENV) reaches it without a list
     base, model = _model()
     home = work / "pi"
     home.mkdir(parents=True, exist_ok=True)
@@ -135,7 +148,7 @@ def setup_pi(work: Path, repo: str, env: dict[str, str]) -> dict[str, str]:
     return {"PI_CODING_AGENT_DIR": str(home), "PI_OFFLINE": "1", "PI_SKIP_VERSION_CHECK": "1", "PI_TELEMETRY": "0"}
 
 
-def setup_hermes21(work: Path, repo: str, env: dict[str, str]) -> dict[str, str]:
+def setup_hermes21(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str] = ()) -> dict[str, str]:
     base, model = _model()
     home = work / "hermes"
     home.mkdir(parents=True, exist_ok=True)
@@ -145,7 +158,7 @@ def setup_hermes21(work: Path, repo: str, env: dict[str, str]) -> dict[str, str]
                   "context_length": 131072, "max_tokens": 4096},
         "approvals": {"mode": "off"},
         "mcp_servers": {"hpc-bridge": {"command": cmd[0], "args": cmd[1:],
-                                       "env": {k: env[k] for k in _PASSTHROUGH if k in env},
+                                       "env": {k: env[k] for k in _server_env_names(env, extra)},
                                        "connect_timeout": 180, "timeout": 600}},
     }
     (home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
@@ -255,6 +268,19 @@ def _journal_call(row: dict) -> ToolCall:
     return ToolCall.of(f"mcp__hpc-bridge__{row.get('tool')}", row.get("args") or {}, result)
 
 
+def _stamped(call: ToolCall, row: dict, t0: float | None) -> ToolCall:
+    """The server's own timing on an hpc-bridge call, in the trace's stamp fields (seconds since the run's first
+    hpc-bridge call started): `t_call` when the call started (`ts`), `t_result` when it returned (`ts` + `ms`). These
+    operators' own records carry no reliable clock, so their native calls stay unstamped; graders that time a run
+    (`first_result_s`) read these."""
+    ts, ms = row.get("ts"), row.get("ms")
+    if t0 is not None and isinstance(ts, int | float):
+        call.t_call = round(float(ts) - t0, 3)
+        if isinstance(ms, int | float):
+            call.t_result = round(float(ts) - t0 + float(ms) / 1000.0, 3)
+    return call
+
+
 def _loose(v: Any) -> Any:
     """A value as a harness may have coerced it before the call (Pi, Hermes): "true" → True, "3" → 3, a JSON string
     → the object it encodes."""
@@ -313,6 +339,7 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tup
     itself refused (`ran is False`) takes no row; a call with no row is kept as an error; rows no native event
     accounts for (a reader blind spot) are appended and counted — run.py GATES on that count."""
     ordered = sorted(rows, key=lambda r: (r.get("ts") is None, r.get("ts") or 0, r.get("seq") or 0))
+    t0 = min((float(r["ts"]) for r in ordered if isinstance(r.get("ts"), int | float)), default=None)
     hp = [k for k, e in enumerate(events) if e.hpcb]
     pairs = {hp[a]: b for a, b in _align([events[k] for k in hp], ordered).items()}
     calls: list[ToolCall] = []
@@ -323,7 +350,7 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tup
             calls.append(_native_call(ev))
             stats["native"] += 1
         elif k in pairs:
-            calls.append(_journal_call(ordered[pairs[k]]))
+            calls.append(_stamped(_journal_call(ordered[pairs[k]]), ordered[pairs[k]], t0))
             stats["hpcb_matched"] += 1
         else:
             refused = ev.ran is False
@@ -334,7 +361,7 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tup
             stats["harness_rejected" if refused else "hpcb_not_reaching_server"] += 1
     used = set(pairs.values())
     left = [r for j, r in enumerate(ordered) if j not in used]
-    calls.extend(_journal_call(r) for r in left)
+    calls.extend(_stamped(_journal_call(r), r, t0) for r in left)
     stats["journal_unplaced"] = len(left)
     return Trace(calls, texts), stats
 
@@ -570,10 +597,13 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
                        harness: str = "codex"):
     if persona:
         raise NotImplementedError(f"the {harness} operator drives autonomous scenarios only (no persona) for now")
-    if midrun_hooks:
-        raise NotImplementedError(f"the {harness} operator does not support mid-run chaos hooks yet")
     if harness not in HARNESSES:
         raise ValueError(f"unknown harness {harness!r}")
+    missing = unsupported_hook_needs(harness, midrun_hooks)
+    if missing:   # run.py reports such a cell SKIPPED first; this keeps a direct caller honest too
+        raise NotImplementedError(f"the {harness} operator cannot serve mid-run hooks that need {sorted(missing)}: a "
+                                  "one-shot turn takes no user message mid-turn, and the journal sees a call only "
+                                  "once it has returned")
     from runner import RunResult  # jail-only import chain (the Claude Agent SDK); kept off module import
     repo = str(repo_root)
     # under HOME, not /tmp: Codex refuses to put its helper binaries under a temporary dir. The RECORD (journal, relay
@@ -589,12 +619,13 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     if ablate_skill:
         env["HPC_BRIDGE_OMIT_INSTRUCTIONS"] = "1"
     relay = None
+    extra = tuple(k for k, v in (extra_env or {}).items() if v is not None)
     if harness == "codex":  # Codex speaks only streamed Responses with namespaced tools; ALCF serves neither
         os.environ["HPCB_RELAY_LOG"] = str(rec / "relay.jsonl")
         relay = start_relay(_model()[0])
-        env.update(setup_codex(rec, repo, env, base_url=relay.base_url))
+        env.update(setup_codex(rec, repo, env, base_url=relay.base_url, extra=extra))
     else:
-        env.update({"pi": setup_pi, "hermes21": setup_hermes21}[harness](rec, repo, env))
+        env.update({"pi": setup_pi, "hermes21": setup_hermes21}[harness](rec, repo, env, extra=extra))
     if not ablate_skill:  # where each looks: ~/.agents/skills (Codex, Pi), $HERMES_HOME/skills (Hermes)
         _install_skill(repo_root, Path.home() / ".agents" / "skills",
                        Path(env.get("HERMES_HOME", rec / "hermes")) / "skills")
@@ -604,11 +635,39 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     argv = _turn_argv(harness, prompt, ws, rec, str(uuid.uuid4()))
     print(f"  → {harness}: {' '.join(a if len(a) < 80 else a[:77] + '…' for a in argv[:8])} …", flush=True)
     t0 = time.monotonic()
+    # MIDRUN_HOOKS (`cmd` after a tool result): fed from the server's journal while the turn runs — the one record of
+    # these calls that exists DURING the run (midrun_hooks.follow_journal)
+    watcher = HookWatcher(midrun_hooks)
+    fired: list[dict] = []
+    stop = asyncio.Event()
+
+    async def act(hook: dict) -> None:
+        print(f"  💥 hook: {hook_label(hook)} {trigger_text(hook)} (journal row {hook['call_index']})", flush=True)
+        try:
+            outcome = (await hook_runner(hook) if hook_runner else None) or {"rc": None, "out": "(no hook runner)"}
+        except Exception as exc:  # noqa: BLE001 - recorded as a failed hook (harness:midrun_hooks gates it), never lost
+            outcome = {"rc": 1, "out": f"the hook failed: {type(exc).__name__}: {exc}"}
+        fired.append(fired_record(hook, outcome))
+
+    follower = (asyncio.create_task(follow_journal(journal, watcher, act, stop=stop, to_call=_journal_call, record=fired))
+                if midrun_hooks else None)
     try:
         rc, out, err = await run_turn_process(argv, cwd=str(ws), env=env, timeout_s=TURN_TIMEOUT_S)
+    except BaseException:
+        if follower is not None:
+            follower.cancel()
+            with contextlib.suppress(BaseException):
+                await follower
+        raise
     finally:
         if relay:
             relay.shutdown()
+    if follower is not None:
+        stop.set()      # a hook acting now finishes first; the follower reads the journal once more, then returns
+        try:
+            await follower
+        except Exception as exc:  # noqa: BLE001 - the hooks it never acted on read NEVER FIRED, which gates the cell
+            print(f"  ⚠ journal hooks stopped: {type(exc).__name__}: {exc}", flush=True)
     (rec / "harness-stdout.txt").write_text(out or "")
     (rec / "harness-stderr.txt").write_text(err or "")
     hops = _journal_rows(rec / "relay.jsonl")
@@ -625,4 +684,5 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
                  "trace_stats": stats, "stdout_tail": (out or "")[-4000:], "stderr_tail": (err or "")[-4000:]},
                 *({"native": _bundle_native(n)} for n in events), *({"text": t} for t in texts), {"final": text},
                 *({"journal": r} for r in rows), *({"relay": h} for h in hops)]
-    return RunResult(trace=trace, final=final, messages=messages)
+    return RunResult(trace=trace, final=final, messages=messages,
+                     hooks_fired=(fired + watcher.unfired_records()) if midrun_hooks else None)
