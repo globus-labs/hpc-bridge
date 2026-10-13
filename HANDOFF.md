@@ -23,9 +23,9 @@ hostile`) that is now the main regression backbone; the lab cluster is the real-
 Summary page: vault `Reference/Hackathon readiness 2026-10-09.md`.
 - **The registry is checked against its facilities** (0.1.21, #169): `hpc-bridge-registry-health` compares the live
   index with main's seeds and each facility endpoint with what its entry was proven against, and checks parsl
-  releases, SSH hosts and a fresh install's resolution. Run 2026-10-09: all OK. **`scripts/registry_monitor.sh install`
-  (hourly launchd job) is NOT installed** — the maintainer picks where it runs. Expanse still carries its 4.16-client
-  proof; its re-prove on 4.18 needs a one-time code.
+  releases, SSH hosts and a fresh install's resolution. Run 2026-10-09: all OK. It is an **on-demand drift check**,
+  not scheduled (maintainer's decision, 2026-10-09; how and when: vault `Concepts/Registry health.md`). Expanse still
+  carries its 4.16-client proof; its re-prove on 4.18 is parked (maintainer, 2026-10-09).
 - **Codex 0.162.0, Pi 1.1.0, Hermes v0.21.6** (0.1.22, `feat/harness-compat`):
   - Recipes are in `docs/user/other-hosts.md`. `agentic/install_check/` follows them in a clean container; all three
     end up with 12 tools and the skill.
