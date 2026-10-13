@@ -1,8 +1,9 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-09. `main` carries **plugin 0.1.21** (#169, registry health); branch **`feat/harness-compat`** carries
-**0.1.22** (Codex / Pi / Hermes recipes, progress on long calls, the cross-harness test operators) in review. The latest
-tag is **`v0.1.20-beta.1`** (2026-10-06, pre-release). The repository is **`globus-labs/hpc-bridge`**. Design rationale
+_Snapshot: 2026-10-13. `main` carries **plugin 0.1.23**: the 5 s scaling pass and job-id reap detection (#173),
+honest Esc/stop (#175), long output cut only to a marked end (#174), hand-submitted batch jobs counted as spend
+(#176), the no-facility notice (#177) and ALCF Polaris in the registry (#179). The latest tag is
+**`v0.1.20-beta.1`** (2026-10-06, pre-release). The repository is **`globus-labs/hpc-bridge`**. Design rationale
 lives in `docs/hpc-bridge-vault/`; this file is the live state + how-to-run + gotchas on top._
 
 ## TL;DR
