@@ -181,3 +181,13 @@ knobs (qos, cores_per_node, scheduler_options…). Driver: `agentic/mep_live_che
   queued tasks completed (21 success, 3 failed on cancelled blocks), and the endpoints released their blocks.
   Fix (0.1.19): Delta's entry pins `"parsl==2026.8.10"` in its install, `worker_env.strategy: pin`.
 - **Expanse** (SSH, one-time code) — the login shape and the scheduler-rejection path worked (a wrong account, `CIS250223` instead of the project `chi152`, came back as a terminal REJECTED, nothing billed). With `chi152` the block PENDED forever: `QOSMaxCpuPerJobLimit`, because Parsl's SlurmProvider defaults to `--exclusive` (a whole 128-core node) and `shared` caps a job at 127 CPUs. Fix 0.1.20: `defaults.exclusive: false` in the entry. A running endpoint keeps its old template until torn down and re-bootstrapped. **PASS on 0.1.20** after a teardown + fresh bootstrap: worker on exp-1-15 (1 CPU, job 54706201, 12 s), stop `down`. All four registry facilities proven 2026-10-06.
+- **ALCF Polaris** (MEP `9a947ba5-…aadec`, PBS Pro), added to the registry 2026-10-13 as `polaris`. The endpoint
+  (`polaris-esn-02-ep`, gce 4.9.0, Python 3.13.11) is not high-assurance and maps identities through PAM. Its template
+  requires `queue` + `account` (the entry's `key_map` renames `partition` → `queue`), appends ALCF's own
+  `/opt/globus-compute-agent/venv-py313/bin` to the workers' PATH after any `worker_init`, defaults
+  `scheduler_options` to `#PBS -l filesystems=home`, and idle-releases after 240 s. So the entry sends no
+  `worker_init`: the worker runs the facility's install, matching the user endpoint by construction, with no
+  `worker_env` pin. **PASS** with `registry_reprove.py polaris --account Diaspora`: the identity mapped
+  (`gusellerm@uchicago.edu` → `gusellerm`); a `debug` worker was live in 39 s on x3206c0s31b1n0 (py3.13.11, dill
+  0.3.9, parsl 2026.2.23); `hostname` returned exit 0; the stop came back `draining`. The client was Python 3.13.12;
+  the SDK warns about the patch-level difference only. Not yet run through an agent.
