@@ -32,6 +32,7 @@ This vault has two halves:
 - [[The MCP tools]] — the agent-facing surface (eleven tools)
 - [[Plugin packaging]] — `.mcp.json` · `plugin.json` · the `driving-hpc` skill · `hpc-connect` · the fresh-user script
 - [[Configuration]] — environment variables
+- [[Scenario itinerary 2026-10-13]] — **every agentic scenario at 0.1.23**: what each guards, its last verdict per operator, the behaviours with no scenario, ranked proposals for new ones, and a free-first sweep plan
 - [[Hackathon readiness 2026-10-09]] — **is it ready for the hackathon**: the registry checked against its facilities, the install and simulated jobs under the latest Codex / Pi / Hermes (15/18, failures all the open model's), how the grading stays honest
 - [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the 2026-09 recipe + config gotchas (current recipes: `docs/user/other-hosts.md`)
 - [[Cross-harness study - gpt-oss-120b vs Claude]] — the first weaker-model study (2026-09-06) and its confound analysis: the OPERATOR dominated the model signal; why those interactive numbers are not a model comparison
