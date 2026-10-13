@@ -371,6 +371,7 @@ async def _ensure_endpoint_up(
                 status="down",
                 block_state="cold",
                 endpoint_id=app.state.endpoint_id,
+                session_spend=_total_session_spend(app),  # _provision stopped the clock: a down leaves none running
                 partition=active_partition,
                 account=active_account,
                 notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
@@ -381,6 +382,7 @@ async def _ensure_endpoint_up(
                 status="needs_confirmation",
                 block_state="provisioning" if rt.reap_kicked else "cold",
                 endpoint_id=app.state.endpoint_id,
+                session_spend=_total_session_spend(app),  # a reap this call found has just banked the old block
                 partition=active_partition,
                 account=active_account,
                 notice=_needs_confirmation_notice(app, where, rt),
@@ -390,6 +392,7 @@ async def _ensure_endpoint_up(
                 status="needs_account",
                 block_state="cold",
                 endpoint_id=app.state.endpoint_id,
+                session_spend=_total_session_spend(app),
                 partition=active_partition,
                 account=None,
                 notice=_needs_account_notice(app),
@@ -1469,7 +1472,11 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
             resolved = _resolve_task(app, task_id)  # it may have raced to done in the meantime
             if resolved is not None:
                 return resolved
-            if app.tasks.pop(task_id, None) is not None:
+            orphan = app.tasks.pop(task_id, None)
+            if orphan is not None:
+                rt = app.shapes.get(orphan.shape)
+                if rt is not None and (orphan.runtime is None or orphan.runtime is rt):
+                    _bank_warm_interval(rt, app)  # its endpoint is gone: the block's clock stops with the verdict
                 return _orphaned_outcome(app, task_id)
     still = app.tasks.get(task_id)
     # its block was released under it (its runtime is no longer the shape's): what it ran on reads cold, as in the

@@ -20,7 +20,15 @@ import re
 import time
 
 from . import dispatch
-from .config import CANARY_TIMEOUT_S, CANARY_TTL_S, SYNC_WAIT_S, TASK_CEILING_MARGIN_S, _parse_hhmmss, _task_ceiling_s
+from .config import (
+    CANARY_TIMEOUT_S,
+    CANARY_TTL_S,
+    SYNC_WAIT_S,
+    TASK_CEILING_MARGIN_S,
+    TRANSIENT_CONFLICT_LIMIT,
+    _parse_hhmmss,
+    _task_ceiling_s,
+)
 from .context import (
     DEFAULT_SHAPE,
     AppCtx,
@@ -33,7 +41,7 @@ from .context import (
 from .cost import _bank_warm_interval, _billable, _settle_billing, _total_session_spend, _with_spend
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .models import ShellOutcome, Submission
-from .notices import _no_account_failure, _transient_dispatch_failure, _with_submission_notice
+from .notices import _no_account_failure, _submit_rejected, _transient_dispatch_failure, _with_submission_notice
 from .runner import GlobusRunner
 from .shapes import SHAPES, shape_config
 
@@ -133,8 +141,30 @@ def _runner_for(app: AppCtx, shape: str) -> GlobusRunner:
             walltime=ceiling_s, timeout=sync_wait_s
         )
         rt.runner_stale = False
-        rt.warm_confirmed_at = None
+        _void_warm(rt)
     return rt.runner
+
+def _void_warm(rt: ShapeRuntime) -> None:
+    """Force a check on the next call without saying the block is gone: void the warm confirmation, and keep it as the
+    block's last proof of life (`last_proof_at`), which the idle presumption and the billing bound still count from."""
+    if rt.warm_confirmed_at is not None:  # the latest wins: a late poll can set an older confirmation over a newer one
+        rt.last_proof_at = max(rt.warm_confirmed_at, rt.last_proof_at or rt.warm_confirmed_at)
+    rt.warm_confirmed_at = None
+
+def _single_block(rt: ShapeRuntime) -> bool:
+    """One block at most (max_blocks 1: every template and registry entry we know, and a facility template's own
+    default when its schema drops the key): a different scheduler job answering, or a new block being submitted at all,
+    means the confirmed block is gone. With more, it may be a sibling."""
+    return rt.user_endpoint_config.get("max_blocks") in (None, 1, "1")
+
+def _terminal_failure(rt: ShapeRuntime) -> bool:
+    """The last failed check is a terminal verdict, which the tools report as `down` (or a failed run_shell): the
+    scheduler rejected a block submission — which, with one block, the endpoint makes only once the confirmed block is
+    gone (with more, another block may still be up) — the identity has no account, or the conflict streak hit its
+    limit."""
+    error = rt.last_canary.error if rt.last_canary is not None and not rt.last_canary.ok else None
+    return (bool(rt.no_account) or (_submit_rejected(error) and _single_block(rt))
+            or rt.transient_conflicts >= TRANSIENT_CONFLICT_LIMIT)
 
 def _kicked_release_note(app: AppCtx) -> str:
     """What happens to a block a check started if the user declines it."""
@@ -151,8 +181,9 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     rt = _shape_runtime(app, shape)
     if rt.no_account:  # terminal for this identity: no canary, no runner rebuild — keep last_canary as the evidence
         return "provisioning"
-    # A block confirmed warm and not since found gone (block_since survives a failed dispatch and a runner rebuild,
-    # both of which void warm_confirmed_at) — read BEFORE _runner_for, which voids it on a rebuild.
+    # A block confirmed warm and not since found gone. Its identity (block_since, block_job) survives a failed dispatch,
+    # a runner rebuild and a check that failed with an error, which void warm_confirmed_at, so the next answer is
+    # compared against it. Only a reap, or a partition or account switch (a different block), clears it.
     was_warm = rt.block_since is not None
     runner = _runner_for(app, shape)
     now = time.monotonic()
@@ -172,18 +203,23 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
-    single_block = rt.user_endpoint_config.get("max_blocks") in (None, 1, "1")
-    if (result.ok and single_block and was_warm and _billable(rt) and rt.spend_confirmed and rt.block_job is not None
+    single_block = _single_block(rt)
+    # The block this spend was confirmed for, by its job. (A set block_job implies a set block_since, so this asks no
+    # less than was_warm did; what changed is that a failed check no longer clears the job.)
+    if (result.ok and single_block and _billable(rt) and rt.spend_confirmed and rt.block_job is not None
             and result.worker_job is not None and result.worker_job != rt.block_job):
         # A DIFFERENT scheduler job answered while this block was believed up: the block is gone (idle-released,
         # cancelled, failed, or preempted — though a preempted job REQUEUED keeps its id, which only a timeout can
-        # then reveal) and this check, a task, had the endpoint start a new one without the user's confirmation.
-        # With the 5 s scaling pass that block can answer inside CANARY_TIMEOUT_S, so a timeout alone no longer
-        # catches it. A reap found by a check, left exactly like the timeout's below: the answering block is not
-        # adopted (no age, no job, no spend clock) until the user confirms; the confirm's canary then dates it.
+        # then reveal) and a task — this check, or work sent after the block went — had the endpoint start a new one
+        # without the user's confirmation. With the 5 s scaling pass that block can answer inside CANARY_TIMEOUT_S,
+        # so a timeout alone no longer catches it. A reap found by a check, left exactly like the timeout's below:
+        # the answering block is not adopted (no age, no job, no spend clock) until the user confirms; the confirm's
+        # canary then dates it.
         _mark_reaped(app, rt, f"the previous block (job {rt.block_job}) is gone — idle-released, cancelled, "
-                     f"preempted or failed — and a check was answered by a new block (job {result.worker_job}) "
-                     f"that the check had the facility start: {_kicked_release_note(app)}",
+                     f"preempted or failed — and a check was answered by a new block (job {result.worker_job}), which "
+                     "is already running and billing the allocation. The facility started it for work sent after the "
+                     "old block went (a task left waiting for a block) or for the check itself. Nothing more runs on "
+                     f"job {result.worker_job} until the user confirms; {_kicked_release_note(app)}",
                      _release_bound(app, shape, rt), kicked=True)
         rt.transient_conflicts = 0
         return "provisioning"
@@ -201,8 +237,13 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         _mark_reaped(app, rt, f"the previous block did not answer a check within {CANARY_TIMEOUT_S:g} s — most "
                      "likely cancelled, preempted or failed. That check may already have asked the facility for a "
                      f"new block: {_kicked_release_note(app)}", _release_bound(app, shape, rt), kicked=True)
-    rt.warm_confirmed_at = None
-    rt.block_since = rt.block_job = None
+    # A check that failed with an ERROR (a task that failed with its worker, a refused or broken submit, a transient
+    # conflict) says nothing about which block is up, so the confirmed block keeps its identity (only the reap above
+    # clears it): the next answer is compared against its job (a different one is a kicked reap; the same one keeps its
+    # age), a timeout is that block gone, not a cold start, and its idle clock and bill keep counting from its last
+    # proof of life. Clearing it here took the replacement under the old confirmation (live 2026-10-13: job 112
+    # scancel'd, a check failed with TaskExecutionFailed, job 113 then used without asking).
+    _void_warm(rt)
     if result.error == "timeout":
         rt.transient_conflicts = 0  # the submit was ACCEPTED (a normal cold-start wait) — not a conflict streak
     if result.error and result.error != "timeout":
@@ -259,7 +300,7 @@ def _note_dispatch(rt: ShapeRuntime, out: ShellOutcome, *, at: float | None = No
         rt.warm_confirmed_at = seen if rt.warm_confirmed_at is None else max(rt.warm_confirmed_at, seen)
         rt.transient_conflicts = 0
     elif out.phase == "failed":
-        rt.warm_confirmed_at = None
+        _void_warm(rt)
 
 # How long past the idle window the clock waits before presuming the block idle-released, without looking (a canary to a
 # released block makes the endpoint submit a new billed one before the user is asked). parsl cancels an idle block
@@ -284,11 +325,13 @@ def _idle_window(app: AppCtx) -> int | None:
     return _idle_release_s(app)
 
 def _last_activity(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
-    """The block's last proof of work: its last confirmation (warm_confirmed_at, voided by a failed dispatch) or the
-    end of a task nobody has polled yet (`done_at`), whichever is later. One source for the presumption and the
-    billing bound — the bound used to read the confirmation alone, and billed a block short after a long task."""
-    stamps = [t for t in (rt.warm_confirmed_at, *(h.done_at for h in app.tasks.values() if h.shape == shape))
-              if t is not None]
+    """The block's last proof of work: its last confirmation (warm_confirmed_at, and `last_proof_at`, the one a failed
+    dispatch or check or a rebuild voided — a late poll of an older task can set an older confirmation after it) or the
+    end of a task nobody has polled yet (`done_at`), whichever is latest. One source for the presumption and the billing
+    bound — the bound used to read the confirmation alone, and billed a block short after a long task; and a voided
+    confirmation used to stop the idle presumption for good."""
+    ends = [h.done_at for h in app.tasks.values() if h.shape == shape]
+    stamps = [t for t in (rt.warm_confirmed_at, rt.last_proof_at, *ends) if t is not None]
     return max(stamps) if stamps else None
 
 def _no_idle_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> bool:
@@ -349,7 +392,7 @@ def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | N
     lived, not now), forget its warmth, and require a fresh acknowledgement for the next block. `kicked`: the reap
     was found by a check that may already have asked for a new block."""
     _bank_warm_interval(rt, app, until=released_at)
-    rt.warm_confirmed_at = None
+    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None
     rt.provisioning_since = None
     rt.spend_confirmed = False
@@ -357,8 +400,9 @@ def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | N
 
 def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """Before anything voids the evidence (a provision, a partition or account switch): if the clock says the block
-    the spend acknowledgement covered is gone, record the reap."""
-    if _billable(rt) and rt.spend_confirmed and rt.reaped is None:
+    the spend acknowledgement covered is gone, record the reap. Not under a no-account verdict: no block can be started
+    for this identity, so asking for spend would only lead to the same refusal."""
+    if _billable(rt) and rt.spend_confirmed and rt.reaped is None and not rt.no_account:
         idle_gone = _presumed_idle_released(app, shape, rt)
         gone = idle_gone or _presumed_past_walltime(app, shape, rt)
         if gone is not None:
@@ -366,7 +410,8 @@ def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
                 rt.presumed_block_since, rt.presumed_block_job = rt.block_since, rt.block_job
                 rt.presumed_block_until = idle_gone[1]
                 # ...and where the reap below stops its spend clock, so the same block can resume it from there
-                rt.presumed_billed_until = min(time.monotonic(), idle_gone[1]) if rt.warm_since is not None else None
+                rt.presumed_billed_until = (min(time.monotonic(), idle_gone[1]) if rt.warm_since is not None
+                                            else rt.clock_stopped_at)  # (already stopped there, by a failure)
             _mark_reaped(app, rt, *gone)
 
 def _forget_presumed(rt: ShapeRuntime) -> None:
@@ -421,15 +466,41 @@ async def _provision(
         if bootstrap is not None:
             handle = await bootstrap(app.profile)
             app.state = EndpointState(endpoint_id=handle.endpoint_id, reused=handle.reused)
-    block, app.state = await ensure_warm(app.facility, app.profile, app.state)
-    if block == "warm":  # manager online -> confirm a worker is actually live
-        block = await _confirm_worker(app, shape, force=force_canary)
+    try:
+        block, app.state = await ensure_warm(app.facility, app.profile, app.state)
+        checked = block == "warm"
+        if checked:  # manager online -> confirm a worker is actually live
+            block = await _confirm_worker(app, shape, force=force_canary)
+    except Exception:
+        _bank_warm_interval(rt, app)  # nothing could be checked: the caller reports `down` / an error — clock stopped
+        raise
     if block == "warm" and _billable(rt) and not rt.spend_confirmed:
         # Defensive invariant: a billed block is dated and billed only once spend is confirmed for it. Today every
         # path in _confirm_worker that voids the confirmation (its reaps) already answers "provisioning"; this keeps a
         # future path from adopting a block the user has not confirmed.
         block = "provisioning"
-    _settle_billing(rt, app, block)
+    billed_as = block
+    if checked and block != "warm" and _billable(rt) and rt.spend_confirmed and rt.block_since is not None:
+        # A check that failed with an error left the confirmed block's identity in place (_confirm_worker). It is
+        # billed as warm while it could still be up: its clock runs on, or restarts at once if this call's runner
+        # rebuild banked it, so a same-job answer leaves no unbilled gap, and the idle presumption above ends it at its
+        # release bound. A terminal verdict (a `down`: a rejected submit, which with one block means the confirmed one
+        # is gone; no account; the conflict limit), or a block with no bound (an unknown idle window: nothing would
+        # end the hold) stops the clock instead, at the latest the block could have lived. A `down` never leaves a
+        # clock running.
+        bound = _release_bound(app, shape, rt)
+        if bound is not None and not _terminal_failure(rt):
+            billed_as = "warm"
+        else:
+            _bank_warm_interval(rt, app, until=bound)
+    if billed_as == "warm":
+        if rt.block_since is not None and rt.warm_since is None and rt.clock_stopped_at is not None:
+            # the block that kept its identity is up (or held) again after its clock was stopped without it being found
+            # gone: the same block was billing all along, so the clock resumes where it stopped and the gap is billed.
+            # (A different job would have been a reap; a block first confirmed now has no stop point to resume.)
+            rt.warm_since = rt.clock_stopped_at
+        rt.clock_stopped_at = None
+    _settle_billing(rt, app, billed_as)
     if block == "warm" and rt.block_since is None:  # a block first confirmed warm: its age (for its walltime) and job
         job = rt.last_canary.worker_job if rt.last_canary is not None and rt.last_canary.ok else None
         since = _answering_block_since(rt, job, time.monotonic())
@@ -479,7 +550,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["partition"] = partition
     rt.runner_stale = True
-    rt.warm_confirmed_at = None
+    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different partition is a different block: not the old one's age
     _forget_presumed(rt)
     return None
@@ -507,7 +578,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     rt.user_endpoint_config["account"] = account
     rt.runner_stale = True
-    rt.warm_confirmed_at = None
+    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different account is a different block: not the old one's age
     _forget_presumed(rt)
     return None
