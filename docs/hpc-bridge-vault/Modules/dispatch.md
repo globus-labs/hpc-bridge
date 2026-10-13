@@ -5,7 +5,7 @@
 
 ## What it does
 
-`execute(command, runner, …)` (`dispatch.py:19`) calls `runner.run()` ([[runner]]); on success it shapes a `complete` [[models|`ShellOutcome`]] via `complete_outcome` (capped stdout/stderr — [[cost]] `cap_output`). On *any* exception, `failure_outcome` maps it to a `failed` outcome with a helpful notice. Both shapers are **public and shared** with the server's submit/poll path (`_run_shell` / `poll_task`), so the completion/failure mapping lives in one place ([#21](https://github.com/globus-labs/hpc-bridge/issues/21)):
+`execute(command, runner, …)` (`dispatch.py:19`) calls `runner.run()` ([[runner]]); on success it shapes a `complete` [[models|`ShellOutcome`]] via `complete_outcome` (capped stdout/stderr — [[cost]] `cap_output`). On *any* exception, `failure_outcome` maps it to a `failed` outcome with a helpful notice. Both shapers are **public and shared** with the server's submit/poll path (`_run_shell` and `_reset_session` through `server._dispatch_counted`, and `poll_task`), so the completion/failure mapping lives in one place ([#21](https://github.com/globus-labs/hpc-bridge/issues/21)). The server no longer calls `execute` itself: the submit path needs the future in hand so that a call cancelled mid-wait can keep tracking its command ([[Cost control]]). `execute` stays as the standalone run-and-shape helper, which the live integration test (`tests/integration/test_run_shell_live.py`) and the failure-mapping tests use.
 
 | Failure | exit | notice |
 |---|---|---|

@@ -6,7 +6,7 @@ import json
 import os
 import sys
 import time
-from collections.abc import AsyncIterator, Awaitable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any, Literal, TypeVar
@@ -89,6 +89,7 @@ from .models import (
     ShellOutcome,
 )
 from .notices import (  # noqa: F401 - re-exported
+    _CLIENT_CANCELLED,
     _GLOBUS_USERNAME_RE,
     _NO_ACCOUNT_MARKERS,
     _SSH_AUTH_DENIED,
@@ -109,9 +110,13 @@ from .notices import (  # noqa: F401 - re-exported
     _needs_confirmation_outcome,
     _needs_login_result,
     _needs_preauth_result,
+    _never_sent_outcome,
     _no_account_failure,
     _no_account_notice,
     _orphaned_outcome,
+    _past_ceiling_outcome,
+    _released_under_outcome,
+    _reserved_session_outcome,
     _running_outcome,
     _shape_reject_outcome,
     _spend_floor_guidance,
@@ -480,8 +485,9 @@ _HEARTBEAT_S = 15.0
 
 
 async def _heartbeat(ctx: Context, work: Awaitable[_T], label: str) -> _T:
-    """Await `work`, sending an MCP progress notification every `_HEARTBEAT_S` while it runs. A cancelled call still
-    cancels the work (the semantics of awaiting it directly)."""
+    """Await `work`, sending an MCP progress notification every `_HEARTBEAT_S` while it runs. A cancelled call cancels
+    the work coroutine (the semantics of awaiting it directly) — which does not cancel a command it already sent to the
+    endpoint: an agent's run_shell / reset_session keeps tracking that command (`_dispatch_counted`)."""
     task = asyncio.ensure_future(work)
     t0 = time.monotonic()
     beats = 0
@@ -675,6 +681,98 @@ async def connect_facility(
                             "connect_facility")
 
 
+def _block_work(app: AppCtx, *, then: str) -> tuple[str, str] | None:
+    """What of ours holds the compute block, and what to do about it — or None when nothing does.
+
+    Holding it: a task running behind a poll handle (including one whose call the client cancelled, and one whose
+    block was released under it — a sent task runs on), or a run_shell / reset_session still inside its sync-wait
+    (`rt.inflight`: no handle yet, but its command is on the block now). A task past its ceiling still holds it: it may
+    only be queued behind a relaunching block. Except on a facility endpoint, where nothing could ever end a lost one:
+    there a task presumed lost (`warmth._overdue`) does not hold it. Returns (`what`, `action`): what holds it, and the
+    steps that end with "call {then}"."""
+    rt = app.shapes.get(DEFAULT_SHAPE)
+    mep = not _has_login_shape(app)
+    now = time.monotonic()
+    live = [(tid, h) for tid, h in _live_task_handles(app, DEFAULT_SHAPE) if not (mep and warmth._overdue(h, now))]
+    # calls in their sync-wait: on the shape's runtime, or on one dropped under them (a teardown's release, a re-bind)
+    # whose endpoint is still the bound one — after a teardown or a re-bind elsewhere that work is abandoned
+    eid = app.state.endpoint_id
+    released = [r for r in app.released_inflight if r.runner is not None and r.runner.endpoint_id == eid]
+    waiting = [r for r in ([rt] if rt is not None else []) + released if r.inflight]
+    inflight = sum(r.inflight for r in waiting)
+    if not live and not inflight:
+        return None
+    block = "the block" if mep else "the compute block"
+    # the latest any of it can still be running: a task is killed at its ceiling (counted from its start — it may queue
+    # first); a call in its sync-wait has at most its full ceiling ahead of it
+    left = max([h.ceiling_s - (now - h.submitted_at) for _, h in live]
+               + [_task_ceiling_s(r.user_endpoint_config) for r in waiting])
+    if left >= 1:
+        bound = f"at most ~{int(left)}s more"
+    else:
+        bound = "past its ceiling with no result — queued behind another task or a relaunching block, or lost"
+        if mep:
+            lost_in = max(h.ceiling_s + warmth._LOST_TASK_GRACE_S - (now - h.submitted_at) for _, h in live)
+            bound += f"; with none within ~{int(lost_in)}s it is presumed lost and no longer holds the block"
+    held = []
+    if live:
+        held.append(f"task(s) {', '.join(tid for tid, _ in live)} are still running on {block}")
+        cancelled = [tid for tid, h in live if h.client_cancelled]
+        if cancelled:
+            held[-1] += f" ({', '.join(cancelled)}: {_CLIENT_CANCELLED})"
+    if inflight:
+        held.append(f"a run_shell or reset_session call is still inside its sync-wait, its command on {block} now"
+                    if inflight == 1 else
+                    f"{inflight} run_shell / reset_session calls are still inside their sync-wait, their commands on "
+                    f"{block} now")
+    steps = []
+    if inflight:
+        steps.append(f"Let {'that call' if inflight == 1 else 'those calls'} return (within ~{int(SYNC_WAIT_S)}s "
+                     f"{'it' if inflight == 1 else 'each'} hands back its result, or a task_id to poll_task)")
+    if live:  # a tool name opens the sentence in lower case, as everywhere else
+        steps.append("poll_task " + ("them" if len(live) > 1 else "it") + " to completion (results stay retrievable)")
+    what = " and ".join(held)
+    action = f"{' and '.join(steps)}, then call {then}."
+    if mep:
+        what += (". On a facility multi-user endpoint hpc-bridge has NO cancel channel — nothing here can end that "
+                 "work: the block stays busy (billing) until it finishes" + (f", {bound}" if left >= 1 else
+                                                                            f". It is {bound}"))
+    else:
+        what += f", {bound}" if left >= 1 else f"; it is {bound}"
+        action += " To abandon that work and remove everything, teardown_endpoint."
+    return what, action
+
+
+def _lost_note(app: AppCtx, *, op: str) -> str:
+    """On a facility endpoint: the tasks a stop or detach abandons because they are presumed lost (`warmth._overdue`),
+    said plainly — their handles go with the shape, and one that was only queued may keep the facility relaunching."""
+    lost = [tid for tid, h in _live_task_handles(app, DEFAULT_SHAPE) if warmth._overdue(h)]
+    if not lost:
+        return ""
+    return (f"Task(s) {', '.join(lost)} had no result long past their ceiling and are presumed lost, so they did not "
+            f"hold this {op}: they are abandoned (their results can no longer be retrieved here), and one that was "
+            "only queued counts as a task of ours still queued there. ")
+
+
+def _busy_block_refusal(app: AppCtx, eid: str, *, op: Literal["stop", "detach"] = "stop") -> EndpointStatus | None:
+    """`stop_endpoint` (either kind) and a facility-MEP detach REFUSE while our work holds the compute block
+    (`_block_work`). On an SSH endpoint releasing the block does not end that work — the endpoint relaunches a block for
+    it (fake-cluster chaos `stop_while_running`, 2026-09-05); on a MEP nothing here can end it. Either way, dropping the
+    shape would lose the result and leave the block billing behind a 'down'/'draining'. Callers hold app.lock, so a
+    dispatch holding it (provisioning, its canary) has been counted before the look. None = nothing holds the block."""
+    work = _block_work(app, then="stop_endpoint" if op == "stop" else "teardown_endpoint")
+    if work is None:
+        return None
+    what, action = work
+    why = ("" if not _has_login_shape(app) else
+           ". Releasing the block now would not end that work — the endpoint would relaunch a block to run it and "
+           "spend would continue after a false 'down'")
+    return EndpointStatus(  # "cold" when the shape holding the work was already released under it
+        status="up", block_state="warm" if DEFAULT_SHAPE in app.shapes else "cold", endpoint_id=eid,
+        session_spend=_total_session_spend(app), notice=f"can't {op} yet: {what}{why}. {action}",
+    )
+
+
 async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
     """Stop on a facility-run multi-user endpoint: **draining-only, never 'down'**.
 
@@ -684,28 +782,11 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
     block, and rely on the facility template's idle-release (max_idletime) to reclaim it. The block
     keeps burning for up to that idle window after our last task — we report that tail rather than
     pretend it's gone. `draining` here is TERMINAL: re-polling stop will never yield `down`."""
-    live = _live_task_handles(app, DEFAULT_SHAPE)
-    if live:
-        # A running task is exactly what "stop" cannot touch here: there is no cancel channel, so
-        # the block stays BUSY (billing) until the task ends — not idle-releasing in ~600s. Refuse,
-        # like _apply_partition does for a live task, rather than drain the handles (which would
-        # make the result unretrievable) while claiming the block is idle.
-        rt = app.shapes[DEFAULT_SHAPE]
-        ceiling = int(_task_ceiling_s(rt.user_endpoint_config))
-        ids = ", ".join(tid for tid, _ in live)
-        return EndpointStatus(
-            status="up",
-            block_state="warm",
-            endpoint_id=eid,
-            session_spend=_total_session_spend(app),
-            notice=(
-                f"can't stop yet: task(s) {ids} are still running on the block, and on a facility "
-                "multi-user endpoint hpc-bridge has NO cancel channel — nothing here can end them. The "
-                f"block stays busy (billing) until they finish, at most ~{ceiling}s more. poll_task them "
-                "to completion (their results stay retrievable), then call stop_endpoint."
-            ),
-        )
-    await warmth._drop_compute_shape(app)  # its spend stays in the session total (app.released_spend)
+    async with app.lock:  # look and drop in ONE step: no dispatch can be counted in between
+        if busy := _busy_block_refusal(app, eid):  # our work holds the block, and nothing here can end it
+            return busy
+        lost = _lost_note(app, op="stop")
+        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
     idle = _idle_window_text(app)
     return EndpointStatus(
         status="draining",
@@ -713,7 +794,7 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
         endpoint_id=eid,
         session_spend=_total_session_spend(app),
         notice=(
-            "stopped submitting; the block is DRAINING. On a facility multi-user endpoint hpc-bridge "
+            f"stopped submitting; the block is DRAINING. {lost}On a facility multi-user endpoint hpc-bridge "
             "has no cancel channel, so the block cannot be released or confirmed from here — the "
             f"facility's idle-release reclaims it after {idle} of no tasks (or at walltime) — unless a task of "
             "ours is still queued there (a check that never got an answer counts): the facility may then keep "
@@ -725,12 +806,21 @@ async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
     )
 
 
+# The login-shape session the scheduler ops (block release, pilot probe, allocation listing) run in — never one of the
+# agent's: an agent command still running in its own session must not make the stop's scancel "busy", and an internal
+# op that outlives its sync-wait must not occupy the agent's session. The prefix is reserved: an agent call may not
+# use it (`_reserved_session_outcome`), or its command could make the scheduler ops wait.
+_RESERVED_SESSION_PREFIX = "_hpc-bridge"
+_INTERNAL_SESSION = f"{_RESERVED_SESSION_PREFIX}-internal"
+
+
 def _login_runner(app: AppCtx):
     """The free login-shape channel the scheduler ops ride, INJECTED into scheduler_ops so it needn't
     import server. Resolves `_run_shell` at call time from this module's namespace, so a test that
-    patches `server._run_shell` still reaches every scheduler op."""
+    patches `server._run_shell` still reaches every scheduler op. Runs in `_INTERNAL_SESSION`, and is not
+    an agent call: cancelled, its command is not tracked."""
     async def run(cmd: str) -> ShellOutcome:
-        return await _run_shell(app, cmd, shape="login")
+        return await _run_shell(app, cmd, session_id=_INTERNAL_SESSION, shape="login")
     return run
 
 
@@ -745,34 +835,33 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
     if not _has_login_shape(app):  # a facility MEP: no release channel exists — drain honestly
         return await _stop_mep(app, eid)
-    live = _live_task_handles(app, DEFAULT_SHAPE)
-    if live:
-        # A RUNNING task holds the block. Cancelling the block under it does not end the task: the endpoint's own
-        # scheduler still has it outstanding and relaunches a fresh block to run it — so "down, released" would be
-        # false and spend continues (fake-cluster chaos run 2026-09-05: `block-1` appeared 60 s after a `down`).
-        # Refuse, as _stop_mep does; the results stay retrievable and the agent has two honest ways out.
-        rt = app.shapes[DEFAULT_SHAPE]
-        ceiling = int(_task_ceiling_s(rt.user_endpoint_config))
-        ids = ", ".join(tid for tid, _ in live)
-        return EndpointStatus(
-            status="up", block_state="warm", endpoint_id=eid, session_spend=_total_session_spend(app),
-            notice=(f"can't stop yet: task(s) {ids} are still running on the compute block. Releasing the block now "
-                    "would not end them — the endpoint would relaunch a block to run them and spend would continue "
-                    f"after a false 'down'. poll_task them to completion (at most ~{ceiling}s more; their results stay "
-                    "retrievable), then call stop_endpoint. To abandon them and remove everything, teardown_endpoint."),
-        )
-    # Was a block REQUESTED but never CONFIRMED running? Then a scheduler submit may still be in flight — a
-    # one-shot scancel that finds nothing has NOT confirmed the block gone: the pilot's sbatch can land a moment
-    # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
-    # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
-    rt_pre = app.shapes.get(DEFAULT_SHAPE)
-    # A reap found by a canary voided the acknowledgement, but that canary may itself have requested the pilot.
-    expect_block = (rt_pre is not None and (rt_pre.spend_confirmed or rt_pre.reap_kicked)
-                    and rt_pre.warm_confirmed_at is None)
-    # Cancel the scheduler block over the login shape (AMQP) — no SSH.
+    async with app.lock:  # under the lock: a run_shell provisioning right now has counted its dispatch before we look
+        if busy := _busy_block_refusal(app, eid):  # releasing would not end our work: the endpoint relaunches for it
+            return busy
+        # Was a block REQUESTED but never CONFIRMED running? Then a scheduler submit may still be in flight — a
+        # one-shot scancel that finds nothing has NOT confirmed the block gone: the pilot's sbatch can land a moment
+        # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
+        # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
+        rt_pre = app.shapes.get(DEFAULT_SHAPE)
+        # A reap found by a canary voided the acknowledgement, but that canary may itself have requested the pilot.
+        expect_block = (rt_pre is not None and (rt_pre.spend_confirmed or rt_pre.reap_kicked)
+                        and rt_pre.warm_confirmed_at is None)
+        # an earlier scheduler command of ours already occupying the internal login session (the cancel would wait)
+        internal_before = _busy_session(app, "login", _INTERNAL_SESSION)
+    # Cancel the scheduler block over the login shape (AMQP) — no SSH. OFF the lock: the release rides run_shell.
     confirmed, detail = await scheduler_ops._release_blocks_over_login(
         app, eid, _login_runner(app), expect_block=expect_block)
-    await warmth._drop_compute_shape(app)  # its spend stays in the session total (app.released_spend)
+    async with app.lock:  # look again and drop in ONE step: a dispatch may have reached the block during the release
+        if work := _block_work(app, then="stop_endpoint again"):
+            # Its command was sent to a block being cancelled: the endpoint may relaunch one to run it. Keep the shape
+            # (its handle or returning call stays tracked there, and the next stop refuses or releases honestly).
+            what, action = work
+            return EndpointStatus(
+                status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+                notice=(f"{detail}. Spend is NOT confirmed stopped: {what} — it reached the block while it was being "
+                        f"released, so the endpoint may relaunch a block to run it. {action}"),
+            )
+        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
     if confirmed:
         return EndpointStatus(
             status="down",  # cancel CONFIRMED: a block was found + cancelled, or none was ever requested
@@ -794,7 +883,23 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
                     "Do not call stop_endpoint again; connect_facility stands the endpoint up afresh."),
         )
     # HONEST unconfirmed release (#24): NEVER "down" here — the agent must know spend may still be running.
-    if expect_block:
+    internal = _busy_session(app, "login", _INTERNAL_SESSION)
+    held = app.tasks.get(internal) if internal is not None else None
+    if held is not None and internal != internal_before and held.command == scheduler_ops._release_cmd_for(app, eid):
+        # this stop's own cancel went out but outlived its sync-wait: queued behind other login-node work, or a slow
+        # scheduler — sent, not confirmed
+        notice = (f"Spend is NOT confirmed stopped: the cancel was sent (task_id={internal!r}) but has not finished — "
+                  "it is queued behind other work on the login node, or the scheduler is slow. Call stop_endpoint "
+                  "again in a little while to confirm (idle-release, ~10 min, min_blocks=0, is the backstop). The "
+                  "login endpoint stays online for reuse.")
+    elif internal is not None:
+        # the cancel never left: another scheduler command of ours (an earlier one, or one started meanwhile)
+        # occupies the internal login session
+        notice = ("Spend is NOT confirmed stopped: the cancel could not be sent — the login release channel is busy, "
+                  f"not cold, with another scheduler command of hpc-bridge's own (task_id={internal!r}) that is "
+                  "still running. Call stop_endpoint again in a little while (idle-release, ~10 min, min_blocks=0, is "
+                  "the backstop). The login endpoint stays online for reuse.")
+    elif expect_block:
         # the block was still being submitted and no pilot appeared in the scheduler within the release window;
         # one may land shortly (the stop-during-provisioning race, 0.1.14).
         notice = (f"{detail}. Spend is NOT confirmed stopped — the compute block was still being submitted and no "
@@ -855,6 +960,11 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
             # A facility MEP is NOT ours to destroy (and there's no release channel): detach — drop our
             # shapes/state so nothing of ours lingers — and say exactly that. The facility's endpoint
             # stays online; a block we left is reclaimed by its idle-release (see _stop_mep).
+            assert eid is not None  # the no-endpoint case returned above
+            if busy := _busy_block_refusal(app, eid, op="detach"):  # detaching would lose results, not idle it
+                return busy
+            lost = _lost_note(app, op="detach") or "No task of ours is known to be running there. "
+            idle = _idle_window_text(app)
             spent = _drop_all_shapes(app, bank=True)  # banks the compute shape too; app.tasks cleared
             return EndpointStatus(
                 status="down",  # OUR state is fully cleared; the facility's endpoint is untouched
@@ -863,9 +973,10 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
                 session_spend=spent,
                 notice=(
                     "detached from the facility's multi-user endpoint (nothing of ours to tear down — the "
-                    "facility runs it). Any block still draining is reclaimed by the facility's idle-release; "
-                    "it cannot be cancelled from here. Do NOT call run_shell now (it would re-attach); "
-                    "connect_facility re-attaches with zero SSH."
+                    f"facility runs it). {lost}A block we used is reclaimed by the facility's idle-release after "
+                    f"{idle} of no tasks (or at walltime) — unless a task or check of ours is still queued there, "
+                    "which can keep the facility relaunching blocks. It cannot be cancelled from here. Do NOT call "
+                    "run_shell now (it would re-attach); connect_facility re-attaches with zero SSH."
                 ),
             )
         if task is None:
@@ -1154,6 +1265,7 @@ async def _ready_session(
         return _shape_reject_outcome(reject)
     session = Session(session_id, app.scratch_root)  # validates session_id before provisioning
     busy = None
+    busy_cancelled = False
     async with app.lock:  # provision + bind the runner atomically (no race with a concurrent stop)
         not_warm = await _ensure_warm_runner(app, shape)
         rt = _shape_runtime(app, shape)
@@ -1162,6 +1274,8 @@ async def _ready_session(
             busy = _busy_session(app, shape, session_id)
             if busy is None:
                 rt.inflight += 1  # the worker is about to be busy with this: a canary meanwhile is not a reap probe
+            else:
+                busy_cancelled = app.tasks[busy].client_cancelled
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
         return _needs_confirmation_outcome(app, rt)
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
@@ -1169,63 +1283,125 @@ async def _ready_session(
     if not_warm is not None:
         return _cold_outcome(not_warm, _shape_runtime(app, shape).last_canary)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
-        return _busy_session_outcome(busy, shape, session_id)
+        return _busy_session_outcome(busy, shape, session_id, client_cancelled=busy_cancelled,
+                                     internal=session_id == _INTERNAL_SESSION)
     assert runner is not None  # _ensure_warm_runner returns None only after binding the runner
     return runner, session, rt
 
 
-async def _run_shell(
-    app: AppCtx, command: str, session_id: str = "default", shape: str = DEFAULT_SHAPE
+async def _dispatch_counted(
+    app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
+    payload: Callable[[], str], *, agent_call: bool, reset: bool = False,
 ) -> ShellOutcome:
-    ready = await _ready_session(app, shape, session_id)
-    if isinstance(ready, ShellOutcome):
-        return ready
-    runner, session, rt = ready
+    """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
+    lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
+    running past the wait comes back as a poll handle (`command` is what the handle records).
+
+    A SENT task stays tracked while it can still report: the endpoint it was sent to is still bound and its shape's
+    runner is the one it went out on (`tracked`). That holds even when a stop released the block and dropped the shape
+    meanwhile — Executor.shutdown cancels only UNSENT tasks, and the SDK's result watcher still resolves sent ones —
+    so the task keeps its handle (poll_task returns it; stop refuses honestly while it runs), but the dropped runtime is
+    never rebuilt for it and nothing is noted on it. A teardown or re-bind abandons tasks (`_drop_all_shapes`), and a
+    runner swapped for a new endpoint drains them (`_runner_for`); there it is reported, not tracked.
+
+    `agent_call`: the agent's own run_shell / reset_session. If the CLIENT cancels it (Esc in Claude Code →
+    notifications/cancelled → `_heartbeat` cancels this coroutine), in the sync-wait or queued for the lock after it,
+    its command is not cancelled with it: untracked, a stop would answer a false 'down', a forced canary would queue
+    behind it and read as a reap, and a second command could clobber the session. So the count is handed to a poll
+    handle marked `client_cancelled` in ONE synchronous step (no await: a cancelled call must not wait for the lock, and
+    nothing interleaves without one), and the cancellation propagates. An internal call (the scheduler ops, which run
+    in their own login session, `_INTERNAL_SESSION`) that is cancelled is not tracked, as before. `reset`: the dispatch
+    is a reset_session (its running notice says so).
+
+    (A cancel BEFORE the submit — still in _ready_session — propagates from there with nothing counted or sent; the
+    submit is synchronous, so once anything was sent the future is in hand.)"""
     counted: ShapeRuntime | None = rt  # the in-flight count _ready_session took, until it is handed back
+    fut: Any = None  # the SDK future, once sent
+
+    def tracked() -> bool:
+        return rt.runner is runner and runner.endpoint_id == app.state.endpoint_id
+
     try:
-        wrapped = session_shell.wrap(command, session)
-        fut = runner.submit(wrapped)  # submit; wait a bounded time OFF the lock, else hand back a handle
         try:
+            fut = runner.submit(payload())  # submit; wait a bounded time OFF the lock, else hand back a handle
             res = await asyncio.to_thread(fut.result, runner.timeout)
-        except TimeoutError:  # still running past the sync-wait -> a poll handle, NOT a kill
-            async with app.lock:
-                rt.inflight -= 1  # the handle takes over as the liveness signal, in the same locked step
-                counted = None
-                task_id = _register_task(app, shape, session_id, command, fut, runner.walltime)
-                out = _running_outcome(app, task_id, runner.walltime)
-                _note_dispatch(_shape_runtime(app, shape), out)  # the worker took our task -> it's alive
-                return out
-        except Exception as exc:  # noqa: BLE001 - translate ALL dispatch failures to a structured outcome
+        except asyncio.CancelledError:
+            me = asyncio.current_task()
+            if fut is None or not fut.cancelled() or (me is not None and me.cancelling()):
+                raise  # the CLIENT cancelled the call: handled below (a cancelled future here is the SDK's)
+            # NOT this call: the SDK cancelled the task before sending it — its runner was closed under the call
+            out = _never_sent_outcome(app)
+        except TimeoutError as exc:
+            if fut is None:  # the submit itself timed out: nothing was sent
+                out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
+            else:  # still running past the sync-wait -> a poll handle, NOT a kill
+                async with app.lock:
+                    rt.inflight -= 1  # the handle takes over as the liveness signal, in the same locked step
+                    counted = None
+                    if not tracked():
+                        return _released_under_outcome(app, None, runner.walltime)
+                    task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, runtime=rt,
+                                             reset=reset)
+                    released = app.shapes.get(shape) is not rt
+                    out = _running_outcome(app, task_id, runner.walltime, reset=reset,
+                                           block_state="cold" if released else "warm")
+                    if released:  # released under the call: tracked, but don't revive the shape
+                        return _released_under_outcome(app, out, runner.walltime)
+                    _note_dispatch(rt, out)  # the worker took our task -> it's alive
+                    return out
+        except Exception as exc:  # noqa: BLE001 - the submit or the task failed: a structured outcome, never a raise
             out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
         else:
             out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
         async with app.lock:
             rt.inflight -= 1
             counted = None
-            _note_dispatch(_shape_runtime(app, shape), out)
+            if app.shapes.get(shape) is not rt:  # released under the call: say so, and don't revive the shape
+                sent = fut is not None and not fut.cancelled()
+                return _released_under_outcome(app, out, runner.walltime) if sent else _with_spend(app, out)
+            _note_dispatch(rt, out)
             return _with_spend(app, out)
+    except asyncio.CancelledError:
+        if counted is not None:  # cancelled before the count was handed back
+            rt.inflight -= 1
+            counted = None
+            if agent_call and fut is not None and not fut.done() and tracked():  # still running and reachable
+                _register_task(app, shape, session_id, command, fut, runner.walltime, client_cancelled=True,
+                               runtime=rt, reset=reset)
+        raise
     finally:
-        if counted is not None:  # an exception escaped before the count was handed back (e.g. a cancelled call)
+        if counted is not None:  # an exception escaped before the count was handed back
             counted.inflight -= 1
 
 
-async def _reset_session(
-    app: AppCtx, session_id: str = "default", shape: str = DEFAULT_SHAPE
+async def _run_shell(
+    app: AppCtx, command: str, session_id: str = "default", shape: str = DEFAULT_SHAPE, *, agent_call: bool = False
 ) -> ShellOutcome:
+    """`agent_call`: the agent's own command (the run_shell tool) — a client cancel keeps it tracked, and the internal
+    session is off limits. Internal callers (the scheduler ops on the login shape) leave it False."""
+    if agent_call and session_id.startswith(_RESERVED_SESSION_PREFIX):
+        return _reserved_session_outcome(session_id)
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
     runner, session, rt = ready
-    try:
-        cmd = session_shell.reset_command(session)
-        out = await dispatch.execute(
-            cmd, runner, block_state="warm", max_output_chars=app.max_output_chars
-        )
-    finally:
-        rt.inflight -= 1
-    async with app.lock:
-        _note_dispatch(_shape_runtime(app, shape), out)
-    return out
+    return await _dispatch_counted(app, rt, runner, shape, session_id, command,
+                                   lambda: session_shell.wrap(command, session), agent_call=agent_call)
+
+
+async def _reset_session(
+    app: AppCtx, session_id: str = "default", shape: str = DEFAULT_SHAPE, *, agent_call: bool = False
+) -> ShellOutcome:
+    if agent_call and session_id.startswith(_RESERVED_SESSION_PREFIX):
+        return _reserved_session_outcome(session_id)
+    ready = await _ready_session(app, shape, session_id)
+    if isinstance(ready, ShellOutcome):
+        return ready
+    runner, session, rt = ready
+    # A reset is a task like any other: queued behind work on the worker it can outlive the sync-wait (a poll handle)
+    # or be cancelled mid-wait (tracked) — untracked, it would keep the endpoint asking for a block after a stop.
+    return await _dispatch_counted(app, rt, runner, shape, session_id, "reset_session",
+                                   lambda: session_shell.reset_command(session), agent_call=agent_call, reset=True)
 
 
 async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutcome:
@@ -1236,14 +1412,18 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
     task is offline/gone (torn down by us or by someone else, a facility outage), the future never
     resolves and an agent would poll forever — seen live 2026-08-19: 25 polls over 20 minutes after
     another process deleted the endpoint. So a pending task on a dead endpoint is reported as a
-    terminal `failed` (orphaned) and its handle dropped."""
+    terminal `failed` (orphaned) and its handle dropped. One still pending past its ceiling (counted from its
+    submit) is still `running` — it may be queued behind another task or a relaunching block, or lost — and the
+    notice says so and what, for its shape, can abandon it."""
     wait = max(0.0, min(wait, 600.0))  # a bounded courtesy wait; never an unbounded tool hang
     async with app.lock:
         resolved = _resolve_task(app, task_id)
         if resolved is not None:
             return resolved
         handle = app.tasks[task_id]  # resolved is None => the still-running handle is present
-        fut, ceiling_s = handle.future, handle.ceiling_s
+        fut, ceiling_s, cancelled, reset = handle.future, handle.ceiling_s, handle.client_cancelled, handle.reset
+    # A poll_task call cancelled anywhere below drops nothing: the handle is only ever popped once the task resolved
+    # (or its endpoint is gone), and a cancellation propagates past every await here.
     if wait > 0:
         try:
             await asyncio.to_thread(fut.result, wait)
@@ -1264,7 +1444,18 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
                 return resolved
             if app.tasks.pop(task_id, None) is not None:
                 return _orphaned_outcome(app, task_id)
-    return _running_outcome(app, task_id, ceiling_s)
+    still = app.tasks.get(task_id)
+    # its block was released under it (its runtime is no longer the shape's): what it ran on reads cold, as in the
+    # call's own result
+    current = app.shapes.get(handle.shape)
+    block: Literal["warm", "cold"] = (
+        "warm" if current is not None and (handle.runtime is None or handle.runtime is current) else "cold")
+    if still is not None and warmth._past_ceiling(still):
+        return _past_ceiling_outcome(app, task_id, ceiling_s, shape=still.shape, session_id=still.session_id,
+                                     facility_mep=not _has_login_shape(app), block_state=block,
+                                     lost_in=still.ceiling_s + warmth._LOST_TASK_GRACE_S
+                                     - (time.monotonic() - still.submitted_at))
+    return _running_outcome(app, task_id, ceiling_s, client_cancelled=cancelled, reset=reset, block_state=block)
 
 
 @mcp.tool()
@@ -1285,7 +1476,7 @@ async def run_shell(
     task, so the block would idle-release out from under it (issue #21)."""
     try:
         return await _heartbeat(ctx, _run_shell(
-            ctx.request_context.lifespan_context, command, session_id, shape
+            ctx.request_context.lifespan_context, command, session_id, shape, agent_call=True
         ), "run_shell")
     except Exception as exc:  # noqa: BLE001
         return _error_outcome(exc)
@@ -1300,7 +1491,8 @@ async def poll_task(task_id: str, ctx: Context, wait: float = 0.0) -> ShellOutco
     before returning (default 0 = check once and return now). The task runs up to the block walltime
     and the block stays warm while it runs, so a long job never needs detaching. An unknown or ended
     task_id returns a failed outcome explaining why (already retrieved, or the block was
-    stopped/repointed)."""
+    stopped/repointed). One with no result past its ceiling still reads phase="running" — it may only be queued
+    behind a relaunching block — and its notice says how to abandon it instead."""
     try:
         return await _heartbeat(ctx, _poll_task(ctx.request_context.lifespan_context, task_id, wait), "poll_task")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
@@ -1311,10 +1503,11 @@ async def poll_task(task_id: str, ctx: Context, wait: float = 0.0) -> ShellOutco
 async def reset_session(
     ctx: Context, session_id: str = "default", shape: str = DEFAULT_SHAPE
 ) -> ShellOutcome:
-    """Clear a session's persisted working directory and environment (fresh slate)."""
+    """Clear a session's persisted working directory and environment (fresh slate). Like run_shell, a reset still
+    waiting past the sync-wait (queued behind other work on the block) comes back phase="running" with a task_id."""
     try:
         return await _heartbeat(ctx, _reset_session(
-            ctx.request_context.lifespan_context, session_id, shape
+            ctx.request_context.lifespan_context, session_id, shape, agent_call=True
         ), "reset_session")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
