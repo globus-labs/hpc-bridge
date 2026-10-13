@@ -58,3 +58,29 @@ def test_introspection_grader_reports_reads_of_harness_material():
     envdump = Trace([ToolCall.of("Bash", {"command": "env | sort"})])
     assert not no_harness_introspection(envdump).ok
     assert any(r.name == "no_harness_introspection" for r in check_all(clean))  # registered, reported on every run
+
+
+def test_record_keeps_the_runs_metrics_and_says_how_each_hook_was_triggered(tmp_path):
+    events = [{"name": "esc", "trigger": "during run_shell +10s", "on_tool": "run_shell", "nth": 1, "call_index": 4,
+               "rc": 0, "out": "interrupted the turn; the user's message follows it"},
+              {"name": "old", "after_tool": "poll_task", "nth": 1, "call_index": 2, "rc": 0, "out": "stopped"}]  # an older bundle
+    d = write_run_record(tmp_path, config={"runid": "1-3", "scenario": "esc_mid_call"}, messages=[], dialogue=[],
+                         grading=[Result("agent_engaged", True, "ok")], final=None, rc=0, result="OK", events=events,
+                         metrics={"first_result_s": 41.4})
+    rec = json.loads((d / "record.json").read_text())
+    assert rec["metrics"] == {"first_result_s": 41.4}
+    md = (d / "transcript.md").read_text()
+    assert "**esc** during run_shell +10s at call 4" in md and "**old** after poll_task #1 at call 2" in md
+    bare = write_run_record(tmp_path / "b", config={"runid": "1-4", "scenario": "x"}, messages=[], dialogue=[],
+                            grading=[], final=None, rc=0)
+    assert json.loads((bare / "record.json").read_text())["metrics"] == {}
+
+
+def test_the_result_line_carries_the_first_result_time(harness_run):
+    assert harness_run._metrics_tail({"first_result_s": 41.4}) == "  (first result 41.4 s)"
+    assert harness_run._metrics_tail({"first_result_s": None}) == "" and harness_run._metrics_tail({}) == ""
+    # repl_sweep (and run_suite's summary) still read the verdict off the line
+    sys.path.insert(0, str(HERE.parent))
+    import repl_sweep
+    assert repl_sweep.parse_output("RESULT: OK  (first result 41.4 s)\n")[0] == "OK"
+    assert repl_sweep.parse_output("RESULT: FAILED — critical checks broke: ['x']  (first result 50 s)\n")[0] == "FAILED"

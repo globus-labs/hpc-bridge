@@ -32,20 +32,23 @@ agentic/
     responses_relay.py   ← lets Codex use ALCF: replays an unstreamed Responses answer as SSE, flattens Codex's
                            `namespace` / `custom` tools to plain functions and restores them on the way back
     run.py               ← per-scenario orchestration: SETUP → agent → invariants → WORLD POSTCHECKS → teardown
+    midrun_hooks.py      ← MIDRUN_HOOKS: when a hook is due (after a result, or DURING a call), what it does, and
+                           which operator can serve it (see "Mid-run hooks" below)
     provenance.py        ← per-run provenance bundle writer (see runs/)
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 51 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 53 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
                            spend + account: gated_provision · spend_refusal · spend_gate_enforced · spend_revoked · rich_gate ·
                              partition_choice · saturation · hand_batch_job · fake_mep_username_not_account
-                           blocks + reaps: block_reaped_resume · gpu_rule · submit_policy_rejected · slurm_worker_died · polaris_filesystems
+                           blocks + reaps: block_reaped_resume · reap_replaced_block · gpu_rule · submit_policy_rejected ·
+                             slurm_worker_died · polaris_filesystems
                            long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·
                              repl_interaction · repl_baseline_local
-                           stop + chaos: stop_while_running · draining_restop · orphaned_task
+                           stop + chaos: stop_while_running · esc_mid_call · draining_restop · orphaned_task
                            facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute · fake_mep_no_account
                            adversarial: canary_login_discovery · canary_compute_output
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
@@ -80,10 +83,11 @@ Every run writes a provenance bundle to `agentic/runs/<runid>-<scenario>/` — s
 **Other harnesses.** `HPCB_OPERATOR=codex|pi|hermes21 ./agentic/run_smoke.sh <scenario>` runs the scenario under
 Codex, Pi or Hermes at the versions pinned in the Dockerfile, on the ALCF model (`HPCB_ALCF_*` in `.env`; the token is
 minted on the host). Autonomous scenarios only — a persona, a multi-phase chain (`PHASES`) or a mid-run hook is
-reported SKIPPED, not graded. The graded trace merges the harness's own record (Codex: the relay's log of the model's
-wire; Pi: `--mode json` events; Hermes: state.db) — the order of every call and the agent's own shell/read calls —
-with hpc-bridge's journal (what each hpc-bridge tool received and returned), aligned in start order;
-`harness:trace_complete` gates on every journal row being accounted for. The bundle's `messages.jsonl` holds all of
+reported SKIPPED, not graded — except a mid-run hook that only runs a `cmd` after a tool result, which these operators
+serve from hpc-bridge's journal (see "Mid-run hooks" below). The graded trace merges the harness's own record (Codex:
+the relay's log of the model's wire; Pi: `--mode json` events; Hermes: state.db) — the order of every call and the
+agent's own shell/read calls — with hpc-bridge's journal (what each hpc-bridge tool received and returned), aligned in
+start order; `harness:trace_complete` gates on every journal row being accounted for. The bundle's `messages.jsonl` holds all of
 it (`native`, `text`, `final`, `journal`, `relay`), so `regrade.py` replays it. The server runs from this checkout
 (`uv run`); the users' `uvx --from git+…` path is covered by `agentic/install_check/`, the clean-container check of the
 install recipes.
@@ -150,6 +154,51 @@ that user **by hand, only when no run is using it**: `./agentic/sweep_pool_user.
 (the one deliberately user-wide operation; it refuses if the user's claim is held). Direct
 `run_smoke.sh` runs use the base `hpcbridge-test` user and don't participate in claims — don't run two
 of those at once; use `run_suite` for parallelism.
+
+## Mid-run hooks (`MIDRUN_HOOKS`, `harness/midrun_hooks.py`)
+
+A scenario's hooks act on the world, or on the agent's session, at a chosen point of the run. Each has ONE trigger:
+
+- `after_tool` — after the Nth result of that tool (`nth`, default 1), optionally only when the call's input matches
+  (`when_input`) or the result's phase does (`when_phase`).
+- `on_tool` — a **during** hook: `after_s` seconds after a matching call STARTED, if that call is still in flight
+  (`nth` counts the matching calls that were). This is how a scenario presses Esc in the middle of a call.
+
+`when_input` is a dict (each key equal to the call's argument; `True` and `"true"` alike) or a string (a regex searched
+in the call's argument values, e.g. a marker in the command). And one or more actions — what the hook carries:
+
+| action | what it does | `claude` (SDK) | `codex` · `pi` · `hermes21` | `hermes` · `claude-acp` |
+|---|---|---|---|---|
+| `cmd` | a shell command on the cluster as the pool user (`"on": "each_login"` fans it out); `expect_any_host` fails the hook unless some node printed that text | after or during a call | after a result only (from hpc-bridge's journal) | — |
+| `world: "stop_manager"` | stop THIS run's endpoint manager where it runs (`cluster_ops.stop_here_cmd` on every login node); fails unless some node stopped it | after or during a call | after a result only | — |
+| `interject` | the SDK interrupt (Esc), then the text as the user's next turn | with a persona | — | — |
+| `"action": "interrupt"` | the interrupt alone (Esc, nothing said after it — the run ends there) | with a persona | — | — |
+
+A world `cmd` reports its REAL outcome: rc 0 only when it did its job. A plain `gce stop …; echo stopped` sent to the
+round-robin `login` alias can land on the node without the manager and still say it worked — `orphaned_task` did
+(pi, live 2026-10-13) — hence `world: "stop_manager"`, and `expect_any_host` on `draining_restop`'s freeze/thaw.
+An MCP call in flight when Esc is pressed gets `notifications/cancelled`: in the first live `esc_mid_call` (2026-10-13)
+the server kept the command tracked; its graders still accept a stop naming a call still in its sync-wait.
+
+A during hook (`on_tool`) needs `claude`: it is timed from the ToolUseBlock's arrival on the SDK stream. The free CLI
+operators get their hooks from the server's journal (`HPC_BRIDGE_JOURNAL`), which hpc-bridge writes when a call
+**ends** — so a `cmd` fires right after a matching result, but nothing can see a call in flight, and a one-shot CLI
+turn cannot take a user message mid-turn (no `interject`, no `interrupt`). The ACP operators (`hermes`, `claude-acp`)
+take no hooks yet. What an operator cannot serve, `run.py` reports SKIPPED (`midrun_hooks.operator_refusal`) — never
+graded vacuously. That made the `cmd`-only chaos cells free: `orphaned_task`, `draining_restop`, `reap_replaced_block`.
+`harness:midrun_hooks` gates every hooked cell: a hook that never fired, failed, or is missing from the record (its
+action raised) fails it. A journal hook's `call_index` is the journal row (hpc-bridge calls only), not the trace
+index; after the turn ends, the journal is read once more, so a hook due on the last call still acts.
+
+The sweep's free wave: `HPCB_OPERATOR=pi agentic/sweep_profiles.sh` leaves out `paid_only()` — the cells those
+operators cannot drive (a persona, PHASES, a hook that needs the interrupt) — and says which, per profile, in the
+summary; the default (Claude) wave runs them.
+
+**`first_result_s`** (REPORTED; `happy_path` and `fake_mep_compute` list it, nothing gates it yet): seconds from the
+first `connect_facility` call to the first completed compute `run_shell` in the same session — #173's first-result
+time (37–45 s on fake with the 5 s scaling pass). It is timed from the SDK's arrival stamps, and for the CLI operators from the journal's
+own (`ts` when a call started, `ts + ms` when it returned). `run.py` records it in the bundle (`record.json` →
+`metrics.first_result_s`) and on the RESULT line, e.g. `RESULT: OK  (first result 41 s)`.
 
 ## Regression set (before merging a PR)
 
@@ -286,7 +335,9 @@ REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matche
                                  #   list-valued capability is a membership test — {"partitions": ["debug"], "accounts": ["hpcb"]};
                                  #   {"catalog": "registry"} = needs the public registry (a profile's local catalog replaces it)
 MIDRUN_HOOKS = [{"after_tool": "poll_task", "nth": 1, "cmd": "…"}]   # optional: chaos — fire on the cluster mid-run
-                                 #   (`"on": "each_login"` runs the hook on every login node of a round-robin pool)
+                                 #   (`"on": "each_login"` runs the hook on every login node of a round-robin pool);
+                                 #   {"on_tool": "run_shell", "when_input": "MARKER", "after_s": 10, "interject": "…"} presses
+                                 #   Esc DURING a call — see "Mid-run hooks" for the fields and which operator serves what
 ADMIN_SETUP = ["sacctmgr -i modify user where name={user} set MaxSubmitJobs=0"]   # optional: cluster-ADMIN world changes,
 ADMIN_CLEANUP = ["… MaxSubmitJobs=-1"]  #   run by run_smoke.sh through the target's admin channel (fake only: docker exec into
                                         #   slurmctld; `{user}` = the pool user) before the agent / always after; no channel ⇒ skipped

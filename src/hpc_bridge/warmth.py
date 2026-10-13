@@ -22,13 +22,13 @@ import time
 
 from . import dispatch
 from .config import (
-    CANARY_TIMEOUT_S,
     CANARY_TTL_S,
     SYNC_WAIT_S,
     TASK_CEILING_MARGIN_S,
     TRANSIENT_CONFLICT_LIMIT,
     _parse_hhmmss,
     _task_ceiling_s,
+    canary_timeout_s,
 )
 from .context import (
     DEFAULT_SHAPE,
@@ -199,7 +199,8 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     if not force and rt.warm_confirmed_at is not None and now - rt.warm_confirmed_at < CANARY_TTL_S:
         rt.provisioning_since = None
         return "warm"
-    result = await runner.canary(timeout=CANARY_TIMEOUT_S)
+    timeout = canary_timeout_s()
+    result = await runner.canary(timeout=timeout)
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
@@ -212,7 +213,7 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         # A DIFFERENT scheduler job answered while this block was believed up: the block is gone (idle-released,
         # cancelled, failed, or preempted — though a preempted job REQUEUED keeps its id, which only a timeout can
         # then reveal) and a task — this check, or work sent after the block went — had the endpoint start a new one
-        # without the user's confirmation. With the 5 s scaling pass that block can answer inside CANARY_TIMEOUT_S,
+        # without the user's confirmation. With the 5 s scaling pass that block can answer inside the canary timeout,
         # so a timeout alone no longer catches it. A reap found by a check, left exactly like the timeout's below:
         # the answering block is not adopted (no age, no job, no spend clock) until the user confirms; the confirm's
         # canary then dates it.
@@ -235,7 +236,7 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         # A block we had confirmed warm, with no task of ours on it, no longer answers: cancelled, preempted or
         # failed before its idle window or walltime ran out. The check itself was a task, so the endpoint may
         # already be asking for a new block — say so, and ask before any work runs on it.
-        _mark_reaped(app, rt, f"the previous block did not answer a check within {CANARY_TIMEOUT_S:g} s — most "
+        _mark_reaped(app, rt, f"the previous block did not answer a check within {timeout:g} s — most "
                      "likely cancelled, preempted or failed. That check may already have asked the facility for a "
                      f"new block: {_kicked_release_note(app)}", _release_bound(app, shape, rt), kicked=True)
     # A check that failed with an ERROR (a task that failed with its worker, a refused or broken submit, a transient

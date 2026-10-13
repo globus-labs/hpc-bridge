@@ -136,6 +136,17 @@ def stop_here_cmd(endpoint_name: str, *, listing: str | None = None, gce: str = 
             'echo "HPCB_STOP $h rc=$rc $(printf %s "$out" | tail -n 2 | tr \'\\n\' \' \' | cut -c1-200)"; fi')
 
 
+def stop_outcome(out: str) -> tuple[str, str]:
+    """Read `stop_here_cmd`'s line from one node's output: (`none` | `rc=<n>` | `missing`, the rest of the line).
+    `rc=0` is the only outcome where this node stopped the manager; `missing` means the command never reported (ssh)."""
+    line = next((ln[len("HPCB_STOP "):].strip() for ln in out.splitlines() if ln.startswith("HPCB_STOP ")), None)
+    if line is None:
+        return "missing", out.strip()[:160]
+    parts = line.split(" ", 2)   # <host> none | <host> rc=<n> <output>
+    status = parts[1] if len(parts) > 1 else "missing"
+    return status, (parts[2] if len(parts) > 2 else "")
+
+
 def delete_registration_cmd(endpoint_name: str, *, gce: str = GCE) -> str:
     """`gce delete <name> --yes` with stdin CLOSED, its outcome printed as `HPCB_DELETE rc=<rc> <output>`, or
     `HPCB_DELETE none` when the endpoint has no directory (nothing was configured). Why: with no token store on the
@@ -278,3 +289,43 @@ def leftover_manager_cmd(endpoint_name: str, eids: list[str] | tuple[str, ...] =
             f'{listing} >/dev/null 2>&1 || {{ echo "HPCB_UNVERIFIABLE: ps failed on $(hostname)"; exit 0; }}; '
             f'out=""; for i in $(seq 1 {int(tries)}); do out=$({listing} | {filt}); '
             f'[ -z "$out" ] && break; sleep {int(pause_s)}; done; [ -n "$out" ] && printf \'%s\\n\' "$out"; true')
+
+
+# --- world checks over the run's pilot jobs (Slurm accounting) -----------------------------------------------------
+# A scenario stamps the cell's start on the login node in SETUP (`stamp_t0_cmd`), and a POSTCHECK reads back every
+# pilot job (`parsl*`) this pool user SUBMITTED since then (`parsl_jobs_since_cmd`) as one line:
+#   parsl_jobs=<n>; overlap=<k>; old=<state of the first>; jobs=<id>:<state>,…
+# `overlap` counts jobs that STARTED while an earlier one was still running — "never two blocks at once". Fake cluster
+# (sacct needs slurmdbd); python3 is on every node. Its Python must hold no single quote (it rides in '…').
+_PARSL_JOBS_PY = """
+import sys
+t0, END = sys.argv[1], "9999-12-31T23:59:59"
+rows = []
+for line in sys.stdin:
+    f = line.strip().split("|")
+    if len(f) >= 6 and f[1].startswith("parsl") and f[3] >= t0:
+        rows.append(f)
+rows.sort(key=lambda f: (f[3], f[0]))
+overlap, last_end = 0, ""
+for f in sorted((f for f in rows if f[4][:1].isdigit()), key=lambda f: f[4]):
+    if last_end and f[4] < last_end:
+        overlap += 1
+    last_end = max(last_end, f[5] if f[5][:1].isdigit() else END)
+state = lambda f: (f[2].split() or ["?"])[0]
+print("parsl_jobs=%d; overlap=%d; old=%s; jobs=%s" % (len(rows), overlap, state(rows[0]) if rows else "none",
+      ",".join(f[0] + ":" + state(f) for f in rows) or "none"))
+"""
+
+
+def stamp_t0_cmd(t0_file: str) -> str:
+    """SETUP: record the cell's start on the login node, in the format sacct prints (`2026-10-13T10:00:00`)."""
+    return f"date +%Y-%m-%dT%H:%M:%S > {t0_file}"
+
+
+def parsl_jobs_since_cmd(t0_file: str) -> str:
+    """POSTCHECK: one line describing this pool user's pilot jobs submitted since `stamp_t0_cmd` (see above). Fails
+    (rc 1) when the stamp is missing, so a check against it can never pass vacuously."""
+    assert "'" not in _PARSL_JOBS_PY
+    return (f'T0="$(cat {t0_file} 2>/dev/null)"; [ -n "$T0" ] || {{ echo "no t0 stamp at {t0_file}"; exit 1; }}; '
+            'sacct -u "$(whoami)" -X -n -P -S "$T0" -o JobID,JobName,State,Submit,Start,End 2>/dev/null '
+            f"| python3 -c '{_PARSL_JOBS_PY}' \"$T0\"")

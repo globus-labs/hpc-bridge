@@ -4,12 +4,15 @@
 # through run_suite with the usual node gate. Results land in agentic/runs/ (bundles) and a per-sweep summary file.
 #
 #   agentic/sweep_profiles.sh [--models claude-opus-5] [--profiles default,site,...]
+#   HPCB_OPERATOR=pi agentic/sweep_profiles.sh      # the FREE wave: codex / pi / hermes21 on the ALCF model
 #
 # The agent model defaults to run_suite's DEFAULT_MODEL (claude-opus-5); the human-sim is Haiku. Never Fable unless
 # asked. `mep` is skipped unless HPCB_MEP_EMAIL is set in agentic/.env (its managers register a contact address).
 # What is NOT swept, and why, is the list in excluded() below (the summary prints it): every scenario that can run on
 # the fake target is in cells() or there — test_sweep_script.py enforces it, so a new scenario cannot drop out of the
-# sweeps unnoticed.
+# sweeps unnoticed. The paid wave is the default (the Claude operator runs every cell); with HPCB_OPERATOR=codex|pi|hermes21
+# the sweep is the free wave and leaves out paid_only() — what those one-shot operators cannot drive (a persona, PHASES, a
+# hook that needs the SDK interrupt). test_sweep_script.py keeps that list equal to what run.py would report SKIPPED.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,polaris,internal,hostile,mep"
@@ -21,7 +24,7 @@ echo "# profile sweep $STAMP — target fake, models $MODELS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse 2" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call 2" ;;
     site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job 3" ;;
     totp)     echo "otp_preauth 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
@@ -52,10 +55,38 @@ long_job_30m                  globus1: a 20-min job past the idle-release window
 EXCLUDED
 }
 
+paid_only() {  # swept scenarios the free CLI operators cannot drive — the paid (Claude) wave only; one name per line
+  cat <<'PAID'
+gated_provision
+spend_refusal
+endpoint_reuse_chain
+unknown_host_key
+spend_revoked
+block_reaped_resume
+esc_mid_call
+rich_gate
+partition_choice
+otp_preauth
+fake_mep_username_not_account
+PAID
+}
+
+OPERATOR="${HPCB_OPERATOR:-claude}"
+case "$OPERATOR" in
+  codex|pi|hermes21) FREE_WAVE=1; echo "free wave: operator $OPERATOR — leaving out paid_only()" | tee -a "$SUMMARY" ;;
+  *) FREE_WAVE= ;;
+esac
+
 IFS=, read -ra PROFS <<< "$PROFILES"
 for prof in "${PROFS[@]}"; do
   read -r scen conc <<< "$(cells "$prof")"
   [ -n "$scen" ] || { echo "sweep: unknown profile $prof"; continue; }
+  if [ -n "$FREE_WAVE" ]; then
+    dropped="$(tr ',' '\n' <<< "$scen" | grep -xF -f <(paid_only) | paste -sd, -)"
+    scen="$(tr ',' '\n' <<< "$scen" | grep -vxF -f <(paid_only) | paste -sd, -)"
+    [ -z "$dropped" ] || echo "## $prof — free wave leaves out (paid_only): $dropped" | tee -a "$SUMMARY"
+    [ -n "$scen" ] || { echo "## $prof — SKIPPED (every cell is paid-only)" | tee -a "$SUMMARY"; continue; }
+  fi
   if [ "$prof" = mep ] && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
     echo "## $prof — SKIPPED (HPCB_MEP_EMAIL unset in agentic/.env)" | tee -a "$SUMMARY"; continue
   fi

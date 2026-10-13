@@ -67,6 +67,7 @@ def build_trace(
     calls: list[ToolCall] = []
     by_id: dict[str, ToolCall] = {}
     texts: list[str] = []
+    text_at: list[int] = []   # how many calls came before each text
     for n, msg in enumerate(messages):
         t_at = arrivals[n] if n < len(arrivals) else None
         content = getattr(msg, "content", None)
@@ -77,6 +78,7 @@ def build_trace(
                 txt = getattr(b, "text", None)
                 if isinstance(txt, str) and txt.strip():
                     texts.append(txt)
+                    text_at.append(len(calls))
                 continue
             if _is_tool_use(b):
                 bid = getattr(b, "id", None)
@@ -94,7 +96,7 @@ def build_trace(
                 if tc is not None and tc.result is None:
                     tc.result = _result_to_dict(getattr(b, "content", None))
                     tc.t_result = t_at
-    return Trace(calls, texts)
+    return Trace(calls, texts, text_at)
 
 
 def trace_from_bundle(bundle_dir) -> Trace:
@@ -111,6 +113,7 @@ def trace_from_bundle(bundle_dir) -> Trace:
     calls: list[ToolCall] = []
     by_id: dict[str, ToolCall] = {}
     texts: list[str] = []
+    text_at: list[int] = []
     sessions: list[str] = []   # distinct session ids, in order of first appearance
     phase = 0
     with (Path(bundle_dir) / "messages.jsonl").open() as fh:
@@ -133,6 +136,7 @@ def trace_from_bundle(bundle_dir) -> Trace:
                 if m.get("__type__") == "AssistantMessage" and b.get("__type__") == "TextBlock":
                     if str(b.get("text") or "").strip():
                         texts.append(str(b.get("text")))
+                        text_at.append(len(calls))
                     continue
                 if b.get("__type__") == "ToolUseBlock":
                     tc = ToolCall.of(b.get("name", "") or "", dict(b.get("input") or {}), phase=phase)
@@ -145,7 +149,7 @@ def trace_from_bundle(bundle_dir) -> Trace:
                     if tc is not None and tc.result is None:
                         tc.result = _result_to_dict(b.get("content"))
                         tc.t_result = t_at
-    return Trace(calls, texts)
+    return Trace(calls, texts, text_at)
 
 
 def insert_interjections(trace: Trace, events: list[dict] | None) -> Trace:
@@ -160,4 +164,6 @@ def insert_interjections(trace: Trace, events: list[dict] | None) -> Trace:
         phase = trace.calls[k].phase if 0 <= k < len(trace.calls) else 0
         trace.calls.insert(at, ToolCall(name="user_interjection", input={"text": str(e.get("text") or e.get("interject"))},
                                         result={"after_call": k}, raw_name="user_interjection", phase=phase))
+        # a text that came after the interrupted call came after the user spoke: it now follows the interjection too
+        trace.text_at = [n + 1 if n >= at else n for n in trace.text_at]
     return trace

@@ -5,6 +5,7 @@ Reference/Configuration.md is the human-readable twin of the accessors below.
 """
 from __future__ import annotations
 
+import math
 import os
 import stat
 import sys
@@ -170,6 +171,27 @@ CANARY_TTL_S = 45.0  # trust a confirmed worker this long before re-canarying. S
 # task one of its scaling passes sees, so short commands may not keep a block alive (vault: Concepts/Cost control.md).
 TRANSIENT_CONFLICT_LIMIT = 3  # consecutive RESOURCE_CONFLICT dispatch refusals before we stop saying 'call again'
 CANARY_TIMEOUT_S = 8.0  # a live worker answers in ~1-2s; a cold block blows past this -> not warm
+CANARY_TIMEOUT_MAX_S = 120.0  # the test seam's ceiling: the check holds app.lock, so a long one holds stop_endpoint
+_CANARY_SEAM_NOTED: set[str] = set()   # out-of-range seam values already reported (once each, not at every check)
+
+
+def canary_timeout_s() -> float:
+    """How long a check's canary waits for a worker: CANARY_TIMEOUT_S, unless HPC_BRIDGE_CANARY_TIMEOUT_S overrides it.
+    A TEST SEAM, never set in normal use: the agentic harness lengthens it so a block that replaced a cancelled one can
+    answer INSIDE the check (scenario `reap_replaced_block` — the reap found by job id, #173). Read at each check.
+    It only LENGTHENS the wait, within [CANARY_TIMEOUT_S, CANARY_TIMEOUT_MAX_S]: a shorter wait would read a live block
+    as reaped, and the check holds app.lock (a stop waits behind it). A value below the range, invalid or not finite
+    keeps the default; one above it is capped; either is said once on stderr."""
+    raw = env("HPC_BRIDGE_CANARY_TIMEOUT_S")
+    val = _env_float("HPC_BRIDGE_CANARY_TIMEOUT_S", CANARY_TIMEOUT_S)
+    in_range = math.isfinite(val) and val >= CANARY_TIMEOUT_S
+    use = min(val, CANARY_TIMEOUT_MAX_S) if in_range else CANARY_TIMEOUT_S
+    if raw is not None and use != val and raw not in _CANARY_SEAM_NOTED:
+        _CANARY_SEAM_NOTED.add(raw)
+        print(f"hpc-bridge: HPC_BRIDGE_CANARY_TIMEOUT_S={raw!r} is outside [{CANARY_TIMEOUT_S:g}, "
+              f"{CANARY_TIMEOUT_MAX_S:g}] s; using {use:g}", file=sys.stderr)
+    return use
+
 
 # --- long-task submit/poll bounds (#21) ---
 # The client blocks up to SYNC_WAIT_S for a task's result; a task still running past it is NOT cut —

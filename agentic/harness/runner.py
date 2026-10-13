@@ -16,6 +16,7 @@ agentic harness image). The hermetic ``pytest -q`` never imports this module
 """
 from __future__ import annotations
 
+import asyncio
 import contextlib
 import json
 import os
@@ -35,7 +36,10 @@ from claude_agent_sdk import (  # type: ignore[import-not-found]
 # MAX_PROSE_FOLLOWUPS: used by the prose loop below, re-exported to hermes_runner
 from human_sim import MAX_PROSE_FOLLOWUPS, HumanSim, ends_with_question
 from invariants import Trace, logical_name
-from trace_adapter import _result_to_dict, build_trace, insert_interjections
+
+# HookWatcher lives in midrun_hooks.py (SDK-free, shared with cli_runner); `runner.HookWatcher` still names it
+from midrun_hooks import HookWatcher, fired_record, hook_actions, hook_label, trigger_text
+from trace_adapter import build_trace, insert_interjections
 
 # Logical hpc-bridge tool names (see Modules/server.md). Registered under SDK key
 # "endpoint" -> the agent sees them as mcp__endpoint__<tool>.
@@ -93,60 +97,12 @@ class RunResult:
     arrivals: list[float | None] = None  # parallel to `messages`: seconds since the session started (turn latency; bundle `__t__`)
 
 
-class HookWatcher:
-    """Chaos hooks: a scenario's MIDRUN_HOOKS fire at a chosen point in the agent's tool sequence — after the Nth
-    result of a given tool (optionally only when the call's input matches, e.g. shape="compute", or the result's
-    phase matches) — and run a command on the cluster while the agent is mid-task. The harness had no channel into
-    the world between SETUP and POSTCHECKS, so a dead endpoint under a polled task, a stop that must come back
-    `draining`, or a stop while a task runs could never be provoked on purpose (review 2026-09-05, N6–N8).
-
-    Pure over the message stream: `observe(msg)` returns the hooks due after this message. The runner awaits the
-    executor for each; the fake cluster is where these run (a hook kills things)."""
-
-    def __init__(self, hooks: list[dict] | None) -> None:
-        self.hooks = [dict(h) for h in (hooks or [])]
-        self._uses: dict[str, tuple[str, dict]] = {}   # tool_use_id -> (logical name, input)
-        self._counts: dict[str, int] = {}
-        self._fired: set[int] = set()
-        self.calls = 0                                  # tool_use blocks seen (the trace's call index)
-        self.endpoint_ids: list[str] = []
-
-    def observe(self, msg: Any) -> list[dict]:
-        due: list[dict] = []
-        content = getattr(msg, "content", None)
-        if not isinstance(content, list):
-            return due
-        for b in content:
-            if hasattr(b, "name") and hasattr(b, "input") and hasattr(b, "id"):
-                self._uses[b.id] = (logical_name(getattr(b, "name", "") or ""), dict(getattr(b, "input", {}) or {}))
-                self.calls += 1
-            elif hasattr(b, "tool_use_id"):
-                use = self._uses.get(b.tool_use_id)
-                if use is None:
-                    continue
-                name, inp = use
-                result = _result_to_dict(getattr(b, "content", None)) or {}
-                eid = str(result.get("endpoint_id") or "")
-                if eid and eid not in self.endpoint_ids:
-                    self.endpoint_ids.append(eid)
-                for k, h in enumerate(self.hooks):
-                    if k in self._fired or h.get("after_tool") != name:
-                        continue
-                    want = h.get("when_input") or {}
-                    if any(str(inp.get(kk)).lower() != str(vv).lower() for kk, vv in want.items()):  # True/"true" alike
-                        continue
-                    if h.get("when_phase") and str(result.get("phase")) != str(h["when_phase"]):
-                        continue
-                    self._counts[k] = self._counts.get(k, 0) + 1
-                    if self._counts[k] == int(h.get("nth", 1)):
-                        self._fired.add(k)
-                        due.append({**h, "index": k, "call_index": self.calls - 1, "result": result,
-                                    "endpoint_ids": list(self.endpoint_ids)})
-        return due
-
-    @property
-    def unfired(self) -> list[dict]:
-        return [h for k, h in enumerate(self.hooks) if k not in self._fired]
+@dataclass
+class _EndedByHook:
+    """Stand-in `final` when an `interrupt`-only hook ended the run (Esc with nothing said after it): the interrupted
+    turn's error-subtype result is the harness's doing, so the run did complete; graders judge what happened."""
+    result: str
+    is_error: bool = False
 
 
 @dataclass
@@ -323,30 +279,70 @@ async def run_scenario(
     fired: list[dict] = []
     interjections: list[dict] = []   # `interject` hooks that fired: what the user said, after which call
     pending: list[str] = []          # an interjection to send once the interrupted turn has ended
-    live: dict[str, Any] = {}        # the ClaudeSDKClient while an interactive run is alive (interject hooks need it)
+    ended_by: list[str] = []         # an `interrupt`-only hook ended the turn: Esc with nothing after it — the run ends
+    live: dict[str, Any] = {}        # the ClaudeSDKClient while an interactive run is alive (interrupt hooks need it)
+    timers: list[asyncio.Task] = []  # during hooks: one timer per matching call that started
+
+    async def _act(hook: dict) -> None:
+        label = hook_label(hook)
+        print(f"  💥 hook: {label} {trigger_text(hook)} (call {hook['call_index']})", file=sys.stderr, flush=True)
+        acts = hook_actions(hook)
+        outcome: dict = {}
+        if "cmd" in acts:
+            outcome = dict((await hook_runner(hook) if hook_runner else None) or {"rc": None, "out": "(no hook runner)"})
+        if acts & {"interrupt", "interject"}:
+            # The USER presses Esc (Claude Code's interrupt). The SDK interrupt rejects the in-flight tool use and ends
+            # the turn with an error-subtype result (live-verified 2026-09-06); an MCP call in flight is cancelled with
+            # it (the server kept the command tracked — esc_mid_call, live 2026-10-13). For an `interject` the
+            # interactive loop below then sends the text as the next turn of the SAME session. Only a run with a user
+            # (a persona) has the streaming client to interrupt.
+            client = live.get("client")
+            if client is None:
+                said = {"rc": 1, "out": "an interrupt/interject hook needs an interactive run (a persona): an autonomous "
+                                        "run has no session to interrupt (or it had ended)"}
+            else:
+                # queued BEFORE the interrupt: the turn can end while the interrupt is still being acknowledged
+                text = str(hook.get("interject") or "")
+                queue, item = (pending, text) if "interject" in acts else (ended_by, label)
+                queue.append(item)
+                try:
+                    await client.interrupt()
+                except Exception:
+                    queue.remove(item)
+                    raise
+                if "interject" in acts:
+                    interjections.append({"name": label, "text": text, "call_index": hook["call_index"]})
+                    said = {"rc": 0, "out": "interrupted the turn; the user's message follows it", "interject": text[:300]}
+                else:
+                    said = {"rc": 0, "out": "interrupted the turn (Esc); nothing follows it — the run ends with this turn"}
+            if outcome:   # a cmd ran too: keep its record, with the worse rc and what the interrupt did
+                said = {**outcome, **{k: v for k, v in said.items() if k != "out"}, "interrupt": said["out"],
+                        "rc": outcome.get("rc") or said["rc"]}
+            outcome = said
+        fired.append(fired_record(hook, outcome))
+
+    async def _during(armed: dict) -> None:
+        """A during hook's timer: `after_s` after its call started, act if that call is still in flight."""
+        await asyncio.sleep(float(armed.get("after_s", 0)))
+        hook = watcher.due_during(armed)
+        if hook is None:
+            return
+        try:
+            await _act(hook)
+        except asyncio.CancelledError:
+            fired.append(fired_record(hook, {"rc": 1, "out": "the run ended while the hook was acting"}))
+            raise
+        except Exception as exc:  # noqa: BLE001 - recorded (and gated by harness:midrun_hooks), never a crashed run
+            fired.append(fired_record(hook, {"rc": 1, "out": f"the hook failed: {type(exc).__name__}: {exc}"}))
 
     async def _observe(msg: Any) -> None:
         for hook in watcher.observe(msg):
-            label = hook.get("name", hook["after_tool"])
-            print(f"  💥 hook: {label} after {hook['after_tool']} #{hook.get('nth', 1)} (call {hook['call_index']})",
-                  file=sys.stderr, flush=True)
-            if "interject" in hook:
-                # The USER interrupts (Esc in Claude Code) and speaks. The SDK interrupt rejects the in-flight tool use and
-                # ends the turn with an error-subtype result (live-verified 2026-09-06); the interactive loop below then
-                # sends the text as the next turn of the SAME session. Only a run with a user (a persona) can interject.
-                client = live.get("client")
-                if client is None:
-                    outcome = {"rc": 1, "out": "interject hook needs an interactive run (a persona): an autonomous run has no user to interrupt"}
-                else:
-                    text = str(hook["interject"])
-                    await client.interrupt()
-                    pending.append(text)
-                    interjections.append({"name": label, "text": text, "call_index": hook["call_index"]})
-                    outcome = {"rc": 0, "out": "interrupted the turn; the user's message follows it", "interject": text[:300]}
-            else:
-                outcome = await hook_runner(hook) if hook_runner else {"rc": None, "out": "(no hook runner)"}
-            fired.append({"name": label, "after_tool": hook["after_tool"],
-                          "nth": int(hook.get("nth", 1)), "call_index": hook["call_index"], **(outcome or {})})
+            try:
+                await _act(hook)
+            except Exception as exc:  # noqa: BLE001 - recorded (harness:midrun_hooks gates it), never a lost hook
+                fired.append(fired_record(hook, {"rc": 1, "out": f"the hook failed: {type(exc).__name__}: {exc}"}))
+        for armed in watcher.take_armed():
+            timers.append(asyncio.create_task(_during(armed)))
     try:
         with _scrubbed_agent_env():
             if interactive:
@@ -380,6 +376,11 @@ async def run_scenario(
                             print(f"  ✋ user({persona}) INTERJECTS: {text[:160]}", file=sys.stderr, flush=True)
                             await client.query(text)
                             continue
+                        if ended_by:
+                            # an interrupt-only hook pressed Esc and nobody spoke after it: the run ends HERE, by design —
+                            # its error-subtype result is the harness's doing, not a failed run
+                            final = _EndedByHook(result=f"the run ended at hook {ended_by[0]!r}: Esc, nothing said after it")
+                            break
                         # The turn ended on a text-only question (no tool call): a real user would answer in
                         # chat, so the sim does — one more `query` continues the SAME session (SDK multi-turn).
                         if last_had_tool or getattr(final, "is_error", False) or not ends_with_question(last_text):
@@ -391,7 +392,7 @@ async def run_scenario(
                         followups += 1
                         print(f"  ! human({persona}) answers a PROSE question: {reply}", file=sys.stderr, flush=True)
                         await client.query(reply)
-                live.pop("client", None)
+                    live.pop("client", None)   # before the client closes: a late hook must not interrupt a closing one
             else:
                 async for msg in query(prompt=prompt, options=options):
                     _keep(msg)
@@ -408,6 +409,10 @@ async def run_scenario(
         print(f"  ⚠ run aborted mid-stream: {e}", file=sys.stderr, flush=True)
         if (interactive and turn_final is None) or final is None:
             final = _AbortedResult(result=str(e))
+    finally:
+        for task in timers:   # the run is over: a during hook still waiting has nothing in flight to act on
+            task.cancel()
+        await asyncio.gather(*timers, return_exceptions=True)
     return RunResult(
         trace=insert_interjections(build_trace(messages, injected_answers=injected_answers, arrivals=arrivals), interjections),
         final=final, messages=messages, arrivals=arrivals,
@@ -415,7 +420,5 @@ async def run_scenario(
         prose_followups=followups, followups_capped=capped,
         human_sim_model=(human.model if human else None),
         interjections=interjections,
-        hooks_fired=fired + [{"name": h.get("name", h["after_tool"]), "after_tool": h["after_tool"],
-                              "nth": int(h.get("nth", 1)), "call_index": None, "rc": None, "out": "NEVER FIRED"}
-                             for h in watcher.unfired],
+        hooks_fired=fired + watcher.unfired_records(),
     )

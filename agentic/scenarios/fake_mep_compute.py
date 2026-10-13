@@ -11,7 +11,7 @@ key the manager rejects the submission and no block ever comes.
 The catalog is LOCAL (run_smoke.sh mounts this cluster's generated entries as HPC_BRIDGE_CATALOG_FILE): the MEP UUIDs
 are minted per cluster. Graded like mep_compute_only, with the mapped user and idle-release of this facility.
 """
-from invariants import Result, Trace, _shape, compute_ran
+from invariants import Result, Trace, _shape, compute_ran, first_result_s
 from mep_compute_only import mep_no_login_shape_submit, mep_stop_is_draining_only, mep_zero_ssh
 
 FACILITY_ID = "fake-mep-strict"       # the local catalog's id for the strict-schema manager
@@ -67,7 +67,9 @@ def strict_keys_dropped(t: Trace) -> Result:
     return Result("strict_keys_dropped", False, "no notice said keys were dropped for the strict schema")
 
 
-EXTRA_INVARIANTS = [mep_zero_ssh, mep_no_login_shape_submit, mep_identity_mapped, mep_stop_is_draining_only, strict_keys_dropped, compute_ran]
+# first_result_s: REPORTED, not gated — the first-result time from the attach (a MEP block, its worker env installing)
+EXTRA_INVARIANTS = [mep_zero_ssh, mep_no_login_shape_submit, mep_identity_mapped, mep_stop_is_draining_only, strict_keys_dropped, compute_ran,
+                    first_result_s]
 
 EXPECT_OK = [
     "mep_zero_ssh",                 # attached, never probed, never SSH'd

@@ -33,12 +33,12 @@ MIDRUN_HOOKS = [
     # second hook resumes it after the FIRST stop (draining), so the re-stop finds the channel warm again (down).
     # The bracket trick: a plain `-f process_worker_pool` matched the ssh shell's own command line (first run, 09-05).
     # "on": "each_login": the endpoint's manager (and its login worker pool) sits on ONE node of a round-robin pool;
-    # a hook sent to the alias may land on the other one (the sweep rerun, 2026-09-06). pkill's own rc is echoed so the
-    # bundle shows whether anything was actually frozen.
+    # a hook sent to the alias may land on the other one (the sweep rerun, 2026-09-06). pkill's own rc is echoed, and
+    # `expect_any_host` makes each hook FAIL (harness:midrun_hooks) unless some node actually froze / thawed a worker.
     {"name": "freeze_login_worker", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "nth": 2, "on": "each_login",
-     "cmd": "pkill -STOP -u $(whoami) -f 'process_worker_[p]ool'; echo \"frozen pkill-rc=$?\""},
+     "cmd": "pkill -STOP -u $(whoami) -f 'process_worker_[p]ool'; echo \"frozen pkill-rc=$?\"", "expect_any_host": "pkill-rc=0"},
     {"name": "thaw_login_worker", "after_tool": "stop_endpoint", "nth": 1, "on": "each_login",
-     "cmd": "pkill -CONT -u $(whoami) -f 'process_worker_[p]ool'; echo \"thawed pkill-rc=$?\""},
+     "cmd": "pkill -CONT -u $(whoami) -f 'process_worker_[p]ool'; echo \"thawed pkill-rc=$?\"", "expect_any_host": "pkill-rc=0"},
 ]
 CLEANUP = [{"on": "each_login", "cmd": "pkill -CONT -u $(whoami) -f 'process_worker_[p]ool' 2>/dev/null; echo thawed"}]   # never leave a frozen worker
 

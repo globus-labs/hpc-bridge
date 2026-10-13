@@ -87,3 +87,43 @@ def test_the_docs_list_every_scenario_and_count_them_right():
     handoff = (HERE.parents[1] / "HANDOFF.md").read_text()
     counts = {int(n) for n in re.findall(r"(\d+) scenarios\b", handoff)}
     assert counts == {len(SCENARIOS)}, (counts, len(SCENARIOS))
+
+
+def _paid_only() -> list[str]:
+    m = re.search(r"^paid_only\(\) \{.*?\n  cat <<'PAID'\n(.*?)\nPAID\n", SWEEP.read_text(), re.S | re.M)
+    assert m, "sweep_profiles.sh lost its paid_only() list"
+    return [ln.strip() for ln in m.group(1).splitlines() if ln.strip()]
+
+
+def test_the_free_wave_leaves_out_exactly_what_the_free_operators_cannot_drive():
+    # HPCB_OPERATOR=codex|pi|hermes21 drops paid_only() from every profile: it must be exactly the swept scenarios
+    # run.py would report SKIPPED for those operators (a persona, PHASES, a hook that needs the SDK interrupt) — a
+    # stale entry would hide a free cell, a missing one would launch a container just to skip it
+    import importlib
+
+    from midrun_hooks import CLI_OPERATORS, operator_refusal
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    paid = _paid_only()
+    assert len(paid) == len(set(paid))
+    for op in CLI_OPERATORS:
+        refused = set()
+        for n in _swept():
+            mod = importlib.import_module(n)
+            if operator_refusal(op, persona=getattr(mod, "PERSONA", None), phases=bool(getattr(mod, "PHASES", None)),
+                                hooks=getattr(mod, "MIDRUN_HOOKS", None)):
+                refused.add(n)
+        assert set(paid) == refused, {"paid_only but drivable": sorted(set(paid) - refused),
+                                      "not drivable, missing from paid_only": sorted(refused - set(paid))}
+    assert "esc_mid_call" in paid and "reap_replaced_block" not in paid   # the Esc needs the SDK; the reap is free
+    assert {"reap_replaced_block", "esc_mid_call"} <= set(_cells()["default"])
+
+
+def test_the_free_wave_filter_keeps_order_and_drops_paid_cells(tmp_path):
+    import subprocess
+    fn = re.search(r"^paid_only\(\) \{.*?\n\}\n", SWEEP.read_text(), re.S | re.M).group(0)
+    script = tmp_path / "f.sh"
+    script.write_text(fn + 'scen="$1"\ntr \',\' \'\\n\' <<< "$scen" | grep -vxF -f <(paid_only) | paste -sd, -\n')
+    out = subprocess.run(["bash", str(script), "happy_path,gated_provision,reap_replaced_block,esc_mid_call,long_output"],
+                         capture_output=True, text=True, timeout=30)
+    assert out.stdout.strip() == "happy_path,reap_replaced_block,long_output", out
+    assert 'grep -vxF -f <(paid_only)' in SWEEP.read_text()   # the same filter the sweep runs
