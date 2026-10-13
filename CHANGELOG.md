@@ -3,6 +3,44 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## 0.1.23 — 2026-10-13 — faster first results, honest stops and output, batch jobs counted as spend, ALCF Polaris
+
+### Added
+- **ALCF Polaris** joins the registry as `polaris`: ALCF's facility multi-user endpoint (PBS Pro), zero SSH, an ALCF
+  project as the account (default queue `debug`, 15 min). Workers run ALCF's own Python 3.13 install. Proven live
+  2026-10-13. Your ALCF identity must be linked to your Globus login.
+
+### Changed
+- **The first SSH result comes in about 40 s, not 95–114 s.** Endpoints hpc-bridge stands up run parsl's scaling pass
+  every 5 s instead of 30 s; scheduler queries stay at once a minute. An endpoint configured before this keeps 30 s
+  until it is torn down.
+- **A replaced block is caught.** The canary now reports the block's scheduler job id. When a check is answered by a
+  different job (the old block was released, cancelled or preempted), the user is asked about spend again before any
+  work runs on it. An idle block is presumed released 15 s after its idle window, not 60 s.
+- **A batch job submitted by hand is spend.** The skill no longer suggests `sbatch` over the free login shape without
+  asking: a job submitted from the login node, or from inside a block, bills the allocation like a block, so the user
+  confirms it first. `run_shell`, `login_shell` and `poll_task` results that submitted a job say so and how to cancel
+  it; hpc-bridge doesn't track or stop such jobs. The agentic graders count it as a billed start.
+- **With no facility connected, the tools say so and start nothing.** Before, a `run_shell` sent before
+  `connect_facility` finished got raw internals, and on Linux could stand up a local `hpc-bridge-dev` endpoint. The
+  notice now says what to call, including how to finish a connect that only proposed a configuration or is waiting on
+  a one-time login. **The server never stands up a local endpoint any more:** `HPC_BRIDGE_ENDPOINT_ID` is the only
+  local-development path, on every OS.
+
+### Fixed
+- **Long output is never cut silently.** The Compute SDK kept only the last 1000 lines of each stream and said
+  nothing, so a long `cat` came back as its tail passing for the whole file. Each stream the agent gets now keeps its
+  end (16,000 chars), opens with a marker saying what was dropped, and the notice says how to read the rest (redirect
+  to a file, read ranges). A result over Compute's 10 MiB limit is reported as what it is: the command ran, its output
+  and exit code are lost.
+- **Pressing Esc on a long `run_shell` no longer loses the command.** Cancelling a call does not cancel its command,
+  which kept running untracked: `stop_endpoint` answered `down` while the endpoint relaunched a block for it. Now the
+  command stays tracked (`poll_task` returns it) and stop refuses honestly, naming what holds the block. Stop also
+  refuses while a call is still in its sync-wait. A `reset_session` that outlives its wait becomes a poll handle
+  instead of a false "timed out".
+- **A one-time-login resume keeps the login host**, so following it reaches the proposed configuration instead of
+  asking for the facility details again.
+
 ## 0.1.22 — 2026-10-09 — Codex, Pi and Hermes: tested recipes, and long calls that survive their timeouts
 
 ### Added
