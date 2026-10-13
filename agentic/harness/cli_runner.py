@@ -18,11 +18,11 @@ long-lived session mode (an MCP server that lives across turns, as in real use) 
 from __future__ import annotations
 
 import asyncio
+import contextlib
 import json
 import os
 import re
 import shutil
-import subprocess
 import tempfile
 import time
 import uuid
@@ -32,9 +32,36 @@ from typing import Any
 
 import yaml
 from invariants import ToolCall, Trace
+from proctree import kill_group
 from responses_relay import start_relay
 
 HARNESSES = ("codex", "pi", "hermes21")
+
+
+async def run_turn_process(argv: list[str], *, cwd: str, env: dict[str, str], timeout_s: float) -> tuple[int, str, str]:
+    """One operator turn as a child in its OWN process group (`start_new_session`), so the operator and the hpc-bridge
+    MCP server it spawns stop together: on a timeout (rc 124) and on cancellation (a SIGINT / docker stop reaching
+    run.py), the whole group is terminated and waited for before control returns. Why: run in a worker thread
+    (`to_thread(subprocess.run)`), a cancelled turn left the operator running, and its next tool call re-provisioned
+    the endpoint the teardown had just removed."""
+    proc = await asyncio.create_subprocess_exec(*argv, cwd=cwd, env=env, stdin=asyncio.subprocess.DEVNULL,
+                                                stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE,
+                                                start_new_session=True)
+
+    async def stop() -> None:
+        await asyncio.to_thread(kill_group, proc.pid)
+        with contextlib.suppress(Exception):
+            await asyncio.wait_for(proc.wait(), timeout=5)
+
+    try:
+        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+    except TimeoutError:
+        await stop()
+        return 124, "", f"timed out after {timeout_s:.0f} s"
+    except asyncio.CancelledError:
+        await asyncio.shield(stop())
+        raise
+    return proc.returncode or 0, out_b.decode(errors="replace"), err_b.decode(errors="replace")
 _UV = "/usr/local/bin/uv"
 # What the hpc-bridge server needs from the jail's env; Codex and Hermes filter the child env, so it is named explicitly.
 _PASSTHROUGH = (
@@ -578,12 +605,7 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     print(f"  → {harness}: {' '.join(a if len(a) < 80 else a[:77] + '…' for a in argv[:8])} …", flush=True)
     t0 = time.monotonic()
     try:
-        proc = await asyncio.to_thread(subprocess.run, argv, cwd=ws, env=env, stdin=subprocess.DEVNULL,
-                                       capture_output=True, text=True, timeout=TURN_TIMEOUT_S)
-        rc, out, err = proc.returncode, proc.stdout, proc.stderr
-    except subprocess.TimeoutExpired as exc:
-        rc, out, err = 124, (exc.stdout or b"").decode() if isinstance(exc.stdout, bytes) else (exc.stdout or ""), \
-            f"timed out after {TURN_TIMEOUT_S:.0f} s"
+        rc, out, err = await run_turn_process(argv, cwd=str(ws), env=env, timeout_s=TURN_TIMEOUT_S)
     finally:
         if relay:
             relay.shutdown()

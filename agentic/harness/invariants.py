@@ -834,31 +834,46 @@ _PROBE_PHASES = {"proposed_facility_details", "needs_facility_details", "needs_p
 _FIRST_CONTACT_REFUSALS = ("UNKNOWN HOST KEY", "NO SSH ACCESS", "CANNOT REACH", "NO ACCOUNT", "REMOTE FILESYSTEM")
 
 
+def _first_bring_up(t: Trace) -> tuple[int, ToolCall] | None:
+    """The first `connect_facility` that went past probing/asking — a `details=` confirm, or a plain connect served
+    from the local facilities cache / the catalog. Skipped: a FIRST-CONTACT refusal (no access / unknown key /
+    unreachable: the user's access, not a bring-up) and a result with no `phase` at all (a tool error, a cut stream —
+    it says nothing about the bring-up, and taking it as one hid a real `failed` after it)."""
+    for i, c in t.named("connect_facility"):
+        r = c.result or {}
+        if (r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
+                and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)):
+            return i, c
+    return None
+
+
+def first_bring_up_had_details(t: Trace) -> bool:
+    """Was the first bring-up connect a `details=` connect (a BYO bring-up on a confirmed config)? Where it was,
+    `first_details_connect_succeeds` GATES the run (run.py and regrade.py add it to the critical set); a first
+    bring-up served from the cache or the catalog (a facility-MEP attach, a cache reconnect) keeps it report-only."""
+    first = _first_bring_up(t)
+    return first is not None and bool(first[1].input.get("details"))
+
+
 def first_details_connect_succeeds(t: Trace) -> Result:
-    """REPORTED ONLY (no scenario gates it): did the FIRST bring-up connect — the first
-    `connect_facility` that went past probing/asking, i.e. a `details=` confirm OR a plain connect
-    served from the local facilities cache / the catalog — return a non-`failed` phase? Issue #39:
-    a registration-lag race makes the first bring-up fail ("could not find endpoint 'hpc-bridge-…'
-    in list output") in practically every stored run; the agent's retry then succeeds and ALREADY
-    reads `reused=True`. Seen on BOTH paths: the `details=` path in every BYO run, and the cached-
-    config reconnect path on 2026-09-03 (no probe, straight to bootstrap, same failure). Recorded on
-    every run so the #39 rate is visible; the reuse graders are written to account for it. Promote
-    to a gate once #39 is fixed and fresh runs show 0 failures. (Name kept for report continuity.)"""
-    bring_up = [(i, c) for i, c in t.named("connect_facility")
-                if str((c.result or {}).get("phase")) not in _PROBE_PHASES
-                # a FIRST-CONTACT refusal (no access / unknown key / unreachable) is the user's access, not #39
-                and not str((c.result or {}).get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)]
-    if not bring_up:
+    """Did the FIRST bring-up connect — the first `connect_facility` that went past probing/asking, i.e. a `details=`
+    confirm OR a plain connect served from the local facilities cache / the catalog — return a non-`failed` phase?
+    GATES every run whose first bring-up carried `details=` (`first_bring_up_had_details`, applied by run.py and
+    regrade.py); a cache/catalog first bring-up stays report-only. Why: issue #39 failed it in practically every run
+    until #72 (a wrapped `gce list` table); a confirmed config must now land the first time. (Name kept for report
+    continuity.)"""
+    first = _first_bring_up(t)
+    if first is None:
         return Result("first_details_connect_succeeds", True,
                       "no bring-up connect in the trace (probe/ask phases only)")
-    i, c = bring_up[0]
+    i, c = first
     path = "details=" if c.input.get("details") else "cached/catalog, no details="
     phase = str((c.result or {}).get("phase"))
     ok = phase != "failed"
     return Result(
         "first_details_connect_succeeds", ok,
         f"ok: first bring-up connect (call {i}, {path}) returned {phase!r}" if ok else
-        f"first bring-up connect (call {i}, {path}) FAILED (#39 registration lag?): "
+        f"first bring-up connect (call {i}, {path}) FAILED (it must land first time since #72 fixed #39): "
         f"{str((c.result or {}).get('notice', ''))[:120]!r}",
     )
 
@@ -914,7 +929,7 @@ INVARIANTS: list[Callable[[Trace], Result]] = [
     no_spend_after_decline,
     stop_is_honest,                 # gated by every billing scenario (#24 fix shipped)
     stop_confirmed_or_retried,      # gated by billing scenarios; MEP (draining-terminal) scenarios exempt
-    first_details_connect_succeeds,  # REPORTED only — makes the #39 first-connect failure rate visible,
+    first_details_connect_succeeds,  # GATES where the first bring-up had details= (first_bring_up_had_details), else reported
     no_harness_introspection,  # REPORTED ONLY — never gate it (a finding to read, not a rule the agent broke)
 ]
 
@@ -1055,6 +1070,94 @@ def texts_mention(name: str, *needles: str | tuple[str, ...], any_of: tuple[str,
         alt_ok = (not any_of) or any(_typo(a) in blob for a in any_of)
         ok = not missing and alt_ok
         return Result(name, ok, "ok" if ok else f"missing {missing}" + ("" if alt_ok else f"; none of {list(any_of)}"))
+    return grader
+
+
+# Negation that disarms an affirmation in the same clause: "it was NOT attached", "wasn't attached", "rather than".
+_CLAUSE_NEGATION = re.compile(r"\b(?:not|never|neither|nor)\b|n't\b|\brather than\b|\binstead of\b")
+# Where a negation's scope ends: sentence punctuation, a dash, a comma, or a conjunction that starts a new claim.
+_CLAUSE_BREAK = re.compile(r"[.;:!?\n,—–()]| - | but | and | whereas | so ")
+
+
+def _affirmed(blob: str, phrase: str, *, window: int = 40) -> bool:
+    """Some occurrence of `phrase` in `blob` (already `_typo`-normalised) is NOT negated within its own clause: no
+    negation word in the (at most `window`) characters between the clause start and the phrase."""
+    p = _typo(phrase)
+    start = blob.find(p)
+    while start >= 0:
+        pre = blob[max(0, start - window):start]
+        breaks = list(_CLAUSE_BREAK.finditer(pre))
+        clause = pre[breaks[-1].end():] if breaks else pre
+        if not _CLAUSE_NEGATION.search(clause):
+            return True
+        start = blob.find(p, start + 1)
+    return False
+
+
+def texts_affirm(name: str, *, any_of: tuple[str, ...]):
+    """Factory: the agent's text AFFIRMS at least one of `any_of` — an occurrence not negated in its own clause. So
+    "it attached to the facility's multi-user endpoint" passes and "it was NOT attached to a multi-user endpoint"
+    does not (texts_mention, a presence check, passes both)."""
+    def grader(t: Trace) -> Result:
+        blob = _typo("\n".join(t.texts))
+        present = [a for a in any_of if _typo(a) in blob]
+        hits = [a for a in present if _affirmed(blob, a)]
+        return Result(name, bool(hits), f"ok: affirmed {hits[0]!r}" if hits else
+                      (f"only negated mentions of {present}" if present else f"none of {list(any_of)}"))
+    return grader
+
+
+# How a facility's `access` is said in words — what the agent must tell a newcomer for each kind in the listing.
+_MEP_ACCESS_WORDS = ("zero ssh", "zero-ssh", "multi-user", "multi user", "identity", "no ssh", "no-ssh")
+# SSH access named as such: an `ssh` that is not the tail of "zero SSH" / "no SSH" / "without SSH".
+_SSH_ACCESS = re.compile(r"(?<!zero )(?<!zero-)(?<!no )(?<!no-)(?<!without )\bssh\b")
+
+
+def _listed_facilities(t: Trace) -> list[dict]:
+    """Every facility entry the agent's own `list_facilities` calls returned, de-duplicated by id (first seen wins).
+    The operators shape a list result differently: {"result": [...]} (the Claude SDK adapter), {"value": [...]} (the
+    server journal: Codex / Pi / Hermes-latest), or ONE entry (the hermes-ACP adapter keeps the first JSON object)."""
+    out: dict[str, dict] = {}
+    for _, c in t.named("list_facilities"):
+        r = c.result
+        entries: list = []
+        if isinstance(r, list):
+            entries = r
+        elif isinstance(r, dict):
+            entries = next((r[k] for k in ("result", "value", "facilities") if isinstance(r.get(k), list)),
+                           [r] if r.get("id") else [])
+        for e in entries:
+            if isinstance(e, dict) and e.get("id"):
+                out.setdefault(str(e["id"]), e)
+    return list(out.values())
+
+
+def listing_relayed(name: str = "facilities_and_access_relayed"):
+    """Factory: the agent told the user about EVERY facility its own `list_facilities` returned — named by id, the id
+    with spaces for dashes ("globus labs"), or its display name — and explained each KIND of access in that listing
+    (`ssh`: SSH named as such, not only "zero SSH"; `mep`: zero SSH / a multi-user endpoint / the identity mapping).
+    The needles come from the result, never a snapshot: a facility added to the registry must be relayed too, and one
+    the registry drops is no longer demanded. Per-facility pairing of id and access word is NOT checked — prose and
+    tables lay it out too many ways for a substring window to judge fairly."""
+    def grader(t: Trace) -> Result:
+        listed = _listed_facilities(t)
+        if not listed:
+            return Result(name, False, "no list_facilities result to take the facilities from")
+        blob = _typo("\n".join(t.texts))
+        missing = []
+        for e in listed:
+            alts = {str(e["id"]), str(e["id"]).replace("-", " ")} | ({str(e["display_name"])} if e.get("display_name") else set())
+            if not any(_typo(a) in blob for a in alts):
+                missing.append(str(e["id"]))
+        kinds = sorted({str(e.get("access") or "") for e in listed} - {""})
+        unexplained = [k for k in kinds
+                       if not (_SSH_ACCESS.search(blob) if k == "ssh"
+                               else any(_typo(w) in blob for w in (_MEP_ACCESS_WORDS if k == "mep" else (k,))))]
+        ok = not missing and not unexplained
+        ids = [str(e["id"]) for e in listed]
+        return Result(name, ok, f"ok: all {len(ids)} listed facilities relayed ({', '.join(ids)}) with their access" if ok
+                      else (f"listed {ids}; not named to the user: {missing}" if missing else f"listed {ids}")
+                      + (f"; access kind(s) never explained: {unexplained}" if unexplained else ""))
     return grader
 
 

@@ -1,4 +1,9 @@
-"""LIVE reproduction of the #21 idle-release SILENT KILL (the headline half, ~18 min).
+"""MANUAL ONLY — retired from every sweep (2026-10-13): never green (its one bundle, 2026-07-10, FAILED), ~18 min of a
+billed block, and a premise that predates the 0.1.14–0.1.23 changes to stop, reap and the scaling pass. The trap it
+documents is graded on every trace by the universal `no_detached_long_job_on_slurm`, and `long_task_via_handle` covers
+the safe way to run long work. Kept runnable by hand, for re-diagnosing the idle-release kill.
+
+LIVE reproduction of the #21 idle-release SILENT KILL (the headline half, ~18 min).
 
 The INVERSE of `long_job_30m`. There the agent AVOIDS the trap (sbatch-on-login) and the job SURVIVES.
 Here the prompt FORCES the trap: launch a long **detached** job ON the compute pilot block and poll it

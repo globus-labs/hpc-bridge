@@ -1,4 +1,9 @@
-"""LIVE end-to-end bring-up of ALCF **Aurora** — the first **PBS** + **bastion/MFA** facility in the
+"""MANUAL ONLY — retired from every sweep (2026-10-13): the Aurora allocation expired unused (2026-06-03), the recipe
+cannot run in the Docker jail (the two-hop MFA below), and its one bundle (2026-07-16) FAILED. What it was for — the
+plugin's PBS path end to end — is covered by the fake `pbs` / `polaris` profiles and the Polaris MEP registry entry
+(`agentic/registry_reprove.py`). Kept runnable by hand (PRECONDITIONS below) for when an ALCF allocation returns.
+
+LIVE end-to-end bring-up of ALCF **Aurora** — the first **PBS** + **bastion/MFA** facility in the
 harness. Exercises the scheduler-neutral compute path (#28) against a real PBS Pro system and, above
 all, **validates the `interface=hsn0` guess**: if the worker registers (the canary goes warm), hsn0 is
 the right address_by_interface for the login-node interchange; if it stays `provisioning`, it isn't.

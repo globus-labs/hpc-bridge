@@ -36,9 +36,19 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← happy_path · gated_provision · spend_refusal · spend_gate_enforced · session_persistence · repl_interaction · repl_baseline_local · mep_compute_only · byo_teardown_clean · unknown_host_key ·
-                           long_job_30m · saturation · endpoint_reuse · endpoint_reuse_chain · facility_cache ·
-                           long_task_via_handle · idle_release_kill · aurora_pbs_bringup
+  scenarios/             ← 48 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+                           connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
+                             endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
+                             lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
+                           spend + account: gated_provision · spend_refusal · spend_gate_enforced · spend_revoked · rich_gate ·
+                             partition_choice · saturation · hand_batch_job · fake_mep_username_not_account
+                           blocks + reaps: block_reaped_resume · gpu_rule · submit_policy_rejected · slurm_worker_died · polaris_filesystems
+                           long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·
+                             repl_interaction · repl_baseline_local
+                           stop + chaos: stop_while_running · draining_restop · orphaned_task
+                           facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute · fake_mep_no_account
+                           adversarial: canary_login_discovery · canary_compute_output
+                           manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
                            claude-session/ (the CLI's native transcripts, both actors)
@@ -58,7 +68,7 @@ One-time setup:
 Run:
 ```bash
 ./agentic/run_smoke.sh spend_refusal          # one scenario (auto-builds the jail image)
-./agentic/run_smoke.sh saturation             # run SOLO — its setup holds all 3 nodes
+./agentic/run_smoke.sh saturation             # run SOLO — its setup holds every node (4 on globus1)
 ./agentic/run_smoke.sh long_job_30m           # ~20 min: waits out the idle-release window
 python3 agentic/run_suite.py --scenarios happy_path,gated_provision \
     --ablations none,skill --repeat 5 --concurrency 3   # a measurement matrix
@@ -95,14 +105,39 @@ then already hold the Search scope: grant it ONCE on the host with `hpc-bridge-c
 
 Every live run needs its **own** pool user (`hpcbridge-test-00..09`): the user is a shared cluster
 identity — its jobs, `~/.globus_compute`, and the endpoint manager — and the harness cleans up after
-a run as that user. `run_suite` claims users with a per-user **`flock`** file under
-`agentic/runs/.pool-claims/` (`HPCB_POOL_CLAIMS_DIR` to move it), held for exactly as long as the user
-is in use and released by the kernel if the process dies. So **two `run_suite` invocations on one host
-can run concurrently** — they take disjoint users, and a suite that finds every user claimed waits
-rather than colliding. Teardown is **run-scoped**: it deletes only this run's endpoint
+a run as that user. `run_suite` claims users with a per-user **`flock`** file in ONE host-wide directory,
+`$XDG_STATE_HOME/hpc-bridge/harness-claims/` (else `~/.local/state/…`; `HPCB_POOL_CLAIMS_DIR` moves it), held for
+exactly as long as the user is in use and released by the kernel if the process dies. So **two `run_suite`
+invocations on one host can run concurrently, from any checkout or worktree** — they take disjoint users, and a
+suite that finds every user claimed waits rather than colliding. (Claims used to live per checkout in
+`agentic/runs/.pool-claims/`; while that directory exists a claim takes its lock too, so a suite still on older
+code in the same checkout is respected.) The **node gate** is cross-process too: the compute cells launched in the last 300 s are
+recorded in `nodes-<target>.json` beside the claims, and the probe + decision + claim runs under a `flock`. So
+concurrent suites (one per operator) count each other's launches, and cannot oversubscribe the cluster.
+Teardown is **run-scoped**: it deletes only this run's endpoint
 (`HPC_BRIDGE_ENDPOINT_NAME`), cancels only blocks carrying this run's `uep.<eid>` marker — never
 `scancel -u` — and removes this run's `uep.<eid>.*` dirs (which `gce delete` leaves behind). Before each delete it saves the manager + UEP `endpoint.log`s and the blocks'
 stdout/stderr into the bundle as `endpoint-logs.txt` (the post-mortem evidence `delete` would erase).
+The stop is sent to EVERY login node at once, and each node runs `gce stop` only if this run's manager is in its own `ps`.
+That match is anchored to a process title or a gce entry-point command line, so a shell that merely carries the
+name (the guard's own included) never counts.
+The `delete` runs with stdin closed, on the node the manager ran on, and every step's outcome is printed: the stop per
+node, the delete, a verification probe, and one line that says whether the registration was removed. Why: the fake
+cluster's `login` alias round-robins login01/login02 over Docker DNS. A stop that landed on the other node signalled
+the NFS-shared `daemon.pid` there, and the manager kept running. `delete` then waited at an authorization-code prompt
+(no token store) until it was Aborted, and with all output sent to /dev/null the teardown still said "ok". The product
+is not affected: it pins its stop to the node it recorded. The record itself is deregistered from the jail, by uuid,
+in the project's own environment (`uv run … python`), because the harness' interpreter has no Globus Compute SDK.
+Before any teardown the harness stops the operator's whole process tree and waits for it: the agent CLI or ACP agent
+and the hpc-bridge MCP server under it (run.py is their subreaper, so orphans count; `harness/proctree.py`). The CLI
+operators' turns also run in their own process group, killed on cancellation. Why: an interrupted Pi cell's operator
+outlived the teardown, and a later tool call re-provisioned the endpoint. On an exit path (interrupted, crashed,
+setup failed) that stop gets 10 s, the teardown 50 s, a final leak probe 15 s and CLEANUP 15 s — inside
+`docker stop`'s 120 s, so the bundle is still written; a step that does not fit is skipped and named.
+After the teardown, the world check **`harness:no_manager_after_teardown`** grades that probe: no process of this
+run's endpoint may still run as the pool user on any login node. It gates `TEARDOWN="delete"` cells, and is
+report-only where the endpoint is kept. On 2026-10-11, 14 such managers were found under `hpcbridge-test` on the
+fake cluster, from runs whose teardown had said "deleted".
 
 > **Why:** on 2026-08-19 two suites both allocated test-00 (the old allocator was per-process and
 > started at 00) and one run's `scancel -u` teardown killed the other's live blocks mid-task — it looked
@@ -127,8 +162,7 @@ the local-discovery cache, or stop — **ordered by risk**. Grade each from its 
 python3 agentic/run_suite.py --scenarios happy_path --repeat 3 --concurrency 3   # want 3/3, no stuck 'provisioning'
 
 # 2. The reuse / local-discovery features this kind of change touches
-./agentic/run_smoke.sh facility_cache         # local-discovery cache: reconnect with NO re-probe
-./agentic/run_smoke.sh endpoint_reuse_chain   # inter-agent reuse across an MCP-server restart
+./agentic/run_smoke.sh endpoint_reuse_chain   # inter-agent reuse across an MCP-server restart + the local-discovery cache (no re-probe)
 ./agentic/run_smoke.sh endpoint_reuse         # intra-agent reuse + the `reused` signal
 
 # 3. Cost-safety insurance (unchanged paths, cheap)
@@ -137,8 +171,8 @@ python3 agentic/run_suite.py --scenarios gated_provision --repeat 2   # the spen
 HPCB_NO_SKILL=1 ./agentic/run_smoke.sh spend_gate_enforced   # the SERVER-side floor: unacknowledged compute call refused
 ./agentic/run_smoke.sh session_persistence    # session shell: cwd/env persist across calls, reset clears (login-only, free)
 HPCB_TARGET=fake ./agentic/run_smoke.sh block_reaped_resume   # chaos: block reaped under an idle session, user returns — spend re-asked naming the reap, session cwd survives, work completes on a new block (fake only, ~8 min)
-./agentic/run_smoke.sh repl_baseline_local    # REPL benchmark reference: the 10-step protocol on the agent's local Bash tool (no HPC)
 ./agentic/run_smoke.sh repl_interaction       # REPL benchmark on a warm compute block: P1/P3/P4/P5 gated, turn latency reported
+./agentic/run_smoke.sh repl_baseline_local    # …and ONLY alongside it: the same protocol on the local Bash tool (the reference; no HPC)
 python agentic/repl_report.py agentic/runs    # side-by-side properties + latency, and the hpc-bridge / local ratio
 python3 agentic/repl_sweep.py --repeat 5 --dry-run   # REPL sweep: 5 alternating local/hpc-bridge rounds on fake, then the graph (plan + estimate)
 python3 agentic/repl_sweep.py --repeat 5             # run it; writes agentic/runs/repl-sweep-<id>/{manifest.json,logs/,repl-sweep.html}
@@ -149,7 +183,7 @@ python3 agentic/repl_sweep.py --repeat 6 --targets fake,globus1   # add the lab 
 ```
 
 Keep `--concurrency 3` (globus1 SSH headroom + the subscription 5h/7d cap; big sweeps → API creds). Compute cells
-are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs all three nodes
+are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs every node
 and runs alone. Cleanup guarantees: `run.py` tears down its own endpoint + blocks in its `finally` (also on
 `docker stop`, which now reaches it via SIGTERM) and deletes the run's endpoint RECORDS from the Globus Compute service
 through the SDK (the login-node `gce delete` deregisters only while the pool user still holds the credentials — four
@@ -158,10 +192,11 @@ through the SDK (the login-node `gce delete` deregisters only while the pool use
 ~30–40 min end to end. #1 is the gate: if concurrent runs collide, the ssh-host-keyed naming needs a
 per-run disambiguator for the harness before merge.
 
-Known wrinkle (issue #39): the FIRST `connect_facility(details=…)` fails on a registration-lag race
-("could not find endpoint … in list output") in practically every run and the retry already reads
-`reused=True` — the reuse graders account for it (phase-keyed; `reused` FIELD only) and the reported
-`first_details_connect_succeeds` invariant tracks the rate until #39 is fixed.
+Issue #39, fixed in #72 (2026-09-04): the FIRST `connect_facility(details=…)` used to fail ("could not find
+endpoint … in list output") in practically every run, and the retry already read `reused=True`. The reuse graders
+still tolerate that form (phase-keyed; the `reused` FIELD only). `first_details_connect_succeeds` now GATES every
+run whose first bring-up connect carried `details=` (run.py and regrade.py apply the rule). It stays report-only
+for a cache or catalog first connect. In the stored bundles, every verdict it flips is a pre-#72 run that hit #39.
 
 ## Stranger, login & refusal scenarios — and the model sweep (2026-09-03)
 
@@ -175,9 +210,9 @@ no cluster block, so they are cheap enough to sweep across models. Graders for t
 | `zero_config_list` | nothing | `list_facilities` out of the box; access notes relayed; no unprompted connect | ~2 min, no cluster |
 | `needs_login_paste` | **no** store (`NO_GLOBUS_DB`) | `needs_login` (paste mode) relayed as a link; no password asked; no code invented; bounded retries | ~2 min, no cluster |
 | `mep_no_account` | a 2nd identity's store (`GLOBUS_DB_SECRET` → `$HPCB_TEST_GLOBUS_DB_NOACCOUNT`) | terminal, sticky NO ACCOUNT relayed once with the identity; no SSH workaround | ~3 min, attach + one refused submit |
-| `no_ssh_access` | server-only `EXTRA_ENV` (bogus login name, no key); **SERIAL + 660 s cooldown** | NO SSH ACCESS explained (host, login name, remedies); no password; no raw ssh | ~2 min, one refused auth — **a fail2ban trigger**: cells are spaced past findtime, or whitelist the harness egress in the cluster's `ignoreip` |
+| `no_ssh_access` | server-only `EXTRA_ENV` (bogus login name, no key); **SERIAL + 660 s cooldown** | NO SSH ACCESS explained (host, login name, remedies); no password; no raw ssh | ~2 min, one refused auth — **a fail2ban trigger**: cells are spaced past findtime, or whitelist the harness egress in the cluster's `ignoreip`. **A globus1 spot check, not in routine sweeps** (`f2b_stranger` covers it on the fake cluster) |
 | `registry_over_cache` | `SEED_FACILITY_CACHE` (a stale SSH-era `globus-labs`) | the registry's MEP entry wins: attach, zero SSH, no probe | ~2 min, attach only |
-| `stranger_mep_walk` | a block; **SERIAL** | one natural request: list → MEP attach → ask → compute run → honest stop | ~3 min + 11 min settle |
+| `stranger_mep_walk` | a block; **SERIAL** | one natural request: list → MEP attach → ask → compute run → honest stop | ~3 min + 12 min settle (the lab MEP releases 600–660 s after the last task; the check waits 720 s) |
 
 Per-scenario knobs (module constants): `NO_GLOBUS_DB` and `GLOBUS_DB_SECRET` are read on the host by
 `harness/scenario_knobs.py` (run_smoke.sh decides what to mount); `EXTRA_ENV` (MCP-server-only env),
@@ -190,7 +225,9 @@ in once as an identity globus1 does not map (e.g. a personal Google identity) vi
 # The model sweep (subscription-billed; the cheap tier fits one 5-h window)
 # 1. cheap tier — every model, 2 repeats, 3 pool users, staggered against 429s. SERIAL scenarios
 #    (mep_no_account, stranger_mep_walk — one Globus identity each) are serialised by run_suite itself.
-python3 agentic/run_suite.py --scenarios zero_config_list,needs_login_paste,mep_no_account,no_ssh_access,registry_over_cache \
+#    These four need the PUBLIC registry (REQUIRES {"catalog": "registry"}): globus1, or fake/default — never fake/mep,
+#    whose local catalog replaces it. no_ssh_access left this tier (a globus1 spot check; f2b_stranger covers it).
+python3 agentic/run_suite.py --scenarios zero_config_list,needs_login_paste,mep_no_account,registry_over_cache \
   --models claude-opus-5,claude-sonnet-5,claude-haiku-4-5-20251001 --repeat 2 --concurrency 3 --stagger 20
 # 2. block tier — every MEP run maps to glabs-gc; SERIAL keeps them one at a time
 python3 agentic/run_suite.py --scenarios stranger_mep_walk --models claude-opus-5,claude-sonnet-5,claude-haiku-4-5-20251001 --repeat 2 --concurrency 1
@@ -231,7 +268,8 @@ PROMPT = "…{facility}…"          # the user's ask (facility id is templated 
 PERSONA = "cooperative"          # or None for autonomous; USER_GOAL = the human-sim's context
 EXPECT_OK = [...]                # which invariants GATE this scenario (see invariants.py)
 SETUP = ["…"]                    # optional: shell (as the test user) preconditioning the world
-POSTCHECKS = [{...}]             # optional: world assertions (cmd + expect_present/absent)
+POSTCHECKS = [{...}]             # optional: world assertions (cmd + expect_present/absent/empty); "on": "each_login" runs one
+                                 #   on every login node, "on": "local" in the jail itself (what the MCP host created)
 EXTRA_INVARIANTS = [my_grader]   # optional: scenario-local Trace -> Result functions
 PHASES = ["…", "…"]              # optional: a multi-session CHAIN (fresh MCP server per phase); every
                                  #   ToolCall carries its 0-based `phase` — grade with t.named(..., phase=k)
@@ -243,7 +281,9 @@ NEEDS_COMPUTE_NODE = True        # nodes the cell occupies (True=1, an int, Fals
 WARM_BLOCK_USER = "glabs-gc"        # optional: a facility MEP's running block (that user's) satisfies the need instead
 SERIAL = True                    # one cell at a time (a shared facility identity, or a cell that holds every node)
 TARGETS = ("fake",)              # optional: only these targets (chaos scenarios kill things)
-REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matched against the target/profile manifest)
+REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matched against the target/profile manifest); a
+                                 #   list-valued capability is a membership test — {"partitions": ["debug"], "accounts": ["hpcb"]};
+                                 #   {"catalog": "registry"} = needs the public registry (a profile's local catalog replaces it)
 MIDRUN_HOOKS = [{"after_tool": "poll_task", "nth": 1, "cmd": "…"}]   # optional: chaos — fire on the cluster mid-run
                                  #   (`"on": "each_login"` runs the hook on every login node of a round-robin pool)
 ADMIN_SETUP = ["sacctmgr -i modify user where name={user} set MaxSubmitJobs=0"]   # optional: cluster-ADMIN world changes,

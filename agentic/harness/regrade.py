@@ -21,7 +21,14 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parents[0] / "scenarios"))
 
-from invariants import FLOOR_NAMES, OPERATOR_PREFERENCE_GRADERS, Trace, check_all, floor_graders  # noqa: E402
+from invariants import (  # noqa: E402
+    FLOOR_NAMES,
+    OPERATOR_PREFERENCE_GRADERS,
+    Trace,
+    check_all,
+    first_bring_up_had_details,
+    floor_graders,
+)
 from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
 
 
@@ -99,6 +106,8 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
                 critical.discard("agent_engaged")   # a calibration run that must not use hpc-bridge (run.py, same rule)
         except ModuleNotFoundError:
             pass
+        if first_bring_up_had_details(t):   # the same conditional gate as run.py: a details= bring-up must land first time
+            critical.add("first_details_connect_succeeds")
         # the completion gate, from what the bundle recorded (not from the trace)
         fin = rec.get("final") or {}
         completed = rec.get("rc") != 3 and fin.get("is_error") is False

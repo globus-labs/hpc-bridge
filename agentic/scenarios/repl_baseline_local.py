@@ -5,6 +5,9 @@ locally. This run anchors `repl_interaction`'s turn latency as a ratio, and reco
 profile: Claude Code's Bash tool keeps the working directory between calls but NOT environment variables, so
 `repl_env_carries` is reported here, not gated. `LOCAL_BASELINE` drops the `agent_engaged` liveness gate (it demands an
 hpc-bridge call); `repl_local_only` gates instead — some Bash, and no hpc-bridge call at all. No cluster work.
+
+Run it ONLY alongside `repl_interaction` (`agentic/repl_sweep.py` alternates the two): alone it says nothing about
+hpc-bridge — it is the reference the other's latency is a ratio of. Not in routine sweeps.
 """
 from repl_protocol import GATED, graders, protocol_prompt
 

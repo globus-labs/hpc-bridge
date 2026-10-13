@@ -21,6 +21,7 @@ GLOBUS_DB_SECRET = "HPCB_TEST_GLOBUS_DB_NOACCOUNT"
 SERIAL = True   # every cell uses the SAME second identity: two at once make the web service answer the
                 # second with RESOURCE_CONFLICT instead of the 422 (seen on the first model sweep)
 FACILITY_ID = "globus-labs"
+REQUIRES = {"catalog": "registry"}   # the registry's `globus-labs` MEP entry: a profile's local catalog (fake `mep`) replaces the registry
 PROMPT = (
     "Connect me to the HPC facility `globus-labs` (catalogued: connect_facility(facility='globus-labs'), no "
     "ssh_host, no details) and bring up a compute block on partition `main` so I can run `hostname` "

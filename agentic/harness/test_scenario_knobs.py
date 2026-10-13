@@ -3,6 +3,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib.util
+import json
 import subprocess
 import sys
 from pathlib import Path
@@ -47,7 +48,7 @@ def test_node_need_is_derived_for_every_block_bringing_scenario():
     # explicit True -> 1; derived from a `compute_ran` gate -> 1; explicit int -> that many; MEP pair name a warm user
     for s, need in (("happy_path", "1"), ("gated_provision", "1"), ("spend_gate_enforced", "1"),
                     ("mep_compute_only", "1"), ("stranger_mep_walk", "1"), ("long_task_via_handle", "1"),
-                    ("idle_release_kill", "1"), ("long_job_30m", "1"), ("saturation", "3")):
+                    ("idle_release_kill", "1"), ("long_job_30m", "1"), ("saturation", "4")):
         rc, k = _knobs(s)
         assert rc == 0 and k.get("HPCB_KNOB_NEEDS_NODE") == need, (s, k)
     for s in ("mep_compute_only", "stranger_mep_walk"):
@@ -58,8 +59,9 @@ def test_node_need_is_derived_for_every_block_bringing_scenario():
     assert k.get("HPCB_KNOB_SERIAL") == "1"  # holds every node: never alongside another cell
 
 
-def _gate(mod, idle_seq, monkeypatch, warm_seq=None):
-    clock = {"t": 1000.0}
+def _gate(mod, idle_seq, monkeypatch, warm_seq=None, *, claims_dir, clock=None):
+    """A NodeGate over a fake probe and clock, its cross-process launch record in `claims_dir` (never the repo's)."""
+    clock = clock if clock is not None else {"t": 1000.0}
     seq = iter(idle_seq)
     monkeypatch.setattr(mod, "_idle_nodes", lambda: next(seq))
     wseq = iter(warm_seq or [])
@@ -70,14 +72,15 @@ def _gate(mod, idle_seq, monkeypatch, warm_seq=None):
         clock["t"] += s
 
     monkeypatch.setattr(mod.asyncio, "sleep", fake_sleep)  # restored after the test (a bare assignment leaked into others)
-    return mod.NodeGate(clock=lambda: clock["t"]), clock
+    launches = mod.NodeLaunches("fake", claims_dir, window_s=mod.NODE_CLAIM_S, clock=lambda: clock["t"])
+    return mod.NodeGate(launches=launches), clock
 
 
-def test_gate_counts_in_flight_launches_against_the_idle_nodes(monkeypatch):
+def test_gate_counts_in_flight_launches_against_the_idle_nodes(monkeypatch, tmp_path):
     # two idle nodes, three cells arriving within the claim window: the third must WAIT (it used to launch —
     # every cell read "2 idle" and one starved PENDING for its whole run, the 2026-09-03 starvation)
     mod = _run_suite()
-    gate, clock = _gate(mod, [2, 2, 2, 2, 3], monkeypatch)
+    gate, clock = _gate(mod, [2, 2, 2, 2, 3], monkeypatch, claims_dir=tmp_path)
 
     async def go():
         halt = asyncio.Event()
@@ -91,36 +94,117 @@ def test_gate_counts_in_flight_launches_against_the_idle_nodes(monkeypatch):
     asyncio.run(go())
 
 
-def test_gate_need_of_three_admits_only_when_all_are_free(monkeypatch):
+def test_gate_need_of_three_admits_only_when_all_are_free(monkeypatch, tmp_path):
     mod = _run_suite()
-    gate, _clock = _gate(mod, [2, 2, 3], monkeypatch)
+    gate, _clock = _gate(mod, [2, 2, 3], monkeypatch, claims_dir=tmp_path)
 
     async def go():
         assert await gate.admit("sat", 3, None, asyncio.Event(), 3600) == 3
     asyncio.run(go())
 
 
-def test_gate_warm_block_satisfies_a_mep_cell_without_an_idle_node(monkeypatch):
+def test_gate_warm_block_satisfies_a_mep_cell_without_an_idle_node(monkeypatch, tmp_path):
     mod = _run_suite()
-    gate, _clock = _gate(mod, [0], monkeypatch, warm_seq=[True])
+    gate, _clock = _gate(mod, [0], monkeypatch, warm_seq=[True], claims_dir=tmp_path)
 
     async def go():
         assert await gate.admit("mep", 1, "glabs-gc", asyncio.Event(), 3600) == -1  # unguarded: reusing the warm block
     asyncio.run(go())
 
 
-def test_gate_gives_up_after_max_wait_and_launches_unguarded_on_probe_failure(monkeypatch):
+def test_gate_gives_up_after_max_wait_and_launches_unguarded_on_probe_failure(monkeypatch, tmp_path):
     mod = _run_suite()
-    gate, _clock = _gate(mod, [0] * 10, monkeypatch)
+    gate, _clock = _gate(mod, [0] * 10, monkeypatch, claims_dir=tmp_path)
 
     async def go():
         assert await gate.admit("x", 1, None, asyncio.Event(), 120) is None
     asyncio.run(go())
-    gate2, _c2 = _gate(mod, [None], monkeypatch)
+    gate2, _c2 = _gate(mod, [None], monkeypatch, claims_dir=tmp_path / "b")
 
     async def go2():
         assert await gate2.admit("y", 1, None, asyncio.Event(), 3600) == -1
     asyncio.run(go2())
+
+
+def test_gate_counts_another_suites_launches(monkeypatch, tmp_path):
+    # three concurrent run_suite invocations (one per operator) each saw "3 idle" and oversubscribed the fake cluster
+    # (itinerary review 2026-10-13): two gates over ONE claims dir are two suites on one host — the second must count
+    # the first's launches
+    mod = _run_suite()
+    clock = {"t": 1000.0}
+    a, _ = _gate(mod, [2, 2], monkeypatch, claims_dir=tmp_path, clock=clock)
+    b, _ = _gate(mod, [2, 2, 2, 3], monkeypatch, claims_dir=tmp_path, clock=clock)
+    seq = iter([2, 2, 2, 2, 3])
+    monkeypatch.setattr(mod, "_idle_nodes", lambda: next(seq))   # one cluster, seen by both suites
+
+    async def go():
+        halt = asyncio.Event()
+        assert await a.admit("suite-a/1", 1, None, halt, 3600) == 2
+        assert await a.admit("suite-a/2", 1, None, halt, 3600) == 2
+        t_before = clock["t"]
+        assert await b.admit("suite-b/1", 1, None, halt, 3600) == 3   # waited: 2 idle - 2 launched elsewhere = 0
+        assert clock["t"] > t_before
+    asyncio.run(go())
+    rec = json.loads((tmp_path / "nodes-fake.json").read_text())
+    assert [e["label"] for e in rec] == ["suite-a/1", "suite-a/2", "suite-b/1"]
+
+
+def test_node_launches_expire_and_are_seen_by_another_process(tmp_path):
+    # a REAL second process records a launch; this one counts it, and the entry stops counting after the window (a
+    # crashed suite's launches never pin the gate shut)
+    import os
+
+    import pool
+    code = ("import sys; sys.path.insert(0, sys.argv[1]); import pool; "
+            "L = pool.NodeLaunches('fake', sys.argv[2], window_s=300, clock=lambda: 1000.0)\n"
+            "with L.locked():\n    L.record('other-suite')")
+    r = subprocess.run([sys.executable, "-c", code, str(HERE), str(tmp_path)], capture_output=True, text=True,
+                       timeout=60, check=False)
+    assert r.returncode == 0, r.stderr
+    now = {"t": 1100.0}
+    mine = pool.NodeLaunches("fake", tmp_path, window_s=300, clock=lambda: now["t"])
+    with mine.locked():
+        assert mine.recent() == 1
+        mine.record("this-suite")
+        assert mine.recent() == 2
+    now["t"] = 1350.0   # the other suite's launch is 350 s old: expired; ours (250 s) still counts
+    with mine.locked():
+        assert mine.recent() == 1
+    assert pool.NodeLaunches("globus1", tmp_path).path.name == "nodes-globus1.json"   # one record per target
+    first = json.loads(mine.path.read_text())[0]
+    assert first["label"] == "other-suite" and first["pid"] != os.getpid()   # written by the other process
+
+
+def test_node_launch_lock_is_exclusive_across_processes(tmp_path):
+    # the probe + decision + claim must be ONE step across suites: while ANOTHER PROCESS holds the lock, this one
+    # cannot take it; once that process exits (the kernel drops its flock), it can
+    import fcntl
+    import os
+
+    import pool
+    holder = subprocess.Popen(
+        [sys.executable, "-c", "import sys, time; sys.path.insert(0, sys.argv[1]); import pool; "
+                               "L = pool.NodeLaunches('fake', sys.argv[2])\n"
+                               "with L.locked():\n    print('held', flush=True); time.sleep(30)",
+         str(HERE), str(tmp_path)], stdout=subprocess.PIPE, text=True)
+    try:
+        assert holder.stdout.readline().strip() == "held"
+        lock_path = pool.NodeLaunches("fake", tmp_path)._lock_path
+        fd = os.open(lock_path, os.O_RDWR)
+        try:
+            try:
+                fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+                got_while_held = True
+            except OSError:
+                got_while_held = False
+        finally:
+            os.close(fd)
+    finally:
+        holder.kill()
+        holder.wait()
+    assert got_while_held is False
+    with pool.NodeLaunches("fake", tmp_path).locked():   # the holder is gone: free again (would block forever if not)
+        pass
 
 
 def test_idle_probe_counts_only_exactly_idle_nodes(monkeypatch):
