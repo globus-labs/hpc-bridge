@@ -39,7 +39,7 @@ EXPECT_OK = [
     "spend_follows_question", "spend_not_unprompted", "stop_is_honest", "ends_with_stop",
     "never_asks_for_password",
 ]
-POSTCHECK_DELAY_S = 660   # the facility's idle-release is the only thing that reclaims glabs-gc's block
+POSTCHECK_DELAY_S = 720   # the lab MEP's release lands 600–660 s after the last task, so 660 sat on the edge and flaked
 POSTCHECKS = [
     {"name": "mep_block_idle_released", "cmd": f"squeue -u {MAPPED_USER} -h -o %j", "expect_absent": "parsl"},
 ]

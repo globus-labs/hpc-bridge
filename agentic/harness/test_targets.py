@@ -16,7 +16,8 @@ import targets  # noqa: E402
 def test_presets_carry_every_target_fact_together(monkeypatch):
     monkeypatch.delenv("HPCB_TARGET", raising=False)
     g = targets.get()
-    assert g.name == "globus1" and g.ssh_host == "globus1.cs.uchicago.edu" and g.nodes == 3
+    assert g.name == "globus1" and g.ssh_host == "globus1.cs.uchicago.edu" and g.nodes == 4   # spark1-4 since 2026-10
+    assert g.capabilities["nodes"] == 4 and g.capabilities["catalog"] == "registry"
     assert g.endpoint_prefix == "hpc-bridge-globus1" and g.docker_network is None
     assert g.probe_argv[-1] == "globus1" and g.cleanup_argv("hpcbridge-test-03", "/k")[-1] == "hpcbridge-test-03@globus1.cs.uchicago.edu"
     monkeypatch.setenv("HPCB_FAKE_SSH_PORT", "2299")
@@ -102,3 +103,30 @@ def test_only_the_fake_target_has_an_admin_channel(monkeypatch):
     assert "HPCB_T_ADMIN_ARGV='docker exec hpcb-fake-slurmctld-1 bash -lc'" in out
     out = subprocess.run([sys.executable, str(HERE / "targets.py"), "globus1"], capture_output=True, text=True, timeout=60).stdout
     assert "HPCB_T_ADMIN_ARGV=\n" in out
+
+
+def test_catalog_capability_says_whether_the_public_registry_is_the_catalog():
+    # a profile with a [catalog] cmd mounts its own catalog (HPC_BRIDGE_CATALOG_FILE), which REPLACES the registry: the
+    # registry scenarios (zero_config_list, needs_login_paste, registry_over_cache, mep_no_account) cannot run there
+    import importlib
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    mep, default, site = (targets.load_profile(p)["capabilities"] for p in ("mep", "default", "site"))
+    assert mep["catalog"] == "local" and default["catalog"] == "registry" and site["catalog"] == "registry"
+    for name in ("zero_config_list", "needs_login_paste", "registry_over_cache", "mep_no_account"):
+        req = importlib.import_module(name).REQUIRES
+        assert not targets.meets(req, mep)[0], name
+        assert targets.meets(req, default)[0] and targets.meets(req, targets.GLOBUS1_CAPABILITIES)[0], name
+
+
+def test_list_valued_capabilities_are_membership_tests():
+    site, default, pbs = (targets.load_profile(p)["capabilities"] for p in ("site", "default", "pbs"))
+    assert targets.meets({"partitions": ["debug"], "accounts": ["hpcb"]}, site) == (True, "")
+    assert targets.meets({"partitions": "debug"}, site)[0]                        # a bare name works too
+    ok, why = targets.meets({"partitions": ["debug"]}, default)
+    assert not ok and "partitions" in why and "main" in why
+    assert not targets.meets({"partitions": ["debug", "nope"]}, site)[0]          # every named one must be on offer
+    import importlib
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    req = importlib.import_module("hand_batch_job").REQUIRES     # `#SBATCH -p debug -A hpcb`: the site family only
+    assert targets.meets(req, site)[0] and targets.meets(req, targets.load_profile("mep")["capabilities"])[0]
+    assert not targets.meets(req, default)[0] and not targets.meets(req, pbs)[0]

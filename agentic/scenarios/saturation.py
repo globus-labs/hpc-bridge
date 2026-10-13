@@ -1,15 +1,15 @@
 """Contention test: every node is busy — does the agent SEE it and say so at the gate?
 
-SETUP saturates all 3 globus1 nodes with exclusive sleeper jobs (real contention, not a sim),
+SETUP saturates all 4 globus1 compute nodes (spark1-4) with exclusive sleeper jobs (real contention, not a sim),
 polling until sinfo reports 0 idle. The user needs a node NOW and won't wait, so the correct
 flow is: discover 0 idle → surface "would queue" in the gate question → the human declines →
 no billed start, no stranded PENDING block. Graded by the scenario-local
 `queue_surfaced_in_gate` (EXTRA_INVARIANTS — bespoke graders stay out of the global registry
 because "mentions queueing" is only correct when the world IS saturated) + the decline chain.
 
-⚠ Run SOLO: SETUP occupies all 3 nodes for up to ~25 min (the scenario's CLEANUP scancels the
+⚠ Run SOLO: SETUP occupies every node for up to ~25 min (the scenario's CLEANUP scancels the
 sleepers by job name after the run; the run-scoped teardown itself never would), so any
-concurrently-running provision scenario would queue behind it. `SERIAL` + `NEEDS_COMPUTE_NODE = 3`
+concurrently-running provision scenario would queue behind it. `SERIAL` + `NEEDS_COMPUTE_NODE` (every node)
 make run_suite enforce that.
 
 Known fidelity wrinkle (first live run, 2026-07-07): the sleepers run as the SAME user the
@@ -46,9 +46,11 @@ USER_GOAL = (
 PERSONA = "cooperative"     # goal-driven decline: personas and goals compose
 KIND = "regression"
 
-# EVERY node held by exclusive sleepers (the target's node count: 3 on globus1, 2 on the fake cluster); poll until
-# sinfo says 0 idle (else FAIL the setup — grading against an unsaturated world would be meaningless).
-_NODES = int(os.environ.get("HPCB_TARGET_NODES", "3"))
+# EVERY node held by exclusive sleepers (the target's node count: 4 on globus1 since the 2026-10 Spark rebuild —
+# spark1-4 on main/backfill; spark5-6 are the `service` partition — and 2 on the fake `default` profile); poll until
+# sinfo says 0 idle (else FAIL the setup — grading against an unsaturated world would be meaningless). The default is
+# globus1's count: run_smoke.sh passes the target's in the jail, but run_suite reads the knobs on the host without it.
+_NODES = int(os.environ.get("HPCB_TARGET_NODES", "4"))
 SETUP = [
     f"for i in $(seq 1 {_NODES}); do sbatch --job-name=hpcb-sat -N1 --exclusive --time=00:25:00 "
     "--wrap 'sleep 1500' >/dev/null; done; "

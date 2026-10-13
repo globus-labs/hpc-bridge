@@ -29,7 +29,7 @@ SMOKE = REPO / "agentic" / "run_smoke.sh"
 sys.path.insert(0, str(REPO / "agentic" / "harness"))
 import targets  # noqa: E402  (the cluster a run targets: globus1 | fake)
 from cluster_ops import delete_endpoint_cmd, endpoint_uuid_cmd, scoped_cancel_cmd, uep_dirs_cleanup_cmd  # noqa: E402
-from pool import PoolClaims  # noqa: E402  (cross-process pool-user claims — see pool.py)
+from pool import NodeLaunches, PoolClaims  # noqa: E402  (cross-process pool-user + node claims — see pool.py)
 
 POOL = [f"hpcbridge-test-{i:02d}" for i in range(10)]
 _TARGET = targets.get()  # replaced by --target in _main; module-level so the probe/cleanup helpers can read it
@@ -215,17 +215,30 @@ class NodeGate:
     Replaces the exactly-one-idle special case: with two idle nodes and --concurrency 3, three cells used to
     read "2 idle" within seconds and all launch — one starved PENDING for its whole run (the 2026-09-03
     starvation the operator hand-serialised around). A WARM_BLOCK_USER whose block is running satisfies the
-    need outright (the MEP pair reuses that block). Probe failure ⇒ launch unguarded (never never-launch)."""
+    need outright (the MEP pair reuses that block). Probe failure ⇒ launch unguarded (never never-launch).
 
-    def __init__(self, clock=time.monotonic) -> None:
-        self._launches: list[float] = []
-        self._lock = asyncio.Lock()
-        self._clock = clock
+    The launches are CROSS-PROCESS (pool.NodeLaunches: a file + flock beside the host-wide pool claims): concurrent
+    `run_suite` invocations on this host count each other's launches, and the probe + decision + claim is one step
+    under the lock, so two suites can't both take the last node."""
 
-    def _recent(self) -> int:
-        now = self._clock()
-        self._launches = [t for t in self._launches if now - t < NODE_CLAIM_S]
-        return len(self._launches)
+    def __init__(self, clock=time.time, launches: NodeLaunches | None = None) -> None:
+        self._launches = launches or NodeLaunches(_TARGET.name, window_s=NODE_CLAIM_S, clock=clock)
+        self._lock = asyncio.Lock()   # this process's cells take the cross-process lock one at a time
+
+    def _step(self, label: str, need: int, warm_user: str | None) -> tuple[str, int | None, int]:
+        """ONE probe + decision + claim, under the cross-process lock (a worker thread: flock blocks).
+        Returns (outcome, idle, recent): outcome in launch | wait | warm | unguarded."""
+        with self._launches.locked():
+            if warm_user and _warm_block_running(warm_user):
+                return "warm", None, 0
+            idle = _idle_nodes()
+            if idle is None:
+                return "unguarded", None, 0
+            recent = self._launches.recent()
+            if idle - recent >= need:
+                self._launches.record(label)
+                return "launch", idle, recent
+            return "wait", idle, recent
 
     async def admit(self, label: str, need: int, warm_user: str | None, halt: asyncio.Event,
                     max_wait_s: int) -> int | None:
@@ -234,28 +247,23 @@ class NodeGate:
         t0 = time.monotonic()
         last_note = -600.0
         while not halt.is_set():
-            async with self._lock:  # probe + decision + claim are one step, so two cells can't take one node
-                if warm_user:
-                    warm = await asyncio.to_thread(_warm_block_running, warm_user)
-                    if warm:
-                        print(f"🖥 nodes  {label}: {warm_user}'s block is running — reusing it, no idle node needed",
-                              flush=True)
-                        return -1
-                idle = await asyncio.to_thread(_idle_nodes)
-                if idle is None:
-                    print(f"⚠ nodes  {label}: node probe unavailable (ssh/sinfo) — launching unguarded", flush=True)
-                    return -1
-                free = idle - self._recent()
-                if free >= need:
-                    self._launches.append(self._clock())
-                    print(f"🖥 nodes  {label}: {idle} idle, {self._recent() - 1} claimed by recent launches, "
-                          f"need {need} — launching", flush=True)
-                    return idle
+            async with self._lock:
+                outcome, idle, recent = await asyncio.to_thread(self._step, label, need, warm_user)
+            if outcome == "warm":
+                print(f"🖥 nodes  {label}: {warm_user}'s block is running — reusing it, no idle node needed", flush=True)
+                return -1
+            if outcome == "unguarded":
+                print(f"⚠ nodes  {label}: node probe unavailable (ssh/sinfo) — launching unguarded", flush=True)
+                return -1
+            if outcome == "launch":
+                print(f"🖥 nodes  {label}: {idle} idle, {recent} claimed by recent launches (any suite on this host), "
+                      f"need {need} — launching", flush=True)
+                return idle
             elapsed = time.monotonic() - t0
             if elapsed >= max_wait_s:
                 return None
             if elapsed - last_note >= 600:
-                print(f"⏳ nodes  {label}: {idle} idle minus {self._recent()} claimed < {need} needed — waiting "
+                print(f"⏳ nodes  {label}: {idle} idle minus {recent} claimed < {need} needed — waiting "
                       f"({int(elapsed)}s of {max_wait_s}s)", flush=True)
                 last_note = elapsed
             await asyncio.sleep(60)

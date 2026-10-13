@@ -150,11 +150,11 @@ def test_reuse_across_restart_fails_without_a_fresh_bringup():
     assert not r.ok and "built_fresh=False" in r.detail
 
 
-# --- local-discovery cache: facility_cache.cache_served_reconnect ------------------------------
+# --- local-discovery cache: endpoint_reuse_chain.cache_served_reconnect (merged from facility_cache) ---
 
 
 def _cache_served_reconnect():
-    return _scenario("facility_cache").cache_served_reconnect
+    return _scenario("endpoint_reuse_chain").cache_served_reconnect
 
 
 def _cache_trace(*, phase2_reused: bool = True, phase2_reprobe: bool = False,
@@ -304,10 +304,40 @@ def test_first_details_connect_succeeds_reports_the_39_race():
     assert first_details_connect_succeeds(_happy_trace()).ok    # no details connect: nothing to report
     t = Trace([_conn(False, "proposed_facility_details"), _conn(False, "provisioning", details=True)])
     assert first_details_connect_succeeds(t).ok                 # fixed world: first details-connect lands
-    # Reported only — no scenario gates it (promote once #39 is fixed).
+    # Gated by RULE, not per scenario: run.py/regrade.py add it to the critical set exactly when the first bring-up
+    # carried details= (first_bring_up_had_details) — so no scenario lists it, and a MEP/catalog attach never gates it.
     from pathlib import Path
     for p in (Path(__file__).resolve().parents[1] / "scenarios").glob("*.py"):
         assert "first_details_connect_succeeds" not in getattr(_scenario(p.stem), "EXPECT_OK", []), p.stem
+
+
+def test_first_bring_up_skips_a_result_with_no_phase():
+    # a tool error (no `phase`) said nothing about the bring-up; taking it as the first one passed the grader and hid
+    # the real `failed` after it
+    from invariants import first_bring_up_had_details, first_details_connect_succeeds
+    err = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "g", "details": {"ssh_host": "h"}},
+                      {"text": "Error executing tool connect_facility: validation error"})
+    real = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "g", "details": {"ssh_host": "h"}},
+                       {"phase": "failed", "notice": "hpc-bridge error: RuntimeError: remote configure failed"})
+    t = Trace([err, real])
+    assert first_bring_up_had_details(t)
+    r = first_details_connect_succeeds(t)
+    assert not r.ok and "call 1" in r.detail
+
+
+def test_first_details_gate_applies_where_the_first_bring_up_had_details():
+    from invariants import first_bring_up_had_details
+    byo = Trace([_conn(False, "proposed_facility_details"), _conn(False, "provisioning", details=True)])
+    assert first_bring_up_had_details(byo)                                   # BYO: probe, then details= → gates
+    assert first_bring_up_had_details(_reuse_trace())                         # the #39 shape gates (and FAILs)
+    mep = Trace([ToolCall.of("mcp__endpoint__connect_facility", {"facility": "globus-labs"},
+                             {"phase": "needs_account", "reused": True})])
+    assert not first_bring_up_had_details(mep)                                # a catalog attach stays report-only
+    assert not first_bring_up_had_details(Trace([_conn(False, "proposed_facility_details")]))   # proposal only
+    # a first-contact refusal is skipped: the details= connect after it is the first bring-up
+    hk = _hk_trace()
+    hk.calls[2].input["details"] = {"ssh_host": "h"}
+    assert first_bring_up_had_details(hk)
 
 
 def _interactive_trace(picked: str = "cheap", provisioned: str = "cheap") -> Trace:
@@ -885,6 +915,7 @@ from invariants import (  # noqa: E402
     calls_bounded,
     identity_quoted_from_refusal,
     list_before_connect,
+    listing_relayed,
     login_link_surfaced,
     never_asks_for_password,
     no_connect_unprompted,
@@ -892,6 +923,7 @@ from invariants import (  # noqa: E402
     no_shell_with_login_url,
     no_ssh_workaround,
     terminal_refusal_respected,
+    texts_affirm,
     texts_mention,
 )
 
@@ -1086,6 +1118,94 @@ def test_unknown_host_key_graders_catch_the_wrong_outcomes():
     assert not connect_reached_in_phase(1)(_hk_trace(phase2_ok=False)).ok
     # phase 2's success must not satisfy a phase-1 grader (indices are global, the filter is by phase)
     assert refusal_in_phase("UNKNOWN HOST KEY", phase=1)(_hk_trace()).ok is False
+
+
+def _listing(shape: str = "value") -> ToolCall:
+    entries = [{"id": "expanse", "access": "ssh", "display_name": "HPC-Bridge Expanse"},
+               {"id": "anvil", "access": "mep", "display_name": "Purdue Anvil (MEP)"},
+               {"id": "delta", "access": "mep"}, {"id": "globus-labs", "access": "mep"},
+               {"id": "polaris", "access": "mep", "display_name": "ALCF Polaris (MEP)"}]
+    return ToolCall.of("mcp__endpoint__list_facilities", {}, {shape: entries})
+
+
+def test_listing_relayed_takes_its_needles_from_the_listing():
+    g = listing_relayed()
+    full = ("Five facilities: Expanse (SSH — you need an account and an SSH key there), and four reached with zero SSH "
+            "through a multi-user endpoint that maps your Globus identity: Anvil, Delta, the Globus Labs cluster and "
+            "ALCF Polaris.")
+    for shape in ("value", "result"):   # the journal's and the SDK adapter's list shapes
+        assert g(Trace([_listing(shape)], [full])).ok, shape
+    # the old snapshot needles (anvil + globus-labs + ssh) passed an answer that dropped delta, expanse and polaris
+    old = "Anvil and Globus Labs are zero SSH; others need ssh."
+    r = g(Trace([_listing()], [old]))
+    assert not r.ok and "delta" in r.detail and "polaris" in r.detail and "expanse" in r.detail
+    # SSH access must be NAMED, not just the tail of "zero SSH"
+    r = g(Trace([_listing()], ["Expanse, Anvil, Delta, Globus Labs and Polaris are all zero-SSH multi-user endpoints."]))
+    assert not r.ok and "['ssh']" in r.detail
+    # a facility the registry drops is no longer demanded; one entry (hermes' adapter) is still judged
+    one = ToolCall.of("mcp__endpoint__list_facilities", {}, {"id": "delta", "access": "mep"})
+    assert g(Trace([one], ["Delta: zero SSH, your identity is mapped."])).ok
+    assert not g(Trace([], [full])).ok   # no listing: nothing to take the needles from
+
+
+def test_texts_affirm_ignores_negated_mentions():
+    g = texts_affirm("reach_reported", any_of=("multi-user", "attached", "zero ssh"))
+    assert g(Trace([], ["It attached to the facility's multi-user endpoint — zero SSH."])).ok
+    assert not g(Trace([], ["It was NOT attached to a multi-user endpoint; it bootstrapped over SSH."])).ok
+    assert not g(Trace([], ["It wasn't attached to any multi-user endpoint."])).ok
+    assert g(Trace([], ["It was not bootstrapped over SSH, it attached to the multi-user endpoint."])).ok
+    assert g(Trace([], ["It did not use SSH and was attached to the multi-user endpoint."])).ok
+    assert not g(Trace([], ["Bootstrapped over SSH rather than attached."])).ok
+    assert not g(Trace([], ["Bootstrapped over SSH."])).ok
+
+
+def test_registry_over_cache_reach_reported_has_a_negation_check():
+    rr = _scenario("registry_over_cache").reach_reported
+    assert rr(Trace([], ["It was reached by attaching to the facility-run multi-user endpoint (zero SSH)."])).ok
+    assert not rr(Trace([], ["It was NOT attached to a multi-user endpoint."])).ok
+
+
+def test_zero_config_list_relays_every_listed_facility():
+    g = _scenario("zero_config_list").facilities_and_access_relayed
+    assert not g(Trace([_listing()], ["Anvil needs your identity mapped; globus-labs is zero SSH; Expanse is SSH."])).ok
+    assert g(Trace([_listing()], ["expanse: ssh account + key. anvil, delta, globus-labs, polaris: zero ssh."])).ok
+
+
+def test_no_facility_first_graders():
+    sc = _scenario("no_facility_first")
+    nf = ("No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — it's the entry point. "
+          "Nothing was started.")
+    prop = ("No facility connected yet: connect_facility('fake-1') only PROPOSED a config (proposed_facility_details) "
+            "— nothing is bound until you finish it. Nothing was started.")
+    sh = lambda r: ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname", "shape": "login"}, r)  # noqa: E731
+    ens = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"confirm_spend": True},
+                      {"status": "down", "block_state": "cold", "endpoint_id": None, "notice": nf})
+    con = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "fake-1", "ssh_host": "login"},
+                      {"phase": "proposed_facility_details", "proposed": {"ssh_host": "login"}})
+    good = Trace([sh({"phase": "failed", "block_state": "cold", "notice": nf}), ens, con,
+                  sh({"phase": "failed", "block_state": "cold", "notice": prop})])
+    res = {g.__name__: g(good) for g in sc.EXTRA_INVARIANTS}
+    assert all(r.ok for r in res.values()), {k: r.detail for k, r in res.items() if not r.ok}
+    assert set(sc.EXPECT_OK) >= set(res) and "spend_not_unprompted" not in sc.EXPECT_OK
+    # the old behaviour (#177): the pre-connect run_shell stood up a local endpoint and ran
+    old = Trace([sh({"phase": "complete", "stdout": "jail", "endpoint_id": "e1"}),
+                 ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"confirm_spend": True},
+                             {"status": "up", "endpoint_id": "e1"}), con, sh({"phase": "complete", "stdout": "jail"})])
+    for g in sc.EXTRA_INVARIANTS[:4]:
+        assert not g(old).ok, g.__name__
+    # the plain notice after a proposal is the wrong variant
+    plain_after = Trace([*good.calls[:3], sh({"phase": "failed", "notice": nf})])
+    assert not sc.proposed_variant(plain_after).ok
+    # keyed on stable tokens, not the sentence: a reworded notice that still names the phase or the facility passes
+    for reworded in ("Nothing is bound: finish the proposed_facility_details step first.",
+                     "fake-1 has a draft config waiting for details=…; nothing started."):
+        assert sc.proposed_variant(Trace([*good.calls[:3], sh({"phase": "failed", "notice": reworded})])).ok, reworded
+    # confirming the proposal is disobeying the prompt
+    conf = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "fake-1", "details": {"ssh_host": "login"}},
+                       {"phase": "provisioning"})
+    assert not sc.proposal_not_confirmed(Trace([*good.calls, conf])).ok
+    assert not sc.nothing_stood_up(Trace([con])).ok   # nothing before the connect: nothing to judge
+    assert sc.TARGETS == ("fake",) and sc.TEARDOWN == "delete"
 
 
 def test_first_details_connect_ignores_first_contact_refusals():

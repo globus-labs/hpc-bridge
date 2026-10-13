@@ -39,6 +39,9 @@ SUMMARY = "edge: a hand-submitted sbatch over the login shape comes back with th
 TAGS = ["fake", "spend", "login", "batch"]
 MAX_TURNS = 30
 TARGETS = ("fake",)
+# The script hard-codes `#SBATCH -p debug -A hpcb`: only a Slurm profile offering both runs it (the `site` family) — on
+# `default` (one partition, `main`) or `pbs` the cell failed for the world's reasons, not the agent's.
+REQUIRES = {"scheduler": "slurm", "partitions": ["debug"], "accounts": ["hpcb"]}
 
 
 def _submits(t: Trace) -> list:

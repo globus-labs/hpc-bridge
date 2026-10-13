@@ -15,19 +15,25 @@ import argparse
 import asyncio
 import importlib
 import json
+import math
 import os
 import re
 import signal
 import subprocess
 import sys
+import time
+from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
 from acp_trace import capture_crosscheck
 from cluster_ops import (
     capture_logs_cmd,
-    delete_endpoint_cmd,
+    delete_records,
+    delete_registration_cmd,
     endpoint_uuid_cmd,
+    leftover_manager_cmd,
     scoped_cancel_cmd,
+    stop_here_cmd,
     token_store_cleanup_cmd,
     uep_dirs_cleanup_cmd,
 )
@@ -37,9 +43,11 @@ from invariants import (
     Result,
     Trace,
     check_all,
+    first_bring_up_had_details,
     floor_graders,
     guidance_fetched,
 )
+from proctree import become_subreaper, stop_tree
 from provenance import write_run_record
 from runner import RunResult, run_scenario
 from targets import fill_prompt
@@ -341,10 +349,22 @@ def _scheduler(scen) -> str:
     return str(_capabilities().get("scheduler") or getattr(scen, "SCHEDULER", "slurm"))
 
 
+def _local_run(cmd: str, *, timeout: int = 60) -> tuple[int, str]:
+    """Run one shell command INSIDE THE JAIL (the MCP host's side of the world) — a postcheck with `"on": "local"`.
+    Scenario-authored shell, never user input."""
+    try:
+        r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, timeout=timeout)
+        return r.returncode, r.stdout + r.stderr
+    except Exception as exc:  # noqa: BLE001 - graded as a failed check, never a crashed run
+        return 255, f"{type(exc).__name__}: {exc}"
+
+
 def _postchecks(scen) -> list[Result]:
     """World-state assertions, run AFTER the agent but BEFORE teardown — the ordering is the
     grading integrity: harness cleanup (scancel/delete) must never mask what the agent left
-    behind. Declarative: run cmd over SSH, then substring expectations on the output."""
+    behind. Declarative: run cmd over SSH, then substring expectations on the output.
+    `"on": "each_login"` runs it on every login node; `"on": "local"` runs it in the jail itself (what the MCP
+    server, on this host, created — #177's implicit local endpoint appeared there, not on the cluster)."""
     results = []
     universal = _universal_postchecks(_scheduler(scen))
     login_hosts = _login_hosts() or [os.environ.get("HPC_BRIDGE_SSH_HOST", "")]
@@ -353,6 +373,11 @@ def _postchecks(scen) -> list[Result]:
         # node the alias did not pick is exactly the leak a pin bug produces) and joins the outputs
         hosts = login_hosts if pc.get("on") == "each_login" else [None]
         rc, raw, shown = 0, [], []
+        if pc.get("on") == "local":
+            rc, out_l = _local_run(pc["cmd"], timeout=pc.get("timeout", 60))
+            raw.append(out_l)
+            shown.append(f"[jail] {out_l.strip()}")
+            hosts = []
         for h in hosts:
             rc_h, out_h = _ssh_run(pc["cmd"], timeout=pc.get("timeout", 60), host=h)
             rc = rc or rc_h
@@ -411,12 +436,18 @@ async def _run_hook(hook: dict) -> dict:
     return {"rc": rc, "out": out[:400], "cmd": cmd[:300], "hosts": [h for h in hosts if h]}
 
 
-def _cleanup(scen) -> None:
+def _cleanup(scen, budget_s: float | None = None) -> None:
     """Scenario-declared CLEANUP commands (the mirror of SETUP), run as the test user AFTER postchecks and
     the run-scoped teardown, whatever the outcome — for the world state a scenario itself created (saturation's
-    sleepers), which the run-scoped teardown deliberately never touches. Best-effort."""
+    sleepers), which the run-scoped teardown deliberately never touches. Best-effort; `budget_s` bounds it on an exit
+    path (see EXIT_TEARDOWN_BUDGET_S)."""
+    budget = _Budget(budget_s)
     for c, host in _world_cmds(getattr(scen, "CLEANUP", [])):
-        rc, out = _ssh_run(c, timeout=120, host=host)
+        t = budget.timeout(120)
+        if t is None:
+            print(f"cleanup: SKIPPED (the exit budget is spent) — {c[:100]}", file=sys.stderr, flush=True)
+            continue
+        rc, out = _ssh_run(c, timeout=t, host=host)
         where = f" [{host}]" if host else ""
         print(f"cleanup{where}: {'ok' if rc == 0 else f'rc={rc}'} — {out.strip()[:160]}", file=sys.stderr, flush=True)
 
@@ -501,70 +532,273 @@ def _secret_material() -> dict[str, list[str]]:
     return out
 
 
-def _teardown(scen, res=None) -> str:
+# An exit path (interrupted, crashed, setup failed) races `docker stop --stop-timeout 120` (run_smoke.sh): past it the
+# container dies and the bundle with it. Stopping the operator, the teardown, the final probe and CLEANUP share at most
+# these many seconds there (90 s in all).
+EXIT_STOP_OPERATOR_S = 10.0
+EXIT_TEARDOWN_BUDGET_S = 50.0
+EXIT_FINAL_PROBE_S = 15.0
+EXIT_CLEANUP_BUDGET_S = 15.0
+
+
+def _stop_operator(where: str, *, budget_s: float = EXIT_STOP_OPERATOR_S) -> list[int]:
+    """Stop the operator's whole process tree — the agent CLI / ACP agent and the hpc-bridge MCP server under it,
+    orphans included (run.py is their subreaper on Linux) — and WAIT for it, before the teardown. Returns the pids
+    still running afterwards. Why: an operator that outlived a cancelled run made a tool call after the teardown and
+    re-provisioned the endpoint it had just removed."""
+    try:
+        found, left = stop_tree(grace_s=max(1.0, budget_s - 3.0), kill_s=3.0)
+    except Exception as exc:  # noqa: BLE001 - never let this block the teardown
+        print(f"{where}: could not inspect the operator's processes ({type(exc).__name__}: {exc})", file=sys.stderr,
+              flush=True)
+        return []
+    print(f"{where}: " + (f"stopped {len(found)} operator process(es) before the teardown (pids {found})"
+                          if found else "no operator process left before the teardown")
+          + (f"; STILL RUNNING: {left}" if left else ""), file=sys.stderr, flush=True)
+    return left
+
+
+class _Budget:
+    """A deadline for a sequence of world steps; unbounded when `seconds` is None (the graded path)."""
+
+    def __init__(self, seconds: float | None) -> None:
+        self.end = None if seconds is None else time.monotonic() + seconds
+
+    @property
+    def bounded(self) -> bool:
+        return self.end is not None
+
+    def left(self) -> float:
+        return math.inf if self.end is None else self.end - time.monotonic()
+
+    def timeout(self, default: float) -> int | None:
+        """A step's timeout: its default capped by what is left — None once less than 3 s is left (skip the step)."""
+        left = self.left()
+        return None if left < 3 else int(min(default, left))
+
+
+def _on_hosts(cmd: str, hosts: list[str | None], timeout: int) -> list[tuple[int, str]]:
+    """One command on several login nodes at once (results in `hosts` order)."""
+    if len(hosts) == 1:
+        return [_ssh_run(cmd, timeout=timeout, host=hosts[0])]
+    with ThreadPoolExecutor(max_workers=len(hosts)) as pool:
+        return list(pool.map(lambda h: _ssh_run(cmd, timeout=timeout, host=h), hosts))
+
+
+def _teardown(scen, res=None, *, budget_s: float | None = None) -> tuple[str, tuple[list[str], list[str]] | None]:
     """Tear down THIS RUN's endpoint and blocks — and nothing else the pool user owns — unless the
     scenario keeps state for a reuse chain (TEARDOWN != 'delete'). Runs AFTER postchecks so cleanup
-    can't mask agent failures. Best-effort: never fails the run. Returns the captured endpoint logs
-    (manager + UEPs + block stdout/stderr), which the caller files into the provenance bundle.
+    can't mask agent failures. Best-effort: never fails the run by itself. Returns (the captured endpoint logs —
+    manager + UEPs + block stdout/stderr, filed into the provenance bundle by the caller — and the after-teardown
+    probe `(left, unverifiable)`, which `_no_manager_after_teardown` grades; None when nothing was torn down).
 
-    Scoped on purpose (2026-09-03). The old form deleted every `hpc-bridge-*` endpoint the user had
-    and ran `scancel -u $(whoami)`, assuming concurrent runs use DISTINCT users. Two `run_suite`
-    invocations both allocated test-00 (see pool.py), and one run's teardown killed the other's live
-    blocks mid-task — the "block-thrashing bug" that wasn't. Now: the endpoint is deleted BY NAME
-    (this run's HPC_BRIDGE_ENDPOINT_NAME) and blocks are cancelled by the `uep.<eid>` StdOut marker
-    for this run's uuid(s) only (the server's own scope); with no uuid known, nothing is cancelled.
-    This run's per-UEP dirs are removed too (after their logs are captured) — `gce delete` leaves them
-    behind. Stranded leftovers from a crashed run are swept by hand: agentic/sweep_pool_user.sh."""
+    Run-scoped: the endpoint is deleted BY NAME (this run's HPC_BRIDGE_ENDPOINT_NAME), blocks are cancelled by
+    the `uep.<eid>` StdOut marker of this run's uuid(s) only (never `scancel -u`: a user-wide cancel once killed
+    a concurrent run's blocks), and this run's per-UEP dirs are removed after their logs are captured. The stop
+    goes to EVERY login node and acts only where the manager runs (cluster_ops.stop_here_cmd): sent to the
+    round-robin alias it could land on the other node and leave the manager running. Every step's outcome is
+    printed, a probe verifies, and the last line says whether the registration was removed. `budget_s` bounds
+    the whole teardown on an exit path; steps that do not fit are skipped and named.
+    Stranded leftovers from a crashed run are swept by hand: agentic/sweep_pool_user.sh."""
     if getattr(scen, "TEARDOWN", "delete") != "delete":
         print("teardown: KEEP — leaving endpoint(s) + jobs for the chain", file=sys.stderr, flush=True)
-        return ""
+        return "", None
+    budget = _Budget(budget_s)
+    quick = budget.bounded                     # an exit path: shorter steps, fewer retries
+    skipped: list[str] = []
+
+    def step(label: str, default: float, quick_default: float) -> int | None:
+        t = budget.timeout(quick_default if quick else default)
+        if t is None:
+            skipped.append(label)
+        return t
+
     scheduler = _scheduler(scen)
     name = os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip()
     eids = _run_endpoint_ids(res)
-    if name:  # the registered uuid, from the endpoint's own endpoint.json (works even if the agent never saw it)
-        _rc, out = _ssh_run(endpoint_uuid_cmd(name), timeout=30)
+    if name and (t := step("uuid lookup", 30, 15)):  # the registered uuid, from the endpoint's own endpoint.json
+        _rc, out = _ssh_run(endpoint_uuid_cmd(name), timeout=t)
         m = _UUID_RE.search(out)
         if m and m.group(0) not in eids:
             eids.append(m.group(0))
     logs = ""
-    if name or eids:  # capture BEFORE delete erases the evidence
-        _rc, logs = _ssh_run(capture_logs_cmd(name or "no-endpoint-name", eids), timeout=90)
-    delete = (
-        delete_endpoint_cmd(name) if name
-        else 'echo "no HPC_BRIDGE_ENDPOINT_NAME: endpoint left in place (never enumerate-delete; see agentic/sweep_pool_user.sh)"'
-    )
+    if (name or eids) and (t := step("log capture", 90, 20)):  # capture BEFORE delete erases the evidence
+        _rc, logs = _ssh_run(capture_logs_cmd(name or "no-endpoint-name", eids), timeout=t)
     print(f"teardown: endpoint {name or '<unknown>'}; cancelling blocks of uuid(s) {eids or 'none'} …",
           file=sys.stderr, flush=True)
     store = token_store_cleanup_cmd() if _is_pool_user() else 'echo "token store left: not a harness pool user"'
-    rc, out = _ssh_run(f"{delete}; {scoped_cancel_cmd(scheduler, eids)}; {uep_dirs_cleanup_cmd(eids)}; {store}",
-                       timeout=90)
-    tag = "ok" if rc == 0 else f"rc={rc}"
-    print(f"teardown: {tag} — {out.strip().replace(chr(10), ' ')[:200]}", file=sys.stderr, flush=True)
-    print(f"teardown: registrations — {_deregister_endpoints(eids)}", file=sys.stderr, flush=True)
-    return logs
+    deleted_on_node: bool | None = None
+    probe: tuple[list[str], list[str]] | None = None
+    delete = 'echo "no HPC_BRIDGE_ENDPOINT_NAME: endpoint left in place (never enumerate-delete; see agentic/sweep_pool_user.sh)"'
+    delete_host: str | None = None
+    hosts = _login_hosts() or [None]
+    if name:
+        try:
+            stop_cmd = stop_here_cmd(name)
+        except ValueError as exc:
+            stop_cmd = ""
+            print(f"teardown: stop — skipped: {exc}", file=sys.stderr, flush=True)
+        if stop_cmd and (t := step("stop", 90, 20)):
+            stops = []
+            for h, (rc_h, out_h) in zip(hosts, _on_hosts(stop_cmd, hosts, t), strict=True):
+                line = next((ln[len("HPCB_STOP "):].strip() for ln in out_h.splitlines() if ln.startswith("HPCB_STOP ")), "")
+                where = h or "login"
+                if rc_h != 0 or not line:
+                    stops.append(f"[{where}] UNVERIFIABLE (ssh rc={rc_h}: {out_h.strip()[:80]!r})")
+                elif line.split(" ", 1)[-1] == "none":
+                    stops.append(f"[{where}] no manager of it here")
+                else:
+                    stops.append(f"[{where}] gce stop {line.split(' ', 1)[-1]}")
+                    delete_host = delete_host or h   # delete where it ran: that node holds its process
+            print(f"teardown: stop — {' · '.join(stops)}", file=sys.stderr, flush=True)
+            delete = delete_registration_cmd(name)
+    if t := step("delete + block cancel + cleanup", 120, 25):
+        rc, out = _ssh_run(f"{delete}; {scoped_cancel_cmd(scheduler, eids)}; {uep_dirs_cleanup_cmd(eids)}; {store}",
+                           timeout=t, host=delete_host)
+        dline = next((ln for ln in out.splitlines() if ln.startswith("HPCB_DELETE ")), "")
+        rest = " ".join(ln.strip() for ln in out.splitlines() if ln.strip() and not ln.startswith("HPCB_DELETE "))
+        if dline:
+            drc = dline.split()[1] if len(dline.split()) > 1 else "rc=?"
+            if drc == "none":
+                dtext = "nothing to delete (no endpoint directory on the login node)"
+            else:
+                deleted_on_node = drc == "rc=0"
+                dtext = "deleted" if deleted_on_node else f"FAILED ({drc}: {dline.split(' ', 2)[-1][:120]})"
+            print(f"teardown: gce delete on the login node — {dtext}", file=sys.stderr, flush=True)
+        print(f"teardown: {'ok' if rc == 0 else f'rc={rc}'} — {rest[:200]}", file=sys.stderr, flush=True)
+    if name:
+        if t := step("verify", 120, 15):
+            probe = _probe_leftovers(name, eids, tries=3 if quick else 10, pause_s=2 if quick else 3, timeout=t)
+        else:
+            probe = ([], ["every login node (not checked: the exit budget was spent)"])
+        left, unverifiable = probe
+        print("teardown: verify — " + (f"ok: no process of {name} left on the login node(s)" if not left and not unverifiable
+              else "; ".join(([f"LEFT RUNNING ({len(left)}): " + " | ".join(left)[:240]] if left else [])
+                             + ([f"UNVERIFIABLE on {', '.join(unverifiable)}"] if unverifiable else []))),
+              file=sys.stderr, flush=True)
+    if eids and (t := step("deregistration", 60, 30)) is None:
+        dereg = "SKIPPED: the exit budget was spent — records left for the sweep"
+    else:
+        dereg = _deregister_endpoints(eids, timeout=t if eids else 60)
+    print(f"teardown: registration — {_registration_verdict(deleted_on_node, eids, dereg)}", file=sys.stderr, flush=True)
+    if budget.bounded:
+        used = (budget_s or 0) - max(0.0, budget.left())
+        print(f"teardown: exit budget — {used:.0f} s of {budget_s:.0f} s"
+              + (f"; SKIPPED: {', '.join(skipped)}" if skipped else ""), file=sys.stderr, flush=True)
+    return logs, probe
 
 
-def _deregister_endpoints(eids: list[str], client_factory=None) -> str:
+def _registration_verdict(deleted_on_node: bool | None, eids: list[str], dereg: str) -> str:
+    """One plain sentence: was this run's endpoint registration removed, and by which channel?"""
+    service = [part.strip() for part in dereg.split(";") if part.strip()]
+    by_service = bool(eids) and len(service) == len(eids) and all(x.endswith(("deleted", "already gone")) for x in service)
+    if deleted_on_node:
+        return f"REMOVED (gce delete on the login node; service: {dereg})"
+    if by_service:
+        return f"REMOVED by the service, from the jail ({dereg})" + (
+            " — the login-node delete had failed" if deleted_on_node is False else "")
+    if not eids:
+        return "none known — no uuid for this run (nothing registered, or its endpoint.json never written)" + (
+            "; the login-node delete FAILED" if deleted_on_node is False else "")
+    return f"NOT removed — login-node delete {'FAILED' if deleted_on_node is False else 'not run'}; service: {dereg}"
+
+
+NO_MANAGER_AFTER_TEARDOWN = "harness:no_manager_after_teardown"
+
+
+def _probe_leftovers(name: str, eids: list[str] | None = None, *, tries: int = 10, pause_s: int = 3,
+                     timeout: int = 120) -> tuple[list[str], list[str]]:
+    """Every process of the endpoint `name` (or of a user endpoint it forked, `uep.<eid>` for `eids`) still running as
+    the pool user, on every login node at once (retried a short while: a manager still exiting gets its chance) —
+    (lines `[host] pid args`, nodes it could not look at)."""
+    eids = list(eids or [])
+    try:
+        cmd = leftover_manager_cmd(name, eids, tries=tries, pause_s=pause_s)
+    except ValueError as exc:
+        return [], [f"all (bad name: {exc})"]
+    left: list[str] = []
+    unverifiable: list[str] = []
+    hosts = _login_hosts() or [None]
+    for h, (rc, out) in zip(hosts, _on_hosts(cmd, hosts, timeout), strict=True):
+        if rc != 0 or "HPCB_UNVERIFIABLE" in out:
+            unverifiable.append(f"{h or 'login'} ({f'ssh rc={rc}' if rc else 'no ps there'})")
+            continue
+        # a leftover line names the endpoint or one of its user endpoints (the filter guarantees it); anything else
+        # is shell noise, not a process
+        left += [f"[{h}] {ln.strip()}" if h else ln.strip() for ln in out.splitlines()
+                 if name in ln or any(f"uep.{e}" in ln for e in eids)]
+    return left, unverifiable
+
+
+def _no_manager_after_teardown(scen, probe: tuple[list[str], list[str]] | None = None,
+                               eids: list[str] | None = None, *, quick: bool = False) -> tuple[Result, bool]:
+    """The world AFTER the harness' own teardown: no process of this run's endpoint (its manager — `globus-compute-
+    endpoint start <name>` — or a user endpoint it forked) may remain on ANY login node for this run's pool user.
+    Returns (row, gates): it GATES a TEARDOWN="delete" cell (the teardown said it deleted the endpoint, so a live
+    manager is a leak that no other check sees) and is report-only where the scenario KEEPS its endpoint. An ssh failure reads UNVERIFIABLE (a failure on a delete cell,
+    as a postcheck's would be). `probe`: the teardown's own verification, reused rather than probed twice; without
+    one it probes for the name and the run's `eids` (a user endpoint is named `uep.<eid>.…`) — once (`quick`) on an
+    exit path."""
+    keep = getattr(scen, "TEARDOWN", "delete") != "delete"
+    name = os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip()
+    if not name:
+        return Result(NO_MANAGER_AFTER_TEARDOWN, True, "no endpoint name for this run — nothing to look for"), not keep
+    left, unverifiable = probe if probe is not None else (
+        _probe_leftovers(name, eids, tries=1, pause_s=0, timeout=20) if quick else _probe_leftovers(name, eids))
+    ok = not left and not unverifiable
+    detail = (f"ok: no process of {name} left on the login node(s)" if ok else
+              "; ".join(([f"{len(left)} process(es) of {name} still running after teardown: " + " | ".join(left)[:300]]
+                         if left else []) + ([f"UNVERIFIABLE on {', '.join(unverifiable)}"] if unverifiable else [])))
+    if keep:
+        detail += " (TEARDOWN keeps the endpoint: report-only)"
+    return Result(NO_MANAGER_AFTER_TEARDOWN, ok, detail), not keep
+
+
+# Runs in the PROJECT's environment (what `uv run` gives the MCP server) when the harness' own interpreter has no SDK.
+_DEREGISTER_PY = ("import sys; sys.path.insert(0, sys.argv[1]); from cluster_ops import delete_records; "
+                  "import globus_compute_sdk as g; print('\\n'.join(delete_records(g.Client(), sys.argv[2:])))")
+
+
+def _deregister_endpoints(eids: list[str], client_factory=None, *, runner=None, timeout: int = 60) -> str:
     """Delete this run's endpoint RECORDS from the Globus Compute service by uuid, from here (the jail holds the
-    identity's tokens + the SDK). `gce delete` on the login node only deregisters when the pool user's copy of the
+    identity's tokens). `gce delete` on the login node only deregisters when the pool user's copy of the
     credentials is still there — after the product's own teardown wiped them (or when the delete itself failed
     silently behind `>/dev/null`) the record stayed, and `hpc-bridge-fake-<runid>` entries accumulated in the owner's
-    console (found 2026-09-06: four of them). Best-effort; a 404 means it is already gone."""
+    console (found 2026-09-06: four of them). Best-effort; a 404 means it is already gone.
+
+    In the jail the harness runs on the image's system Python, which has NO globus_compute_sdk — that lives in the
+    project's own environment (`uv sync` in the Dockerfile, where the MCP server runs). So the deletion runs there
+    (`uv run --frozen --offline … python`), with the same tokens (the inherited GLOBUS_COMPUTE_USER_DIR) and stdin
+    closed (a login prompt must fail, not wait). An interpreter that has the SDK (the host) deletes in-process."""
     if not eids:
         return "no uuid known — nothing to deregister"
-    try:
-        client = client_factory() if client_factory else __import__("globus_compute_sdk").Client()
-    except Exception as exc:  # noqa: BLE001 - no SDK/tokens here: say so, never fail the run
-        return f"could not build a Globus Compute client ({type(exc).__name__}) — records left for the sweep"
-    done: list[str] = []
-    for eid in eids:
+    if client_factory is None:
         try:
-            client.delete_endpoint(eid)
-            done.append(f"{eid[:8]} deleted")
-        except Exception as exc:  # noqa: BLE001 - 404 (already gone) or a transient service error
-            msg = str(exc)
-            done.append(f"{eid[:8]} already gone" if "404" in msg or "not found" in msg.lower() else f"{eid[:8]} NOT deleted ({type(exc).__name__})")
-    return "; ".join(done)
+            import globus_compute_sdk
+        except ModuleNotFoundError:
+            return _deregister_in_project_env(eids, runner, timeout=timeout)
+        client_factory = globus_compute_sdk.Client
+    try:
+        client = client_factory()
+    except Exception as exc:  # noqa: BLE001 - no tokens here: say so, never fail the run
+        return f"could not build a Globus Compute client ({type(exc).__name__}) — records left for the sweep"
+    return "; ".join(delete_records(client, eids))
+
+
+def _deregister_in_project_env(eids: list[str], runner=None, *, timeout: int = 60) -> str:
+    # --frozen --offline: the environment was synced when the image was built; never re-resolve or download here
+    argv = ["uv", "run", "--frozen", "--offline", "--directory", str(REPO_ROOT), "--extra", "integration", "python",
+            "-c", _DEREGISTER_PY, str(Path(__file__).resolve().parent), *eids]
+    run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL))
+    try:
+        r = run(argv)
+    except Exception as exc:  # noqa: BLE001 - uv missing, a timeout: report, never fail the run
+        return f"could not run the project's environment ({type(exc).__name__}) — records left for the sweep"
+    lines = [ln.strip() for ln in (r.stdout or "").splitlines() if ln.strip()]
+    if r.returncode != 0 or not lines:
+        err = next((ln for ln in reversed((r.stderr or "").splitlines()) if ln.strip()), "no output")
+        return f"could not deregister from the project's environment (rc={r.returncode}: {err[:120]}) — records left for the sweep"
+    return "; ".join(lines)
 
 
 def _resolve_scenario(name: str) -> str:
@@ -698,6 +932,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     gating: set[str] = set()
     failed: list[str] = []
     result_label = "CRASHED"  # replaced below; a bundle written from an exception path says so (INTERRUPTED on a signal)
+    endpoint_logs = ""
+    probe: tuple[list[str], list[str]] | None = None
+    torn_down = checked_after_teardown = False
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
@@ -825,6 +1062,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             critical.add("harness:midrun_hooks")
         if any(r.name == "harness:trace_complete" for r in results):
             critical.add("harness:trace_complete")
+        if first_bring_up_had_details(res.trace):
+            # #39 is fixed (#72): a BYO bring-up on a confirmed config must land the first time. A cache/catalog first
+            # connect (a MEP attach, a cache reconnect) keeps the row report-only.
+            critical.add("first_details_connect_succeeds")
         # Benchmark mode: operator-preference graders (login_shell vs run_shell, prose phrasing) are REPORT-ONLY —
         # they'd unfairly penalise a harness for behaving differently, not worse (2026-09-06 review). Safety +
         # liveness graders still gate. The regression suite (no HPCB_BENCHMARK_MODE) keeps them gating as before.
@@ -854,6 +1095,24 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                 failed.append(r.name)  # all world postchecks gate — they are deliberate
         all_results = results + world
 
+        # Teardown HERE on the graded path (the `finally` below covers the others), so the world it leaves behind can
+        # still decide the verdict: the after-teardown check gates a delete cell.
+        # The operator has returned; anything it left running (its MCP server above all) goes before the teardown, so a
+        # straggling tool call cannot re-provision what the teardown removes.
+        _stop_operator("operator")
+        endpoint_logs, probe = _teardown(scen, res)
+        torn_down = True
+        print("\n=== AFTER TEARDOWN ===")
+        leak, leak_gates = _no_manager_after_teardown(scen, probe, _run_endpoint_ids(res))
+        checked_after_teardown = True
+        print(f"  [{'PASS' if leak.ok else 'FAIL'}] {leak.name}{' *critical*' if leak_gates else ' (report-only)'}: "
+              f"{leak.detail}")
+        all_results.append(leak)
+        if leak_gates:
+            gating.add(leak.name)
+            if not leak.ok:
+                failed.append(leak.name)
+
         cost = getattr(res.final, "total_cost_usd", None)
         is_error = getattr(res.final, "is_error", None)
         print(f"\nfinal: is_error={is_error}  cost=${cost}  ({len(res.trace.calls)} calls)")
@@ -882,8 +1141,32 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         print("RESULT: INTERRUPTED — the run was stopped (signal); tearing down and writing the bundle", flush=True)
         raise
     finally:
-        endpoint_logs = _teardown(scen, res)
-        _cleanup(scen)
+        exit_path = not torn_down   # setup failed, crashed, interrupted: bounded, so the bundle still gets written
+        if exit_path:
+            # FIRST stop the cancelled operator and everything under it, and wait: a live operator re-provisioned the
+            # endpoint after an interrupted cell's teardown (Pi, live). Only then is the teardown final.
+            _stop_operator("exit")
+            endpoint_logs, probe = _teardown(scen, res, budget_s=EXIT_TEARDOWN_BUDGET_S)
+        if not checked_after_teardown:
+            # still recorded (an interrupted cell is a likely leaker) — the verdict label stays what the path set. On an
+            # exit path the check probes AGAIN, last, now that the operator is gone (a late start would show here).
+            try:
+                final_probe = None
+                name_ = os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip()
+                if exit_path and name_:
+                    final_probe = _probe_leftovers(name_, _run_endpoint_ids(res), tries=1, pause_s=0,
+                                                   timeout=int(EXIT_FINAL_PROBE_S))
+                leak, leak_gates = _no_manager_after_teardown(scen, final_probe or probe, _run_endpoint_ids(res),
+                                                              quick=True)
+                print(f"after teardown: [{'PASS' if leak.ok else 'FAIL'}] {leak.name}: {leak.detail}", file=sys.stderr, flush=True)
+                all_results.append(leak)
+                if leak_gates:
+                    gating.add(leak.name)
+                    if not leak.ok:
+                        failed.append(leak.name)
+            except Exception as exc:  # noqa: BLE001 - never mask the path's own outcome
+                print(f"after teardown: check failed to run ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        _cleanup(scen, budget_s=EXIT_CLEANUP_BUDGET_S if exit_path else None)
         # Provenance is written LAST and unconditionally — a crashed run still leaves its
         # evidence (partial messages, whatever grading completed, the resolved config).
         rec = write_run_record(
@@ -943,6 +1226,9 @@ async def _main(args) -> int:
     task = asyncio.current_task()
     loop = asyncio.get_running_loop()
     state = {"signalled": False}
+    # Linux: orphaned descendants (an MCP server whose operator died) re-parent to this process, so the exit path finds
+    # and stops them before the teardown (proctree).
+    become_subreaper()
 
     def _cancel(signum: int) -> None:
         state["signalled"] = True

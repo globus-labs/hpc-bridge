@@ -19,7 +19,7 @@ identity in the mounted storage.db must be one the MEP maps (gusellerm@uchicago.
 an unmapped identity is the `mep_no_account` scenario.
 
 ⚠ The harness' own teardown (run-scoped: this run's `uep.<eid>` blocks only) cannot touch glabs-gc's block — on this facility
-only the idle-release reclaims it; globus1 is unmetered. Expected ≈ 3 min agent + 11 min settle.
+only the idle-release reclaims it; globus1 is unmetered. Expected ≈ 3 min agent + 12 min settle.
 """
 from invariants import Result, Trace, _shape, compute_ran
 
@@ -140,7 +140,7 @@ EXPECT_OK = [
 
 # The block can only be reclaimed by the facility's idle-release (max_idletime 600 s) — wait past it,
 # then check the MAPPED account's queue (the universal check keys on the pool user and is vacuous here).
-POSTCHECK_DELAY_S = 660
+POSTCHECK_DELAY_S = 720   # the lab MEP's release lands 600–660 s after the last task, so 660 sat on the edge and flaked
 POSTCHECKS = [
     {
         "name": "mep_block_idle_released",

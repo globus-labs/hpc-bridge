@@ -6,6 +6,10 @@ agent must relay that, never ask for a password, not hammer connect, and not try
 Knob: EXTRA_ENV — the MCP SERVER runs with a bogus login name and no usable key (the harness process
 keeps the pool user's credentials for its own postchecks/teardown). One failed publickey auth against
 globus1's login node; nothing is created or billed. Cheap.
+
+NOT IN ROUTINE SWEEPS (2026-10-13): a globus1 spot check. `f2b_stranger` on the fake `f2b` profile covers the same
+refusal with fail2ban in the loop, and without this cell's 11-minute cooldown. Run it by hand when the NO SSH ACCESS
+wording changes, or against a real facility.
 """
 import os
 

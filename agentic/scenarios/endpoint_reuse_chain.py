@@ -13,8 +13,15 @@ the harness tears down once, after phase 2.
 
 STATUS: GREEN with #20's `reused` signal live — the spec is that phase 1 reports `reused=False`
 (genuine fresh bootstrap) and phase 2 reports `reused=True` (reattached). Graded per phase via
-`ToolCall.phase` (see `reuse_across_restart`); phase 1's own first up-connect reading `reused=True` is
-the #39 registration-lag retry, tolerated there and reported by `first_details_connect_succeeds`.
+`ToolCall.phase` (see `reuse_across_restart`). Phase 1 is judged loosely: a retry after a failed first connect
+already reads `reused=True` (#39, fixed in #72; `first_details_connect_succeeds` now gates the details= bring-up).
+
+The LOCAL-DISCOVERY CACHE half (merged from `facility_cache`): the same chain
+also proves phase 2's cold server resolved the facility's CONFIG from `~/.hpc-bridge/facilities.json` (both phases
+share the container) WITHOUT re-probing over SSH — `cache_served_reconnect`. The two graders are not nested (they
+disagree on some stored chain bundles), so both gate. Phase 1 discovers the un-catalogued
+facility (a `proposed_facility_details` probe) → confirms → proves the login shape (since #78 a config is cached only
+once the login shape ran work on it) → phase 2 reconnects with no probe.
 Login-shape only, no billed block: ~6 min for the pair.
 """
 from invariants import _UP_PHASES, Result, Trace
@@ -25,7 +32,9 @@ from invariants import _UP_PHASES, Result, Trace
 PHASES = [
     (
         "Connect me to the HPC facility with login host `{ssh_host}` — use facility "
-        "id `{facility}` — and run `hostname` on the LOGIN shape to confirm it's up. Do NOT "
+        "id `{facility}` — and run `hostname` on the LOGIN shape to confirm it's up. The first bring-up installs "
+        "a toolchain on the login node and can take several minutes: keep calling connect_facility while it "
+        "reports `provisioning` (it is not stuck) until the login node is up, THEN run `hostname`. Do NOT "
         "provision any billed compute block, and do NOT tear anything down.\n\n"
         "This is an AUTOMATED run — no one is available to answer questions: accept discovered "
         "facility config yourself."
@@ -43,8 +52,9 @@ PHASES = [
 USER_GOAL = ""       # autonomous
 PERSONA = None
 KIND = "regression"
-SUMMARY = "inter-agent reuse: a fresh server (new session) reattaches to an endpoint a prior session stood up — cross-restart, zero-SSH"
-TAGS = ["reuse", "zero-ssh", "inter-agent", "chain"]
+SUMMARY = ("inter-agent reuse: a fresh server (new session) reattaches to an endpoint a prior session stood up — "
+           "cross-restart, zero-SSH, the config served from the local cache with no re-probe")
+TAGS = ["reuse", "zero-ssh", "inter-agent", "chain", "cache", "local-discovery"]
 INTERPHASE_DELAY_S = 30  # let phase 1's endpoint register 'online' before phase 2 tries to reattach
 
 
@@ -61,16 +71,13 @@ def reuse_across_restart(t: Trace) -> Result:
     - phase 2 REATTACHED CLEANLY: its FIRST connect that reaches the endpoint reads `reused=True`
       (the FIELD — a "reuse" substring in the notice is not evidence), with NO non-up connect
       (`failed` / `proposed_facility_details` / `needs_facility_details` …) before it within phase
-      2 — a cold server that re-probes or trips #39 before finding the endpoint did not reattach.
+      2 — a cold server that re-probes or fails a connect before finding the endpoint did not reattach.
 
-    Phase 1 is judged loosely on purpose: its first UP-phase connect routinely ALREADY reads
-    `reused=True` — issue #39's registration-lag race fails the first `connect(details=…)` and the
-    retry finds the just-registered endpoint online — so "first up-connect was fresh" is a false
-    negative (seen live, run 1783608805). `reused=False` on the probe/failed connect is sufficient
-    proof the endpoint was built by this chain (per-run unique facility ids + TEARDOWN=delete rule
-    out a leftover). Phase 2 gets the strict form: the reattach must be the first thing that works.
-    Pre-phase-attribution this grader keyed on the LAST connect, which passed on phase 1's #39 retry
-    alone even when phase 2 never connected (coverage audit)."""
+    Phase 1 is judged loosely on purpose: when its first `connect(details=…)` fails, the retry already
+    reads `reused=True` (the #39 shape, fixed in #72), so "first up-connect was fresh" would be a false
+    negative. `reused=False` on the probe/failed connect is sufficient proof the endpoint was built by
+    this chain (per-run unique facility ids + TEARDOWN=delete rule out a leftover). Phase 2 gets the
+    strict form: the reattach must be the first thing that works."""
     if t.n_phases < 2:
         return Result("reuse_across_restart", False,
                       f"needs a two-phase chain trace; saw {t.n_phases} phase(s)")
@@ -93,10 +100,52 @@ def reuse_across_restart(t: Trace) -> Result:
     return Result("reuse_across_restart", ok, detail)
 
 
-EXTRA_INVARIANTS = [reuse_across_restart]
+# connect_facility phases that mean the cache did NOT serve the config: the server either probed the
+# login node again (proposed) or asked for details outright (needs_facility_details).
+_DISCOVERY_PHASES = {"proposed_facility_details", "needs_facility_details"}
+
+
+def cache_served_reconnect(t: Trace) -> Result:
+    """The cache spec, keyed on `ToolCall.phase` (phase 0 = the discovering session, phase 1 = the
+    restarted one): phase 1 DISCOVERS the BYO facility (a `proposed_facility_details` probe in phase
+    0), and phase 2's fresh server RECONNECTS from the local cache — its FIRST connect that reaches
+    the endpoint reads `reused=True` (the field) and NO phase-2 connect is a discovery phase. A
+    probe / details request in phase 2 means a cache MISS (it re-discovered instead of reading
+    `facilities.json`). Keyed per phase: a flat-trace form was satisfied by phase 1's own retry."""
+    if t.n_phases < 2:
+        return Result("cache_served_reconnect", False,
+                      f"needs a two-phase chain trace; saw {t.n_phases} phase(s)")
+    p1 = t.named("connect_facility", phase=0)
+    discovered = any(str((c.result or {}).get("phase")) == "proposed_facility_details" for _, c in p1)
+    p2 = t.named("connect_facility", phase=1)
+    p2_ups = [(i, c) for i, c in p2 if str((c.result or {}).get("phase")) in _UP_PHASES]
+    if not discovered or not p2_ups:
+        return Result("cache_served_reconnect", False,
+                      f"needs a phase-1 discovery then a phase-2 reconnect "
+                      f"(discovered={discovered}, phase-2 up-connects={len(p2_ups)})")
+    # Since #78 a BYO config is cached only once PROVEN (the login shape reached warm in the discovering session).
+    # A phase 1 that ended while still `provisioning` never wrote the cache, so a phase-2 re-probe is the agent's
+    # impatience in phase 1, not a cache miss — say which (first block-tier run after #78, 2026-09-05).
+    p1_proved = any(str(c.input.get("shape")) == "login" and str((c.result or {}).get("phase")) == "complete"
+                    for _, c in t.named("run_shell", phase=0))
+    if not p1_proved:
+        return Result("cache_served_reconnect", False,
+                      "phase 1 never ran work on a warm login shape, so the config was never PROVEN and (since #78) "
+                      "never cached — phase 2 had nothing to reconnect from (agent impatience in phase 1, not a cache miss)")
+    reattached = bool((p2_ups[0][1].result or {}).get("reused"))
+    reprobed = [i for i, c in p2 if str((c.result or {}).get("phase")) in _DISCOVERY_PHASES]
+    ok = reattached and not reprobed
+    detail = ("ok: phase-2 reconnect served from the local cache (no re-probe), endpoint reused" if ok else
+              f"phase-2 first up-connect reused={reattached} (want True), "
+              f"reprobed_in_phase2={bool(reprobed)} (want False; calls {reprobed})")
+    return Result("cache_served_reconnect", ok, detail)
+
+
+EXTRA_INVARIANTS = [reuse_across_restart, cache_served_reconnect]
 
 EXPECT_OK = [
     "reuse_across_restart",          # the spec: fresh bootstrap, then reattach across the restart
+    "cache_served_reconnect",        # …with the config from the local cache: no re-probe (the merged facility_cache)
     "no_raw_ssh_after_endpoint_up",  # the reattach rides the web service, not a fresh SSH
     "spend_not_unprompted",
     "ends_with_stop",                # login-only: trivially satisfied (no billed block)

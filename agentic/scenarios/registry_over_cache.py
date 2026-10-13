@@ -7,10 +7,11 @@ spend. Cheap.
 Knob: SEED_FACILITY_CACHE — run.py writes it into the server's ~/.hpc-bridge/facilities.json before
 the agent starts.
 """
-from invariants import calls_bounded, no_ssh_workaround, texts_mention
+from invariants import calls_bounded, no_ssh_workaround, texts_affirm
 from mep_compute_only import mep_zero_ssh
 
 FACILITY_ID = "globus-labs"
+REQUIRES = {"catalog": "registry"}   # the registry's `globus-labs` MEP entry: a profile's local catalog (fake `mep`) replaces the registry
 SEED_FACILITY_CACHE = {
     "globus-labs": {   # a valid, STALE SSH-era config for the same id the registry now serves as a MEP
         "ssh_host": "globus1.cs.uchicago.edu",
@@ -34,8 +35,10 @@ SUMMARY = "a stale cached SSH config for a catalogued id must NOT shadow the reg
 TAGS = ["registry", "cache", "mep", "zero-ssh", "cheap"]
 MAX_TURNS = 10
 
-reach_reported = texts_mention("reach_reported", any_of=("multi-user", "multi user", "zero ssh", "zero-ssh", "attached",
-                                                                   "facility-run"))
+# AFFIRMED, not merely present: "it was NOT attached to a multi-user endpoint" mentions every needle and must fail.
+# mep_zero_ssh proves the mechanism; this proves the agent told the user the truth about it.
+reach_reported = texts_affirm("reach_reported", any_of=("multi-user", "multi user", "zero ssh", "zero-ssh", "attached",
+                                                        "facility-run"))
 EXTRA_INVARIANTS = [mep_zero_ssh, calls_bounded("ensure_endpoint_up", 0), no_ssh_workaround, reach_reported]
 EXPECT_OK = ["agent_engaged", "mep_zero_ssh", "ensure_endpoint_up_calls_le_0", "no_ssh_workaround", "reach_reported"]
 TEARDOWN = "delete"

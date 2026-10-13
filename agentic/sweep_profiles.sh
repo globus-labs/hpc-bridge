@@ -7,8 +7,9 @@
 #
 # The agent model defaults to run_suite's DEFAULT_MODEL (claude-opus-5); the human-sim is Haiku. Never Fable unless
 # asked. `mep` is skipped unless HPCB_MEP_EMAIL is set in agentic/.env (its managers register a contact address).
-# globus1-only scenarios (catalogued MEP ids, Aurora, the 25-min saturation sleepers, the 30-min long job, the
-# 11-min fail2ban cooldown of no_ssh_access — covered by f2b_stranger) are not part of the fake sweep.
+# What is NOT swept, and why, is the list in excluded() below (the summary prints it): every scenario that can run on
+# the fake target is in cells() or there — test_sweep_script.py enforces it, so a new scenario cannot drop out of the
+# sweeps unnoticed.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,polaris,internal,hostile,mep"
@@ -20,8 +21,8 @@ echo "# profile sweep $STAMP — target fake, models $MODELS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,facility_cache,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked 2" ;;
-    site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path 3" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first 2" ;;
+    site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job 3" ;;
     totp)     echo "otp_preauth 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
     lmod)     echo "lmod_bootstrap 1" ;;
@@ -29,9 +30,26 @@ cells() {  # cells <profile> -> the scenario list (and concurrency) for that pro
     polaris)  echo "polaris_filesystems 1" ;;
     internal) echo "internal_hostnames 1" ;;
     hostile)  echo "canary_login_discovery,canary_compute_output 1" ;;  # per-node canary channels are shared → SERIAL, one at a time
-    mep)      echo "fake_mep_compute,fake_mep_no_account 1" ;;
+    mep)      echo "fake_mep_compute,fake_mep_no_account,fake_mep_username_not_account 1" ;;
     *) echo "" ;;
   esac
+}
+
+excluded() {  # scenarios that could run on the fake target but are NOT in this sweep — one per line: <name> <why>
+  cat <<'EXCLUDED'
+aurora_pbs_bringup            manual only: a live ALCF Aurora recipe (allocation expired; cannot run in the jail)
+idle_release_kill             manual only: never green; documents the #21 kill that no_detached_long_job_on_slurm grades
+no_ssh_access                 a globus1 spot check (fail2ban cooldown 11 min); f2b_stranger covers it here
+repl_interaction              the REPL benchmark: agentic/repl_sweep.py runs it, alternating with repl_baseline_local
+repl_baseline_local           only alongside repl_interaction (agentic/repl_sweep.py): the local reference, no HPC
+mep_compute_only              globus1: the real globus-labs MEP (its world check reads glabs-gc's queue there)
+stranger_mep_walk             globus1: the real globus-labs MEP, a block + the facility's 12-min settle
+registry_over_cache           the registry tier: the real globus-labs MEP entry (--target globus1, or fake/default)
+mep_no_account                the registry tier: the real globus-labs MEP + a second, unmapped Globus identity
+needs_login_paste             the registry tier: a logged-out connect to the real registry's globus-labs entry
+saturation                    globus1: holds every node for 25 min (re-homing it to fake is a later change)
+long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
+EXCLUDED
 }
 
 IFS=, read -ra PROFS <<< "$PROFILES"
@@ -53,5 +71,7 @@ for prof in "${PROFS[@]}"; do
       | grep -E "RESULT:" | tail -1 | sed 's/^/    spend_gate_enforced — /' | tee -a "$SUMMARY"
   fi
 done
+echo "## not swept (by design — see excluded() in agentic/sweep_profiles.sh)" >> "$SUMMARY"
+excluded | sed 's/^/    /' >> "$SUMMARY"
 echo "## done — $(date +%H:%M)" | tee -a "$SUMMARY"
 echo "$SUMMARY"

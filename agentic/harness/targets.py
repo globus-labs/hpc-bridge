@@ -25,11 +25,14 @@ DEFAULT_TARGET = "globus1"
 REPO_ROOT = Path(__file__).resolve().parents[2]
 PROFILES_DIR = REPO_ROOT / "agentic" / "fakecluster" / "profiles"
 
-# What the lab cluster offers, in the same vocabulary as a fake-cluster profile's [capabilities].
+# What the lab cluster offers, in the same vocabulary as a fake-cluster profile's [capabilities]. Four compute nodes
+# since the 2026-10 Spark rebuild (spark1-4 on main/backfill; spark5-6 sit in a `service` partition no cell may use).
+# `catalog`: where `list_facilities` / a catalogued connect read the facilities from — the public registry here.
 GLOBUS1_CAPABILITIES = {
-    "scheduler": "slurm", "nodes": 3, "login_nodes": 1, "login_hosts": ["globus1.cs.uchicago.edu"],
+    "scheduler": "slurm", "nodes": 4, "login_nodes": 1, "login_hosts": ["globus1.cs.uchicago.edu"],
     "partitions": ["main", "backfill"], "default_partition": "main", "accounting": "none", "accounts": ["lab"],
     "balance_tool": "none", "nics": 1, "qos": [], "gres": "none", "module_system": "none", "mfa": "none",
+    "catalog": "registry",
 }
 
 
@@ -74,15 +77,23 @@ def load_profile(name: str) -> dict:
     assert spec.loader is not None
     spec.loader.exec_module(mod)
     try:
-        return mod.manifest(name)
+        man = mod.manifest(name)
     except SystemExit as exc:
         raise SystemExit(f"targets: {exc}") from None
+    # DERIVED capability `catalog`: a profile with a [catalog] cmd mounts its own catalog into the jail
+    # (HPC_BRIDGE_CATALOG_FILE), which REPLACES the public registry for that process — a scenario that needs the real
+    # registry's entries (globus-labs, anvil, …) declares REQUIRES = {"catalog": "registry"} and is skipped there.
+    caps = man.setdefault("capabilities", {})
+    caps.setdefault("catalog", "local" if (man.get("catalog") or {}).get("cmd") else "registry")
+    return man
 
 
 def meets(requires: dict | None, caps: dict) -> tuple[bool, str]:
     """Does a cluster with `caps` satisfy a scenario's REQUIRES? Keys: scheduler (==), min_nodes (<= nodes),
     login_nodes (<= login_nodes), accounting (==), balance_tool (==), gres (==), module_system (==), mfa (==),
-    min_partitions (<= len(partitions)), min_nics (<= nics). Returns (ok, the first unmet requirement)."""
+    catalog (==), min_partitions (<= len(partitions)), min_nics (<= nics). A LIST-valued capability (partitions,
+    accounts, qos, modules, …) is a membership test: `{"partitions": ["debug"], "accounts": "hpcb"}` needs each named
+    one to be on offer. Returns (ok, the first unmet requirement)."""
     for k, want in (requires or {}).items():
         if k == "min_nodes":
             ok = int(caps.get("nodes", 0)) >= int(want)
@@ -92,6 +103,8 @@ def meets(requires: dict | None, caps: dict) -> tuple[bool, str]:
             ok = len(caps.get("partitions", [])) >= int(want)
         elif k == "min_nics":
             ok = int(caps.get("nics", 1)) >= int(want)
+        elif isinstance(caps.get(k), list):
+            ok = all(str(w) in [str(x) for x in caps[k]] for w in ([want] if isinstance(want, str) else want))
         else:
             ok = str(caps.get(k)) == str(want)
         if not ok:
@@ -104,7 +117,7 @@ def get(name: str | None = None) -> Target:
     home = str(Path.home())
     if name == "globus1":
         return Target(
-            name="globus1", ssh_host="globus1.cs.uchicago.edu", nodes=3, endpoint_prefix="hpc-bridge-globus1",
+            name="globus1", ssh_host="globus1.cs.uchicago.edu", nodes=4, endpoint_prefix="hpc-bridge-globus1",
             default_key=f"{home}/.ssh/hpcbridge-test", docker_network=None,
             # the operator's own ssh alias (admin identity) — sinfo/squeue for the node gate
             probe_argv=("ssh", "-o", "BatchMode=yes", "-o", "ConnectTimeout=20", os.environ.get("HPCB_NODE_PROBE_SSH", "globus1")),

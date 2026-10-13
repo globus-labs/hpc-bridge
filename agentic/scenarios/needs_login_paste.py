@@ -17,6 +17,7 @@ from invariants import (
 
 NO_GLOBUS_DB = True
 FACILITY_ID = "globus-labs"
+REQUIRES = {"catalog": "registry"}   # the registry's `globus-labs` entry: a profile's local catalog (fake `mep`) replaces the registry
 PROMPT = (
     "Connect me to the HPC facility with id `globus-labs` — it is catalogued, so use "
     "connect_facility(facility='globus-labs') with no ssh_host and no details. This is an AUTOMATED run: "
