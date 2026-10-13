@@ -126,6 +126,7 @@ async def _connect_facility(
     # the catalog on a fresh install would run the SDK's OWN command-line login: a URL on stdout and
     # input() on stdin — i.e. the MCP transport. A phase, not a prompt: the agent shows the link, the
     # user's browser completes it, the next call proceeds. (login_required() is a local SQLite read.)
+    app.proposed_facility = None  # a draft belongs to the connect that made it: this one proposes again, or doesn't
     if ssh_host:
         try:
             ssh_host = validate_host(ssh_host)
@@ -396,7 +397,9 @@ async def _propose_or_ask(
     except NeedsPreauth as pre:  # host wants an interactive login (password/MFA) — hand off to the user
         if app is not None:
             app.pending_preauth = (facility, pre.target)  # what complete_preauth(code) will open
-            app.preauth_resume = f"connect_facility({facility!r})"  # never a stale "teardown_endpoint()"
+            # never a stale "teardown_endpoint()"; and WITH the host: an un-catalogued facility resumed without it
+            # resolves to nothing and answers needs_facility_details (review 2026-10-10)
+            app.preauth_resume = f"connect_facility({facility!r}, ssh_host={host!r})"
         return _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
     except Exception as exc:  # noqa: BLE001 - probe/connect/creds failure -> structured result
         # The same first-contact explanation the bootstrap gives (stranger's walk): a refused SSH is
@@ -416,6 +419,8 @@ async def _propose_or_ask(
         "from the user in THIS conversation — a remembered or previously cached confirmation is not consent. "
         "Notes: " + " | ".join(notes)
     )
+    if app is not None:  # nothing is bound by a proposal: a run_shell meanwhile is told to finish this connect
+        app.proposed_facility = facility
     return ConnectFacilityResult(
         phase="proposed_facility_details",
         facility=facility,

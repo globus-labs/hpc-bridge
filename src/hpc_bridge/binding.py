@@ -151,10 +151,22 @@ async def _catalog_facility(machine: str) -> Facility:
         pinned_host=config.ssh_host(),
     )
 
+def _default_local_facility(*, unbound: bool = False) -> LocalFacility:
+    """The facility the server holds when no machine is pinned (or the pin failed at boot) — make_facility's and
+    lifespan's one builder. It is `implicit` (nothing chose it: the tools that would stand up or use an endpoint
+    refuse on it with "No facility connected") unless HPC_BRIDGE_ENDPOINT_ID opts into local dev: an endpoint the
+    user runs themself, which hpc-bridge dispatches to (it never stands one up on this boot path). `unbound=True` —
+    lifespan's fallback after a FAILED pin — is implicit even with HPC_BRIDGE_ENDPOINT_ID set: that UUID may be the
+    very one the pin refused (a MEP entry's conflict), and a failed pin starts unbound. Before, the unpinned server
+    stood up a local `hpc-bridge-dev` endpoint on the MCP host for a run_shell made before any connect_facility
+    (Hermes on the fake cluster, live 2026-10-10)."""
+    return LocalFacility(EndpointCLI(user_dir=config.user_dir()), implicit=unbound or not _env_endpoint_id())
+
 async def make_facility() -> Facility:
     """Select the facility: a catalog-described machine (HPC_BRIDGE_MACHINE — sourced from the
-    Globus Search index), or local dev. Machines are catalog *data*, never hardcoded; the agent
-    can also bind one at runtime via connect_facility. (lifespan boots resiliently if this raises.)"""
+    Globus Search index), or — none pinned — the no-facility default (_default_local_facility: unbound,
+    or local dev when opted into). Machines are catalog *data*, never hardcoded; the agent binds one
+    at runtime via connect_facility. (lifespan boots resiliently if this raises.)"""
     machine = (config.machine() or "")
     if not machine and (config.env("HPC_BRIDGE_FACILITY") or ""):
         raise RuntimeError(
@@ -163,8 +175,7 @@ async def make_facility() -> Facility:
         )
     if machine:
         return await _catalog_facility(machine)
-    user_dir = config.user_dir()
-    return LocalFacility(EndpointCLI(user_dir=user_dir))
+    return _default_local_facility()
 
 def _resolve_scratch_root(facility) -> str:
     """The session-shell root for `facility`: explicit env wins, else the facility's shared-FS

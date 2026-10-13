@@ -586,7 +586,8 @@ async def test_a_byo_proposal_that_needs_a_code_resumes_with_connect(monkeypatch
     monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "u")
     monkeypatch.setattr(connect.config, "_control_settings", lambda: (None, 60))
     res = await server._connect_facility(app, "newfac", ssh_host="login.newfac.edu")
-    assert res.phase == "needs_preauth" and app.preauth_resume == "connect_facility('newfac')"
+    # the resume keeps the probed host: without it the un-catalogued facility resolves to nothing (review 2026-10-10)
+    assert res.phase == "needs_preauth" and app.preauth_resume == "connect_facility('newfac', ssh_host='login.newfac.edu')"
 
 
 # --- low: a changed or revoked host key is never coached like an unknown one -----------------------------------------

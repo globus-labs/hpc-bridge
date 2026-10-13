@@ -30,6 +30,9 @@
 > [!note] The selection flow
 > `list_facilities` → `connect_facility(facility)` → pick an allocation → `ensure_endpoint_up(account=…, partition=…, confirm_spend=True)`. Machine + allocation are **agent-chosen at runtime** ([[Facility catalog]]); a machine can also be pinned at startup with `HPC_BRIDGE_MACHINE`. The Globus login is folded into the first `connect_facility` (or `authenticate` explicitly).
 
+> [!note] Before a facility is bound
+> With no machine pinned and none connected, `ensure_endpoint_up`, `run_shell`, `reset_session` and `login_shell` all answer the same **"No facility connected"** notice (call `connect_facility` first; nothing was started) — or, when the last `connect_facility` returned `proposed_facility_details`, a notice saying to finish it with `connect_facility(<id>, details=…)`; when it returned `needs_preauth`, one pointing at `complete_preauth` / the user's own terminal (not another connect). No local endpoint is ever stood up in the facility's place ([[facility-local]]; local dev is an endpoint you run, named by `HPC_BRIDGE_ENDPOINT_ID`, [[Configuration]]).
+
 > [!note] Compute-only facilities (a facility MEP)
 > Every tool that takes a `shape` runs `_shape_reject` first ([[server]]): on a [[facility-mep|MEP]] `shape="login"` — and `login_shell` — are refused with a notice, every shape is billed, `stop_endpoint` drains (terminal), `teardown_endpoint` detaches, and the first billed start is where a missing account surfaces as a terminal `NO ACCOUNT`.
 
