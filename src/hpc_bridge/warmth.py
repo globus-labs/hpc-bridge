@@ -32,8 +32,8 @@ from .context import (
 )
 from .cost import _bank_warm_interval, _billable, _settle_billing, _total_session_spend, _with_spend
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
-from .models import ShellOutcome
-from .notices import _no_account_failure, _transient_dispatch_failure
+from .models import ShellOutcome, Submission
+from .notices import _no_account_failure, _transient_dispatch_failure, _with_submission_notice
 from .runner import GlobusRunner
 from .shapes import SHAPES, shape_config
 
@@ -569,7 +569,8 @@ def _busy_session(app: AppCtx, shape: str, session_id: str) -> str | None:
     return None
 
 def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, ceiling_s: float, *,
-                   client_cancelled: bool = False, runtime: ShapeRuntime | None = None, reset: bool = False) -> str:
+                   client_cancelled: bool = False, runtime: ShapeRuntime | None = None, reset: bool = False,
+                   submission: Submission | None = None) -> str:
     """Register a still-running task as a poll handle and return its id. Caller holds app.lock — or calls it in one
     synchronous step with no await around it (a cancelled call, which must not wait for the lock), which nothing can
     interleave with either. `runtime`: the shape runtime it was dispatched on (its result is noted there only while
@@ -586,6 +587,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         client_cancelled=client_cancelled,
         runtime=runtime,
         reset=reset,
+        submission=submission,
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
@@ -628,7 +630,7 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         _note_dispatch(current, out, at=handle.done_at)
     else:
         out.block_state = "cold"  # its block was released while it ran (a newer block's runtime is not its own)
-    return _with_spend(app, out)
+    return _with_spend(app, _with_submission_notice(out, handle.submission, handle.shape))
 
 async def _endpoint_gone(app: AppCtx) -> bool:
     """True when nothing can resolve a pending task any more: the endpoint the task was dispatched

@@ -9,7 +9,7 @@
 
 | Failure | exit | notice |
 |---|---|---|
-| `TimeoutError` | 124 | "timed out — run ensure_endpoint_up and retry, or move to a batch job" |
+| `TimeoutError` | 124 | "timed out — run ensure_endpoint_up and retry, or move to a batch job (billed like a block, so only with the user's spend confirmation)" |
 | result over Compute's 10 MiB limit | `None` | "the command RAN, but its result (N bytes serialized; the limit is L) was over the limit — no output, no exit code; write it to a file and read ranges; check for its side effects before running it again" |
 | `TaskExecutionFailed` (other) | 1 | "the remote task failed to execute" |
 | other | 1 | "Dispatch error: \<type\>" |

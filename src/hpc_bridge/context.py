@@ -19,6 +19,7 @@ from .catalog.entry import CatalogEntry
 from .facility.base import Facility
 from .lifecycle import EndpointState
 from .login import LoginFlow
+from .models import Submission
 from .profile import Profile
 from .runner import CanaryResult, GlobusRunner
 from .shapes import SHAPES
@@ -101,6 +102,8 @@ class TaskHandle:
     # still runs; its result is then noted nowhere — never on a rebuilt or newer runtime. None: the shape's current one.
     runtime: ShapeRuntime | None = field(default=None, repr=False, compare=False)
     reset: bool = False  # a reset_session, not a command: its notices say so
+    # The scheduler job the command submits by hand, if any — so the result poll_task hands back says so (2026-10-10).
+    submission: Submission | None = None
 
 
 @dataclass
