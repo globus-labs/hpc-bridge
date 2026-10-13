@@ -3,6 +3,41 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## Unreleased
+
+### Fixed
+- **A block replaced after a failed check is asked about.** If a check failed with an error (a task lost with its
+  worker, a refused submit, a transient conflict), hpc-bridge forgot which block the user had confirmed. The block
+  that came up next was then used under the old confirmation, with no new question. Seen on the fake cluster
+  (2026-10-13): job 112 was cancelled and a check failed with `TaskExecutionFailed`. Job 113 then read `up` and ran
+  work. Now the confirmed block's job id survives a failed check, as it already survived a failed command and a
+  runner rebuild:
+  - a different job answering means the old block is gone. The user is asked again, the notice says the new block is
+    already running and billing, and nothing more runs on it once a check has seen it;
+  - a check that times out reads as the block gone, not a cold start;
+  - the same job answering keeps its age, and the time since the failed check is billed;
+  - the idle presumption keeps counting from the block's last proof of life, so it still asks before a check could
+    start a new block.
+- **A `down` stops the spend clock.** After a confirmed block, the following now stop the block's spend clock where
+  the block was last known up, at the latest:
+  - a rejected block submission (when the endpoint runs one block);
+  - a no-account verdict;
+  - the repeated conflict that reads `down`;
+  - a check that fails with an error.
+
+  An orphaned task stops its block's clock too. Before, the clock could run on while the status read `down`. If
+  the same block answers again later, its clock picks up where it stopped, so the gap is still counted. Before, the
+  gap counted 0 s where the facility publishes no idle window (Anvil, Delta). `needs_confirmation`,
+  `needs_account` and an error's `down` now report the session spend, so a block that was just released shows in
+  it at once. The rejected-submission notice no longer says "nothing was billed": only the new block wasn't
+  created.
+
+### Known issues
+- **A replaced block can run work before a check sees it.** A check runs only once the last answer is 45 s old, and
+  every completed command counts as an answer. So commands sent less than 45 s apart run on a replacement block
+  without a question until a pause lets a check run, or the old block's walltime is reached. A follow-up closes it:
+  each command will report the scheduler job it ran in.
+
 ## 0.1.23 — 2026-10-13 — faster first results, honest stops and output, batch jobs counted as spend, ALCF Polaris
 
 ### Added

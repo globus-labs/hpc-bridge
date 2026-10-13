@@ -64,6 +64,14 @@ class ShapeRuntime:
     block_since: float | None = None
     # The scheduler job id the block's canary reported when it was first confirmed warm (None: unknown).
     block_job: str | None = None
+    # The block's last proof of life when something voided warm_confirmed_at (a failed dispatch or check, a runner
+    # rebuild) without finding it gone: the idle clock and the billing bound keep counting from it (warmth._void_warm).
+    last_proof_at: float | None = None
+    # Where the spend clock stopped while the block kept its identity (not found gone): a terminal verdict, a failed
+    # check with no idle window to bound a hold, the manager offline, an orphaned task, a runner rebuild, an error. If
+    # that block answers again, its clock resumes from here, so the gap is billed (cost._bank_warm_interval records it;
+    # warmth._provision resumes it).
+    clock_stopped_at: float | None = None
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False

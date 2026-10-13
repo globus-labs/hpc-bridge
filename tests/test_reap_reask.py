@@ -33,7 +33,7 @@ from hpc_bridge.warmth import (
 from tests.fakes import FakeFacility
 from tests.test_remote_facility import _pbs_profile, _render
 from tests.test_remote_facility import _profile as _slurm_profile
-from tests.test_server import _FakeRunner, _Res
+from tests.test_server import _DoneFuture, _FakeRunner, _Res
 
 _OK = CanaryResult(ok=True, worker_host="b002", worker_python="3.11.7", worker_dill="0.3.9")
 _TIMEOUT = CanaryResult(ok=False, error="timeout")
@@ -626,3 +626,483 @@ def test_a_cancelled_task_is_not_activity():
     tid = _register_task(app, "compute", "default", "sleep 1", fut, 60.0)
     fut.cancel()
     assert app.tasks[tid].done_at is None
+
+
+# -- a replaced block found after something voided the warm confirmation (reap_replaced_block, 2026-10-13) -----------
+# A failed dispatch, a runner rebuild and a check that failed with an error each void warm_confirmed_at (forcing a
+# check) without finding the block gone. The block the spend was confirmed for must stay the one the next answer is
+# compared against. A check that failed with an error used to erase it, and the block that replaced it was taken under
+# the old confirmation.
+
+_TEF = CanaryResult(ok=False, error="TaskExecutionFailed: Task failed due to loss of manager (ManagerLost)")
+
+
+async def test_reap_replaced_block_a_failed_check_then_a_new_job_answering_is_asked_for():
+    # The live journal (fake cluster, Pi operator): warm on job 112; a hook scancels it; `sleep 75` completes on the
+    # block the endpoint started for it (113); the next call's check fails with TaskExecutionFailed; the status call
+    # after it is answered by job 113. That read "up", and the next command ran on job 113 without asking.
+    app, rt, runner = await _warm_app(job="112")                       # 1. warm on job 112, a command ran
+    # 2. job 112 is scancel'd: nothing the fake can see
+    assert (await _run_shell(app, "sleep 75")).phase == "complete"     # 3. inside the check's TTL: no check
+    rt.warm_confirmed_at -= 55                                          # past the TTL, well inside the idle window
+    runner._canary = _TEF
+    out = await _run_shell(app, "echo JOB=$SLURM_JOB_ID")               # 4. the check fails with an error
+    assert out.phase == "cold_start" and "last dispatch failed: TaskExecutionFailed" in out.notice
+    assert rt.spend_confirmed is True and rt.block_job == "112" and rt.reaped is None  # not a reap; 112 is still it
+    runner._canary = _job("113")
+    commands = len(runner.commands)
+    res = await _ensure_endpoint_up(app)                                # 5. answered by job 113
+    assert res.status == "needs_confirmation" and res.block_state == "provisioning" and rt.reap_kicked is True
+    assert "previous block (job 112) is gone" in res.notice and "new block (job 113)" in res.notice
+    assert "already running and billing the allocation" in res.notice   # not "a new block bills again": it is
+    assert "started it for work sent after the old block went" in res.notice
+    assert "Nothing more runs on job 113 until the user confirms" in res.notice
+    assert "bills from the moment it starts, confirmed or not" in res.notice and "bills again" not in res.notice
+    out = await _run_shell(app, "echo JOB=$SLURM_JOB_ID")               # 6. nothing runs on job 113 before the re-ask
+    assert out.phase == "needs_confirmation" and len(runner.commands) == commands
+    assert (rt.spend_confirmed, rt.block_job, rt.block_since, rt.warm_since) == (False, None, None, None)
+    res = await _ensure_endpoint_up(app, confirm_spend=True)            # the user says yes: job 113 is taken now
+    assert res.status == "up" and rt.block_job == "113" and rt.spend_confirmed is True and rt.reaped is None
+    assert (await _run_shell(app, "echo JOB=$SLURM_JOB_ID")).phase == "complete"
+
+
+@pytest.mark.parametrize("voided_by", ["failed-dispatch", "runner-rebuild", "failed-check"])
+async def test_a_new_job_answering_after_the_warm_confirmation_was_voided_is_a_kicked_reap(voided_by, monkeypatch):
+    # whatever voided the warm confirmation, a different job answering means the confirmed block was replaced
+    from globus_compute_sdk.errors import TaskExecutionFailed
+
+    app, rt, runner = await _warm_app(job="112")
+    if voided_by == "failed-dispatch":  # the task fails with its worker: _note_dispatch voids the confirmation
+        monkeypatch.setattr(runner, "submit", lambda command: _DoneFuture(exc=TaskExecutionFailed("ManagerLost", "0")))
+        out = await _run_shell(app, "true")
+        assert out.phase == "failed" and rt.warm_confirmed_at is None
+        monkeypatch.undo()
+    elif voided_by == "runner-rebuild":  # e.g. a new Globus login: the rebuild voids it before the check
+        rt.runner_stale = True
+    else:
+        rt.warm_confirmed_at -= 55
+        runner._canary = _TEF
+        assert (await _run_shell(app, "true")).phase == "cold_start"
+    runner._canary = _job("113")
+    commands = len(runner.commands)
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and out.block_state == "provisioning" and rt.reap_kicked is True
+    assert "previous block (job 112) is gone" in out.notice and len(runner.commands) == commands
+
+
+# Every non-timeout check failure takes the same path (TaskExecutionFailed, "Executor is shutdown", a task-side
+# TimeoutError, a cancelled canary...): `worker-lost` stands for them all. A transient conflict takes it too, and also
+# counts the conflict streak. A no-account verdict is a different path: its own test below.
+_CHECK_ERRORS = {
+    "worker-lost": _TEF.error,
+    "transient-conflict": ("ComputeAPIError[RESOURCE_CONFLICT]: Endpoint fake-eid is already in use: possibly due to "
+                           "concurrent requests -- please try again"),
+}
+
+
+@pytest.mark.parametrize("then", ["new-job", "timeout", "same-job"])
+@pytest.mark.parametrize("error", list(_CHECK_ERRORS.values()), ids=list(_CHECK_ERRORS))
+async def test_a_check_that_fails_with_an_error_keeps_the_confirmed_block_to_compare_against(error, then):
+    # The confirmed block keeps its job and age through the failed check: a new job answering is a kicked reap, a
+    # timeout is that block gone (not a cold start), and the same job answering is that block, still dated from when it
+    # started (so its walltime is still presumed without a check).
+    app, rt, runner = await _warm_app(job="112")
+    rt.user_endpoint_config["walltime"] = "00:30:00"
+    rt.block_since -= 600                                       # 10 minutes into its walltime
+    age = rt.block_since
+    rt.warm_confirmed_at -= 55
+    runner._canary = CanaryResult(ok=False, error=error)
+    assert (await _run_shell(app, "true")).phase == "cold_start"
+    assert (rt.spend_confirmed, rt.block_job, rt.block_since, rt.reaped) == (True, "112", age, None)
+    runner._canary = {"new-job": _job("113"), "timeout": _TIMEOUT, "same-job": _job("112")}[then]
+    commands = len(runner.commands)
+    out = await _run_shell(app, "true")
+    if then == "same-job":
+        assert out.phase == "complete" and rt.block_since == age and rt.spend_confirmed is True and rt.reaped is None
+    else:
+        assert out.phase == "needs_confirmation" and out.block_state == "provisioning" and rt.reap_kicked is True
+        assert len(runner.commands) == commands and rt.spend_confirmed is False
+        assert ("new block (job 113)" if then == "new-job" else "did not answer a check") in out.notice
+
+
+@pytest.mark.parametrize("voided_by", ["failed-check", "failed-dispatch", "rebuild-then-failed-check"])
+async def test_after_the_confirmation_is_voided_the_idle_presumption_still_counts_from_the_last_proof(voided_by,
+                                                                                                     monkeypatch):
+    # A failed check, a failed dispatch and a runner rebuild (a new login) each void the warm confirmation; the idle
+    # clock must not lose the block's last proof of life with it (_void_warm keeps it as last_proof_at). Past the idle
+    # window the next call presumes the block released and asks first, sending nothing: a canary to a released endpoint
+    # would have it start a new billed block before the user is asked.
+    from globus_compute_sdk.errors import TaskExecutionFailed
+
+    app, rt, runner = await _warm_app(job="112")
+    proof = rt.warm_confirmed_at
+    if voided_by == "failed-dispatch":
+        monkeypatch.setattr(runner, "submit", lambda command: _DoneFuture(exc=TaskExecutionFailed("ManagerLost", "0")))
+        assert (await _run_shell(app, "true")).phase == "failed"
+        monkeypatch.undo()
+    else:
+        if voided_by == "rebuild-then-failed-check":
+            rt.runner_stale = True                                  # the rebuild voids it before the check fails
+        else:
+            rt.warm_confirmed_at -= 55
+            proof = rt.warm_confirmed_at
+        runner._canary = CanaryResult(ok=False, error=_CHECK_ERRORS["transient-conflict"])
+        assert (await _run_shell(app, "true")).phase == "cold_start"
+    assert rt.warm_confirmed_at is None and rt.last_proof_at == proof
+    rt.last_proof_at -= app.profile.max_idletime_s + 300           # the idle window and more, with no call
+    runner._canary = _job("113")                                    # what a check would find
+    canaries, commands = runner.canaries, len(runner.commands)
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and out.block_state == "cold" and "idle-released" in out.notice
+    assert runner.canaries == canaries and len(runner.commands) == commands and rt.reap_kicked is False
+    assert rt.presumed_block_job == "112"                           # the answer after the yes is dated by its job
+
+
+async def test_a_late_poll_of_an_older_task_does_not_hide_a_newer_proof():
+    # After a failed check, polling a task that ended long before it sets that older end as the confirmation: the idle
+    # clock must still count from the newer proof (the max of the two), not presume the block idle-released
+    from hpc_bridge.server import _poll_task
+    from hpc_bridge.warmth import _register_task
+
+    app, rt, runner = await _warm_app(job="112")
+    tid = _register_task(app, "compute", "s2", "make", _DoneFuture(_Res(0, "built", "")), 60.0, runtime=rt)
+    app.tasks[tid].done_at = time.monotonic() - (app.profile.max_idletime_s + 300)  # it ended long ago
+    rt.warm_confirmed_at -= 55
+    runner._canary = _TEF
+    assert (await _run_shell(app, "true")).phase == "cold_start"    # the failed check: last proof 55 s ago
+    assert (await _poll_task(app, tid)).phase == "complete"         # sets the older end as the confirmation
+    assert (await _run_shell(app, "true")).phase == "cold_start"    # the next check fails too: its rebuild re-voids
+    assert rt.reaped is None and rt.last_proof_at > time.monotonic() - 60  # the newer proof is the one kept
+    runner._canary = _job("112")
+    out = await _run_shell(app, "true")
+    assert out.phase == "complete" and rt.reaped is None
+
+
+@pytest.mark.parametrize("failed_checks", [1, 2])
+@pytest.mark.parametrize("then", ["same-job", "new-job"])
+async def test_the_clock_of_the_confirmed_block_runs_on_through_a_failed_check(then, failed_checks, monkeypatch):
+    # A failed check is not the block gone: it may well be up and billing. If the same job answers 5 minutes later
+    # those 5 minutes are billed; if a new job answers, the old block is billed through them too (its reap banks it to
+    # the latest it could have lived: here, now, inside its idle window). Two failed checks in a row (a transient
+    # conflict streak): the second call's runner rebuild banks the clock, which must start again at once.
+    app, rt, runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
+    rt.warm_confirmed_at -= 55
+    runner._canary = _TEF
+    real, skew = time.monotonic, {"s": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew["s"])
+    for _ in range(failed_checks):
+        assert (await _run_shell(app, "true")).phase == "cold_start"
+        assert rt.warm_since is not None                            # not stopped at the error
+        skew["s"] += 300 / failed_checks
+    runner._canary = _job("112" if then == "same-job" else "113")
+    res = await _ensure_endpoint_up(app)
+    gap = 300 / 3600 * _block_nodes(rt, app)
+    if then == "same-job":  # (a runner rebuild banks the interval and restarts the clock: the total is what counts)
+        assert res.status == "up" and rt.warm_since is not None and _total_session_spend(app) >= gap
+    else:
+        assert res.status == "needs_confirmation" and rt.warm_since is None and rt.spend_accrued >= gap
+
+
+_REJECTED = ("Failed to start block 1: Cannot launch job parsl.slurm.1: Could not read job ID from submit command "
+             "standard output; recode=1, stderr='sbatch: error: Batch job submission failed: Invalid account or "
+             "account/partition combination specified'")
+
+
+def _mep_app(job, idle_s=None):
+    from hpc_bridge.facility.mep import MEPFacility
+    from tests.fakes import fake_mep_entry
+    from tests.test_mep_server import _Status
+
+    fac = MEPFacility.from_entry(fake_mep_entry(), client_factory=lambda: _Status("online"))
+    fac.max_idletime_s = idle_s  # the facility's own idle window, when its template publishes one
+    app = AppCtx(facility=fac, profile=Profile())
+    runner = _FakeRunner(fac.endpoint_id, _Res(0, "ok", ""), canary_result=_job(job))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    return app, runner
+
+
+@pytest.mark.parametrize("facility", ["ssh", "mep"])
+@pytest.mark.parametrize("verdict", ["rejected", "conflict-limit", "no-account"])
+async def test_a_down_never_leaves_a_clock_running(verdict, facility, monkeypatch):
+    # A terminal verdict after a confirmed block: the scheduler rejected the block submission (with one block, the
+    # endpoint submits only once the confirmed block is gone), the conflict streak hit its limit, or no account. The
+    # status is `down`; its clock must stop there (banked to the latest the block could have lived), not run on. (The
+    # MEP here publishes its idle window, so its failed checks are held like the SSH endpoint's.)
+    from tests.test_mep_server import _LIVE_409, _LIVE_422
+
+    if facility == "ssh":
+        app, rt, runner = await _warm_app(job="112")
+    else:
+        app, runner = _mep_app("112", idle_s=600)
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+        rt = _shape_runtime(app, "compute")
+    app.charge_factor = 1.0
+    real, skew = time.monotonic, {"s": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew["s"])
+    skew["s"] += 60
+    runner._canary = CanaryResult(ok=False, error={"rejected": _REJECTED, "conflict-limit": _LIVE_409,
+                                                   "no-account": _LIVE_422}[verdict])
+    res = await _ensure_endpoint_up(app)
+    for _ in range(2 if verdict == "conflict-limit" else 0):       # the first two conflicts are transient
+        assert res.status == "provisioning" and rt.warm_since is not None
+        res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and rt.warm_since is None
+    if verdict == "rejected":  # "nothing was billed" was true of the new block only
+        assert "The new block was not created" in res.notice and "stays in session_spend" in res.notice
+    spent = _total_session_spend(app)
+    assert spent >= 60 / 3600 * _block_nodes(rt, app)              # billed up to the verdict, not short of it
+    skew["s"] += 300
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and _total_session_spend(app) == spent and rt.warm_since is None
+
+
+async def test_with_no_idle_window_known_a_failed_check_stops_the_clock():
+    # a facility endpoint whose idle window could not be read: nothing would end a hold, so the clock stops at the
+    # failed check, as it did before holds existed (the block keeps its identity: the next answer is still compared)
+    from tests.test_mep_server import _LIVE_409
+
+    app, runner = _mep_app("112", idle_s=None)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = _shape_runtime(app, "compute")
+    runner._canary = CanaryResult(ok=False, error=_LIVE_409)
+    assert (await _ensure_endpoint_up(app)).status == "provisioning"
+    assert rt.warm_since is None and rt.block_job == "112"
+
+
+def _skewed(monkeypatch):
+    """time.monotonic, shifted by skew["s"] — to let minutes pass between calls."""
+    real, skew = time.monotonic, {"s": 0.0}
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew["s"])
+    return skew
+
+
+@pytest.mark.parametrize("gap", [30, 400])
+@pytest.mark.parametrize("window", ["unknown", "known"])
+async def test_the_same_job_answering_after_its_clock_stopped_bills_the_gap(window, gap, monkeypatch):
+    # With no idle window known (the registry's Anvil and Delta MEPs publish none) a failed check is not held: the clock
+    # stops there. If the same job answers later it was billing all along, so the clock resumes where it stopped (with a
+    # known window the hold already kept it running). Before, the gap billed 0 s.
+    from tests.test_mep_server import _LIVE_409
+
+    app, runner = _mep_app("112", idle_s=None if window == "unknown" else 600)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = _shape_runtime(app, "compute")
+    app.charge_factor = 1.0
+    skew = _skewed(monkeypatch)
+    runner._canary = CanaryResult(ok=False, error=_LIVE_409)
+    assert (await _ensure_endpoint_up(app)).status == "provisioning"
+    assert (rt.warm_since is None) is (window == "unknown")         # stopped only where nothing would end a hold
+    skew["s"] += gap
+    runner._canary = _job("112")
+    assert (await _ensure_endpoint_up(app)).status == "up"
+    assert _total_session_spend(app) >= gap / 3600 * _block_nodes(rt, app) and rt.clock_stopped_at is None
+
+
+@pytest.mark.parametrize(("verdict", "then"), [("conflict-limit", "answer"), ("conflict-limit", "presumed-then-answer"),
+                                               ("no-account-then-login", "answer")])  # (no presumption under no-account)
+async def test_a_block_that_answers_after_a_down_is_billed_through_it(verdict, then, monkeypatch):
+    # A `down` stops the clock at the verdict, the identity kept. If that job answers later (the conflicts cleared; a
+    # new login maps the identity again), the gap is billed from where the clock stopped, also when the idle
+    # presumption came in between (it hands the stop point on as presumed_billed_until).
+    from hpc_bridge.warmth import _forget_identity_verdicts
+    from tests.test_mep_server import _LIVE_409, _LIVE_422
+
+    app, rt, runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
+    skew = _skewed(monkeypatch)
+    skew["s"] += 60
+    runner._canary = CanaryResult(ok=False, error=_LIVE_409 if verdict == "conflict-limit" else _LIVE_422)
+    res = await _ensure_endpoint_up(app)
+    for _ in range(2 if verdict == "conflict-limit" else 0):
+        res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and rt.warm_since is None and rt.clock_stopped_at is not None
+    stopped = rt.clock_stopped_at
+    if verdict != "conflict-limit":
+        _forget_identity_verdicts(app)                                # a new login
+    runner._canary = _job("112")
+    if then == "presumed-then-answer":
+        skew["s"] += app.profile.max_idletime_s + 300               # past the idle window: presumed released
+        assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+        assert rt.presumed_billed_until == stopped
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up" and rt.warm_since == stopped
+        return
+    skew["s"] += 300
+    assert (await _ensure_endpoint_up(app)).status == "up"
+    assert rt.warm_since == stopped and _total_session_spend(app) >= 360 / 3600 * _block_nodes(rt, app) - 1e-9
+
+
+@pytest.mark.parametrize("path", ["ensure_endpoint_up", "run_shell"])
+async def test_an_error_while_checking_stops_the_clock_and_reports_the_spend(path, monkeypatch):
+    # A check that raises (the status API unreachable) reads `down` (or an error from run_shell): the clock stops there,
+    # the status carries the session spend, and if the block answers again its clock resumes where it stopped.
+    app, rt, _runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
+    rt.warm_since -= 600
+
+    async def unreachable(endpoint_id):
+        raise RuntimeError("status API unreachable")
+
+    monkeypatch.setattr(app.facility, "manager_online", unreachable)
+    if path == "ensure_endpoint_up":
+        res = await _ensure_endpoint_up(app)
+        assert res.status == "down" and res.session_spend == _total_session_spend(app) > 0.1
+    else:
+        with pytest.raises(RuntimeError):
+            await _run_shell(app, "true")
+    assert rt.warm_since is None and rt.clock_stopped_at is not None
+    stopped = rt.clock_stopped_at
+    monkeypatch.undo()
+    assert (await _ensure_endpoint_up(app)).status == "up" and rt.warm_since == stopped
+
+
+async def test_with_several_blocks_a_rejected_submission_does_not_stop_the_confirmed_blocks_clock():
+    # with max_blocks > 1 a rejected submission is a NEW block refused; the confirmed one may still be up and billing
+    app, rt, runner = await _warm_app(job="112")
+    rt.user_endpoint_config["max_blocks"] = 2
+    rt.warm_confirmed_at -= 55
+    runner._canary = CanaryResult(ok=False, error=_REJECTED)
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and rt.warm_since is not None and rt.block_job == "112"
+
+
+async def test_an_orphaned_task_stops_its_blocks_clock():
+    # poll_task finds the endpoint gone: the task is ORPHANED (terminal), and its block's clock stops with it
+    from hpc_bridge.server import _poll_task
+
+    app, rt, runner = await _warm_app()
+    app.charge_factor = 1.0
+    runner.pending, runner.timeout = True, 0.01
+    out = await _run_shell(app, "sleep 3000")
+    assert out.phase == "running" and rt.warm_since is not None
+    app.facility.manager_up = False
+    polled = await _poll_task(app, out.task_id)
+    assert polled.phase == "failed" and "ORPHANED" in polled.notice and rt.warm_since is None
+
+
+@pytest.mark.parametrize("case", ["first-check-error", "first-check-timeout", "switch-then-timeout"])
+async def test_a_check_that_fails_with_no_confirmed_block_starts_no_clock(case):
+    # Only a CONFIRMED block whose check failed is billed as still up. A failed first check, a cold start, or the first
+    # check after a switch (even with a recently finished task on the shape) bills nothing.
+    if case == "switch-then-timeout":
+        app, rt, runner = await _warm_app(job="112")
+        fut: Future = Future()
+        fut.set_result(None)
+        app.tasks["t1"] = TaskHandle(future=fut, shape="compute", session_id="s2", command="make",
+                                     submitted_at=time.monotonic(), ceiling_s=60.0, done_at=time.monotonic())
+        runner._canary = _TIMEOUT
+        res = await _ensure_endpoint_up(app, partition="other")
+    else:
+        f = FakeFacility()
+        f.workers = 1
+        app = AppCtx(facility=f, profile=Profile())
+        runner = _FakeRunner("fake-eid", _Res(0, "ok", ""), canary_result=_TEF if case == "first-check-error" else _TIMEOUT)
+        app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+        res = await _ensure_endpoint_up(app, confirm_spend=True)
+        rt = _shape_runtime(app, "compute")
+    assert res.status == "provisioning" and rt.block_since is None and rt.warm_since is None
+
+
+async def test_a_manager_reported_offline_stops_the_clock():
+    # no check ran (the manager is offline): nothing says the block is up, so its clock stops as before
+    app, rt, _runner = await _warm_app(job="112")
+    app.facility.manager_up = False
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "provisioning" and rt.warm_since is None and rt.block_job == "112"
+
+
+async def test_the_spend_floors_report_the_spend_a_reap_just_banked():
+    # needs_confirmation (and needs_account after it) carried no session_spend, so they read 0 right after a reap
+    # banked the old block
+    app, rt, _runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
+    rt.warm_since -= 3600
+    rt.warm_confirmed_at -= app.profile.max_idletime_s + 120        # idle-released: this call's reap banks the hour
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "needs_confirmation" and res.session_spend == _total_session_spend(app) > 0.5
+    app.facility.account_required = True
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "needs_account" and res.session_spend == _total_session_spend(app) > 0.5
+
+
+async def test_a_no_account_verdict_keeps_the_block_but_asks_for_no_spend():
+    # A no-account verdict (after a new Globus login, say) is terminal for this identity: no block can be started, so
+    # the walltime presumption must not turn it into a spend question whose yes only meets the same refusal. The clock
+    # stops at the verdict. The block's identity is kept, so after a login that clears the verdict the next answer is
+    # still compared against it.
+    from hpc_bridge.warmth import _forget_identity_verdicts
+    from tests.test_mep_server import _LIVE_422
+
+    app, rt, runner = await _warm_app(job="112")
+    rt.user_endpoint_config["walltime"] = "00:30:00"
+    rt.warm_confirmed_at -= 55
+    runner._canary = CanaryResult(ok=False, error=_LIVE_422)
+    out = await _run_shell(app, "true")
+    assert out.phase == "failed" and rt.no_account and rt.block_job == "112" and rt.warm_since is None
+    rt.block_since -= 1900                                          # past its walltime
+    out = await _run_shell(app, "true")
+    assert out.phase == "failed" and rt.reaped is None and "Confirm spend again" not in (out.notice or "")
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "down" and rt.reaped is None
+    rt.block_since += 1900                                          # (inside its walltime again)
+    _forget_identity_verdicts(app)                                  # a new login
+    runner._canary = _job("113")
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and rt.reap_kicked is True and "previous block (job 112)" in out.notice
+
+
+async def test_on_a_facility_endpoint_a_block_replaced_after_a_transient_conflict_is_asked_for():
+    # a facility MEP's canaries carry the job too; RESOURCE_CONFLICT is common there, and nothing can cancel the block
+    from tests.test_mep_server import _LIVE_409
+
+    app, runner = _mep_app("101")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = _shape_runtime(app, "compute")
+    runner._canary = CanaryResult(ok=False, error=_LIVE_409)
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "provisioning" and "TRANSIENT" in res.notice and rt.block_job == "101"
+    runner._canary = _job("202")
+    commands = len(runner.commands)
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation" and rt.reap_kicked is True and "nothing can cancel it" in out.notice
+    assert "previous block (job 101) is gone" in out.notice and len(runner.commands) == commands
+
+
+# The comparison needs a block this spend was confirmed for. Where there is none, the first block to answer is taken.
+
+@pytest.mark.parametrize("switch", ["partition", "account"])
+async def test_after_a_switch_the_first_block_to_answer_is_taken_not_compared(switch):
+    # a switch is a different block the agent asked for under the same confirmation: no job to compare it against
+    app, rt, runner = await _warm_app(job="112")
+    runner._canary = _job("113")
+    res = await _ensure_endpoint_up(app, **{switch: "other"})
+    assert res.status == "up" and rt.block_job == "113" and rt.spend_confirmed is True and rt.reaped is None
+
+
+async def test_a_first_confirmation_has_no_block_to_compare_against():
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", _Res(0, "ok", ""), canary_result=_TEF)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    runner._canary = _job("113")
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "up" and _shape_runtime(app, "compute").block_job == "113"
+
+
+@pytest.mark.parametrize(("new", "kept"), [("112", True), ("113", False)], ids=["same-job", "new-job"])
+async def test_after_an_idle_presumption_a_failed_check_still_dates_the_answer_by_its_job(new, kept):
+    # the user's yes after a presumption covers the block that answers next: it is dated by its job against the
+    # presumed one (presumed_block_job), never compared as a replacement, even after a check that failed with an error
+    app, rt, runner = await _warm_app(job="112")
+    now = time.monotonic()
+    rt.block_since = now - 1200
+    rt.warm_confirmed_at = now - (app.profile.max_idletime_s + 20)
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"
+    runner._canary = _TEF
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    assert rt.block_job is None and rt.presumed_block_job == "112"
+    runner._canary = _job(new)
+    assert (await _ensure_endpoint_up(app)).status == "up" and rt.reaped is None and rt.spend_confirmed is True
+    assert (abs(rt.block_since - (now - 1200)) < 1e-6) is kept and rt.block_job == new

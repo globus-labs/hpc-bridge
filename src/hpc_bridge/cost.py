@@ -99,6 +99,8 @@ def _bank_warm_interval(rt: ShapeRuntime, app: AppCtx, *, until: float | None = 
             max(0.0, end - rt.warm_since), _block_nodes(rt, app), app.charge_factor
         )
         rt.warm_since = None
+        if rt.block_since is not None:  # the block keeps its identity: if it answers again, its clock resumes here
+            rt.clock_stopped_at = end
 
 def _billable(rt: ShapeRuntime) -> bool:
     """LocalProvider (login-node) shapes consume no allocation, so they don't bill."""

@@ -181,8 +181,11 @@ def _reap_prefix(rt: ShapeRuntime | None) -> str:
     """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone."""
     if rt is None or rt.reaped is None:
         return ""
-    return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; a new "
-            "block bills again. ")
+    # Found by a check (kicked): a replacement may already be running, and billing from when it started — not "again".
+    bills = ("a replacement bills from the moment it starts, confirmed or not" if rt.reap_kicked else
+             "a new block bills again")
+    return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; "
+            f"{bills}. ")
 
 def _spend_floor_guidance(app: AppCtx | None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -344,7 +347,8 @@ def _submit_rejected_notice(partition: str | None, account: str | None, error: s
     where = f" on {partition!r}" if partition else ""
     charged = f" for account {account!r}" if account else " with no account"
     return (f"the scheduler REJECTED the block submission{where}{charged}: {_submit_rejection_cause(error)}. "
-            "Nothing is queued and nothing was billed. Not a queue wait: the account, partition or QOS is wrong for "
+            "The new block was not created: nothing is queued and it bills nothing (time an earlier block ran stays "
+            "in session_spend). Not a queue wait: the account, partition or QOS is wrong for "
             "this facility, or the partition needs a resource request. Ask the user / check the facility's docs, then "
             "change it and confirm again — ensure_endpoint_up(account=…, partition=…, confirm_spend=True). Do not "
             "retry unchanged.")
