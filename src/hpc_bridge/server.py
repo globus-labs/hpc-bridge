@@ -1298,8 +1298,8 @@ async def _ready_session(
 async def _detect_submission(command: str, shape: str) -> Submission | None:
     """The scheduler job `command` starts by hand (sbatch/qsub/salloc, or srun outside a block), or None. The spend
     floor never sees one: the login shape is free, and from inside a block it is a new job beside the block. Worked
-    out BEFORE the command is dispatched (never between the submit and its poll handle), off the event loop and
-    outside app.lock, and never raising — recognising a submission must not fail or stall the command."""
+    out BEFORE the dispatch is counted (never between the count and the submit), off the event loop and outside
+    app.lock, and never raising — recognising a submission must not fail or stall the command."""
     try:
         return await asyncio.to_thread(scheduler_ops._submission, command, inside_job=shape != "login")
     except Exception:  # noqa: BLE001 - advisory: a lexer surprise leaves the outcome as it was
@@ -1308,7 +1308,7 @@ async def _detect_submission(command: str, shape: str) -> Submission | None:
 
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
-    payload: Callable[[], str], *, agent_call: bool, reset: bool = False,
+    payload: Callable[[], str], *, agent_call: bool, reset: bool = False, submission: Submission | None = None,
 ) -> ShellOutcome:
     """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
     lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
@@ -1334,15 +1334,12 @@ async def _dispatch_counted(
     submit is synchronous, so once anything was sent the future is in hand.)"""
     counted: ShapeRuntime | None = rt  # the in-flight count _ready_session took, until it is handed back
     fut: Any = None  # the SDK future, once sent
-    sub: Submission | None = None  # the scheduler job the command submits by hand, if any
+    sub = submission  # the scheduler job the command submits by hand, if any (_run_shell finds it before the count)
 
     def tracked() -> bool:
         return rt.runner is runner and runner.endpoint_id == app.state.endpoint_id
 
     try:
-        # before the submit (a reset runs no command of the agent's): nothing awaits between the submit and
-        # its poll handle, and a cancel here propagates with nothing sent
-        sub = None if reset else await _detect_submission(command, shape)
         try:
             fut = runner.submit(payload())  # submit; wait a bounded time OFF the lock, else hand back a handle
             res = await asyncio.to_thread(fut.result, runner.timeout)
@@ -1404,12 +1401,16 @@ async def _run_shell(
     session is off limits. Internal callers (the scheduler ops on the login shape) leave it False."""
     if agent_call and session_id.startswith(_RESERVED_SESSION_PREFIX):
         return _reserved_session_outcome(session_id)
+    # Before the dispatch is counted: once it is, nothing may await before its submit (a stop queued behind it must
+    # find the command sent), and a cancel here propagates with nothing counted or sent.
+    sub = await _detect_submission(command, shape)
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
     runner, session, rt = ready
     return await _dispatch_counted(app, rt, runner, shape, session_id, command,
-                                   lambda: session_shell.wrap(command, session), agent_call=agent_call)
+                                   lambda: session_shell.wrap(command, session), agent_call=agent_call,
+                                   submission=sub)
 
 
 async def _reset_session(
