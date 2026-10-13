@@ -68,7 +68,6 @@ from .cost import (  # noqa: F401 - re-exported
     _settle_billing,
     _total_session_spend,
     _with_spend,
-    cap_output,
 )
 from .endpoint import EndpointCLI
 from .facility.local import LocalFacility
@@ -1232,11 +1231,7 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
         rc, out, err = await login_exec(command)
     except Exception as exc:  # noqa: BLE001 - never crash the tool; report structurally
         return LoginShellResult(exit_code=1, notice=f"login_shell error: {type(exc).__name__}: {exc}"[:300])
-    return LoginShellResult(
-        exit_code=rc,
-        stdout=cap_output(out, app.max_output_chars),
-        stderr_snippet=cap_output(err, app.max_output_chars),
-    )
+    return LoginShellResult(exit_code=rc, stdout=out, stderr_snippet=err)
 
 
 @mcp.tool()
@@ -1250,7 +1245,8 @@ async def login_shell(command: str, ctx: Context) -> LoginShellResult:
     on an MFA facility can force a re-auth. SSH is meant to be a one-time bootstrap, not a
     channel. Only available for an SSH facility (a catalog machine via HPC_BRIDGE_MACHINE or
     connect_facility), not local dev."""
-    return await _heartbeat(ctx, _login_shell(ctx.request_context.lifespan_context, command), "login_shell")
+    res = await _heartbeat(ctx, _login_shell(ctx.request_context.lifespan_context, command), "login_shell")
+    return dispatch.for_agent(res)  # the agent gets each stream's marked end
 
 
 async def _ready_session(
@@ -1333,7 +1329,7 @@ async def _dispatch_counted(
             out = _never_sent_outcome(app)
         except TimeoutError as exc:
             if fut is None:  # the submit itself timed out: nothing was sent
-                out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
+                out = dispatch.failure_outcome(exc, "warm")
             else:  # still running past the sync-wait -> a poll handle, NOT a kill
                 async with app.lock:
                     rt.inflight -= 1  # the handle takes over as the liveness signal, in the same locked step
@@ -1350,9 +1346,9 @@ async def _dispatch_counted(
                     _note_dispatch(rt, out)  # the worker took our task -> it's alive
                     return out
         except Exception as exc:  # noqa: BLE001 - the submit or the task failed: a structured outcome, never a raise
-            out = dispatch.failure_outcome(exc, "warm", app.max_output_chars)
+            out = dispatch.failure_outcome(exc, "warm")
         else:
-            out = dispatch.complete_outcome(res, "warm", app.max_output_chars)
+            out = dispatch.complete_outcome(res, "warm")
         async with app.lock:
             rt.inflight -= 1
             counted = None
@@ -1475,9 +1471,9 @@ async def run_shell(
     block warm while it runs, so it won't be cut or idle-released — but a *detached* process is not a
     task, so the block would idle-release out from under it (issue #21)."""
     try:
-        return await _heartbeat(ctx, _run_shell(
+        return dispatch.for_agent(await _heartbeat(ctx, _run_shell(
             ctx.request_context.lifespan_context, command, session_id, shape, agent_call=True
-        ), "run_shell")
+        ), "run_shell"))  # cut only here: _run_shell's own callers (the pilot probe, allocations) read it whole
     except Exception as exc:  # noqa: BLE001
         return _error_outcome(exc)
 
@@ -1494,7 +1490,9 @@ async def poll_task(task_id: str, ctx: Context, wait: float = 0.0) -> ShellOutco
     stopped/repointed). One with no result past its ceiling still reads phase="running" — it may only be queued
     behind a relaunching block — and its notice says how to abandon it instead."""
     try:
-        return await _heartbeat(ctx, _poll_task(ctx.request_context.lifespan_context, task_id, wait), "poll_task")
+        return dispatch.for_agent(
+            await _heartbeat(ctx, _poll_task(ctx.request_context.lifespan_context, task_id, wait), "poll_task")
+        )
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
 
@@ -1506,9 +1504,9 @@ async def reset_session(
     """Clear a session's persisted working directory and environment (fresh slate). Like run_shell, a reset still
     waiting past the sync-wait (queued behind other work on the block) comes back phase="running" with a task_id."""
     try:
-        return await _heartbeat(ctx, _reset_session(
+        return dispatch.for_agent(await _heartbeat(ctx, _reset_session(
             ctx.request_context.lifespan_context, session_id, shape, agent_call=True
-        ), "reset_session")
+        ), "reset_session"))
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
 
