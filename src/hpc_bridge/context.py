@@ -61,9 +61,18 @@ class ShapeRuntime:
     # needs_confirmation, even if it carried confirm_spend=True, so the user is asked AFTER learning of the reap.
     # `reap_kicked`: the reap was found by a check (a task), which may already have asked for a new block.
     block_since: float | None = None
+    # The scheduler job id the block's canary reported when it was first confirmed warm (None: unknown).
+    block_job: str | None = None
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
+    # An idle presumption can come while the block is still up (an endpoint on a slower scaling pass): that block's
+    # age, job id, the latest it could have lived, and where the presumption stopped its spend clock — so the block
+    # that answers next is dated and billed right (warmth._provision).
+    presumed_block_since: float | None = None
+    presumed_block_job: str | None = None
+    presumed_block_until: float | None = None
+    presumed_billed_until: float | None = None
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0

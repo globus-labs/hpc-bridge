@@ -795,6 +795,10 @@ class RemoteEndpointCLI:
             return False
 
 
+# `strategy_period: 5` (both templates; 30 on endpoints configured before this change): a new user endpoint scales
+# out only on its first scaling pass, one period after it starts, and a first SSH result pays that wait twice
+# (login shape, then compute). It is not the scheduler query rate (parsl polls Slurm/PBS at most every 60 s).
+# warmth._IDLE_GRACE_S is two of these passes plus 5 s; a test ties them.
 _SLURM_TEMPLATE = """\
 engine:
   type: GlobusComputeEngine
@@ -812,7 +816,7 @@ engine:
 {% endif %}
   job_status_kwargs:
     max_idletime: @@IDLE@@
-    strategy_period: 30
+    strategy_period: 5
   provider:
     type: {{ provider_type | default('SlurmProvider') }}
 {% if compute | default(true) %}
@@ -860,7 +864,7 @@ engine:
 {% endif %}
   job_status_kwargs:
     max_idletime: @@IDLE@@
-    strategy_period: 30
+    strategy_period: 5
   provider:
     type: {{ provider_type | default('PBSProProvider') }}
 {% if compute | default(true) %}

@@ -164,7 +164,8 @@ _CONTROL_PATH_BUDGET = 100 - 1 - 40  # dir + '/' + %C must stay under the cap wi
 
 CANARY_TTL_S = 45.0  # trust a confirmed worker this long before re-canarying. Safe: an idle
 # block needs >= max_idletime (default 600s) of SILENCE to release, so a worker seen <45s ago
-# cannot have idle-released out from under us.
+# cannot have idle-released out from under us — except that parsl only resets its idle timer for a
+# task one of its scaling passes sees, so short commands may not keep a block alive (vault: Concepts/Cost control.md).
 TRANSIENT_CONFLICT_LIMIT = 3  # consecutive RESOURCE_CONFLICT dispatch refusals before we stop saying 'call again'
 CANARY_TIMEOUT_S = 8.0  # a live worker answers in ~1-2s; a cold block blows past this -> not warm
 
