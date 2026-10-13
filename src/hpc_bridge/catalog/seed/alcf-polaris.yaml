@@ -1,0 +1,45 @@
+# src/hpc_bridge/catalog/seed/alcf-polaris.yaml
+# ALCF Polaris via its facility-run MULTI-USER endpoint (documented, GA): zero SSH; the facility maps the user's
+# Globus identity (an ALCF identity, MobilePASS+, linked to their Globus login) to their ALCF account through PAM.
+# The facility owns the template (PBSProProvider on the `hsn0` address; `queue` and `account` required;
+# select_options `system=polaris`; scheduler_options default `#PBS -l filesystems=home` — a full override replaces
+# it, so re-include `filesystems=`; max_idletime 240 s; additionalProperties: true, so a misspelt key is silently
+# ignored, not rejected). Workers run the facility's own install: its template appends
+# /opt/globus-compute-agent/venv-py313/bin to PATH after any worker_init, so the entry sends none and the worker
+# matches the user endpoint by construction (no worker_env pin). The client must run Python 3.13 like the workers.
+# Source: https://docs.alcf.anl.gov/services/globus-compute/ and the endpoint's published template (2026-10-13).
+- id: polaris
+  facility_key: alcf
+  facility: "ALCF / Argonne"
+  description: "ALCF Polaris (PBS Pro; 4×A100 GPU nodes) via its multi-user endpoint — zero SSH; your ALCF identity must be linked to your Globus login, and a project (account) is required"
+  display_name: "ALCF Polaris (MEP)"
+  aliases: [alcf-polaris, polaris-mep]
+  compute_mep_uuid: 9a947ba5-f537-4681-acf3-cc66485aadec
+  ssh_host: null
+  auth_method: ssh-key
+  allocation: null
+  account_required: true            # the template requires `account`: the ALCF project to charge
+  compute:
+    scheduler: pbs
+    interface: hsn0                 # informational: the facility template pins its own address
+    env_setup: ""                   # none: the template's default worker_init puts the facility's own venv on PATH
+    key_map:
+      partition: queue              # PBS: hpc-bridge's partition is the template's `queue`
+    scratch_root: "$HOME/.hpc-bridge"
+    endpoint_name: alcf-polaris-mep
+  defaults:
+    partition: debug                # → queue; Polaris's debug queue: small, short jobs, quick to start
+    walltime: "00:15:00"
+    max_workers_per_node: 4
+    nodes_per_block: 1
+    init_blocks: 1
+    max_blocks: 1
+  provenance: curated
+  last_validated: 2026-10-13
+  verification:                    # written by agentic/registry_reprove.py — what the live run met
+    verified_on: 2026-10-13
+    endpoint_version: "4.9.0"
+    python_version: "3.13.11"
+    template_sha256: "568137d34da581b47aa361e70102f5e20a1d8eb752d151f65a9aa224f7e9a438"
+    config_sha256: "136353d3d0973c9f209320db1924181bb2a814aa36b201686c7ff4b7bc285460"
+    worker: "py3.13.11 dill0.3.9 parsl2026.2.23 gce4.9.0 on x3206c0s31b1n0"

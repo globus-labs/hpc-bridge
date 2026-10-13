@@ -63,9 +63,9 @@ endpoint needs no SSH at all. Design, tool reference and module notes: the **[va
 
 **Public beta** (0.1.6, Apache-2.0): tested live on six clusters, security-reviewed, and now in the hands
 of test users — expect rough edges and please [report them](https://github.com/globus-labs/hpc-bridge/issues). In the
-registry: **Purdue Anvil** (multi-user endpoint), **NCSA Delta** (multi-user endpoint), **SDSC Expanse**
-(SSH with a one-time code) and Globus Labs' cluster; also proven live through the bring-your-own path on **Midway**
-(Slurm) and **ALCF Polaris** (PBS). Slurm and PBS are the supported schedulers.
+registry: **ALCF Polaris** (multi-user endpoint, PBS), **Purdue Anvil** (multi-user endpoint), **NCSA Delta**
+(multi-user endpoint), **SDSC Expanse** (SSH with a one-time code) and Globus Labs' cluster; also proven live through
+the bring-your-own path on **Midway** (Slurm) and Polaris over SSH (PBS). Slurm and PBS are the supported schedulers.
 Unit tests, lint and type checks run in CI. Every command after the bootstrap carries only a scoped Globus token,
 never SSH material; SSH is key-only and used once to bootstrap. A facility that asks for a one-time code
 (TOTP or Duo passcode) at login gets it from you in the chat, single-use; a password is never handled by the agent:
