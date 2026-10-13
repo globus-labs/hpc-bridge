@@ -12,8 +12,14 @@ eval "$(python3 "$REPO_ROOT/agentic/harness/targets.py" "$TARGET")"
 KEY="${HPCB_TEST_SSH_KEY:-$HPCB_T_KEY_DEFAULT}"
 # host-side reach: globus1's FQDN, or the fake cluster's published sshd (localhost:port, unpinned host key)
 if [ "$TARGET" = fake ]; then HOST=localhost; SSH_EXTRA=(-p "${HPCB_FAKE_SSH_PORT:-2222}" -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o LogLevel=ERROR); else HOST="${HPC_BRIDGE_SSH_HOST:-globus1.cs.uchicago.edu}"; SSH_EXTRA=(); fi
-GCE='$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint'
-REMOTE="for ep in \$(ls ~/.globus_compute/ 2>/dev/null | grep '^hpc-bridge-'); do $GCE stop \"\$ep\" >/dev/null 2>&1; $GCE delete \"\$ep\" --yes >/dev/null 2>&1; echo \"deleted \$ep\"; done; scancel -u \"\$(whoami)\" 2>/dev/null; n=\$(ls -d ~/.globus_compute/uep.* 2>/dev/null | wc -l); rm -rf ~/.globus_compute/uep.* 2>/dev/null; echo \"uep dirs removed: \$n\"; rm -f ~/.globus_compute/storage.db; echo \"token store removed\"; echo \"jobs left: \$(squeue -u \"\$(whoami)\" -h | wc -l)\""
+# a working endpoint CLI: the first hpc-bridge venv whose entry point runs (keyed gce-venv-endpoint-<gce>-py<X.Y>,
+# newest first, then the unkeyed gce-venv of plugins up to 0.1.23), never a moved-aside one — harness/cluster_ops.py's
+# GCE_FIND (the plugin's teardown candidates, in its own order; any working CLI stops/deletes an endpoint by name)
+GCE='"$(for d in $(ls -d "$HOME"/hpc-bridge/gce-venv-endpoint-* 2>/dev/null | sort -rV) "$HOME/hpc-bridge/gce-venv"; do case $d in (*.build.*|*.broken.*|*.failed.*|*.lock|*.old.*) continue;; esac; "$d/bin/globus-compute-endpoint" version >/dev/null 2>&1 && { echo "$d/bin/globus-compute-endpoint"; break; }; done)"'
+# venv_arch_mismatch's planted wrapper (bin/.gce-real), should a killed cell have left it — the same as
+# harness/cluster_ops.py's restore_planted_entry_points_cmd
+RESTORE='n=0; for r in "$HOME"/hpc-bridge/gce-venv-endpoint-*/bin/.gce-real; do [ -e "$r" ] || continue; d="${r%/bin/.gce-real}"; mv -f "$r" "$d/bin/globus-compute-endpoint" && uname -m > "$d/.hpcb-arch" && n=$((n+1)); done; echo "planted entry points restored: $n"'
+REMOTE="$RESTORE; for ep in \$(ls ~/.globus_compute/ 2>/dev/null | grep '^hpc-bridge-'); do $GCE stop \"\$ep\" >/dev/null 2>&1; $GCE delete \"\$ep\" --yes >/dev/null 2>&1; echo \"deleted \$ep\"; done; scancel -u \"\$(whoami)\" 2>/dev/null; n=\$(ls -d ~/.globus_compute/uep.* 2>/dev/null | wc -l); rm -rf ~/.globus_compute/uep.* 2>/dev/null; echo \"uep dirs removed: \$n\"; rm -f ~/.globus_compute/storage.db; echo \"token store removed\"; echo \"jobs left: \$(squeue -u \"\$(whoami)\" -h | wc -l)\""
 echo "sweeping $USER_@$HOST: all hpc-bridge-* endpoints + ALL uep.* dirs + ALL jobs of this user …"
 # The claim (flock) is HELD for the whole sweep: taking it in a throwaway check and releasing it before the ssh
 # let a run_suite claim the user mid-sweep (a TOCTOU — review 2026-09-05). No `flock(1)` on macOS, so Python holds it.

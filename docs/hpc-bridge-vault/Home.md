@@ -24,7 +24,7 @@ This vault has two halves:
 
 ## Modules — `src/hpc_bridge/`
 **Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]]
-**Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-mep]]
+**Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-endpoint_venv]] · [[facility-mep]]
 **Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]]
 *(The `catalog/` package — `entry` · `search` · `bundled` · `ingest` · `parsers` — is documented in [[Facility catalog]].)*
 
@@ -46,6 +46,7 @@ This vault has two halves:
 
 ## Planned — design notes (core built; deferred extras remain)
 - [[Next priorities 2026-10]] — **the ordered work list after the hackathon push**: 18 items for UX, stability and usefulness, cheapest-for-the-value first (strategy tick, output truncation, honest Esc/stop, walltime …), each with effort, usefulness and the code evidence
+- [[Per-architecture endpoint venvs]] — designed, not built: a venv per CPU architecture, so a compute partition unlike the login node can run an endpoint hpc-bridge stands up over SSH (today it fails at once with a message naming both; a facility's own multi-user endpoint is not affected)
 - [[V1 release]] — **the plan of record** for the sprint (scope, tiers, what's ticked); reorient here when a task runs long
 - [[ACP interactive benchmark driver]] — the cross-harness benchmark's plan of record: the agent-agnostic ACP driver, the human-sim turn policy, trace sources per harness, the Claude-Code-over-ACP operator, the refined objective (like models through a variety of harnesses) and the ordered next steps
 - [[Facility self-description via Compute]] — scoping (2026-09-22): can facilities describe themselves through their multi-user endpoint instead of the external index? Measured: `get_endpoints(role="any")` lists every public MEP (57), metadata (template, schema, config) is readable for any UUID, nobody uses `description`; design = standard JSON-Schema keywords + an `x-facility` block, a login-shape MEP for dynamic probes, the index demoted to cache/fallback

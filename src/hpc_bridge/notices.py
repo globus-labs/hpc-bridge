@@ -58,8 +58,10 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     account or key on the facility must instead hear WHICH host and login name were tried, where the
     name came from, and the two remedies (found on the stranger's walk, 2026-09-03)."""
     raw = str(exc)
-    if type(exc).__name__ == "RemoteTokenStoreExists":  # already says what to do; its quoted whoami text could
-        return raw                                       # otherwise be misread as an SSH denial or a network error
+    # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
+    # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
+    if type(exc).__name__ in ("RemoteTokenStoreExists", "EndpointVenvError"):
+        return raw
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -109,10 +111,10 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         return (f"CANNOT REACH {host}: {ssh_line[:200]}. Check the login host name and your network/VPN, "
                 "then call connect_facility again. Nothing was started or billed.")
     if isinstance(exc, TimeoutError | asyncio.TimeoutError) or type(exc).__name__ == "TimeoutError":
-        return (f"TIMED OUT waiting for the login node {host}: a bootstrap step did not finish in time. On a first "
-                "connect that is usually the toolchain install (uv and globus-compute-endpoint into your home there), "
-                "which keeps running on the login node after the timeout and is idempotent — call connect_facility "
-                "again in a minute or two. Nothing was billed.")
+        return (f"TIMED OUT waiting for the login node {host}: a bootstrap step did not finish in time (a slow login "
+                "node or filesystem). Every step is safe to repeat: an unfinished build of hpc-bridge's endpoint venv "
+                "is stopped and never takes the venv's place, and the next connect builds it again — call "
+                "connect_facility again in a minute or two. Nothing was billed.")
     if "controlpath too long" in low:
         return (f"hpc-bridge error: the SSH ControlMaster socket path is too long ({ssh_line[:160]}); set "
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")

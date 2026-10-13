@@ -12,45 +12,33 @@ import re
 import shlex
 from typing import Literal
 
+from .facility.endpoint_venv import (
+    DEFAULT_REMOTE_VENV,
+    client_gce,
+    client_python,
+    keyed_venv,
+    safe_base,
+    shell_path,
+    short_env_setup,
+)
 from .facility.remote import NeedsPreauth, SshTarget, is_interactive_auth_failure, offers_one_time_code, ssh_exec
 from .models import FacilityDetails
 
 
-# uv-bootstrap env_setup (validated live on globus1): idempotent create-venv + install, so the FIRST
-# connect provisions the toolchain and every later call (and the compute worker, which replays
-# env_setup) short-circuits to a bare activate. `{venv}` is templated by profile_from_catalog_entry.
-def _gce_pin() -> str:
-    """`globus-compute-endpoint==<the installed SDK's version>` (the two are released in lockstep), so the
-    login-node install is pinned like the client side; unpinned only if the SDK isn't importable here."""
-    try:
-        from importlib.metadata import version
-
-        return f"'globus-compute-endpoint=={version('globus-compute-sdk')}'"
-    except Exception:  # noqa: BLE001 - no SDK in this environment (hermetic tests): leave it unpinned
-        return "globus-compute-endpoint"
+def _gce_version() -> str | None:
+    """The endpoint version hpc-bridge's venv is pinned to: this client's SDK's (released in lockstep)."""
+    return client_gce()
 
 
 def _client_python() -> str:
-    """This client's major.minor: the worker venv must deserialise task functions dill'd by this interpreter,
-    and a facility's system python may be too old for the endpoint at all (uv downloads the version if needed)."""
-    import sys
-
-    return f"{sys.version_info.major}.{sys.version_info.minor}"
+    """This client's major.minor: the worker venv must deserialise task functions dill'd by this interpreter."""
+    return client_python()
 
 
-_UV_ENV_SETUP = (
-    f"[ -d {{venv}} ] || uv venv {{venv}} --python {_client_python()}; . {{venv}}/bin/activate; "
-    f"command -v globus-compute-endpoint >/dev/null 2>&1 || uv pip install -q {_gce_pin()}"
-)
-
-# A facility with NEITHER globus-compute-endpoint nor uv (SDSC Expanse, live 2026-09-04): install uv into the
-# user's home first (what the Delta and Anvil facility templates do in their own worker_init), then the same
-# idempotent venv+install. Outbound HTTPS from the login node (and, via worker_init, the compute node) is assumed.
-_BOOTSTRAP_UV_ENV_SETUP = (
-    'export PATH="$HOME/.local/bin:$PATH"; '
-    "command -v uv >/dev/null 2>&1 || curl -LsSf https://astral.sh/uv/install.sh | sh; "
-    + _UV_ENV_SETUP
-)
+# hpc-bridge's own venv line (facility.endpoint_venv): it activates `{venv}-endpoint-<gce>-py<X.Y>` and never builds —
+# hpc-bridge builds that venv with uv over SSH when it starts the endpoint (installing uv first where the node has
+# none).
+_UV_ENV_SETUP = short_env_setup("{venv}")
 
 # Dedicated HPC high-speed fabrics — a strong `interface` signal vs a management eth. Ordered by
 # priority: the dedicated compute fabric (hsn/ipogif/ib/hsi) outranks a `bond` mgmt NIC.
@@ -69,7 +57,36 @@ echo "PSCRATCH=${PSCRATCH:-}"
 if command -v sbatch >/dev/null 2>&1; then echo SCHED=slurm;
 elif command -v qsub >/dev/null 2>&1; then echo SCHED=pbs;
 else echo SCHED=none; fi
-echo "GCE=$(command -v globus-compute-endpoint 2>/dev/null)"
+export PYTHONDONTWRITEBYTECODE=1
+hpcb_capped() {  # run "$@" for at most 20 s where `timeout` exists: a slow filesystem must not eat the probe's budget
+  if command -v timeout >/dev/null 2>&1; then timeout 15 "$@"; else "$@"; fi
+}
+hpcb_py() {  # the interpreter an entry point runs: its shebang, or the python a /bin/sh launcher execs (uv's, pip's)
+  l=$(head -n 1 "$1" 2>/dev/null)
+  case $l in
+    "#!/bin/sh"*) sed -n "2s/^'''exec' ['\"]\{0,1\}\([^'\" ]*\).*/\1/p" "$1" ;;
+    "#!/usr/bin/env "*) command -v "${l#\#!/usr/bin/env }" ;;
+    "#!"*) l=${l#\#!}; echo "${l%% *}" ;;
+  esac
+}
+hpcb_state() {  # "<python X.Y> <gce version>" from the entry point itself, "timed out", or why it fails
+  o=$(hpcb_capped "$1" version 2>&1); r=$?
+  [ "$r" -eq 124 ] && { echo "timed out"; return; }
+  [ "$r" -eq 0 ] || { printf '%s\n' "$o" | tail -n 1; return; }
+  p=$(hpcb_capped "$2" -c "import sys;print('%d.%d' % sys.version_info[:2])" 2>/dev/null); r=$?
+  [ "$r" -eq 124 ] && { echo "timed out"; return; }
+  [ "$r" -eq 0 ] || { echo "its python ($2) fails"; return; }
+  echo "$p ${o##*: }"
+}
+G=$(command -v globus-compute-endpoint 2>/dev/null); echo "GCE=$G"
+[ -n "$G" ] && echo "GCE_STATE=$(hpcb_state "$G" "$(hpcb_py "$G")")"
+[ -n "$G" ] && { [ -f "${G%/*}/activate" ] && echo GCE_ACTIVATE=yes || echo GCE_ACTIVATE=no; }
+V="@@VENV@@"
+if [ -e "$V" ]; then
+  echo "VENV=$V"
+  if [ -f "$V/pyvenv.cfg" ]; then echo "VENV_STATE=$(hpcb_state "$V/bin/globus-compute-endpoint" "$V/bin/python")"
+  else echo "VENV_STATE=not a venv"; fi
+fi
 echo "UV=$(command -v uv 2>/dev/null)"
 echo "MYBALANCE=$(command -v mybalance 2>/dev/null)"
 echo "XDUSAGE=$(command -v xdusage 2>/dev/null)"
@@ -86,12 +103,24 @@ echo HPCB_PROBE_END
 """.strip()
 
 
+def _probe_script() -> str:
+    """`_PROBE` with the keyed venv a bring-up would use (HPC_BRIDGE_REMOTE_VENV, else the convention), checked
+    through its entry point with bytecode writes off, so the proposal can say whether it is reused or repaired."""
+    from . import config
+
+    venv = shell_path(config.remote_venv() or DEFAULT_REMOTE_VENV)
+    if not safe_base(venv):  # a path the probe could not quote as it is: not checked (the bring-up refuses it too)
+        return _PROBE.replace("@@VENV@@", "")
+    venv = venv.replace("{user}", "$(whoami)")
+    return _PROBE.replace("@@VENV@@", keyed_venv(venv, python=_client_python(), gce=_gce_version()))
+
+
 async def discover_facility_details(target: SshTarget) -> tuple[FacilityDetails, list[str]]:
     """Run the batched probe over `target` and parse it into a proposed FacilityDetails + notes.
 
     `notes` names the low-confidence / unresolved fields the agent must confirm with the user
     (`interface` above all). Raises RuntimeError if the probe SSH itself can't reach the host."""
-    rc, out, err = await ssh_exec(target, f"bash -lc {shlex.quote(_PROBE)}")
+    rc, out, err = await ssh_exec(target, f"bash -lc {shlex.quote(_probe_script())}")
     if "HPCB_PROBE_BEGIN" not in out:  # never even ran the script (auth/connect failure)
         if is_interactive_auth_failure(rc, err):  # needs a one-time interactive pre-auth, not broken
             raise NeedsPreauth(target, otp_ok=offers_one_time_code(err))
@@ -131,7 +160,9 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
     notes.append(nic_note)  # interface is always flagged — it's the field the canary most often fails on
 
     env_setup, env_note = _env_setup(f.get("GCE"), f.get("UV"), user,
-                                     modules=f.get("MODULE", []), lmod_init=f.get("LMOD_INIT"))
+                                     modules=f.get("MODULE", []), lmod_init=f.get("LMOD_INIT"),
+                                     gce_state=f.get("GCE_STATE"), gce_activate=f.get("GCE_ACTIVATE"),
+                                     venv=f.get("VENV"), venv_state=f.get("VENV_STATE"))
     notes.append(env_note)
 
     alloc_cmd, alloc_parser, alloc_note = _allocation(f)
@@ -248,9 +279,10 @@ def _module_env_setup(modules: list[str], lmod_init: str | None) -> tuple[str, s
     """A `module load` based env_setup when the facility's module system (Lmod/Tmod) offers uv or a Python matching
     this client's — the site-supported way to a toolchain, ahead of curl-installing uv. None when no usable module.
 
-    The setup re-initialises the module command itself when it is missing: a compute node's batch script is NOT a
+    The prefix re-initialises the module command itself when it is missing: a compute node's batch script is NOT a
     login shell (Slurm's and PBS's start `#!/bin/bash`), so `/etc/profile.d` never ran there and `module` is
-    undefined unless the site exports BASH_ENV — `worker_init` replays env_setup exactly there."""
+    undefined unless the site exports BASH_ENV — `worker_init` replays env_setup exactly there. hpc-bridge's build runs
+    after the same prefix, so it finds the module's uv or python3."""
     modules = [m for m in modules if m and not m.endswith("/")]  # Lmod's terse `avail` also prints `name/` dir rows
     if not modules:
         return None
@@ -261,48 +293,102 @@ def _module_env_setup(modules: list[str], lmod_init: str | None) -> tuple[str, s
     py_match = [m for m in py_mods if client_py in m]
     if uv_mods:
         return (f"{init}module load {uv_mods[0]}; " + _UV_ENV_SETUP,
-                f"env_setup: no globus-compute-endpoint or uv on the default PATH, but the module system offers "
-                f"`{uv_mods[0]}` — proposed `module load {uv_mods[0]}` then the idempotent uv venv+install "
-                f"(Python {client_py}, this client's). Confirm the module name (`module avail`).")
+                "env_setup: no usable globus-compute-endpoint and no uv on the default PATH, but the module system "
+                f"offers `{uv_mods[0]}` — proposed `module load {uv_mods[0]}`, then hpc-bridge's own venv (Python "
+                f"{client_py}, this client's), which hpc-bridge builds with that uv when it starts the endpoint. "
+                "Confirm the module name (`module avail`).")
     if py_match:
         mod = py_match[0]
-        return (f"{init}module load {mod}; [ -d {{venv}} ] || python3 -m venv {{venv}}; . {{venv}}/bin/activate; "
-                f"command -v globus-compute-endpoint >/dev/null 2>&1 || pip install -q {_gce_pin()}",
-                f"env_setup: no globus-compute-endpoint or uv on the default PATH, but the module system offers "
-                f"`{mod}` (matches this client's Python {client_py}, so tasks deserialise) — proposed "
-                f"`module load {mod}`, a venv and a pip install of the endpoint. Confirm the module name "
-                "(`module avail`).")
-    if py_mods:
-        return None  # a Python module of the WRONG minor: fall through to the uv bootstrap (uv fetches the right one)
-    return None
+        return (f"{init}module load {mod}; " + _UV_ENV_SETUP,
+                "env_setup: no usable globus-compute-endpoint and no uv on the default PATH, but the module system "
+                f"offers `{mod}` (matches this client's Python {client_py}, so tasks deserialise) — proposed "
+                f"`module load {mod}`, then hpc-bridge's own venv (hpc-bridge installs uv first if the node has none: "
+                "astral.sh, else that python's pip). Confirm the module name (`module avail`).")
+    return None  # no module, or a Python module of the WRONG minor: hpc-bridge's build fetches the right one with uv
+
+
+TIMED_OUT = "timed out"  # what the probe reports when its time cap stopped a check (exit 124)
+_INSTALL_OK = re.compile(r"^(\d+\.\d+) (\S+)$")
+
+
+def _install_state(raw: str | None) -> tuple[str, str] | str | None:
+    """A probed install: `(python, gce version)` when its entry point ran, `TIMED_OUT` when the probe's time cap hit,
+    the failure's last line otherwise, None when it was not probed (no install there)."""
+    if raw is None:
+        return None
+    m = _INSTALL_OK.match(raw.strip())
+    return (m.group(1), m.group(2)) if m else (raw.strip()[:200] or "no output")
+
+
+def _clip(text: str, n: int = 70) -> str:
+    """An error quoted in a note, short: the proposal's notice is capped (1800 chars) and must keep every note."""
+    return text if len(text) <= n else text[: n - 1] + "…"
+
+
+def _venv_note(venv: str | None, state: str | None) -> str:
+    """What the first connect does with hpc-bridge's existing venv: reuse it, repair it, or refuse it."""
+    if not venv:
+        return ""
+    s = _install_state(state)
+    if s == TIMED_OUT:
+        return f" Existing venv {venv}: not checked in time (slow filesystem?); checked again at start."
+    if s == "not a venv":
+        return (f" {venv} exists and is NOT a venv: hpc-bridge will not replace it, so the start fails — move it "
+                "away, or set HPC_BRIDGE_REMOTE_VENV.")
+    want_py, want_gce = _client_python(), _gce_version()
+    if isinstance(s, tuple):
+        if s[0] == want_py and (want_gce is None or s[1] == want_gce):
+            return f" Existing venv {venv} (globus-compute-endpoint {s[1]}, Python {s[0]}) is reused."
+        return (f" Existing venv {venv} has {s[1]} on Python {s[0]}, not {want_gce or 'the pin'} on {want_py}: it "
+                "will be rebuilt at start (the old one kept).")
+    if s is not None:
+        return f" Existing venv {venv} fails its check ({_clip(s)}): it will be rebuilt at start (the old one kept)."
+    return ""
+
+
+_OWN_VENV = ("proposed hpc-bridge's own venv (built or repaired over SSH when the endpoint starts; omit env_setup "
+             "from details=)")
 
 
 def _env_setup(gce: str | None, uv: str | None, user: str, modules: list[str] | None = None,
-               lmod_init: str | None = None) -> tuple[str, str]:
-    """Propose how to put globus-compute-endpoint on PATH for the bootstrap's `bash -lc`: an endpoint already
-    there > uv on PATH > the site's module system (uv or a matching Python module) > curl-install uv."""
-    if gce:
-        if gce.endswith("/bin/globus-compute-endpoint"):
-            venv = _templatize(gce[: -len("/bin/globus-compute-endpoint")], user)
-            return f"source {venv}/bin/activate", (f"env_setup: globus-compute-endpoint already at "
+               lmod_init: str | None = None, *, gce_state: str | None = None, gce_activate: str | None = None,
+               venv: str | None = None, venv_state: str | None = None) -> tuple[str, str]:
+    """Propose how to put globus-compute-endpoint on PATH for the bootstrap's `bash -lc`: a WORKING endpoint already
+    there > hpc-bridge's own venv line (after a site module that offers uv or a matching Python, when there is no uv on
+    PATH). An install on PATH whose entry point fails, or that runs another Python than this client's (task functions
+    would not deserialise), is passed over for hpc-bridge's own venv — never repaired: it is not ours. hpc-bridge's line
+    never builds; hpc-bridge builds its venv over SSH when it starts the endpoint."""
+    found = _install_state(gce_state)
+    skip = ""
+    if gce and isinstance(found, str) and found != TIMED_OUT:
+        skip = f"globus-compute-endpoint at {gce} fails its check ({_clip(found, 50)}) — not used; "
+    elif gce and isinstance(found, tuple) and found[0] != _client_python():
+        skip = (f"globus-compute-endpoint at {gce} runs Python {found[0]}, not this client's {_client_python()} — not "
+                "used; ")
+    elif gce:
+        ver = (f" {found[1]} (Python {found[0]})" if isinstance(found, tuple) else
+               " (its check timed out, a slow filesystem? — confirm it works)" if found == TIMED_OUT else "")
+        # a venv's bin/ has `activate`; a `pip install --user` entry point in ~/.local/bin does not (the probe says)
+        if gce.endswith("/bin/globus-compute-endpoint") and gce_activate != "no":
+            path = _templatize(gce[: -len("/bin/globus-compute-endpoint")], user)
+            return f"source {path}/bin/activate", (f"env_setup: globus-compute-endpoint{ver} already at "
                     f"{gce}; proposed activating its venv — confirm.")
-        return "true", (f"env_setup: globus-compute-endpoint already on PATH ({gce}); using a no-op — "
+        return "true", (f"env_setup: globus-compute-endpoint{ver} already on PATH ({gce}); using a no-op — "
                         "confirm it's on the *bootstrap* PATH (a non-interactive `bash -lc`).")
+    ours = _venv_note(venv, venv_state)
     if uv:
-        return _UV_ENV_SETUP, ("env_setup: no globus-compute-endpoint found, but `uv` is present — "
-                               "proposed an idempotent uv create-venv+install (first connect provisions "
-                               "the toolchain).")
+        return _UV_ENV_SETUP, (f"env_setup: {skip or 'no globus-compute-endpoint found, but '}`uv` is present — "
+                               f"{_OWN_VENV}." + ours)
     via_modules = _module_env_setup(list(modules or []), lmod_init)
     if via_modules:
-        return via_modules
+        return via_modules[0], f"env_setup: {skip}" + via_modules[1].removeprefix("env_setup: ") + ours
     py_mods = [m for m in (modules or []) if _PYTHON_MODULE.match(m)]
-    hint = (f" The module system lists Python modules ({', '.join(py_mods[:4])}) but none matches this client's "
-            f"Python {_client_python()}; uv fetches a matching one." if py_mods else
+    hint = (f" Python modules ({', '.join(py_mods[:3])}) do not match this client's {_client_python()}; uv fetches "
+            "one." if py_mods else
             " If the facility provides Python/uv via `module load`, say so and use that instead.")
-    return (_BOOTSTRAP_UV_ENV_SETUP,
-            "env_setup: neither globus-compute-endpoint nor uv found — proposed installing uv into $HOME/.local/bin "
-            "(astral.sh installer, ~20 MB) and then the endpoint into a venv at this client's Python; needs outbound "
-            "HTTPS from the login and compute nodes." + hint)
+    return (_UV_ENV_SETUP,
+            f"env_setup: {skip}neither a working globus-compute-endpoint nor uv found — {_OWN_VENV}. hpc-bridge "
+            "installs uv into ~/.local/bin first (astral.sh, else pip; needs outbound HTTPS)." + hint + ours)
 
 
 def _allocation(f: dict) -> tuple[str | None, Literal["sbank", "iris", "mybalance"] | None, str | None]:

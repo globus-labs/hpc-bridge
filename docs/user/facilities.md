@@ -67,14 +67,34 @@ To make a cluster available to everyone, add it to the registry: see
 
 Read-only first: the probe runs a short shell script on the login node that prints the hostname, which
 scheduler is present (`sbatch` or `qsub`), the partitions or queues, the network interfaces, the scratch
-variables, and whether `uv` and Globus Compute are already installed. Nothing is written.
+variables, and whether `uv` and Globus Compute are already installed (and whether an install it finds
+actually works). Nothing is installed or changed (asking an existing endpoint install for its version can create an
+empty `~/.globus_compute`).
 
-Then, only after you confirm the proposed settings, the bootstrap installs `uv` if needed and creates a
-Python environment at `~/hpc-bridge/gce-venv` in your home directory there with `globus-compute-endpoint`
-in it, writes the endpoint's configuration under `~/.globus_compute/hpc-bridge-<host>/`, copies a trimmed
-Globus token store there (mode 600) so the endpoint can register, and starts the endpoint. The process you
-will see in `ps` is `globus-compute-endpoint`; it stays running on the login node between sessions so the
-next connect needs no SSH. If your facility's policy forbids persistent user processes on login nodes, ask
-the agent for a *teardown* at the end of each session; it stops and removes the endpoint. To remove
-everything, tear down, then delete `~/hpc-bridge/` and `~/.globus_compute/` there.
+Then, only after you confirm the proposed settings, hpc-bridge sets up the endpoint:
+
+- **Its Python environment.** hpc-bridge keeps one in your home directory there, under `~/hpc-bridge/`, named
+  for the endpoint version and Python it was built for (for example `gce-venv-endpoint-4.18.0-py3.13`). It checks
+  that environment each time it starts the endpoint, and builds a new one when it is missing or broken, with `uv`
+  (installing `uv` into `~/.local/bin` first if the login node has none, without editing your shell profiles). The new one is built beside the old, under
+  a name ending in `.build.<token>`, checked, and only then renamed into place; a broken one it replaces is kept
+  under a name ending in `.broken.<time>`, and a build that fails under `.failed.<time>`. Nothing is deleted. A newer
+  endpoint version or Python gets a new environment beside the old ones, since an endpoint may still be running from
+  them. Remove the ones you no longer use if your home quota is tight. If you prepare an environment yourself at
+  `HPC_BRIDGE_REMOTE_VENV` (the same endpoint version and Python as your client), hpc-bridge uses it instead of
+  building one: a login node without internet access works that way.
+- **The endpoint.** It writes the endpoint's configuration under `~/.globus_compute/hpc-bridge-<host>/`, copies a
+  trimmed Globus token store there (mode 600) so the endpoint can register, and starts the endpoint. The process you
+  will see in `ps` is `globus-compute-endpoint`; it stays running on the login node between sessions so the next
+  connect needs no SSH.
+
+The environment line hpc-bridge proposes (`env_setup`) only activates that environment; it never installs
+anything. On a compute node it also checks that the environment runs there, and if it does not (built on a login
+node of another CPU type, for instance), the job ends at once with one line saying so. You do not need to copy that
+line anywhere: when you accept a proposed configuration, the agent leaves it out and hpc-bridge keeps the one it
+proposed.
+
+If your facility's policy forbids persistent user processes on login nodes, ask the agent for a *teardown* at the
+end of each session; it stops and removes the endpoint. To remove everything, tear down, then delete
+`~/hpc-bridge/` and `~/.globus_compute/` there.
 

@@ -16,6 +16,7 @@ re-exports every name for imports.
 """
 from __future__ import annotations
 
+import inspect
 import re
 import time
 
@@ -468,6 +469,11 @@ async def _provision(
             app.state = EndpointState(endpoint_id=handle.endpoint_id, reused=handle.reused)
     try:
         block, app.state = await ensure_warm(app.facility, app.profile, app.state)
+        # Before the first runner for this endpoint exists: learn the worker_init the endpoint was configured with, so
+        # its tasks carry that one (an SSH facility; once per endpoint id). Every path to an endpoint id passes here.
+        adopt = getattr(app.facility, "adopt_endpoint", None)
+        if app.state.endpoint_id and inspect.iscoroutinefunction(adopt):
+            await adopt(app.state.endpoint_id)
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)

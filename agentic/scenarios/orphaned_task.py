@@ -7,6 +7,7 @@ the agent's first `poll_task` fires the hook (`globus-compute-endpoint stop <thi
 (server._poll_task via warmth._endpoint_gone) → the agent reports it once, calls stop_endpoint (which answers
 OFFLINE/ORPHANED, down) and finishes. Before hooks (review 2026-09-05, N6) this verdict existed only hermetically.
 """
+from cluster_ops import GCE
 from invariants import Result, Trace, texts_mention
 
 _MARK = "HPCB_CHAOS"
@@ -33,7 +34,8 @@ POSTCHECK_DELAY_S = 90     # the block's worker pool exits once its manager is g
 
 MIDRUN_HOOKS = [
     {"name": "kill_manager", "after_tool": "poll_task", "nth": 1,
-     "cmd": "$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped"},
+     # the endpoint's venv is keyed by version (gce-venv-endpoint-<gce>-py<X.Y>); GCE finds the one that runs
+     "cmd": f"{GCE} stop {{endpoint_name}} >/dev/null 2>&1; echo manager-stopped"},
 ]
 
 

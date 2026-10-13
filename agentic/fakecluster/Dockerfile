@@ -18,8 +18,8 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
         curl ca-certificates git iproute2 iputils-ping procps less nano \
     && rm -rf /var/lib/apt/lists/*
 
-# uv — hpc-bridge's discover-first flow proposes an env_setup that self-provisions the
-# globus-compute-endpoint venv with `uv venv` + `uv pip install` (see discovery._UV_ENV_SETUP).
+# uv — hpc-bridge builds its globus-compute-endpoint venv over SSH with `uv venv` + `uv pip install` when it starts the
+# endpoint (facility/endpoint_venv.py); the env_setup discovery proposes only activates it.
 COPY --from=ghcr.io/astral-sh/uv:0.12.9 /uv /uvx /usr/local/bin/
 # Lmod is installed for every profile but ENABLED only by one (profiles/lmod): its /etc/profile.d hooks are parked, so
 # the `module` command does not exist unless a profile puts them back. The module-served Python (3.11 — the jail's,

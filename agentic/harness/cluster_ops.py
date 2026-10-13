@@ -15,8 +15,76 @@ from __future__ import annotations
 
 import re
 import shlex
+import subprocess
+import sys
+from pathlib import Path
 
-GCE = "$HOME/hpc-bridge/gce-venv/bin/globus-compute-endpoint"
+# A working endpoint CLI on the pool user's node: the first hpc-bridge venv under ~/hpc-bridge whose entry point runs —
+# the keyed ones (`gce-venv-endpoint-<gce>-py<X.Y>`, newest version first, `sort -V`), then the unkeyed `gce-venv` that
+# plugins up to 0.1.23 built — skipping builds in progress (`.build.*`) and moved-aside ones (`.broken.*`,
+# `.failed.*`). The same candidates and skips as the plugin's teardown (hpc_bridge.facility.endpoint_venv.find_script),
+# but not its order: the plugin tries the venv its endpoint was started with first, which the harness does not know.
+# Any working CLI can stop/delete an endpoint by name, so the order only picks among working ones. Prints the entry
+# point's path (nothing when none runs); `GCE` is that, quoted, as a drop-in for the old fixed path.
+GCE_FIND = (
+    'for d in $(ls -d "$HOME"/hpc-bridge/gce-venv-endpoint-* 2>/dev/null | sort -rV) "$HOME/hpc-bridge/gce-venv"; do '
+    "case $d in (*.build.*|*.broken.*|*.failed.*|*.lock|*.old.*) continue;; esac; "
+    '"$d/bin/globus-compute-endpoint" version >/dev/null 2>&1 && { echo "$d/bin/globus-compute-endpoint"; break; }; '
+    "done"
+)
+GCE = f'"$({GCE_FIND})"'
+
+
+def restore_planted_entry_points_cmd() -> str:
+    """Put back what `venv_arch_mismatch` plants, in case its cell was killed before its CLEANUP: the keyed venv's real
+    entry point (moved to `bin/.gce-real` behind a wrapper that fails off the login node) and its arch marker. Runs
+    before every cell on a pool user; a no-op when nothing is planted."""
+    return ('n=0; for r in "$HOME"/hpc-bridge/gce-venv-endpoint-*/bin/.gce-real; do [ -e "$r" ] || continue; '
+            'd="${r%/bin/.gce-real}"; mv -f "$r" "$d/bin/globus-compute-endpoint" && uname -m > "$d/.hpcb-arch" && '
+            'n=$((n+1)); done; echo "planted entry points restored: $n"')
+
+
+def plugin_versions(repo_root: Path | None = None) -> tuple[str, str]:
+    """(endpoint version, Python X.Y) the plugin under test keys its endpoint venv by: the SDK pin in pyproject.toml (the
+    jail's locked install) and the Python of the repo's `.venv` (`uv run` serves the plugin from it), else this
+    interpreter's. A scenario that plants something in that venv needs its exact path."""
+    root = repo_root or Path(__file__).resolve().parents[2]
+    m = re.search(r'"globus-compute-sdk==([\w.]+)"', (root / "pyproject.toml").read_text())
+    gce = m.group(1) if m else "unknown"
+    py = f"{sys.version_info.major}.{sys.version_info.minor}"
+    venv_py = root / ".venv" / "bin" / "python"
+    if venv_py.exists():
+        try:
+            out = subprocess.run([str(venv_py), "-c", "import sys;print('%d.%d' % sys.version_info[:2])"],
+                                 capture_output=True, text=True, timeout=30, check=False).stdout.strip()
+        except Exception:  # noqa: BLE001 - an unusable .venv: this interpreter's version stands
+            out = ""
+        py = out if re.fullmatch(r"\d+\.\d+", out) else py
+    return gce, py
+
+
+def keyed_endpoint_venv(gce: str, python: str) -> str:
+    """The plugin's keyed endpoint venv on a cluster whose home is `$HOME` (the default `{venv}`), as a remote path."""
+    return f"$HOME/hpc-bridge/gce-venv-endpoint-{gce}-py{python}"
+
+
+def locked_globus_sdk(repo_root: Path | None = None) -> str | None:
+    """The globus-sdk version uv.lock pins: the one the plugin co-pins in the endpoint venv it builds."""
+    root = repo_root or Path(__file__).resolve().parents[2]
+    m = re.search(r'^name = "globus-sdk"\nversion = "([^"]+)"', (root / "uv.lock").read_text(), re.M)
+    return m.group(1) if m else None
+
+
+def build_endpoint_venv_cmd(gce: str, python: str, sdk: str | None = None) -> str:
+    """Make sure the keyed venv exists and runs, built as the plugin builds it (relocatable, no package cache, files
+    copied, globus-sdk co-pinned; here in place, as a harness shortcut) — for a scenario that then plants a break in
+    it. Leaves a working one as it is."""
+    k = keyed_endpoint_venv(gce, python)
+    reqs = f'"globus-compute-endpoint=={gce}"' + (f' "globus-sdk=={sdk}"' if sdk else "")
+    return (f'K="{k}"; "$K/bin/globus-compute-endpoint" version >/dev/null 2>&1 || {{ rm -rf "$K"; '
+            f'mkdir -p "$HOME/hpc-bridge" && uv venv -q --relocatable --no-cache --python {python} "$K" && '
+            f'uv pip install -q --no-cache --link-mode=copy --python "$K/bin/python" {reqs}; }} && '
+            '"$K/bin/globus-compute-endpoint" version')
 
 
 def endpoint_uuid_cmd(endpoint_name: str) -> str:
@@ -132,8 +200,10 @@ _PS_LISTING = 'ps -ww -u "$(whoami)" -o pid=,args='
 # Keeps only processes that ARE a Globus Compute endpoint of this run, read off `ps -o pid=,args=` lines. ANCHORED:
 #  - a process TITLE the daemon sets — args START with `Globus Compute Endpoint` (`… *(<uuid>, <name>) [state]`); or
 #  - an entry-point COMMAND LINE — one of the first three words is `globus-compute-endpoint` (`<python> <gce> start
-#    <name>`, `<gce> _start-user-endpoint …`) or a `globus_compute_endpoint…` module (`python -m …`), and the first
-#    word is not a shell.
+#    <name>`, `<gce> _start-user-endpoint …`; uv's trampoline in a keyed `gce-venv-endpoint-*` venv execs
+#    `<venv>/bin/python <venv>/bin/globus-compute-endpoint …`), `.gce-real` (venv_arch_mismatch's real entry point,
+#    moved aside behind its wrapper: `<venv>/bin/python <venv>/bin/.gce-real start <name>` until the daemon sets its
+#    title) or a `globus_compute_endpoint…` module (`python -m …`), and the first word is not a shell.
 # …that names this run: the endpoint name as a whole token, or `uep.<eid>` (a user endpoint the manager forked is
 # named `uep.<manager uuid>.<config hash>`). Why anchored: a shell whose args merely CONTAIN the text — the stop
 # guard's own `bash -c "… globus-compute-endpoint stop <name> …"` and its `$(…)` subshells — matched an unanchored
@@ -157,7 +227,7 @@ function tok(s, t,   i, j, b, a) {
   if (base($2) !~ /^-?(ba|da|z|k|c|tc)?sh$/)
     for (k = 2; k <= 4 && k <= NF; k++) {
       w = base($k)
-      if (w == "globus-compute-endpoint" || index(w, "globus_compute_endpoint") == 1) entry = 1
+      if (w == "globus-compute-endpoint" || w == ".gce-real" || index(w, "globus_compute_endpoint") == 1) entry = 1
     }
   if (!title && !entry) next
   hit = tok(args, n)

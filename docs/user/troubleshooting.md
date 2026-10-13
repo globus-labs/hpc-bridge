@@ -45,6 +45,38 @@ it finish the connect. If it says a connect is **waiting on a one-time login**, 
 the agent the current one-time code, or run the `ssh` command it shows in your own terminal, then let
 it connect again. Connecting again before that only repeats the failed login.
 
+**"could not build hpc-bridge's endpoint venv for <path>"** (SSH facility). Each time hpc-bridge starts the
+endpoint it checks the Python environment it keeps on the login node (under `~/hpc-bridge/`), and builds a new one
+when it is missing or broken. This time the build failed; the message ends with the build's own last error line: no
+network to PyPI (or to astral.sh when `uv` is being installed), a full home quota, or a home directory that is not
+where hpc-bridge expects it (`Permission denied` creating `/home/<you>/hpc-bridge`: set `HPC_BRIDGE_REMOTE_VENV` to a
+path under your real home). The message says where the failed build is kept (`<path>.failed.<time>`), if anything
+of it was made, and the environment that was there before is left as it was. Fix the cause and connect again. A login node with no internet can still be used: put a
+venv with `globus-compute-endpoint` at `HPC_BRIDGE_REMOTE_VENV` yourself (same endpoint version and Python as your
+client); hpc-bridge uses it when it passes the same check.
+
+**"this node's uv (…) is too old to build hpc-bridge's venv"**. The login node's own `uv` predates
+`uv venv --relocatable` (0.2.31). Upgrade it (`uv self update`, or a newer site module), or remove it from your PATH
+there so hpc-bridge installs its own into `~/.local/bin`, and connect again. Nothing was started.
+
+**"<path> exists and is not a venv"**. Something other than a Python environment sits where hpc-bridge keeps its
+own; hpc-bridge never replaces it. Move it, or set `HPC_BRIDGE_REMOTE_VENV` to another path, and connect again.
+
+**"another bring-up put a venv at <path> first, and it fails its check"**. Two sessions built the environment at the
+same moment and the other one's arrived first but does not work. Connect again; hpc-bridge builds a working one.
+
+**"checking hpc-bridge's endpoint venv … timed out"**. The login node's filesystem was too slow to answer within a
+minute. Nothing was changed; connect again shortly.
+
+**"this endpoint was started with a different env_setup"**. The facility's `env_setup` was changed, but the endpoint
+was already running and is being reused, so its blocks keep the environment it was started with. That only matters
+if its blocks fail or you meant the change: then ask the agent to tear the endpoint down and connect again.
+
+**"no working globus-compute-endpoint venv of hpc-bridge's"** (teardown). A teardown never builds an environment.
+It runs the endpoint's command in the environment the endpoint was started with, even after a reconnect changed
+`env_setup`, and none under `~/hpc-bridge/` answered. The endpoint's blocks were cancelled; stop the `globus-compute-endpoint`
+process on the login node yourself, and the next connect builds a fresh environment.
+
 ## While a block is starting
 
 **"allocating nodes"** is a normal queue wait; the agent polls. Two variants are not:
@@ -57,6 +89,19 @@ it connect again. Connecting again before that only repeats the failed login.
 
 **"reports OFFLINE"** on a facility-run endpoint. The facility's endpoint is down. Only the facility
 can restart it.
+
+**A pilot "already FINISHED" whose job said "hpc-bridge: endpoint venv <path> (built on <arch>) does not run on
+<node> (<arch>)"**. The compute node cannot use the environment hpc-bridge built on the login node, and the job
+stopped there rather than fail later; a new block fails the same way. If the two architectures differ (built on
+`x86_64`, the node `aarch64`, as on a cluster with x86 login nodes and Arm compute nodes), that partition's nodes are a
+different CPU type from the login node, and rebuilding does not help: the environment is built on the login node
+again. Choose a partition of the login node's type, or the facility's own multi-user endpoint if `list_facilities`
+shows one (its workers bring their own environment). Changing `env_setup` does not fix it: the running endpoint keeps
+the environment it was started with, and an empty or hand-written one only means hpc-bridge builds no venv. If the
+facility provides an environment for both (a site `module load`), tear the endpoint down first, then connect with that
+`env_setup`. hpc-bridge cannot yet build a second environment for them. If they match, the
+environment runs on the login node but not on that node (the line above it in the job's error output says why): ask
+the agent to tear the endpoint down and connect again, which rebuilds it if it is broken on the login node too.
 
 ## During and after work
 

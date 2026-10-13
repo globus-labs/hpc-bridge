@@ -55,6 +55,15 @@ def _reuse_note(app: AppCtx, facility: str, reused: bool, fac) -> str:
         return "reused the already-online endpoint (zero-SSH reconnect). "
     return _first_contact_note(fac)
 
+def _venv_note(fac) -> str:
+    """What this bring-up did to hpc-bridge's endpoint venv, when it built one (a first build, or a repair)."""
+    res = getattr(getattr(fac, "cli", None), "venv_built", None)
+    if res is None or not getattr(res, "built", False):
+        return ""
+    aside = f"; the broken one was moved to {res.moved_aside}" if getattr(res, "moved_aside", None) else ""
+    return f"built hpc-bridge's endpoint venv {res.path} ({res.reason}){aside}. "
+
+
 def _master_alive(target) -> bool:
     """Is a shared SSH connection (ControlMaster) already open for `target`? `ssh -O check` against its socket."""
     import subprocess
@@ -150,6 +159,23 @@ async def _connect_facility(
         # match, so a correction after discovery actually takes effect. Previously the cached entry
         # (frozen on the FIRST call — even one that later failed) silently won, so a wrong field could
         # never be fixed and stranded the whole session (seen live on Midway).
+        if details.env_setup is None:
+            # env_setup is optional after a proposal: the proposal's line is used, never an agent's copy of it
+            draft = app.proposed_drafts.get(facility)
+            if draft is None or draft.env_setup is None:
+                return ConnectFacilityResult(
+                    phase="failed", facility=facility,
+                    notice=("details= has no env_setup and there is no proposal for this facility to take it from. "
+                            f"Call connect_facility({facility!r}, ssh_host=…) without details for a proposed config, "
+                            "or give env_setup. Nothing was started."))
+            if draft.ssh_host != details.ssh_host:
+                return ConnectFacilityResult(
+                    phase="failed", facility=facility,
+                    notice=(f"details= has no env_setup, and the proposal for {facility!r} was for {draft.ssh_host!r}, "
+                            f"not {details.ssh_host!r}: its env_setup may not fit. Give env_setup, or call "
+                            f"connect_facility({facility!r}, ssh_host={details.ssh_host!r}) for a proposal for that "
+                            "host. Nothing was started."))
+            details = details.model_copy(update={"env_setup": draft.env_setup})
         try:
             entry = binding._entry_from_details(facility, details)
         except Exception as exc:  # noqa: BLE001 - bad details -> structured failure, not a crash
@@ -273,7 +299,9 @@ async def _connect_facility(
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
         if block == "warm":
             _commit_proven_facility(app, facility)
-    reuse_note = login_note + _reuse_note(app, facility, app.state.reused, fac)
+    wi_note = getattr(fac, "worker_init_note", "")  # an edited env_setup that a reused endpoint does not run
+    reuse_note = (login_note + _reuse_note(app, facility, app.state.reused, fac)
+                  + (wi_note if isinstance(wi_note, str) else "") + _venv_note(fac))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities
@@ -415,15 +443,33 @@ async def _propose_or_ask(
     notice = (
         "probed the login node and proposed this config — review/correct it WITH THE USER "
         "(confirm the flagged fields, above all `interface`), then call connect_facility(details=…). "
+        "Leave env_setup OUT of details= unless the user wants to change it: the server keeps the proposed one. "
         "The probe has already run: do NOT re-probe the host over your own ssh. The confirmation must come "
         "from the user in THIS conversation — a remembered or previously cached confirmation is not consent. "
-        "Notes: " + " | ".join(notes)
+        "Notes: " + " | ".join(_fit_notes(notes, _PROPOSAL_CAP - 600))
     )
     if app is not None:  # nothing is bound by a proposal: a run_shell meanwhile is told to finish this connect
         app.proposed_facility = facility
+        app.proposed_drafts[facility] = draft  # a details= without env_setup takes this one
     return ConnectFacilityResult(
         phase="proposed_facility_details",
         facility=facility,
         proposed_details=draft,
-        notice=notice[:1800],
+        notice=notice[:_PROPOSAL_CAP],
     )
+
+
+_PROPOSAL_CAP = 1800  # the proposal's notice; its fixed head is under 600 chars
+
+
+def _fit_notes(notes: list[str], budget: int) -> list[str]:
+    """Every note keeps its start: when they run over `budget`, the longest are clipped first (never below 120 chars),
+    instead of the notice losing its last notes to a blind cut. Bounded: each note is clipped at most once."""
+    out = list(notes)
+    for i in sorted(range(len(out)), key=lambda j: -len(out[j])):
+        over = sum(len(n) for n in out) + 3 * max(len(out) - 1, 0) - budget
+        if over <= 0:
+            break
+        if len(out[i]) > 120:
+            out[i] = out[i][: max(120, len(out[i]) - over - 1)] + "…"
+    return out

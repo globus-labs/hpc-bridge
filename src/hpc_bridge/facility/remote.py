@@ -37,7 +37,9 @@ from ..state import EndpointRecord, LoginNodeStore
 
 if TYPE_CHECKING:
     from ..catalog.entry import CatalogEntry
-from .base import EndpointHandle
+from . import endpoint_venv
+from .base import EndpointHandle, endpoint_metadata
+from .endpoint_venv import DEFAULT_REMOTE_VENV, managed_venv, migrate_env_setup, safe_base, shell_path
 
 # A Globus endpoint UUID — scopes the per-UEP pidfile-cleanup glob to one endpoint, and refuses to
 # build a remote glob from anything that isn't a plain UUID.
@@ -349,13 +351,19 @@ def profile_from_catalog_entry(
 
     The catalog stores user-agnostic templates; this resolves them at provision time:
     ``{user}`` is the SSH login user and ``{venv}`` is the remote globus-compute-endpoint venv
-    (defaults to the ``/home/{user}/hpc-bridge/gce-venv`` convention). ``account`` and the derived
+    (defaults to the ``/home/{user}/hpc-bridge/gce-venv`` convention; a leading ``~/`` becomes ``$HOME/``, since
+    hpc-bridge's line quotes it). ``account`` and the derived
     ``worker_init`` (= the resolved ``env_setup``, replayed on the compute worker) are supplied
     here, never stored in the catalog. ``partition`` overrides the entry's default when given.
     Substitution uses ``str.replace`` (not ``str.format``) so literal shell braces in ``env_setup``
     are left untouched.
+
+    Upgrade-on-read: an env_setup an earlier hpc-bridge generated (EXACTLY: discovery's guarded uv/pip lines, the
+    0.1.23 Expanse seed) becomes hpc-bridge's short line here, and that line is keyed to this client's endpoint
+    version and Python (`endpoint_venv.migrate_env_setup`). The registry and facilities.json keep their text, so an
+    older plugin reading them is unaffected. Hand-written text is used exactly as given.
     """
-    venv = venv or f"/home/{user}/hpc-bridge/gce-venv"
+    venv = shell_path(venv or DEFAULT_REMOTE_VENV.replace("{user}", user))
 
     def _resolve(template: str) -> str:
         # Accept the plugin template ({user}/{venv}) AND the natural shell idiom ($USER/${USER}) —
@@ -370,7 +378,11 @@ def profile_from_catalog_entry(
     # shared name collides (stale-reuse → stuck "provisioning"). A seed that omits endpoint_name
     # derives hpc-bridge-<id> here; session entries already set it explicitly.
     kw["endpoint_name"] = kw["endpoint_name"] or f"hpc-bridge-{entry.id}"
-    kw["env_setup"] = _resolve(kw["env_setup"])
+    template = migrate_env_setup(kw["env_setup"])
+    if endpoint_venv.is_line(template) and "{venv}" in template and not safe_base(venv):
+        raise ValueError(f"the remote venv path {venv!r} (HPC_BRIDGE_REMOTE_VENV) must be an absolute or $HOME/ path "
+                         "with no spaces, quotes, `$` or backslashes: hpc-bridge's env_setup quotes it")
+    kw["env_setup"] = _resolve(template)
     kw["scratch_root"] = _resolve(kw["scratch_root"])
     if partition:
         kw["partition"] = partition
@@ -410,6 +422,13 @@ class RemoteEndpointCLI:
         self.gce_python: str | None = None  # python3 inside the gce environment, seen by whoami (it has sqlite3)
         self.env_setup = env_setup
         self.remote_dir = remote_dir
+        # hpc-bridge's own venv when env_setup is its line (None: a hand-written env_setup, used as given, never built)
+        self.venv = managed_venv(env_setup)
+        self.venv_ready: str | None = None  # the venv this process checked or built: it works
+        self.venv_built: endpoint_venv.EnsureResult | None = None  # what the last bring-up's ensure did
+        # teardown: run the CLI in this environment instead of env_setup's (`use_working_venv`): the one the endpoint
+        # was started with, or a working venv of hpc-bridge's
+        self._prefix_override: str | None = None
 
     async def _gce(self, *args: str, timeout: float = 120.0) -> tuple[int, str, str]:
         inner = (f"export COLUMNS={_GCE_COLUMNS}; {self._env_prefix()}globus-compute-endpoint "
@@ -418,9 +437,97 @@ class RemoteEndpointCLI:
 
     def _env_prefix(self) -> str:
         """`<env_setup> && ` — or nothing when the entry has no env_setup (a bare `&& gce …` is a shell
-        syntax error; an Expanse probe with neither uv nor gce proposed "" — live 2026-09-04)."""
+        syntax error; an Expanse probe with neither uv nor gce proposed "" — live 2026-09-04). A teardown runs the CLI
+        where `use_working_venv` found it instead."""
+        if self._prefix_override is not None:
+            return self._prefix_override
         es = (self.env_setup or "").strip()
         return f"{es} && " if es else ""
+
+    async def _venv_run(self, step: str, script: str, timeout: float) -> tuple[int, str, str]:
+        """One step of the endpoint-venv check/build (`endpoint_venv`), as `bash -lc` over this target."""
+        return await ssh_exec(self.target, f"bash -lc {shlex.quote(script)}", timeout=timeout)
+
+    async def ensure_venv(self) -> None:
+        """Bring-up only (before whoami/configure/start): make hpc-bridge's keyed venv serve this client — checked
+        through its entry point, and only when the check fails built beside it and renamed into place
+        (`endpoint_venv.ensure`). A hand-written env_setup is not ours and is left alone. Once per process."""
+        self.end_teardown()  # a bring-up runs in env_setup's environment, never in a torn-down endpoint's
+        if self.venv is None or self.venv_ready:
+            return
+        res = await endpoint_venv.ensure(
+            self._venv_run, self.venv, host=self.target.host, gce=self.venv.gce, python=self.venv.python,
+            sdk=endpoint_venv.client_sdk())
+        self.venv_ready, self.venv_built = res.path, res
+
+    def end_teardown(self) -> None:
+        """Back to env_setup's environment: what `use_working_venv` chose serves one teardown only."""
+        self._prefix_override = None
+
+    def _run_in(self, line: str) -> str | None:
+        """The prefix override that runs the CLI after `line` (None: env_setup itself; "": no setup at all)."""
+        line = line.strip()
+        if line == (self.env_setup or "").strip():
+            return None
+        return f"{line} && " if line else ""
+
+    async def use_working_venv(self, started: str | None = None) -> tuple[bool, str]:
+        """Teardown (stop/delete/list), which never builds: run the CLI in the environment the endpoint was STARTED
+        with — `started`, its own configured worker_init when known ("" = started with none), else this facility's
+        env_setup. A reconnect may have changed env_setup since (emptied it, or written one by hand), and that
+        environment may not have the CLI at all (live on globus1, 2026-10-13: `globus-compute-endpoint: command not
+        found`, and the endpoint kept running). The choice lasts until `end_teardown` (teardown's `finally`, and every
+        bring-up's `ensure_venv`).
+
+        - Started with a hand-written line, or none: exactly that, no search.
+        - Started with hpc-bridge's line (a line an earlier plugin generated is read as the short one, never run: it
+          builds): its venv if this process checked exactly that one, else the first hpc-bridge venv whose entry
+          point runs — the line's keyed venv, its unkeyed `{venv}`, the default `$HOME/hpc-bridge/gce-venv`, then any
+          other `<base>-endpoint-*` (an endpoint an older plugin started runs from another one).
+        - The start unknown: the same search from env_setup's venv when it is hpc-bridge's line, else from the
+          default.
+        - The search can't tell (its ssh timed out, a candidate only ran out of time, the deadline left some untried),
+          or nothing says it is ours and none of hpc-bridge's runs: the line it was started with, else env_setup.
+
+        Returns (usable, why-not); `why-not` starts with "ssh:" when ssh itself failed."""
+        self.end_teardown()
+        known = started is not None
+        line = (started or "").strip()
+        own = managed_venv(line) if line else None  # hpc-bridge's line, keyed exactly as the endpoint was started
+        if line and own is None:  # a line an earlier hpc-bridge generated: read as the short one
+            migrated = migrate_env_setup(line).strip()
+            if (own := managed_venv(migrated)) is not None:
+                line = migrated
+        if known and own is None:  # started with a hand-written env_setup, or none: that environment, as given
+            self._prefix_override = self._run_in(line)
+            return True, ""
+        mv, mv_line = (own, line) if own is not None else (self.venv, self.env_setup or "")
+        if mv is not None and self.venv_ready and mv == self.venv:
+            return True, ""  # this process checked (or built) exactly this venv, with this site prefix
+        fallback = mv is None
+        if mv is None:  # nothing says it is ours: search where hpc-bridge puts its venv by default
+            mv = managed_venv(endpoint_venv.short_env_setup(endpoint_venv.HOME_VENV))
+            assert mv is not None  # hpc-bridge's own line parses back
+        undecided = None if fallback else self._run_in(mv_line)  # the line it was started with, else env_setup
+        try:
+            found = await endpoint_venv.find_working(self._venv_run, mv, (endpoint_venv.HOME_VENV,))
+        except TimeoutError:  # a slow login node: can't tell — try the stop rather than give up
+            self._prefix_override = undecided
+            return True, ""
+        if found.rc == 255:
+            return False, "ssh: " + (found.err or "").strip()[:400]
+        if found.cli is None:
+            if found.unknown or fallback:  # can't tell, or nothing of hpc-bridge's runs: the stop is tried anyway
+                self._prefix_override = undecided
+                return True, ""
+            return False, (f"no working globus-compute-endpoint venv of hpc-bridge's beside {mv.base} on "
+                           f"{self.target.host} (a teardown never builds one)")
+        if found.cli == mv.key and not fallback:  # the line's own venv: through the line itself
+            self._prefix_override = self._run_in(mv_line)
+        else:  # activate it the way the line does, after the site's own prefix
+            self._prefix_override = (f'{mv.prefix}unset PYTHONHOME; export VIRTUAL_ENV="{found.cli}" '
+                                     f'PATH="{found.cli}/bin:$PATH" && ')
+        return True, ""
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Run a read-only command on the login node over SSH for facility discovery
@@ -894,6 +1001,40 @@ engine:
 """
 
 
+# Our template's worker_init line; its default literal is the endpoint's own worker_init as configured (one JSON
+# encoding from plugins up to 0.1.23, two since).
+_WORKER_INIT_LINE = re.compile(r"^\s*worker_init: \{\{ worker_init \| default\((.+)\) \}\}\s*$", re.M)
+
+
+def configured_worker_init(template: object, *, prefer: str | None = None) -> str | None:
+    """The worker_init an endpoint was configured with, read from its published UEP template (`get_endpoint_metadata`
+    → `user_config_template`), or None when that is not one of ours or cannot be read. The default is encoded once
+    (plugins up to 0.1.23) or twice (since): when a once-encoded value is itself a JSON string, both readings are
+    possible, and the one equal to `prefer` (the profile's worker_init) wins; else the twice-encoded reading."""
+    if not isinstance(template, str):
+        return None
+    m = _WORKER_INIT_LINE.search(template)
+    if m is None:
+        return None
+    try:
+        value = json.loads(m.group(1))
+    except ValueError:
+        return None
+    if not isinstance(value, str):
+        return None
+    readings = [value]
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        try:
+            inner = json.loads(value)
+        except ValueError:
+            inner = None
+        if isinstance(inner, str):
+            readings.insert(0, inner)
+    if prefer is not None and prefer in readings:
+        return prefer
+    return readings[0]
+
+
 # ---------------------------------------------------------------- the facility
 
 
@@ -919,10 +1060,55 @@ class SlurmFacility:
         # The catalog entry's `auth_method` ("ssh-key" | "mfa-otp"): the ops that MUST SSH (bootstrap, teardown)
         # consult it to raise the one-time-code handoff BEFORE a failing attempt, instead of after one.
         self.auth_method = auth_method
+        # The endpoint's own configured worker_init (adopt_endpoint read it, or provision started it with the
+        # profile's), sent with every task in place of the profile's: its blocks keep the environment its manager was
+        # started with, and teardown runs the CLI there. None ⇒ unknown, the profile's is sent.
+        self.endpoint_worker_init: str | None = None
+        self.worker_init_note = ""  # set when the endpoint's own differs from this facility's env_setup
+        self._adopted: str | None = None  # the endpoint id whose worker_init is known (READ, or started here)
 
     @property
     def scratch_root(self) -> str | None:
         return self.profile.scratch_root
+
+    async def adopt_endpoint(self, endpoint_id: str) -> None:
+        """Learn the bound endpoint's own worker_init from its published template, once per endpoint id (best-effort:
+        unreadable ⇒ the profile's is sent, as before). An edited env_setup does not reach a reused endpoint's blocks —
+        its manager and UEP template still run the old one — so `worker_init_note` says so. A difference that is only
+        the upgrade-on-read (a line an earlier hpc-bridge generated, which this plugin reads as its short line) is not
+        an edit and gets no note."""
+        if endpoint_id == self._adopted:
+            return
+        self.endpoint_worker_init, self.worker_init_note = None, ""
+        try:
+            md = await endpoint_metadata(self._client_factory, endpoint_id)
+        except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
+            return
+        self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
+        own = configured_worker_init(md.get("user_config_template"), prefer=self.profile.worker_init)
+        if own is None:
+            return
+        self.endpoint_worker_init = own
+        if own != self.profile.worker_init and migrate_env_setup(own) != self.profile.worker_init:
+            self.worker_init_note = (
+                "this endpoint was started with a different env_setup than this facility's current one, and its "
+                "blocks keep the one it was started with. Only if its blocks fail or you changed env_setup: "
+                "teardown_endpoint, then connect_facility, to start it with the current one. ")
+            if endpoint_venv.is_line(migrate_env_setup(own)) and not endpoint_venv.is_line(self.profile.worker_init):
+                # hpc-bridge's own line replaced by an empty or hand-written one, on a running endpoint (live on
+                # globus1, 2026-10-13: an agent emptied env_setup to "fix" an architecture mismatch)
+                self.worker_init_note += (
+                    "WARNING: the current env_setup is not hpc-bridge's own line, and this endpoint is running from "
+                    "hpc-bridge's venv. hpc-bridge neither builds nor checks a venv for it, so a new bring-up with it "
+                    "fails unless it provides globus-compute-endpoint itself. It cannot fix a pilot that says its venv "
+                    "does not run on the compute nodes' architecture (that notice says what can). Teardown still "
+                    "stops this endpoint through the venv it was started with. ")
+
+    def dispatch_uec(self, uec: dict) -> dict:
+        """The config sent with a task: the endpoint's own worker_init when known (see adopt_endpoint)."""
+        if self.endpoint_worker_init is None or "worker_init" not in uec:
+            return uec
+        return {**uec, "worker_init": self.endpoint_worker_init}
 
     def config_template(self, hpc: Profile) -> tuple[str, dict]:
         """Return (jinja_template_str, default_user_opts) for the UEP template.
@@ -956,13 +1142,18 @@ class SlurmFacility:
             "@@PARTITION@@": json.dumps(p.partition),
             "@@ACCOUNT@@": json.dumps(p.account),
             "@@WALLTIME@@": json.dumps(p.walltime),
-            "@@WORKER_INIT@@": json.dumps(p.worker_init),
+            # Encoded twice, so the default reaches the YAML as a quoted scalar, as a sanitized UEC value does (a plain
+            # one breaks on the `: ` hpc-bridge's env_setup line contains). It is the fallback for a task whose config
+            # carries no worker_init; `configured_worker_init` reads it back (either encoding).
+            "@@WORKER_INIT@@": json.dumps(json.dumps(p.worker_init)),
             "@@EAGER@@": str(eager),
             "@@NODES@@": str(p.nodes_per_block),
             "@@MAXBLK@@": str(p.max_blocks),
         }
         for token, value in subs.items():
             template = template.replace(token, value)
+        # These ride every task's user_endpoint_config. `worker_init` is the profile's here; `dispatch_uec` sends the
+        # endpoint's OWN configured one instead once `adopt_endpoint` has read it.
         defaults: dict = {
             "interface": p.interface,
             "partition": p.partition,
@@ -999,6 +1190,8 @@ class SlurmFacility:
         reused = await self.find_online_endpoint(self.profile.endpoint_name)
         if reused is not None:
             return EndpointHandle(endpoint_id=reused, name=self.profile.endpoint_name, reused=True)
+        # hpc-bridge's own venv, checked (and built only when the check fails) before anything runs through it
+        await self._ensure_venv()
         store, alias = self.store, self.alias
         # ONE read of what an earlier run recorded, before anything below rewrites it: who placed the remote token
         # store, and which node the endpoint was pinned to (review 2026-10-05).
@@ -1056,6 +1249,11 @@ class SlurmFacility:
             )
         return handle
 
+    async def _ensure_venv(self) -> None:
+        ensure = getattr(self.cli, "ensure_venv", None)
+        if ensure is not None:
+            await ensure()
+
     def _seeded_by_us(self) -> bool:
         """Did hpc-bridge place the remote token store? This process remembers its own bootstrap; across
         sessions the endpoint record does. Unknown ⇒ False: never delete a credential we did not create."""
@@ -1070,6 +1268,7 @@ class SlurmFacility:
         # Idempotent: reuse a running endpoint; configure only if it doesn't exist yet
         # (re-configuring an existing one raises ConfigExists).
         name = self.profile.endpoint_name
+        await self._ensure_venv()  # a no-op once bootstrap ran it
         st = await self.cli.status(name)
         if st == "running":
             # REUSE: we did NOT launch it, so its node is unknown from a fresh round-robin probe —
@@ -1098,7 +1297,15 @@ class SlurmFacility:
         )
         uep, _defaults = self.config_template(hpc)
         await self.cli.write_config(name, manager, uep)
+        # the template on disk is this profile's now: forget what an earlier read learned, also if `start` fails below
+        # (the daemon may register anyway, and a retry's reuse must read it again)
+        self._adopted, self.endpoint_worker_init, self.worker_init_note = None, None, ""
         eid, host, addr = await self.cli.start(name)
+        # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
+        # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so
+        # the web service would still serve the OLD template (review 2026-10-13), and every task would carry the old
+        # line. Recorded as known (a teardown runs the CLI in it, even after a reconnect changed env_setup).
+        self._adopted, self.endpoint_worker_init, self.worker_init_note = eid, self.profile.worker_init, ""
         # the node's FQDN when routable from here, else the address this connection reached, else the alias
         host = await asyncio.to_thread(_routable_pin, host, addr)
         if host:
@@ -1125,6 +1332,31 @@ class SlurmFacility:
         seeded-flag) is kept so a later teardown can still do the job. The record is dropped only
         when the delete actually happened."""
         name = self.profile.endpoint_name
+        # stop/delete/list never build, and run the CLI where the endpoint was STARTED: its own worker_init when this
+        # process read it (adopt_endpoint) or started it (provision), else unknown (None) — a reconnect may have
+        # emptied or rewritten env_setup since. `use_working_venv` decides; `end_teardown` undoes it afterwards.
+        started = self.endpoint_worker_init if self._adopted == endpoint_id else None
+        try:
+            return await self._teardown(endpoint_id, name, started, wipe_credentials=wipe_credentials)
+        finally:
+            end = getattr(self.cli, "end_teardown", None)
+            if end is not None:
+                end()  # the environment chosen for this teardown never outlives it
+
+    async def _teardown(self, endpoint_id: str, name: str, started: str | None, *,
+                        wipe_credentials: bool) -> dict[str, Any]:
+        find = getattr(self.cli, "use_working_venv", None)  # a CLI without an endpoint venv of ours has nothing to find
+        usable, why = await find(started) if find is not None else (True, "")
+        if not usable and why.startswith("ssh:"):
+            return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
+                    "ssh_failed": True, "error": why[4:].strip()}
+        if not usable:
+            # blocks are released without the CLI (squeue/scancel); the manager needs one
+            await self.cli.cancel_blocks(endpoint_id, self.profile.scheduler)
+            return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
+                    "ssh_failed": False, "delete_error": "",
+                    "error": (why + ". Its blocks were cancelled. Stop the endpoint's globus-compute-endpoint process "
+                              "on the login node yourself; the next connect_facility builds a fresh venv.")}
         try:
             rc, err = await self.cli.stop(name)
         except TimeoutError:  # a slow filesystem: the stop may be finishing there — the status re-check below decides

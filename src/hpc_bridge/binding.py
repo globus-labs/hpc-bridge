@@ -263,6 +263,9 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
     machine not in the catalog. provenance="session"; never written to the shared index. Identity is
     defaulted from the id; the transfer endpoint is omitted (compute-only); the allocation block is
     set only when a listing command + a parser were given (else the human supplies the account)."""
+    if details.env_setup is None:
+        raise ValueError("env_setup is missing and there is no proposal to take it from: call connect_facility with "
+                         "ssh_host=… (no details) for a proposed config, or give env_setup")
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)

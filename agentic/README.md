@@ -36,7 +36,7 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 48 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 51 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -48,6 +48,7 @@ agentic/
                            stop + chaos: stop_while_running · draining_restop · orphaned_task
                            facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute · fake_mep_no_account
                            adversarial: canary_login_discovery · canary_compute_output
+                           endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·

@@ -428,7 +428,7 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
    - Run the operators **one after another** (the node gate is per process), each with `--concurrency 3`.
    - Run every SERIAL scenario (fake MEP, hostile, f2b) as-is.
 5. **globus1 is held back:**
-   - Compute is blocked (aarch64 Spark compute behind an x86_64 login node, until per-architecture venvs exist).
+   - Compute through an endpoint hpc-bridge stands up over SSH is blocked (aarch64 Spark compute behind an x86_64 login node, until per-architecture venvs exist). The `globus-labs` facility endpoint is not affected.
    - Pool users `hpcbridge-test-00..09` hold broken py3.12 venvs, so even BYO login bring-up fails. Only `hpcbridge-test` was cleared.
    - The globus-labs MEP cells (`mep_compute_only`, `stranger_mep_walk`) are feasible, but they need an idle Spark and an 11-minute settle each. Run them later, by hand, at 720 s.
 6. **Optional, about 30 min before starting:**

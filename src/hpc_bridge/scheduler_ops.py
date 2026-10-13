@@ -21,6 +21,7 @@ from typing import NamedTuple
 from . import config
 from .config import PROVISION_GRACE_S
 from .context import AppCtx
+from .facility.endpoint_venv import WORKER_SAID
 from .models import ShellOutcome, Submission
 
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
@@ -94,11 +95,28 @@ async def _release_blocks_over_login(
             await asyncio.sleep(backoff)  # let the woken login worker register / the sbatch land, then re-confirm
     return False, f"cancel not confirmed ({detail}); idle-release will reclaim it"
 
+# A finished pilot's own job may say why it died: hpc-bridge's env_setup line prints one `hpc-bridge: endpoint venv …`
+# line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each
+# pilot that FINISHED with an exit status of its own (Slurm: sacct's SubmitLine names the script, parsl writes
+# `<script>.stderr`; PBS: the record's Error_Path), and this loop turns them into `HPCB_SAID <jobid> <line>` — scoped to
+# that job, so a later pilot (another partition) is never told what an earlier one said.
+_SAID_LOOP = (
+    "while IFS= read -r l; do case $l in (\"HPCB_ERR \"*) set -- $l; "
+    "s=$(sed -n '/^hpc-bridge: /p' \"$3\" 2>/dev/null | tail -n 1); [ -n \"$s\" ] && echo \"HPCB_SAID $2 $s\";; "
+    "(*) echo \"$l\";; esac; done; true"
+)
+
+
 def _pilot_status_cmd(scheduler: str, eid: str) -> str:
     """Login-shape one-liner that prints THIS endpoint's pilot block(s) as `STATE JOBID` lines,
     matched by the same `uep.<eid>` StdOut marker `_release_cmd` uses (so it never reads another
     endpoint's jobs). Read-only — the diagnostic twin of `_release_cmd`. Empty output ⇒ no pilot is
-    in the scheduler (submission rejected, or not yet registered)."""
+    in the scheduler (submission rejected, or not yet registered). `HPCB_SAID <jobid> <line>` rows carry a finished
+    pilot's own `hpc-bridge: …` line (`_SAID_LOOP`)."""
+    return "{ " + _pilot_rows_cmd(scheduler, eid) + "; } | " + _SAID_LOOP
+
+
+def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
     marker = f"uep.{eid}"
     if scheduler == "pbs":
         # Bare `qstat -f` (the -u filter suppresses full-format output on PBS Pro); unwrap the 80-col
@@ -114,7 +132,10 @@ def _pilot_status_cmd(scheduler: str, eid: str) -> str:
             's="?"; if (match($0,/job_state = [A-Za-z]/)) s=substr($0,RSTART+12,1); '
             'x="-"; if (match($0,/Exit_status = -?[0-9]+/)) x=substr($0,RSTART+14,RLENGTH-14); '
             'c=""; if (match($0,/comment = [^\\n]*/)) c=substr($0,RSTART+10,RLENGTH-10); '
-            "print s\" \"$1\" \"x\" \"c}'"
+            "print s\" \"$1\" \"x\" \"c; "
+            # where a pilot that ran and died wrote its stderr (Error_Path is host:path)
+            'if (s ~ /^[FEX]$/ && x != "-" && match($0,/Error_Path = [^\\n]*/)) '
+            '{p=substr($0,RSTART+13,RLENGTH-13); sub(/^[^:]*:/,"",p); print "HPCB_ERR "$1" "p}}\''
         )
     m = shlex.quote(marker)
     # Live pilots from squeue — `STATE JOBID - REASON` (the PENDING reason tells a normal queue wait from a job the
@@ -134,7 +155,10 @@ def _pilot_status_cmd(scheduler: str, eid: str) -> str:
         'split($3,e,":"); x=e[1]; '
         'if (st ~ /^(CANCELLED|TIMEOUT|PREEMPTED|NODE_FAIL|DEADLINE|REQUEUED|REVOKED)$/) x="-"; '
         'if (st == "COMPLETED" && x == "0") x="-"; '
-        "print \"F \"$2\" \"x\" \"st}'; } 2>/dev/null; true"
+        "print \"F \"$2\" \"x\" \"st; "
+        # where a pilot that ran and died wrote its stderr: parsl's `<script>.stderr`, the script being the last word
+        # of SubmitLine
+        'if (x != "-") {n=split($4,w," "); print "HPCB_ERR "$2" "w[n]".stderr"}}\'; } 2>/dev/null; true'
     )
 
 # Slurm PENDING reasons that mean "never, as submitted" (Slurm leaves such a job PENDING forever unless
@@ -153,7 +177,12 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float) -> tuple[str, s
     # job never ran). Finished rows are read by WHY they finished: an exit status of its own means the worker died
     # there; `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our own
     # release, or the walltime) is a leftover of an earlier block, not a diagnosis, and is ignored.
-    rows = [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip()]
+    said: dict[str, str] = {}
+    for ln in stdout.splitlines():
+        if ln.startswith("HPCB_SAID "):
+            _tag, jid, line = (ln.split(None, 2) + ["", ""])[:3]
+            said[jid] = line.strip()
+    rows = [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip() and not ln.startswith("HPCB_")]
     done_states = {"F", "E", "X"}
     live = [r for r in rows if r and r[0][:1].upper() not in done_states]
     died = [r for r in rows
@@ -161,6 +190,9 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float) -> tuple[str, s
     if not live:
         if died:  # every pilot this endpoint submitted has FINISHED with an exit status of its own: it ran and died
             r = died[-1]
+            m = WORKER_SAID.match(said.get(r[1], ""))
+            if m:  # the block said why itself: hpc-bridge's env_setup line, in its worker_init
+                return "finished", f"— pilot {r[1]} already FINISHED (exit status {r[2]}): " + _venv_verdict(m)
             return "finished", (
                 f"— pilot {r[1]} already FINISHED (exit status {r[2]}): the block started and its worker exited "
                 "(a failed worker_init, an environment the compute node lacks, a network the worker cannot reach). "
@@ -175,7 +207,31 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float) -> tuple[str, s
             "rather than queued. Check run_shell('qstat -u $USER', shape='login') (squeue on Slurm) "
             "and the endpoint log."
         )
-    rows = live
+    return _summarize_live(live, provisioning_elapsed_s)
+
+
+def _venv_verdict(m: re.Match[str]) -> str:
+    """What a pilot's `hpc-bridge: endpoint venv … (built on A) does not run on <node> (B)` means, and what helps. On
+    another architecture than the login node a rebuild cannot help: the venv is built on the login node again."""
+    built, arch, host = m.group("built"), m.group("arch"), m.group("host")
+    head = f"its job said {m.group(0)[:300]!r}. Not a queue wait, and a new block will fail the same way: "
+    if built and built != "unknown" and built != arch:
+        return head + (
+            f"the endpoint's venv is built on the login node ({built}) and these compute nodes ({arch}) cannot run "
+            "it. Do NOT change env_setup (connect_facility details): no env_setup changes the architecture the venv "
+            "was built for, the running endpoint keeps the one it was started with, and an emptied or rewritten one "
+            "only hides the endpoint's own CLI from later calls. Rebuilding does not help either (it is built on the "
+            f"login node again). What works: a partition whose nodes are {built}; or this facility's own multi-user "
+            "endpoint, if list_facilities has one for it (its workers bring their own environment). A venv per "
+            "architecture is planned, not built (see 'does not run on' in docs/user/troubleshooting.md).")
+    return head + (
+        f"the venv runs on the login node but not on {host}. Tear the endpoint down and connect again (the bring-up "
+        "rebuilds it if it is broken on the login node too); if it still fails, the compute nodes lack something the "
+        "login node has.")
+
+
+def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float) -> tuple[str, str]:
+    """`_summarize_pilot` for the live rows (at least one)."""
     states = {r[0][:1].upper() for r in rows}
     jid = rows[0][1] if len(rows[0]) > 1 else "?"
     if "H" in states:
@@ -224,6 +280,11 @@ async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elaps
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
         return notice
     suffix = status[1] if status else ""
+    note = getattr(app.facility, "worker_init_note", "")
+    if status and status[0] == "finished" and isinstance(note, str) and note:
+        # a worker that died on a REUSED endpoint whose env_setup was edited: its blocks run the endpoint's own one, so
+        # editing it again changes nothing — say so (only for a pilot that ran and died, not for a queue wait)
+        suffix += " " + note.rstrip()
     return f"{notice} {suffix}" if suffix else notice
 
 

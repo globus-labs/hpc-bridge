@@ -9,7 +9,13 @@ fresh install can list facilities with no login. The plugin never writes to it. 
    **facility-run multi-user endpoint** (zero SSH: `compute_mep_uuid`, no `ssh_host`, `$HOME`-relative
    scratch, a version-pinned `env_setup`).
 2. Fill in the scheduler, network interface, `env_setup`, scratch root, defaults and `last_validated`,
-   then run `python -m pytest tests/test_catalog_bundled.py -q`; the schema validates the seed.
+   then run `python -m pytest tests/test_catalog_bundled.py -q`; the schema validates the seed. For an
+   SSH facility with no endpoint installed, use the line hpc-bridge itself proposes:
+   `python -c "from hpc_bridge.facility.endpoint_venv import short_env_setup; print(short_env_setup())"`,
+   with any site `module load …; ` in front. It only activates hpc-bridge's own environment; hpc-bridge builds and
+   repairs that over SSH when it starts the endpoint, at the endpoint version and Python of the user's client. Do not
+   hand-write `[ -d {venv} ] ||` / `command -v globus-compute-endpoint ||` guards: they keep a broken install. (The
+   Expanse seed still holds the guarded line earlier releases generated; hpc-bridge reads such a line as its own.)
 3. Open a pull request. A curator ingests it with `hpc-bridge-catalog <index-uuid> <seed>.yaml`
    (idempotent, keyed by subject) and it is live for everyone at the next `list_facilities()`.
 

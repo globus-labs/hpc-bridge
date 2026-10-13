@@ -683,7 +683,8 @@ async def connect_facility(
     NOT in the catalog and not cached → discover, don't interrogate. Pass `ssh_host` (login
     host/alias; SSH user+key come from the environment) and the tool PROBES the login node →
     phase="proposed_facility_details" with a draft — review/correct it with the user (above all
-    `interface`), then call again with details=… to register the session facility (then CACHED for
+    `interface`), then call again with details=… (leave env_setup out: the server keeps the proposed one) to
+    register the session facility (then CACHED for
     zero-SSH reconnects; the canary validates). phase="needs_preauth" ⇒ the host needs a one-time
     interactive login (password/MFA) — relay its `preauth_command` for the user to run in THEIR OWN
     terminal; never handle the secret. neither ssh_host nor details ⇒ needs_facility_details."""

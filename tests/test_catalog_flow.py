@@ -238,6 +238,46 @@ async def test_connect_facility_signals_reuse_when_endpoint_already_online(monke
     assert res.notice and "reused" in res.notice.lower()  # and narrated for the agent
 
 
+async def test_connect_facility_says_when_a_reused_endpoint_runs_its_old_environment(monkeypatch):
+    # an edited env_setup does not reach a reused endpoint's blocks (they run the one it was started with): the connect
+    # result says so, conditionally, instead of the agent editing again after every failed block
+    from hpc_bridge import server
+
+    f = FakeFacility()
+    f.workers = 1
+    f.reused = True
+    f.worker_init_note = "this endpoint was started with a different env_setup …: teardown_endpoint, then … "
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, MYBALANCE, ""))
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")])
+    )
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: f)
+
+    res = await server._connect_facility(app, "anvil")
+    assert "was started with a different env_setup" in (res.notice or "")
+
+
+async def test_connect_facility_says_when_it_built_the_endpoint_venv(monkeypatch):
+    from types import SimpleNamespace
+
+    from hpc_bridge import server
+    from hpc_bridge.facility.endpoint_venv import EnsureResult
+
+    f = FakeFacility()
+    f.workers = 1
+    f.cli = SimpleNamespace(venv_built=EnsureResult(path="/h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13", built=True,
+                                                    moved_aside="/h/u/x.broken.1", reason="its globus-compute-endpoint fails: ImportError"))
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, MYBALANCE, ""))
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")])
+    )
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: f)
+    res = await server._connect_facility(app, "anvil")
+    n = res.notice or ""
+    assert "built hpc-bridge's endpoint venv /h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13" in n
+    assert "ImportError" in n and "moved to /h/u/x.broken.1" in n
+
+
 async def test_connect_facility_unknown_returns_needs_facility_details(monkeypatch):
     # Not in the catalog -> the Socratic fallback: ask for the facility's config via details=,
     # not a dead-end. (The agent then elicits and calls again with details.)
