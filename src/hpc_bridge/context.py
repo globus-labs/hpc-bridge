@@ -19,7 +19,7 @@ from .catalog.entry import CatalogEntry
 from .facility.base import Facility
 from .lifecycle import EndpointState
 from .login import LoginFlow
-from .models import Submission
+from .models import FacilityDetails, Submission
 from .profile import Profile
 from .runner import CanaryResult, GlobusRunner
 from .shapes import SHAPES
@@ -139,6 +139,10 @@ class AppCtx:
     # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
     # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.
     proposed_facility: str | None = None
+    # The LAST draft config each facility id was proposed (connect_facility's proposed_facility_details): a details=
+    # that omits env_setup takes the proposal's, so the agent never has to echo hpc-bridge's env_setup line back
+    # (gpt-oss corrupted a 3.8 KB one doing that, 2026-10-10).
+    proposed_drafts: dict[str, FacilityDetails] = field(default_factory=dict)
     # Facilities THIS session bootstrapped over SSH (a fresh start, not a reattach). The very next connect
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).

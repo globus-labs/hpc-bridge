@@ -227,16 +227,19 @@ def test_mcp_launch_is_locked():
 
 
 def test_remote_endpoint_install_is_pinned_to_the_sdk_version():
+    # the venv hpc-bridge builds on the login node carries this client's endpoint version (keyed path + install pin)
+    from importlib.metadata import version
+
     from hpc_bridge import discovery
+    from hpc_bridge.facility import endpoint_venv
 
-    pin = discovery._gce_pin()
-    try:
-        from importlib.metadata import version
-
-        expected = f"'globus-compute-endpoint=={version('globus-compute-sdk')}'"
-    except Exception:  # noqa: BLE001 - hermetic env without the SDK
-        expected = "globus-compute-endpoint"
-    assert pin == expected and pin in discovery._UV_ENV_SETUP
+    gce = version("globus-compute-sdk")
+    assert f"-endpoint-{gce}-py" in discovery._UV_ENV_SETUP
+    mv = endpoint_venv.managed_venv(discovery._UV_ENV_SETUP.replace("{venv}", "/home/u/hpc-bridge/gce-venv"))
+    assert mv is not None and mv.gce == gce
+    script = endpoint_venv.build_script(mv, token="t", method="uv", gce=mv.gce, python=mv.python,
+                                        sdk=endpoint_venv.client_sdk())
+    assert f"'globus-compute-endpoint=={gce}'" in script and f"'globus-sdk=={version('globus-sdk')}'" in script
 
 
 # ---- the identity that landed is named (B-02) -------------------------------------------------------------------
@@ -510,7 +513,7 @@ def test_bootstrap_timeout_is_explained_not_bare():
     # "hpc-bridge error: TimeoutError: " — nothing to act on.
     msg = _explain_provision_error(TimeoutError(), host="login.expanse.sdsc.edu")
     assert msg.startswith("TIMED OUT waiting for the login node login.expanse.sdsc.edu")
-    assert "toolchain install" in msg and "connect_facility again" in msg
+    assert "endpoint venv is stopped and never takes the venv's place" in msg and "connect_facility again" in msg
 
 
 async def test_bootstrap_steps_use_the_long_ssh_timeout(monkeypatch):

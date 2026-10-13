@@ -121,7 +121,25 @@ one commit (b76978c). CI is green.
 - Known gap, not fixed: with `HPC_BRIDGE_ENDPOINT_ID`, `teardown_endpoint` on a `LocalFacility` says "deleted" and then
   re-provisions `hpc-bridge-dev`.
 
-**A — the endpoint install is checked, not trusted: WIP, no PR yet.** Branch `fix/env-setup-verify-install`, pushed
+**A — the endpoint install is checked, not trusted: REDESIGNED (v2), branch `fix/endpoint-venv-v2` (plugin 0.1.24, no PR yet).** After four review rounds kept finding must-fix bugs in the ~3.9 KB generated shell line below, the maintainer chose a split: the env_setup line only activates the keyed venv (~460 chars; on a worker it checks the entry point and names the architecture), and the check/lock/build/verify lives in Python over short SSH commands (`facility/endpoint_venv.py`). gpt-oss had also corrupted the 3.8 KB line when echoing it back in
+`details=` (an extra `fi;`), so `details.env_setup` became optional. After two more reviews (2026-10-13) the build lost
+its `mkdir` lock too: it builds a relocatable venv in a directory of its own and claims the keyed path with one atomic
+rename (uv 0.12.9 `--relocatable` venvs, parsl's worker pool included, checked to run after a rename in a clean
+container). Live on the fake cluster (pi): happy_path rebuilt a broken keyed venv, venv_broken_repair OK,
+endpoint_upgrade_reuse's product checks all passed, venv_arch_mismatch printed the arch line (codex passed it; gpt-oss
+stopped early on the old prompt). 8ebc31e then passed all four live with Pi (fake/mep); its delta review (READY) added
+the old-uv message, the loop-relative teardown deadline, PYTHONHOME, a dotfile-free uv install and the claim's inode
+re-check. 81c30ae then ran `happy_path` on globus1 (Pi, an endpoint hpc-bridge stands up over SSH). The bring-up
+used the unkeyed venv, which passed its check, and both pilots FINISHED quoting "built on x86_64 … does not run on
+spark4 (aarch64)". The agent then reconnected with env_setup `""` to "fix" it, and teardown failed (`command not
+found`, manager left running). Fixed in the same commit: teardown runs the CLI in the environment the endpoint was
+started with, searching hpc-bridge's default venv when that is unknown; the arch notice says not to edit env_setup;
+the reconnect warns. f26d868 re-ran on globus1: the arch message showed on both partitions, gpt-oss left env_setup
+alone, and the harness teardown through the finder was the first fully clean one there. Its delta review's must-fix
+(a teardown's choice of environment outliving it, into the next bring-up) is fixed: the choice now ends with the
+teardown. What is true now: [[Standing up the endpoint]] § *The endpoint's own venv*. The record below is round 3's (branch `fix/env-setup-verify-install`, superseded).
+
+*Round 3 (superseded):* branch `fix/env-setup-verify-install`, pushed
 for safekeeping, one commit (839b02e, round 3). Worktree `.claude/worktrees/agent-ac4e16a6d5ae2acc1`.
 - *Design.*
   - hpc-bridge's own venv is keyed by version: `{venv}-endpoint-<gce>-py<X.Y>`. A version or Python move builds a new
@@ -164,8 +182,8 @@ for safekeeping, one commit (839b02e, round 3). Worktree `.claude/worktrees/agen
      endpoint over the web, so it built nothing) and a planted repair.
   3. globus1 `happy_path` as `hpcbridge-test` only (the one account whose venv the maintainer cleared): the block
      should fail with the named architecture message. Login is x86_64, the compute nodes are aarch64 on a shared NFS
-     home, so compute stays blocked on globus1 until per-architecture venvs exist (described as a follow-up in the
-     vault). Don't touch the `hpcbridge-test-00..09` pool venvs without asking.
+     home, so compute through an endpoint hpc-bridge stands up over SSH stays blocked on globus1 until per-architecture
+     venvs exist (described as a follow-up in the vault). The `globus-labs` facility endpoint is not affected. Don't touch the `hpcbridge-test-00..09` pool venvs without asking.
 - *Open points from the implementer.*
   - The Expanse line is about 3.9 KB.
   - Old venvs pile up against home quotas; there's no cleaner.

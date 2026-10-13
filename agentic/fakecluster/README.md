@@ -85,7 +85,7 @@ a local fixture inside the private network, not a secret).
 | Nodes | `c1`, `c2` — `CPUs=4 RealMemory=4000` (declared; `config_overrides` so slurmd doesn't argue with the VM's real 18 cores) |
 | Login node | service/hostname `login`, sshd on container port 22 → host **2222**; `hostname -f` = `login` (single-label ⇒ hpc-bridge keeps the alias, no node pin) |
 | Users | `hpcbridge-test` (uid 1999) + **`hpcbridge-test-00..09`** (uids 2000–2009), group `hpcb` (2000); same on every node; key-only ssh; no password |
-| Shared FS | named volume `home` mounted at **`/home`** on `login`, `c1`, `c2` (the endpoint venv `~/hpc-bridge/gce-venv`, `~/.globus_compute`, and the session scratch `~/.hpc-bridge` are all visible to workers) |
+| Shared FS | named volume `home` mounted at **`/home`** on `login`, `c1`, `c2` (hpc-bridge's endpoint venvs `~/hpc-bridge/gce-venv-endpoint-<gce>-py<X.Y>`, `~/.globus_compute`, and the session scratch `~/.hpc-bridge` are all visible to workers) |
 | Accounting | cluster `fake` registered; account `hpcb` with all pool users; **no enforcement** (`--account` not required — like globus1's `AccountingStorageEnforce=none`) |
 | Toolchain on every node | Python **3.12.3**, **uv**, `bash base64 scancel squeue sacct sinfo sacctmgr sbatch srun ip curl git`, build-essential |
 | NIC | **`eth0`** (the only non-lo interface — `address_by_interface: eth0`) |
@@ -93,13 +93,17 @@ a local fixture inside the private network, not a secret).
 
 ### hpc-bridge facility config
 
-This is what hpc-bridge's discovery probe proposes for it (verified live — you can pass it as
-`connect_facility(details=…)` verbatim, or just use `connect_facility(facility="fake", ssh_host=…)`):
+This is what hpc-bridge's discovery probe proposes for it — easiest is
+`connect_facility(facility="fake", ssh_host=…)` and confirming the proposal (a `details=` may leave env_setup out:
+the server keeps the proposed one). The proposed env_setup is hpc-bridge's own short line, keyed to the CLIENT's
+endpoint version and Python (print yours: `uv run python -c "from hpc_bridge.facility.endpoint_venv import
+short_env_setup; print(short_env_setup())"`); it only activates the venv, which hpc-bridge builds over SSH when it
+starts the endpoint (vault `Concepts/Standing up the endpoint.md`):
 
 ```yaml
 ssh_host: login            # `hpcb-fake` from the host via the ssh alias; `login` from a container on the network
 interface: eth0
-env_setup: "[ -d {venv} ] || uv venv {venv}; . {venv}/bin/activate; command -v globus-compute-endpoint >/dev/null 2>&1 || uv pip install -q globus-compute-endpoint"
+env_setup: "<short_env_setup()>"   # omit it from details= after a proposal
 scratch_root: /home/{user}/.hpc-bridge
 partition: main
 scheduler: slurm

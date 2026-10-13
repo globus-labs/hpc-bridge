@@ -175,6 +175,19 @@ def test_leftover_manager_cmd_finds_this_runs_manager_in_either_form():
     assert _leftovers([title, argv]) == [title, argv]
 
 
+def test_leftover_manager_cmd_finds_managers_started_from_a_keyed_venv_or_the_planted_wrapper():
+    # 0.1.24: the endpoint runs from a keyed venv (uv's relocatable trampoline execs `<venv>/bin/python <entry> …`), and
+    # venv_arch_mismatch moves the real entry point to bin/.gce-real behind a wrapper that execs it on a login node
+    k = "/home/u/hpc-bridge/gce-venv-endpoint-4.16.0-py3.12"
+    keyed = f"4250 {k}/bin/python {k}/bin/globus-compute-endpoint start {_NAME} --detach"
+    planted = f"4251 {k}/bin/python {k}/bin/.gce-real start {_NAME} --detach"                 # before its title is set
+    titled = f"4252 Globus Compute Endpoint *({EID}, {_NAME}) [{k}/bin/python {k}/bin/.gce-real start {_NAME}]"
+    assert _leftovers([keyed, planted, titled]) == [keyed, planted, titled]
+    restore = f"4253 mv -f {k}/bin/.gce-real {k}/bin/globus-compute-endpoint"                  # names no endpoint
+    wrapper_sh = f"4254 /bin/sh {k}/bin/.gce-real start {_NAME}"                                # a shell: never
+    assert _leftovers([restore, wrapper_sh]) == []
+
+
 def test_leftover_manager_cmd_ignores_other_runs_and_unrelated_processes():
     other = f"4244 Globus Compute Endpoint *({EID}, {_NAME}4) [idle]"            # a longer name: another run's
     prefix = f"4245 globus-compute-endpoint start {_NAME[:-1]} --detach"          # a shorter one
@@ -287,8 +300,8 @@ def _uep_child(tmp_path, eid: str):
 
 
 def _real_gce_home(tmp_path):
-    """HOME with a stand-in at the DEFAULT gce path, so the guard runs its real text — `…/globus-compute-endpoint stop
-    <name>` in its own argv, as on the cluster — and records whether it was called."""
+    """HOME with a stand-in where the guard's real text finds a gce (cluster_ops.GCE: the first hpc-bridge venv whose
+    `version` runs) — the finder and `stop <name>` in its own argv, as on the cluster — recording every call."""
     home = tmp_path / "home"
     gce = home / "hpc-bridge" / "gce-venv" / "bin" / "globus-compute-endpoint"
     gce.parent.mkdir(parents=True)
@@ -312,8 +325,8 @@ def test_the_real_stop_guard_ignores_its_own_shell_and_finds_a_real_manager(tmp_
     from cluster_ops import stop_here_cmd
     name = "hpc-bridge-fake-1791900000-4242-77"
     home = _real_gce_home(tmp_path)
-    cmd = stop_here_cmd(name)                     # the real text: default gce path, default `ps` listing
-    assert "globus-compute-endpoint stop hpc-bridge-fake-1791900000-4242-77" in cmd   # in the shell's own argv
+    cmd = stop_here_cmd(name)                     # the real text: the gce finder, default `ps` listing
+    assert "globus-compute-endpoint" in cmd and '" stop hpc-bridge-fake-1791900000-4242-77' in cmd  # in its own argv
     # a node WITHOUT the manager — the guard's own `bash -c` (and its `$(…)` subshell) carry the name and the gce
     # path in their args; they must not count
     out = _bash(cmd, env={"HOME": str(home)})
@@ -325,7 +338,7 @@ def test_the_real_stop_guard_ignores_its_own_shell_and_finds_a_real_manager(tmp_
         _wait_listed(mgr)
         out = _bash(cmd, env={"HOME": str(home)})
         assert " rc=0 Endpoint <" in out and out.startswith("HPCB_STOP "), out
-        assert (home / "gce-calls").read_text().split() == ["stop", name]
+        assert (home / "gce-calls").read_text().split() == ["version", "stop", name]   # the finder's check, the stop
     finally:
         mgr.kill()
         mgr.wait()
@@ -398,3 +411,93 @@ def test_pool_claims_are_host_wide_and_honour_the_old_per_checkout_dir(tmp_path,
     newer.release_all()
     assert older.try_claim("hpcbridge-test-01") is True
     assert pool.PoolClaims(tmp_path / "x").legacy is None     # an explicit dir is a deliberate choice: no legacy
+
+
+# ---- the endpoint's venv: found like the plugin's teardown finds it ---------------------------------------------------
+
+def _gce_stub(venv, version: str, works: bool = True) -> None:
+    (venv / "bin").mkdir(parents=True)
+    ep = venv / "bin" / "globus-compute-endpoint"
+    ep.write_text(f'#!/bin/sh\n[ "$1" = version ] && {{ echo "Globus Compute endpoint version: {version}"; exit '
+                  f'{0 if works else 1}; }}\necho "$@" >> "{venv}/calls"\n')
+    ep.chmod(0o755)
+
+
+def test_the_harness_finds_a_working_endpoint_venv(tmp_path):
+    import subprocess
+
+    from cluster_ops import GCE, GCE_FIND, delete_registration_cmd, stop_here_cmd
+
+    home = tmp_path / "home"
+    hb = home / "hpc-bridge"
+
+    def found() -> str:
+        r = subprocess.run(["bash", "-c", GCE_FIND], env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                           capture_output=True, text=True, check=False)
+        return r.stdout.strip()
+
+    assert found() == ""  # nothing there: an empty path, never an error
+    _gce_stub(hb / "gce-venv", "4.13.0")  # plugins up to 0.1.23
+    assert found() == f"{hb}/gce-venv/bin/globus-compute-endpoint"
+    _gce_stub(hb / "gce-venv-endpoint-4.18.0-py3.11", "4.18.0", works=False)  # keyed, broken
+    _gce_stub(hb / "gce-venv-endpoint-4.19.0-py3.11.broken.20261013-1", "4.19.0")  # moved aside: skipped
+    _gce_stub(hb / "gce-venv-endpoint-4.20.0-py3.11.build.abc", "4.20.0")  # a build in progress: skipped
+    _gce_stub(hb / "gce-venv-endpoint-4.9.0-py3.11", "4.9.0")  # older than 4.16 (`sort -V`, not by text)
+    _gce_stub(hb / "gce-venv-endpoint-4.16.0-py3.11", "4.16.0")
+    assert found() == f"{hb}/gce-venv-endpoint-4.16.0-py3.11/bin/globus-compute-endpoint"
+    # the stop (its manager runs here) and the delete (its directory exists) the teardown runs go through that one
+    (home / ".globus_compute" / "hpc-bridge-fake-1").mkdir(parents=True)
+    here = f"printf '%s\\n' {shlex.quote(f'4242 Globus Compute Endpoint *({EID}, hpc-bridge-fake-1) [idle]')}"
+    env = {"HOME": str(home), "PATH": "/usr/bin:/bin"}
+    out = _bash(f"{stop_here_cmd('hpc-bridge-fake-1', listing=here)}; {delete_registration_cmd('hpc-bridge-fake-1')}",
+                env=env)
+    assert " rc=0 " in out and "HPCB_DELETE rc=0" in out, out
+    assert (hb / "gce-venv-endpoint-4.16.0-py3.11" / "calls").read_text().splitlines() == [
+        "stop hpc-bridge-fake-1", "delete hpc-bridge-fake-1 --yes"]
+    assert GCE.startswith('"$(') and GCE_FIND in GCE
+
+
+def test_the_sweep_script_uses_the_same_finder():
+    import re
+    from pathlib import Path
+
+    from cluster_ops import GCE_FIND
+
+    text = (Path(__file__).resolve().parents[1] / "sweep_pool_user.sh").read_text()
+    m = re.search(r"^GCE='\"\$\((.*)\)\"'$", text, re.M)
+    assert m and m.group(1) == GCE_FIND
+
+
+def test_a_planted_entry_point_is_restored_before_every_cell(tmp_path, monkeypatch, harness_run):
+    # venv_arch_mismatch moves the real entry point to bin/.gce-real behind a failing wrapper; a cell killed before its
+    # CLEANUP must not leave it for the next cell on that pool user
+    import subprocess
+
+    from cluster_ops import restore_planted_entry_points_cmd
+
+    home = tmp_path / "home"
+    k = home / "hpc-bridge" / "gce-venv-endpoint-4.18.0-py3.11"
+    _gce_stub(k, "4.18.0")
+    (k / "bin" / "globus-compute-endpoint").rename(k / "bin" / ".gce-real")
+    (k / "bin" / "globus-compute-endpoint").write_text("#!/bin/sh\nexit 2\n")
+    (k / ".hpcb-arch").write_text("x86_64\n")
+    r = subprocess.run(["bash", "-c", restore_planted_entry_points_cmd()], env={"HOME": str(home), "PATH": "/usr/bin:/bin"},
+                       capture_output=True, text=True, check=False)
+    assert r.returncode == 0 and "restored: 1" in r.stdout
+    assert not (k / "bin" / ".gce-real").exists() and "4.18.0" in (k / "bin" / "globus-compute-endpoint").read_text()
+    seen = []
+    monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, timeout=60, host=None: (seen.append(cmd), (0, "restored: 0"))[1])
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "hpcbridge-test-03")
+    harness_run._restore_planted_venvs()
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "jdoe")  # never a real user's venvs
+    harness_run._restore_planted_venvs()
+    assert seen == [restore_planted_entry_points_cmd()]
+
+
+def test_the_sweep_script_restores_planted_entry_points_too():
+    from pathlib import Path
+
+    from cluster_ops import restore_planted_entry_points_cmd
+
+    text = (Path(__file__).resolve().parents[1] / "sweep_pool_user.sh").read_text()
+    assert f"RESTORE='{restore_planted_entry_points_cmd()}'" in text and 'REMOTE="$RESTORE; ' in text

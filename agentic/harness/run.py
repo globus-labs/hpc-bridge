@@ -32,6 +32,7 @@ from cluster_ops import (
     delete_registration_cmd,
     endpoint_uuid_cmd,
     leftover_manager_cmd,
+    restore_planted_entry_points_cmd,
     scoped_cancel_cmd,
     stop_here_cmd,
     token_store_cleanup_cmd,
@@ -295,6 +296,16 @@ def _preclean_token_store(scen) -> None:
         return
     rc, out = _ssh_run(token_store_cleanup_cmd(), timeout=60)
     print(f"pre-run: {out.strip()[:120] if rc == 0 else f'token store cleanup rc={rc}'}", file=sys.stderr, flush=True)
+
+
+def _restore_planted_venvs() -> None:
+    """Undo what a killed `venv_arch_mismatch` cell may have planted in a pool user's keyed venv (its CLEANUP never
+    ran): before every cell on a harness pool user, so no later cell meets a wrapper that fails on the compute nodes.
+    Best-effort."""
+    if not _is_pool_user():
+        return
+    rc, out = _ssh_run(restore_planted_entry_points_cmd(), timeout=60)
+    print(f"pre-run: {out.strip()[:120] if rc == 0 else f'planted-venv restore rc={rc}'}", file=sys.stderr, flush=True)
 
 
 def _setup(scen) -> bool:
@@ -939,6 +950,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         _seed_facility_cache(scen)
         _trust_host_key(scen)
         _preclean_token_store(scen)
+        if getattr(scen, "TRUST_HOST_KEY", True):  # the harness' own ssh would trust the key for an untrusted-key cell
+            _restore_planted_venvs()
         if not _setup(scen) or not _local_setup(scen):
             print("RESULT: SETUP FAILED — scenario not run (world precondition unmet)")
             rc = 2

@@ -3,9 +3,36 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
-## Unreleased
+## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 
 ### Fixed
+- **A broken endpoint environment on the login node is repaired, not reused.** On an SSH facility with no endpoint
+  installed, hpc-bridge keeps its own Python environment under `~/hpc-bridge/`. It used to trust whatever was there,
+  so an environment whose dependencies had drifted (live on the lab cluster: the endpoint's command failed at import)
+  broke every first connect. Now each bring-up checks the environment through the endpoint's own command and its
+  Python version. When the check fails it builds a new, relocatable environment beside it (package cache off), checks
+  it, and only then renames it into place, keeping the broken one as `.broken.<time>`. Two sessions building at once
+  both finish and one wins the rename; there is no lock to wait on or leave behind. A failed build is kept as
+  `.failed.<time>` with its last error line reported, and nothing is ever deleted. Stop and teardown never build; they
+  use any environment of hpc-bridge's that answers. An environment you prepared yourself at `HPC_BRIDGE_REMOTE_VENV`
+  is used when it passes the same check, so a login node without internet works. Where the login node has no `uv`,
+  hpc-bridge installs one into `~/.local/bin` without editing your shell profiles; a `uv` too old to build (before
+  0.2.31) is named in the error.
+- **A compute node that cannot run the environment says so at once.** A block on a node of another CPU type than the
+  login node used to die with a bare exit code (the lab cluster, for an endpoint hpc-bridge stands up over SSH: an
+  x86_64 login node, aarch64 compute nodes, a shared home; its facility endpoint is not affected). Its job now ends
+  with one line naming the environment, the architecture it was built on and the node's. The pilot notice quotes that
+  job's own line and says a rebuild cannot help when the architectures differ. It also tells the agent not to change
+  `env_setup`. What works is a partition of the login node's type, or the facility's own multi-user endpoint where
+  `list_facilities` has one.
+- **Teardown stops an endpoint even after `env_setup` was changed.** Stop, delete and list now run the endpoint's
+  command in the environment the endpoint was started with, not the facility's current `env_setup`. Live on the lab
+  cluster, an agent reconnected with an empty `env_setup` to "fix" an architecture mismatch. The teardown then failed
+  with `globus-compute-endpoint: command not found` and left the endpoint running. An endpoint started in this
+  session is stopped through the `env_setup` it was started with. When the start is unknown, teardown searches
+  hpc-bridge's default environment under `~/hpc-bridge/`, and never builds one. That choice ends with the teardown,
+  so the next bring-up runs in the current `env_setup` again. A reconnect that replaces hpc-bridge's line on a running
+  endpoint now gets a warning saying what that does and doesn't change.
 - **A block replaced after a failed check is asked about.** If a check failed with an error (a task lost with its
   worker, a refused submit, a transient conflict), hpc-bridge forgot which block the user had confirmed. The block
   that came up next was then used under the old confirmation, with no new question. Seen on the fake cluster
@@ -32,11 +59,28 @@ installed plugin only when that version changes); git tags mark releases.
   it at once. The rejected-submission notice no longer says "nothing was billed": only the new block wasn't
   created.
 
+### Changed
+- **The environment line is short.** The `env_setup` discovery proposes is now about 460 characters and only
+  activates the environment, named for the endpoint version and Python it was built for
+  (`~/hpc-bridge/gce-venv-endpoint-<version>-py<X.Y>`); a newer version gets a new one beside the old. **`details=`
+  no longer needs `env_setup`** after a proposal: the server keeps the proposed one, and the proposal tells the agent
+  to leave it out unless the user wants to change it. (An open model corrupted the old, much longer line when it
+  echoed it back.)
+- **Older configurations keep working.** A line an earlier hpc-bridge generated, in your local facility cache or in
+  the registry (the Expanse entry), is read as the new line; the stored text is not changed, so earlier plugins
+  reading it are unaffected. An endpoint an earlier hpc-bridge started is reused as it is: its blocks keep the
+  environment it was started with, and hpc-bridge says so only when that is not just this upgrade ("only if its
+  blocks fail or you changed env_setup").
+
 ### Known issues
 - **A replaced block can run work before a check sees it.** A check runs only once the last answer is 45 s old, and
   every completed command counts as an answer. So commands sent less than 45 s apart run on a replacement block
   without a question until a pause lets a check run, or the old block's walltime is reached. A follow-up closes it:
   each command will report the scheduler job it ran in.
+
+### Testing
+- Three fake-cluster scenarios join the profile sweep: `venv_broken_repair`, `venv_arch_mismatch`,
+  `endpoint_upgrade_reuse`. The harness finds the endpoint's environment the way the plugin's teardown does.
 
 ## 0.1.23 — 2026-10-13 — faster first results, honest stops and output, batch jobs counted as spend, ALCF Polaris
 

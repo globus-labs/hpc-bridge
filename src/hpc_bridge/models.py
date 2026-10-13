@@ -119,9 +119,12 @@ class FacilityDetails(BaseModel):
         "home (address_by_interface). Wrong value ⇒ workers never register.",
         examples=["ib0", "hsn0"],
     )
-    env_setup: str = Field(
+    env_setup: str | None = Field(
+        default=None,
         description="Bash that puts `globus-compute-endpoint` on PATH on the login node — usually a "
-        "`module load …` and/or `source <venv>/bin/activate`. '{user}'/'{venv}' are templated.",
+        "`module load …` and/or `source <venv>/bin/activate`. '{user}'/'{venv}' are templated. OMIT it after a "
+        "proposal (phase='proposed_facility_details'): the server keeps the proposed env_setup; give it only when "
+        "the user wants to change it.",
         examples=["module load anaconda && source {venv}/bin/activate"],
     )
     scratch_root: str = Field(
