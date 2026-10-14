@@ -129,6 +129,7 @@ from .notices import (  # noqa: F401 - re-exported
     _spend_floor_guidance,
     _submit_rejected,
     _submit_rejected_notice,
+    _switch_receipt,
     _transient_dispatch_failure,
     _with_submission_notice,
     _worker_notice,
@@ -354,6 +355,7 @@ async def _ensure_endpoint_up(
         # A login shape has no partition; surface that we ignored a supplied one rather than
         # silently dropping the user's selection.
         ignored = partition is not None and not rt.user_endpoint_config.get("compute")
+        epoch = rt.block_epoch
         reject = _apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
         if reject:  # a live task blocks repointing the block (the swap would cancel it) — change nothing
             return EndpointStatus(
@@ -367,6 +369,13 @@ async def _ensure_endpoint_up(
             )
         active_partition = rt.user_endpoint_config.get("partition")
         active_account = rt.user_endpoint_config.get("account")
+        # A switch confirmed in this same call: no needs_confirmation answer said what became of the old block, so the
+        # answer of the call that confirms the new one does, once.
+        receipt = _switch_receipt(app, rt) if confirm_spend and rt.block_epoch != epoch else ""
+
+        def said(notice: str | None) -> str | None:
+            return receipt + (notice or "") if receipt and rt.spend_confirmed else notice
+
         try:
             # force_canary: a status probe must re-verify the worker (and kick a cold block),
             # never trust the TTL — that's exactly the cold-start gap callers are asking about.
@@ -379,7 +388,7 @@ async def _ensure_endpoint_up(
                 session_spend=_total_session_spend(app),  # _provision stopped the clock: a down leaves none running
                 partition=active_partition,
                 account=active_account,
-                notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
+                notice=said(f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500]),
             )
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             where = f" on {active_partition!r}" if active_partition else ""
@@ -433,7 +442,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=(f"the endpoint refused to start for this identity {rt.transient_conflicts} times in a row "
+                    notice=said(f"the endpoint refused to start for this identity {rt.transient_conflicts} times in a row "  # noqa: E501
                             f"(RESOURCE_CONFLICT: 'already in use … concurrent requests'). This is NO LONGER transient: "  # noqa: E501
                             "another session with the SAME Globus identity is starting or holding a user endpoint here "
                             "(a concurrent hpc-bridge run?), or the facility's manager is wedged. Stop retrying: end the "  # noqa: E501
@@ -449,7 +458,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=_no_account_notice(app, rt.last_canary.error, identity),
+                    notice=said(_no_account_notice(app, rt.last_canary.error, identity)),
                 )
             if rt.last_canary is not None and _submit_rejected(rt.last_canary.error):
                 # The scheduler refused the submission (bad account/partition/QOS, missing resource request): a
@@ -459,7 +468,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=_submit_rejected_notice(active_partition, active_account, rt.last_canary.error),
+                    notice=said(_submit_rejected_notice(active_partition, active_account, rt.last_canary.error)),
                 )
             if not _has_login_shape(app) and rt.last_canary is None:
                 # On a MEP a canary runs on EVERY poll whose manager gate passes (and is recorded even
@@ -490,7 +499,7 @@ async def _ensure_endpoint_up(
         session_spend=spend,
         partition=active_partition,
         account=active_account,
-        notice=notice,
+        notice=said(notice),
     )
 
 
@@ -535,8 +544,9 @@ async def ensure_endpoint_up(
     """Ensure the personal HPC endpoint is up; report whether its pilot block is warm.
 
     Pass `partition` (from the discovery selection gate) to provision the scheduler block onto that
-    partition; the choice persists for the session until changed. Omit it to keep the facility
-    default. Ignored for shape="login" (a login-node LocalProvider has no partition).
+    partition; the choice persists for the session until changed (stop_endpoint keeps it; a new
+    connect_facility or a teardown forgets it). Omit it to keep the facility default. Ignored for
+    shape="login" (a login-node LocalProvider has no partition).
 
     Pass `account` (the allocation chosen from connect_facility's options) to charge the scheduler
     block to it; like `partition`, it persists for the session and is ignored for shape="login".
@@ -547,6 +557,8 @@ async def ensure_endpoint_up(
     nothing. The acknowledgement covers the block it starts: it holds while that block lives, and once the
     block is gone (idle-released, past its walltime, or cancelled) the next call returns needs_confirmation
     with the reason — even one that passes confirm_spend=True — so the user is asked again for the new block.
+    A different partition or account is a different block too: the call that changes them answers
+    needs_confirmation (saying what becomes of the old block) unless it passes confirm_spend=True itself.
     Not needed for shape="login" (free)."""
     return await _heartbeat(ctx, _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account
@@ -884,9 +896,14 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
         # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
         rt_pre = app.shapes.get(DEFAULT_SHAPE)
-        # A reap found by a canary voided the acknowledgement, but that canary may itself have requested the pilot.
-        expect_block = (rt_pre is not None and (rt_pre.spend_confirmed or rt_pre.reap_kicked)
-                        and rt_pre.warm_confirmed_at is None)
+        # A block asked for and never seen up (no confirmation, no identity): its sbatch may still land. A reap found by
+        # a canary voided the acknowledgement, but that canary may itself have requested the pilot; a partition or
+        # account switch voids it too, while the old terms' pilot may still be landing. A block that was seen up and
+        # only had its confirmation voided (a failed dispatch, a rebuild, a new login) is not one.
+        expect_block = rt_pre is not None and (
+            ((rt_pre.spend_confirmed or rt_pre.reap_kicked) and rt_pre.warm_confirmed_at is None
+             and rt_pre.block_since is None)
+            or rt_pre.switch_unseen)
         # an earlier scheduler command of ours already occupying the internal login session (the cancel would wait)
         internal_before = _busy_session(app, "login", _INTERNAL_SESSION)
     # Cancel the scheduler block over the login shape (AMQP) — no SSH. OFF the lock: the release rides run_shell.

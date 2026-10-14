@@ -63,6 +63,52 @@ installed plugin only when that version changes); git tags mark releases.
     stop (`run_shell` or a confirmed `ensure_endpoint_up`). A block cancelling itself was considered and rejected:
     its task stays outstanding until the endpoint notices the worker gone, so the endpoint starts a replacement
     block, which then idles out its window.
+- **A registry SSH facility that requires an account starts nothing without one.** The account floor (0.1.17) held
+  only on a facility's multi-user endpoint. A registry SSH entry marked `account_required` (Expanse) built its
+  facility without the flag, so a confirmed start with no account submitted a block the scheduler could only reject,
+  or charged it to the user's default account. Now every facility built from a registry entry carries the flag, over
+  SSH on Slurm and PBS as on a facility endpoint, and `ensure_endpoint_up(confirm_spend=True)` with no account answers
+  `needs_account` and starts nothing. The floor reads the account the block would be charged to: the one this session
+  chose, or the facility's own configured default (the startup pin's `HPC_BRIDGE_ACCOUNT`). On an SSH facility its
+  notice says where to find an account: `connect_facility`'s allocations, or the facility's allocation tool, which
+  runs free on the login shape. A facility you bring yourself is unchanged: nothing curated says it needs one.
+- **`HPC_BRIDGE_ACCOUNT` and `HPC_BRIDGE_PARTITION` apply only to the facility `HPC_BRIDGE_MACHINE` names.** They
+  reached every facility, one you bring yourself included: a `connect_facility` anywhere charged its blocks to
+  `HPC_BRIDGE_ACCOUNT`, and every SSH facility took `HPC_BRIDGE_PARTITION` as its default. A user who once exported an
+  account for one machine had every other machine's blocks charged to it unasked; on an account-required facility it
+  even answered the account question. Now each applies only to the machine `HPC_BRIDGE_MACHINE` names, by id, subject
+  or the alias the startup pin resolved. The startup pin is unchanged and still requires `HPC_BRIDGE_ACCOUNT`; a
+  partition you give in `details=` wins over the preset, and a facility endpoint never takes the partition preset. A
+  connect where a preset goes unused says so in one clause that names the variable, never its value: "(HPC_BRIDGE_ACCOUNT
+  applies only to HPC_BRIDGE_MACHINE=anvil, so it was not used here.)".
+- **Changing the partition or account asks for spend again.** The spend confirmation covers one block, and another
+  partition or account is another block. Yet `ensure_endpoint_up(partition=…)` after a confirmed block started the new
+  block under the old confirmation. Now a real change on a confirmed block answers `needs_confirmation`, and so does a
+  `run_shell` after it, unless the changing call passes `confirm_spend=True` itself; then that call's own answer says
+  what became of the old block. Nothing cancels it on a switch. On an SSH facility it idle-releases on its own; to end
+  it now, call `stop_endpoint` before confirming the new block. On a facility endpoint it is named as a reconnect names
+  one (its scheduler job, and `scancel <id>`, or `qdel <id>` on PBS), and a later stop names it in full. Either way the
+  session spend counts whatever block of ours the switch knows up (the confirmed one, one a late check answer proved
+  up, a replacement a check or a refused command found) to the latest it can bill, an upper bound. A command the
+  wrong-block guard refused that nobody has polled yet is taken in before a stop, detach, reconnect or switch lets go
+  of the block, so the replacement it found is what gets named and billed, and the call that switches answers with
+  that reap. A job met again, after a switch back, a stop or a reconnect, keeps its real age for its walltime (dated by
+  its scheduler job, on any number of switches), unless it answers more than 30 s past that walltime (the time a
+  scheduler may let a job run on before killing it), counted to when it answered: then it was requeued under its id
+  and runs a fresh one. It bills afresh from that confirmation: switching back and forth can count some time twice,
+  never less than ran. A switch back to the confirmed terms says so. A task that finished on the old block and is polled later no
+  longer marks the new block warm (which skipped its check and left it unguarded). The same partition or account again
+  is not a change.
+- **A stop keeps the partition and account the session chose.** `stop_endpoint` forgot them, so the next block went
+  to the facility's default partition and account without a word, although the tool says the choice persists for the
+  session. Now the next block after a stop uses them, after the usual spend question, which names the partition; its
+  result carries both. A new `connect_facility` or a teardown forgets them; a new Globus login does not.
+- **The facilities page no longer offers a scheduler option no tool takes.** `docs/user/facilities.md` told Polaris
+  users to pass `scheduler_options: "#PBS -l filesystems=home:eagle"`, and Anvil users `"#SBATCH --gpus-per-node=1"`
+  for a GPU partition. No tool takes `scheduler_options` for a registry facility. The rows now say what each entry
+  sends (Polaris: none, so the facility's default `-l filesystems=home`; Anvil: no GPU request) and that a job needing
+  more cannot ask for it through that entry yet. The skill says the same, and a held pilot's notice offers
+  `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
 - `reap_replaced_block` now waits until the cancelled block has left the queue, then sends `echo JOB=$SLURM_JOB_ID`
@@ -77,6 +123,22 @@ installed plugin only when that version changes); git tags mark releases.
   `run_shell`, `reset_session` or confirmed `ensure_endpoint_up`); a world hook checks the block is still in the
   mapped account's queue at stop time. Graders read `confirm_spend` through one check (`_confirms_spend`), so a
   `"True"` counts like `true`.
+- Three scenarios for these fixes, autonomous so the free operators drive them too:
+  - `term_switch_reasks` (fake `mep`): after a confirmed `debug` block, the switch to `compute` without a confirm
+    answers `needs_confirmation` and names the `debug` block's job and `scancel <id>`. Nothing runs before the
+    confirmed switch, and the next block's own job reports `compute`. If the old block idled out before the switch, the
+    switch graders say "inconclusive";
+  - `preset_account_scoped` (fake `mep`; the server runs with `HPC_BRIDGE_ACCOUNT=hpcb-gpu` and no
+    `HPC_BRIDGE_MACHINE`): the connect says the preset was not used, a confirm with no account answers
+    `needs_account`, and sacct shows no job of the mapped account submitted with `hpcb-gpu`. An admin step makes
+    `hpcb-gpu` a valid account for that user (and fails the cell if it did not take), so a leak would bill rather than
+    be refused. An agent that passes the preset itself (a CLI operator can read it) is reported apart;
+  - `ssh_account_floor` (fake `site`): a registry SSH entry with `account_required`, written for the cell by
+    `agentic/harness/fake_ssh_catalog.py` and served through `HPC_BRIDGE_CATALOG_FILE`. A confirm with no account
+    answers `needs_account`, and sacct shows no block submitted. A connect with `details=` is a broken premise.
+
+  Their graders are tested hermetically in `agentic/harness/test_spend_terms_scenarios.py`; it and the existing
+  `test_mep_scenarios.py` and `test_site_scenarios.py` are now in the CI list.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

@@ -38,12 +38,13 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 54 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 57 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
                            spend + account: gated_provision · spend_refusal · spend_gate_enforced · spend_revoked · rich_gate ·
-                             partition_choice · saturation · hand_batch_job · fake_mep_username_not_account
+                             partition_choice · saturation · hand_batch_job · fake_mep_username_not_account ·
+                             term_switch_reasks · preset_account_scoped · ssh_account_floor
                            blocks + reaps: block_reaped_resume · reap_replaced_block · gpu_rule · submit_policy_rejected ·
                              slurm_worker_died · polaris_filesystems
                            long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·
@@ -273,7 +274,10 @@ no cluster block, so they are cheap enough to sweep across models. Graders for t
 
 Per-scenario knobs (module constants): `NO_GLOBUS_DB` and `GLOBUS_DB_SECRET` are read on the host by
 `harness/scenario_knobs.py` (run_smoke.sh decides what to mount); `EXTRA_ENV` (MCP-server-only env),
-`SEED_FACILITY_CACHE` and `SERIAL` are applied inside the container by run.py. The second identity: log
+`SEED_FACILITY_CACHE` and `SERIAL` are applied inside the container by run.py. `EXTRA_ENV` is the server's only for the
+Claude SDK and ACP operators: the CLI operators (codex, pi, hermes21) pass it through their own process environment
+(`harness/cli_runner.py`), where the agent's shell can read it — a grader must not take an agent's use of such a value
+for the product's. The second identity: log
 in once as an identity globus1 does not map (e.g. a personal Google identity) via
 `scripts/fresh_user_session.sh --reset` or `agentic/mep_no_account_check.py`, then point
 `HPCB_TEST_GLOBUS_DB_NOACCOUNT=<that dir>/storage.db` in `agentic/.env`.

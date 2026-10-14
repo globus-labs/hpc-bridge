@@ -476,7 +476,8 @@ class CatalogEntry(BaseModel):
         selection, not MachineProfile. `init_blocks` is likewise absent — the SSH path derives
         eager start from the run mode (`@@EAGER@@`), and the MEP UEC builder reads
         `defaults.init_blocks` directly. `scheduler` IS passed through to the profile (the
-        template dispatches on it). `auth_method` is reserved (only ssh-key is wired; nothing
+        template dispatches on it), and so is `account_required` (the server's account floor reads it
+        on an SSH facility as on a MEP). `auth_method` is reserved (only ssh-key is wired; nothing
         reads it yet).
         """
         return {
@@ -497,4 +498,5 @@ class CatalogEntry(BaseModel):
             "scheduler": self.compute.scheduler,
             "cpus_per_node": self.defaults.cpus_per_node,
             "exclusive": self.defaults.exclusive,
+            "account_required": self.account_required,
         }

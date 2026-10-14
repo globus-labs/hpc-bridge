@@ -96,6 +96,8 @@ def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
         uec = {**defaults, **shape_config(shape)}
         # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
         uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
+        if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
+            uec.update(app.compute_choice)
         rt = ShapeRuntime(user_endpoint_config=uec)
         app.shapes[shape] = rt
     return rt
@@ -221,6 +223,8 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
     if result.ok and result.worker_user:  # the account the work runs as (a facility's identity mapping): for squeue -u
         app.worker_user = result.worker_user
+    if result.ok:  # its job is up: the first proof dates it (for its walltime), on whatever terms it is met again
+        _saw_job(app, result.worker_job, min(now, result.answered_at) if result.answered_at else now)
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
@@ -304,6 +308,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
             rt.runner.close()
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
+    app.compute_choice.clear()  # chosen for this binding: a stop keeps them, a new binding or a teardown does not
     app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()
     return spent
@@ -445,7 +450,8 @@ def _guard_refusal(out: ShellOutcome, guard: session_shell.Guard) -> session_she
     return session_shell.refusal(out.exit_code, out.stderr_snippet, guard)
 
 def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, guard: session_shell.Guard,
-                         refused: session_shell.Refusal, *, reset: bool = False) -> ShellOutcome:
+                         refused: session_shell.Refusal, *, reset: bool = False,
+                         at: float | None = None) -> ShellOutcome:
     """A command the guard refused: it reached another scheduler job than the block it was sent for (`guard.job`), and
     did NOT run. While that block is still the confirmed one, this is the reap `_confirm_worker` makes when a different
     job answers a check, found by the command instead: kicked (the replacement is up and billing), the old block banked
@@ -472,8 +478,9 @@ def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, 
         # the block) dates the block by the last answer's job (_provision): make that this job, not the old block's,
         # or the next guard would expect the block that is gone.
         prev = rt.last_canary if rt.last_canary is not None and rt.last_canary.ok else CanaryResult(ok=True)
-        rt.last_canary = dataclasses.replace(prev, worker_host=None, worker_job=refused.job,
-                                             answered_at=time.monotonic())
+        seen = at if at is not None else time.monotonic()  # when it refused (a polled handle's end), not when read
+        rt.last_canary = dataclasses.replace(prev, worker_host=None, worker_job=refused.job, answered_at=seen)
+        _saw_job(app, refused.job, seen)
     if not rt.spend_confirmed:  # this reap, or one a check or another command found first
         return _with_spend(app, ShellOutcome(
             phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
@@ -508,18 +515,49 @@ def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
 def _forget_presumed(rt: ShapeRuntime) -> None:
     rt.presumed_block_since = rt.presumed_block_job = rt.presumed_block_until = rt.presumed_billed_until = None
 
-def _answering_block_since(rt: ShapeRuntime, job: str | None, now: float) -> float:
-    """When the block that has just answered started, for its walltime. After an idle presumption, which can come while
-    the block is still up (on a slower scaling pass), the answer is dated by the scheduler job id: the same job is the
-    presumed block and keeps its older age; a different job is a new block, aged from now. With either id unknown (not
-    expected: every Slurm or PBS block has one), a block answering before the presumed one's latest possible end keeps
-    the older age, so its walltime is presumed early (a question) rather than missed."""
+# How many jobs `AppCtx.job_seen_since` remembers: far more than one session meets. The oldest go first, never the job
+# of a shape's confirmed or presumed block.
+_JOBS_SEEN_MAX = 256
+
+def _saw_job(app: AppCtx, job: str | None, at: float) -> None:
+    """Scheduler job `job` was proven up at `at` (a check or a command reported it): remember the first such time on
+    this endpoint, never a later one."""
+    if job is None:
+        return
+    app.job_seen_since.setdefault((app.state.endpoint_id, job), at)
+    if len(app.job_seen_since) <= _JOBS_SEEN_MAX:
+        return
+    live = {(app.state.endpoint_id, j)
+            for rt in app.shapes.values() for j in (rt.block_job, rt.presumed_block_job) if j}
+    while len(app.job_seen_since) > _JOBS_SEEN_MAX and (spare := [k for k in app.job_seen_since if k not in live]):
+        del app.job_seen_since[min(spare, key=app.job_seen_since.__getitem__)]
+
+# How long past its walltime a job may still answer before the scheduler kills it (Slurm KillWait / OverTimeLimit, PBS's
+# kill grace): only an answer later than this is a requeue. Safety first: a real requeue is then recognised one confirm
+# later at worst (one more re-ask), never a job at its hard end taken for a fresh one.
+_REQUEUE_GRACE_S = 30.0
+
+def _answering_block_since(app: AppCtx, rt: ShapeRuntime, job: str | None, now: float) -> float:
+    """When the block that has just answered started, for its walltime: when its scheduler job was first proven up on
+    this endpoint (`AppCtx.job_seen_since`), whatever partition or account it is on — a job that answers again after an
+    idle presumption, a stop or a switch away and back keeps its real age. A job not seen before started now. With
+    either id unknown (not expected: every Slurm or PBS block has one), a block answering before the idle-presumed
+    one's latest possible end keeps the older age, so its walltime is presumed early (a question) rather than missed.
+    No job outlives its walltime: one that answers past it plus _REQUEUE_GRACE_S, counted from its first proof, was
+    requeued under the same id (a preemption, a node failure, a PBS rerun) and runs a fresh walltime from that answer.
+    `now` is when the block answered (a check's answer may be up to the runner's freshness window old), not the call's
+    clock."""
     old, old_job, until = rt.presumed_block_since, rt.presumed_block_job, rt.presumed_block_until
-    if old is None:
-        return now
-    if job is not None and old_job is not None:
-        return old if job == old_job else now
-    return old if until is not None and now < until else now
+    if job is not None and (old is None or old_job is not None):  # by job: the earliest proof of it
+        ages = [app.job_seen_since.get((app.state.endpoint_id, job), now)]
+        if old is not None and old_job == job:
+            ages.append(old)
+        wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
+        if wall and now - min(ages) > wall + _REQUEUE_GRACE_S:  # requeued: this proof is its new first one
+            app.job_seen_since[(app.state.endpoint_id, job)] = now
+            return now
+        return min(ages)
+    return old if old is not None and until is not None and now < until else now
 
 async def _provision(
     app: AppCtx, shape: str, *, force_canary: bool = False, confirm_spend: bool = False
@@ -547,11 +585,14 @@ async def _provision(
         # NOTHING until an allocation account is set (passed now, or sticky from an earlier call). Live 2026-09-09:
         # on NCSA Delta (account_required) the agent confirmed spend with no account — the user had offered a
         # LOGIN NAME — and the MEP submitted a GPU block Slurm could only reject, which a MEP has no channel to see,
-        # so it read "allocating nodes…" for five minutes. The flag was stored and never enforced.
+        # so it read "allocating nodes…" for five minutes. Every channel carries the flag (an SSH facility in its
+        # profile), and the account read is the one the block would be charged to: this session's choice or the
+        # facility's configured default (the startup pin's), both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
-        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped)
+        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, or its terms switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
+        rt.switched_terms, rt.switch_left, rt.switch_unseen, rt.reap_terms = None, None, False, None
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -598,8 +639,11 @@ async def _provision(
         rt.clock_stopped_at = None
     _settle_billing(rt, app, billed_as)
     if block == "warm" and rt.block_since is None:  # a block first confirmed warm: its age (for its walltime) and job
-        job = rt.last_canary.worker_job if rt.last_canary is not None and rt.last_canary.ok else None
-        since = _answering_block_since(rt, job, time.monotonic())
+        answer = rt.last_canary if rt.last_canary is not None and rt.last_canary.ok else None
+        job = answer.worker_job if answer is not None else None
+        now = time.monotonic()  # dated by its answer: a cached one may be older than this call
+        answered = min(now, answer.answered_at) if answer is not None and answer.answered_at else now
+        since = _answering_block_since(app, rt, job, answered)
         if (rt.presumed_block_since is not None and since == rt.presumed_block_since
                 and rt.presumed_billed_until is not None):
             rt.warm_since = rt.presumed_billed_until  # the presumed block lived on: its spend clock continues
@@ -626,11 +670,11 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     make the caller poll_task/stop_endpoint first. Otherwise returns None.
 
     No-op when `partition` is None (keep the facility/profile default) or unchanged, or for the
-    login shape, which has no partition. A real change means a different scheduler block,
-    so we mark the cached runner stale (its Executor captured the old partition at build time —
-    _runner_for rebuilds it and banks the prior warm interval) and drop the warm confirmation;
-    the old block idle-releases on its own (min_blocks=0). The selection persists in
-    user_endpoint_config for the rest of the session."""
+    login shape, which has no partition. A real change means a different scheduler block (_repoint): the
+    confirmation covered the old block only, the cached runner is stale (its Executor captured the old partition at
+    build time — _runner_for rebuilds it), and nothing cancels the old block (an SSH endpoint's idle-releases on its
+    own, min_blocks=0; a facility endpoint's is left billing and named). The selection persists for the session, a
+    stop included."""
     if partition is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("partition") == partition:
@@ -644,14 +688,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
-    _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
-    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
-        _leave_switched(app, shape, rt)
-    rt.user_endpoint_config["partition"] = partition
-    rt.runner_stale = True
-    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
-    rt.block_since = rt.block_job = None  # a different partition is a different block: not the old one's age
-    _forget_presumed(rt)
+    _repoint(app, shape, rt, "partition", partition)
     return None
 
 def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | None) -> str | None:
@@ -659,8 +696,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     analogue of _apply_partition. Returns a rejection notice (and applies nothing) when a task is still
     running on the shape (the runner swap would cancel it). compute-shape only; the config_template
     renders `account` from user_endpoint_config with the profile default, so a selection here overrides
-    it. A change invalidates the cached runner (banking the prior warm interval) and drops the warm
-    confirmation; the selection persists for the session."""
+    it. A change is a different block (_repoint); the selection persists for the session, a stop included."""
     if account is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("account") == account:
@@ -674,15 +710,60 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    _repoint(app, shape, rt, "account", account)
+    return None
+
+def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) -> None:
+    """A real partition or account change, once nothing of ours holds the block: a different block.
+
+    The spend confirmation covered the old terms' block only, so it is dropped: the call answers needs_confirmation
+    unless it carries confirm_spend=True itself, and the answer says what became of the old block
+    (`rt.switched_terms`, `rt.switch_left`; notices._reask_prefix). Nothing here cancels that block: on an SSH endpoint
+    it idle-releases on its own (min_blocks=0) and stop_endpoint cancels it; on a facility endpoint it is left billing
+    and remembered for naming (_leave_switched, #178). Either way whatever block of ours is known up there is billed
+    once, to the latest it can bill (_leave_block). A finished command the wrong-block guard refused is taken in first
+    (`_settle_refusals`): the replacement it found is such a block. If the old job is met again later, it keeps its age
+    (dated by its job) and bills afresh from that confirmation: switching back and forth over-counts, never under.
+    Task handles from before the switch stop vouching for this shape's block (`block_epoch`). The new value is the
+    session's choice (`app.compute_choice`)."""
+    _settle_refusals(app, shape, rt)
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
-    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
-        _leave_switched(app, shape, rt)
-    rt.user_endpoint_config["account"] = account
+    uec = rt.user_endpoint_config
+    terms = (uec.get("partition"), uec.get("account"))
+    confirmed = _billable(rt) and rt.spend_confirmed
+    unseen = rt.block_since is None and rt.warm_confirmed_at is None  # asked for, never seen up: its pilot may land
+    if _has_login_shape(app):  # an SSH endpoint: a block idles out — banked to that latest end, not named
+        _leave_block(app, shape, rt, how="switch", remember=False)
+    elif (left := _leave_switched(app, shape, rt)) is not None:  # a facility endpoint: it bills on, and is named
+        rt.switch_left = left
+    if confirmed:
+        rt.spend_confirmed = False
+        rt.switched_terms, rt.switch_unseen = terms, unseen
+    elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
+        rt.reap_terms = terms
+    _bank_warm_interval(rt, app)  # (a no-op once the block was left)
+    uec[key] = value
+    app.compute_choice[key] = value
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
-    rt.block_since = rt.block_job = None  # a different account is a different block: not the old one's age
+    rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age
     _forget_presumed(rt)
-    return None
+    rt.block_epoch += 1
+
+def _settle_refusals(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+    """Before a switch lets go of the block: a finished command of this runtime that the wrong-block guard refused, not
+    polled yet, found a replacement block — take that in now, as its poll would have (`_wrong_block_outcome`: a kicked
+    reap), so the switch leaves the replacement billed and named, not the block that is gone. The handle stays: its
+    poll still says the command did not run. A reap found here was told to no one: the calling call answers
+    needs_confirmation with it (`reap_told` left False), as any call that finds a reap does."""
+    for h in list(app.tasks.values()):
+        if (h.shape == shape and h.guard is not None and h.future.done() and not h.future.cancelled()
+                and (h.runtime is None or h.runtime is rt)
+                and (refused := _guard_refusal(_finished_outcome(h), h.guard)) is not None):
+            was = rt.reaped
+            _wrong_block_outcome(app, shape, rt, h.guard, refused, reset=h.reset, at=h.done_at)
+            if was is None and rt.reaped is not None:
+                rt.reap_told = False
 
 def _check_queued(rt: ShapeRuntime) -> bool:
     """A check (canary) of ours is still queued on the endpoint: its runner holds one unresolved, or the last check
@@ -751,6 +832,7 @@ def _resolve_left(app: AppCtx, shape: str, rt: ShapeRuntime, now: float,
         if late.worker_user:
             app.worker_user = late.worker_user
         seen = min(now, late.answered_at) if late.answered_at else now
+        _saw_job(app, late.worker_job, seen)
         return answered(seen, late.worker_job, False), seen
     if rt.presumed_block_since is not None:
         ends = rt.presumed_block_since + wall if wall else None
@@ -760,11 +842,14 @@ def _resolve_left(app: AppCtx, shape: str, rt: ShapeRuntime, now: float,
         return replace(base, kind="check"), None  # a queued check never expires: the queue wait is unbounded
     return None
 
-def _leave_block(app: AppCtx, shape: str, rt: ShapeRuntime, *, how: str) -> LeftBlock | None:
+def _leave_block(app: AppCtx, shape: str, rt: ShapeRuntime, *, how: str, remember: bool = True) -> LeftBlock | None:
     """A facility-endpoint stop, detach, reconnect or switch lets go of this shape's block, which keeps billing (no
     cancel channel there, #178): resolve it (`_resolve_left`), stop its spend clock and bank it ONCE to its latest end —
     the honest upper bound, beyond now when that is still ahead — and remember it in `app.left_blocks`, where it is
-    only ever NAMED again (a later stop, a teardown, a re-bind note), never billed or dated. Callers hold app.lock."""
+    only ever NAMED again (a later stop, a teardown, a re-bind note), never billed or dated. A refused command not yet
+    polled is taken in first (`_settle_refusals`): the block left is then the replacement it found. Callers hold
+    app.lock."""
+    _settle_refusals(app, shape, rt)
     now = time.monotonic()
     _prune_left(app, now)
     found = _resolve_left(app, shape, rt, now, how)
@@ -786,7 +871,8 @@ def _leave_block(app: AppCtx, shape: str, rt: ShapeRuntime, *, how: str) -> Left
         counted = left.until
     if key is not None and counted is not None:
         app.billed_to[key] = counted if mark is None else max(mark, counted)
-    _remember_left(app, left)
+    if remember:  # an SSH switch is banked the same way, but never named: a stop there cancels it
+        _remember_left(app, left)
     return left
 
 def _remember_left(app: AppCtx, left: LeftBlock) -> None:
@@ -801,17 +887,18 @@ def _remember_left(app: AppCtx, left: LeftBlock) -> None:
         return (b.partition, b.account) == (left.partition, left.account)
     app.left_blocks = [b for b in app.left_blocks if not same(b)] + [left]
 
-def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> LeftBlock | None:
     """A partition or account switch on a facility endpoint: leave the old block (`_leave_block`, banked once), then let
     go of everything that still points at it — the old runner (closed: its unread late answer belongs to the old
     partition), the last check and a reap's kick — so no later stop reads that block again and files it under the new
-    partition (review of a6de41e, X)."""
-    _leave_block(app, shape, rt, how="switch")
+    partition (review of a6de41e, X). Returns the block left, for the spend question to name."""
+    left = _leave_block(app, shape, rt, how="switch")
     _bank_warm_interval(rt, app)  # (a no-op once _leave_block banked it)
     if rt.runner is not None:
         rt.runner.close()
     rt.runner, rt.runner_stale = None, False
     rt.last_canary, rt.reap_kicked = None, False
+    return left
 
 def _prune_left(app: AppCtx, now: float | None = None) -> list[LeftBlock]:
     """Drop the left BLOCKS that cannot still be running — past their walltime's end — and return the rest. A queued
@@ -920,6 +1007,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
     guard (the job and nonce), so a refusal found when it is polled is still the replacement found."""
     app.task_seq += 1
     task_id = f"{shape}-{app.task_seq}"
+    sent_on = runtime if runtime is not None else app.shapes.get(shape)
     handle = TaskHandle(
         future=fut,
         shape=shape,
@@ -932,6 +1020,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         reset=reset,
         submission=submission,
         guard=guard,
+        epoch=sent_on.block_epoch if sent_on is not None else 0,
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
@@ -962,22 +1051,28 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
     if not fut.done():
         return None  # still running
     app.tasks.pop(task_id, None)  # atomic claim under the lock
-    try:
-        res = fut.result()  # done -> returns at once (or raises the task's own exception)
-    except Exception as exc:  # noqa: BLE001 - shape a failed task exactly as execute() would
-        out = dispatch.failure_outcome(exc, "warm")
-    else:
-        out = dispatch.complete_outcome(res, "warm")
+    out = _finished_outcome(handle)
     if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
-        return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset)
+        return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,
+                                    at=handle.done_at)
     current = app.shapes.get(handle.shape)
     # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
-    if current is not None and (handle.runtime is None or handle.runtime is current):
+    # (a released runtime, or a switch since it was sent: the same runtime now stands for another block)
+    if (current is not None and (handle.runtime is None or handle.runtime is current)
+            and handle.epoch == current.block_epoch):
         _note_dispatch(current, out, at=handle.done_at)
     else:
-        out.block_state = "cold"  # its block was released while it ran (a newer block's runtime is not its own)
+        out.block_state = "cold"  # its block was released, or switched away from, while it ran
     return _with_spend(app, _with_submission_notice(out, handle.submission, handle.shape))
+
+def _finished_outcome(handle: TaskHandle) -> ShellOutcome:
+    """A finished handle's result, shaped exactly as execute() would shape it."""
+    try:
+        res = handle.future.result()  # done -> returns at once (or raises the task's own exception)
+    except Exception as exc:  # noqa: BLE001 - a failed task is an outcome, not a raise
+        return dispatch.failure_outcome(exc, "warm")
+    return dispatch.complete_outcome(res, "warm")
 
 async def _endpoint_gone(app: AppCtx) -> bool:
     """True when nothing can resolve a pending task any more: the endpoint the task was dispatched

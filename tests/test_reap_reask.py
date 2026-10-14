@@ -258,7 +258,8 @@ async def test_a_partition_switch_does_not_hide_a_reap_or_inherit_the_old_block_
     app, rt, _runner = await _warm_app()
     rt.block_since -= 3000
     assert _apply_partition(app, "compute", rt, "other") is None
-    assert rt.block_since is None and rt.spend_confirmed is True  # a live block: no reap, and a fresh age
+    # a live block: no reap, and a fresh age — and a different block, so spend is asked again
+    assert rt.block_since is None and rt.reaped is None and rt.spend_confirmed is False and rt.switched_terms
 
 
 async def test_stop_after_a_reap_check_waits_for_the_pilot_that_check_may_have_requested(monkeypatch):
@@ -991,7 +992,7 @@ async def test_a_check_that_fails_with_no_confirmed_block_starts_no_clock(case):
         app.tasks["t1"] = TaskHandle(future=fut, shape="compute", session_id="s2", command="make",
                                      submitted_at=time.monotonic(), ceiling_s=60.0, done_at=time.monotonic())
         runner._canary = _TIMEOUT
-        res = await _ensure_endpoint_up(app, partition="other")
+        res = await _ensure_endpoint_up(app, partition="other", confirm_spend=True)  # the user's yes for the new terms
     else:
         f = FakeFacility()
         f.workers = 1
@@ -1072,10 +1073,10 @@ async def test_on_a_facility_endpoint_a_block_replaced_after_a_transient_conflic
 
 @pytest.mark.parametrize("switch", ["partition", "account"])
 async def test_after_a_switch_the_first_block_to_answer_is_taken_not_compared(switch):
-    # a switch is a different block the agent asked for under the same confirmation: no job to compare it against
+    # a switch is a different block, confirmed with the switch itself: no job to compare it against
     app, rt, runner = await _warm_app(job="112")
     runner._canary = _job("113")
-    res = await _ensure_endpoint_up(app, **{switch: "other"})
+    res = await _ensure_endpoint_up(app, **{switch: "other"}, confirm_spend=True)
     assert res.status == "up" and rt.block_job == "113" and rt.spend_confirmed is True and rt.reaped is None
 
 

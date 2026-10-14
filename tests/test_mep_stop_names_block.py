@@ -274,7 +274,8 @@ async def test_a_stop_banks_the_block_once_and_a_later_confirmation_bills_fresh(
     runner._canary = _now_ok(clock)  # the SAME job answers the new confirmation (same binding: no reconnect)
     assert (await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)).status == "up"
     rt = app.shapes["compute"]
-    assert rt.warm_since == t0 + 30 and rt.block_since == t0 + 30  # fresh: its own confirmation, not the left entry
+    # it bills fresh from its own confirmation, never continued from the left entry; dated by its job, it keeps its age
+    assert rt.warm_since == t0 + 30 and rt.block_since == t0
     assert app.left_blocks == []  # the entry named it; now it is the confirmed block again
     for t in (60, 300):
         clock[0] = t0 + t
@@ -816,11 +817,12 @@ async def test_stop_and_reconfirm_cycles_never_recount_a_tail(monkeypatch, clock
 
 async def test_quick_stops_with_no_idle_window_count_the_walltime_once(monkeypatch, clock):
     # Anvil- and Delta-like (no idle window published): every stop's tail runs to a walltime end — 4 stops in 310 s
-    # reported 8.0 node-h before the mark; now the walltime is counted once, plus each cycle's own clock and shift
+    # reported 8.0 node-h before the mark; now the walltime is counted once, plus each cycle's own clock. The job keeps
+    # its age when it answers again (dated by its job), so its walltime end does not move and no tail is added past it.
     seen, last_end = await _cycles(monkeypatch, clock, idle=None, stops=4)
     assert seen == sorted(seen)
     assert seen[0] == pytest.approx(7200, abs=0.01)  # the first stop: to its walltime's end
-    assert seen[-1] == pytest.approx(7200 + (60 + 50) + 2 * (60 + 100), abs=0.01)
+    assert seen[-1] == pytest.approx(7200 + 3 * 60, abs=0.01)
     assert seen[-1] <= last_end + 7200 and seen[-1] / 3600 < 2.2  # not 8 node-h
 
 

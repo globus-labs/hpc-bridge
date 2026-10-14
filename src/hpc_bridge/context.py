@@ -56,7 +56,8 @@ class ShapeRuntime:
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
     # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
     # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
-    # the block is reaped (idle-release, walltime, or found gone) so the NEXT block is asked for again (0.1.18).
+    # the block is reaped (idle-release, walltime, or found gone) or its partition or account is switched, so the NEXT
+    # block is asked for again.
     spend_confirmed: bool = False
     # When the current block was first confirmed warm (for its walltime), and why it is presumed or known gone.
     # `reap_told`: the agent has been handed that reason once — the call that detects a reap always answers
@@ -76,6 +77,21 @@ class ShapeRuntime:
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
+    # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
+    # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
+    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
+    # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
+    # (server._stop_endpoint's expect_block). A confirmation clears them.
+    switched_terms: tuple[str | None, str | None] | None = None
+    switch_left: LeftBlock | None = None
+    switch_unseen: bool = False
+    # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
+    # while they differ from these — back on them, the block the reap found is that confirmation's again.
+    reap_terms: tuple[str | None, str | None] | None = None
+    # Bumped by a switch: a task handle records the epoch it was sent in, and its result is proof of life only for a
+    # block of that epoch — a task that finished on the old block, polled later, must not vouch for the new one
+    # (warmth._resolve_task). Its end is still the old block's last activity, which every stamp of the new block passes.
+    block_epoch: int = 0
     # An idle presumption can come while the block is still up (an endpoint on a slower scaling pass): that block's
     # age, job id, the latest it could have lived, and where the presumption stopped its spend clock — so the block
     # that answers next is dated and billed right (warmth._provision).
@@ -117,6 +133,7 @@ class TaskHandle:
     # unguarded. A result the guard refused is the replacement found (warmth._wrong_block_outcome), whenever it is
     # polled.
     guard: Guard | None = None
+    epoch: int = 0  # its runtime's block_epoch when it was sent: a switch since then means it ran on the old block
 
 
 @dataclass
@@ -216,6 +233,17 @@ class AppCtx:
     # The local account the last check (canary) ran as — on a facility endpoint, the identity mapping's: a stop's
     # `squeue -u` names it. Cleared with left_blocks on a bind elsewhere, and on a new Globus login.
     worker_user: str | None = None
+    # The partition and account this session chose for the compute shape (ensure_endpoint_up partition= / account=,
+    # warmth._repoint). A stop drops the compute shape whole; the next one starts with these (warmth._shape_runtime), so
+    # the choice persists for the session as the tool says: the spend question after a stop names the partition, and
+    # its result carries both. Forgotten with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a
+    # teardown or a detach); a new Globus login keeps them, as it keeps a live shape's.
+    compute_choice: dict[str, str] = field(default_factory=dict)
+    # When each scheduler job on the bound endpoint was first proven up (a check or a command reporting it), keyed
+    # (endpoint id, job): never moved later, so a block dated by its job keeps its real age (for its walltime) however
+    # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
+    # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
+    job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

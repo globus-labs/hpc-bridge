@@ -31,6 +31,14 @@ def endpoint_name() -> str | None: return env("HPC_BRIDGE_ENDPOINT_NAME")
 def scratch() -> str | None: return env("HPC_BRIDGE_SCRATCH")
 
 
+def names_machine(*names: str) -> bool:
+    """Whether HPC_BRIDGE_MACHINE names the facility known by `names` (its catalog id and subject): the ONE facility
+    the env presets HPC_BRIDGE_ACCOUNT and HPC_BRIDGE_PARTITION apply to (binding._names_machine adds an alias the
+    startup pin resolved). Unset: no facility."""
+    m = machine()
+    return m is not None and m in names
+
+
 def search_index() -> str:
     """The registry to read: the built-in public one unless HPC_BRIDGE_SEARCH_INDEX overrides it."""
     return env("HPC_BRIDGE_SEARCH_INDEX") or PUBLIC_REGISTRY_INDEX
