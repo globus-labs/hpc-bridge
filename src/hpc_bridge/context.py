@@ -85,7 +85,9 @@ class ShapeRuntime:
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
     switch_unseen: bool = False
-    switched_since_reap: bool = False  # a switch while spend was asked anyway (a reap): the re-ask says so
+    # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
+    # while they differ from these — back on them, the block the reap found is that confirmation's again.
+    reap_terms: tuple[str | None, str | None] | None = None
     # Bumped by a switch: a task handle records the epoch it was sent in, and its result is proof of life only for a
     # block of that epoch — a task that finished on the old block, polled later, must not vouch for the new one
     # (warmth._resolve_task). Its end is still the old block's last activity, which every stamp of the new block passes.

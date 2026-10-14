@@ -93,8 +93,9 @@ installed plugin only when that version changes); git tags mark releases.
   wrong-block guard refused that nobody has polled yet is taken in before a stop, detach, reconnect or switch lets go
   of the block, so the replacement it found is what gets named and billed, and the call that switches answers with
   that reap. A job met again, after a switch back, a stop or a reconnect, keeps its real age for its walltime (dated by
-  its scheduler job, on any number of switches), unless it answers past that walltime: then it was requeued under its
-  id and runs a fresh one. It bills afresh from that confirmation: switching back and forth can count some time twice,
+  its scheduler job, on any number of switches), unless it answers more than 30 s past that walltime (the time a
+  scheduler may let a job run on before killing it), counted to when it answered: then it was requeued under its id
+  and runs a fresh one. It bills afresh from that confirmation: switching back and forth can count some time twice,
   never less than ran. A switch back to the confirmed terms says so. A task that finished on the old block and is polled later no
   longer marks the new block warm (which skipped its check and left it unguarded). The same partition or account again
   is not a change.

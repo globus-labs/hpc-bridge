@@ -532,21 +532,28 @@ def _saw_job(app: AppCtx, job: str | None, at: float) -> None:
     while len(app.job_seen_since) > _JOBS_SEEN_MAX and (spare := [k for k in app.job_seen_since if k not in live]):
         del app.job_seen_since[min(spare, key=app.job_seen_since.__getitem__)]
 
+# How long past its walltime a job may still answer before the scheduler kills it (Slurm KillWait / OverTimeLimit, PBS's
+# kill grace): only an answer later than this is a requeue. Safety first: a real requeue is then recognised one confirm
+# later at worst (one more re-ask), never a job at its hard end taken for a fresh one.
+_REQUEUE_GRACE_S = 30.0
+
 def _answering_block_since(app: AppCtx, rt: ShapeRuntime, job: str | None, now: float) -> float:
     """When the block that has just answered started, for its walltime: when its scheduler job was first proven up on
     this endpoint (`AppCtx.job_seen_since`), whatever partition or account it is on — a job that answers again after an
     idle presumption, a stop or a switch away and back keeps its real age. A job not seen before started now. With
     either id unknown (not expected: every Slurm or PBS block has one), a block answering before the idle-presumed
     one's latest possible end keeps the older age, so its walltime is presumed early (a question) rather than missed.
-    No job outlives its walltime: one that answers at or past it, counted from its first proof, was requeued under the
-    same id (a preemption, a node failure, a PBS rerun) and runs a fresh walltime from now."""
+    No job outlives its walltime: one that answers past it plus _REQUEUE_GRACE_S, counted from its first proof, was
+    requeued under the same id (a preemption, a node failure, a PBS rerun) and runs a fresh walltime from that answer.
+    `now` is when the block answered (a check's answer may be up to the runner's freshness window old), not the call's
+    clock."""
     old, old_job, until = rt.presumed_block_since, rt.presumed_block_job, rt.presumed_block_until
     if job is not None and (old is None or old_job is not None):  # by job: the earliest proof of it
         ages = [app.job_seen_since.get((app.state.endpoint_id, job), now)]
         if old is not None and old_job == job:
             ages.append(old)
         wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
-        if wall and now - min(ages) >= wall:  # requeued: this proof is its new first one
+        if wall and now - min(ages) > wall + _REQUEUE_GRACE_S:  # requeued: this proof is its new first one
             app.job_seen_since[(app.state.endpoint_id, job)] = now
             return now
         return min(ages)
@@ -585,7 +592,7 @@ async def _provision(
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, or its terms switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
-        rt.switched_terms, rt.switch_left, rt.switch_unseen, rt.switched_since_reap = None, None, False, False
+        rt.switched_terms, rt.switch_left, rt.switch_unseen, rt.reap_terms = None, None, False, None
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -632,8 +639,11 @@ async def _provision(
         rt.clock_stopped_at = None
     _settle_billing(rt, app, billed_as)
     if block == "warm" and rt.block_since is None:  # a block first confirmed warm: its age (for its walltime) and job
-        job = rt.last_canary.worker_job if rt.last_canary is not None and rt.last_canary.ok else None
-        since = _answering_block_since(app, rt, job, time.monotonic())
+        answer = rt.last_canary if rt.last_canary is not None and rt.last_canary.ok else None
+        job = answer.worker_job if answer is not None else None
+        now = time.monotonic()  # dated by its answer: a cached one may be older than this call
+        answered = min(now, answer.answered_at) if answer is not None and answer.answered_at else now
+        since = _answering_block_since(app, rt, job, answered)
         if (rt.presumed_block_since is not None and since == rt.presumed_block_since
                 and rt.presumed_billed_until is not None):
             rt.warm_since = rt.presumed_billed_until  # the presumed block lived on: its spend clock continues
@@ -729,8 +739,8 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     if confirmed:
         rt.spend_confirmed = False
         rt.switched_terms, rt.switch_unseen = terms, unseen
-    elif rt.reaped is not None:  # spend is being asked anyway (a reap): the re-ask says the terms changed since
-        rt.switched_since_reap = True
+    elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
+        rt.reap_terms = terms
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
     uec[key] = value
     app.compute_choice[key] = value

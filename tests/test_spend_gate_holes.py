@@ -941,7 +941,10 @@ def test_the_jobs_remembered_are_bounded_and_never_moved_later():
 
 
 class _ClockRunner(_FakeRunner):
-    """A fake runner whose check is answered now (the fake clock), by `self.job`."""
+    """A fake runner whose check is answered now (the fake clock), by `self.job` — or, with `self.answered` set, handed
+    back as a cached answer from then; with no job, not answered within its wait."""
+
+    answered: float | None = None
 
     def __init__(self, eid, clock, job, **kw):
         super().__init__(eid, _Res(0, "ok", ""), **kw)
@@ -949,8 +952,11 @@ class _ClockRunner(_FakeRunner):
 
     async def canary(self, timeout=8.0):
         self.canaries += 1
+        if self.job is None:
+            return CanaryResult(ok=False, error="timeout")
         return CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.3.9",
-                            worker_job=self.job, worker_user="u", answered_at=self.clock[0])
+                            worker_job=self.job, worker_user="u",
+                            answered_at=self.answered if self.answered is not None else self.clock[0])
 
 
 def _answer_now(app, clock, job):
@@ -1006,13 +1012,13 @@ async def test_a_job_requeued_under_its_id_runs_a_fresh_walltime_and_bills_on(cl
         assert (await _run_shell(app, "true")).phase == "complete"
     clock[0] = t0 + 1810
     assert (await _run_shell(app, "true")).phase == "needs_confirmation"   # its walltime, presumed
-    clock[0] = t0 + 1820
+    clock[0] = t0 + 1840                                               # past its walltime + the kill grace
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"   # the requeued job answers
-    assert rt.block_job == job and rt.block_since == t0 + 1820
-    clock[0] = t0 + 1830
+    assert rt.block_job == job and rt.block_since == t0 + 1840
+    clock[0] = t0 + 1850
     assert (await _run_shell(app, "true")).phase == "complete"
     before = server._total_session_spend(app) * 3600
-    clock[0] = t0 + 2430
+    clock[0] = t0 + 2450
     assert (await _run_shell(app, "true")).phase == "complete"
     assert server._total_session_spend(app) * 3600 - before == pytest.approx(600, abs=0.01)   # it bills on
 
@@ -1117,3 +1123,50 @@ async def test_a_pin_with_a_bad_ssh_host_names_no_machine(monkeypatch):
     with pytest.raises(ValueError):
         await binding._catalog_facility("expanse")
     assert binding._PINNED == {}
+
+
+@pytest.mark.parametrize("kind", ["ssh", "mep"])
+@pytest.mark.parametrize("how", ["cached_answer", "kill_slack"])
+async def test_a_job_at_its_hard_end_is_not_taken_for_a_requeued_one(clock, kind, how):
+    # job 112 (30 min walltime, first proven at t0) is NOT requeued; a check at t0+1790 times out (a kicked reap). 112
+    # answers the confirm inside the scheduler's kill grace: at t0+1810 itself, or that answer handed back cached at
+    # t0+1835 (25 s old, inside the runner's freshness window; the call's own clock is past walltime + grace). It must
+    # not be re-dated as a fresh walltime: the next command re-asks and is not sent to a block at its hard end
+    t0 = clock[0]
+    app = await _warm() if kind == "ssh" else _mep_app("112")
+    _answer_now(app, clock, "112")
+    if kind == "mep":
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.user_endpoint_config["walltime"] = "00:30:00"
+    for t in range(300, 1501, 300):
+        clock[0] = t0 + t
+        assert (await _run_shell(app, "true")).phase == "complete"
+    clock[0] = t0 + 1790
+    rt.runner.job = None                                               # the check is not answered within its wait
+    assert (await _ensure_endpoint_up(app)).status == "needs_confirmation" and rt.reaped
+    clock[0] = t0 + 1810
+    rt.runner.job = "112"
+    if how == "cached_answer":
+        rt.runner.answered, clock[0] = t0 + 1810, t0 + 1835
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    assert rt.block_job == "112" and rt.block_since == t0                # its first proof: not a fresh walltime
+    clock[0] += 10
+    sent = len(rt.runner.commands)
+    out = await _run_shell(app, "hostname")
+    assert out.phase == "needs_confirmation" and "reached its walltime" in out.notice and len(rt.runner.commands) == sent
+
+
+async def test_a_switch_back_to_the_terms_of_a_reap_does_not_claim_new_terms(clock):
+    # a reap on debug (113 replaced 112 there) -> a switch to compute says it switched -> a switch back to debug: these
+    # are 113's terms again, so the re-ask no longer says a confirmation starts a block on new terms
+    t0 = clock[0]
+    app = await _warm()
+    _answer_now(app, clock, "113")
+    clock[0] = t0 + 100
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "needs_confirmation"
+    away = await _ensure_endpoint_up(app, partition="compute")
+    assert "The partition or account was switched since" in away.notice
+    back = await _ensure_endpoint_up(app, partition="debug")
+    assert back.status == "needs_confirmation" and "job 113" in back.notice
+    assert "switched since" not in back.notice and "new terms" not in back.notice
