@@ -20,6 +20,7 @@ import dataclasses
 import inspect
 import re
 import time
+from dataclasses import replace
 
 from . import dispatch, session_shell
 from .config import (
@@ -34,13 +35,22 @@ from .config import (
 from .context import (
     DEFAULT_SHAPE,
     AppCtx,
+    LeftBlock,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
     _idle_release_s,
     _supported_shapes,
 )
-from .cost import _bank_warm_interval, _billable, _settle_billing, _total_session_spend, _with_spend
+from .cost import (
+    _bank_warm_interval,
+    _billable,
+    _block_nodes,
+    _settle_billing,
+    _total_session_spend,
+    _with_spend,
+    estimate_spend,
+)
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .models import ShellOutcome, Submission
 from .notices import (
@@ -209,6 +219,8 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     timeout = canary_timeout_s()
     result = await runner.canary(timeout=timeout)
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
+    if result.ok and result.worker_user:  # the account the work runs as (a facility's identity mapping): for squeue -u
+        app.worker_user = result.worker_user
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
@@ -591,6 +603,7 @@ async def _provision(
         if (rt.presumed_block_since is not None and since == rt.presumed_block_since
                 and rt.presumed_billed_until is not None):
             rt.warm_since = rt.presumed_billed_until  # the presumed block lived on: its spend clock continues
+        _take_left(app, rt, job)  # names only: a block a facility stop left is this one, or gone (#178)
         rt.block_since, rt.block_job = since, job
     if block == "warm":
         _forget_presumed(rt)
@@ -632,6 +645,8 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
+    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
+        _leave_switched(app, shape, rt)
     rt.user_endpoint_config["partition"] = partition
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
@@ -660,12 +675,183 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
+    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
+        _leave_switched(app, shape, rt)
     rt.user_endpoint_config["account"] = account
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different account is a different block: not the old one's age
     _forget_presumed(rt)
     return None
+
+def _check_queued(rt: ShapeRuntime) -> bool:
+    """A check (canary) of ours is still queued on the endpoint: its runner holds one unresolved, or the last check
+    timed out and nothing has proved a block live since. On a facility endpoint the facility starts (or keeps) a
+    billed block for it, whatever this session does next — nothing here can cancel it (#178)."""
+    if getattr(rt.runner, "canary_pending", False) is True:
+        return True
+    c = rt.last_canary
+    return c is not None and c.error == "timeout" and rt.warm_confirmed_at is None
+
+def _work_on_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> bool:
+    """Work of ours may still be on the block: a task whose end is not stamped yet (running, or presumed lost but never
+    resolved), or a call still inside its sync-wait. Its idle window cannot have started, so the idle bound says
+    nothing about when it ends."""
+    return bool(rt.inflight) or any(h.done_at is None for h in app.tasks.values() if h.shape == shape)
+
+def _resolve_left(app: AppCtx, shape: str, rt: ShapeRuntime, now: float,
+                  how: str) -> tuple[LeftBlock, float | None] | None:
+    """The block this shape leaves running on a facility endpoint — and where its spend clock stands, from which a stop
+    banks it to its latest end — or None when there is none to name. Read BEFORE the shape's state is dropped, in this
+    order (#178):
+    1. the block confirmed warm (`block_job`; its identity survives a failed check);
+    2. else the new block a check found answering after a reap (`reap_kicked`: the check's own job), from its answer;
+    3. else a block whose check answered after its caller stopped waiting (`canary_answer`: read now, never waited on);
+    4. else the block the idle presumption took for gone (`presumed_block_job`), to its latest end;
+    5. else a check still queued (`_check_queued`): no block seen yet, no job id.
+    A check still queued is flagged on 1, 2 and 4. The latest end (`until`, `bound`) is the idle bound — last activity +
+    idle window + _RELEASE_BOUND_S, capped at the walltime — or the walltime's end alone when the idle window is
+    unknown, or when work of ours may still be on the block (`_work_on_block`: no idle window has started)."""
+    if not _billable(rt):
+        return None
+    uec = rt.user_endpoint_config
+    wall = _parse_hhmmss(uec.get("walltime"))
+    idle = _idle_window(app)
+    queued = _check_queued(rt)
+    base = LeftBlock(endpoint_id=app.state.endpoint_id, job=None, until=None, left_at=now, how=how,
+                     check_queued=queued, partition=uec.get("partition"), account=uec.get("account"),
+                     multi=not _single_block(rt))
+
+    def answered(seen: float, job: str | None, check_queued: bool) -> LeftBlock:  # a block seen only by a check
+        until = seen + idle + _RELEASE_BOUND_S if idle else None
+        bound = "idle" if idle else ("walltime" if wall else None)
+        ends = seen + wall if wall else None  # it started before it answered: its walltime ends before this
+        if ends is not None:
+            until = min(until, ends) if until is not None else ends
+        return replace(base, job=job, until=until, bound=bound, ends_by=ends, check_queued=check_queued)
+
+    if rt.block_since is not None:
+        ends = rt.block_since + wall if wall else None
+        if _work_on_block(app, shape, rt):
+            until, bound = ends, ("busy" if ends is not None else None)
+        else:
+            until, bound = _release_bound(app, shape, rt), "idle"
+            if until is None:
+                until, bound = ends, ("walltime" if ends is not None else None)
+        # the clock is banked first (_leave_block): from where it stopped
+        return replace(base, job=rt.block_job, until=until, bound=bound, ends_by=ends, verified=True), None
+    canary = rt.last_canary
+    if rt.reap_kicked and canary is not None and canary.ok:
+        # not adopted (no age, no clock) until the user confirms it — but it has been billing since it answered
+        seen = min(now, canary.answered_at) if canary.answered_at else now
+        return answered(seen, canary.worker_job, queued), seen
+    late = getattr(rt.runner, "canary_answer", lambda: None)()
+    if isinstance(late, CanaryResult) and late.ok:
+        # our check answered after its caller stopped waiting: the block it started (or ran on) is up, unbilled so far
+        if late.worker_user:
+            app.worker_user = late.worker_user
+        seen = min(now, late.answered_at) if late.answered_at else now
+        return answered(seen, late.worker_job, False), seen
+    if rt.presumed_block_since is not None:
+        ends = rt.presumed_block_since + wall if wall else None
+        return (replace(base, job=rt.presumed_block_job, until=rt.presumed_block_until, bound="idle", ends_by=ends,
+                        verified=True), rt.presumed_billed_until)
+    if queued:
+        return replace(base, kind="check"), None  # a queued check never expires: the queue wait is unbounded
+    return None
+
+def _leave_block(app: AppCtx, shape: str, rt: ShapeRuntime, *, how: str) -> LeftBlock | None:
+    """A facility-endpoint stop, detach, reconnect or switch lets go of this shape's block, which keeps billing (no
+    cancel channel there, #178): resolve it (`_resolve_left`), stop its spend clock and bank it ONCE to its latest end —
+    the honest upper bound, beyond now when that is still ahead — and remember it in `app.left_blocks`, where it is
+    only ever NAMED again (a later stop, a teardown, a re-bind note), never billed or dated. Callers hold app.lock."""
+    now = time.monotonic()
+    _prune_left(app, now)
+    found = _resolve_left(app, shape, rt, now, how)
+    if found is None:
+        return None
+    left, billed = found
+    if rt.block_since is not None:  # the confirmed block: stop its clock where a drop would (now, or its presumed end)
+        _bank_warm_interval(rt, app, until=_presumed_release_at(app, shape, rt))
+        billed = rt.clock_stopped_at
+    # The job's high-water mark: how far a bank of ours has already counted this job. The tail adds only the part
+    # beyond it, so stop/re-confirm cycles of one block never recount a span its earlier tail counted (each cycle can
+    # still count its own confirmation-to-stop clock twice: session_spend is an upper bound).
+    key = (left.endpoint_id, left.job) if left.job else None
+    mark = app.billed_to.get(key) if key is not None else None
+    start = billed if billed is None or mark is None else max(billed, mark)
+    counted = billed
+    if left.until is not None and start is not None and left.until > start:
+        rt.spend_accrued += estimate_spend(left.until - start, _block_nodes(rt, app), app.charge_factor)
+        counted = left.until
+    if key is not None and counted is not None:
+        app.billed_to[key] = counted if mark is None else max(mark, counted)
+    _remember_left(app, left)
+    return left
+
+def _remember_left(app: AppCtx, left: LeftBlock) -> None:
+    """Keep `left` in `app.left_blocks`, replacing an entry for the same job — or, unnamed, the same kind on the same
+    partition and account: the most recent queued check per partition and account is kept (one facility user endpoint
+    each), so checks left on other partitions stay named."""
+    def same(b: LeftBlock) -> bool:
+        if b.endpoint_id != left.endpoint_id or b.kind != left.kind:
+            return False
+        if left.job is not None or b.job is not None:
+            return b.job == left.job
+        return (b.partition, b.account) == (left.partition, left.account)
+    app.left_blocks = [b for b in app.left_blocks if not same(b)] + [left]
+
+def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+    """A partition or account switch on a facility endpoint: leave the old block (`_leave_block`, banked once), then let
+    go of everything that still points at it — the old runner (closed: its unread late answer belongs to the old
+    partition), the last check and a reap's kick — so no later stop reads that block again and files it under the new
+    partition (review of a6de41e, X)."""
+    _leave_block(app, shape, rt, how="switch")
+    _bank_warm_interval(rt, app)  # (a no-op once _leave_block banked it)
+    if rt.runner is not None:
+        rt.runner.close()
+    rt.runner, rt.runner_stale = None, False
+    rt.last_canary, rt.reap_kicked = None, False
+
+def _prune_left(app: AppCtx, now: float | None = None) -> list[LeftBlock]:
+    """Drop the left BLOCKS that cannot still be running — past their walltime's end — and return the rest. A queued
+    check is never dropped: the queue wait is unbounded, and the facility keeps starting blocks while it waits; its
+    entry stays dated instead ("left queued at …; it may have run since")."""
+    now = time.monotonic() if now is None else now
+    app.left_blocks = [b for b in app.left_blocks if b.ends_by is None or b.ends_by > now]
+    return app.left_blocks
+
+def _take_left(app: AppCtx, rt: ShapeRuntime, job: str | None) -> None:
+    """A block first confirmed warm answers for the entries a facility stop, detach, reconnect or switch left on this
+    endpoint (#178) — for NAMING only: the same job is that block, now this shape's again; with one block at most, an
+    entry on the same partition and account (the same facility user endpoint, so a queued check of it too) is gone,
+    since the endpoint started this block only after it went. Either way it leaves `app.left_blocks`, so no later
+    notice names a stale job. Nothing is billed or dated from it: the block confirmed now bills from its own
+    confirmation (session_spend is an upper bound, and may count an overlap with the left block's bank twice)."""
+    eid, uec = app.state.endpoint_id, rt.user_endpoint_config
+    app.left_blocks = [
+        b for b in app.left_blocks
+        if not (b.endpoint_id == eid and ((job is not None and b.job == job) or (
+            _single_block(rt) and (b.partition, b.account) == (uec.get("partition"), uec.get("account")))))
+    ]
+
+def _known_block_job(app: AppCtx, rt: ShapeRuntime | None) -> tuple[str | None, bool]:
+    """The scheduler job of a CONFIRMED block of this shape's partition and account, not presumed gone, for the
+    five-minute allocating notice to name — and whether it is this shape's own block (`block_job`, whose cancel the
+    notice gives); else the newest confirmed block a stop or switch left on the same partition and account that may
+    still bill (named, never given a cancel: it may be gone). (None, False): none. Never another partition's job, a
+    presumed-gone one, or one only a check saw — the user could cancel someone else's job (#178)."""
+    if rt is None:
+        return None, False
+    if rt.block_job:
+        return rt.block_job, True
+    now, uec = time.monotonic(), rt.user_endpoint_config
+    for b in reversed(_prune_left(app, now)):
+        if (b.endpoint_id == app.state.endpoint_id and b.job and b.verified
+                and (b.partition, b.account) == (uec.get("partition"), uec.get("account"))
+                and (b.until is None or b.until > now)):
+            return b.job, False
+    return None, False
 
 async def _drop_compute_shape(app: AppCtx) -> float:
     """Drop the billed (compute) shape so a later run re-provisions a FRESH block (its runner now
@@ -700,6 +886,7 @@ def _forget_identity_verdicts(app: AppCtx) -> None:
     from .login import reset_identity_label
 
     reset_identity_label()  # the cached "who am I" may name the previous identity
+    app.worker_user = None  # ...and so may the local account the facility mapped it to
     for rt in app.shapes.values():
         if rt.no_account:
             rt.no_account = None

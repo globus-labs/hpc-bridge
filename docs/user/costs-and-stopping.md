@@ -50,10 +50,23 @@ it to be cancelled (`scancel` or `qdel`) when you no longer want it.
   `globus-compute-endpoint` process in your home directory there), so the next session reconnects with
   no SSH. Ask for a teardown only if you want that endpoint removed entirely, for instance because your
   facility forbids persistent processes on login nodes.
-- **Facility-run endpoint:** hpc-bridge has no cancel channel into the facility's block. The agent
-  drains it, no more work is accepted, and reports `draining` as the final state; the facility's idle
-  timeout reclaims the block, about ten minutes on `globus-labs`. Spend can accrue for that tail. The
-  agent should not keep polling for "down" here, and there is nothing of yours to tear down.
+- **Facility-run endpoint:** hpc-bridge has no cancel channel into the facility's block, so a stop
+  issues no cancel. No more work is sent, and the block keeps billing until the facility's idle
+  timeout reclaims it (about ten minutes on `globus-labs`) or its walltime ends. The stop says so
+  first, then names the block's scheduler job, the latest time it can bill until, and the command
+  that ends it now, which you run on the facility yourself: `scancel <id>` (or `qdel <id>` on a PBS
+  facility), and `squeue -j <id>` to check on it. When the id is unknown, `squeue -u` lists your jobs
+  there. Globus Compute names its blocks `parsl.GlobusComputeEngine-…` (squeue shows `parsl.Gl`), but so
+  is every other Globus Compute block on an account the facility maps several people to, so check the
+  start time and partition before cancelling one.
+  The agent should relay those, report `draining` as
+  the final state, and not keep polling for "down". It should not check from here after the stop
+  either: hpc-bridge cannot see the facility's queue, and a command sent then could keep the block
+  alive or start a new one. Leaving the endpoint (a teardown here only detaches) leaves the block
+  billing the same way and says the same. The session spend counts the block up to that latest time,
+  an upper bound. If you use the block again after the stop, it counts from that new confirmation, so
+  that stretch can count twice; a later stop never counts the same tail again. A block an earlier stop
+  left was counted in the spend reported then, and a block a still-queued check starts is not counted.
 
 A stop is refused while a command of yours is still running on the block, because releasing the block
 would not end it: the endpoint would start another block to finish it. Interrupting a long command

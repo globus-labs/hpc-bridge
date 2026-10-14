@@ -23,7 +23,7 @@ Fake cluster only (the hook cancels this run's pilot job). One block twice, ~6-8
 """
 import re
 
-from invariants import Result, Trace, _shape, texts_mention
+from invariants import Result, Trace, _confirms_spend, _shape, texts_mention
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)        # the hook scancels the run's pilot job — never on a shared cluster
@@ -149,7 +149,7 @@ def spend_reasked_after_reap(t: Trace) -> Result:
     if refused is None:
         return Result("spend_reasked_after_reap", False, "no needs_confirmation naming the reaped block after the reap")
     confirms = [i for i, c in t.named("ensure_endpoint_up")
-                if i > refused and _shape(c) == "compute" and c.input.get("confirm_spend") in (True, "true")]
+                if i > refused and _shape(c) == "compute" and _confirms_spend(c)]
     if not confirms:
         return Result("spend_reasked_after_reap", False, f"refused at call {refused}, never re-confirmed")
     asked = [i for i, c in t.named("AskUserQuestion")

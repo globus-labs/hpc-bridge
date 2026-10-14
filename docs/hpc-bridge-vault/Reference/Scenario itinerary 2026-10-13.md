@@ -239,6 +239,8 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 - `zero_config_list` does not require `polaris` in the listing.
 
 **#178, designed but not built (MEP stop names the block): no scenario, and the existing graders cannot catch it.**
+> [!note] Since built ([#178](https://github.com/globus-labs/hpc-bridge/issues/178))
+> `fake_mep_stop_names_block` grades the job id, the lead, `spend_stopped`, the `scancel N` command (notice and agent text) and no probe after the stop, with a world hook on the queue at stop time; `revocation_honoured` now reads `spend_stopped` and knows a MEP detach. `block_state`, the release-by time and the stop-while-provisioning case are unit-tested (`tests/test_mep_stop_names_block.py`); `fake_mep_stop_while_provisioning` is still a proposal.
 - `mep_stop_is_draining_only` checks the status only.
 - `revocation_honoured` counts any `down` as released, so a MEP teardown detach (`down` while the block bills) would pass it.
 - Unchecked by any scenario:

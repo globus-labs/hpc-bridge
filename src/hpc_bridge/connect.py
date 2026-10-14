@@ -21,13 +21,19 @@ import os
 from . import binding, config, login_gate, warmth
 from .catalog.entry import CatalogEntry
 from .catalog.parsers import PARSERS
-from .context import AppCtx, _has_login_shape
+from .context import DEFAULT_SHAPE, AppCtx, LeftBlock, _facility_shapes, _has_login_shape
 from .discovery import discover_facility_details
 from .dispatch import for_agent
 from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
 from .lifecycle import EndpointState, ensure_warm
 from .models import ConnectFacilityResult, FacilityDetails, validate_host
-from .notices import _explain_provision_error, _first_contact_note, _needs_login_result, _needs_preauth_result
+from .notices import (
+    _explain_provision_error,
+    _first_contact_note,
+    _needs_login_result,
+    _needs_preauth_result,
+    _scheduler_cmds,
+)
 from .scheduler_ops import LoginRunner
 from .warmth import _drop_all_shapes
 
@@ -255,7 +261,20 @@ async def _connect_facility(
         # connection to it and tell the agent to re-connect there, dropping this facility (review 2026-09-05 #3).
         app.pending_preauth = None
         app.preauth_resume = None
+        compute, old_eid, old_mep = app.shapes.get(DEFAULT_SHAPE), app.state.endpoint_id, not _has_login_shape(app)
+        left = None
+        if compute is not None and old_mep:
+            # the old binding is a facility endpoint: nothing cancels its block, which bills on — remember it (#178)
+            left = warmth._leave_block(app, DEFAULT_SHAPE, compute, how="reconnect")
+        sched = getattr(app.facility, "scheduler", None)
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's blocks/handles are gone
+        # Blocks a facility stop, detach or switch left belong to THAT endpoint: a reconnect to it keeps them (the next
+        # stop still names them); a bind to any other endpoint drops them, and the account its identity was mapped to.
+        here = None if "login" in _facility_shapes(fac) else getattr(fac, "endpoint_id", None)
+        app.left_blocks = [b for b in app.left_blocks if here is not None and b.endpoint_id == here]
+        app.billed_to = {k: t for k, t in app.billed_to.items() if here is not None and k[0] == here}
+        if not app.left_blocks and (here is None or here != old_eid):
+            app.worker_user = None
         app.facility = fac
         app.machine = facility
         # The session-shell root follows the bound facility — else run_shell would use the local
@@ -263,8 +282,8 @@ async def _connect_facility(
         app.scratch_root = binding._resolve_scratch_root(fac)
         if not _has_login_shape(app):  # a facility-run multi-user endpoint: attach, don't provision
             res = await _connect_mep(app, facility, fac)
-            if prior_spend > 0:  # a re-bind released a warm block: the number must not vanish (review 2)
-                res.notice = f"the previous facility's shapes were released (session spend so far ≈ {prior_spend:.2f}). " + (res.notice or "")  # noqa: E501
+            if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
+                res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
             res.notice = login_note + (res.notice or "")
             return res
         # An MFA facility (curated `auth_method: mfa-otp`) with no shared connection yet: don't burn a failing
@@ -305,8 +324,8 @@ async def _connect_facility(
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities
-    if prior_spend > 0:  # a re-bind released a warm block: say what it cost rather than lose the number
-        reuse_note = f"the previous facility's shapes were released (session spend so far ≈ {prior_spend:.2f}). " + reuse_note  # noqa: E501
+    if prior_spend > 0 or left is not None:  # say what it cost, and name a block left billing, rather than lose them
+        reuse_note = _prior_note(prior_spend, left, sched, same=False, old_mep=old_mep) + reuse_note
     if block != "warm":  # login node still coming up — nothing to read yet
         return ConnectFacilityResult(
             phase="provisioning",
@@ -339,6 +358,25 @@ async def _connect_facility(
         allocations=allocations,
         notice=reuse_note + "pick an allocation, then ensure_endpoint_up(account=…, partition=…, confirm_spend=True)",
     )
+
+def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, same: bool, old_mep: bool) -> str:
+    """What a re-bind did to the previous binding's blocks, with the session spend so far. An SSH facility's shapes are
+    released; a facility endpoint's block is NOT — nothing here cancels it (#178): it bills until that facility's
+    idle-release, so the note names it (and a stop on the same endpoint names it again)."""
+    if not old_mep:
+        return f"the previous facility's shapes were released (session spend so far ≈ {spent:.2f}). "
+    where = "this endpoint" if same else "the previous facility's endpoint"
+    note = f"the previous session on {where} was closed (session spend so far ≈ {spent:.2f})"
+    if left is None:
+        return note + ". "
+    cancel = _scheduler_cmds(scheduler)[0]
+    block = (f"its block, scheduler job {left.job}, was not cancelled" if left.job else
+             "its block was not cancelled" if left.kind == "block" else
+             "a check of ours was still queued there and was not cancelled")
+    end = (f" (`{cancel.format(job=left.job)}` on that facility ends it)" if left.job else "")
+    return (f"{note}, but {block} — no cancel channel on a facility endpoint: it bills until that facility's "
+            f"idle-release{end}" + ("; stop_endpoint names it. " if same else ". "))
+
 
 async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult:
     """Bind a facility-run multi-user endpoint (MEP). Called under app.lock, after the bind.

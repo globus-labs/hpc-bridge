@@ -33,7 +33,7 @@ cells() {  # cells <profile> -> the scenario list (and concurrency) for that pro
     polaris)  echo "polaris_filesystems 1" ;;
     internal) echo "internal_hostnames 1" ;;
     hostile)  echo "canary_login_discovery,canary_compute_output 1" ;;  # per-node canary channels are shared → SERIAL, one at a time
-    mep)      echo "fake_mep_compute,fake_mep_no_account,fake_mep_username_not_account 1" ;;
+    mep)      echo "fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,fake_mep_username_not_account 1" ;;
     *) echo "" ;;
   esac
 }

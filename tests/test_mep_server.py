@@ -181,7 +181,7 @@ async def test_stop_is_draining_only_and_never_touches_login(monkeypatch):
     res = await _stop_endpoint(app)
     assert res.status == "draining"  # NEVER "down": no cancel can be confirmed from here
     assert called == []  # no scancel-over-login attempt (and so no login-shape submit)
-    assert "do not re-poll" in res.notice.lower()  # draining is terminal here (the skill's re-poll loop must not spin)
+    assert "don't call stop_endpoint again" in res.notice  # draining is terminal here (the re-poll loop must not spin)
     assert "compute" not in app.shapes  # the shape is dropped: nothing further lands on the block
     assert app.state.endpoint_id == MEP_UUID  # the facility's endpoint stays attached/available
     # a second stop is honest too, not a lie

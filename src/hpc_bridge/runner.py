@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import re
 import time
 from dataclasses import dataclass
 
@@ -22,6 +23,9 @@ class CanaryResult:
     worker_gce: str | None = None  # the worker's globus-compute-endpoint (a `client` facility builds it at ours)
     # the scheduler job (block) the worker runs in — tells the block that was presumed idle-released from a new one
     worker_job: str | None = None
+    # the local account the worker runs as (`id -un`): on a facility endpoint, the account its identity mapping chose,
+    # which is what `squeue -u` needs there (the lab cluster maps to glabs-gc, not the user's login name) — #178
+    worker_user: str | None = None
     error: str | None = None
     # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
     # while nobody was waiting; warmth is dated from it, not from when it was read.
@@ -41,6 +45,7 @@ _CANARY_MAX_WAIT_S = 300.0
 _CANARY_PARSL = "HPCB_PARSL"
 _CANARY_GCE = "HPCB_GCE"
 _CANARY_JOB = "HPCB_JOB"
+_CANARY_USER = "HPCB_USER"
 _CANARY_CMD = (
     f"echo {_CANARY_SENTINEL}; "
     'python -c "import platform,dill,socket;'
@@ -49,6 +54,9 @@ _CANARY_CMD = (
     f"python -c \"import importlib.metadata as m;print('{_CANARY_PARSL}',m.version('parsl'))\" 2>/dev/null || true; "
     f"python -c \"import importlib.metadata as m;print('{_CANARY_GCE}',m.version('globus-compute-endpoint'))\" "
     "2>/dev/null || true; "
+    # The local account the worker runs as: on a facility endpoint, the identity mapping's — a stop names it for
+    # `squeue -u` (server._stop_mep, #178).
+    f'echo "{_CANARY_USER} $(id -un 2>/dev/null)"; '
     # The scheduler job the worker runs in (Slurm's or PBS's job id; empty on a LocalProvider block): which BLOCK
     # answered. After an idle presumption, the block that answers next is dated by it: the old block keeps its age, a
     # new one starts its own (warmth._provision). The wrong-block guard compares the SAME expression with the confirmed
@@ -64,6 +72,20 @@ def _parse_canary_tagged(stdout: str, tag: str) -> str | None:
     for line in stdout.splitlines():
         parts = line.split()
         if len(parts) == 2 and parts[0] == tag and parts[1][:1].isdigit():
+            return parts[1]
+    return None
+
+
+# A POSIX-portable login name (what `id -un` prints): letters, digits, '.', '_', '-', at most 64 — and never an option.
+_USER_NAME = re.compile(r"^[A-Za-z_][A-Za-z0-9._-]{0,63}$")
+
+
+def _parse_canary_user(stdout: str) -> str | None:
+    """The worker's local account from canary stdout's `HPCB_USER <name>` line (the `HPCB_JOB` line's style), or None
+    when it is absent, empty or not a plain login name."""
+    for line in stdout.splitlines():
+        parts = line.split()
+        if len(parts) == 2 and parts[0] == _CANARY_USER and _USER_NAME.match(parts[1]):
             return parts[1]
     return None
 
@@ -116,6 +138,17 @@ def dispatch_error_text(exc: BaseException, limit: int = 600) -> str:
     code = getattr(exc, "code", None)
     head = f"{type(exc).__name__}" + (f"[{code}]" if isinstance(code, str) and code else "")
     return f"{head}: {' '.join(text.split())}"[:limit]
+
+
+def _canary_result(res: object, answered_at: float) -> CanaryResult:
+    """A worker's canary answer, parsed."""
+    stdout = getattr(res, "stdout", "") or ""
+    py, dill_v, host = _parse_canary(stdout)
+    return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host,
+                        worker_parsl=_parse_canary_parsl(stdout),
+                        worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE),
+                        worker_job=_parse_canary_tagged(stdout, _CANARY_JOB),
+                        worker_user=_parse_canary_user(stdout), answered_at=answered_at)
 
 
 class GlobusRunner:
@@ -245,12 +278,22 @@ class GlobusRunner:
         answered_at = self._canary_done_at or time.monotonic()
         if self._canary_fut is fut:
             self._canary_fut = None
-        stdout = getattr(res, "stdout", "") or ""
-        py, dill_v, host = _parse_canary(stdout)
-        return CanaryResult(ok=True, worker_python=py, worker_dill=dill_v, worker_host=host,
-                            worker_parsl=_parse_canary_parsl(stdout),
-                            worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE),
-                            worker_job=_parse_canary_tagged(stdout, _CANARY_JOB), answered_at=answered_at)
+        return _canary_result(res, answered_at)
+
+    def canary_answer(self) -> CanaryResult | None:
+        """The answer of a canary that resolved after its caller stopped waiting (a timeout) and that nobody has read
+        yet — the block it ran on (its job, its account) — or None. Never waits and never submits: a facility stop
+        names that block instead of calling it a check still queued (#178)."""
+        fut = self._canary_fut
+        if fut is None or not fut.done() or fut.cancelled() or fut.exception() is not None:
+            return None
+        return _canary_result(fut.result(), self._canary_done_at or time.monotonic())
+
+    @property
+    def canary_pending(self) -> bool:
+        """A canary of ours was submitted and has not resolved: a task still queued on the endpoint, for which a
+        facility endpoint starts (or keeps) a billed block — whatever happens to this runner (#178)."""
+        return self._canary_fut is not None and not self._canary_fut.done()
 
     def close(self) -> None:
         if self._ex is not None:
