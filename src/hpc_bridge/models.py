@@ -43,10 +43,20 @@ class ShellOutcome(BaseModel):
 class EndpointStatus(BaseModel):
     # needs_confirmation: a scheduler compute block was requested without an explicit spend
     # acknowledgement — nothing was provisioned; re-call with confirm_spend=True to proceed.
-    # draining: stop_endpoint dispatched the block cancel but could NOT confirm it (the login
-    # release channel was cold) — spend is NOT verifiably stopped; idle-release is the backstop
-    # and re-calling stop_endpoint (channel now warming) confirms. Never claim "down" here — an
-    # agent that reads "down" walks away while the block may still burn (issue #24).
+    # draining: stop_endpoint did NOT confirm that spend stopped. Two cases, which the notice and
+    # `spend_stopped` tell apart:
+    #   - an endpoint hpc-bridge stood up over SSH: the block cancel was sent but not confirmed (the
+    #     login release channel was cold or busy, the pilot had not landed yet, or a dispatch reached
+    #     the block during the release), or it could NOT be sent (the release channel was busy with
+    #     another scheduler command of ours). Idle-release is the backstop, and calling stop_endpoint
+    #     again confirms (`spend_stopped` None: unknown).
+    #   - a facility multi-user endpoint: NO cancel was issued — hpc-bridge has no cancel channel
+    #     there. It stopped submitting; the block bills until the facility's idle-release or its
+    #     walltime. FINAL: calling again never yields "down". The notice names the block's scheduler
+    #     job (`block_job_id`), the latest it can bill until, and the user's own cancel command
+    #     (`spend_stopped` False while a block is presumed up or a check of ours is queued).
+    # Never claim "down" while spend may continue — an agent that reads "down" walks away while the
+    # block may still burn (issues #24, #178).
     # tearing_down: teardown_endpoint started the login-node ops (gce stop + delete over SSH) and they outlived
     # the call's wait — they keep running in the server; call teardown_endpoint again to confirm 'down'.
     # (Expanse, live 2026-09-04: stop + delete take ~3 min on its filesystem, past the client's tool window.)
@@ -62,6 +72,16 @@ class EndpointStatus(BaseModel):
     # Allocation/account this scheduler shape charges to (from connect_facility's selection, or the
     # facility default). None for the login shape.
     account: str | None = None
+    # The scheduler job id of the billed block this result is about, when hpc-bridge knows it (from the block's
+    # check): on a stop or a detach of a facility endpoint, the block left running (the notice names the command that
+    # ends it). None: unknown, or no block.
+    block_job_id: str | None = None
+    # stop_endpoint / teardown_endpoint: is the spend stopped? True ONLY when an SSH stop's cancel was confirmed
+    # (`down`). False: a block may still bill — a facility endpoint left one running or a check of ours queued there
+    # (never True on a facility endpoint: nothing here can cancel its block), or the stop was refused. None: not known
+    # either way (an unconfirmed SSH cancel, an offline manager, a facility block presumed released by now, no block
+    # known), and on every other result.
+    spend_stopped: bool | None = None
     notice: str | None = None
 
 

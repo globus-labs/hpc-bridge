@@ -86,6 +86,7 @@ class MEPFacility:
         scratch_root: str = "$HOME/.hpc-bridge",
         account_required: bool = False,
         max_idletime_s: int | None = None,
+        scheduler: str = "slurm",
         client_factory=None,
     ) -> None:
         self.endpoint_id = endpoint_id
@@ -102,6 +103,9 @@ class MEPFacility:
         self.scratch_root = scratch_root
         self.account_required = account_required
         self.max_idletime_s = max_idletime_s  # the FACILITY's idle-release (its template), if known
+        # The facility's batch scheduler (entry.compute.scheduler): not for the template (the facility owns it) but for
+        # the commands a stop hands the USER to end the block it cannot cancel — scancel or qdel (#178).
+        self.scheduler = scheduler
         self._client_factory = client_factory or self._default_client
         # The facility's published template contract, read once at attach (`load_template`): the JSON
         # schema its manager validates `user_endpoint_config` against (Anvil's rejects unknown keys —
@@ -151,6 +155,7 @@ class MEPFacility:
             user_opts=opts,
             scratch_root=c.scratch_root,
             account_required=entry.account_required,
+            scheduler=c.scheduler,
             client_factory=client_factory,
         )
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"

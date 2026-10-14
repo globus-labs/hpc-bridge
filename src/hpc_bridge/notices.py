@@ -10,10 +10,11 @@ from __future__ import annotations
 
 import asyncio
 import re
+import time
 
 from . import config
 from .config import SYNC_WAIT_S, _task_ceiling_s
-from .context import AppCtx, ShapeRuntime, _has_login_shape, _idle_release_s
+from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _with_spend
 from .lifecycle import BlockState
 from .login import LoginStart
@@ -381,32 +382,214 @@ def _no_account_notice(app: AppCtx | None, error: str | None, identity: str | No
     )
 
 def _allocating_notice(partition: str | None, elapsed_s: float, *, facility_mep: bool,
-                       stale: str | None = None) -> str:
+                       stale: str | None = None, job: str | None = None, job_verified: bool = False,
+                       scheduler: str | None = None, user: str | None = None) -> str:
     """The provisioning notice. After five minutes on a facility-run endpoint, say what the client cannot
     see: a scheduler REJECTION there looks exactly like an endless allocation (Anvil gpu-debug, live
     2026-09-04: every sbatch failed the QOS policy — no GPU request — while the client saw 'allocating'), and so
     does a block that IS running but whose worker cannot hand results back (a package mismatch with the
     facility's endpoint, Anvil and Delta 2026-10-06) — which bills, and which the facility keeps relaunching while
-    a task stays queued. `stale`: the attach's STALE ENTRY note, the likeliest cause of the latter."""
+    a task stays queued. `stale`: the attach's STALE ENTRY note, the likeliest cause of the latter. `job`: a block
+    hpc-bridge saw for this partition and account (warmth._known_block_job), named with the scheduler's own cancel
+    command only when `job_verified` (it is this shape's confirmed block) — an unverified one may be gone, and an
+    `scancel` of a wrong id can end someone else's job (#178). `user`: the local account the facility maps the
+    identity to (its jobs run as that account, not the user's login name)."""
     notice = f"allocating nodes on {partition!r}…" if partition else "allocating nodes…"
     if facility_mep and elapsed_s >= 300:
-        notice += (f" Still allocating after {int(elapsed_s)}s. On a facility-run endpoint the scheduler is invisible "
-                   "from here, so three different situations look exactly like this: (1) a long queue (a busy GPU "
-                   "partition can take longer); (2) a scheduler rejection — wrong account or partition, or a missing "
-                   "resource request (a GPU partition usually needs scheduler_options like '#SBATCH "
+        cancel, _check, by_user = _scheduler_cmds(scheduler)
+        mine = by_user.format(user=user) if user else by_user.format(user="<the account the facility maps you to>")
+        if job and job_verified:
+            known = (f" The block hpc-bridge last confirmed here is scheduler job {job} (`{cancel.format(job=job)}` "
+                     "ends it).")
+        elif job:
+            known = (f" hpc-bridge last confirmed scheduler job {job} on this partition before it was let go; it may "
+                     "be gone by now (not verified).")
+        else:
+            known = ""
+        target = cancel.format(job=job if job and job_verified else "<job id>")
+        notice += (f" Still allocating after {int(elapsed_s)}s.{known} On a facility-run endpoint the scheduler is "
+                   "invisible from here, so three different situations look exactly like this: (1) a long queue (a "
+                   "busy GPU partition can take longer); (2) a scheduler rejection — wrong account or partition, or a "
+                   "missing resource request (a GPU partition usually needs scheduler_options like '#SBATCH "
                    "--gpus-per-node=1'); (3) a block that is RUNNING and billing while its worker cannot return "
                    "results "
                    "(a package mismatch with the facility's endpoint), which the facility keeps relaunching while our "
                    "check task stays queued — hpc-bridge cannot cancel either. Don't poll indefinitely: ask the user "
-                   "to check their jobs on the facility (squeue -u $USER, with the REASON column). PENDING for "
+                   f"to check their jobs on the facility ({mine}, with the REASON column; {_PARSL_NAME_NOTE}). "
+                   "PENDING for "
                    "Priority/Resources = (1), keep waiting or try a less busy partition (a policy reason, e.g. an "
                    "exhausted allocation, will not clear by waiting); no job at all = most likely (2), or a worker "
                    "that crashes at start; a RUNNING job that never answers = (3): call stop_endpoint and have the "
-                   "user scancel it — that ends the current block, but while our check stays queued the facility may "
-                   "start another, so if blocks keep reappearing, contact the facility.")
+                   f"user cancel it ({target}) — that ends the current block, but while "
+                   "our check stays queued the facility may start another, so if blocks keep reappearing, contact the "
+                   "facility.")
         if stale:
             notice += f" Likely here — {stale}."
     return notice
+
+
+# The user's own commands for a facility's block, by scheduler: end it, check it, list the account's jobs (#178).
+_SCHEDULER_CMDS = {
+    "slurm": ("scancel {job}", "squeue -j {job}", "squeue -u {user}"),
+    "pbs": ("qdel {job}", "qstat {job}", "qstat -u {user}"),
+    "lsf": ("bkill {job}", "bjobs {job}", "bjobs -u {user}"),
+}
+# What a Globus Compute block's scheduler job is called (parsl status_handling `parsl.<executor label>.block-<n>`, plus
+# the provider's timestamp): `parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1760…`, which squeue's default
+# NAME column cuts to `parsl.Gl`. It does NOT single out ours: every Globus Compute block of a SHARED mapped account
+# (globus-labs maps to glabs-gc) has it, and a facility's own --job-name can override it. Only for a block whose job id
+# is unknown — a named job id is always preferred.
+_PARSL_NAME_NOTE = ("Globus Compute blocks are named `parsl.GlobusComputeEngine-…` (squeue shows `parsl.Gl`) unless "
+                    "the facility renames them, and others on a shared account may show the same prefix: check the "
+                    "start time and partition before cancelling")
+
+def _scheduler_cmds(scheduler: str | None) -> tuple[str, str, str]:
+    return _SCHEDULER_CMDS.get(str(scheduler or "slurm").lower(), _SCHEDULER_CMDS["slurm"])
+
+def _clock_time(t: float, now: float, *, rel: bool = True) -> str:
+    """A time.monotonic() instant as the user's own clock time, for a notice the agent relays: `21:35 (in ~11 min)`,
+    with the date when it is not today (`Oct 10 21:24`). `rel`: with how far off it is."""
+    at = time.localtime(time.time() + (t - now))
+    today = time.localtime()
+    hhmm = time.strftime("%H:%M" if at[:3] == today[:3] else "%b %d %H:%M", at)
+    if not rel:
+        return hhmm
+    mins = round(abs(t - now) / 60)
+    off = "about now" if mins == 0 else (f"in ~{mins} min" if t > now else f"~{mins} min ago")
+    return f"{hhmm} ({off})"
+
+def _left_state(b: LeftBlock, now: float) -> str:
+    """'up': a block that may still bill (its latest end ahead, or unknown); 'released': presumed gone by its latest
+    end, not verified; 'queued': no block seen, only a check of ours queued."""
+    if b.kind == "check":
+        return "queued"
+    return "up" if b.until is None or b.until > now else "released"
+
+def _left_spend_stopped(blocks: list[LeftBlock], now: float) -> bool | None:
+    """`spend_stopped` for a facility-endpoint stop or detach: never True (nothing here cancels a block). False while a
+    block it left may still bill or a check of ours is queued (the facility starts or keeps a block for it); None when
+    every block is presumed released by now, or none is known."""
+    if any(_left_state(b, now) in ("up", "queued") or b.check_queued for b in blocks):
+        return False
+    return None
+
+def _left_block_state(blocks: list[LeftBlock], now: float) -> BlockState:
+    """`block_state` for a facility-endpoint stop or detach: the block's PRESUMED state, never 'cold' while one may
+    still run — 'warm' (a block may still bill), 'provisioning' (a check of ours queued: the facility may be starting
+    one), else 'cold'."""
+    states = {_left_state(b, now) for b in blocks}
+    if "up" in states:
+        return "warm"
+    return "provisioning" if "queued" in states or any(b.check_queued for b in blocks) else "cold"
+
+def _left_job(blocks: list[LeftBlock], now: float) -> str | None:
+    """`block_job_id`: the first named block that may still bill (the stop's own first), else the first named at all."""
+    for b in blocks:
+        if b.job and _left_state(b, now) == "up":
+            return b.job
+    return next((b.job for b in blocks if b.job), None)
+
+_UNTIL_WHY = {
+    "idle": "",
+    "walltime": " (its walltime: the facility's idle window is unknown here)",
+    "busy": " (its walltime: work of ours may still be running on it)",
+}
+
+# At most this many earlier queued checks are named one by one (most recent first); the rest are counted.
+_CHECKS_NAMED = 5
+
+def _where(b: LeftBlock) -> str:
+    """The partition (and account) a left block or check belongs to, for a notice."""
+    where = f"partition {b.partition!r}" if b.partition else "the default partition"
+    return where + (f", account {b.account!r}" if b.account else "")
+
+def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, current: LeftBlock | None = None,
+                      lost: str = "", op: str = "stop") -> str:
+    """What a stop or detach on a facility multi-user endpoint leaves billing, said so the agent can relay it (#178).
+    It LEADS with the fact that no cancel was issued, then names each block left (`blocks`: this call's own —
+    `current` — first, then the ones an earlier stop, detach, reconnect or switch left): its scheduler job, the latest
+    it can bill until as a clock time (possibly sooner, not verified), the user's own commands to end it and check on
+    it there — and never a check from here: run_shell or a confirmed ensure_endpoint_up after a stop is a task, which
+    can keep the block alive or start a new one. Only this call's own block is said to be in `session_spend` now (a new
+    binding starts it at 0): an earlier one was counted in the spend reported when it was left, and a block a queued
+    check may start is never counted. `op`: "stop" (draining, final) or "detach"."""
+    cancel, check, by_user = _scheduler_cmds(getattr(app.facility, "scheduler", None))
+    if app.worker_user:
+        find = f"`{by_user.format(user=app.worker_user)}`"
+    else:
+        find = (f"`{by_user.format(user='<your account there>')}` (the account the facility maps your identity to, "
+                "maybe not your login name)")
+    find += f" on the facility ({_PARSL_NAME_NOTE})"
+    unknown_end = f"ends it with `{cancel.format(job='<id>')}`; relay both."
+    out = ["NO CANCEL WAS ISSUED: hpc-bridge has no cancel channel on a facility endpoint."]
+    if lost:
+        out.append(lost.strip())
+    spend, earlier_named, checks = "", False, []
+    for b in blocks:
+        state, own = _left_state(b, now), b is current
+        if state == "queued":
+            if own:
+                out.append(f"A check of ours is still queued there ({_where(b)}): the facility will start (or keep) a "
+                           "block for it, which bills until its idle window passes — session_spend does not count "
+                           f"that block; its job id is unknown here. The user finds it with {find} and {unknown_end}")
+            else:
+                checks.append(b)
+            continue
+        earlier = "" if own else f"Left by an earlier {b.how} at {_clock_time(b.left_at, now, rel=False)}: "
+        earlier_named = earlier_named or not own
+        name = f"scheduler job {b.job}" if b.job else "a block of ours (its job id is unknown here)"
+        name = (name[:1].upper() + name[1:]) if own else name
+        least = " (at least this one: the endpoint can run more than one block)" if b.multi else ""
+        if state == "released":
+            assert b.until is not None
+            how = (f"the user checks with `{check.format(job=b.job)}` on the facility and ends it with "
+                   f"`{cancel.format(job=b.job)}` if it is still there." if b.job else
+                   f"the user checks with {find}.")
+            out.append(f"{earlier}{name}{least} is presumed released by {_clock_time(b.until, now)} (not verified); "
+                       f"{how}")
+        else:
+            if b.until is not None:
+                when = (f"until {_clock_time(b.until, now)} at the latest{_UNTIL_WHY.get(b.bound or 'idle', '')}, "
+                        "possibly sooner (not verified)")
+                if own:
+                    spend = (f"session_spend counts it to {_clock_time(b.until, now, rel=False)} (an upper bound; a "
+                             "block confirmed again after a stop counts from its new confirmation).")
+            else:
+                when = ("— when it ends is unknown here (the facility's idle window and its walltime are both unknown"
+                        + ("; session_spend counts it only up to now)" if own else ")"))
+            how = (f"The user ends it now with `{cancel.format(job=b.job)}`, or checks it with "
+                   f"`{check.format(job=b.job)}`, on the facility; relay both." if b.job else
+                   f"The user finds it with {find} and {unknown_end}")
+            out.append(f"{earlier}{name}{least} may still be running and billing {when}. {how}")
+        if b.check_queued:
+            out.append("A check of ours is also still queued there, so the facility may keep this block or start "
+                       "another.")
+    if checks:  # earlier queued checks, newest first: dated and hedged, never dropped (the queue wait is unbounded)
+        named = [f"{_where(b)} at {_clock_time(b.left_at, now, rel=False)}" for b in checks[:_CHECKS_NAMED]]
+        more = f", and {len(checks) - _CHECKS_NAMED} more" if len(checks) > _CHECKS_NAMED else ""
+        one = len(checks) == 1
+        out.append(f"{'A check' if one else 'Checks'} of ours {'was' if one else 'were'} still queued there "
+                   f"({'; '.join(named)}{more}) when an earlier stop, detach, reconnect or switch left "
+                   f"{'it' if one else 'them'}; {'it' if one else 'each'} may have run since, and a block "
+                   f"{'it' if one else 'one'} started bills until its idle window passes — session_spend does not "
+                   f"count it. The user finds {'it' if one else 'them'} with {find}, started after "
+                   f"{'that time' if one else 'those times'}, and {unknown_end}")
+    if not blocks:
+        out.append("No block of ours is known to be running there.")
+    probe = ("don't check from here (run_shell or a confirmed ensure_endpoint_up is a task that can keep the block "
+             "alive or start one)")
+    if op == "stop":
+        out.append(f"'draining' is final: don't call stop_endpoint again, and {probe}.")
+    else:
+        out.append(f"Detached: nothing of ours to tear down (the facility runs the endpoint); {probe}. "
+                   "connect_facility re-attaches with zero SSH.")
+    if spend:
+        out.append(spend)
+    if earlier_named:
+        out.append("A block left earlier was counted in the spend reported when it was left.")
+    if op == "stop":
+        out.append("The endpoint stays available.")
+    return " ".join(out)
 
 
 def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> ShellOutcome:

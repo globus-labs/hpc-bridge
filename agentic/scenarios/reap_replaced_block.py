@@ -35,7 +35,7 @@ hpc-bridge's journal (midrun_hooks.follow_journal), the Claude SDK operator's fr
 import re
 
 from cluster_ops import parsl_jobs_since_cmd, stamp_t0_cmd
-from invariants import Result, ToolCall, Trace, _shape, compute_ran
+from invariants import Result, ToolCall, Trace, _confirms_spend, _shape, compute_ran
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)        # the hook cancels this run's pilot job — never on a shared cluster
@@ -204,7 +204,7 @@ def replaced_block_named(t: Trace) -> Result:
 def _confirm_after(t: Trace, i: int) -> int | None:
     """The first compute `ensure_endpoint_up(confirm_spend=True)` after call `i`."""
     return next((k for k, c in t.named("ensure_endpoint_up")
-                 if k > i and _shape(c) == "compute" and c.input.get("confirm_spend") in (True, "true")), None)
+                 if k > i and _shape(c) == "compute" and _confirms_spend(c)), None)
 
 
 def not_adopted_before_confirm(t: Trace) -> Result:

@@ -20,6 +20,9 @@ flowchart TD
   U -. "LocalProvider → login node<br/>(shape=login)" .-> L[Login-node worker]
 ```
 
+> [!warning] On a facility MEP, nothing of ours can cancel the block
+> The block belongs to the facility's UEP, and the Globus SDK has no foreign-endpoint cancel, so `stop_endpoint` and the `teardown_endpoint` detach issue **no cancel**: the block bills until the facility's `max_idletime` or its walltime. What they can do is say so — the block's scheduler job, the latest it can bill until, and the user's own `scancel`/`qdel` ([#178](https://github.com/globus-labs/hpc-bridge/issues/178); [[Cost control]]). A task still queued there (a check that never got an answer counts) keeps the facility starting blocks for it, and a check sent after a stop is such a task.
+
 ## Shapes: one endpoint, many configs
 
 `user_endpoint_config` is a named bag of template vars — a **shape** ([[shapes]]). `shape="compute"` renders a scheduler block (billed compute); `shape="login"` renders a `LocalProvider` (a free process on the login node — also the no-SSH discovery channel). `compute` is **scheduler-neutral**: the facility's `profile.scheduler` (`config_template`, `remote.py:657`) selects `_SLURM_TEMPLATE`/`_PBS_TEMPLATE`, and thus the provider (`SlurmProvider` / `PBSProProvider`) and launcher. A facility MEP serves **only** `compute` (its schema rejects the `LocalProvider` login shape) — see [[Resource shapes & the spend floor]].

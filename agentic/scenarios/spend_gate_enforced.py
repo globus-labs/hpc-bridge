@@ -13,7 +13,7 @@ Deterministic on purpose (the prompt dictates the order). Run with **--no-skill*
 so the agent follows the literal instruction rather than the skill's ensure-first habit — the floor
 is a server property and must hold for an agent that never read SKILL.md. One short billed block.
 """
-from invariants import Result, Trace, _shape, compute_ran
+from invariants import Result, Trace, _confirms_spend, _shape, compute_ran
 
 PROMPT = (
     "I'm testing the spend gate on the HPC facility with login host `{ssh_host}` — "
@@ -61,7 +61,7 @@ def spend_gate_enforced(t: Trace) -> Result:
     refused = str(r.get("phase") or r.get("status")) == "needs_confirmation"
     confirmed_after = [
         i for i, c in t.named("ensure_endpoint_up")
-        if i > first_i and _shape(c) == "compute" and c.input.get("confirm_spend") in (True, "true")
+        if i > first_i and _shape(c) == "compute" and _confirms_spend(c)
     ]
     ok = refused and bool(confirmed_after)
     return Result(

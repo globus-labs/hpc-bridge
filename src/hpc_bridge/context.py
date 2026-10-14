@@ -13,7 +13,7 @@ import asyncio
 from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import dataclass, field
-from typing import Any
+from typing import Any, Literal
 
 from .catalog.entry import CatalogEntry
 from .facility.base import Facility
@@ -120,6 +120,32 @@ class TaskHandle:
 
 
 @dataclass
+class LeftBlock:
+    """What a facility-endpoint stop, detach, reconnect or partition/account switch LEFT running (#178) — a block, or a
+    check of ours still queued: a facility multi-user endpoint gives hpc-bridge no cancel channel, so a block bills
+    until the facility's idle-release or its walltime. Kept in `AppCtx.left_blocks` ONLY to NAME it in later notices (a
+    second stop, a teardown, a re-bind) — never to bill it again or to date another block. Times: time.monotonic()."""
+
+    endpoint_id: str | None
+    job: str | None              # its scheduler job id (from our own check's HPCB_JOB); None: unknown here
+    until: float | None          # the latest it can bill to (see `bound`); None: unknown
+    left_at: float               # when it was left
+    how: str                     # what left it: "stop" | "detach" | "reconnect" | "switch"
+    kind: Literal["block", "check"] = "block"  # "check": no block seen, only a check of ours still queued
+    # What `until` is: "idle" — the facility's idle window after our last task, capped at its walltime; "walltime" —
+    # its walltime alone (the idle window is unknown); "busy" — its walltime, because work of ours may still be on it.
+    bound: str | None = None
+    # A block's walltime end, past which it cannot still run and the entry is dropped; None: unknown, or a queued check
+    # (kept, dated: the queue wait is unbounded and the facility keeps starting blocks while it waits).
+    ends_by: float | None = None
+    verified: bool = False       # the job is a block hpc-bridge confirmed warm (not only one a check saw)
+    check_queued: bool = False   # a check of ours was also still queued: the facility may keep a block or start one
+    partition: str | None = None  # the block's partition and account: the same pair is the same facility user
+    account: str | None = None    # endpoint process, whose next block supersedes this one (with one block at most)
+    multi: bool = False          # the shape could run more than one block (max_blocks > 1): "at least" this one
+
+
+@dataclass
 class AppCtx:
     facility: Facility
     profile: Profile
@@ -178,9 +204,25 @@ class AppCtx:
     # them: the dispatch's command is on the endpoint, so a stop must still see it — while that endpoint is the bound
     # one (warmth._retain_inflight; server._block_work).
     released_inflight: list[ShapeRuntime] = field(default_factory=list)
+    # Billed blocks a facility-endpoint stop, detach or switch left running (no cancel channel there; #178), so a
+    # second stop or a stop after a reconnect still names them. Kept across a detach and a reconnect to the same
+    # endpoint, dropped by a bind to another one (connect) and when a block on the same endpoint takes one over
+    # (warmth._take_left).
+    left_blocks: list[LeftBlock] = field(default_factory=list)
+    # Per (endpoint, scheduler job): how far a facility stop's bank has already counted that job (its latest end, which
+    # may be ahead of now). A later bank for the same job adds only the time beyond it (warmth._leave_block), so stop /
+    # re-confirm cycles of one block never recount a span a tail already counted. Kept with left_blocks.
+    billed_to: dict[tuple[str | None, str], float] = field(default_factory=dict)
+    # The local account the last check (canary) ran as — on a facility endpoint, the identity mapping's: a stop's
+    # `squeue -u` names it. Cleared with left_blocks on a bind elsewhere, and on a new Globus login.
+    worker_user: str | None = None
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 
+
+def _facility_shapes(facility: object) -> tuple[str, ...]:
+    """The shapes `facility` can serve (bound or not): its `supported_shapes`, else every shape."""
+    return tuple(getattr(facility, "supported_shapes", None) or SHAPES)
 
 def _supported_shapes(app: AppCtx) -> tuple[str, ...]:
     """The shapes the bound facility can serve. Default: every shape (a personal endpoint renders
@@ -189,7 +231,7 @@ def _supported_shapes(app: AppCtx) -> tuple[str, ...]:
     server derives the rest from that single fact: no login shape ⇒ no free channel for the
     allocation listing / the pilot query / the scancel release ⇒ stop is draining-only, teardown is
     a no-op, every shape is billed."""
-    return tuple(getattr(app.facility, "supported_shapes", None) or SHAPES)
+    return _facility_shapes(app.facility)
 
 def _has_login_shape(app: AppCtx) -> bool:
     return "login" in _supported_shapes(app)

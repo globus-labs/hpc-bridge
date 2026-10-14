@@ -55,6 +55,7 @@ from .connect import (  # noqa: F401 - re-exported for imports; PATCH connect.di
 from .context import (  # noqa: F401 - re-exported: tools + tests import them from here
     DEFAULT_SHAPE,
     AppCtx,
+    LeftBlock,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
@@ -101,6 +102,9 @@ from .notices import (  # noqa: F401 - re-exported
     _explain_provision_error,
     _identity_from_error,
     _idle_window_text,
+    _left_block_state,
+    _left_job,
+    _left_spend_stopped,
     _local_dill,
     _login_notice,
     _needs_account_notice,
@@ -112,6 +116,7 @@ from .notices import (  # noqa: F401 - re-exported
     _never_sent_outcome,
     _no_account_failure,
     _no_account_notice,
+    _no_cancel_notice,
     _no_facility_notice,
     _no_facility_outcome,
     _orphaned_outcome,
@@ -419,8 +424,10 @@ async def _ensure_endpoint_up(
                 rt.provisioning_since = time.monotonic()
             provisioning_elapsed = time.monotonic() - rt.provisioning_since
             stale = getattr(app.facility, "stale_worker_note", lambda: None)()
+            job, verified = warmth._known_block_job(app, rt)
             notice = _allocating_notice(active_partition, provisioning_elapsed, facility_mep=not _has_login_shape(app),
-                                        stale=stale)
+                                        stale=stale, job=job, job_verified=verified,
+                                        scheduler=getattr(app.facility, "scheduler", None), user=app.worker_user)
             if rt.transient_conflicts >= TRANSIENT_CONFLICT_LIMIT:
                 rt.provisioning_since = None
                 return EndpointStatus(
@@ -779,42 +786,62 @@ def _busy_block_refusal(app: AppCtx, eid: str, *, op: Literal["stop", "detach"] 
     why = ("" if not _has_login_shape(app) else
            ". Releasing the block now would not end that work — the endpoint would relaunch a block to run it and "
            "spend would continue after a false 'down'")
+    rt = app.shapes.get(DEFAULT_SHAPE)
     return EndpointStatus(  # "cold" when the shape holding the work was already released under it
-        status="up", block_state="warm" if DEFAULT_SHAPE in app.shapes else "cold", endpoint_id=eid,
-        session_spend=_total_session_spend(app), notice=f"can't {op} yet: {what}{why}. {action}",
+        status="up", block_state="warm" if rt is not None else "cold", endpoint_id=eid,
+        session_spend=_total_session_spend(app), block_job_id=rt.block_job if rt is not None else None,
+        spend_stopped=False,  # refused: the block runs on with our work on it
+        notice=f"can't {op} yet: {what}{why}. {action}",
     )
 
 
-async def _stop_mep(app: AppCtx, eid: str) -> EndpointStatus:
-    """Stop on a facility-run multi-user endpoint: **draining-only, never 'down'**.
+async def _stop_mep(app: AppCtx, eid: str | None) -> EndpointStatus:
+    """Stop on a facility-run multi-user endpoint: **draining-only, never 'down' — and NO cancel is issued**.
 
     We own neither the manager nor a login channel, and the Globus SDK offers no foreign-endpoint
-    cancel (ComputeFuture.cancel is pre-run only; stop/delete_endpoint act on OUR registration). So
-    the honest thing (#24) is: stop submitting, drop the shape so no further work lands on the
-    block, and rely on the facility template's idle-release (max_idletime) to reclaim it. The block
-    keeps burning for up to that idle window after our last task — we report that tail rather than
-    pretend it's gone. `draining` here is TERMINAL: re-polling stop will never yield `down`."""
+    cancel (ComputeFuture.cancel is pre-run only; stop/delete_endpoint act on OUR registration). A block cancelling
+    itself (a last task running `scancel $SLURM_JOB_ID`) was rejected (#178): the task stays outstanding until the
+    manager notices the worker is gone, so parsl starts a replacement block, which then idles out its window — and it
+    could kill a sibling session's block. So the honest thing (#24, #178) is: stop submitting, drop the shape so no
+    further work lands on the block, and SAY what is left billing — the block's scheduler job (resolved in this
+    locked step, before the shape goes: `warmth._leave_block`), the latest it can bill until, and the user's own
+    command to end it now — remembering it (`app.left_blocks`) so a second stop, or a stop after a reconnect, still
+    names it. `draining` here is TERMINAL: re-polling stop will never yield `down`. `eid` None: nothing is bound any
+    more (a detach), but blocks it left may still bill."""
     async with app.lock:  # look and drop in ONE step: no dispatch can be counted in between
-        if busy := _busy_block_refusal(app, eid):  # our work holds the block, and nothing here can end it
-            return busy
-        lost = _lost_note(app, op="stop")
-        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
-    idle = _idle_window_text(app)
+        lost, current = "", None
+        if eid is not None:
+            if busy := _busy_block_refusal(app, eid):  # our work holds the block, and nothing here can end it
+                return busy
+            lost = _lost_note(app, op="stop")
+            rt = app.shapes.get(DEFAULT_SHAPE)
+            current = warmth._leave_block(app, DEFAULT_SHAPE, rt, how="stop") if rt is not None else None
+            warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
+        return _left_blocks_status(app, eid, current, lost, op="stop", spent=_total_session_spend(app))
+
+
+def _left_blocks_here(app: AppCtx, eid: str | None, current: LeftBlock | None) -> list[LeftBlock]:
+    """The blocks a facility stop or detach reports: this call's own first, then the ones earlier stops, detaches,
+    reconnects and switches left on the same endpoint (every one, with nothing bound), newest first — those that can
+    still be running (`warmth._prune_left`)."""
+    rest = [b for b in reversed(warmth._prune_left(app)) if b is not current and (eid is None or b.endpoint_id == eid)]
+    return ([current] if current is not None else []) + rest
+
+
+def _left_blocks_status(app: AppCtx, eid: str | None, current: LeftBlock | None, lost: str, *,
+                        op: Literal["stop", "detach"], spent: float) -> EndpointStatus:
+    """The answer of a facility-endpoint stop (`draining`, final) or detach (`down` — for OUR state only): no cancel was
+    issued, and the notice and fields say what is left billing (#178). Callers hold app.lock."""
+    now = time.monotonic()
+    blocks = _left_blocks_here(app, eid, current)
     return EndpointStatus(
-        status="draining",
-        block_state="cold",
+        status="draining" if op == "stop" else "down",
+        block_state=_left_block_state(blocks, now),  # its presumed state: never 'cold' while it may run
         endpoint_id=eid,
-        session_spend=_total_session_spend(app),
-        notice=(
-            f"stopped submitting; the block is DRAINING. {lost}On a facility multi-user endpoint hpc-bridge "
-            "has no cancel channel, so the block cannot be released or confirmed from here — the "
-            f"facility's idle-release reclaims it after {idle} of no tasks (or at walltime) — unless a task of "
-            "ours is still queued there (a check that never got an answer counts): the facility may then keep "
-            "relaunching blocks for it, up to its own hard limit; the user can scancel each block on the facility, "
-            "and only the facility can stop the relaunching. Spend may accrue for that tail, or longer in that case. "
-            "'draining' is FINAL on this facility: do NOT "
-            "re-poll stop_endpoint waiting for 'down'. The endpoint stays available (it's the facility's)."
-        ),
+        session_spend=spent,
+        block_job_id=_left_job(blocks, now),
+        spend_stopped=_left_spend_stopped(blocks, now),
+        notice=_no_cancel_notice(app, blocks, now, current=current, lost=lost, op=op),
     )
 
 
@@ -843,6 +870,8 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     endpoint|SSH-once]], #12). Fully pulling the endpoint down (`gce stop`, the facility's
     `teardown()`) is a separate, rarer operation, not done here."""
     eid = app.state.endpoint_id
+    if eid is None and not _has_login_shape(app) and warmth._prune_left(app):
+        return await _stop_mep(app, None)  # detached, but a block it left may still bill: name it again (#178)
     if eid is None:
         return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
     if not _has_login_shape(app):  # a facility MEP: no release channel exists — drain honestly
@@ -880,6 +909,7 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
             block_state="cold",
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
+            spend_stopped=True,  # the one result that may say so
             notice=f"compute block released over AMQP ({detail}); the login endpoint stays online for "
             "reuse (reconnecting is zero-SSH).",
         )
@@ -933,10 +963,14 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
 
 @mcp.tool()
 async def stop_endpoint(ctx: Context) -> EndpointStatus:
-    """Release the HPC compute block so the allocation stops being charged. Cancels the billed
-    scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a
-    later reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint
-    down. Call when you're done with a compute block."""
+    """Stop spending on the HPC compute block. On an endpoint hpc-bridge stood up over SSH it cancels the billed
+    scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
+    reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
+    `spend_stopped` true) means the cancel was confirmed, `draining` that it was not yet. On a facility multi-user
+    endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
+    which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
+    the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
+    compute block."""
     return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context), "stop_endpoint")
 
 
@@ -966,6 +1000,9 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
         eid = app.state.endpoint_id
         if task is not None and task.done() and not _replayable_teardown(app, task):
             task = app.teardown_task = None  # a stale result (another endpoint, or a code gate since answered)
+        if task is None and eid is None and not _has_login_shape(app) and warmth._prune_left(app):
+            # already detached, but a block it left may still bill: say so again, never a bare 'down' (#178)
+            return _left_blocks_status(app, None, None, "", op="detach", spent=_total_session_spend(app))
         if task is None and eid is None:
             return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
         if task is None and not _has_login_shape(app):
@@ -975,22 +1012,13 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
             assert eid is not None  # the no-endpoint case returned above
             if busy := _busy_block_refusal(app, eid, op="detach"):  # detaching would lose results, not idle it
                 return busy
-            lost = _lost_note(app, op="detach") or "No task of ours is known to be running there. "
-            idle = _idle_window_text(app)
+            lost = _lost_note(app, op="detach") or "No task of ours is known to be running there."
+            # the block it leaves, resolved before the shapes go, banked to its latest end and remembered (#178)
+            rt = app.shapes.get(DEFAULT_SHAPE)
+            current = warmth._leave_block(app, DEFAULT_SHAPE, rt, how="detach") if rt is not None else None
             spent = _drop_all_shapes(app, bank=True)  # banks the compute shape too; app.tasks cleared
-            return EndpointStatus(
-                status="down",  # OUR state is fully cleared; the facility's endpoint is untouched
-                block_state="cold",
-                endpoint_id=eid,
-                session_spend=spent,
-                notice=(
-                    "detached from the facility's multi-user endpoint (nothing of ours to tear down — the "
-                    f"facility runs it). {lost}A block we used is reclaimed by the facility's idle-release after "
-                    f"{idle} of no tasks (or at walltime) — unless a task or check of ours is still queued there, "
-                    "which can keep the facility relaunching blocks. It cannot be cancelled from here. Do NOT call "
-                    "run_shell now (it would re-attach); connect_facility re-attaches with zero SSH."
-                ),
-            )
+            # `down`: OUR state is fully cleared; the facility's endpoint is untouched — and so is its block
+            return _left_blocks_status(app, eid, current, lost, op="detach", spent=spent)
         if task is None:
             assert eid is not None  # the no-endpoint case returned above
             app.teardown_eid, app.teardown_release = eid, None
