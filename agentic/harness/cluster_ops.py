@@ -258,12 +258,28 @@ def _endpoint_proc_filter(endpoint_name: str, eids: list[str] | tuple[str, ...] 
             f"{shlex.quote(_PROC_AWK.strip())}")
 
 
-def delete_records(client, eids: list[str]) -> list[str]:
-    """Delete endpoint RECORDS from the Globus Compute service by uuid: one outcome line per uuid (`<id8> deleted`,
-    `<id8> already gone` on a 404, `<id8> NOT deleted (<Error>)`). Pure apart from `client` — imported both by run.py
-    and by the one-line script it runs in the project's environment when the harness' interpreter lacks the SDK."""
+def delete_records(client, eids: list[str], name: str) -> list[str]:
+    """Delete endpoint RECORDS from the Globus Compute service by uuid — but only THIS run's own endpoint: the
+    service's record must carry `name` (the run's unique endpoint name, `<prefix>-<runid>`) and must not be a
+    multi-user endpoint. Anything else is left alone and reported. A run's tool results also carry the uuid of a
+    FACILITY endpoint it attached to; deleting that record shut the fake cluster's multi-user endpoint down (and
+    munged with it) on 2026-10-13, and on globus1 it would have been the lab's production endpoint. An empty
+    `name` deletes nothing. One outcome line per uuid: `<id8> deleted`, `<id8> already gone` (404),
+    `<id8> NOT deleted (not this run's endpoint: …)`, `<id8> NOT deleted (<Error>)`. Pure apart from `client` —
+    imported both by run.py and by the one-line script it runs in the project's environment."""
     out = []
     for eid in eids:
+        try:
+            md = client.get_endpoint_metadata(eid) or {}
+        except Exception as exc:  # noqa: BLE001 - 404 (already gone) or a transient service error
+            msg = str(exc)
+            out.append(f"{eid[:8]} already gone" if "404" in msg or "not found" in msg.lower()
+                       else f"{eid[:8]} NOT deleted (its record could not be read: {type(exc).__name__})")
+            continue
+        if not name or md.get("name") != name or md.get("multi_user"):
+            what = ("a multi-user endpoint " if md.get("multi_user") else "") + repr(md.get("name"))
+            out.append(f"{eid[:8]} NOT deleted (not this run's endpoint: {what})")
+            continue
         try:
             client.delete_endpoint(eid)
             out.append(f"{eid[:8]} deleted")

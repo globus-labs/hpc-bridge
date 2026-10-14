@@ -730,7 +730,7 @@ def _teardown(scen, res=None, *, budget_s: float | None = None) -> tuple[str, tu
     if eids and (t := step("deregistration", 60, 30)) is None:
         dereg = "SKIPPED: the exit budget was spent — records left for the sweep"
     else:
-        dereg = _deregister_endpoints(eids, timeout=t if eids else 60)
+        dereg = _deregister_endpoints(eids, name=name, timeout=t if eids else 60)
     print(f"teardown: registration — {_registration_verdict(deleted_on_node, eids, dereg)}", file=sys.stderr, flush=True)
     if budget.bounded:
         used = (budget_s or 0) - max(0.0, budget.left())
@@ -740,17 +740,22 @@ def _teardown(scen, res=None, *, budget_s: float | None = None) -> tuple[str, tu
 
 
 def _registration_verdict(deleted_on_node: bool | None, eids: list[str], dereg: str) -> str:
-    """One plain sentence: was this run's endpoint registration removed, and by which channel?"""
-    service = [part.strip() for part in dereg.split(";") if part.strip()]
-    by_service = bool(eids) and len(service) == len(eids) and all(x.endswith(("deleted", "already gone")) for x in service)
+    """One plain sentence: was this run's endpoint registration removed, and by which channel? A facility endpoint the
+    run attached to is refused by `delete_records` ("not this run's endpoint") and does not count either way."""
+    parts = [part.strip() for part in dereg.split(";") if part.strip()]
+    foreign = [x for x in parts if "not this run's endpoint" in x]
+    service = [x for x in parts if x not in foreign]
+    note = f" (left alone: {'; '.join(foreign)})" if foreign else ""
+    own = len(eids) - len(foreign)
+    by_service = own > 0 and len(service) == own and all(x.endswith(("deleted", "already gone")) for x in service)
     if deleted_on_node:
         return f"REMOVED (gce delete on the login node; service: {dereg})"
     if by_service:
-        return f"REMOVED by the service, from the jail ({dereg})" + (
-            " — the login-node delete had failed" if deleted_on_node is False else "")
-    if not eids:
+        return f"REMOVED by the service, from the jail ({'; '.join(service)})" + (
+            " — the login-node delete had failed" if deleted_on_node is False else "") + note
+    if own <= 0:
         return "none known — no uuid for this run (nothing registered, or its endpoint.json never written)" + (
-            "; the login-node delete FAILED" if deleted_on_node is False else "")
+            "; the login-node delete FAILED" if deleted_on_node is False else "") + note
     return f"NOT removed — login-node delete {'FAILED' if deleted_on_node is False else 'not run'}; service: {dereg}"
 
 
@@ -807,10 +812,11 @@ def _no_manager_after_teardown(scen, probe: tuple[list[str], list[str]] | None =
 
 # Runs in the PROJECT's environment (what `uv run` gives the MCP server) when the harness' own interpreter has no SDK.
 _DEREGISTER_PY = ("import sys; sys.path.insert(0, sys.argv[1]); from cluster_ops import delete_records; "
-                  "import globus_compute_sdk as g; print('\\n'.join(delete_records(g.Client(), sys.argv[2:])))")
+                  "import globus_compute_sdk as g; print('\\n'.join(delete_records(g.Client(), sys.argv[3:], sys.argv[2])))")
 
 
-def _deregister_endpoints(eids: list[str], client_factory=None, *, runner=None, timeout: int = 60) -> str:
+def _deregister_endpoints(eids: list[str], client_factory=None, *, name: str = "", runner=None,
+                          timeout: int = 60) -> str:
     """Delete this run's endpoint RECORDS from the Globus Compute service by uuid, from here (the jail holds the
     identity's tokens). `gce delete` on the login node only deregisters when the pool user's copy of the
     credentials is still there — after the product's own teardown wiped them (or when the delete itself failed
@@ -820,26 +826,29 @@ def _deregister_endpoints(eids: list[str], client_factory=None, *, runner=None, 
     In the jail the harness runs on the image's system Python, which has NO globus_compute_sdk — that lives in the
     project's own environment (`uv sync` in the Dockerfile, where the MCP server runs). So the deletion runs there
     (`uv run --frozen --offline … python`), with the same tokens (the inherited GLOBUS_COMPUTE_USER_DIR) and stdin
-    closed (a login prompt must fail, not wait). An interpreter that has the SDK (the host) deletes in-process."""
+    closed (a login prompt must fail, not wait). An interpreter that has the SDK (the host) deletes in-process.
+
+    Only a record that IS this run's endpoint is deleted (`cluster_ops.delete_records`: named `name`, not
+    multi-user). `eids` may hold a facility endpoint the run attached to; it is reported, never deleted."""
     if not eids:
         return "no uuid known — nothing to deregister"
     if client_factory is None:
         try:
             import globus_compute_sdk
         except ModuleNotFoundError:
-            return _deregister_in_project_env(eids, runner, timeout=timeout)
+            return _deregister_in_project_env(eids, runner, name=name, timeout=timeout)
         client_factory = globus_compute_sdk.Client
     try:
         client = client_factory()
     except Exception as exc:  # noqa: BLE001 - no tokens here: say so, never fail the run
         return f"could not build a Globus Compute client ({type(exc).__name__}) — records left for the sweep"
-    return "; ".join(delete_records(client, eids))
+    return "; ".join(delete_records(client, eids, name))
 
 
-def _deregister_in_project_env(eids: list[str], runner=None, *, timeout: int = 60) -> str:
+def _deregister_in_project_env(eids: list[str], runner=None, *, name: str = "", timeout: int = 60) -> str:
     # --frozen --offline: the environment was synced when the image was built; never re-resolve or download here
     argv = ["uv", "run", "--frozen", "--offline", "--directory", str(REPO_ROOT), "--extra", "integration", "python",
-            "-c", _DEREGISTER_PY, str(Path(__file__).resolve().parent), *eids]
+            "-c", _DEREGISTER_PY, str(Path(__file__).resolve().parent), name, *eids]
     run = runner or (lambda a: subprocess.run(a, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL))
     try:
         r = run(argv)
