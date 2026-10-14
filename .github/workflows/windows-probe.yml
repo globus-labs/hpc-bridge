@@ -12,8 +12,10 @@ on:
 
 jobs:
   probe:
-    name: ${{ matrix.os }} / uv from ${{ matrix.uv }}
+    name: ${{ matrix.os }} / uv from ${{ matrix.uv }}${{ matrix.python && ' / x64 python' || '' }}
     runs-on: ${{ matrix.os }}
+    env:
+      UV_PYTHON: ${{ matrix.python }}   # empty = uv's default for the machine
     timeout-minutes: 30
     strategy:
       fail-fast: false
@@ -24,6 +26,9 @@ jobs:
           - { os: windows-latest, uv: installer }
           - { os: windows-11-arm, uv: installer }
           - { os: windows-latest, uv: none }
+          # Windows on Arm with an x64 Python (run under Windows' x64 emulation): cryptography has no win_arm64
+          # wheel after 46.0.3, so arm64 fails to build it; its x64 wheel needs no build.
+          - { os: windows-11-arm, uv: action, python: cpython-3.13-windows-x86_64-none }
     steps:
       - uses: actions/checkout@v4
 
@@ -133,7 +138,7 @@ jobs:
             *)    want_server="success"; want_bash="success"; want_cc="success" ;;
           esac
           {
-            echo "### ${{ matrix.os }} / uv from ${{ matrix.uv }}"
+            echo "### ${{ matrix.os }} / uv from ${{ matrix.uv }} ${{ matrix.python }}"
             echo "| check | actual | expected |"
             echo "|---|---|---|"
             echo "| 1. server starts and lists its tools (uv run) | ${{ steps.server.outcome }} | $want_server |"
