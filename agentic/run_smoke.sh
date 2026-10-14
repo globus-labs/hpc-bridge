@@ -81,6 +81,29 @@ GLOBUS_DB="${HPCB_TEST_GLOBUS_DB:-}"
 # stranger: needs_login), or with an ALTERNATE store (a second identity — e.g. one the MEP does not map).
 KNOBS="$(python3 "$REPO_ROOT/agentic/harness/scenario_knobs.py" "$SCENARIO")" || { echo "ERROR: scenario knobs could not be read for '$SCENARIO' (unknown scenario?) — refusing to guess what to mount"; exit 1; }
 eval "$KNOBS"
+# Refuse a cell this target cannot run, as run_suite.py skips one: its TARGETS, its REQUIRES against the target's
+# declared capabilities, and — on the fake cluster — the declared profile against the one the running stack was started
+# with. Why: a `mep` cell started with HPCB_FAKE_PROFILE unset ran against the default profile's one login host, so its
+# teardown stopped on the round-robin alias and missed the manager on the other node (2026-10-14).
+if [ -n "${HPCB_KNOB_TARGETS:-}" ] && [[ ",$HPCB_KNOB_TARGETS," != *",$HPCB_T_NAME,"* ]]; then
+  echo "ERROR: scenario '$SCENARIO' runs only on target(s) $HPCB_KNOB_TARGETS, not '$HPCB_T_NAME'"; exit 1
+fi
+if [ "$HPCB_T_NAME" = fake ]; then
+  RUNNING_PROFILE=""
+  for cid in $(docker ps -q --filter "label=com.docker.compose.project=${HPCB_FAKE_PROJECT:-hpcb-fake}" 2>/dev/null); do
+    src="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/hpcb/profile"}}{{.Source}}{{end}}{{end}}' "$cid" 2>/dev/null)"
+    [ -n "$src" ] && { RUNNING_PROFILE="$(basename "$src")"; break; }
+  done
+  if [ -n "$RUNNING_PROFILE" ] && [ "$RUNNING_PROFILE" != "$HPCB_T_PROFILE" ]; then
+    echo "ERROR: the fake cluster is up with profile '$RUNNING_PROFILE', but this run declares '$HPCB_T_PROFILE' — set HPCB_FAKE_PROFILE=$RUNNING_PROFILE"; exit 1
+  fi
+fi
+if [ -n "${HPCB_KNOB_REQUIRES:-}" ]; then
+  UNMET="$(python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import targets
+ok, why = targets.meets(json.loads(sys.argv[2]), json.loads(sys.argv[3])); print(why); sys.exit(0 if ok else 3)' \
+    "$REPO_ROOT/agentic/harness" "$HPCB_KNOB_REQUIRES" "$HPCB_T_CAPS_JSON")" \
+    || { echo "ERROR: scenario '$SCENARIO' REQUIRES ${UNMET:-?} — not met by target '$HPCB_T_NAME'${HPCB_T_PROFILE:+ profile $HPCB_T_PROFILE}"; exit 1; }
+fi
 if [ -n "${HPCB_KNOB_GLOBUS_DB_SECRET:-}" ]; then
   GLOBUS_DB="${!HPCB_KNOB_GLOBUS_DB_SECRET:-}"
   [ -n "$GLOBUS_DB" ] || { echo "ERROR: scenario '$SCENARIO' needs \$$HPCB_KNOB_GLOBUS_DB_SECRET (path to a storage.db) — set it in agentic/.env"; exit 1; }

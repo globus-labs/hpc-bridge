@@ -99,6 +99,9 @@ target's facts live; prompts say `{ssh_host}`, never a literal host. Fake-cluste
 The fake cluster has **profiles** (`--profile default|site`, see `fakecluster/README.md`): scenarios declare the
 cluster they need (`TARGETS`, `REQUIRES = {"login_nodes": 2, "accounting": "enforce", …}`) and the suite skips a cell
 the target cannot satisfy — coverage is a deliberate coupling of scenario to cluster shape, not a cross product.
+A single `run_smoke.sh` run REFUSES such a cell instead, and on the fake cluster also refuses a declared profile
+(`HPCB_FAKE_PROFILE`) other than the one the running stack was started with: the profile names the login nodes the
+teardown stops on, so a mismatch can leave a manager running on the node it never reached.
 
 Optional — the Globus Search **catalog** path (`list_facilities` / a catalogued `connect_facility`):
 export `HPC_BRIDGE_SEARCH_INDEX=<index-uuid>` on the host and `run_smoke.sh` forwards it into the jail
