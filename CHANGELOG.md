@@ -6,6 +6,13 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
+  Windows-on-Arm build since 46.0.3. On an Arm Python, the first start tried to build it from source, failed for
+  want of OpenSSL, and Claude Code showed only `Failed to reconnect to plugin:hpc-bridge … CONNECTION_CLOSED`.
+  Now the plugin's launcher asks `uv` for an x64 Python there, which Windows runs under emulation, unless
+  `UV_PYTHON` is already set. A failed earlier start's Arm environment is replaced. On another MCP host, pass
+  `--python cpython-3.13-windows-x86_64-none` to `uvx` (see Other hosts). The install page now says what is
+  checked on Windows, and Troubleshooting names the `CONNECTION_CLOSED` message.
 - **A command never runs on a block the user did not confirm.** This fixes 0.1.24's known issue. hpc-bridge checks
   the block before a command only when its last answer is 45 s old, and every completed command counts as an answer.
   So commands sent less than 45 s apart could run on a replacement block without a question for as long as they kept
@@ -111,6 +118,10 @@ installed plugin only when that version changes); git tags mark releases.
   `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
+- **A Windows check in CI** (`.github/workflows/windows.yml`), on every pull request and push to `main`. It checks
+  that Claude Code (its latest release) loads the plugin and connects to its server on Windows Server (x64), with
+  `uv` on PATH and with `uv` only in `~/.local/bin`, and on Windows 11 on Arm after an earlier failed start. On
+  x64 it also checks that the server starts and lists its tools.
 - `reap_replaced_block` now waits until the cancelled block has left the queue, then sends `echo JOB=$SLURM_JOB_ID`
   inside the 45 s window. A new critical grader, `no_work_on_replacement`, checks that nothing ran on the new block
   before the user confirmed it, whether the command was refused there or lost with the old block. A report-only row,

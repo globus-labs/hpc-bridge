@@ -13,7 +13,7 @@ Everything Claude-Code-specific is **install chrome** that translates or drops p
 |---|---|---|
 | plugin manifest | `.claude-plugin/plugin.json` | nothing — a non-CC host points its own MCP config at the console script |
 | launch stanza | `.mcp.json` (`${CLAUDE_PLUGIN_ROOT}`/`${CLAUDE_PLUGIN_DATA}`) | the host's own `mcpServers` entry with the vars resolved to literal paths |
-| PATH shim | `bin/run-with-uv` | unneeded on any host that launches subprocesses with a normal login PATH |
+| PATH shim | `bin/run-with-uv` | unneeded on any host that launches subprocesses with a normal login PATH; it also picks an x64 Python on Windows on Arm (no `cryptography` wheel there), which a `uvx` host does with `--python cpython-3.13-windows-x86_64-none` |
 | slash command | `commands/hpc-connect.md` | a system-prompt fragment, or an `@mcp.prompt` (the server defines none today) |
 | credential guard | `hooks/hooks.json` + `credential-guard.sh` | the host's own middleware, or nothing — better as an in-process check in `run_shell` |
 | standing guidance | `skills/driving-hpc/SKILL.md` | `instructions=` / `@mcp.resource` / tool docstrings (see below) |

@@ -116,11 +116,18 @@ facility's idle timeout reclaims the block. See [Costs and stopping](costs-and-s
 
 ## The agent has no hpc-bridge tools
 
-The plugin's server did not start. Look at the server's error output in `/plugin` (its **Errors** tab)
-or `/mcp`. The usual cause is `uv` not being found by the process that starts the server: the message there reads
+The plugin's server did not start. Claude Code may show it as **`Failed to reconnect to plugin:hpc-bridge …
+CONNECTION_CLOSED`**: the server stopped as it started. Look at the server's error output in `/plugin` (its
+**Errors** tab) or `/mcp`. The usual cause is `uv` not being found by the process that starts the server: the message there reads
 **"'uv' was not found on PATH or in the usual install locations"**, and the fix is to install `uv` or
 symlink yours into `~/.local/bin`, then `/reload-plugins`. `uv run` resolves the server's Python
 dependencies itself, so a dependency error shows in the same place.
+
+On Windows on Arm, a **`Failed to build cryptography`** error there means the server ran on an Arm Python,
+for which that dependency has no build. The plugin picks an x64 Python by itself unless `UV_PYTHON` is set;
+set it to `cpython-3.13-windows-x86_64-none`, or unset it, then `/reload-plugins`. To see the error
+outside Claude Code, start the server by hand from the plugin's folder:
+`uv run --locked --extra integration hpc-bridge` (it waits silently when it works).
 
 ## SSH multiplexing errors
 
