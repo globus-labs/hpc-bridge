@@ -1,19 +1,15 @@
-"""Five holes in the spend gate (2026-10-14), each RED on main before its fix.
+"""The spend gate's terms: who may start or charge a billed block, and on which partition and account.
 
-1. The account floor held only on a facility multi-user endpoint: a registry SSH entry with `account_required` (Expanse)
-   built a Slurm or PBS facility without it, so a confirmed start with no account submitted a block the scheduler could
-   only reject. Now a facility built from a catalog entry carries the entry's `account_required` on every channel; the
-   floor reads the account that would be sent (this session's choice, or the facility's configured default).
-2. The env presets leaked to every facility: HPC_BRIDGE_ACCOUNT reached every catalogued facility on the agentic
-   connect path, HPC_BRIDGE_PARTITION every SSH entry (bring-your-own too). Now each applies only to the facility
-   HPC_BRIDGE_MACHINE names, and a connect elsewhere says in one clause that a set preset was not used.
-3. A partition or account switch started a new billed block under the old confirmation. Now a real change on a
-   confirmed block drops the confirmation: the switching call answers `needs_confirmation` unless it carries
-   confirm_spend=True itself, and says what became of the previous block.
-5. A stop forgot the session's partition and account (the compute shape was dropped whole), so the next block silently
-   used the facility defaults. Now they survive a stop; a connect_facility or a teardown forgets them.
-
-(4 is documentation only: docs/user/facilities.md no longer offers a per-session `scheduler_options`.)
+- The account floor holds on every channel: a facility built from a registry entry carries the entry's
+  `account_required`, an SSH one as a facility endpoint, and the floor reads the account the block would be charged to
+  (this session's choice, or the facility's configured default). A bring-your-own facility has none.
+- The env presets HPC_BRIDGE_ACCOUNT / HPC_BRIDGE_PARTITION apply only to the facility HPC_BRIDGE_MACHINE names (by id,
+  subject or the alias the startup pin resolved); a connect where one goes unused says so in one clause, never its value.
+- A partition or account switch on a confirmed block is a different block: the call answers `needs_confirmation` unless
+  it confirms itself, and either way an answer says what became of the old block. Nothing cancels that block; it is
+  billed once to the latest it can bill, and a switch back that the same job answers keeps its age and its clock. A task
+  that finished on the old block never vouches for the new one.
+- A stop keeps the session's partition and account; a connect_facility or a teardown forgets them.
 """
 import time
 from pathlib import Path
@@ -21,13 +17,14 @@ from pathlib import Path
 import pytest
 
 from hpc_bridge import binding, connect, notices, scheduler_ops, server, warmth
+from hpc_bridge.context import LeftBlock
 from hpc_bridge.facility.mep import MEPFacility
 from hpc_bridge.facility.remote import SlurmFacility
 from hpc_bridge.lifecycle import EndpointState
 from hpc_bridge.models import FacilityDetails, ShellOutcome
 from hpc_bridge.profile import Profile
 from hpc_bridge.runner import CanaryResult
-from hpc_bridge.server import AppCtx, _ensure_endpoint_up, _run_shell, _shape_runtime, _stop_endpoint
+from hpc_bridge.server import AppCtx, _ensure_endpoint_up, _poll_task, _run_shell, _shape_runtime, _stop_endpoint
 from tests.fakes import FakeCatalog, FakeFacility, fake_entry, fake_mep_entry
 from tests.test_mep_server import _Status
 from tests.test_server import _FakeRunner, _Res
@@ -74,7 +71,7 @@ def _ssh_app(monkeypatch, entry=None, *, account: str = "") -> AppCtx:
     return app
 
 
-# --- 1. the account floor on an SSH facility ------------------------------------------------------------------------
+# --- the account floor on an SSH facility ---------------------------------------------------------------------------
 
 
 @pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
@@ -113,7 +110,7 @@ async def test_a_bring_your_own_facility_keeps_todays_behaviour(monkeypatch):
     assert (await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)).status == "up"
 
 
-async def test_the_needs_account_notice_reads_right_on_an_ssh_facility(monkeypatch):
+async def test_the_needs_account_notice_points_an_ssh_user_at_the_login_shape(monkeypatch):
     app = _ssh_app(monkeypatch)
     notice = (await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)).notice
     assert "LOGIN NAME is not an account" in notice and "ensure_endpoint_up(account=" in notice
@@ -126,7 +123,7 @@ async def test_the_needs_account_notice_reads_right_on_an_ssh_facility(monkeypat
     assert "allocation tool or portal" in server._needs_account_notice(mep)
 
 
-# --- 2. the env presets apply only to the facility HPC_BRIDGE_MACHINE names -----------------------------------------
+# --- the env presets apply only to the facility HPC_BRIDGE_MACHINE names --------------------------------------------
 
 
 async def _connect_mep_capturing(monkeypatch, entry=None):
@@ -158,7 +155,7 @@ async def test_the_account_preset_does_not_reach_another_facility(monkeypatch, m
     assert account == ""
     # one clause says so — naming the variable and the machine it is for, never the account itself
     assert "HPC_BRIDGE_ACCOUNT applies only to" in res.notice and "hpcb-gpu" not in res.notice
-    assert (f"HPC_BRIDGE_MACHINE={machine}" if machine else "HPC_BRIDGE_MACHINE names, and that is unset") in res.notice
+    assert (f"HPC_BRIDGE_MACHINE={machine}" if machine else "HPC_BRIDGE_MACHINE is unset") in res.notice
 
 
 @pytest.mark.parametrize("machine", ["globus1", "globus:globus1"], ids=["id", "subject"])
@@ -199,9 +196,56 @@ def test_both_presets_unused_read_as_one_clause(monkeypatch):
     monkeypatch.setenv("HPC_BRIDGE_ACCOUNT", "secret-project")
     monkeypatch.setenv("HPC_BRIDGE_PARTITION", "gpu")
     monkeypatch.delenv("HPC_BRIDGE_MACHINE", raising=False)
-    note = notices._unapplied_presets_note("delta", "ncsa:delta")
+    note = notices._unapplied_presets_note(named=False, facility_endpoint=True, own_partition=False)
     assert note == ("(HPC_BRIDGE_ACCOUNT and HPC_BRIDGE_PARTITION apply only to the facility HPC_BRIDGE_MACHINE names, "
-                    "and that is unset, so they were not used here.) ")
+                    "and HPC_BRIDGE_MACHINE is unset, so they were not used here.) ")
+
+
+async def test_the_partition_preset_says_it_never_applies_to_a_facility_endpoint(monkeypatch):
+    monkeypatch.setenv("HPC_BRIDGE_ACCOUNT", "hpcb-gpu")
+    monkeypatch.setenv("HPC_BRIDGE_PARTITION", "gpu")
+    monkeypatch.setenv("HPC_BRIDGE_MACHINE", "globus1")
+    res, account, _app = await _connect_mep_capturing(monkeypatch)
+    assert account == "hpcb-gpu"                                       # the account is the named machine's
+    assert ("(HPC_BRIDGE_PARTITION never applies to a facility endpoint, whose entry sets the partition, so it was not "
+            "used here.)") in res.notice and "gpu'" not in res.notice
+
+
+def test_details_win_over_the_partition_preset_of_the_machine_they_define(monkeypatch):
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "u")
+    monkeypatch.setenv("HPC_BRIDGE_PARTITION", "gpu")
+    monkeypatch.setenv("HPC_BRIDGE_MACHINE", "mine")
+    entry = binding._entry_from_details("mine", FacilityDetails(
+        ssh_host="login.example.edu", interface="ib0", env_setup="module load x", scratch_root="/scratch/{user}",
+        partition="batch"))
+    assert binding._facility_from_entry(entry, account="").profile.partition == "batch"
+    assert notices._unapplied_presets_note(named=True, facility_endpoint=False, own_partition=True) == (
+        "(HPC_BRIDGE_PARTITION gives way to the partition given in details=, so it was not used here.) ")
+
+
+async def test_an_alias_the_pin_resolved_names_its_machine_for_the_presets(monkeypatch):
+    from hpc_bridge.catalog.bundled import BundledCatalog
+
+    monkeypatch.setattr(binding, "_PINNED", {}, raising=False)
+    monkeypatch.setattr(binding, "make_catalog", lambda: BundledCatalog(_ANVIL_SSH_SEED))
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "x-u")
+    monkeypatch.delenv("HPC_BRIDGE_SSH_HOST", raising=False)
+    monkeypatch.delenv("HPC_BRIDGE_PARTITION", raising=False)
+    monkeypatch.setenv("HPC_BRIDGE_MACHINE", "anvil.rcac.purdue.edu")
+    monkeypatch.setenv("HPC_BRIDGE_ACCOUNT", "ACC")
+    await binding.make_facility()                                      # the startup pin resolves the alias
+    seen = []
+    f = FakeFacility()
+    f.workers = 1
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: seen.append(account) or f)
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "", ""))
+
+    async def run_login(cmd):
+        return ShellOutcome(phase="complete", block_state="warm", exit_code=0, stdout="")
+
+    res = await connect._connect_facility(app, "anvil", run_login=run_login)
+    assert seen == ["ACC"] and "applies only to" not in (res.notice or "")
 
 
 @pytest.mark.parametrize(("machine", "want"), [(None, "debug"), ("other", "debug"), ("expanse", "gpu"),
@@ -248,7 +292,7 @@ async def test_the_startup_pin_still_applies_both_presets(monkeypatch, machine):
         await binding.make_facility()
 
 
-# --- 3. a partition or account switch asks for spend again ----------------------------------------------------------
+# --- a partition or account switch asks for spend again -------------------------------------------------------------
 
 
 async def _warm(facility=None, job: str | None = "112"):
@@ -287,7 +331,7 @@ async def test_a_switch_without_a_confirmation_starts_nothing(switch):
     res = await _ensure_endpoint_up(app, confirm_spend=True)
     assert res.status == "up" and len(app.built) == built + 1
     assert all(app.built[-1][k] == v for k, v in switch.items())
-    assert rt.switched is None
+    assert rt.switched_terms is None
 
 
 async def test_a_switch_of_both_in_one_call_asks_once_and_names_the_old_terms():
@@ -328,7 +372,7 @@ async def test_the_ssh_switch_notice_says_the_old_block_idles_out_and_stop_cance
     assert "Confirm spend again" in notice and "partition 'debug'" in notice and "account 'hpcb'" in notice
     assert "Nothing cancels the previous block on a switch" in notice and "min_blocks=0" in notice
     assert "idle-releases ~600s after its last task" in notice
-    assert "stop_endpoint first" in notice
+    assert "call stop_endpoint before confirming the new block" in notice
     assert "on 'compute'" in notice                                    # the head names the new block's partition
 
 
@@ -373,15 +417,16 @@ async def test_a_switch_away_from_a_block_still_being_requested_keeps_the_stop_l
     assert seen["expect_block"] is True
 
 
-async def test_an_ssh_switch_stops_the_old_blocks_clock_at_the_switch():
+async def test_an_ssh_switch_banks_the_old_block_to_the_latest_it_can_bill():
+    # nothing cancels it, so it bills until its idle window after its last task (+ the release bound): an upper bound
     app = await _warm()
     app.charge_factor = 1.0
     rt = app.shapes["compute"]
     rt.warm_since -= 3600                                              # the old block has billed an hour
     await _ensure_endpoint_up(app, partition="compute")
-    assert rt.warm_since is None
-    at_switch = server._total_session_spend(app)
-    assert at_switch == pytest.approx(1.0, abs=0.01)                  # an hour, one node, banked at the switch
+    assert rt.warm_since is None                                       # no clock runs while the user is asked
+    expected_s = 3600 + app.profile.max_idletime_s + warmth._RELEASE_BOUND_S
+    assert server._total_session_spend(app) == pytest.approx(expected_s / 3600, abs=0.01)
 
 
 def _mep_app(job: str = "100") -> AppCtx:
@@ -406,7 +451,7 @@ async def test_a_switch_on_a_facility_endpoint_asks_again_and_names_the_block_it
     built = len(app.built)
     res = await _ensure_endpoint_up(app, partition="other")
     assert res.status == "needs_confirmation" and len(app.built) == built
-    # #188's words for a block a facility endpoint lets go of, and the block it remembered for a later stop
+    # #178's words for a block a facility endpoint lets go of, and the block it remembered for a later stop
     assert "scheduler job 100, was not cancelled — no cancel channel on a facility endpoint" in res.notice
     assert "`scancel 100` on that facility ends it" in res.notice and "stop_endpoint names it" in res.notice
     assert "partition 'main'" in res.notice
@@ -415,7 +460,7 @@ async def test_a_switch_on_a_facility_endpoint_asks_again_and_names_the_block_it
     assert stop.block_job_id == "100" and "by an earlier switch" in stop.notice
 
 
-# --- 5. a stop keeps the session's partition and account ------------------------------------------------------------
+# --- a stop keeps the session's partition and account ---------------------------------------------------------------
 
 
 async def _ssh_stop(app, monkeypatch):
@@ -447,7 +492,7 @@ async def test_a_facility_endpoint_stop_keeps_them_too():
     assert res.status == "needs_confirmation" and res.partition == "gpu" and res.account == "proj"
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
     assert app.built[-1]["partition"] == "gpu" and app.built[-1]["account"] == "proj"
-    assert app.left_blocks == []                                       # #188: the same terms' block took it over
+    assert app.left_blocks == []                                       # #178: the same terms' block took it over
 
 
 async def test_a_new_connect_forgets_them(monkeypatch):
@@ -464,7 +509,7 @@ async def test_a_new_connect_forgets_them(monkeypatch):
     assert _shape_runtime(app, "compute").user_endpoint_config.get("partition") is None
 
 
-async def test_a_teardown_forgets_them():
+async def test_dropping_the_binding_forgets_them():
     app = await _warm()
     warmth._drop_all_shapes(app, bank=True)
     assert _shape_runtime(app, "compute").user_endpoint_config.get("account") is None
@@ -478,3 +523,215 @@ async def test_a_new_globus_login_keeps_them(monkeypatch):
     warmth._forget_identity_verdicts(app)
     res = await _ensure_endpoint_up(app)
     assert res.status == "needs_confirmation" and res.partition == "debug" and res.account == "hpcb"
+
+
+# --- the old block after a switch: its tasks, a switch back, its fate ----------------------------------------------
+
+
+@pytest.fixture
+def clock(monkeypatch):
+    """A fake time.monotonic the test moves by hand."""
+    c = [100000.0]
+    monkeypatch.setattr(time, "monotonic", lambda: c[0])
+    return c
+
+
+async def test_a_task_that_finished_on_the_old_block_never_vouches_for_the_new_one():
+    # finished unpolled on job 112, polled after the switch and its confirmation: it used to mark the still-queued new
+    # block warm, so the next command ran no check, adopted a block with no job, and the wrong-block guard was off
+    app = await _warm()
+    rt = app.shapes["compute"]
+    old_runner = rt.runner
+    old_runner.pending = True
+    out = await _run_shell(app, "sleep 200")
+    assert out.phase == "running"
+    old_runner.futures[-1].finish(_Res(0, "done", ""))                # it finished on job 112; nobody polled it yet
+    assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "ok", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    new_runner = rt.runner
+    polled = await _poll_task(app, out.task_id)
+    assert polled.phase == "complete" and polled.block_state == "cold"   # its result, but no news about the new block
+    assert rt.warm_confirmed_at is None and warmth._last_activity(app, "compute", rt) is None
+    canaries = new_runner.canaries
+    nxt = await _run_shell(app, "hostname")
+    assert nxt.phase == "cold_start" and new_runner.canaries == canaries + 1 and rt.block_since is None
+
+
+async def test_a_switch_back_to_the_confirmed_terms_says_so():
+    app = await _warm()
+    assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
+    res = await _ensure_endpoint_up(app, partition="debug")
+    assert res.status == "needs_confirmation" and res.partition == "debug"
+    assert "back to the ones it covered (partition 'debug', account 'hpcb')" in res.notice
+    assert "different block" not in res.notice and "Nothing cancels" not in res.notice
+
+
+async def test_a_switch_back_answered_by_the_same_job_keeps_its_age_and_bills_the_gap(clock):
+    t0 = clock[0]
+    app = await _warm()                                                # job 112, confirmed warm at t0
+    app.charge_factor = 1.0
+    rt = app.shapes["compute"]
+    clock[0] = t0 + 100
+    await _ensure_endpoint_up(app, partition="compute")
+    clock[0] = t0 + 200
+    await _ensure_endpoint_up(app, partition="debug")
+    clock[0] = t0 + 300
+    res = await _ensure_endpoint_up(app, confirm_spend=True)           # job 112 answers again
+    assert res.status == "up" and rt.block_job == "112" and rt.block_since == t0   # its walltime counts from t0
+    assert rt.warm_since is not None and rt.warm_since <= clock[0]     # a clock never starts ahead of now
+    assert server._total_session_spend(app) * 3600 >= 300              # nothing since t0 went unbilled
+    clock[0] = t0 + 900
+    assert server._total_session_spend(app) * 3600 >= 900
+
+
+async def test_a_new_block_with_no_job_id_on_other_terms_is_not_dated_as_the_one_left(clock):
+    # with no job id to compare, a block answering before the left block's latest end would inherit its age — but
+    # only a block of the same terms can be that block
+    t0 = clock[0]
+    app = await _warm()
+    rt = app.shapes["compute"]
+    clock[0] = t0 + 100
+    await _ensure_endpoint_up(app, partition="compute")
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "ok", ""),
+                                                                                   canary_result=_ok(None))
+    clock[0] = t0 + 200
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    assert rt.block_since == t0 + 200
+
+
+async def test_a_switch_from_a_block_seen_up_leaves_no_pilot_in_flight(monkeypatch):
+    # a voided confirmation (a failed dispatch, a rebuild, a new login) is not a block that was never seen up: a stop
+    # must not poll the long budget and say it is "still being submitted"
+    app = await _warm()
+    rt = app.shapes["compute"]
+    warmth._void_warm(rt)
+    await _ensure_endpoint_up(app, partition="compute")
+    assert rt.switch_unseen is False
+    seen = {}
+
+    async def release(a, eid, *rest, expect_block=False, **kw):
+        seen["expect_block"] = expect_block
+        return True, "released 112"
+
+    monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
+    await _stop_endpoint(app)
+    assert seen["expect_block"] is False
+
+
+async def test_a_voided_confirmation_of_a_block_seen_up_does_not_make_the_stop_wait(monkeypatch):
+    app = await _warm()
+    warmth._void_warm(app.shapes["compute"])
+    seen = {}
+
+    async def release(a, eid, *rest, expect_block=False, **kw):
+        seen["expect_block"] = expect_block
+        return True, "released 112"
+
+    monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
+    await _stop_endpoint(app)
+    assert seen["expect_block"] is False
+
+
+async def test_a_confirmation_ends_the_wait_for_a_switched_away_pilot(monkeypatch):
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
+    assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
+    runner._canary = _ok("113")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"   # the new block is up and confirmed
+    seen = {}
+
+    async def release(a, eid, *rest, expect_block=False, **kw):
+        seen["expect_block"] = expect_block
+        return True, "released 113"
+
+    monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
+    await _stop_endpoint(app)
+    assert seen["expect_block"] is False
+
+
+async def test_a_facility_switch_after_a_kicked_reap_names_the_replacement_it_leaves():
+    app = _mep_app("100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.runner._canary = _ok("101")                                     # job 100 was replaced: job 101 answers the check
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "needs_confirmation" and rt.reap_kicked
+    res = await _ensure_endpoint_up(app, partition="other")
+    assert res.status == "needs_confirmation"
+    assert "That block, scheduler job 101, was not cancelled" in res.notice and "`scancel 101`" in res.notice
+    assert [(b.job, b.how) for b in app.left_blocks] == [("101", "switch")]
+
+
+async def test_a_switch_confirmed_in_the_same_call_says_once_what_became_of_the_old_block():
+    app = await _warm()
+    res = await _ensure_endpoint_up(app, partition="compute", confirm_spend=True)
+    assert res.status == "up"
+    assert res.notice.startswith("This confirmation is for a new block: the partition or account changed from "
+                                 "partition 'debug', account 'hpcb'. Nothing cancelled the previous block")
+    assert "stop_endpoint cancels every block of this endpoint, this new one included" in res.notice
+    assert "This confirmation is for a new block" not in (await _ensure_endpoint_up(app)).notice   # once
+    mep = _mep_app("100")
+    assert (await _ensure_endpoint_up(mep, confirm_spend=True)).status == "up"
+    res = await _ensure_endpoint_up(mep, partition="other", confirm_spend=True)
+    assert "That block, scheduler job 100, was not cancelled" in res.notice and "`scancel 100`" in res.notice
+
+
+@pytest.mark.parametrize("kind", ["block", "check"])
+def test_a_reconnect_and_a_switch_name_a_left_block_in_the_same_words(kind):
+    left = LeftBlock(endpoint_id="e", job="7.pbs01" if kind == "block" else None, until=None, left_at=0.0, how="switch",
+                     kind=kind, partition="debug")
+    fac = MEPFacility.from_entry(fake_mep_entry(), client_factory=_Status)
+    fac.scheduler = "pbs"
+    app = AppCtx(facility=fac, profile=Profile())
+    clause = notices._left_block_clause(left, "pbs")
+    assert clause in connect._prior_note(0.0, left, "pbs", same=True, old_mep=True)
+    switch = notices._left_block_clause(left, "pbs", subject="that block")
+    assert switch[1:] in notices._switch_fate(app, left, confirmed=False)       # (capitalised there)
+    assert clause.split("was not cancelled")[1] == switch.split("was not cancelled")[1]
+    assert ("`qdel 7.pbs01` on that facility ends it" in clause) is (kind == "block")
+    assert ("a block the facility starts for it bills" in clause) is (kind == "check")
+
+
+async def test_the_choice_never_reaches_the_login_shape():
+    app = await _warm()
+    await _ensure_endpoint_up(app, partition="compute", account="hpcb-gpu", confirm_spend=True)
+    login = warmth._shape_runtime(app, "login").user_endpoint_config
+    assert "partition" not in login and "account" not in login
+
+
+# --- a registry facility's scheduler directives cannot be set per session ---------------------------------------------
+
+
+@pytest.mark.parametrize("rows", ["H 7.pbs01 - held: needs -l filesystems\n", "P 7 - AssocGrpSubmitJobsLimit\n"],
+                         ids=["held", "pending-for-good"])
+async def test_a_held_pilot_offers_details_only_for_a_facility_you_bring(rows):
+    def app_for(machine, byo):
+        app = AppCtx(facility=FakeFacility(), profile=Profile())
+        app.machine = machine
+        if byo:
+            app.session_facilities[machine] = binding._entry_from_details(machine, FacilityDetails(
+                ssh_host="login.example.edu", interface="ib0", env_setup="module load x",
+                scratch_root="/scratch/{user}", partition="batch"))
+        return app
+
+    async def run_login(cmd):
+        return ShellOutcome(phase="complete", block_state="warm", exit_code=0, stdout=rows)
+
+    mine = await scheduler_ops._pilot_status_over_login(app_for("mine", True), "eid", 30.0, run_login)
+    registry = await scheduler_ops._pilot_status_over_login(app_for("expanse", False), "eid", 30.0, run_login)
+    assert mine is not None and registry is not None and mine[0] == registry[0] == "held"
+    assert "connect_facility with details=" in mine[1]
+    assert "connect_facility with details=" not in registry[1] and "registry entry" in registry[1]
+    assert "cannot change per session yet" in registry[1]
+
+
+def test_the_agent_facing_texts_promise_no_directive_a_registry_facility_cannot_take():
+    late = notices._allocating_notice("gpuA40x4", 480, facility_mep=True)
+    assert "scheduler_options" not in late and "cannot add to a facility endpoint's block yet" in late
+    desc = FacilityDetails.model_fields["scheduler_options"].description or ""
+    assert "Polaris" not in desc and "filesystems directive" in desc

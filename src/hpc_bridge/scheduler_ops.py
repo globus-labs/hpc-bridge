@@ -168,11 +168,13 @@ _NEVER_PENDING = re.compile(
     r"InvalidAccount|InvalidQOS|ReqNodeNotAvail|DependencyNeverSatisfied|AccountNotAllowed|PartitionDown", re.I)
 
 
-def _summarize_pilot(stdout: str, provisioning_elapsed_s: float) -> tuple[str, str]:
+def _summarize_pilot(stdout: str, provisioning_elapsed_s: float, *, own_config: bool = True) -> tuple[str, str]:
     """(category, notice-suffix) from `_pilot_status_cmd` output. category ∈ {starting, queued, held,
     rejected, finished}. A visible pilot (Q/R/H) is reported at once; a MISSING pilot is only called
     `rejected` once the block has been cold past `PROVISION_GRACE_S` — before that it's a normal
-    cold-start gap (empty suffix ⇒ the caller leaves 'allocating nodes…' unchanged)."""
+    cold-start gap (empty suffix ⇒ the caller leaves 'allocating nodes…' unchanged). `own_config`: the facility's
+    configuration is the user's own (a bring-your-own facility, changed with connect_facility(details=…)); a registry
+    entry's scheduler directives and walltime cannot be changed per session."""
     # Slurm rows are `STATE JOBID`; PBS rows are `STATE JOBID EXIT [comment…]` (EXIT = Exit_status, or `-` when the
     # job never ran). Finished rows are read by WHY they finished: an exit status of its own means the worker died
     # there; `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our own
@@ -207,7 +209,7 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float) -> tuple[str, s
             "rather than queued. Check run_shell('qstat -u $USER', shape='login') (squeue on Slurm) "
             "and the endpoint log."
         )
-    return _summarize_live(live, provisioning_elapsed_s)
+    return _summarize_live(live, provisioning_elapsed_s, own_config=own_config)
 
 
 def _venv_verdict(m: re.Match[str]) -> str:
@@ -230,7 +232,7 @@ def _venv_verdict(m: re.Match[str]) -> str:
         "login node has.")
 
 
-def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float) -> tuple[str, str]:
+def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float, *, own_config: bool = True) -> tuple[str, str]:  # noqa: E501
     """`_summarize_pilot` for the live rows (at least one)."""
     states = {r[0][:1].upper() for r in rows}
     jid = rows[0][1] if len(rows[0]) > 1 else "?"
@@ -241,20 +243,26 @@ def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float) -> tup
                " A held job usually means a bad scheduler directive (e.g. filesystems/account) — inspect qstat -f / "
                "the #PBS|#SBATCH directives.")
         hjid = held[1] if len(held) > 1 else jid
-        return "held", (
-            f"— pilot {hjid} is HELD and will not start on its own.{why} Fix the facility's scheduler_options "
-            "(connect_facility with details=) or the account/queue, then start again."
-        )
+        fix = ("Fix the facility's scheduler_options (connect_facility with details=) or the account/queue, then start "
+               "again." if own_config else
+               "The scheduler directives come from the registry entry, which hpc-bridge cannot change per session yet: "
+               "if the account or queue is the cause, change it (ensure_endpoint_up(account=…, partition=…, "
+               "confirm_spend=True)); otherwise tell the user the facility needs a directive this entry does not send.")
+        return "held", f"— pilot {hjid} is HELD and will not start on its own.{why} {fix}"
     if "R" in states:
         return "starting", f"— pilot {jid} is RUNNING; the worker is starting, retry shortly."
     pend = next((r for r in rows if r[0][:1].upper() == "P"), rows[0])
     reason = pend[3].strip() if len(pend) > 3 else ""
     pjid = pend[1] if len(pend) > 1 else jid
     if reason and _NEVER_PENDING.search(reason):
+        fix = ("Fix the facility's walltime/partition/account (connect_facility with details=), then start again."
+               if own_config else
+               "Change the partition or account if that is the cause (ensure_endpoint_up(account=…, partition=…, "
+               "confirm_spend=True)); a walltime or size comes from the registry entry, which hpc-bridge cannot change "
+               "per session yet: tell the user.")
         return "held", (
             f"— pilot {pjid} is PENDING with reason {reason!r}: the scheduler will not start it as submitted (a "
-            "walltime or size over the partition's or QOS's limit, an account/QOS it may not use, a held job). Fix the "
-            "facility's walltime/partition/account (connect_facility with details=), then start again."
+            f"walltime or size over the partition's or QOS's limit, an account/QOS it may not use, a held job). {fix}"
         )
     tail = f" (reason {reason})" if reason and reason.lower() != "none" else ""
     return "queued", f"— pilot {pjid} is queued (PENDING{tail}); waiting on the scheduler."
@@ -268,7 +276,9 @@ async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_
     out = await run_login(_pilot_status_cmd(scheduler, eid))
     if out.phase != "complete" or out.exit_code != 0:
         return None
-    return _summarize_pilot(out.stdout or "", elapsed_s)
+    machine = getattr(app, "machine", None)  # bring-your-own (a session facility): its config is the user's to change
+    own = machine is not None and machine in getattr(app, "session_facilities", {})
+    return _summarize_pilot(out.stdout or "", elapsed_s, own_config=own)
 
 async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
     """Enrich a still-cold BILLED block's 'allocating nodes…' with the pilot's ACTUAL scheduler state,

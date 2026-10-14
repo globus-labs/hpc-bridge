@@ -337,10 +337,7 @@ class MachineProfile:
     scheduler: Literal["slurm", "pbs"] = "slurm"  # "slurm" | "pbs" — selects the config_template branch
     cpus_per_node: int | None = None  # PBS: emitted as PBSProProvider.cpus_per_node; Slurm: unused
     exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
-    # The catalog entry's `account_required`: every block must be charged to an allocation account, so the server's
-    # account floor (warmth._provision) starts nothing without one. False when no curated entry says so (a facility
-    # you bring yourself, a profile built by hand).
-    account_required: bool = False
+    account_required: bool = False  # the entry's: warmth._provision starts no block without an account (False: BYO)
 
 
 def profile_from_catalog_entry(

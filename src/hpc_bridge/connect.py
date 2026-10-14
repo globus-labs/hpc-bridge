@@ -30,9 +30,9 @@ from .models import ConnectFacilityResult, FacilityDetails, validate_host
 from .notices import (
     _explain_provision_error,
     _first_contact_note,
+    _left_block_clause,
     _needs_login_result,
     _needs_preauth_result,
-    _scheduler_cmds,
     _unapplied_presets_note,
 )
 from .scheduler_ops import LoginRunner
@@ -239,10 +239,12 @@ async def _connect_facility(
         )
     if reason:
         return ConnectFacilityResult(phase="unsupported", facility=facility, notice=reason)
-    # HPC_BRIDGE_ACCOUNT is the account of the facility HPC_BRIDGE_MACHINE names, never of another one (hole 2): a
-    # connect elsewhere is told, in one clause, that it was not used
-    preset = config.account() if config.names_machine(entry.id, entry.subject) else None
-    presets_note = _unapplied_presets_note(entry.id, entry.subject)
+    # HPC_BRIDGE_ACCOUNT is the account of the facility HPC_BRIDGE_MACHINE names, never of another one; a connect where
+    # a preset goes unused is told so in one clause
+    named = binding._names_machine(entry)
+    preset = config.account() if named else None
+    presets_note = _unapplied_presets_note(named=named, facility_endpoint=entry.compute_mep_uuid is not None,
+                                           own_partition=entry.facility_key == binding.SESSION_KEY)
     try:
         # off the loop: it may run `ssh -G` (a subprocess with a 10 s timeout) to read ~/.ssh/config
         fac = await asyncio.to_thread(binding._facility_from_entry, entry, account=(preset or ""))
@@ -374,13 +376,7 @@ def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, 
     note = f"the previous session on {where} was closed (session spend so far ≈ {spent:.2f})"
     if left is None:
         return note + ". "
-    cancel = _scheduler_cmds(scheduler)[0]
-    block = (f"its block, scheduler job {left.job}, was not cancelled" if left.job else
-             "its block was not cancelled" if left.kind == "block" else
-             "a check of ours was still queued there and was not cancelled")
-    end = (f" (`{cancel.format(job=left.job)}` on that facility ends it)" if left.job else "")
-    return (f"{note}, but {block} — no cancel channel on a facility endpoint: it bills until that facility's "
-            f"idle-release{end}" + ("; stop_endpoint names it. " if same else ". "))
+    return f"{note}, but {_left_block_clause(left, scheduler)}" + ("; stop_endpoint names it. " if same else ". ")
 
 
 async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult:

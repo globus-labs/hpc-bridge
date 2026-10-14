@@ -620,7 +620,7 @@ def test_allocating_notice_hints_at_rejection_on_a_facility_mep_after_five_minut
 
     assert _allocating_notice("gpu-debug", 60, facility_mep=True) == "allocating nodes on 'gpu-debug'…"
     late = _allocating_notice("gpu-debug", 480, facility_mep=True)
-    assert "Still allocating after 480s" in late and "scheduler_options" in late
+    assert "Still allocating after 480s" in late and "missing resource request" in late
     assert "Still allocating" not in _allocating_notice("main", 480, facility_mep=False)  # SSH facilities can read squeue
 
 

@@ -1,17 +1,18 @@
-"""HPC_BRIDGE_ACCOUNT reaches only the facility HPC_BRIDGE_MACHINE names (hole 2, 2026-10-14) — fake cluster, `mep`.
+"""HPC_BRIDGE_ACCOUNT reaches only the facility HPC_BRIDGE_MACHINE names — fake cluster, `mep` profile.
 
-The env presets are for the startup pin's machine. Before the fix the agentic connect applied HPC_BRIDGE_ACCOUNT to
-EVERY catalogued facility: a user who once exported it for one machine had every other facility's blocks charged to
-it, unasked — and on an account-required facility it even satisfied the account floor, so nothing asked. Here the
-server runs with `HPC_BRIDGE_ACCOUNT=hpcb-gpu` and no HPC_BRIDGE_MACHINE (the common case: an exported account, the
+The env presets belong to the startup pin's machine. Applied to every catalogued facility, a user who once exported an
+account for one machine would have every other facility's blocks charged to it, unasked — and on an account-required
+facility it would even satisfy the account floor, so nothing asked. Here the server runs with `HPC_BRIDGE_ACCOUNT=hpcb-gpu` and no HPC_BRIDGE_MACHINE (the common case: an exported account, the
 agentic flow), and the agent attaches to the fake MEP and confirms a block WITHOUT naming an account. Now the connect
 says in one clause that the preset was not used (naming the variable, never its value), the account floor answers
 `needs_account`, and the block is charged to the account the agent then passes, `hpcb`.
 
-ADMIN_SETUP makes `hpcb-gpu` a valid account for the mapped user `hpcbmep`, so a leak would be BILLED, not refused by
-Slurm — the world check (no `hpcb-gpu` job of hpcbmep in sacct since the cell started) then catches it; ADMIN_CLEANUP
-removes the association again. Not yet graded, for the spend-terms PR that adds it: the start's
-`block.account_source` (it will read `this_call`, never `env`). Autonomous: claude and the free operators. ~6 min.
+ADMIN_SETUP makes `hpcb-gpu` a valid account for the mapped user `hpcbmep` (and fails the cell if the grant did not
+take), so a leak would be BILLED, not refused by Slurm: the world check (no `hpcb-gpu` job of hpcbmep submitted since
+the cell started) then catches it; ADMIN_CLEANUP removes the association again. For the CLI operators (codex, pi,
+hermes21) EXTRA_ENV is in the agent's own environment too, so the agent can read the preset and pass it itself: that is
+reported apart (`agent_chose_the_preset`), never as the product's leak. Not graded: an `account_source` result field,
+which hpc-bridge does not report yet. Autonomous: claude and the free operators. ~6 min.
 """
 import re
 
@@ -31,9 +32,11 @@ EXTRA_ENV = {"HPC_BRIDGE_ACCOUNT": PRESET}   # the SERVER's env only; HPC_BRIDGE
 _START = "$HOME/.hpcb-preset-account-scoped.start"
 _NAMED = re.compile(r"\bACCOUNT=hpcb(?![\w-])")
 SETUP = [f'date +%Y-%m-%dT%H:%M:%S > "{_START}"']   # sacct's window: this cell's jobs only (hpcbmep is shared)
-ADMIN_SETUP = [f"sacctmgr -i add user {MAPPED_USER} account={PRESET} >/dev/null 2>&1 || true"]
+_HAS_GRANT = f"sacctmgr -n -P show assoc user={MAPPED_USER} account={PRESET} format=account | grep -qx {PRESET}"
+ADMIN_SETUP = [f"sacctmgr -i add user {MAPPED_USER} account={PRESET} >/dev/null 2>&1; {_HAS_GRANT}"]  # fails if absent
 ADMIN_CLEANUP = [f"scancel -u {MAPPED_USER} 2>/dev/null || true",
-                 f"sacctmgr -i delete user name={MAPPED_USER} account={PRESET} >/dev/null 2>&1 || true"]
+                 f"for i in 1 2 3 4 5; do sacctmgr -i delete user name={MAPPED_USER} account={PRESET} >/dev/null 2>&1; "
+                 f"{_HAS_GRANT} || break; sleep 3; done; true"]
 
 PROMPT = (
     "Connect to the HPC facility with id `{facility}` (use `connect_facility(facility='{facility}')`; it is a "
@@ -53,7 +56,7 @@ PROMPT = (
 USER_GOAL = ""
 PERSONA = None
 KIND = "regression"
-SUMMARY = ("hole 2: an exported HPC_BRIDGE_ACCOUNT with no HPC_BRIDGE_MACHINE is not applied to the facility the agent "
+SUMMARY = ("an exported HPC_BRIDGE_ACCOUNT with no HPC_BRIDGE_MACHINE is not applied to the facility the agent "
            "connects: the connect says so, the floor asks, and nothing is charged to the preset")
 TAGS = ["mep", "spend", "account", "preset", "fake", "free-operators", "spend-terms"]
 MAX_TURNS = 45
@@ -94,13 +97,29 @@ def floor_asked_without_the_preset(t: Trace) -> Result:
                   else f"the confirmed start with no account (call {i}) answered {status!r}, not 'needs_account'")
 
 
+def _chose_preset(t: Trace) -> int | None:
+    """The first call where the agent itself passed the preset as the account (a CLI operator can read EXTRA_ENV)."""
+    return next((i for i, c in t.named("ensure_endpoint_up") if str(c.input.get("account") or "") == PRESET), None)
+
+
 def preset_not_charged(t: Trace) -> Result:
-    """Nothing was charged to the preset: no ensure_endpoint_up result reports it as the block's account, and no block
-    printed it as its own $SLURM_JOB_ACCOUNT."""
-    bad = [i for i, c in t.named("ensure_endpoint_up") if str(_res(c).get("account") or "") == PRESET]
-    bad += [i for i, c in t.named("run_shell") if f"ACCOUNT={PRESET}" in str(_res(c).get("stdout") or "")]
-    return Result("preset_not_charged", not bad, f"ok: {PRESET!r} charged nowhere" if not bad
+    """The product never charged the preset: no ensure_endpoint_up result reports it as the block's account unless the
+    agent passed it, and no block printed it as its own $SLURM_JOB_ACCOUNT before the agent first did."""
+    chose = _chose_preset(t)
+    before = [(i, c) for i, c in enumerate(t.calls) if chose is None or i < chose]  # up to the agent's own choice
+    bad = [i for i, c in before if c.name == "ensure_endpoint_up" and str(_res(c).get("account") or "") == PRESET]
+    bad += [i for i, c in before if c.name == "run_shell" and f"ACCOUNT={PRESET}" in str(_res(c).get("stdout") or "")]
+    note = f" (the agent passed it itself at call {chose}: see agent_chose_the_preset)" if chose is not None else ""
+    return Result("preset_not_charged", not bad, f"ok: hpc-bridge charged {PRESET!r} nowhere{note}" if not bad
                   else f"{PRESET!r} is the block's account at calls {sorted(bad)}")
+
+
+def agent_chose_the_preset(t: Trace) -> Result:
+    """REPORTED, not gated: the agent passed the preset as the account itself (it read it from its own environment, as
+    the CLI operators allow) — the agent's choice against the prompt, not the product's leak."""
+    chose = _chose_preset(t)
+    return Result("agent_chose_the_preset", chose is None, "ok: the agent never passed the preset" if chose is None
+                  else f"the agent passed account={PRESET!r} itself at call {chose}")
 
 
 def charged_the_named_account(t: Trace) -> Result:
@@ -113,7 +132,7 @@ def charged_the_named_account(t: Trace) -> Result:
 
 
 EXTRA_INVARIANTS = [mep_zero_ssh, compute_ran, preset_clause_shown, floor_asked_without_the_preset, preset_not_charged,
-                    charged_the_named_account, mep_stop_is_draining_only]
+                    agent_chose_the_preset, charged_the_named_account, mep_stop_is_draining_only]
 
 EXPECT_OK = [
     "mep_zero_ssh",
@@ -130,8 +149,9 @@ EXPECT_OK = [
 
 POSTCHECK_DELAY_S = 240   # the facility's 180 s idle-release, then the queue
 POSTCHECKS = [
-    {"name": "no_job_charged_to_the_preset",
-     "cmd": f'sacct -u {MAPPED_USER} -X -n -S "$(cat "{_START}")" -o Account%20 2>/dev/null | sort -u | tr -s " \\n" " "',
+    {"name": "no_job_charged_to_the_preset",   # jobs SUBMITTED since the cell started (sacct -S also lists older ones)
+     "cmd": (f's=$(cat "{_START}"); sacct -u {MAPPED_USER} -X -n -P -S "$s" -o Account,Submit 2>/dev/null '
+             '| awk -F"|" -v s="$s" \'$2 >= s {print $1}\' | sort -u | tr -s " \\n" " "'),
      "expect_absent": PRESET},
     {"name": "mep_block_idle_released", "cmd": f"squeue -u {MAPPED_USER} -h -o %j", "expect_absent": "parsl"},
 ]

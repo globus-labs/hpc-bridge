@@ -258,8 +258,8 @@ async def test_a_partition_switch_does_not_hide_a_reap_or_inherit_the_old_block_
     app, rt, _runner = await _warm_app()
     rt.block_since -= 3000
     assert _apply_partition(app, "compute", rt, "other") is None
-    # a live block: no reap, and a fresh age — and a different block, so spend is asked again (hole 3, 2026-10-14)
-    assert rt.block_since is None and rt.reaped is None and rt.spend_confirmed is False and rt.switched
+    # a live block: no reap, and a fresh age — and a different block, so spend is asked again
+    assert rt.block_since is None and rt.reaped is None and rt.spend_confirmed is False and rt.switched_terms
 
 
 async def test_stop_after_a_reap_check_waits_for_the_pilot_that_check_may_have_requested(monkeypatch):
@@ -459,16 +459,21 @@ async def test_the_spend_clock_of_a_presumed_block_continues_when_it_answers(new
 
 
 @pytest.mark.parametrize("switch", ["partition", "account"])
-async def test_a_switch_forgets_the_presumed_block(switch):
-    # a different partition or account is a different block: it must not be dated or billed as the presumed one
+async def test_a_switch_never_dates_or_bills_a_block_as_the_presumed_one_of_other_terms(switch):
+    # a different partition or account is a different block: it must not be dated or billed as the presumed one, even
+    # when it reports the same job id (the presumed block is kept to its own terms, for a switch back to them)
     app, rt, _runner = await _warm_app(job="101")
     rt.warm_confirmed_at -= app.profile.max_idletime_s + 20
+    rt.block_since -= app.profile.max_idletime_s + 20                  # an old block: its age would show
     assert (await _run_shell(app, "true")).phase == "needs_confirmation"
-    assert rt.presumed_block_since is not None and rt.presumed_billed_until is not None
+    presumed_since, presumed_billed = rt.presumed_block_since, rt.presumed_billed_until
+    assert presumed_since is not None and presumed_billed is not None
     apply = _apply_partition if switch == "partition" else _apply_account
     assert apply(app, "compute", rt, "other") is None
-    assert (rt.presumed_block_since, rt.presumed_block_job, rt.presumed_block_until, rt.presumed_billed_until) == (
-        None, None, None, None)
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    now = time.monotonic()
+    assert res.status == "up" and rt.block_job == "101"
+    assert rt.block_since == pytest.approx(now, abs=5) and rt.warm_since == pytest.approx(now, abs=5)
 
 
 # -- a canary answered by a DIFFERENT scheduler job while the block was believed up ----------------------------------
@@ -1073,7 +1078,7 @@ async def test_on_a_facility_endpoint_a_block_replaced_after_a_transient_conflic
 
 @pytest.mark.parametrize("switch", ["partition", "account"])
 async def test_after_a_switch_the_first_block_to_answer_is_taken_not_compared(switch):
-    # a switch is a different block, confirmed with the switch itself (hole 3): no job to compare it against
+    # a switch is a different block, confirmed with the switch itself: no job to compare it against
     app, rt, runner = await _warm_app(job="112")
     runner._canary = _job("113")
     res = await _ensure_endpoint_up(app, **{switch: "other"}, confirm_spend=True)

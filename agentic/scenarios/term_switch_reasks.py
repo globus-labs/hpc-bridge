@@ -1,18 +1,20 @@
-"""A partition switch asks for spend again (hole 3, 2026-10-14) — on the FAKE cluster's facility MEP (`mep` profile).
+"""A partition switch asks for spend again — on the FAKE cluster's facility MEP (`mep` profile).
 
-The spend confirmation covers one block, and a different partition is a different block. Before the fix,
-`ensure_endpoint_up(partition='compute')` after a confirmed `debug` block, with no confirm_spend, started the `compute`
-block under the old confirmation. Now that call answers `needs_confirmation`, says the earlier confirmation covered the
-`debug` block only, and names that block in #178's words for a block a facility endpoint lets go of: scheduler job N
-was not cancelled (no cancel channel), `scancel N` ends it, stop_endpoint names it.
+The spend confirmation covers one block, and a different partition is a different block: after a confirmed `debug`
+block, `ensure_endpoint_up(partition='compute')` with no confirm_spend must not start the `compute` block under the old
+confirmation. It answers `needs_confirmation`, says the earlier confirmation covered the `debug` block only, and names
+that block in #178's words for a block a facility endpoint lets go of: scheduler job N was not cancelled (no cancel
+channel), `scancel N` ends it, stop_endpoint names it.
 
 The sequence (dictated, so the free CLI operators drive it too): attach, a confirmed `debug` block charged to `hpcb`,
 ONE run that prints `$SLURM_JOB_ID` and `$SLURM_JOB_PARTITION`, the switch WITHOUT a confirm (the point), the switch
 WITH one, the same run on the new block, one stop.
 
-Graded on what this PR delivers: the statuses and notices, and the partition the second block's own job reports. Not
-yet graded, for the spend-terms PR (B-lite) that adds them: the result's `block.queue` / `queue_source` fields, and
-`old_block_released` (the old block released on a switch — today nothing cancels it, and the notice says so).
+Graded on the statuses and notices, and the partition the second block's own job reports. Not graded: a `block.queue`
+/ `queue_source` result field and releasing the old block on a switch (`old_block_released`), which hpc-bridge neither
+reports nor does yet — today nothing cancels the old block, and the notice says so. The old block must still be up at
+the switch: if it idle-released first (the facility's 180 s), the answer re-asks for that reason instead, and the
+switch graders say "inconclusive".
 Autonomous, no hooks: claude and the free operators (codex / pi / hermes21). Fake cluster only. ~8 min.
 """
 import re
@@ -22,14 +24,14 @@ from invariants import Result, Trace, _confirms_spend, _shape, compute_ran
 from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 
 FACILITY_ID = "fake-mep-strict"
-NEEDS_COMPUTE_NODE = True
+NEEDS_COMPUTE_NODE = 2                 # the debug block bills on (idling out) while the compute block starts
 WARM_BLOCK_USER = MAPPED_USER
 SERIAL = True                          # one mapped identity — cells would share the user endpoint
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce", "partitions": ["debug", "compute"]}
 
 OLD, NEW = "debug", "compute"
-_LINE = re.compile(r"JOB=(\S+) PART=(\S+)")
+_LINE = re.compile(r"JOB=(\S+)\s+PART=(\S+)")
 
 PROMPT = (
     "Connect to the HPC facility with id `{facility}` (use `connect_facility(facility='{facility}')`; it is a "
@@ -41,8 +43,9 @@ PROMPT = (
     "minutes while the worker environment installs itself). Then run EXACTLY this as ONE `run_shell` on the compute "
     "shape:\n\n"
     "    echo JOB=$SLURM_JOB_ID PART=$SLURM_JOB_PARTITION; hostname\n\n"
-    f"2. I want partition `{NEW}` instead. FIRST call `ensure_endpoint_up(shape='compute', partition='{NEW}')` with NO "
-    f"confirm_spend, and tell me exactly what it says about spend and about the `{OLD}` block.\n\n"
+    f"2. Right after step 1 (the `{OLD}` block idles out about three minutes after its last command): I want partition "
+    f"`{NEW}` instead. FIRST call `ensure_endpoint_up(shape='compute', partition='{NEW}')` with NO confirm_spend, and "
+    f"tell me exactly what it says about spend and about the `{OLD}` block.\n\n"
     f"3. Then — you are authorised to confirm this new block on my behalf — call `ensure_endpoint_up(shape='compute', "
     f"partition='{NEW}', confirm_spend=True)`, poll until up, and run the same command once more.\n\n"
     "4. Call `stop_endpoint` ONCE (here it answers 'draining', which is final) and tell me what it says is still "
@@ -52,7 +55,7 @@ PROMPT = (
 USER_GOAL = ""
 PERSONA = None
 KIND = "regression"
-SUMMARY = ("hole 3: after a confirmed debug block, a switch to compute without confirm_spend answers "
+SUMMARY = ("after a confirmed debug block, a switch to compute without confirm_spend answers "
            "needs_confirmation and names the debug block it leaves; the confirmed switch then runs on compute")
 TAGS = ["mep", "spend", "gate", "switch", "fake", "free-operators", "spend-terms"]
 MAX_TURNS = 50
@@ -89,6 +92,17 @@ def _switch(t: Trace) -> tuple[int, dict] | None:
     return None
 
 
+_REAPED = ("idle-released", "reached its walltime")
+
+
+def _reaped_first(r: dict) -> bool:
+    """The answer re-asked because the old block was already gone (idle-released or past its walltime), not because of
+    the switch: the scenario's premise — a switch away from a block still up — did not happen."""
+    notice = str(r.get("notice") or "")
+    return (str(r.get("status")) == "needs_confirmation" and "different block" not in notice
+            and any(m in notice for m in _REAPED))
+
+
 def switch_reasked(t: Trace) -> Result:
     """The point: the unconfirmed switch answers `needs_confirmation`, saying the earlier confirmation covered the old
     block only — it does not start the new block under the old confirmation."""
@@ -99,6 +113,9 @@ def switch_reasked(t: Trace) -> Result:
         return Result("switch_reasked", False, f"no ensure_endpoint_up(partition={NEW!r}) without confirm_spend after "
                                                "the first block's run — the premise was not exercised")
     i, r = sw
+    if _reaped_first(r):
+        return Result("switch_reasked", False, f"inconclusive: the old block idle-released before the switch (call {i} "
+                      "re-asked for that reason), so the switch re-ask was not exercised")
     status, notice = str(r.get("status")), str(r.get("notice") or "")
     why = []
     if status != "needs_confirmation":
@@ -114,6 +131,8 @@ def switch_names_old_block(t: Trace) -> Result:
     old, sw = _old_run(t), _switch(t)
     if old is None or sw is None:
         return Result("switch_names_old_block", False, "no old block run, or no unconfirmed switch after it")
+    if _reaped_first(sw[1]):
+        return Result("switch_names_old_block", False, "inconclusive: the old block idle-released before the switch")
     job, notice = old[1], str(sw[1].get("notice") or "")
     why = []
     if f"scheduler job {job}, was not cancelled" not in notice:

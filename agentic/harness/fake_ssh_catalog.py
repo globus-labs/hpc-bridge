@@ -33,7 +33,7 @@ def entry_yaml(*, facility_id: str, endpoint_name: str, ssh_host: str, account_r
 - id: {facility_id}
   facility_key: fake
   facility: "hpc-bridge fake cluster"
-  description: "the fake site cluster over SSH, as a registry SSH entry (Expanse's shape): accounting enforced, an allocation account required (hpcb); no allocation listing"
+  description: "the fake site cluster over SSH, as a registry SSH entry (Expanse's shape): accounting enforced, an allocation account required; no allocation listing"
   display_name: "fake cluster (SSH, account required)"
   compute_mep_uuid: null
   ssh_host: {host}

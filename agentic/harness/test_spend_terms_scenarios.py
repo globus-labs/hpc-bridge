@@ -1,6 +1,6 @@
-"""Hermetic: the spend-gate-hole scenarios (term_switch_reasks, preset_account_scoped, ssh_account_floor) — their graders
-on synthetic traces (a run on the fix passes, a run on the unfixed plugin fails), their REQUIRES against the profile
-manifests, and the local catalog ssh_account_floor writes for its cell."""
+"""Hermetic: the spend-terms scenarios (term_switch_reasks, preset_account_scoped, ssh_account_floor) — their graders on
+synthetic traces (a run the plugin gets right passes, one an unfixed plugin would produce fails, a broken premise is
+labelled as one), their REQUIRES against the profile manifests, and the local catalog ssh_account_floor writes."""
 from __future__ import annotations
 
 import sys
@@ -43,6 +43,9 @@ _REASK = ("Confirm spend again with the user: the partition or account has chang
           "is a different block (the earlier confirmation covered only the one on partition 'debug', account 'hpcb'). "
           "That block, scheduler job 41, was not cancelled — no cancel channel on a facility endpoint: it bills until "
           "that facility's idle-release (`scancel 41` on that facility ends it); stop_endpoint names it. …")
+_REAPED = ("Confirm spend again with the user: the previous block has been idle-released, or is about to be (no task for "
+           "~200 s, past the 180 s idle window). The earlier confirmation covered that block only; a new block bills "
+           "again. That block, scheduler job 41, was not cancelled — … (`scancel 41` on that facility ends it) …")
 
 
 def _switch_trace(*, switch_status="needs_confirmation", notice=_REASK, ran_between=False, new_part="compute",
@@ -58,7 +61,7 @@ def _switch_trace(*, switch_status="needs_confirmation", notice=_REASK, ran_betw
     return Trace(calls, ["The switch asked for spend again; job 41 was not cancelled (`scancel 41`)."])
 
 
-def test_term_switch_reasks_passes_on_the_fix_and_fails_on_main():
+def test_term_switch_reasks_fails_on_the_unfixed_plugin():
     import term_switch_reasks as sc
     good = _switch_trace()
     for g in (sc.switch_reasked, sc.switch_names_old_block, sc.nothing_ran_before_the_confirm,
@@ -72,6 +75,20 @@ def test_term_switch_reasks_passes_on_the_fix_and_fails_on_main():
     assert not sc.switch_names_old_block(_switch_trace(notice="Confirm spend again … different block.")).ok
     assert not sc.ran_on_the_new_partition(_switch_trace(new_job="41")).ok
     assert not sc.ran_on_the_new_partition(_switch_trace(new_part="debug")).ok
+
+
+def test_term_switch_reasks_calls_a_block_gone_before_the_switch_inconclusive():
+    import term_switch_reasks as sc
+    late = _switch_trace(notice=_REAPED)
+    for g in (sc.switch_reasked, sc.switch_names_old_block):
+        r = g(late)
+        assert not r.ok and r.detail.startswith("inconclusive: the old block idle-released before the switch"), r
+
+
+def test_term_switch_reasks_reads_its_marker_line_however_spaced():
+    import term_switch_reasks as sc
+    t = Trace([_run("JOB=41    PART=debug\nc1\n")])
+    assert sc._runs(t) == [(0, "41", "debug")] and sc.NEEDS_COMPUTE_NODE == 2
 
 
 def test_term_switch_reasks_fails_when_its_premise_never_happened():
@@ -98,7 +115,7 @@ def _preset_trace(*, clause=_CLAUSE, bare_status="needs_account", bare_account=N
     return Trace(calls, [f"The block was charged to {printed}."])
 
 
-def test_preset_account_scoped_passes_on_the_fix_and_fails_on_main():
+def test_preset_account_scoped_fails_on_the_unfixed_plugin():
     import preset_account_scoped as sc
     good = _preset_trace()
     for g in (sc.preset_clause_shown, sc.floor_asked_without_the_preset, sc.preset_not_charged,
@@ -114,13 +131,29 @@ def test_preset_account_scoped_passes_on_the_fix_and_fails_on_main():
     assert not sc.preset_clause_shown(leaky).ok
 
 
+def test_preset_account_scoped_tells_the_agents_own_choice_from_a_leak():
+    # a CLI operator's agent can read EXTRA_ENV and pass the preset itself: reported apart, not the product's leak
+    import preset_account_scoped as sc
+    calls = [_connect(_CLAUSE),
+             _ensure("needs_account", "this facility requires an allocation account …", partition="compute",
+                     confirm_spend=True),
+             _ensure("up", partition="compute", account="hpcb-gpu", confirm_spend=True),
+             _run("JOB=7 ACCOUNT=hpcb-gpu\nc2\n"), _stop()]
+    t = Trace(calls, [])
+    assert sc.preset_not_charged(t).ok and "passed it itself at call 2" in sc.preset_not_charged(t).detail
+    assert not sc.agent_chose_the_preset(t).ok and "agent_chose_the_preset" not in sc.EXPECT_OK
+
+
 def test_preset_account_scoped_sets_the_preset_for_the_server_only_and_leaves_the_machine_unset():
     import preset_account_scoped as sc
     assert sc.EXTRA_ENV == {"HPC_BRIDGE_ACCOUNT": "hpcb-gpu"}
-    assert "hpcb-gpu" in sc.ADMIN_SETUP[0] and any("delete user" in c and "hpcb-gpu" in c for c in sc.ADMIN_CLEANUP)
+    (grant,) = sc.ADMIN_SETUP
+    assert grant.endswith(sc._HAS_GRANT) and "|| true" not in grant      # a grant that did not take fails the setup
+    assert any("delete user" in c and "hpcb-gpu" in c and "sleep" in c for c in sc.ADMIN_CLEANUP)   # retried
     world = {p["name"]: p for p in sc.POSTCHECKS}
     assert world["no_job_charged_to_the_preset"]["expect_absent"] == "hpcb-gpu"
     assert sc._START in sc.SETUP[0] and sc._START in world["no_job_charged_to_the_preset"]["cmd"]
+    assert "Submit" in world["no_job_charged_to_the_preset"]["cmd"]      # jobs submitted since the cell started
 
 
 # --- ssh_account_floor ----------------------------------------------------------------------------------------------
@@ -130,7 +163,7 @@ _FLOOR = ("this facility requires an allocation account for every block and none
           "shape='login') — …")
 
 
-def test_ssh_account_floor_passes_on_the_fix_and_fails_on_main():
+def test_ssh_account_floor_fails_on_the_unfixed_plugin():
     import ssh_account_floor as sc
     connect = _connect("login node is up; this facility has no allocation listing …")
     good = Trace([connect, _ensure("needs_account", _FLOOR, partition="compute", confirm_spend=True),
@@ -148,12 +181,25 @@ def test_ssh_account_floor_passes_on_the_fix_and_fails_on_main():
     assert not sc.ssh_floor_answered(Trace([connect, _stop("down")])).ok   # premise
 
 
+def test_ssh_account_floor_calls_a_details_connect_a_broken_premise():
+    # details= defines a bring-your-own facility in place of the entry: no curated account_required, so a start that
+    # goes through is not the product's failure
+    import ssh_account_floor as sc
+    byo = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "fake-ssh-site", "details": {"ssh_host": "login"}},
+                      {"phase": "needs_account", "notice": "login node is up …"})
+    t = Trace([byo, _ensure("up", "worker live", partition="compute", confirm_spend=True), _stop("down")])
+    for g in (sc.ssh_floor_answered, sc.no_start_without_an_account):
+        r = g(t)
+        assert not r.ok and r.detail.startswith("premise: agent bypassed the catalog entry (details="), r
+
+
 def test_ssh_account_floor_points_the_server_at_the_catalog_its_cell_writes():
     import ssh_account_floor as sc
     assert sc.EXTRA_ENV["HPC_BRIDGE_CATALOG_FILE"] == sc._CATALOG
     (cmd,) = sc.LOCAL_SETUP
     assert "agentic/harness/fake_ssh_catalog.py" in cmd and sc._CATALOG in cmd and f"--id {sc.FACILITY_ID}" in cmd
     assert sc.NEEDS_COMPUTE_NODE is False and sc.POSTCHECKS[0]["expect_absent"] == "parsl"
+    assert "Submit" in sc.POSTCHECKS[0]["cmd"]                            # jobs submitted since the cell started
 
 
 def test_the_written_catalog_is_an_account_required_ssh_entry_the_plugin_floors(tmp_path, monkeypatch):
@@ -172,7 +218,7 @@ def test_the_written_catalog_is_an_account_required_ssh_entry_the_plugin_floors(
     import asyncio
     entry = asyncio.run(BundledCatalog(str(out)).get("fake-ssh-site"))
     assert entry is not None and entry.compute_mep_uuid is None and entry.ssh_host == "login"
-    assert entry.account_required is True and entry.allocation is None
+    assert entry.account_required is True and entry.allocation is None and "hpcb" not in entry.description
     assert entry.compute.endpoint_name == "hpc-bridge-fake-run123"   # the harness tears it down by this name
     assert is_line(entry.compute.env_setup)                          # hpc-bridge's own line: built at the bootstrap
     monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "hpcbridge-test-00")
@@ -187,7 +233,7 @@ def test_the_written_catalog_is_an_account_required_ssh_entry_the_plugin_floors(
 @pytest.mark.parametrize(("name", "profile", "not_on"), [
     ("term_switch_reasks", "mep", ("site", "default")),
     ("preset_account_scoped", "mep", ("site", "default")),
-    ("ssh_account_floor", "site", ("default", "pbs")),
+    ("ssh_account_floor", "site", ("default", "pbs", "totp")),
 ])
 def test_each_runs_where_it_can_and_gates_only_checks_it_provides(name, profile, not_on):
     import importlib

@@ -274,7 +274,10 @@ no cluster block, so they are cheap enough to sweep across models. Graders for t
 
 Per-scenario knobs (module constants): `NO_GLOBUS_DB` and `GLOBUS_DB_SECRET` are read on the host by
 `harness/scenario_knobs.py` (run_smoke.sh decides what to mount); `EXTRA_ENV` (MCP-server-only env),
-`SEED_FACILITY_CACHE` and `SERIAL` are applied inside the container by run.py. The second identity: log
+`SEED_FACILITY_CACHE` and `SERIAL` are applied inside the container by run.py. `EXTRA_ENV` is the server's only for the
+Claude SDK and ACP operators: the CLI operators (codex, pi, hermes21) pass it through their own process environment
+(`harness/cli_runner.py`), where the agent's shell can read it — a grader must not take an agent's use of such a value
+for the product's. The second identity: log
 in once as an identity globus1 does not map (e.g. a personal Google identity) via
 `scripts/fresh_user_session.sh --reset` or `agentic/mep_no_account_check.py`, then point
 `HPCB_TEST_GLOBUS_DB_NOACCOUNT=<that dir>/storage.db` in `agentic/.env`.

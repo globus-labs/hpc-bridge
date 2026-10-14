@@ -239,10 +239,9 @@ agentic/fakecluster/bin/down.sh --wipe && agentic/fakecluster/bin/up.sh
 cells that belong to it (the map is in the script; a hermetic test keeps it honest), writing `agentic/runs/sweep-<stamp>.md`
 plus one log per profile. Baseline 2026-09-05: 31 cells over 9 profiles, all passing after one chaos-hook fix; the
 `hostile` profile (2 canary cells) and `spend_revoked` (on `default`) then joined — all three verified live — so the
-sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. Since 2026-10-13 it runs 42:
-`block_reaped_resume`, `long_output`, `no_facility_first`, `reap_replaced_block` and `esc_mid_call` on `default`,
-`hand_batch_job` on `site`, and `fake_mep_username_not_account` on `mep` joined, and `facility_cache` merged into
-`endpoint_reuse_chain`. That is the paid (Claude) wave; `HPCB_OPERATOR=codex|pi|hermes21` makes it the free wave, which
+sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. It now runs 49: the 48 cells of the
+script's map (22 on `default`, 10 on `site`, 6 on `mep`, the rest one or two per profile) plus the no-skill
+`spend_gate_enforced` run on `default`. That is the paid (Claude) wave; `HPCB_OPERATOR=codex|pi|hermes21` makes it the free wave, which
 leaves out the script's `paid_only()` (a persona, PHASES, a hook that needs the SDK interrupt). The scenarios
 it does NOT sweep are listed with their reasons in the script's `excluded()`, and the summary prints them. Its
 hermetic test fails on any scenario that can run here but is in neither list. ≈ 1 h end to end. The agent model is Opus (never Fable unless asked); `mep` needs

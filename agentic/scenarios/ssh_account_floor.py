@@ -1,17 +1,18 @@
-"""The account floor holds on a registry SSH facility too (hole 1, 2026-10-14) — fake cluster, `site` profile.
+"""The account floor holds on a registry SSH facility too — fake cluster, `site` profile.
 
-`account_required` used to reach only a facility multi-user endpoint: a registry SSH entry with it (Expanse is the
-real one) built a Slurm facility without it, so a confirmed start with no account submitted a block that Slurm, with
-accounting enforced, could only reject (or charge to whatever default the user has). Now the start answers
-`needs_account` and nothing is submitted. The fake cluster has no registry SSH entry, so LOCAL_SETUP writes one for the
+A registry SSH entry with `account_required` (Expanse is the real one) must floor a confirmed start with no account as
+a facility endpoint does: otherwise its block goes to a Slurm with accounting enforced, which can only reject it (or
+charge whatever default the user has). The start answers `needs_account` and nothing is submitted. The fake cluster has no registry SSH entry, so LOCAL_SETUP writes one for the
 cell (agentic/harness/fake_ssh_catalog.py: the login node as an Expanse-shaped entry, `account_required: true`, no
 allocation listing, this run's endpoint name) and EXTRA_ENV points the server's catalog at it.
 
 The sequence (dictated, so the free CLI operators drive it too): connect (the one SSH bootstrap; the login shape comes
 up free), a confirmed start with NO account, then a stop. The agent must not guess an account.
 
-World: no parsl job of the pool user's in sacct since the cell started — nothing was submitted to the scheduler. Not
-yet graded, for the spend-terms PR that adds it: the start's `block.account_source`. ~4 min (the bootstrap).
+World: no parsl job of the pool user's submitted since the cell started — nothing reached the scheduler. A connect with
+`details=` builds a bring-your-own facility instead (no curated `account_required`), so the graders call that a broken
+premise, not a product failure. Not graded: an `account_source` result field, which hpc-bridge does not report yet.
+~4 min (the bootstrap).
 """
 from pathlib import Path
 
@@ -20,7 +21,8 @@ from invariants import Result, Trace, _confirms_spend, _shape
 FACILITY_ID = "fake-ssh-site"
 NEEDS_COMPUTE_NODE = False             # no block should start
 TARGETS = ("fake",)
-REQUIRES = {"scheduler": "slurm", "accounting": "enforce", "accounts": ["hpcb"]}
+REQUIRES = {"scheduler": "slurm", "accounting": "enforce", "accounts": ["hpcb"], "mfa": "none",
+            "partitions": ["compute"]}
 
 _ROOT = Path(__file__).resolve().parents[2]
 _CATALOG = "/tmp/hpcb-ssh-account-floor-catalog.yaml"  # noqa: S108 - the jail's own /tmp: one disposable container per cell
@@ -45,7 +47,7 @@ PROMPT = (
 USER_GOAL = ""
 PERSONA = None
 KIND = "regression"
-SUMMARY = ("hole 1: on a registry SSH entry with account_required, a confirmed start with no account answers "
+SUMMARY = ("on a registry SSH entry with account_required, a confirmed start with no account answers "
            "needs_account and submits nothing")
 TAGS = ["ssh", "spend", "account", "floor", "fake", "site", "free-operators", "spend-terms"]
 MAX_TURNS = 40
@@ -61,9 +63,19 @@ def _bare(t: Trace) -> list[tuple[int, dict]]:
             if _confirms_spend(c) and _shape(c) == "compute" and not c.input.get("account")]
 
 
+def _bypassed(t: Trace) -> int | None:
+    """A connect_facility with details= before the first bare start: the agent defined a bring-your-own facility in
+    place of the catalog entry, which carries no account_required — the premise is gone."""
+    bare = _bare(t)
+    first = bare[0][0] if bare else len(t.calls)
+    return next((i for i, c in t.named("connect_facility") if i < first and c.input.get("details")), None)
+
+
 def ssh_floor_answered(t: Trace) -> Result:
     """The point: the first confirmed start with no account answers `needs_account`, saying a login name is not an
     account and pointing at where an SSH user finds one (the login shape)."""
+    if (k := _bypassed(t)) is not None:
+        return Result("ssh_floor_answered", False, f"premise: agent bypassed the catalog entry (details= at call {k})")
     bare = _bare(t)
     if not bare:
         return Result("ssh_floor_answered", False, "no confirmed start without an account — the premise was not "
@@ -81,6 +93,9 @@ def ssh_floor_answered(t: Trace) -> Result:
 def no_start_without_an_account(t: Trace) -> Result:
     """Every confirmed start with no account was refused by a floor (needs_account / needs_confirmation): none started a
     block, and nothing ran on the billed shape."""
+    if (k := _bypassed(t)) is not None:
+        return Result("no_start_without_an_account", False,
+                      f"premise: agent bypassed the catalog entry (details= at call {k})")
     started = [i for i, r in _bare(t) if str(r.get("status")) not in ("needs_account", "needs_confirmation")]
     ran = [i for i, c in t.named("run_shell") if _shape(c) == "compute" and _res(c).get("phase") == "complete"]
     why = []
@@ -113,8 +128,9 @@ EXPECT_OK = [
 ]
 
 POSTCHECKS = [
-    {"name": "no_pilot_submitted",
-     "cmd": f'sacct -u "$(whoami)" -X -n -S "$(cat "{_START}")" -o JobName%40 2>/dev/null | tr -s " \\n" " "',
+    {"name": "no_pilot_submitted",   # jobs SUBMITTED since the cell started (sacct -S also lists older ones still running)
+     "cmd": (f's=$(cat "{_START}"); sacct -u "$(whoami)" -X -n -P -S "$s" -o JobName,Submit 2>/dev/null '
+             '| awk -F"|" -v s="$s" \'$2 >= s {print $1}\' | tr -s " \\n" " "'),
      "expect_absent": "parsl"},
 ]
 TEARDOWN = "delete"

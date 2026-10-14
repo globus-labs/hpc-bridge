@@ -129,7 +129,7 @@ def test_a_long_allocation_on_a_facility_endpoint_names_the_silent_block_and_the
 
     late = _allocating_notice("gpuA40x4", 480, facility_mep=True)
     assert "RUNNING and billing" in late and "stop_endpoint" in late and "squeue" in late
-    assert "scheduler_options" in late  # the rejection case is still named
+    assert "missing resource request" in late  # the rejection case is still named
     stale = "STALE ENTRY: this facility's endpoint now runs v4.17.0"
     assert stale in _allocating_notice("gpuA40x4", 480, facility_mep=True, stale=stale)
     assert "RUNNING" not in _allocating_notice("gpuA40x4", 120, facility_mep=True)  # not before five minutes

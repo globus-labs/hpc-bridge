@@ -33,8 +33,8 @@ def scratch() -> str | None: return env("HPC_BRIDGE_SCRATCH")
 
 def names_machine(*names: str) -> bool:
     """Whether HPC_BRIDGE_MACHINE names the facility known by `names` (its catalog id and subject): the ONE facility
-    the env presets HPC_BRIDGE_ACCOUNT and HPC_BRIDGE_PARTITION apply to. Before, a connect to any facility charged the
-    preset account and took the preset partition (hole 2, 2026-10-14). Unset: no facility."""
+    the env presets HPC_BRIDGE_ACCOUNT and HPC_BRIDGE_PARTITION apply to (binding._names_machine adds an alias the
+    startup pin resolved). Unset: no facility."""
     m = machine()
     return m is not None and m in names
 

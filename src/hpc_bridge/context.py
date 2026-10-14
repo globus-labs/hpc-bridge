@@ -56,7 +56,8 @@ class ShapeRuntime:
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
     # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
     # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
-    # the block is reaped (idle-release, walltime, or found gone) so the NEXT block is asked for again (0.1.18).
+    # the block is reaped (idle-release, walltime, or found gone) or its partition or account is switched, so the NEXT
+    # block is asked for again.
     spend_confirmed: bool = False
     # When the current block was first confirmed warm (for its walltime), and why it is presumed or known gone.
     # `reap_told`: the agent has been handed that reason once — the call that detects a reap always answers
@@ -77,19 +78,27 @@ class ShapeRuntime:
     reap_told: bool = False
     reap_kicked: bool = False
     # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
-    # only, so the switch drops it and the next start asks again (warmth._repoint). `switched` is the reason the spend
-    # question gives — the old terms, and what became of their block; `switch_unseen`: that block was asked for but
-    # never seen up, so a stop must still look for its pilot (server._stop_endpoint's expect_block). A confirmation
-    # clears both.
-    switched: str | None = None
+    # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
+    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
+    # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
+    # (server._stop_endpoint's expect_block). A confirmation clears them.
+    switched_terms: tuple[str | None, str | None] | None = None
+    switch_left: LeftBlock | None = None
     switch_unseen: bool = False
+    # Bumped by a switch: a task handle records the epoch it was sent in, and its result is proof of life only for a
+    # block of that epoch — a task that finished on the old block, polled later, must not vouch for the new one
+    # (warmth._resolve_task). Its end is still the old block's last activity, which every stamp of the new block passes.
+    block_epoch: int = 0
     # An idle presumption can come while the block is still up (an endpoint on a slower scaling pass): that block's
     # age, job id, the latest it could have lived, and where the presumption stopped its spend clock — so the block
-    # that answers next is dated and billed right (warmth._provision).
+    # that answers next is dated and billed right (warmth._provision). A switch keeps the block it left here too, so a
+    # switch back to its terms that is answered by the same job keeps its age and bills the gap. `presumed_block_terms`:
+    # that block's (partition, account), so a facility stop never files it under other terms.
     presumed_block_since: float | None = None
     presumed_block_job: str | None = None
     presumed_block_until: float | None = None
     presumed_billed_until: float | None = None
+    presumed_block_terms: tuple[str | None, str | None] | None = None
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0
@@ -124,6 +133,7 @@ class TaskHandle:
     # unguarded. A result the guard refused is the replacement found (warmth._wrong_block_outcome), whenever it is
     # polled.
     guard: Guard | None = None
+    epoch: int = 0  # its runtime's block_epoch when it was sent: a switch since then means it ran on the old block
 
 
 @dataclass
@@ -225,9 +235,9 @@ class AppCtx:
     worker_user: str | None = None
     # The partition and account this session chose for the compute shape (ensure_endpoint_up partition= / account=,
     # warmth._repoint). A stop drops the compute shape whole; the next one starts with these (warmth._shape_runtime), so
-    # the choice persists for the session as the tool says, and the spend question after a stop names them. Forgotten
-    # with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus
-    # login keeps them, as it keeps a live shape's.
+    # the choice persists for the session as the tool says: the spend question after a stop names the partition, and
+    # its result carries both. Forgotten with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a
+    # teardown or a detach); a new Globus login keeps them, as it keeps a live shape's.
     compute_choice: dict[str, str] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

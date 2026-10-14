@@ -25,6 +25,21 @@ from .facility.local import LocalFacility
 from .models import FacilityDetails, validate_host
 from .state import FacilityStore
 
+# The facility_key of an entry built from a user's own details (`_entry_from_details`): a bring-your-own facility.
+SESSION_KEY = "session"
+# What HPC_BRIDGE_MACHINE resolved to at the startup pin (its value -> the entry's subject): the pin resolves aliases
+# too, and the presets must follow the machine it named, however it was named (`_names_machine`).
+_PINNED: dict[str, str] = {}
+
+
+def _names_machine(entry) -> bool:
+    """Whether HPC_BRIDGE_MACHINE names `entry` — by id or subject, or by the alias the startup pin resolved to it: the
+    one facility the env presets apply to."""
+    if config.names_machine(entry.id, entry.subject):
+        return True
+    machine = config.machine()
+    return machine is not None and _PINNED.get(machine) == entry.subject
+
 
 def _ssh_config_user(host: str) -> str:
     """The login name OpenSSH would use for `host`, honoring ~/.ssh/config — via a local, no-connect
@@ -86,15 +101,15 @@ def _unsupported_entry_reason(entry) -> str | None:
         return f"scheduler {entry.compute.scheduler!r} not supported yet (slurm/pbs only)"
     return None
 
-def _facility_from_entry(entry, *, account: str, pinned_host: str | None = None, startup_pin: bool = False) -> Facility:
+def _facility_from_entry(entry, *, account: str, pinned_host: str | None = None) -> Facility:
     """Build the facility for a catalog entry + per-user runtime values — shared by the startup
     path (make_facility) and the runtime path (connect_facility). `account` may be empty for the
     agentic flow; ensure_endpoint_up(account=…) overrides it per scheduler block.
 
-    HPC_BRIDGE_PARTITION is the default partition of ONE facility: the startup pin's (`startup_pin`, the machine
-    HPC_BRIDGE_MACHINE names by definition, however it was named), or on the agentic path the entry
-    HPC_BRIDGE_MACHINE names by id or subject (`config.names_machine`). Any other facility, a bring-your-own one
-    included, keeps its own default. (A facility MEP never took it: its defaults are the entry's.)
+    HPC_BRIDGE_PARTITION is the default partition of ONE facility: the one HPC_BRIDGE_MACHINE names (`_names_machine`:
+    the startup pin's, however it was named, or the same entry reached by connect_facility). Any other facility keeps
+    its own default, and so does a bring-your-own one, whose details= give the partition explicitly. A facility MEP
+    never takes it: its defaults are the entry's.
 
     A `compute_mep_uuid` entry builds a **MEPFacility** (zero SSH: no login name, no key, no host —
     the facility's identity mapping is the access) and MEP wins if an entry somehow carries both
@@ -115,7 +130,7 @@ def _facility_from_entry(entry, *, account: str, pinned_host: str | None = None,
     # Login name: optional env override, else read live from ~/.ssh/config (`ssh -G`) — never a
     # *required* boot-env var. The key is deferred to the config's IdentityFile in _slurm_facility.
     user = (config.ssh_user() or "") or _ssh_config_user(alias)
-    preset = startup_pin or config.names_machine(entry.id, entry.subject)
+    preset = _names_machine(entry) and entry.facility_key != SESSION_KEY
     profile = profile_from_catalog_entry(
         entry,
         user=user,
@@ -132,6 +147,7 @@ async def _catalog_facility(machine: str) -> Facility:
     entry = await make_catalog().get(machine)
     if entry is None:
         raise RuntimeError(f"HPC_BRIDGE_MACHINE={machine!r} not found in the catalog")
+    _PINNED[machine] = entry.subject  # an alias the pin resolved names this facility for the presets too
     reason = _unsupported_entry_reason(entry)
     if reason:
         raise RuntimeError(f"{machine}: {reason}")
@@ -155,7 +171,6 @@ async def _catalog_facility(machine: str) -> Facility:
         entry,
         account=_require_env("HPC_BRIDGE_ACCOUNT"),
         pinned_host=config.ssh_host(),
-        startup_pin=True,
     )
 
 def _default_local_facility(*, unbound: bool = False) -> LocalFacility:
@@ -284,7 +299,7 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
                or details.endpoint_name or _session_endpoint_name(details.ssh_host or facility))
     return CatalogEntry(
         id=facility,
-        facility_key="session",
+        facility_key=SESSION_KEY,
         facility=details.display_name or facility,
         description="session-local facility (user-supplied, not catalogued)",
         # The endpoint's UI title (manager config display_name) follows the same convention as its
@@ -293,9 +308,8 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
         transfer_endpoint_uuid=None,
         ssh_host=details.ssh_host,
         allocation=alloc,
-        # Nothing curated says whether this scheduler enforces accounting, so the account floor stays off (as it always
-        # was here): the user names an account when the facility needs one. The schema's default (True) is the
-        # registry's claim to make, not the session's.
+        # Nothing curated says whether this scheduler enforces accounting, so the account floor stays off: the user
+        # names an account when the facility needs one. The schema's default (True) is the registry's claim to make.
         account_required=False,
         compute=Compute(
             scheduler=details.scheduler,
