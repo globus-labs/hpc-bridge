@@ -1,0 +1,86 @@
+name: windows-probe
+# A diagnostic, not a gate. A Windows user saw "Failed to reconnect to plugin:hpc-bridge … CONNECTION_CLOSED".
+# Does hpc-bridge's MCP server run on Windows, and does the plugin's launcher (bin/run-with-uv, a /bin/sh script)
+# start it the way Claude Code does? Every check continues on failure so one run answers all of them; the job
+# summary lists the outcomes. Runs only on pushes to its own branch, or by hand.
+on:
+  push:
+    branches: [ci/windows-probe]
+  workflow_dispatch:
+
+jobs:
+  probe:
+    runs-on: windows-latest
+    timeout-minutes: 25
+    steps:
+      - uses: actions/checkout@v4
+      - uses: astral-sh/setup-uv@v6
+
+      - name: "1. The server starts and lists its tools (uv run, no launcher)"
+        id: server
+        continue-on-error: true
+        shell: pwsh
+        run: uv run --locked --extra integration python .github/windows-probe/mcp_probe.py uv run --locked --extra integration hpc-bridge
+
+      - name: "2. Windows executes the launcher when spawned directly, as a stdio client does"
+        id: spawn
+        continue-on-error: true
+        shell: pwsh
+        run: node .github/windows-probe/spawn_probe.js "$env:GITHUB_WORKSPACE/bin/run-with-uv" --version
+
+      - name: "3. The launcher finds uv when Git Bash runs it"
+        id: gitbash
+        continue-on-error: true
+        shell: bash
+        run: sh ./bin/run-with-uv --version
+
+      - name: "4. Install Claude Code"
+        id: cc_install
+        continue-on-error: true
+        shell: pwsh
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: "5. Claude Code health-checks the plugin's server: via the launcher, and via uv directly"
+        id: cc_list
+        continue-on-error: true
+        timeout-minutes: 8
+        shell: bash
+        env:
+          MCP_TIMEOUT: "180000"   # the first `uv run` may still be resolving; give it time
+        run: |
+          set -x
+          claude mcp add hpcb-launcher --scope user -e HPC_BRIDGE_OMIT_INSTRUCTIONS=1 -- "$GITHUB_WORKSPACE/bin/run-with-uv" run --locked --directory "$GITHUB_WORKSPACE" --extra integration hpc-bridge
+          claude mcp add hpcb-uv --scope user -e HPC_BRIDGE_OMIT_INSTRUCTIONS=1 -- uv run --locked --directory "$GITHUB_WORKSPACE" --extra integration hpc-bridge
+          cd "$RUNNER_TEMP"   # away from the repo's own .mcp.json
+          claude mcp list | tee "$RUNNER_TEMP/mcp-list.txt"
+          grep -E "hpcb-launcher" "$RUNNER_TEMP/mcp-list.txt" | grep -qi "connected" || { echo "::warning::hpcb-launcher did not connect"; exit 1; }
+
+      - name: "6. Claude Code loads the plugin itself (--plugin-dir) and health-checks it"
+        id: cc_plugin
+        continue-on-error: true
+        timeout-minutes: 8
+        shell: bash
+        env:
+          MCP_TIMEOUT: "180000"
+        run: |
+          set -x
+          cd "$RUNNER_TEMP"
+          claude --plugin-dir "$GITHUB_WORKSPACE" mcp list | tee "$RUNNER_TEMP/plugin-list.txt"
+          grep -i "endpoint" "$RUNNER_TEMP/plugin-list.txt" | grep -qi "connected"
+
+      - name: Summary
+        if: always()
+        shell: bash
+        run: |
+          {
+            echo "| check | outcome |"
+            echo "|---|---|"
+            echo "| 1. server starts and lists its tools (uv run) | ${{ steps.server.outcome }} |"
+            echo "| 2. Windows executes the launcher, spawned directly | ${{ steps.spawn.outcome }} |"
+            echo "| 3. launcher finds uv under Git Bash | ${{ steps.gitbash.outcome }} |"
+            echo "| 4. Claude Code installs | ${{ steps.cc_install.outcome }} |"
+            echo "| 5. Claude Code connects via the launcher | ${{ steps.cc_list.outcome }} |"
+            echo "| 6. Claude Code connects to the plugin (--plugin-dir) | ${{ steps.cc_plugin.outcome }} |"
+          } >> "$GITHUB_STEP_SUMMARY"
