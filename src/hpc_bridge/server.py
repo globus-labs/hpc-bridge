@@ -1265,13 +1265,15 @@ async def login_shell(command: str, ctx: Context) -> LoginShellResult:
 
 async def _ready_session(
     app: AppCtx, shape: str, session_id: str
-) -> tuple[GlobusRunner, Session, ShapeRuntime] | ShellOutcome:
+) -> tuple[GlobusRunner, Session, ShapeRuntime, session_shell.Guard | None] | ShellOutcome:
     """The shared preamble of run_shell and reset_session: reject an unsupported shape, validate the
     session id, provision + bind the runner atomically under app.lock, and refuse to dispatch when
     the block is cold, the spend is unconfirmed, or a live task owns the session. Returns the runner,
     session and shape state — with the dispatch counted in `rt.inflight` under the lock, which the caller
-    MUST undo when its sync-wait ends — or the outcome to hand back. With no facility bound it refuses first:
-    the implicit local default must never be provisioned in place of the facility the agent forgot to connect."""
+    MUST undo when its sync-wait ends — and the dispatch's wrong-block guard (the block job it must run in, read in
+    the same locked step, and a fresh nonce; None: unguarded), or the outcome to hand back. With no facility bound it
+    refuses first: the implicit local default must never be provisioned in place of the facility the agent forgot to
+    connect."""
     if _no_facility_bound(app):
         return _no_facility_outcome(app)
     if reject := _shape_reject(app, shape):
@@ -1279,6 +1281,7 @@ async def _ready_session(
     session = Session(session_id, app.scratch_root)  # validates session_id before provisioning
     busy = None
     busy_cancelled = False
+    guard: session_shell.Guard | None = None
     async with app.lock:  # provision + bind the runner atomically (no race with a concurrent stop)
         not_warm = await _ensure_warm_runner(app, shape)
         rt = _shape_runtime(app, shape)
@@ -1287,19 +1290,24 @@ async def _ready_session(
             busy = _busy_session(app, shape, session_id)
             if busy is None:
                 rt.inflight += 1  # the worker is about to be busy with this: a canary meanwhile is not a reap probe
+                # The confirmed block's job: the command runs only there. Within CANARY_TTL_S no check ran first, so
+                # this guard is what keeps it off a replacement the user never confirmed (session_shell).
+                guard = warmth._new_guard(rt)
             else:
                 busy_cancelled = app.tasks[busy].client_cancelled
+    # The spend floors report the session spend, as ensure_endpoint_up's do: a reap this call found has just banked the
+    # old block.
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
-        return _needs_confirmation_outcome(app, rt)
+        return _with_spend(app, _needs_confirmation_outcome(app, rt))
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
-        return _needs_account_outcome(app)
+        return _with_spend(app, _needs_account_outcome(app))
     if not_warm is not None:
         return _cold_outcome(not_warm, _shape_runtime(app, shape).last_canary)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
         return _busy_session_outcome(busy, shape, session_id, client_cancelled=busy_cancelled,
                                      internal=session_id == _INTERNAL_SESSION)
     assert runner is not None  # _ensure_warm_runner returns None only after binding the runner
-    return runner, session, rt
+    return runner, session, rt, guard
 
 
 async def _detect_submission(command: str, shape: str) -> Submission | None:
@@ -1316,6 +1324,7 @@ async def _detect_submission(command: str, shape: str) -> Submission | None:
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
     payload: Callable[[], str], *, agent_call: bool, reset: bool = False, submission: Submission | None = None,
+    guard: session_shell.Guard | None = None,
 ) -> ShellOutcome:
     """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
     lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
@@ -1336,6 +1345,11 @@ async def _dispatch_counted(
     nothing interleaves without one), and the cancellation propagates. An internal call (the scheduler ops, which run
     in their own login session, `_INTERNAL_SESSION`) that is cancelled is not tracked, as before. `reset`: the dispatch
     is a reset_session (its running notice says so).
+
+    `guard`: the wrong-block guard `payload` carries (session_shell: the block job and this dispatch's nonce). A result
+    the guard refused did NOT run: it becomes the reap of the confirmed block (warmth._wrong_block_outcome), here or —
+    through the handle, which records the guard — whenever a poll resolves it, a client-cancelled call's command
+    included.
 
     (A cancel BEFORE the submit — still in _ready_session — propagates from there with nothing counted or sent; the
     submit is synchronous, so once anything was sent the future is in hand.)"""
@@ -1366,7 +1380,7 @@ async def _dispatch_counted(
                     if not tracked():
                         return _released_under_outcome(app, None, runner.walltime)
                     task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, runtime=rt,
-                                             reset=reset, submission=sub)
+                                             reset=reset, submission=sub, guard=guard)
                     released = app.shapes.get(shape) is not rt
                     out = _with_submission_notice(
                         _running_outcome(app, task_id, runner.walltime, reset=reset,
@@ -1382,6 +1396,9 @@ async def _dispatch_counted(
         async with app.lock:
             rt.inflight -= 1
             counted = None
+            if guard is not None and (refused := warmth._guard_refusal(out, guard)) is not None:
+                # refused on a replacement block: nothing ran, so no submission and no proof of life — the reap
+                return warmth._wrong_block_outcome(app, shape, rt, guard, refused, reset=reset)
             out = _with_submission_notice(out, sub, shape)  # the command ran (or may have): its job is spend
             if app.shapes.get(shape) is not rt:  # released under the call: say so, and don't revive the shape
                 sent = fut is not None and not fut.cancelled()
@@ -1394,7 +1411,7 @@ async def _dispatch_counted(
             counted = None
             if agent_call and fut is not None and not fut.done() and tracked():  # still running and reachable
                 _register_task(app, shape, session_id, command, fut, runner.walltime, client_cancelled=True,
-                               runtime=rt, reset=reset, submission=sub)
+                               runtime=rt, reset=reset, submission=sub, guard=guard)
         raise
     finally:
         if counted is not None:  # an exception escaped before the count was handed back
@@ -1414,10 +1431,10 @@ async def _run_shell(
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
-    runner, session, rt = ready
+    runner, session, rt, guard = ready
     return await _dispatch_counted(app, rt, runner, shape, session_id, command,
-                                   lambda: session_shell.wrap(command, session), agent_call=agent_call,
-                                   submission=sub)
+                                   lambda: session_shell.wrap(command, session, guard=guard),
+                                   agent_call=agent_call, submission=sub, guard=guard)
 
 
 async def _reset_session(
@@ -1428,11 +1445,14 @@ async def _reset_session(
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
-    runner, session, rt = ready
+    runner, session, rt, guard = ready
     # A reset is a task like any other: queued behind work on the worker it can outlive the sync-wait (a poll handle)
-    # or be cancelled mid-wait (tracked) — untracked, it would keep the endpoint asking for a block after a stop.
+    # or be cancelled mid-wait (tracked) — untracked, it would keep the endpoint asking for a block after a stop. It is
+    # guarded like a command: on a replacement block it would be work there unasked, and a reset that "succeeded" there
+    # would refresh the trust window and hide the replacement from the next check.
     return await _dispatch_counted(app, rt, runner, shape, session_id, "reset_session",
-                                   lambda: session_shell.reset_command(session), agent_call=agent_call, reset=True)
+                                   lambda: session_shell.reset_command(session, guard=guard),
+                                   agent_call=agent_call, reset=True, guard=guard)
 
 
 async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutcome:
