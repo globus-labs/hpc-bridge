@@ -3,6 +3,40 @@
 All notable changes to hpc-bridge. The plugin version lives in `.claude-plugin/plugin.json` (Claude Code updates an
 installed plugin only when that version changes); git tags mark releases.
 
+## Unreleased
+
+### Fixed
+- **A command never runs on a block the user did not confirm.** This fixes 0.1.24's known issue. hpc-bridge checks
+  the block before a command only when its last answer is 45 s old, and every completed command counts as an answer.
+  So commands sent less than 45 s apart could run on a replacement block without a question for as long as they kept
+  coming. Seen on the fake cluster (2026-10-13): job 112 was cancelled and the next command, `sleep 75`, ran on job 113
+  unasked; a probe sent 20 commands 40 s apart over 13 minutes to a replaced block, and no check ran. Now each command
+  on a confirmed block carries that block's scheduler job, and the compute node refuses it on any other job before it
+  touches anything:
+  - the tool answers `needs_confirmation` and says the command did NOT run, which job was replaced by which, and that
+    the new block is already running and billing. Nothing runs on the new block until the user confirms;
+  - the session's working directory and environment are left exactly as they were, so the same session continues on
+    the new block after the user confirms;
+  - the old block is billed as for a replacement a check finds, and the new one from the user's confirmation;
+  - it works the same when the answer comes back later through `poll_task`, also for a call that was cancelled;
+  - `reset_session` is refused the same way;
+  - it applies to a billed block on Slurm or PBS, through SSH or a facility's endpoint, when the endpoint runs one
+    block. The free login shape is not affected;
+  - a refusal is recognised whatever else the compute node writes around it: a warning from its shell first (a locale
+    it lacks, say), or after it the warning a facility's endpoint without task sandboxing adds, a `set -x` trace or an
+    exit trap. A command's own output cannot pass for one: each command's refusal carries a code only that command
+    was sent with.
+- **`run_shell`'s spend question reports the session spend.** When `run_shell` or `reset_session` answers
+  `needs_confirmation` or `needs_account`, it now reports the session spend, as `ensure_endpoint_up` already did, so a
+  block that was just found gone shows in it at once.
+
+### Testing
+- `reap_replaced_block` now waits until the cancelled block has left the queue, then sends `echo JOB=$SLURM_JOB_ID`
+  inside the 45 s window. A new critical grader, `no_work_on_replacement`, checks that nothing ran on the new block
+  before the user confirmed it, whether the command was refused there or lost with the old block. A report-only row,
+  `replacement_found_by`, says which happened, so a sweep shows how often the refusal itself fired. The graders also
+  read results that arrive through `poll_task`.
+
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 
 ### Fixed

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import base64
 import re
+import secrets
 import shlex
 from dataclasses import dataclass
 
@@ -15,6 +16,86 @@ _VALID_SESSION_ID = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 # NB: HOSTNAME (scheduler/compute-node injected) is filtered, but NOT bare HOST — that's a
 # common user var (e.g. HOST=0.0.0.0 for a dev server) we must let the session persist.
 _VOLATILE_NAME_GLOBS = "SLURM*|HOSTNAME|PBS_*|PMI_*|OMPI_*|FLUX_*"
+
+# -- the wrong-block guard ---------------------------------------------------------------------------------------------
+# The scheduler job a worker runs in: Slurm's or PBS's job id, empty on a LocalProvider block. The canary reports this
+# SAME expression as HPCB_JOB (runner._CANARY_CMD), which is where a block's `block_job` comes from. NB a worker that a
+# PBS site starts on a SISTER node (mpiexec / pbsdsh) may not inherit PBS_JOBID: there the expression is empty and a
+# command runs unguarded, as on a block with no job — the canary, which can land on any worker, says the same.
+JOB_ID_EXPR = "${SLURM_JOB_ID:-${PBS_JOBID:-}}"
+# A command sent for one block must not run on another. The block the user confirmed spend for can be replaced
+# (released, cancelled, preempted) between two commands, and a command sent while its last proof of life is fresh
+# (CANARY_TTL_S) is not checked first, so it would run on the replacement unasked (live 2026-10-13: job 112 scancel'd,
+# `sleep 75` ran on job 113). So the wrapper refuses first: when the worker's job is set and is not the expected one, it
+# prints ONE line, `HPCB_WRONG_BLOCK <nonce> <job>`, to stderr and exits 86 — before the cd, the session state and the
+# command. POSIX sh, so it holds whatever the rest of the wrapper needs.
+#
+# Read back by the line carrying THIS dispatch's nonce, wherever it sits on stderr (`refusal`). Other lines come before
+# it — a shell's start-up (a setlocale warning, BASH_ENV, a conda libtinfo note) — and after it: the SDK's own sandbox
+# warning on an endpoint without task sandboxing (a facility's, NCSA Delta's) is flushed AFTER the child's output, and a
+# `set -x` (`+ exit 86`) or an EXIT trap prints after the marker too. A first-line rule lost the refusal to the first
+# kind, a last-line rule to the second. The nonce, not the position, is what output cannot forge: a command never saw
+# it (it would have to read its own wrapper, $BASH_EXECUTION_STRING, on purpose).
+WRONG_BLOCK_MARKER = "HPCB_WRONG_BLOCK"
+WRONG_BLOCK_EXIT = 86
+_GUARD_TEMPLATE = (
+    f"__hb_job={JOB_ID_EXPR}\n"
+    'if [ -n "$__hb_job" ] && [ "$__hb_job" != @@EXPECT@@ ]; then\n'
+    f"  printf '{WRONG_BLOCK_MARKER} @@NONCE@@ %s\\n' \"$__hb_job\" >&2; exit {WRONG_BLOCK_EXIT}\n"
+    "fi\n"
+)
+_NONCE = re.compile(r"[0-9a-f]{16,64}")
+# What a job id may hold before it is named in a notice: Slurm (`123`, `123_4`, `123+0`) and PBS (`123.server.domain`,
+# `123[4].server`) ids, starting with a digit as the canary's do, and bounded. Anything else is "a job hpc-bridge cannot
+# read", never echoed.
+_JOB_ID = re.compile(r"[0-9][A-Za-z0-9._+:\[\]-]{0,95}")
+
+
+@dataclass(frozen=True)
+class Guard:
+    """The wrong-block guard of ONE dispatch: the block job it must run in, and a fresh nonce only its refusal
+    carries. The server keeps it with the dispatch (and a poll handle, TaskHandle.guard) to read the result back."""
+
+    job: str
+    nonce: str
+
+    def __post_init__(self) -> None:
+        if not _NONCE.fullmatch(self.nonce):  # spliced into the guard's printf format: hex only
+            raise ValueError(f"invalid guard nonce {self.nonce!r}")
+
+    @classmethod
+    def new(cls, job: str) -> Guard:
+        return cls(job, secrets.token_hex(8))
+
+
+@dataclass(frozen=True)
+class Refusal:
+    """A guarded command the worker refused: it did NOT run. `job`: the job it reached, or None when that id is not one
+    hpc-bridge can read (then it is never put in a notice)."""
+
+    job: str | None
+
+
+def _guard(guard: Guard | None) -> str:
+    if guard is None:
+        return ""
+    return _GUARD_TEMPLATE.replace("@@EXPECT@@", shlex.quote(guard.job)).replace("@@NONCE@@", guard.nonce)
+
+
+def refusal(exit_code: int | None, stderr: str, guard: Guard) -> Refusal | None:
+    """The guard's refusal of this dispatch, or None when the command ran: exit 86, and a stderr line — any — that is
+    `HPCB_WRONG_BLOCK <this nonce> <job>`. A command that exits 86 by itself, or prints a marker without the nonce, is
+    an ordinary result."""
+    if exit_code != WRONG_BLOCK_EXIT:
+        return None
+    head = f"{WRONG_BLOCK_MARKER} {guard.nonce} "
+    line = next((ln.strip() for ln in stderr.splitlines() if ln.strip().startswith(head)), None)
+    if line is None:
+        return None
+    job = line[len(head):].strip()
+    if job == guard.job:  # the guard never refuses the job it expects
+        return None
+    return Refusal(job if _JOB_ID.fullmatch(job) else None)
 
 
 @dataclass(frozen=True)
@@ -99,8 +180,12 @@ exit $__hb_rc
 """
 
 
-def wrap(command: str, session: Session) -> str:
+def wrap(command: str, session: Session, *, guard: Guard | None = None) -> str:
     """Wrap a command so cwd and env persist across calls (invisible to the model).
+
+    ``guard``: the scheduler job the command must run in (the confirmed block's) and this dispatch's nonce. On any
+    other job the wrapper refuses before touching anything (the wrong-block guard above); with the job unset on the
+    worker (a LocalProvider block), or no guard, it runs as before.
 
     The command is base64-encoded and decoded+`eval`'d in the *current* shell, so
     arbitrary shell (brace groups, quotes, ``${VAR}``) cannot textually break out of
@@ -116,15 +201,16 @@ def wrap(command: str, session: Session) -> str:
     """
     sd = session.quoted_state_dir()
     b64 = shlex.quote(base64.b64encode(command.encode()).decode())
-    return (
+    return _guard(guard) + (
         _WRAP_TEMPLATE.replace("@@SD@@", sd)
         .replace("@@B64@@", b64)
         .replace("@@VOLATILE@@", _VOLATILE_NAME_GLOBS)
     )
 
 
-def reset_command(session: Session) -> str:
-    """A command that clears the session's persisted cwd/env (fresh slate)."""
+def reset_command(session: Session, *, guard: Guard | None = None) -> str:
+    """A command that clears the session's persisted cwd/env (fresh slate). ``guard``: as for `wrap` — a reset is
+    work on the block too, so on a replacement it is refused and the state left as it was."""
     sd = session.quoted_state_dir()
     # also sweep any .env.base.* snapshot a command leaked by exiting mid-wrapper
-    return f"rm -f {sd}/.cwd {sd}/.env {sd}/.env.base.*"
+    return _guard(guard) + f"rm -f {sd}/.cwd {sd}/.env {sd}/.env.base.*"

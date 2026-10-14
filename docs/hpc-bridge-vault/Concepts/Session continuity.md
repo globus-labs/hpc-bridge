@@ -5,17 +5,21 @@
 
 ## How
 
-`wrap()` ([[session_shell]], `session_shell.py:102`) rewrites a command so that, under `/bin/bash`:
+`wrap()` ([[session_shell]], `session_shell.py:183`) rewrites a command so that, under `/bin/bash`:
 
+0. on a confirmed billed block, **refuse on the wrong block first**: if the worker's scheduler job (`${SLURM_JOB_ID:-${PBS_JOBID:-}}`) is set and is not the block's, print `HPCB_WRONG_BLOCK <nonce> <job>` to stderr and exit 86. Nothing below runs and the session state is untouched ([[Cost control]]: the wrong-block guard);
 1. `cd` into the session's saved `.cwd` (or the session dir on first call);
 2. source the saved `.env`;
 3. run the user's command — **base64-carried and `eval`'d in the current shell**, so arbitrary shell (braces, quotes, `${VAR}`) can't textually break out of the wrapper;
 4. persist the new `cwd` and any env the command changed.
 
-`session_id` comes from an untrusted MCP parameter, so `Session` (`session_shell.py:21`) validates it against a strict allowlist (no `../`, no metacharacters). `reset_session` clears the state files.
+`session_id` comes from an untrusted MCP parameter, so `Session` (`session_shell.py:102`) validates it against a strict allowlist (no `../`, no metacharacters). `reset_session` clears the state files, behind the same guard.
+
+> [!note] The guard is the session's too
+> A refused command leaves the session exactly as it was, so after the user confirms the replacement block the same `session_id` picks up its saved `cwd` and env on the new block. The state lives on the shared filesystem, not on the block.
 
 > [!warning] Don't freeze scheduler runtime vars
-> The env diff drops volatile, scheduler-injected names (`SLURM*`, `HOSTNAME`, `PBS_*`, … — `_VOLATILE_NAME_GLOBS`, `session_shell.py:17`). Otherwise the first command's `$SLURM_JOB_ID` would be frozen into `.env` and replayed into a *later, different* allocation.
+> The env diff drops volatile, scheduler-injected names (`SLURM*`, `HOSTNAME`, `PBS_*`, … — `_VOLATILE_NAME_GLOBS`, `session_shell.py:18`). Otherwise the first command's `$SLURM_JOB_ID` would be frozen into `.env` and replayed into a *later, different* allocation.
 
 > [!warning] Record-safe env persistence
 > The env is diffed per-variable via base64 fingerprints and re-emitted with `printf %q`, so a multi-line value can't leave an orphan line that breaks the next `. .env` (which would silently drop the whole session env).

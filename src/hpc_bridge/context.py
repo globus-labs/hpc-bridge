@@ -22,6 +22,7 @@ from .login import LoginFlow
 from .models import FacilityDetails, Submission
 from .profile import Profile
 from .runner import CanaryResult, GlobusRunner
+from .session_shell import Guard
 from .shapes import SHAPES
 
 DEFAULT_SHAPE = "compute"
@@ -112,6 +113,10 @@ class TaskHandle:
     reset: bool = False  # a reset_session, not a command: its notices say so
     # The scheduler job the command submits by hand, if any — so the result poll_task hands back says so (2026-10-10).
     submission: Submission | None = None
+    # Its wrong-block guard (session_shell.Guard: the block job it must run in, and the dispatch's nonce); None: sent
+    # unguarded. A result the guard refused is the replacement found (warmth._wrong_block_outcome), whenever it is
+    # polled.
+    guard: Guard | None = None
 
 
 @dataclass

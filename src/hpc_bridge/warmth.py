@@ -16,11 +16,12 @@ re-exports every name for imports.
 """
 from __future__ import annotations
 
+import dataclasses
 import inspect
 import re
 import time
 
-from . import dispatch
+from . import dispatch, session_shell
 from .config import (
     CANARY_TTL_S,
     SYNC_WAIT_S,
@@ -42,8 +43,14 @@ from .context import (
 from .cost import _bank_warm_interval, _billable, _settle_billing, _total_session_spend, _with_spend
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .models import ShellOutcome, Submission
-from .notices import _no_account_failure, _submit_rejected, _transient_dispatch_failure, _with_submission_notice
-from .runner import GlobusRunner
+from .notices import (
+    _no_account_failure,
+    _spend_floor_guidance,
+    _submit_rejected,
+    _transient_dispatch_failure,
+    _with_submission_notice,
+)
+from .runner import CanaryResult, GlobusRunner
 from .shapes import SHAPES, shape_config
 
 
@@ -400,6 +407,76 @@ def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | N
     rt.spend_confirmed = False
     rt.reaped, rt.reap_told, rt.reap_kicked = why, False, kicked
 
+# -- the wrong-block guard (session_shell) -----------------------------------------------------------------------------
+# A check (the canary) runs only once the block's last proof of life is CANARY_TTL_S old, and every completed command
+# refreshes it, so commands sent less than that apart used to run on a replacement block unasked for as long as they
+# kept coming (live 2026-10-13: job 112 scancel'd, `sleep 75` ran on job 113; a probe sent 20 commands 40 s apart to a
+# replaced block over 13 minutes, and no check ever ran). Now each command on a confirmed block carries the block's job,
+# and the worker refuses it anywhere else.
+
+def _guard_job(rt: ShapeRuntime) -> str | None:
+    """The scheduler job a command sent now must run in, or None for no guard: only on a billed shape with one block at
+    most (a different job is then a replacement, not a sibling), spend confirmed for a block whose job is known."""
+    if _billable(rt) and _single_block(rt) and rt.spend_confirmed:
+        return rt.block_job
+    return None
+
+def _new_guard(rt: ShapeRuntime) -> session_shell.Guard | None:
+    """The guard for one dispatch (its job, and a fresh nonce), or None for no guard."""
+    job = _guard_job(rt)
+    return session_shell.Guard.new(job) if job is not None else None
+
+def _guard_refusal(out: ShellOutcome, guard: session_shell.Guard) -> session_shell.Refusal | None:
+    """The guard's refusal of the command it was sent with, or None when the command ran."""
+    if out.phase != "complete":
+        return None
+    return session_shell.refusal(out.exit_code, out.stderr_snippet, guard)
+
+def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, guard: session_shell.Guard,
+                         refused: session_shell.Refusal, *, reset: bool = False) -> ShellOutcome:
+    """A command the guard refused: it reached another scheduler job than the block it was sent for (`guard.job`), and
+    did NOT run. While that block is still the confirmed one, this is the reap `_confirm_worker` makes when a different
+    job answers a check, found by the command instead: kicked (the replacement is up and billing), the old block banked
+    to the latest it could have lived, spend asked again, the replacement not adopted until the user confirms it.
+    `runtime`: the shape runtime the command was sent on (None: the current one) — a released one is never marked."""
+    rt = app.shapes.get(shape)
+    what = "reset_session" if reset else "command"
+    old = guard.job
+    new = f"job {refused.job}" if refused.job is not None else "a job whose id hpc-bridge cannot read"
+    if rt is None or (runtime is not None and runtime is not rt):  # released under it: nothing here to mark or ask
+        return _with_spend(app, ShellOutcome(
+            phase="failed", block_state="cold", exit_code=None,
+            notice=(f"Your {what} did NOT run: it reached {new}, not the block it was sent to (job {old}), and that "
+                    "block was released meanwhile (a stop, teardown or re-connect). The next command starts on a new "
+                    "block, and a billed one asks for spend again.")))
+    if rt.spend_confirmed and rt.block_job == old and _single_block(rt):
+        _mark_reaped(app, rt, f"the previous block (job {old}) is gone — idle-released, cancelled, preempted or failed "
+                     f"— and a command sent for it reached a new block ({new}), started for work sent after the old "
+                     "block went; the command was refused there, so nothing has run on it; "
+                     f"{_kicked_release_note(app)}", _release_bound(app, shape, rt), kicked=True)
+        rt.reap_told = True  # this result tells it
+        rt.transient_conflicts = 0
+        # The last worker to answer is the replacement's. A confirm that skips its canary (a task of ours still holds
+        # the block) dates the block by the last answer's job (_provision): make that this job, not the old block's,
+        # or the next guard would expect the block that is gone.
+        prev = rt.last_canary if rt.last_canary is not None and rt.last_canary.ok else CanaryResult(ok=True)
+        rt.last_canary = dataclasses.replace(prev, worker_host=None, worker_job=refused.job,
+                                             answered_at=time.monotonic())
+    if not rt.spend_confirmed:  # this reap, or one a check or another command found first
+        return _with_spend(app, ShellOutcome(
+            phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
+            notice=(f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
+                    f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already "
+                    "running and billing the allocation. Confirm spend with the user before anything runs on it; "
+                    f"{_kicked_release_note(app)}. The earlier confirmation covered job {old} only. "
+                    + _spend_floor_guidance(app))))
+    # a late result: spend was confirmed again after this command was sent — for whichever block is up now
+    now_on = f" (now for job {rt.block_job})" if rt.block_job is not None else ""
+    return _with_spend(app, ShellOutcome(
+        phase="failed", block_state="warm" if rt.block_since is not None else "provisioning", exit_code=None,
+        notice=(f"Your {what} did NOT run: it reached {new}, not the block it was sent to (job {old}). Spend has been "
+                f"confirmed again since it was sent{now_on}: send it again if it is still wanted.")))
+
 def _check_reaped(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """Before anything voids the evidence (a provision, a partition or account switch): if the clock says the block
     the spend acknowledgement covered is gone, record the reap. Not under a no-account verdict: no block can be started
@@ -648,11 +725,12 @@ def _busy_session(app: AppCtx, shape: str, session_id: str) -> str | None:
 
 def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, ceiling_s: float, *,
                    client_cancelled: bool = False, runtime: ShapeRuntime | None = None, reset: bool = False,
-                   submission: Submission | None = None) -> str:
+                   submission: Submission | None = None, guard: session_shell.Guard | None = None) -> str:
     """Register a still-running task as a poll handle and return its id. Caller holds app.lock — or calls it in one
     synchronous step with no await around it (a cancelled call, which must not wait for the lock), which nothing can
     interleave with either. `runtime`: the shape runtime it was dispatched on (its result is noted there only while
-    that runtime is still the shape's — a released block's runtime is never rebuilt for it)."""
+    that runtime is still the shape's — a released block's runtime is never rebuilt for it). `guard`: its wrong-block
+    guard (the job and nonce), so a refusal found when it is polled is still the replacement found."""
     app.task_seq += 1
     task_id = f"{shape}-{app.task_seq}"
     handle = TaskHandle(
@@ -666,6 +744,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         runtime=runtime,
         reset=reset,
         submission=submission,
+        guard=guard,
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
@@ -702,6 +781,9 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         out = dispatch.failure_outcome(exc, "warm")
     else:
         out = dispatch.complete_outcome(res, "warm")
+    if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
+        # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
+        return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset)
     current = app.shapes.get(handle.shape)
     # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
     if current is not None and (handle.runtime is None or handle.runtime is current):

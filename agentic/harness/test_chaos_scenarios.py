@@ -206,6 +206,209 @@ def test_reap_replaced_block_is_free_fake_only_and_lengthens_the_check():
     assert sc._T0 in sc.SETUP[0] and sc._T0 in sc.POSTCHECKS[0]["cmd"]
 
 
+def _stamped(c, t_call=None, t_result=None):
+    c.t_call, c.t_result = t_call, t_result
+    return c
+
+
+def _guard_notice(old="101", new="202"):
+    """The guard's refusal as the product words it (warmth._wrong_block_outcome), not a copy that could drift."""
+    import types
+
+    from hpc_bridge.context import AppCtx, ShapeRuntime
+    from hpc_bridge.profile import Profile
+    from hpc_bridge.session_shell import Guard, Refusal
+    from hpc_bridge.warmth import _wrong_block_outcome
+
+    app = AppCtx(facility=types.SimpleNamespace(), profile=Profile())
+    rt = ShapeRuntime(user_endpoint_config={"compute": True}, spend_confirmed=True, block_job=old, block_since=0.0)
+    app.shapes["compute"] = rt
+    out = _wrong_block_outcome(app, "compute", rt, Guard.new(old), Refusal(new))
+    assert out.phase == "needs_confirmation"
+    return out.model_dump()
+
+
+_CHECK_NOTICE = {"phase": "needs_confirmation", "block_state": "provisioning", "notice": (
+    "Confirm spend again with the user: the previous block (job 101) is gone — idle-released, cancelled, preempted or "
+    "failed — and a check was answered by a new block (job 202), which is already running and billing.")}
+_LOST = {"phase": "failed", "notice": "TaskExecutionFailed: The remote task failed to execute (ManagerLost)"}
+
+
+def _wb_trace(*, probe_result=None, polls=(), gap=15.0, before=(), between=(), probe_cmd="echo JOB=$SLURM_JOB_ID",
+              early=(), seen=True, reask_after=None):
+    """marker run on job 101 (result at t=100) · [before…: compute work right after the marker run] · step 2's flag wait
+    (sees the flag when `seen`) · [between…] · the probe (sent `gap` s after the last proof) · [its polls…] ·
+    [reask_after: a later call the check refused] · [early…] · re-confirm · the marker read on job 202 · stop."""
+    import reap_replaced_block as sc
+    mark = _stamped(_compute("run_shell", {"phase": "complete", "stdout": f"{sc._MARK}\nJOB=101\nc1"},
+                             command=f"mkdir -p ~/hpcb_rr && cd ~/hpcb_rr && echo {sc._MARK} > marker && cat marker && "
+                                     "echo JOB=$SLURM_JOB_ID && hostname"), 90.0, 100.0)
+    wait = ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": sc._WAIT},
+                       {"phase": "complete", "stdout": f"{sc._SEEN}\n" if seen else ""})
+    probe = _stamped(_compute("run_shell", probe_result or _guard_notice(), command=probe_cmd),
+                     None if gap is None else 100.0 + gap, None if gap is None else 100.0 + gap + 20)
+    confirm = _compute("ensure_endpoint_up", {"status": "up"}, confirm_spend=True)
+    reread = _compute("run_shell", {"phase": "complete", "stdout": f"{sc._MARK}\nJOB=202\nc2"},
+                      command="cat marker && echo JOB=$SLURM_JOB_ID && hostname")
+    stop = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down"})
+    tail = [reask_after] if reask_after is not None else []
+    return Trace([mark, *before, wait, *between, probe, *polls, *tail, *early, confirm, reread, stop],
+                 ["The command did NOT run: job 101 was replaced by job 202. Confirmed; the marker read back on 202."])
+
+
+def test_the_guard_path_passes_and_is_reported_as_the_guard():
+    import reap_replaced_block as sc
+    t = _wb_trace()
+    for g in (sc.no_work_on_replacement, sc.replaced_block_named, sc.not_adopted_before_confirm,
+              sc.reconfirmed_then_ran, sc.jobs_relayed):
+        assert g(t).ok, g(t)
+    assert "nothing sent after the cancel landed (call 1)" in sc.no_work_on_replacement(t).detail
+    found = sc.replacement_found_by(t)
+    assert found.ok and found.detail.startswith("guard: call 2 was refused"), found
+
+
+def test_the_guard_path_through_a_poll_handle():
+    import reap_replaced_block as sc
+    running = {"phase": "running", "task_id": "compute-3", "block_state": "warm"}
+    polls = [_poll("running", task="compute-3"), ToolCall.of("mcp__endpoint__poll_task", {"task_id": "compute-3"},
+                                                             _guard_notice())]
+    t = _wb_trace(probe_result=running, polls=polls)
+    assert sc.replacement_found_by(t).detail.startswith("guard: call 2 was refused on the replacement (answered at call 4)")
+    assert sc.no_work_on_replacement(t).ok and sc.replaced_block_named(t).ok and sc.not_adopted_before_confirm(t).ok
+
+
+def test_the_lost_path_live_on_pi_and_codex_passes_and_is_reported_as_lost():
+    # 2026-10-13 (fake/mep): mkdir and a pause still finished on the old block after the scancel; the probe went to the
+    # dying worker and was lost with it; the next call's check found the replacement. The product was right.
+    import reap_replaced_block as sc
+    old_work = [_compute("run_shell", {"phase": "complete"}, command="mkdir -p x"),
+                _compute("run_shell", {"phase": "complete"}, command="sleep 10")]
+    reask = _compute("run_shell", _CHECK_NOTICE, command="echo JOB=$SLURM_JOB_ID")
+    t = _wb_trace(probe_result=_LOST, before=old_work, reask_after=reask)
+    r = sc.no_work_on_replacement(t)
+    assert r.ok, r                                     # the silent completions were sent before the cancel landed
+    found = sc.replacement_found_by(t)
+    assert found.ok and found.detail.startswith("lost: call 4") and "ManagerLost" in found.detail
+    assert sc.replaced_block_named(t).ok and sc.not_adopted_before_confirm(t).ok
+
+
+def test_the_check_paths_are_reported_and_never_gate():
+    import reap_replaced_block as sc
+    past = sc.replacement_found_by(_wb_trace(probe_result=_CHECK_NOTICE, gap=60.0))
+    assert past.ok and past.detail.startswith("check: call 2 went out 60 s after the last proof of life")
+    inside = sc.replacement_found_by(_wb_trace(probe_result=_CHECK_NOTICE, gap=20.0))
+    assert not inside.ok and inside.detail.startswith("check inside the window")
+    unstamped = sc.replacement_found_by(_wb_trace(probe_result=_CHECK_NOTICE, gap=None))
+    assert not unstamped.ok and unstamped.detail.startswith("inconclusive")    # not a pass
+    status = sc.replacement_found_by(_wb_trace(between=[_compute("ensure_endpoint_up", _CHECK_NOTICE)]))
+    assert status.ok and status.detail.startswith("check: a status call came first")
+    # the gap counts from the block's LAST proof of life, not the marker run: later compute work refreshed it
+    later = _stamped(_compute("run_shell", {"phase": "complete"}, command="true"), 140.0, 150.0)
+    t = _wb_trace(probe_result=_CHECK_NOTICE, gap=60.0, before=[later])
+    assert t.calls[t.calls.index(later)].t_result == 150.0
+    assert sc.replacement_found_by(t).detail.startswith("check inside the window: call 3 went out 10 s")
+    for r in (past, inside, unstamped, status):
+        assert r.name == "replacement_found_by" and r.name not in sc.EXPECT_OK
+
+
+def test_no_work_on_replacement_fails_whatever_ran_on_it():
+    import reap_replaced_block as sc
+    # the live gap: a silent command sent after the cancel landed completed — on the replacement
+    silent = sc.no_work_on_replacement(_wb_trace(probe_result={"phase": "complete"}, probe_cmd="sleep 75"))
+    assert not silent.ok and "sent after the cancel had landed (call 1)" in silent.detail and "[2]" in silent.detail
+    # one that printed the new job — even through poll_task, even before the flag was seen
+    leak = ToolCall.of("mcp__endpoint__poll_task", {"task_id": "compute-9"}, {"phase": "complete", "stdout": "JOB=202"})
+    r = sc.no_work_on_replacement(_wb_trace(early=[leak]))
+    assert not r.ok and "work ran on another job than 101" in r.detail
+    assert not sc.not_adopted_before_confirm(_wb_trace(early=[leak])).ok       # poll_task results count there too
+    # a poll_task result counts from when its run_shell was SENT
+    sent = _compute("run_shell", {"phase": "running", "task_id": "compute-7"}, command="sleep 30")
+    done = ToolCall.of("mcp__endpoint__poll_task", {"task_id": "compute-7"}, {"phase": "complete", "stdout": ""})
+    r = sc.no_work_on_replacement(_wb_trace(between=[sent, done]))
+    assert not r.ok and "[3]" in r.detail
+    r = sc.no_work_on_replacement(_wb_trace(before=[sent], between=[done]))   # sent before the landing: the old block
+    assert r.ok, r
+
+
+def test_without_the_flag_silent_work_is_inconclusive():
+    import reap_replaced_block as sc
+    quiet = _compute("run_shell", {"phase": "complete"}, command="sleep 10")
+    r = sc.no_work_on_replacement(_wb_trace(seen=False, before=[quiet]))
+    assert not r.ok and r.detail.startswith("inconclusive: the cancel's landing was never seen")
+    r = sc.no_work_on_replacement(_wb_trace(seen=False))
+    assert r.ok and "the cancel's landing was not seen" in r.detail
+
+
+def _run_hook(tmp_path, *, queue, on_cancel):
+    """Run the cancel hook against stub squeue/scancel/sleep: `queue` the user's job ids, `on_cancel` the queue after
+    scancel (a replacement may appear in it). Returns (rc, output, whether the flag was touched)."""
+    import os
+    import stat
+
+    import reap_replaced_block as sc
+    (hook,) = sc.MIDRUN_HOOKS
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(parents=True)
+    state = tmp_path / "queue"
+    state.write_text("".join(f"{j}\n" for j in queue))
+    after = tmp_path / "after"
+    after.write_text("".join(f"{j}\n" for j in on_cancel))
+    stubs = {"squeue": f'cat "{state}"', "scancel": f'cp "{after}" "{state}"', "sleep": "true", "whoami": "echo pool"}
+    for name, body in stubs.items():
+        (bin_ / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_ / name).chmod((bin_ / name).stat().st_mode | stat.S_IEXEC)
+    env = {"PATH": f"{bin_}:{os.environ['PATH']}", "HOME": str(tmp_path)}
+    r = subprocess.run(["bash", "-c", hook["cmd"]], capture_output=True, text=True, env=env, timeout=60)
+    return r.returncode, r.stdout + r.stderr, (tmp_path / ".hpcb-rr-cancelled").exists()
+
+
+def test_the_hook_flags_only_once_the_cancelled_jobs_left_the_queue(tmp_path):
+    rc, out, flagged = _run_hook(tmp_path / "a", queue=["101"], on_cancel=[])
+    assert rc == 0 and flagged and "cancelled 101; left the queue" in out
+    # a replacement queued meanwhile neither holds the wait nor counts as the cancelled job
+    rc, out, flagged = _run_hook(tmp_path / "b", queue=["101"], on_cancel=["202"])
+    assert rc == 0 and flagged
+    # the cancelled job is still queued after the wait: the hook fails and touches no flag
+    rc, out, flagged = _run_hook(tmp_path / "c", queue=["101"], on_cancel=["101", "202"])
+    assert rc == 1 and not flagged and "101 still queued after 60 s" in out
+    # 1010 is not 101: the ids are matched whole
+    rc, out, flagged = _run_hook(tmp_path / "e", queue=["101"], on_cancel=["1010"])
+    assert rc == 0 and flagged
+    # nothing to cancel: the reap was never injected
+    rc, out, flagged = _run_hook(tmp_path / "d", queue=[], on_cancel=[])
+    assert rc == 1 and not flagged and "nothing to cancel" in out
+
+
+def test_an_early_confirm_on_the_old_block_does_not_close_the_window():
+    # delta review: a confirm on block 101 before the cancel landed (the prompt allows one) closed the window early, so
+    # a silent command on the replacement went unseen by every critical grader
+    import reap_replaced_block as sc
+    early_confirm = _compute("ensure_endpoint_up", {"status": "up"}, confirm_spend=True)
+    reask = _compute("run_shell", _CHECK_NOTICE, command="echo JOB=$SLURM_JOB_ID")
+    t = _wb_trace(probe_result={"phase": "complete"}, probe_cmd="sleep 75", before=[early_confirm], reask_after=reask)
+    r = sc.no_work_on_replacement(t)
+    assert not r.ok and "sent after the cancel had landed (call 2)" in r.detail and "[3]" in r.detail
+    # and the honest run with an early confirm still passes
+    assert sc.no_work_on_replacement(_wb_trace(before=[early_confirm])).ok
+
+
+def test_reap_replaced_block_waits_for_the_hooks_flag():
+    import reap_replaced_block as sc
+
+    from hpc_bridge.config import CANARY_TTL_S
+    assert sc._TTL_S == CANARY_TTL_S
+    (hook,) = sc.MIDRUN_HOOKS
+    assert f"touch {sc._FLAG}" in hook["cmd"] and hook["cmd"].index("scancel") < hook["cmd"].index("touch")
+    assert sc._WAIT in sc.PROMPT and sc._FLAG in sc._WAIT and "seq 1 90" in sc._WAIT and "sleep 10" not in sc.PROMPT
+    assert sc._FLAG in sc.SETUP[0] and sc._FLAG in sc.CLEANUP[0]
+    assert sc._PROBE in sc.PROMPT and "no other call in between" in sc.PROMPT and "poll_task" in sc.PROMPT
+    assert "no_work_on_replacement" in sc.EXPECT_OK and "replacement_found_by" not in sc.EXPECT_OK
+    assert {sc.no_work_on_replacement, sc.replacement_found_by} <= set(sc.EXTRA_INVARIANTS)
+    out = subprocess.run(["sh", "-c", sc._WAIT.replace(sc._FLAG, "/nonexistent-hpcb-flag").replace("90", "1")],
+                         capture_output=True, text=True, timeout=30)
+    assert out.returncode != 0 and sc._SEEN not in out.stdout              # bounded, and silent without the flag
+
+
 # ---- esc_mid_call (#175: Esc in the middle of a call) ------------------------------------------------------------------
 
 def _esc_trace(*, result=None, after=None, texts=("The command kept running on the node and finished.",), before=()):

@@ -4,6 +4,8 @@ import asyncio
 import time
 from dataclasses import dataclass
 
+from .session_shell import JOB_ID_EXPR
+
 
 @dataclass(frozen=True)
 class CanaryResult:
@@ -49,8 +51,10 @@ _CANARY_CMD = (
     "2>/dev/null || true; "
     # The scheduler job the worker runs in (Slurm's or PBS's job id; empty on a LocalProvider block): which BLOCK
     # answered. After an idle presumption, the block that answers next is dated by it: the old block keeps its age, a
-    # new one starts its own (warmth._provision). ShellFunction runs this through str.format, then /bin/bash.
-    f'echo "{_CANARY_JOB} ${{SLURM_JOB_ID:-${{PBS_JOBID:-}}}}"'
+    # new one starts its own (warmth._provision). The wrong-block guard compares the SAME expression with the confirmed
+    # block's job before every command it wraps (session_shell). ShellFunction runs this through str.format, then
+    # /bin/bash.
+    f'echo "{_CANARY_JOB} {JOB_ID_EXPR}"'
 )
 
 
