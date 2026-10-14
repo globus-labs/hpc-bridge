@@ -132,7 +132,10 @@ cluster's `login` alias round-robins login01/login02 over Docker DNS. A stop tha
 the NFS-shared `daemon.pid` there, and the manager kept running. `delete` then waited at an authorization-code prompt
 (no token store) until it was Aborted, and with all output sent to /dev/null the teardown still said "ok". The product
 is not affected: it pins its stop to the node it recorded. The record itself is deregistered from the jail, by uuid,
-in the project's own environment (`uv run … python`), because the harness' interpreter has no Globus Compute SDK.
+in the project's own environment (`uv run … python`), because the harness' interpreter has no Globus Compute SDK —
+and only a record the service names for THIS run's endpoint and that is not multi-user (`cluster_ops.delete_records`).
+A facility endpoint the run attached to is left alone: deleting its record shut the fake cluster's multi-user
+endpoint (and munged) down on 2026-10-13, and on globus1 it would be the lab's production endpoint.
 Before any teardown the harness stops the operator's whole process tree and waits for it: the agent CLI or ACP agent
 and the hpc-bridge MCP server under it (run.py is their subreaper, so orphans count; `harness/proctree.py`). The CLI
 operators' turns also run in their own process group, killed on cancellation. Why: an interrupted Pi cell's operator

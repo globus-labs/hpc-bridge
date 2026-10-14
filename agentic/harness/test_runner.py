@@ -342,15 +342,19 @@ def test_teardown_deregisters_the_runs_records_by_uuid_best_effort():
         def __init__(self):
             self.deleted = []
 
-        def delete_endpoint(self, eid):
+        def get_endpoint_metadata(self, eid):
             if eid == "gone":
                 raise RuntimeError("404 Not Found")
+            return {"name": "hpc-bridge-fake-1", "multi_user": False}
+
+        def delete_endpoint(self, eid):
             if eid == "boom":
                 raise ConnectionError("service down")
             self.deleted.append(eid)
 
     c = _Client()
-    out = harness_run._deregister_endpoints(["abcdefgh-1", "gone", "boom"], client_factory=lambda: c)
+    out = harness_run._deregister_endpoints(["abcdefgh-1", "gone", "boom"], client_factory=lambda: c,
+                                            name="hpc-bridge-fake-1")
     assert c.deleted == ["abcdefgh-1"]
     assert "abcdefgh deleted" in out and "gone already gone" in out and "boom NOT deleted (ConnectionError)" in out
     assert harness_run._deregister_endpoints([], client_factory=lambda: c) == "no uuid known — nothing to deregister"
@@ -484,7 +488,7 @@ def test_a_leaked_manager_after_teardown_fails_a_delete_cell_end_to_end(runner, 
     monkeypatch.setattr(run_mod, "run_scenario", fake_run_scenario)
     monkeypatch.setattr(run_mod, "_ssh_run", fake_ssh)
     monkeypatch.setattr(run_mod, "_teardown", lambda scen, res=None: (teardowns.append(1), ("", None))[1])
-    monkeypatch.setattr(run_mod, "_deregister_endpoints", lambda eids, client_factory=None: "none")
+    monkeypatch.setattr(run_mod, "_deregister_endpoints", lambda eids, client_factory=None, **kw: "none")
     monkeypatch.setattr(run_mod, "write_run_record", lambda runs_dir, **kw: recorded.update(kw))
     rc = asyncio.run(run_mod._run("scen_leak", "m", None, None, False))
     assert rc == 1 and recorded["result"] == "FAILED" and teardowns == [1]
@@ -742,8 +746,11 @@ def test_deregister_runs_in_the_projects_environment_when_the_harness_python_lac
     monkeypatch.setitem(sys.modules, "globus_compute_sdk", None)   # the harness interpreter: import fails
     (tmp_path / "globus_compute_sdk.py").write_text(
         "class Client:\n"
+        "    def get_endpoint_metadata(self, eid):\n"
+        "        if eid.startswith('gone'):\n            raise RuntimeError('404 Not Found')\n"
+        "        return {'name': 'hpc-bridge-fake-1', 'multi_user': False}\n"
         "    def delete_endpoint(self, eid):\n"
-        "        if eid.startswith('gone'):\n            raise RuntimeError('404 Not Found')\n")
+        "        pass\n")
     seen = []
 
     def project_env(argv):   # stands in for `uv run --directory <repo> --extra integration python -c …`
@@ -752,7 +759,7 @@ def test_deregister_runs_in_the_projects_environment_when_the_harness_python_lac
         return subprocess.run([sys.executable, "-c", argv[k + 1], *argv[k + 2:]], capture_output=True, text=True,
                               timeout=60, env={**__import__("os").environ, "PYTHONPATH": str(tmp_path)})
 
-    out = run_mod._deregister_endpoints([_EID, "gone0000-x"], runner=project_env)
+    out = run_mod._deregister_endpoints([_EID, "gone0000-x"], runner=project_env, name="hpc-bridge-fake-1")
     assert out == "abcd1234 deleted; gone0000 already gone", out
     assert seen[0][:9] == ["uv", "run", "--frozen", "--offline", "--directory", str(run_mod.REPO_ROOT), "--extra",
                            "integration", "python"]   # never re-resolve or download inside the jail
@@ -866,3 +873,68 @@ def test_the_exit_path_stops_a_still_running_operator_before_the_teardown(runner
                 except ProcessLookupError:
                     pass
         sys.modules.pop("scen_exit", None)
+
+
+def test_a_facility_endpoint_the_run_attached_to_is_never_deregistered():
+    # 2026-10-13: a fake_mep cell's tool results carried the facility endpoint's uuid; the teardown deleted that record
+    # and the fake cluster's multi-user endpoint shut down (munged with it). On globus1 it would have been the lab's
+    # production endpoint. Only a record named for THIS run, and not multi-user, may be deleted.
+    from cluster_ops import delete_records
+
+    class _Client:
+        def __init__(self):
+            self.deleted = []
+            self.records = {
+                "own00000-1": {"name": "hpc-bridge-fake-1", "multi_user": False},
+                "mep00000-1": {"name": "hpcb-mep-open", "multi_user": True},
+                "other000-1": {"name": "hpc-bridge-fake-2", "multi_user": False},   # another run's
+                "sneaky00-1": {"name": "hpc-bridge-fake-1", "multi_user": True},    # our name, but multi-user
+            }
+
+        def get_endpoint_metadata(self, eid):
+            return self.records[eid]
+
+        def delete_endpoint(self, eid):
+            self.deleted.append(eid)
+
+    c = _Client()
+    out = delete_records(c, ["own00000-1", "mep00000-1", "other000-1", "sneaky00-1"], "hpc-bridge-fake-1")
+    assert c.deleted == ["own00000-1"]
+    assert out == ["own00000 deleted",
+                   "mep00000 NOT deleted (not this run's endpoint: a multi-user endpoint 'hpcb-mep-open')",
+                   "other000 NOT deleted (not this run's endpoint: 'hpc-bridge-fake-2')",
+                   "sneaky00 NOT deleted (not this run's endpoint: a multi-user endpoint 'hpc-bridge-fake-1')"]
+    c2 = _Client()
+    assert delete_records(c2, ["own00000-1"], "") == ["own00000 NOT deleted (not this run's endpoint: 'hpc-bridge-fake-1')"]
+    assert c2.deleted == []   # no name: nothing is deleted
+
+
+def test_a_record_that_cannot_be_read_is_not_deleted():
+    from cluster_ops import delete_records
+
+    class _Client:
+        def __init__(self):
+            self.deleted = []
+
+        def get_endpoint_metadata(self, eid):
+            raise ConnectionError("service down")
+
+        def delete_endpoint(self, eid):
+            self.deleted.append(eid)
+
+    c = _Client()
+    assert delete_records(c, ["own00000-1"], "hpc-bridge-fake-1") == [
+        "own00000 NOT deleted (its record could not be read: ConnectionError)"]
+    assert c.deleted == []
+
+
+def test_the_verdict_does_not_count_a_facility_endpoint_left_alone():
+    import run as run_mod
+
+    v = run_mod._registration_verdict(
+        None, ["own00000-1", "mep00000-1"],
+        "own00000 deleted; mep00000 NOT deleted (not this run's endpoint: a multi-user endpoint 'hpcb-mep-open')")
+    assert v.startswith("REMOVED by the service, from the jail (own00000 deleted)") and "left alone: mep00000" in v
+    only_mep = run_mod._registration_verdict(
+        None, ["mep00000-1"], "mep00000 NOT deleted (not this run's endpoint: a multi-user endpoint 'hpcb-mep-open')")
+    assert only_mep.startswith("none known") and "left alone" in only_mep
