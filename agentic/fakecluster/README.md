@@ -159,8 +159,8 @@ node count (2 — `saturation` sizes its sleepers from it). Scenario prompts nam
 python3 agentic/run_suite.py --target fake --scenarios happy_path,endpoint_reuse --concurrency 3
 #   ^ runs bin/up.sh first (build if needed, wait until schedulable + sshd); --reset-cluster wipes it first;
 #     --no-cluster-up skips that. The node gate probes `sinfo` through the published sshd as a pool user.
-python3 agentic/run_suite.py --target fake --profile site --reset-cluster --scenarios rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died
-python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account
+python3 agentic/run_suite.py --target fake --profile site --reset-cluster --scenarios rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,ssh_account_floor
+python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,term_switch_reasks,preset_account_scoped
 #   ^ the facility-MEP path against the fake managers (a local catalog names their UUIDs — see below); the stop names
 #     the block it cannot cancel (#178)
 python3 agentic/run_suite.py --target fake --profile totp --reset-cluster --scenarios otp_preauth

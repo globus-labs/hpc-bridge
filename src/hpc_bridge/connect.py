@@ -33,6 +33,7 @@ from .notices import (
     _needs_login_result,
     _needs_preauth_result,
     _scheduler_cmds,
+    _unapplied_presets_note,
 )
 from .scheduler_ops import LoginRunner
 from .warmth import _drop_all_shapes
@@ -238,9 +239,13 @@ async def _connect_facility(
         )
     if reason:
         return ConnectFacilityResult(phase="unsupported", facility=facility, notice=reason)
+    # HPC_BRIDGE_ACCOUNT is the account of the facility HPC_BRIDGE_MACHINE names, never of another one (hole 2): a
+    # connect elsewhere is told, in one clause, that it was not used
+    preset = config.account() if config.names_machine(entry.id, entry.subject) else None
+    presets_note = _unapplied_presets_note(entry.id, entry.subject)
     try:
         # off the loop: it may run `ssh -G` (a subprocess with a 10 s timeout) to read ~/.ssh/config
-        fac = await asyncio.to_thread(binding._facility_from_entry, entry, account=(config.account() or ""))
+        fac = await asyncio.to_thread(binding._facility_from_entry, entry, account=(preset or ""))
     except Exception as exc:  # noqa: BLE001 - a facility that cannot be built (bad entry, store I/O) is a structured failure
         return ConnectFacilityResult(
             phase="failed",
@@ -284,7 +289,7 @@ async def _connect_facility(
             res = await _connect_mep(app, facility, fac)
             if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
                 res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
-            res.notice = login_note + (res.notice or "")
+            res.notice = login_note + presets_note + (res.notice or "")
             return res
         # An MFA facility (curated `auth_method: mfa-otp`) with no shared connection yet: don't burn a failing
         # SSH attempt (and a fail2ban strike) to learn what the entry already says — hand off first. But ONLY
@@ -319,7 +324,7 @@ async def _connect_facility(
         if block == "warm":
             _commit_proven_facility(app, facility)
     wi_note = getattr(fac, "worker_init_note", "")  # an edited env_setup that a reused endpoint does not run
-    reuse_note = (login_note + _reuse_note(app, facility, app.state.reused, fac)
+    reuse_note = (login_note + presets_note + _reuse_note(app, facility, app.state.reused, fac)
                   + (wi_note if isinstance(wi_note, str) else "") + _venv_note(fac))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one

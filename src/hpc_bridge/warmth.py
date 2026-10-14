@@ -57,6 +57,7 @@ from .notices import (
     _no_account_failure,
     _spend_floor_guidance,
     _submit_rejected,
+    _switch_reason,
     _transient_dispatch_failure,
     _with_submission_notice,
 )
@@ -96,6 +97,8 @@ def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
         uec = {**defaults, **shape_config(shape)}
         # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
         uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
+        if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
+            uec.update(app.compute_choice)
         rt = ShapeRuntime(user_endpoint_config=uec)
         app.shapes[shape] = rt
     return rt
@@ -304,6 +307,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
             rt.runner.close()
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
+    app.compute_choice.clear()  # the partition and account were chosen for this binding: a stop keeps them, this not
     app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()
     return spent
@@ -547,11 +551,15 @@ async def _provision(
         # NOTHING until an allocation account is set (passed now, or sticky from an earlier call). Live 2026-09-09:
         # on NCSA Delta (account_required) the agent confirmed spend with no account — the user had offered a
         # LOGIN NAME — and the MEP submitted a GPU block Slurm could only reject, which a MEP has no channel to see,
-        # so it read "allocating nodes…" for five minutes. The flag was stored and never enforced.
+        # so it read "allocating nodes…" for five minutes. The flag was stored and never enforced. Every channel
+        # carries the flag (an SSH facility in its profile, since 2026-10-14), and the account read is the one the
+        # block would be charged to: this session's choice or the facility's configured default (the startup pin's),
+        # both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
-        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped)
+        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, or its terms switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
+        rt.switched, rt.switch_unseen = None, False
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -626,11 +634,11 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     make the caller poll_task/stop_endpoint first. Otherwise returns None.
 
     No-op when `partition` is None (keep the facility/profile default) or unchanged, or for the
-    login shape, which has no partition. A real change means a different scheduler block,
-    so we mark the cached runner stale (its Executor captured the old partition at build time —
-    _runner_for rebuilds it and banks the prior warm interval) and drop the warm confirmation;
-    the old block idle-releases on its own (min_blocks=0). The selection persists in
-    user_endpoint_config for the rest of the session."""
+    login shape, which has no partition. A real change means a different scheduler block (_repoint): the
+    confirmation covered the old block only, the cached runner is stale (its Executor captured the old partition at
+    build time — _runner_for rebuilds it), and nothing cancels the old block (an SSH endpoint's idle-releases on its
+    own, min_blocks=0; a facility endpoint's is left billing and named). The selection persists for the session, a
+    stop included."""
     if partition is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("partition") == partition:
@@ -644,14 +652,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
-    _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
-    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
-        _leave_switched(app, shape, rt)
-    rt.user_endpoint_config["partition"] = partition
-    rt.runner_stale = True
-    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
-    rt.block_since = rt.block_job = None  # a different partition is a different block: not the old one's age
-    _forget_presumed(rt)
+    _repoint(app, shape, rt, "partition", partition)
     return None
 
 def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | None) -> str | None:
@@ -659,8 +660,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     analogue of _apply_partition. Returns a rejection notice (and applies nothing) when a task is still
     running on the shape (the runner swap would cancel it). compute-shape only; the config_template
     renders `account` from user_endpoint_config with the profile default, so a selection here overrides
-    it. A change invalidates the cached runner (banking the prior warm interval) and drops the warm
-    confirmation; the selection persists for the session."""
+    it. A change is a different block (_repoint); the selection persists for the session, a stop included."""
     if account is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("account") == account:
@@ -674,15 +674,34 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    _repoint(app, shape, rt, "account", account)
+    return None
+
+def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) -> None:
+    """A real partition or account change, once nothing of ours holds the block: a different block.
+
+    The spend confirmation covered the old terms' block only, so it is dropped (hole 3, 2026-10-14: the switch started
+    a new billed block under the old one): the call answers needs_confirmation unless it carries confirm_spend=True
+    itself, and the question says what became of the old block (`rt.switched`). Nothing here cancels that block: on an
+    SSH endpoint it idle-releases on its own (min_blocks=0) and stop_endpoint cancels it; on a facility endpoint it is
+    left billing and remembered for naming (_leave_switched, #178). Its spend clock stops here, as the runner rebuild
+    that follows a confirmation would. The new value is the session's choice (`app.compute_choice`)."""
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
-    if not _has_login_shape(app):  # a facility endpoint: nothing cancels the old block — it bills on; remember it
-        _leave_switched(app, shape, rt)
-    rt.user_endpoint_config["account"] = account
+    uec = rt.user_endpoint_config
+    old_partition, old_account = uec.get("partition"), uec.get("account")
+    unseen = rt.warm_confirmed_at is None  # asked for, never seen up: its pilot may still land (before _leave_switched)
+    left = None if _has_login_shape(app) else _leave_switched(app, shape, rt)  # a facility endpoint: it bills on
+    if _billable(rt) and rt.spend_confirmed:
+        rt.spend_confirmed = False
+        rt.switched = _switch_reason(app, old_partition, old_account, left)
+        rt.switch_unseen = unseen
+    _bank_warm_interval(rt, app)  # (a no-op once _leave_switched banked it)
+    uec[key] = value
+    app.compute_choice[key] = value
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
-    rt.block_since = rt.block_job = None  # a different account is a different block: not the old one's age
+    rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age
     _forget_presumed(rt)
-    return None
 
 def _check_queued(rt: ShapeRuntime) -> bool:
     """A check (canary) of ours is still queued on the endpoint: its runner holds one unresolved, or the last check
@@ -801,17 +820,18 @@ def _remember_left(app: AppCtx, left: LeftBlock) -> None:
         return (b.partition, b.account) == (left.partition, left.account)
     app.left_blocks = [b for b in app.left_blocks if not same(b)] + [left]
 
-def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> LeftBlock | None:
     """A partition or account switch on a facility endpoint: leave the old block (`_leave_block`, banked once), then let
     go of everything that still points at it — the old runner (closed: its unread late answer belongs to the old
     partition), the last check and a reap's kick — so no later stop reads that block again and files it under the new
-    partition (review of a6de41e, X)."""
-    _leave_block(app, shape, rt, how="switch")
+    partition (review of a6de41e, X). Returns the block left, for the spend question to name."""
+    left = _leave_block(app, shape, rt, how="switch")
     _bank_warm_interval(rt, app)  # (a no-op once _leave_block banked it)
     if rt.runner is not None:
         rt.runner.close()
     rt.runner, rt.runner_stale = None, False
     rt.last_canary, rt.reap_kicked = None, False
+    return left
 
 def _prune_left(app: AppCtx, now: float | None = None) -> list[LeftBlock]:
     """Drop the left BLOCKS that cannot still be running — past their walltime's end — and return the rest. A queued

@@ -76,6 +76,13 @@ class ShapeRuntime:
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
+    # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
+    # only, so the switch drops it and the next start asks again (warmth._repoint). `switched` is the reason the spend
+    # question gives — the old terms, and what became of their block; `switch_unseen`: that block was asked for but
+    # never seen up, so a stop must still look for its pilot (server._stop_endpoint's expect_block). A confirmation
+    # clears both.
+    switched: str | None = None
+    switch_unseen: bool = False
     # An idle presumption can come while the block is still up (an endpoint on a slower scaling pass): that block's
     # age, job id, the latest it could have lived, and where the presumption stopped its spend clock — so the block
     # that answers next is dated and billed right (warmth._provision).
@@ -216,6 +223,12 @@ class AppCtx:
     # The local account the last check (canary) ran as — on a facility endpoint, the identity mapping's: a stop's
     # `squeue -u` names it. Cleared with left_blocks on a bind elsewhere, and on a new Globus login.
     worker_user: str | None = None
+    # The partition and account this session chose for the compute shape (ensure_endpoint_up partition= / account=,
+    # warmth._repoint). A stop drops the compute shape whole; the next one starts with these (warmth._shape_runtime), so
+    # the choice persists for the session as the tool says, and the spend question after a stop names them. Forgotten
+    # with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus
+    # login keeps them, as it keeps a live shape's.
+    compute_choice: dict[str, str] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

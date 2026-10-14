@@ -181,14 +181,43 @@ def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None 
     return _reap_prefix(rt) + head + _spend_floor_guidance(app)
 
 def _reap_prefix(rt: ShapeRuntime | None) -> str:
-    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone."""
-    if rt is None or rt.reaped is None:
+    """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone — or the partition or
+    account has changed since, which is a different block (`rt.switched`, _switch_reason)."""
+    if rt is None:
         return ""
+    if rt.reaped is None:
+        return rt.switched or ""
     # Found by a check (kicked): a replacement may already be running, and billing from when it started — not "again".
     bills = ("a replacement bills from the moment it starts, confirmed or not" if rt.reap_kicked else
              "a new block bills again")
     return (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; "
             f"{bills}. ")
+
+def _switch_reason(app: AppCtx, partition: str | None, account: str | None, left: LeftBlock | None) -> str:
+    """Why a partition or account switch asks for spend again, and what became of the block the confirmation covered
+    (on `partition` / `account`). Nothing cancels it on a switch. An SSH endpoint's idle-releases on its own
+    (min_blocks=0), and stop_endpoint cancels every block of the endpoint by its marker — the new choice survives the
+    stop. A facility endpoint's `left` block is named in #178's words for a block it lets go of (connect._prior_note);
+    None: no block of ours was known there."""
+    out = ("Confirm spend again with the user: the partition or account has changed since spend was confirmed, and "
+           "that is a different block (the earlier confirmation covered only the one on "
+           f"{_terms(partition, account)}). ")
+    if _has_login_shape(app):
+        return out + (f"Nothing cancels the previous block on a switch, even one still queued: it idle-releases "
+                      f"{_idle_window_text(app)} after its last task (min_blocks=0). To end it now, call stop_endpoint "
+                      "first: it cancels this endpoint's blocks and keeps the new partition and account for the next "
+                      "one. ")
+    if left is None:
+        return out
+    cancel = _scheduler_cmds(getattr(app.facility, "scheduler", None))[0]
+    if left.kind == "check":
+        return out + ("A check of ours was still queued for it and was not cancelled — no cancel channel on a facility "
+                      "endpoint: a block the facility starts for it bills until that facility's idle-release; "
+                      "stop_endpoint names it. ")
+    which = f"That block, scheduler job {left.job}," if left.job else "That block"
+    end = f" (`{cancel.format(job=left.job)}` on that facility ends it)" if left.job else ""
+    return out + (f"{which} was not cancelled — no cancel channel on a facility endpoint: it bills until that "
+                  f"facility's idle-release{end}; stop_endpoint names it. ")
 
 def _spend_floor_guidance(app: AppCtx | None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -498,10 +527,14 @@ _UNTIL_WHY = {
 # At most this many earlier queued checks are named one by one (most recent first); the rest are counted.
 _CHECKS_NAMED = 5
 
+def _terms(partition: str | None, account: str | None) -> str:
+    """A block's partition (and account), for a notice."""
+    where = f"partition {partition!r}" if partition else "the default partition"
+    return where + (f", account {account!r}" if account else "")
+
 def _where(b: LeftBlock) -> str:
     """The partition (and account) a left block or check belongs to, for a notice."""
-    where = f"partition {b.partition!r}" if b.partition else "the default partition"
-    return where + (f", account {b.account!r}" if b.account else "")
+    return _terms(b.partition, b.account)
 
 def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, current: LeftBlock | None = None,
                       lost: str = "", op: str = "stop") -> str:
@@ -608,12 +641,33 @@ def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> Shel
         notice="allocating nodes…" + _dispatch_error_suffix(canary),
     )
 
+def _unapplied_presets_note(entry_id: str, subject: str) -> str:
+    """One clause for a connect when an env preset (HPC_BRIDGE_ACCOUNT, HPC_BRIDGE_PARTITION) is set but this facility
+    is not the one HPC_BRIDGE_MACHINE names, so the user is not surprised it went unused. Names the variable, never its
+    value. Empty when nothing is set, or it applies here."""
+    unused = [name for name, value in (("HPC_BRIDGE_ACCOUNT", config.account()),
+                                       ("HPC_BRIDGE_PARTITION", config.partition())) if value is not None]
+    if not unused or config.names_machine(entry_id, subject):
+        return ""
+    machine = config.machine()
+    target = f"HPC_BRIDGE_MACHINE={machine}" if machine else "the facility HPC_BRIDGE_MACHINE names, and that is unset"
+    one = len(unused) == 1
+    return (f"({' and '.join(unused)} {'applies' if one else 'apply'} only to {target}, so "
+            f"{'it was' if one else 'they were'} not used here.) ")
+
+
 def _needs_account_notice(app: AppCtx | None = None) -> str:
     """The account floor fired: the facility requires an allocation account and none is set — nothing started.
-    Names what an account is NOT (a login name — the live confusion) and where the real one comes from."""
+    Names what an account is NOT (a login name — the live confusion) and where the real one comes from: on a facility
+    with a login shape (SSH), connect_facility's allocations or the facility's own tool run free there."""
+    if app is not None and _has_login_shape(app):
+        source = ("connect_facility's allocations when it listed some, the facility's allocation tool — it runs free "
+                  "on the login shape, run_shell(…, shape='login') — or its portal")
+    else:
+        source = "the facility's allocation tool or portal"
     return ("this facility requires an allocation account for every block and none is set — nothing was started. "
             "A LOGIN NAME is not an account: an account is the project/allocation the scheduler charges (a project "
-            "id from the facility's allocation tool or portal, or the ACCESS project id). Ask the user which one to "
+            f"id from {source}, or the ACCESS project id). Ask the user which one to "
             "charge, then call ensure_endpoint_up(account=…, partition=…, confirm_spend=True).")
 
 

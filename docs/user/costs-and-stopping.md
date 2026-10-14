@@ -6,8 +6,10 @@ Connecting, listing facilities, and logging in are free. Discovery on an SSH-boo
 on a free login-node worker. The first thing that costs allocation is a compute block, and the agent
 asks before starting one: which partition, which allocation account where one is needed, and your
 confirmation. A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way,
-from wherever it is submitted, so it asks before that too. On a facility-run, compute-only endpoint
-there is no free tier at all, so the question comes at the first command.
+from wherever it is submitted, so it asks before that too. Changing the partition or account later means a new
+block, so it asks again; the switch does not cancel the old block, which idles out on its own unless you stop it
+first. The partition and account you chose are kept for the session, after a stop too. On a facility-run,
+compute-only endpoint there is no free tier at all, so the question comes at the first command.
 
 ## What a block costs
 

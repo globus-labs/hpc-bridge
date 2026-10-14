@@ -264,6 +264,14 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 | Queue and account survive a stop (today stop pops the shape, so the default comes back silently) | **None** |
 | Personas who pre-state the terms, or who want the terms named | **None** (see Personas below) |
 
+> [!note] Since built (2026-10-14, branch `fix/spend-gate-holes`; not yet run live)
+> Holes 1–3, and the queue and account surviving a stop, are fixed. The trio exists as fake-cluster scenarios graded on
+> what that fix delivers (statuses, notices, the block's own `$SLURM_JOB_*`, sacct): `term_switch_reasks` and
+> `preset_account_scoped` on `mep`, `ssh_account_floor` on `site` (its registry SSH entry is written per cell by
+> `agentic/harness/fake_ssh_catalog.py`). Hermetic grader tests: `agentic/harness/test_spend_terms_scenarios.py`. Not yet
+> graded, for the later spend-terms change: the `block.queue` / `queue_source` / `account_source` fields and
+> `old_block_released` (nothing cancels the old block on a switch yet; the notice says so).
+
 **The endpoint-install fix (branch `fix/env-setup-verify-install`, unmerged): no scenarios.**
 - A broken venv repaired in place: none. The vault planted a break by hand (`mv`, never an append, because of the uv hardlinks). The pool users on globus1 are the live instance.
 - The architecture mismatch named ("built on x86_64 … does not run on spark1 (aarch64)"): none. The fake cluster has one architecture.

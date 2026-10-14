@@ -337,6 +337,10 @@ class MachineProfile:
     scheduler: Literal["slurm", "pbs"] = "slurm"  # "slurm" | "pbs" — selects the config_template branch
     cpus_per_node: int | None = None  # PBS: emitted as PBSProProvider.cpus_per_node; Slurm: unused
     exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
+    # The catalog entry's `account_required`: every block must be charged to an allocation account, so the server's
+    # account floor (warmth._provision) starts nothing without one. False when no curated entry says so (a facility
+    # you bring yourself, a profile built by hand).
+    account_required: bool = False
 
 
 def profile_from_catalog_entry(
@@ -1070,6 +1074,11 @@ class SlurmFacility:
     @property
     def scratch_root(self) -> str | None:
         return self.profile.scratch_root
+
+    @property
+    def account_required(self) -> bool:
+        """The account floor reads this on every facility (a facility MEP sets it too): the entry's flag."""
+        return self.profile.account_required
 
     async def adopt_endpoint(self, endpoint_id: str) -> None:
         """Learn the bound endpoint's own worker_init from its published template, once per endpoint id (best-effort:

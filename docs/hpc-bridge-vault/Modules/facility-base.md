@@ -5,7 +5,7 @@
 
 ## What it does
 
-- **`Facility`** Protocol (`facility/base.py:27`) — the contract the runtime depends on: `provision(profile)`, `manager_online(endpoint_id)`, `config_template(profile)`. Concrete facilities add optional capabilities the server reads via `getattr`: `bootstrap`/`teardown`/`login_exec`/`scratch_root`/`profile` (SSH facilities), and **`supported_shapes`** / `account_required` / `max_idletime_s` (a facility MEP) — absent `supported_shapes` means every shape.
+- **`Facility`** Protocol (`facility/base.py:27`) — the contract the runtime depends on: `provision(profile)`, `manager_online(endpoint_id)`, `config_template(profile)`. Concrete facilities add optional capabilities the server reads via `getattr`: `bootstrap`/`teardown`/`login_exec`/`scratch_root`/`profile` (SSH facilities), **`supported_shapes`** / `max_idletime_s` (a facility MEP), and `account_required` (any facility built from a catalog entry: a MEP, and since 2026-10-14 an SSH one) — absent `supported_shapes` means every shape.
 - **`EndpointHandle`** (`:19`) — `provision`/`bootstrap` return value: `endpoint_id`, `name`, `login_host` (the pinned FQDN), `reused` (True if reused over the web — or attached to a facility's endpoint — with no SSH).
 
 - **`endpoint_metadata`** (`:11`) — one read of an endpoint's metadata from the web service (`{}` when it has none); [[facility-mep]] reads its template from it, and [[facility-remote]]'s `adopt_endpoint` the worker_init an endpoint was configured with.
