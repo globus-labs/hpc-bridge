@@ -163,13 +163,22 @@ async def _catalog_facility(machine: str) -> Facility:
         account = (config.account() or "")
         if entry.account_required and not account:
             account = _require_env("HPC_BRIDGE_ACCOUNT")  # raises with the standard message
-        _PINNED[machine] = entry.subject  # the pin holds: an alias it resolved names this facility for the presets
-        return _facility_from_entry(entry, account=account)
+        return _pinned_facility(machine, entry, account=account)
     # Startup pin only: HPC_BRIDGE_SSH_HOST may override the catalog's canonical ssh_host (your own
     # alias / a login node, or the FQDN the container needs). The agentic connect path does NOT (#35).
-    account = _require_env("HPC_BRIDGE_ACCOUNT")
-    _PINNED[machine] = entry.subject  # the pin holds: an alias it resolved names this facility for the presets
-    return _facility_from_entry(entry, account=account, pinned_host=config.ssh_host())
+    return _pinned_facility(machine, entry, account=_require_env("HPC_BRIDGE_ACCOUNT"), pinned_host=config.ssh_host())
+
+
+def _pinned_facility(machine: str, entry, **kw) -> Facility:
+    """The startup pin's facility. The alias it resolved is recorded while the facility is built (its partition preset
+    follows the machine named) and kept only if the build succeeds: a pin that fails — a bad HPC_BRIDGE_SSH_HOST, say
+    — names no machine for the presets."""
+    _PINNED[machine] = entry.subject
+    try:
+        return _facility_from_entry(entry, **kw)
+    except Exception:
+        _PINNED.pop(machine, None)
+        raise
 
 def _default_local_facility(*, unbound: bool = False) -> LocalFacility:
     """The facility the server holds when no machine is pinned (or the pin failed at boot) — make_facility's and

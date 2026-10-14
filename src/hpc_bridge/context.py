@@ -85,6 +85,7 @@ class ShapeRuntime:
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
     switch_unseen: bool = False
+    switched_since_reap: bool = False  # a switch while spend was asked anyway (a reap): the re-ask says so
     # Bumped by a switch: a task handle records the epoch it was sent in, and its result is proof of life only for a
     # block of that epoch — a task that finished on the old block, polled later, must not vouch for the new one
     # (warmth._resolve_task). Its end is still the old block's last activity, which every stamp of the new block passes.
@@ -238,8 +239,8 @@ class AppCtx:
     compute_choice: dict[str, str] = field(default_factory=dict)
     # When each scheduler job on the bound endpoint was first proven up (a check or a command reporting it), keyed
     # (endpoint id, job): never moved later, so a block dated by its job keeps its real age (for its walltime) however
-    # often a switch or a stop let go of it and it answered again (warmth._answering_block_since). Bounded; cleared
-    # with the binding (warmth._drop_all_shapes).
+    # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
+    # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
     job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

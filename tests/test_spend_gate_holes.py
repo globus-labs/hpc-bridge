@@ -927,7 +927,7 @@ async def test_a_pin_that_fails_names_no_machine(monkeypatch):
     assert binding._PINNED == {}
 
 
-def test_the_jobs_remembered_are_bounded_and_forgotten_with_the_binding():
+def test_the_jobs_remembered_are_bounded_and_never_moved_later():
     app = AppCtx(facility=FakeFacility(), profile=Profile())
     last = str(warmth._JOBS_SEEN_MAX + 9)
     for i in range(warmth._JOBS_SEEN_MAX + 10):
@@ -935,5 +935,185 @@ def test_the_jobs_remembered_are_bounded_and_forgotten_with_the_binding():
     assert len(app.job_seen_since) == warmth._JOBS_SEEN_MAX and (None, "0") not in app.job_seen_since
     warmth._saw_job(app, last, 1e9)                                    # never moved later
     assert app.job_seen_since[(None, last)] == warmth._JOBS_SEEN_MAX + 9
-    warmth._drop_all_shapes(app, bank=False)
+
+
+# --- a requeued job, a refusal nobody polled, a reconnect, the job map's bounds --------------------------------------
+
+
+class _ClockRunner(_FakeRunner):
+    """A fake runner whose check is answered now (the fake clock), by `self.job`."""
+
+    def __init__(self, eid, clock, job, **kw):
+        super().__init__(eid, _Res(0, "ok", ""), **kw)
+        self.clock, self.job = clock, job
+
+    async def canary(self, timeout=8.0):
+        self.canaries += 1
+        return CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.3.9",
+                            worker_job=self.job, worker_user="u", answered_at=self.clock[0])
+
+
+def _answer_now(app, clock, job):
+    """The current runner and every one built from now on answer their checks now, from scheduler job `job`."""
+    def factory(eid, user_endpoint_config=None, **_kw):
+        app.built.append(dict(user_endpoint_config or {}))
+        return _ClockRunner(eid, clock, job)
+    app.runner_factory = factory
+    rt = app.shapes.get("compute")
+    if rt is not None and rt.runner is not None:
+        rt.runner.__class__ = _ClockRunner
+        rt.runner.clock, rt.runner.job = clock, job
+
+
+def _refuse(app, out, job):
+    """Finish the pending poll handle `out` as the wrong-block guard's refusal on scheduler job `job`."""
+    from hpc_bridge import session_shell
+
+    h = app.tasks[out.task_id]
+    app.shapes["compute"].runner.futures[-1].finish(
+        _Res(session_shell.WRONG_BLOCK_EXIT, "", f"{session_shell.WRONG_BLOCK_MARKER} {h.guard.nonce} {job}"))
+    return h
+
+
+async def _refused_unpolled(app, clock, t0, job="113"):
+    """A long command handed back as a poll handle, then refused on scheduler job `job` (the block was replaced) at
+    t0 + 20; nobody polls it."""
+    rt = app.shapes["compute"]
+    rt.runner.pending = True
+    clock[0] = t0 + 10
+    out = await _run_shell(app, "sleep 500")
+    assert out.phase == "running"
+    clock[0] = t0 + 20
+    return out, _refuse(app, out, job)
+
+
+@pytest.mark.parametrize("kind", ["ssh", "mep"])
+async def test_a_job_requeued_under_its_id_runs_a_fresh_walltime_and_bills_on(clock, kind):
+    # Slurm PreemptMode=REQUEUE, a node-failure requeue, a PBS rerun: the same job id answers past its walltime counted
+    # from its first proof. It used to stay dated t0: every confirmation came back "up", the next command re-asked
+    # "reached its walltime", and the spend clock froze (banked to block_since + wall, already behind it)
+    t0 = clock[0]
+    app = await _warm() if kind == "ssh" else _mep_app("100")
+    job = "112" if kind == "ssh" else "100"
+    app.charge_factor = 1.0
+    _answer_now(app, clock, job)
+    if kind == "mep":
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.user_endpoint_config["walltime"] = "00:30:00"
+    for t in range(300, 1501, 300):                                    # busy all along: no idle presumption
+        clock[0] = t0 + t
+        assert (await _run_shell(app, "true")).phase == "complete"
+    clock[0] = t0 + 1810
+    assert (await _run_shell(app, "true")).phase == "needs_confirmation"   # its walltime, presumed
+    clock[0] = t0 + 1820
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"   # the requeued job answers
+    assert rt.block_job == job and rt.block_since == t0 + 1820
+    clock[0] = t0 + 1830
+    assert (await _run_shell(app, "true")).phase == "complete"
+    before = server._total_session_spend(app) * 3600
+    clock[0] = t0 + 2430
+    assert (await _run_shell(app, "true")).phase == "complete"
+    assert server._total_session_spend(app) * 3600 - before == pytest.approx(600, abs=0.01)   # it bills on
+
+
+@pytest.mark.parametrize("kind", ["ssh", "mep"])
+async def test_a_switch_that_confirms_after_an_unpolled_refusal_answers_with_the_reap(clock, kind):
+    # the refusal found job 113 replacing the confirmed block; the call that switches and confirms is the call that
+    # finds it, so it answers needs_confirmation naming 113, as any call that finds a reap does
+    t0 = clock[0]
+    app = await _warm() if kind == "ssh" else _mep_app("100")
+    _answer_now(app, clock, "112" if kind == "ssh" else "100")
+    if kind == "mep":
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    out, _h = await _refused_unpolled(app, clock, t0)
+    clock[0] = t0 + 60
+    _answer_now(app, clock, "200")
+    res = await _ensure_endpoint_up(app, partition="compute" if kind == "ssh" else "other", confirm_spend=True)
+    assert res.status == "needs_confirmation" and "job 113" in res.notice and "is gone" in res.notice
+    assert "The partition or account was switched since" in res.notice
+    if kind == "mep":
+        assert [b.job for b in app.left_blocks] == ["113"]
+    polled = await _poll_task(app, out.task_id)
+    assert "did NOT run" in polled.notice
+
+
+async def test_a_stop_after_an_unpolled_refusal_names_the_replacement_and_bills_once(clock):
+    t0 = clock[0]
+    app = _mep_app("100")
+    app.charge_factor = 1.0
+    _answer_now(app, clock, "100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    out, _h = await _refused_unpolled(app, clock, t0, job="101")
+    clock[0] = t0 + 60
+    stop = await _stop_endpoint(app)
+    assert stop.block_job_id == "101" and "`scancel 101`" in stop.notice and "scancel 100" not in stop.notice
+    billed = server._total_session_spend(app)
+    polled = await _poll_task(app, out.task_id)
+    assert "did NOT run" in polled.notice
+    assert server._total_session_spend(app) == pytest.approx(billed) and [b.job for b in app.left_blocks] == ["101"]
+
+
+async def test_a_reconnect_to_the_same_endpoint_keeps_the_jobs_ages(monkeypatch, clock):
+    from tests.test_mep_stop_names_block import _attached, _reconnect
+
+    t0 = clock[0]
+    app, _runner = await _attached(monkeypatch)
+    app.built = []
+    _answer_now(app, clock, "100")
+    assert (await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)).status == "up"
+    clock[0] = t0 + 3000
+    await _reconnect(app)
+    clock[0] = t0 + 3010
+    assert (await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)).status == "up"
+    assert app.shapes["compute"].block_since == t0                    # job 100 keeps its age across the reconnect
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: FakeFacility())
+    monkeypatch.setattr(warmth, "_provision", _no_provision)
+    await server._connect_facility(app, "globus1")                     # a bind elsewhere drops them
     assert app.job_seen_since == {}
+
+
+async def _no_provision(app, shape, **_kw):
+    return "warm"
+
+
+async def test_a_refusal_dates_its_replacement_when_it_refused(clock):
+    t0 = clock[0]
+    app = await _warm()
+    _answer_now(app, clock, "112")
+    _out, h = await _refused_unpolled(app, clock, t0)
+    clock[0] = t0 + 400
+    await _ensure_endpoint_up(app, partition="compute")                # the switch takes the refusal in
+    assert app.job_seen_since[(app.state.endpoint_id, "113")] == h.done_at == t0 + 20
+
+
+async def test_an_ssh_switch_after_a_reap_says_it_switched(clock):
+    t0 = clock[0]
+    app = await _warm()
+    _answer_now(app, clock, "113")
+    clock[0] = t0 + 100
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "needs_confirmation"
+    clock[0] = t0 + 120
+    res = await _ensure_endpoint_up(app, partition="compute")
+    assert "The partition or account was switched since, so a confirmation now starts a block on the new terms." in (
+        res.notice)
+
+
+async def test_the_bound_on_remembered_jobs_never_drops_the_confirmed_blocks(clock):
+    t0 = clock[0]
+    app = await _warm()
+    key = (app.state.endpoint_id, "112")
+    assert key in app.job_seen_since and app.shapes["compute"].block_job == "112"
+    for i in range(warmth._JOBS_SEEN_MAX + 5):
+        warmth._saw_job(app, str(5000 + i), t0 + 1 + i)
+    assert key in app.job_seen_since and len(app.job_seen_since) == warmth._JOBS_SEEN_MAX
+
+
+async def test_a_pin_with_a_bad_ssh_host_names_no_machine(monkeypatch):
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([_ssh_entry()]))
+    monkeypatch.setenv("HPC_BRIDGE_ACCOUNT", "chi152")
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "u")
+    monkeypatch.setenv("HPC_BRIDGE_SSH_HOST", "-oProxyCommand=evil")
+    with pytest.raises(ValueError):
+        await binding._catalog_facility("expanse")
+    assert binding._PINNED == {}

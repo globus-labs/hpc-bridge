@@ -204,7 +204,7 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
         out += ("Confirm spend again with the user: the partition or account has changed since spend was confirmed, "
                 "and that is a different block (the earlier confirmation covered only the one on "
                 f"{_terms(*rt.switched_terms)}). ")
-    elif left is not None:  # a switch while spend was asked anyway (after a reap): it let go of this block too
+    elif left is not None or rt.switched_since_reap:  # a switch while spend was asked anyway (after a reap)
         out += "The partition or account was switched since, so a confirmation now starts a block on the new terms. "
     if app is not None and (rt.switched_terms is not None or left is not None):
         out += _switch_fate(app, left, confirmed=False)

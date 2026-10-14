@@ -280,6 +280,7 @@ async def _connect_facility(
         here = None if "login" in _facility_shapes(fac) else getattr(fac, "endpoint_id", None)
         app.left_blocks = [b for b in app.left_blocks if here is not None and b.endpoint_id == here]
         app.billed_to = {k: t for k, t in app.billed_to.items() if here is not None and k[0] == here}
+        app.job_seen_since = {k: t for k, t in app.job_seen_since.items() if here is not None and k[0] == here}
         if not app.left_blocks and (here is None or here != old_eid):
             app.worker_user = None
         app.facility = fac
