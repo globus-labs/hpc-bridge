@@ -88,10 +88,13 @@ installed plugin only when that version changes); git tags mark releases.
   what became of the old block. Nothing cancels it on a switch. On an SSH facility it idle-releases on its own; to end
   it now, call `stop_endpoint` before confirming the new block. On a facility endpoint it is named as a reconnect names
   one (its scheduler job, and `scancel <id>`, or `qdel <id>` on PBS), and a later stop names it in full. Either way the
-  session spend counts it to the latest it can bill, an upper bound. A switch back to the confirmed terms says so, and
-  if the same job answers, it keeps its age and its clock. A task that finished on the old block and is polled later
-  no longer marks the new block warm (which skipped its check and left it unguarded). The same partition or account
-  again is not a change.
+  session spend counts whatever block of ours the switch knows up (the confirmed one, one a late check answer proved
+  up, a replacement a check or a refused command found) to the latest it can bill, an upper bound. A job met again,
+  after a switch back or a stop, keeps its real age for its walltime (dated by its scheduler job, on any number of
+  switches) and bills afresh from that confirmation: switching back and forth can count some time twice, never less
+  than ran. A switch back to the confirmed terms says so. A task that finished on the old block and is polled later no
+  longer marks the new block warm (which skipped its check and left it unguarded). The same partition or account again
+  is not a change.
 - **A stop keeps the partition and account the session chose.** `stop_endpoint` forgot them, so the next block went
   to the facility's default partition and account without a word, although the tool says the choice persists for the
   session. Now the next block after a stop uses them, after the usual spend question, which names the partition; its

@@ -459,21 +459,16 @@ async def test_the_spend_clock_of_a_presumed_block_continues_when_it_answers(new
 
 
 @pytest.mark.parametrize("switch", ["partition", "account"])
-async def test_a_switch_never_dates_or_bills_a_block_as_the_presumed_one_of_other_terms(switch):
-    # a different partition or account is a different block: it must not be dated or billed as the presumed one, even
-    # when it reports the same job id (the presumed block is kept to its own terms, for a switch back to them)
+async def test_a_switch_forgets_the_presumed_block(switch):
+    # a different partition or account is a different block: it must not be dated or billed as the presumed one
     app, rt, _runner = await _warm_app(job="101")
     rt.warm_confirmed_at -= app.profile.max_idletime_s + 20
-    rt.block_since -= app.profile.max_idletime_s + 20                  # an old block: its age would show
     assert (await _run_shell(app, "true")).phase == "needs_confirmation"
-    presumed_since, presumed_billed = rt.presumed_block_since, rt.presumed_billed_until
-    assert presumed_since is not None and presumed_billed is not None
+    assert rt.presumed_block_since is not None and rt.presumed_billed_until is not None
     apply = _apply_partition if switch == "partition" else _apply_account
     assert apply(app, "compute", rt, "other") is None
-    res = await _ensure_endpoint_up(app, confirm_spend=True)
-    now = time.monotonic()
-    assert res.status == "up" and rt.block_job == "101"
-    assert rt.block_since == pytest.approx(now, abs=5) and rt.warm_since == pytest.approx(now, abs=5)
+    assert (rt.presumed_block_since, rt.presumed_block_job, rt.presumed_block_until, rt.presumed_billed_until) == (
+        None, None, None, None)
 
 
 # -- a canary answered by a DIFFERENT scheduler job while the block was believed up ----------------------------------

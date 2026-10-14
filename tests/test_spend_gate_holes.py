@@ -568,19 +568,19 @@ async def test_a_switch_back_to_the_confirmed_terms_says_so():
     assert "different block" not in res.notice and "Nothing cancels" not in res.notice
 
 
-async def test_a_switch_back_answered_by_the_same_job_keeps_its_age_and_bills_the_gap(clock):
+async def test_a_switch_back_answered_by_the_same_job_keeps_its_age_bills_fresh_and_never_under(clock):
     t0 = clock[0]
     app = await _warm()                                                # job 112, confirmed warm at t0
     app.charge_factor = 1.0
     rt = app.shapes["compute"]
     clock[0] = t0 + 100
-    await _ensure_endpoint_up(app, partition="compute")
+    await _ensure_endpoint_up(app, partition="compute")                # banks 112 once, to its latest end
     clock[0] = t0 + 200
     await _ensure_endpoint_up(app, partition="debug")
     clock[0] = t0 + 300
     res = await _ensure_endpoint_up(app, confirm_spend=True)           # job 112 answers again
     assert res.status == "up" and rt.block_job == "112" and rt.block_since == t0   # its walltime counts from t0
-    assert rt.warm_since is not None and rt.warm_since <= clock[0]     # a clock never starts ahead of now
+    assert rt.warm_since == t0 + 300                                   # it bills fresh from this confirmation
     assert server._total_session_spend(app) * 3600 >= 300              # nothing since t0 went unbilled
     clock[0] = t0 + 900
     assert server._total_session_spend(app) * 3600 >= 900
@@ -735,3 +735,205 @@ def test_the_agent_facing_texts_promise_no_directive_a_registry_facility_cannot_
     assert "scheduler_options" not in late and "cannot add to a facility endpoint's block yet" in late
     desc = FacilityDetails.model_fields["scheduler_options"].description or ""
     assert "Polaris" not in desc and "filesystems directive" in desc
+
+
+# --- a job keeps its age on any number of hops; whatever block a switch knows up is billed -------------------------
+
+
+def _answer(app, job):
+    """Every runner built from now on answers its check from scheduler job `job`."""
+    def factory(eid, user_endpoint_config=None, **_kw):
+        app.built.append(dict(user_endpoint_config or {}))
+        return _FakeRunner(eid, _Res(0, "ok", ""), canary_result=_ok(job))
+    app.runner_factory = factory
+
+
+async def test_a_job_met_again_after_two_switches_keeps_its_age_and_its_walltime_is_presumed(clock):
+    # debug (job 112, up from t0) -> compute confirmed (job 200) -> back to debug confirmed, answered by 112 again: a
+    # slot that dated a block by its terms held 200's block by then, so 112 got a fresh age and its real walltime end
+    # passed unnoticed
+    t0 = clock[0]
+    app = await _warm()
+    rt = app.shapes["compute"]
+    rt.user_endpoint_config["walltime"] = "00:30:00"
+    _answer(app, "200")
+    clock[0] = t0 + 100
+    assert (await _ensure_endpoint_up(app, partition="compute", confirm_spend=True)).status == "up"
+    assert rt.block_job == "200"
+    _answer(app, "112")
+    clock[0] = t0 + 200
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "up"
+    assert rt.block_job == "112" and rt.block_since == t0
+    for k in range(1, 16):                                             # a command every 100 s keeps it busy
+        clock[0] = t0 + 200 + 100 * k
+        assert (await _run_shell(app, "true")).phase == "complete"
+    clock[0] = t0 + 1810                                               # past job 112's real walltime end (t0 + 1800)
+    runner = rt.runner
+    sent = len(runner.commands)
+    out = await _run_shell(app, "hostname")
+    assert out.phase == "needs_confirmation" and "reached its walltime" in out.notice and len(runner.commands) == sent
+
+
+async def test_the_same_on_a_facility_endpoint(clock):
+    t0 = clock[0]
+    app = _mep_app("100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    _answer(app, "200")
+    clock[0] = t0 + 100
+    assert (await _ensure_endpoint_up(app, partition="other", confirm_spend=True)).status == "up"
+    _answer(app, "100")
+    clock[0] = t0 + 200
+    assert (await _ensure_endpoint_up(app, partition="main", confirm_spend=True)).status == "up"
+    assert rt.block_job == "100" and rt.block_since == t0
+
+
+async def test_a_job_met_again_never_resumes_a_clock_inside_what_a_switch_banked(clock):
+    # facility endpoint: the idle presumption fires at the switch, which banks job 100 to its latest end; met again
+    # after the switch back, it bills fresh from that confirmation (never from before that mark)
+    t0 = clock[0]
+    app = _mep_app("100")
+    app.charge_factor = 1.0
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    clock[0] = t0 + 600 + 20                                           # "has been idle-released, or is about to be"
+    await _ensure_endpoint_up(app, partition="other")
+    clock[0] = t0 + 625
+    await _ensure_endpoint_up(app, partition="main")
+    clock[0] = t0 + 630
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    assert rt.block_job == "100" and rt.block_since == t0 and rt.warm_since == t0 + 630
+
+
+@pytest.mark.parametrize("kind", ["ssh", "mep"])
+async def test_a_switch_bills_a_block_a_late_check_answer_proved_up(clock, kind):
+    # spend confirmed, the check timed out, then answered late: that block is up and billing. A switch bills it from
+    # its answer to the latest it can bill — on an SSH endpoint as on a facility endpoint
+    t0 = clock[0]
+    if kind == "ssh":
+        f = FakeFacility()
+        f.workers = 1
+        app = AppCtx(facility=f, profile=Profile())
+    else:
+        app = _mep_app("100")
+    app.charge_factor = 1.0
+    late = CanaryResult(ok=True, worker_job="100", worker_user="u", answered_at=t0 + 30)
+
+    def factory(eid, user_endpoint_config=None, **_kw):
+        r = _FakeRunner(eid, _Res(0, "ok", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+        r.canary_answer = lambda: late
+        return r
+
+    app.runner_factory = factory
+    assert (await _ensure_endpoint_up(app, partition="main", confirm_spend=True)).status == "provisioning"
+    clock[0] = t0 + 60
+    await _ensure_endpoint_up(app, partition="other")
+    bound_s = 600 + warmth._RELEASE_BOUND_S                            # its idle window after its answer, + the bound
+    assert server._total_session_spend(app) * 3600 == pytest.approx(bound_s, abs=0.01)
+
+
+async def test_an_ssh_switch_bills_the_replacement_a_check_found(clock):
+    # job 112 was replaced: job 113 answered a check (a kicked reap: not adopted, but up and billing). A switch away
+    # bills it to the latest it can bill, as a facility endpoint's switch does
+    t0 = clock[0]
+    app = await _warm()
+    app.charge_factor = 1.0
+    rt = app.shapes["compute"]
+    rt.runner._canary = _ok("113")
+    clock[0] = t0 + 100
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "needs_confirmation" and rt.reap_kicked
+    before = server._total_session_spend(app) * 3600
+    clock[0] = t0 + 120
+    await _ensure_endpoint_up(app, partition="compute")
+    added = server._total_session_spend(app) * 3600 - before
+    assert added == pytest.approx(600 + warmth._RELEASE_BOUND_S, abs=0.01)   # 113, from its answer at t0 + 100
+
+
+async def test_flipping_partitions_over_counts_and_never_under_counts(clock):
+    # accepted: a job met again bills fresh, so back-and-forth switching counts some time twice — never less than ran
+    t0 = clock[0]
+    app = await _warm()
+    app.charge_factor = 1.0
+    t = t0
+    for _ in range(5):
+        t += 60
+        clock[0] = t
+        await _ensure_endpoint_up(app, partition="compute")
+        t += 10
+        clock[0] = t
+        await _ensure_endpoint_up(app, partition="debug")
+        t += 10
+        clock[0] = t
+        assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    await _ensure_endpoint_up(app, partition="compute")
+    assert server._total_session_spend(app) * 3600 >= (t - t0) + app.profile.max_idletime_s
+
+
+async def test_a_switch_names_a_left_block_only_while_a_stop_would(clock):
+    # past the left block's walltime end it is no longer named on a stop, nor in the re-ask
+    t0 = clock[0]
+    app = _mep_app("100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    clock[0] = t0 + 60
+    first = await _ensure_endpoint_up(app, partition="other")
+    assert "scheduler job 100, was not cancelled" in first.notice
+    clock[0] = t0 + 3 * 3600                                           # past its walltime's end (02:00:00)
+    out = await _run_shell(app, "true")
+    assert out.phase == "needs_confirmation"
+    assert "job 100" not in out.notice and "stop_endpoint names it" not in out.notice
+
+
+async def test_a_refused_command_from_before_a_switch_is_taken_in_and_its_replacement_named(clock):
+    # facility endpoint: a guarded command for job 100 ran into a replacement (job 101) and was refused; unpolled, the
+    # agent switches partition. The switch takes the refusal in first, so it names 101 (billing), not 100 (gone)
+    from hpc_bridge import session_shell
+
+    t0 = clock[0]
+    app = _mep_app("100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.runner.pending = True
+    out = await _run_shell(app, "sleep 500")
+    assert out.phase == "running"
+    h = app.tasks[out.task_id]
+    rt.runner.futures[-1].finish(_Res(session_shell.WRONG_BLOCK_EXIT, "",
+                                      f"{session_shell.WRONG_BLOCK_MARKER} {h.guard.nonce} 101"))
+    clock[0] = t0 + 30
+    sw = await _ensure_endpoint_up(app, partition="other")
+    assert "scheduler job 101, was not cancelled" in sw.notice and [b.job for b in app.left_blocks] == ["101"]
+    polled = await _poll_task(app, out.task_id)
+    assert polled.phase == "needs_confirmation" and "did NOT run" in polled.notice
+    stop = await _stop_endpoint(app)
+    assert stop.block_job_id == "101"
+
+
+async def test_a_switch_after_a_reap_says_it_switched(clock):
+    app = _mep_app("100")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.runner._canary = _ok("101")
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "needs_confirmation"
+    res = await _ensure_endpoint_up(app, partition="other")
+    assert "The partition or account was switched since, so a confirmation now starts a block on the new terms." in (
+        res.notice) and "scheduler job 101, was not cancelled" in res.notice
+
+
+async def test_a_pin_that_fails_names_no_machine(monkeypatch):
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_mep_entry(account_required=True)]))
+    monkeypatch.delenv("HPC_BRIDGE_ACCOUNT", raising=False)
+    monkeypatch.delenv("HPC_BRIDGE_ENDPOINT_ID", raising=False)
+    with pytest.raises(RuntimeError, match="HPC_BRIDGE_ACCOUNT"):
+        await binding._catalog_facility("globus:globus1")
+    assert binding._PINNED == {}
+
+
+def test_the_jobs_remembered_are_bounded_and_forgotten_with_the_binding():
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    last = str(warmth._JOBS_SEEN_MAX + 9)
+    for i in range(warmth._JOBS_SEEN_MAX + 10):
+        warmth._saw_job(app, str(i), float(i))
+    assert len(app.job_seen_since) == warmth._JOBS_SEEN_MAX and (None, "0") not in app.job_seen_since
+    warmth._saw_job(app, last, 1e9)                                    # never moved later
+    assert app.job_seen_since[(None, last)] == warmth._JOBS_SEEN_MAX + 9
+    warmth._drop_all_shapes(app, bank=False)
+    assert app.job_seen_since == {}

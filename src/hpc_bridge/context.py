@@ -91,14 +91,11 @@ class ShapeRuntime:
     block_epoch: int = 0
     # An idle presumption can come while the block is still up (an endpoint on a slower scaling pass): that block's
     # age, job id, the latest it could have lived, and where the presumption stopped its spend clock — so the block
-    # that answers next is dated and billed right (warmth._provision). A switch keeps the block it left here too, so a
-    # switch back to its terms that is answered by the same job keeps its age and bills the gap. `presumed_block_terms`:
-    # that block's (partition, account), so a facility stop never files it under other terms.
+    # that answers next is dated and billed right (warmth._provision).
     presumed_block_since: float | None = None
     presumed_block_job: str | None = None
     presumed_block_until: float | None = None
     presumed_billed_until: float | None = None
-    presumed_block_terms: tuple[str | None, str | None] | None = None
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0
@@ -239,6 +236,11 @@ class AppCtx:
     # its result carries both. Forgotten with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a
     # teardown or a detach); a new Globus login keeps them, as it keeps a live shape's.
     compute_choice: dict[str, str] = field(default_factory=dict)
+    # When each scheduler job on the bound endpoint was first proven up (a check or a command reporting it), keyed
+    # (endpoint id, job): never moved later, so a block dated by its job keeps its real age (for its walltime) however
+    # often a switch or a stop let go of it and it answered again (warmth._answering_block_since). Bounded; cleared
+    # with the binding (warmth._drop_all_shapes).
+    job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

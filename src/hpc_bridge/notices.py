@@ -183,10 +183,12 @@ def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None 
 def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone — or the partition or
     account has changed since (`rt.switched_terms`), which is a different block, unless it is back to the terms the
-    confirmation covered. A block a facility-endpoint switch left is named either way (`rt.switch_left`)."""
+    confirmation covered. A block a facility-endpoint switch left is named either way (`rt.switch_left`), while it may
+    still bill (`_still_left`)."""
     if rt is None:
         return ""
     out = ""
+    left = rt.switch_left if app is not None and _still_left(app, rt.switch_left) else None
     if rt.reaped is not None:
         # Found by a check (kicked): a replacement may already be running, and billing from when it started.
         bills = ("a replacement bills from the moment it starts, confirmed or not" if rt.reap_kicked else
@@ -202,9 +204,16 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
         out += ("Confirm spend again with the user: the partition or account has changed since spend was confirmed, "
                 "and that is a different block (the earlier confirmation covered only the one on "
                 f"{_terms(*rt.switched_terms)}). ")
-    if app is not None and (rt.switched_terms is not None or rt.switch_left is not None):
-        out += _switch_fate(app, rt.switch_left, confirmed=False)
+    elif left is not None:  # a switch while spend was asked anyway (after a reap): it let go of this block too
+        out += "The partition or account was switched since, so a confirmation now starts a block on the new terms. "
+    if app is not None and (rt.switched_terms is not None or left is not None):
+        out += _switch_fate(app, left, confirmed=False)
     return out
+
+def _still_left(app: AppCtx, left: LeftBlock | None) -> bool:
+    """A block a switch left is still one a stop would name: still in `app.left_blocks`, and not past its walltime's
+    end (the rule warmth._prune_left applies)."""
+    return left is not None and left in app.left_blocks and (left.ends_by is None or left.ends_by > time.monotonic())
 
 def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool) -> str:
     """What became of the block a partition or account switch moved away from: nothing cancels it. On an SSH endpoint it
