@@ -6,15 +6,32 @@
 # `uv` then fails with "command not found" and the agent reports it has no hpc-bridge tools (release-readiness
 # pass, 2026-09-04). This launcher is what .mcp.json calls instead of `uv`.
 set -e
+uv=""
 if command -v uv >/dev/null 2>&1; then
-  exec uv "$@"
+  uv=uv
+else
+  for candidate in "$HOME/.local/bin/uv" "/opt/homebrew/bin/uv" "/usr/local/bin/uv" "$HOME/.cargo/bin/uv" \
+                   "/home/linuxbrew/.linuxbrew/bin/uv"; do
+    if [ -x "$candidate" ]; then
+      uv="$candidate"
+      break
+    fi
+  done
 fi
-for candidate in "$HOME/.local/bin/uv" "/opt/homebrew/bin/uv" "/usr/local/bin/uv" "$HOME/.cargo/bin/uv" \
-                 "/home/linuxbrew/.linuxbrew/bin/uv"; do
-  if [ -x "$candidate" ]; then
-    exec "$candidate" "$@"
-  fi
-done
-echo "hpc-bridge: 'uv' was not found on PATH or in the usual install locations (~/.local/bin, Homebrew, ~/.cargo/bin)." >&2
-echo "hpc-bridge: install it from https://docs.astral.sh/uv/ or symlink your uv into ~/.local/bin, then /reload-plugins." >&2
-exit 127
+if [ -z "$uv" ]; then
+  echo "hpc-bridge: 'uv' was not found on PATH or in the usual install locations (~/.local/bin, Homebrew, ~/.cargo/bin)." >&2
+  echo "hpc-bridge: install it from https://docs.astral.sh/uv/ or symlink your uv into ~/.local/bin, then /reload-plugins." >&2
+  exit 127
+fi
+# Windows on Arm: cryptography has published no win_arm64 wheel since 46.0.3, so on an arm64 Python the server's
+# dependencies fail to build (no OpenSSL) and it never starts. An x64 Python, which Windows runs under emulation, takes
+# the x64 wheel (checked in CI on windows-11-arm, 2026-10-14). Only when the user has chosen no Python (UV_PYTHON).
+if [ -z "${UV_PYTHON:-}" ]; then
+  case "$("$uv" --version 2>/dev/null)" in
+    *aarch64-pc-windows*)
+      UV_PYTHON=cpython-3.13-windows-x86_64-none
+      export UV_PYTHON
+      ;;
+  esac
+fi
+exec "$uv" "$@"

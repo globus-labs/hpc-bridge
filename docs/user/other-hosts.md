@@ -17,6 +17,9 @@ matters: the facilities in the registry were proven with a Python 3.13 client, a
 workers to match your Python, a different one is untested. The **first start builds hpc-bridge (about a minute)** —
 longer than some hosts wait by default, which is why each recipe below raises a timeout.
 
+On **Windows on Arm**, use `--python cpython-3.13-windows-x86_64-none` instead of `--python 3.13`: one dependency
+(`cryptography`) publishes no Arm build for Windows, and Windows runs the x64 Python under emulation.
+
 What you bring is the same as for Claude Code — a Globus login and access to a facility; see [Install](install.md) and
 [Facilities](facilities.md). The Globus login happens on first use: the agent hands you a link to open.
 

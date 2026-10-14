@@ -1,0 +1,64 @@
+name: windows
+# Claude Code on Windows starts the plugin's server through bin/run-with-uv, a /bin/sh script it runs under Git Bash.
+# Checked on Windows Server (x64) and Windows 11 on Arm, with uv on PATH and with uv only in ~/.local/bin (where its
+# installer puts it, which the server's PATH may lack). Claude Code is installed at its latest version on purpose: a
+# change in how it starts plugin servers on Windows should fail here first. Found by a probe (2026-10-14): a Windows
+# user's CONNECTION_CLOSED was uv missing, or Windows on Arm, where cryptography publishes no wheel.
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  plugin:
+    name: ${{ matrix.os }} / uv ${{ matrix.uv }}
+    runs-on: ${{ matrix.os }}
+    timeout-minutes: 25
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: windows-latest, uv: on-path }
+          - { os: windows-latest, uv: installer-only }
+          - { os: windows-11-arm, uv: on-path }
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: uv on PATH
+        if: matrix.uv == 'on-path'
+        uses: astral-sh/setup-uv@v6
+
+      - name: uv from its installer, only in ~/.local/bin
+        if: matrix.uv == 'installer-only'
+        shell: pwsh
+        run: |
+          $dirs = $env:PATH -split ';' | Where-Object { $_ -and -not (Test-Path (Join-Path $_ 'uv.exe')) }
+          "PATH=$($dirs -join ';')" | Out-File -FilePath $env:GITHUB_ENV -Append -Encoding utf8
+          powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+
+      - name: "Windows on Arm: an earlier failed start leaves an arm64 environment for the launcher to replace"
+        if: runner.arch == 'ARM64'
+        continue-on-error: true   # expected to fail: cryptography has no win_arm64 wheel
+        shell: pwsh
+        run: uv sync --locked --extra integration
+
+      - name: The server starts and lists its tools
+        if: runner.arch == 'X64' && matrix.uv == 'on-path'
+        shell: pwsh
+        run: uv run --locked --extra integration python .github/scripts/mcp_probe.py uv run --locked --extra integration hpc-bridge
+
+      - name: Install Claude Code
+        shell: pwsh
+        run: |
+          npm install -g @anthropic-ai/claude-code
+          claude --version
+
+      - name: Claude Code loads the plugin and connects to its server
+        timeout-minutes: 12
+        shell: bash
+        env:
+          MCP_TIMEOUT: "300000"   # the first start installs the server's dependencies
+        run: |
+          cd "$RUNNER_TEMP"   # away from the repo's own .mcp.json
+          claude --plugin-dir "$GITHUB_WORKSPACE" mcp list | tee list.txt
+          grep -E "^plugin:hpc-bridge:endpoint" list.txt | grep -q "Connected"

@@ -80,3 +80,30 @@ def test_mcp_launcher_finds_uv_off_path(tmp_path):
     assert r.returncode == 127 and "'uv' was not found" in r.stderr
     assert os.environ  # (keeps the import used on platforms where the assertions above short-circuit)
 
+
+def test_mcp_launcher_runs_an_x64_python_on_windows_on_arm(tmp_path):
+    # cryptography ships no win_arm64 wheel, so an arm64 Python can't install the server's dependencies there; the
+    # launcher asks uv for an x64 one (Windows emulates it). A stub uv reports the target its --version names and
+    # echoes what it was started with.
+    import subprocess
+
+    launcher = ROOT / "bin" / "run-with-uv"
+
+    def started_with(target: str, extra_env: dict[str, str] | None = None) -> str:
+        bindir = tmp_path / target
+        bindir.mkdir(exist_ok=True)
+        stub = bindir / "uv"
+        stub.write_text('#!/bin/sh\nif [ "$1" = --version ]; then echo "uv 0.13.1 (62faed335 2026-10-13 '
+                        + target + ')"; exit 0; fi\necho "UV_PYTHON=${UV_PYTHON:-} $*"\n')
+        stub.chmod(0o755)
+        env = {"HOME": str(tmp_path), "PATH": f"{bindir}:/usr/bin:/bin", **(extra_env or {})}
+        r = subprocess.run([str(launcher), "run", "hpc-bridge"], capture_output=True, text=True, env=env, check=False)
+        assert r.returncode == 0, r.stderr
+        return r.stdout.strip()
+
+    assert started_with("aarch64-pc-windows-msvc") == "UV_PYTHON=cpython-3.13-windows-x86_64-none run hpc-bridge"
+    # the user's own choice wins, and nothing else is touched: x64 Windows, Arm macOS / Linux
+    assert started_with("aarch64-pc-windows-msvc", {"UV_PYTHON": "3.12"}) == "UV_PYTHON=3.12 run hpc-bridge"
+    for target in ("x86_64-pc-windows-msvc", "aarch64-apple-darwin", "aarch64-unknown-linux-gnu"):
+        assert started_with(target) == "UV_PYTHON= run hpc-bridge", target
+

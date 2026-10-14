@@ -117,8 +117,12 @@ The full reference, including developer and testing knobs, is the vault's
 ### Platforms
 
 - **macOS and Linux** are supported for every path above.
-- **Windows** is untested. The SSH-bootstrap path relies on OpenSSH connection multiplexing, which
-  Windows OpenSSH does not support; the zero-SSH path may work.
+- **Windows**: CI checks that Claude Code loads the plugin and connects to its server on Windows Server (x64)
+  and Windows 11 on Arm. Using a facility from Windows has not been tested end to end. The SSH-bootstrap path
+  relies on OpenSSH connection multiplexing, which Windows OpenSSH does not support: use a facility's own
+  endpoint (zero SSH), or WSL. On Windows on Arm the plugin runs its server on an x64 Python, which Windows
+  runs under emulation, because one dependency (`cryptography`) publishes no Arm build for Windows. Set
+  `UV_PYTHON` yourself to choose another.
 - Local development against an endpoint on your own machine: run the endpoint yourself (the Globus
   Compute endpoint daemon is Linux-only: a container, WSL or a login node) and set
   `HPC_BRIDGE_ENDPOINT_ID=<uuid>`. hpc-bridge dispatches to it from any OS rather than starting one.
