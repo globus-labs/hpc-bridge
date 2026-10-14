@@ -11,6 +11,7 @@ mep_tools_install() {
   [ "$have" = "$ver" ] && return 0
   echo "[mep] installing globus-compute-endpoint==$ver into $MEP_GCE (had: ${have:-none})"
   mkdir -p "$MEP_TOOLS"
-  uv venv -q --python 3.11 "$MEP_GCE" && uv pip install -q --python "$MEP_GCE/bin/python" "globus-compute-endpoint==$ver" || return 1
+  # --clear: our own tools venv is being (re)built; uv 0.8+ refuses to replace an existing directory without it
+  uv venv -q --clear --python 3.11 "$MEP_GCE" && uv pip install -q --python "$MEP_GCE/bin/python" "globus-compute-endpoint==$ver" || return 1
   chmod -R a+rX "$MEP_TOOLS" 2>/dev/null || true
 }
