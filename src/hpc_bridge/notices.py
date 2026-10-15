@@ -304,13 +304,16 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
     word = _queue_word(app)
     asks: list[str] = []
     args: list[str] = []
-    if terms.account is None and (terms.account_required or listed):
+    # never ask for (or offer to send) what the facility would drop at the wire: it would only be refused
+    takes_account = _dropped_term_notice(app, "account", "x") is None
+    takes_partition = _dropped_term_notice(app, "partition", "x") is None
+    if terms.account is None and (terms.account_required or listed) and takes_account:
         asks.append(("which listed allocation" if listed else "which account") + " to charge")
         args.append("account=…")
-    elif terms.account is None and terms.account_source == "none_set":  # a cluster you bring: nothing curated says
+    elif terms.account is None and terms.account_source == "none_set" and takes_account:  # a cluster you bring
         asks.append("which account to charge, if their cluster charges one")
         args.append("account=…")
-    if terms.queue_source != "env":
+    if terms.queue_source != "env" and takes_partition:
         asks.append(f"whether that {word} is OK")
         args.append("partition=…")
     presets = [n for n, src in (("HPC_BRIDGE_PARTITION", terms.queue_source), ("HPC_BRIDGE_ACCOUNT",
@@ -356,16 +359,16 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     if rt.switched_terms is not None:
         uec = rt.user_endpoint_config
         if rt.switched_terms == (uec.get("partition"), uec.get("account")):
-            return out + ("Confirm spend again with the user: a partition or account switch dropped the confirmation, "
+            return out + (f"Confirm spend again with the user: a {word} or account switch dropped the confirmation, "
                           "and the terms are back to the ones it covered "
                           f"({_terms(*rt.switched_terms, word)}). Confirming "
                           "again uses that block if it is still up, or starts a new one. ")
-        out += ("Confirm spend again with the user: the partition or account has changed since spend was confirmed, "
+        out += (f"Confirm spend again with the user: the {word} or account has changed since spend was confirmed, "
                 "and that is a different block (the earlier confirmation covered only the one on "
                 f"{_terms(*rt.switched_terms, word)}). ")
     elif rt.reap_terms is not None and rt.reap_terms != (rt.user_endpoint_config.get("partition"),
                                                          rt.user_endpoint_config.get("account")):  # a switch since
-        out += "The partition or account was switched since, so a confirmation now starts a block on the new terms. "
+        out += f"The {word} or account was switched since, so a confirmation now starts a block on the new terms. "
     if app is not None and (rt.switched_terms is not None or left is not None):
         out += _switch_fate(app, left, confirmed=False)
     return out
@@ -388,7 +391,7 @@ def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool) -> str
                     "endpoint, this new one included. ")
         return (f"Nothing cancels the previous block on a switch, even one still queued: {idle}. To end it now, call "
                 "stop_endpoint before confirming the new block: it cancels this endpoint's blocks and keeps the new "
-                "partition and account for the next one. ")
+                f"{_queue_word(app)} and account for the next one. ")
     if left is None:
         return ""
     clause = _left_block_clause(left, getattr(app.facility, "scheduler", None), subject="that block")
@@ -402,8 +405,8 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     uec = rt.user_endpoint_config
     if terms is None or terms == (uec.get("partition"), uec.get("account")):
         return ""
-    return (f"This confirmation is for a new block: the partition or account changed from "
-            f"{_terms(*terms, _queue_word(app))}. "
+    word = _queue_word(app)
+    return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
             + _switch_fate(app, rt.switch_left, confirmed=True))
 
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:

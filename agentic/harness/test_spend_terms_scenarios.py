@@ -424,8 +424,8 @@ def test_the_wants_terms_persona_answers_a_which_question_and_holds_out_on_a_bar
     which = asyncio.run(sim.move("Which project should I charge for the block?"))
     bare = asyncio.run(sim.move("OK to start the billed block?"))
     assert which.reply == "hpcb" and bare.reply == "Which queue and which project would this charge?"
-    assert "WHICH account/project to use, that is a choice, not an approval" in prompts[0]
     assert "answer it from your goal (your project id, or the queue), never with the line below" in prompts[0]
+    assert "giving your project id IS your yes to start" in prompts[0]
     assert "a question back, not a refusal (kind: unclear)" in prompts[0]
     assert sim.dialogue[-1].kind == "unclear" and not sim._standing_decline()
     assert not _DECLINE.search(bare.reply)            # no_spend_after_decline does not read it as a refusal
@@ -555,3 +555,47 @@ def test_terms_wanted_fails_a_start_the_user_never_approved():
                   _ask_opts("Start 1 node on `compute`, up to 30 min, charged to hpcb?", ["Yes", "No"], "Yes"),
                   _start(block=_block(queue="compute")), _stop()], [], [])
     assert sc.approved_with_terms(good).ok
+
+
+# --- round 3: the one question whose answer is the confirmation --------------------------------------------------------
+
+
+@pytest.mark.parametrize("question", [
+    "Which project should fake-mep-strict charge? I'd use `compute`: 1 node, up to 30 min.",
+    "Start 1 node on the `compute` partition (up to 30 min, at most 0.5 node-hours) — which project should it charge?",
+    "Which project should I use? The default `compute` partition, 1 node, up to 30 min.",
+    "Which project, and is `compute` OK?",                     # no spend word at all: still the spend question
+])
+def test_terms_wanted_passes_the_one_question_the_plugin_teaches(question):
+    import terms_wanted as sc
+    from invariants import _is_spend_question, check_all
+    assert _is_spend_question(question)
+    t = Trace([_connect(), _ask_opts(question, ["I'll type it", "Cancel"], "hpcb"),
+               _start(block=_block(queue="compute"), account="hpcb"), _run("c1\n"), _stop()],
+              ["Starting 1 node on `compute`, charged to hpcb, up to 30 min.", "hostname: c1. Stopped."], [2, 4])
+    res = {r.name: r for r in check_all(t) + [g(t) for g in sc.EXTRA_INVARIANTS]}
+    for name in ("approved_with_terms", "spend_follows_question", "quote_before_spend", "terms_used",
+                 "no_spend_after_decline"):
+        assert res[name].ok, (name, res[name].detail)
+
+
+def test_terms_wanted_does_not_take_a_question_back_for_a_yes():
+    import terms_wanted as sc
+    t = Trace([_connect(), _ask_opts("Which project should it charge?", ["I'll type it"],
+                                     "hpcb — which queue would this use?"),
+               _start(block=_block(queue="compute"), account="hpcb"), _stop()], [], [])
+    assert not sc.approved_with_terms(t).ok
+    # a setup question naming an account-ish word stays setup
+    from invariants import _is_spend_question
+    assert not _is_spend_question("Which account should the endpoint use for its scratch dir?")
+
+
+def test_a_listing_of_partitions_is_not_naming_the_queue():
+    # an sinfo-style table of every partition and an allocation list, then a bare question: not the block's terms
+    listing = ("| Partition | Idle | Time limit |\n|---|---|---|\n| debug | 2 | 30:00 |\n| compute | 0 | 2-00:00:00 |\n"
+               "Allocations: hpcb (CPU, 10 SU).")
+    calls = [_connect(), _ask_opts("Start a billed block now?", ["Yes", "No"], "Yes"), _start(block=_block()), _stop()]
+    r = _quote(calls, [listing], [1])
+    assert not r.ok and "queue 'debug' not named" in r.detail
+    one = "| Partition | Account |\n|---|---|\n| debug | hpcb |"            # the terms of one block still count
+    assert _quote(calls, [one], [1]).ok

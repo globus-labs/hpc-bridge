@@ -17,7 +17,7 @@ import os
 import re
 
 from . import config
-from .catalog.entry import Allocation, CatalogEntry, Compute, Defaults
+from .catalog.entry import Allocation, CatalogEntry, Compute, Defaults, scheduler_terms_directive
 from .config import _env_endpoint_id, _require_env
 from .endpoint import EndpointCLI
 from .facility.base import Facility
@@ -309,9 +309,8 @@ def _facility_store():
 
     return FacilityStore()
 
-# A directive that charges an account or picks a partition/queue behind the spend question's back: Slurm's -A/--account
-# and -p/--partition (its -q is the QOS), PBS's -A and -q.
-_TERMS_DIRECTIVE = re.compile(r"^\s*#SBATCH\s+(?:--(?:account|partition)\b|-[Ap])|^\s*#PBS\s+-[Aq]", re.M)
+class TermsDirectiveError(ValueError):
+    """details= whose scheduler_options set the account or the partition/queue (refused: `_entry_from_details`)."""
 
 
 def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry:
@@ -322,11 +321,12 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
     if details.env_setup is None:
         raise ValueError("env_setup is missing and there is no proposal to take it from: call connect_facility with "
                          "ssh_host=… (no details) for a proposed config, or give env_setup")
-    if details.scheduler_options and _TERMS_DIRECTIVE.search(details.scheduler_options):
+    if line := scheduler_terms_directive(details.scheduler_options):
         # sent verbatim, it would charge an account or pick a queue that the block's terms (and the user) never see
-        raise ValueError("scheduler_options sets the account or the partition/queue (#SBATCH -A/--account/-p/"
-                         "--partition, #PBS -A/-q): take it out — give the partition as details' `partition` and the "
-                         "account to ensure_endpoint_up(account=…), so the spend question names what the block charges")
+        raise TermsDirectiveError(
+            f"scheduler_options sets the account or the partition/queue ({line!r}; #SBATCH -A/--account/-p/"
+            "--partition, #PBS -A/-q): take it out — give the partition as details' `partition` and the account to "
+            "ensure_endpoint_up(account=…), so the spend question names what the block charges")
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)

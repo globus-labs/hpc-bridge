@@ -667,19 +667,22 @@ def _first_word(label: str) -> str:
 
 
 def _in_queue_column(said: str, queue: str) -> bool:
-    """A markdown table whose header names the partition/queue has `queue` in that column of a row."""
+    """A markdown table whose header names the partition/queue has `queue` — and only `queue` — in that column: the
+    terms of one block, not a listing of the facility's partitions (an sinfo-style table names them all)."""
+    tables: list[set[str]] = []
     col: int | None = None
-    for line in said.splitlines():
+    for line in [*said.splitlines(), ""]:
         if not line.strip().startswith("|"):
             col = None
             continue
         cells = [_bare(c) for c in line.strip().strip("|").split("|")]
         if col is None:
             col = next((i for i, c in enumerate(cells) if re.fullmatch(rf"{_QUEUE_WORD}s?", c)), -1)
+            tables.append(set())
             continue
-        if 0 <= col < len(cells) and cells[col] == queue.lower():
-            return True
-    return False
+        if 0 <= col < len(cells) and cells[col] and not set(cells[col]) <= set("-: "):
+            tables[-1].add(cells[col])
+    return any(values == {queue.lower()} for values in tables)
 
 
 def _names_queue(said: str, block: dict, labels: tuple[str, ...] = ()) -> bool:
@@ -914,12 +917,20 @@ _NO_COST = re.compile(
     r"|\b(?:doesn'?t|does not|won'?t|will not|shouldn'?t) (?:cost|charge|bill)|\bnothing (?:is )?(?:billed|charged)", re.I)
 
 
+# A question asking WHICH project/account to charge (spend terms, 2026-10-14): the one question the skill teaches
+# ("Which project should Polaris charge? I'd use `debug` …"), whose answer is the spend confirmation.
+_WHICH_ACCOUNT_Q = re.compile(r"\b(?:which|what)\b[^?]{0,40}?\b(?:project|account|allocation)s?\b", re.I)
+
+
 def _is_spend_question(q: str) -> bool:
     """Main's rule — spend vocabulary, not vetoed by setup wording — plus (2026-10-10) a properly asked batch-job
     question: it asks to submit/run a job AND names a positive cost, which overrides the setup veto ("Submit a 2-hour
-    batch job (~2 SU) writing to your scratch dir?"). Every question main called a spend question still is one."""
+    batch job (~2 SU) writing to your scratch dir?"), and (2026-10-14) a question asking which project or account to
+    charge ("Which project, and is `compute` OK?"), under the same setup veto. Every question main called a spend
+    question still is one."""
     costed_job = bool(_JOB_ASK.search(q) and _COST_CUE.search(q) and not _NO_COST.search(q))
-    return costed_job or (bool(_SPENDY_Q.search(q)) and not _SETUP_Q.search(q))
+    spendy = bool(_SPENDY_Q.search(q) or _WHICH_ACCOUNT_Q.search(q))
+    return costed_job or (spendy and not _SETUP_Q.search(q))
 
 
 _DECLINE = re.compile(

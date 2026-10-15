@@ -366,7 +366,7 @@ def test_the_seeds_carry_their_account_hints():
     assert entries["polaris"].account_hint == "your ALCF project name, as listed in the ALCF portal (e.g. Diaspora)"
     assert "lowercased (e.g. cis250223)" in entries["anvil"].account_hint
     assert "expanse-client user -r expanse" in entries["expanse"].account_hint
-    assert "`accounts`" in entries["delta"].account_hint
+    assert "'accounts'" in entries["delta"].account_hint
     assert entries["globus-labs"].account_hint is None and entries["globus-labs"].account_required is False
     assert not any("sbank" in (e.account_hint or "") for e in entries.values())   # never point a user at sbank
     for e in entries.values():                           # every account-required entry says where to look

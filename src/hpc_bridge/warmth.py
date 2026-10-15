@@ -56,6 +56,7 @@ from .models import ShellOutcome, Submission
 from .notices import (
     _block_terms,
     _no_account_failure,
+    _queue_word,
     _spend_floor_guidance,
     _submit_rejected,
     _terms_line,
@@ -497,7 +498,8 @@ def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, 
                 "and billing the allocation")
         if epoch is not None and epoch != rt.block_epoch:  # switched since it was sent: these terms are another block
             said = (f"{head}; {_kicked_release_note(app)}. The earlier confirmation covered job {old} only, and the "
-                    "partition or account has been switched since: a confirmation now starts a block on the new terms. "
+                    f"{_queue_word(app)} or account has been switched since: a confirmation now starts a block on the "
+                    "new terms. "
                     + _terms_line(app, terms, lead="The new block's terms"))
         else:
             said = (f"{head}. Confirm spend with the user before anything runs on it; {_kicked_release_note(app)}. "

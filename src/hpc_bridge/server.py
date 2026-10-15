@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
 import os
@@ -132,6 +133,7 @@ from .notices import (  # noqa: F401 - re-exported
     _submit_rejected,
     _submit_rejected_notice,
     _switch_receipt,
+    _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
     _worker_notice,
@@ -354,11 +356,17 @@ async def _ensure_endpoint_up(
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid account {account!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
         )
-    for key, value in (("partition", partition), ("account", account)):
-        # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent
-        if value is not None and (dropped := _dropped_term_notice(app, key, value)):
-            return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
-                                  notice=dropped)
+    if partition is not None or account is not None:
+        # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
+        # startup-pinned one has not read its template yet (that happens at its first block): read it first.
+        load = getattr(app.facility, "load_template", None)
+        if inspect.iscoroutinefunction(load):
+            await load()
+        dropped = next((n for k, v in (("partition", partition), ("account", account))
+                        if v is not None and (n := _dropped_term_notice(app, k, v))), None)
+        if dropped:
+            async with app.lock:
+                return _dropped_term_status(app, shape, dropped)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -523,6 +531,27 @@ async def _ensure_endpoint_up(
         block=receipt_terms,
         notice=said(notice),
     )
+
+
+def _dropped_term_status(app: AppCtx, shape: str, dropped: str) -> EndpointStatus:
+    """A refused partition/account (the facility would drop it at the wire): nothing changed, so the answer is the
+    shape's standing state, never a `down` that would read as the block gone while it bills. A confirmed block is `up`
+    (or `provisioning` until first seen warm) on its current terms; an unconfirmed shape is the spend question for
+    those terms. No probe: a refusal sends nothing."""
+    rt = _shape_runtime(app, shape)
+    terms = _block_terms(app, rt) if _billable(rt) else None
+    uec = rt.user_endpoint_config
+    if rt.spend_confirmed or terms is None:
+        warm = rt.block_since is not None or rt.warm_confirmed_at is not None
+        stood = f" The current terms stand. {_terms_line(app, terms)}" if terms is not None else ""
+        return EndpointStatus(status="up" if warm else "provisioning", block_state="warm" if warm else "provisioning",
+                              endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
+                              partition=uec.get("partition"), account=uec.get("account"),
+                              notice=(dropped + stood).strip())
+    return EndpointStatus(status="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
+                          endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
+                          partition=uec.get("partition"), account=uec.get("account"), block=terms,
+                          notice=f"{dropped} {_needs_confirmation_notice(app, rt, terms)}")
 
 
 _T = TypeVar("_T")

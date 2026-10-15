@@ -16,14 +16,18 @@ installed plugin only when that version changes); git tags mark releases.
   The call that confirms spend carries the same `block` in its answer, once, so a start made in one call still shows
   what it started. The terms are only what the facility receives: where a facility's endpoint has no setting for the
   partition or the node count (its published template drops them), they read as the facility's own default, and a
-  partition or account it would drop is refused with a notice instead of being set.
+  partition or account it would drop is refused with a notice instead of being set — the answer then reports the
+  block as it stands (up and billing, or the spend question on its current terms), never a `down` — and the connect
+  neither asks about nor offers it. A facility named by `HPC_BRIDGE_MACHINE` reads its template before that check, so
+  its first call refuses too. On a PBS facility every one of these texts says "queue".
 - **Each registry facility says where to find your account.** A registry entry can now carry an `account_hint`, and
   the spend question and `connect_facility` pass it on, as the registry's own words: Polaris, your ALCF project name
   as the ALCF portal lists it (e.g. `Diaspora`); Anvil, your ACCESS project id in lower case (e.g. `cis250223`);
   Expanse, `expanse-client user -r expanse`, which the agent can run itself on the free login node; Delta, `accounts`
   in your own SSH session on a Delta login node. `globus-labs` needs no account. A plugin before this one ignores the
-  field. A hint is one line of plain text: control, format and bidirectional characters are dropped on read, a
-  malformed hint is dropped (never the facility), and the curator's ingest refuses either.
+  field. A hint is one line of plain text: control, format and bidirectional characters are dropped on read, double
+  quotes and backticks become single quotes and angle brackets go, a malformed hint is dropped (never the facility),
+  and the curator's ingest refuses all of these.
 - **`connect_facility` states the defaults before any spend.** Its answer gives the terms the first block would start
   on: the default queue and where it comes from, whether an account is needed (and where to find it), the nodes and
   the walltime. Nothing is started or billed by it. What fitting the configuration to a facility endpoint's template
@@ -40,9 +44,11 @@ installed plugin only when that version changes); git tags mark releases.
   again. The skill and the tool descriptions no longer say that `connect_facility` lists your allocations: no registry
   facility has a listing hpc-bridge can read.
 - **A cluster you bring may not set the account or the queue in `scheduler_options`.** `#SBATCH -A/--account`,
-  `-p/--partition` and `#PBS -A`/`-q` there would charge an account or pick a queue the spend question never names;
-  the connect now refuses them and says to give the partition in the details and the account to `ensure_endpoint_up`.
-  A registry entry's `defaults.extra` may not carry them either: dropped on read, refused at ingest.
+  `-p/--partition` (by any prefix sbatch accepts, such as `--part=`, or in a bundle such as `-vA`) and `#PBS -A`/`-q`
+  there would charge an account or pick a queue the spend question never names; the connect now refuses them and says
+  to give the partition in the details and the account to `ensure_endpoint_up`. A configuration cached from an earlier
+  session that carries one is refused with that reason. A registry entry may not set them either, in
+  `defaults.extra` or by a directive in its `scheduler_options`: dropped on read, refused at ingest.
 
 ### Fixed
 - **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
@@ -205,8 +211,12 @@ installed plugin only when that version changes); git tags mark releases.
   redundant one) and `terms_wanted`, with a new persona `wants_terms` that answers a question asking which account or
   queue, approves a spend question only when it names both the queue and the account, and otherwise asks "Which queue
   and which project would this charge?" (a question back, not a refusal). Its grader `approved_with_terms` checks
-  that the start followed a yes to a question naming both. The fake `mep` profile's catalog no longer gives the
-  account away in its description (takes effect after a cluster reset).
+  that the start followed a yes to a question naming both — counting the one question the plugin teaches ("Which
+  project should it charge? I'd use `compute` …", answered with the project id), which is now a spend question even
+  with no spend word in it. The persona takes its own project id given to such a question as its yes. A markdown
+  table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
+  fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
+  reset).
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

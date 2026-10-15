@@ -83,9 +83,10 @@ async def test_a_strict_schema_names_only_what_it_receives(monkeypatch):
 async def test_a_partition_the_facility_would_drop_is_refused_not_set(monkeypatch):
     app, _ = await _nesi(monkeypatch)
     res = await _ensure_endpoint_up(app, shape="compute", partition="gpu", account="nesi99999", confirm_spend=True)
-    assert res.status == "down" and res.block_state == "cold"
+    # nothing set, nothing started: the standing state is the spend question on the current terms (round 3)
+    assert res.status == "needs_confirmation" and res.block_state == "cold" and res.block.queue is None
     assert "this facility's endpoint takes no partition" in res.notice and "leave partition= out" in res.notice
-    assert app.compute_choice == {} and app.built == [] and not app.shapes.get("compute", None)
+    assert app.compute_choice == {} and app.built == [] and not app.shapes["compute"].spend_confirmed
 
 
 async def test_a_value_the_wire_drops_reads_as_the_facilitys_default():

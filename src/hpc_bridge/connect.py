@@ -237,6 +237,12 @@ async def _connect_facility(
                 try:
                     entry = binding._entry_from_details(facility, FacilityDetails(**cached))
                     app.session_facilities[facility] = entry
+                except binding.TermsDirectiveError as exc:  # cached before such directives were refused: say so
+                    return ConnectFacilityResult(
+                        phase="failed", facility=facility,
+                        notice=(f"the configuration cached for {facility!r} from an earlier session is no longer "
+                                f"accepted: {exc}. Connect with details= (without that directive), or with ssh_host= "
+                                "for a fresh proposal. Nothing was started."))
                 except Exception:  # noqa: BLE001 - stale/invalid cached config
                     entry = None
         if entry is None and registry_error is not None:
