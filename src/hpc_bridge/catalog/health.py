@@ -281,7 +281,8 @@ def _fresh(pyproject_text: str, python: str, names: tuple[str, ...]) -> dict[str
             raise RuntimeError("uv not found (not on PATH, and UV unset)")
         try:  # cwd + a RELATIVE path: no random temp path in an error (alert keys must be stable run to run)
             res = subprocess.run([uv, "pip", "compile", "pyproject.toml", "--python-version", python, "--quiet",
-                                  "--no-header"], cwd=d, capture_output=True, text=True, timeout=180, check=False)
+                                  "--no-header"], cwd=d, stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                                 timeout=180, check=False)
         except subprocess.TimeoutExpired:
             raise RuntimeError("uv pip compile timed out after 180 s") from None
     if res.returncode != 0:
@@ -373,7 +374,7 @@ def notify(title: str, message: str) -> None:
     if sys.platform == "darwin":
         subprocess.run(["osascript", "-e", "on run argv", "-e",
                         "display notification (item 1 of argv) with title (item 2 of argv)", "-e", "end run",
-                        message[:240], title], capture_output=True, check=False, timeout=10)
+                        message[:240], title], stdin=subprocess.DEVNULL, capture_output=True, check=False, timeout=10)
 
 
 def main(argv: list[str] | None = None) -> int:

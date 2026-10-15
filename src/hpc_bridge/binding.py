@@ -51,7 +51,8 @@ def _ssh_config_user(host: str) -> str:
     import subprocess
 
     try:
-        out = subprocess.run(["ssh", "-G", host], capture_output=True, text=True, timeout=10).stdout
+        out = subprocess.run(["ssh", "-G", host], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=10).stdout
         for line in out.splitlines():
             k, _, v = line.strip().partition(" ")
             if k.lower() == "user" and v.strip():
