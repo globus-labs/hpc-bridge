@@ -26,7 +26,7 @@ for kind, desc in KINDS.items():
     out.append(f"""- id: fake-mep-{kind}
   facility_key: fake
   facility: "hpc-bridge fake cluster"
-  description: "the fake site cluster via its facility multi-user endpoint — {desc} — zero SSH; compute-only (debug/compute/gpu, accounting enforced: account hpcb)"
+  description: "the fake site cluster via its facility multi-user endpoint — {desc} — zero SSH; compute-only (debug/compute/gpu, accounting enforced)"
   display_name: "fake cluster MEP ({kind})"
   aliases: [hpcb-mep-{kind}]
   compute_mep_uuid: {eid}

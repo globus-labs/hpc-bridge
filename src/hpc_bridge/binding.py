@@ -309,6 +309,11 @@ def _facility_store():
 
     return FacilityStore()
 
+# A directive that charges an account or picks a partition/queue behind the spend question's back: Slurm's -A/--account
+# and -p/--partition (its -q is the QOS), PBS's -A and -q.
+_TERMS_DIRECTIVE = re.compile(r"^\s*#SBATCH\s+(?:--(?:account|partition)\b|-[Ap])|^\s*#PBS\s+-[Aq]", re.M)
+
+
 def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry:
     """Build a SESSION-LOCAL CatalogEntry from user-supplied details — the Socratic fallback for a
     machine not in the catalog. provenance="session"; never written to the shared index. Identity is
@@ -317,6 +322,11 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
     if details.env_setup is None:
         raise ValueError("env_setup is missing and there is no proposal to take it from: call connect_facility with "
                          "ssh_host=… (no details) for a proposed config, or give env_setup")
+    if details.scheduler_options and _TERMS_DIRECTIVE.search(details.scheduler_options):
+        # sent verbatim, it would charge an account or pick a queue that the block's terms (and the user) never see
+        raise ValueError("scheduler_options sets the account or the partition/queue (#SBATCH -A/--account/-p/"
+                         "--partition, #PBS -A/-q): take it out — give the partition as details' `partition` and the "
+                         "account to ensure_endpoint_up(account=…), so the spend question names what the block charges")
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)

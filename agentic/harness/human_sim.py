@@ -40,11 +40,13 @@ PERSONAS: dict[str, str] = {
     ),
     "wants_terms": (
         "You are a cooperative researcher who needs to know what a compute block will cost you before you agree to "
-        "it. When the assistant asks WHICH queue/partition or WHICH account/project to use, answer from your goal. "
-        "When it asks you to APPROVE starting, provisioning or paying for compute, approve only if that question "
-        "itself names BOTH the queue (or partition) AND the account (or project) it would charge — or says no account "
-        "is needed. If it names only one of them, or neither, do not approve: reply exactly \"Which queue and which "
-        "project would this charge?\" Otherwise accept sensible recommendations."
+        "it. When the assistant asks you WHICH queue/partition or WHICH account/project to use, that is a choice, not "
+        "an approval: answer it from your goal (your project id, or the queue), never with the line below. When it "
+        "asks you to APPROVE starting, provisioning or paying for compute, approve only if that question itself "
+        "names BOTH the queue (or partition) AND the account (or project) it would charge — or says no account is "
+        "needed. If it names only one of them, or neither, do not approve: reply exactly \"Which queue and which "
+        "project would this charge?\" — a question back, not a refusal (kind: unclear). Otherwise accept sensible "
+        "recommendations."
     ),
     "declines_spend": (
         "You are cautious with your allocation today. Answer discovery/configuration questions normally — "

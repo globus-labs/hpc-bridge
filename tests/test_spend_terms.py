@@ -9,7 +9,8 @@
   none set is "none_needed" only where the registry says so.
 - A registry entry may carry `account_hint` (where a user finds the account): seed → entry → the block's terms → the
   needs_account notice and connect_facility's result.
-- connect_facility states the next block's terms before any spend, and no longer suggests confirm_spend=True.
+- connect_facility states the next block's terms before any spend, and the one question to ask: the confirming call
+  comes only after it (the user's yes is the confirmation).
 """
 import time
 from pathlib import Path
@@ -132,8 +133,9 @@ async def test_needs_account_names_the_block_and_the_hint_on_both_tools(monkeypa
     res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
     assert res.status == "needs_account" and res.block is not None
     assert (res.block.account, res.block.account_source, res.block.account_hint) == (None, "none_set", hint)
-    assert res.notice.startswith(f"Block terms: partition 'main' (the registry's default); account: none set (required "
-                                 f"here) — {hint}; 1 node")
+    assert res.notice.startswith("Block terms: partition 'main' (the registry's default); account: none set (required "
+                                 "here); 1 node for up to 02:00:00 (at most 2 node-hours). Where the user finds the "
+                                 f"account (the facility registry's words): \"{hint}\". ")
     assert "LOGIN NAME is not an account" in res.notice
     # run_shell meets the spend floor first (it never confirms), so its needs_account is the same factory's answer
     out = notices._needs_account_outcome(app, app.shapes["compute"])
@@ -172,10 +174,14 @@ async def test_a_one_call_start_carries_a_receipt(monkeypatch):
     assert res.status == "up" and res.block is not None
     assert (res.block.queue, res.block.queue_source, res.block.account, res.block.account_source) == (
         "main", "registry", "hpcb", "this_call")
-    # a status call that confirms nothing carries none; a later confirm names the choice as an earlier call's
+    # a status call that confirms nothing carries none, and neither does a poll that re-passes confirm_spend=True on
+    # the block already confirmed: it confirmed nothing new
     assert (await _ensure_endpoint_up(app, shape="compute")).block is None
     again = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
-    assert again.status == "up" and again.block.account_source == "earlier_call"
+    assert again.status == "up" and again.block is None
+    # a switch confirmed in the same call is a new block: its receipt names the new terms
+    switched = await _ensure_endpoint_up(app, shape="compute", partition="gpu", confirm_spend=True)
+    assert switched.status == "up" and (switched.block.queue, switched.block.queue_source) == ("gpu", "this_call")
 
 
 async def test_a_provisioning_confirm_carries_a_receipt(monkeypatch):
@@ -239,7 +245,7 @@ async def test_a_new_connect_forgets_the_choice(monkeypatch):
 async def test_no_account_needed_only_where_the_registry_says_so(monkeypatch):
     app, res = await _mep_app(monkeypatch, fake_mep_entry(account_required=False))
     assert (res.block.account, res.block.account_source, res.block.account_required) == (None, "none_needed", False)
-    assert "no account needed here" in notices._terms_line(app, res.block)
+    assert "no allocation account is needed — do not look for one" in notices._terms_line(app, res.block)
     # a facility you bring yourself says nothing either way: none set, the scheduler's default applies
     byo = binding._entry_from_details("mine", FacilityDetails(
         ssh_host="login.example.edu", interface="ib0", env_setup="module load x", scratch_root="/scratch/{user}",
@@ -256,8 +262,12 @@ async def test_env_presets_are_named_as_presets(monkeypatch):
     assert res.phase == "needs_account" and res.block is not None
     assert (res.block.queue, res.block.queue_source, res.block.account, res.block.account_source) == (
         "debug", "env", "chi152", "env")
-    assert ("partition 'debug' (preset by HPC_BRIDGE_PARTITION); account 'chi152' (preset by HPC_BRIDGE_ACCOUNT)"
+    assert ("partition 'debug' (the HPC_BRIDGE_PARTITION preset); account 'chi152' (the HPC_BRIDGE_ACCOUNT preset)"
             in res.notice)
+    # both presets count as the user's answer: no question, the terms are stated and the block started
+    assert "The HPC_BRIDGE_PARTITION and the HPC_BRIDGE_ACCOUNT presets count as the user's own answer." in res.notice
+    assert "State these terms to the user in one line and start: ensure_endpoint_up(confirm_spend=True)." in res.notice
+    assert "ask the user" not in res.notice
     # ...and once this session names one, it is this call's
     up = await _ensure_endpoint_up(app, shape="compute", account="chi999", confirm_spend=True)
     assert up.status == "up" and (up.block.account, up.block.account_source) == ("chi999", "this_call")
@@ -269,11 +279,11 @@ async def test_a_template_default_queue_is_named_as_the_facilitys():
     app = AppCtx(facility=f, profile=Profile())
     _runners(app)
     res = await _ensure_endpoint_up(app, shape="compute")
-    assert (res.block.queue, res.block.queue_source, res.block.walltime, res.block.max_node_hours) == (
-        None, "facility_template", None, None)
+    assert (res.block.queue, res.block.queue_source, res.block.nodes, res.block.walltime, res.block.max_node_hours) == (
+        None, "facility_template", None, None, None)
     assert res.notice.startswith("Block terms: the facility's default partition (hpc-bridge sends none); no account "
-                                 "set (the scheduler's default account applies, if it has one); 1 node for the "
-                                 "facility's default walltime.")
+                                 "set (the scheduler's default account applies, if it has one); the facility's "
+                                 "default size for the facility's default walltime.")
 
 
 def test_bring_your_own_details_say_whether_the_probe_proposed_the_partition():
@@ -377,8 +387,10 @@ async def test_an_ssh_hint_reaches_connect_with_the_defaults(monkeypatch):
     assert res.phase == "needs_account" and res.block is not None
     assert (res.block.queue, res.block.queue_source, res.block.account_required, res.block.nodes,
             res.block.walltime) == ("shared", "registry", True, 1, "00:30:00")
-    assert ("The next block's terms: partition 'shared' (the registry's default); account: none set (required here) "
-            f"— {expanse.account_hint}; 1 node for up to 00:30:00 (at most 0.5 node-hours).") in res.notice
+    assert ("The next block's terms: partition 'shared' (the registry's default); account: none set (required here); "
+            "1 node for up to 00:30:00 (at most 0.5 node-hours). Where the user finds the account (the facility "
+            f"registry's words): \"{expanse.account_hint}\".") in res.notice
+    assert res.notice.startswith("login node is up; hpc-bridge reads no allocation listing here.")
 
 
 def test_a_malformed_hint_costs_the_hint_not_the_entry():
@@ -404,7 +416,7 @@ def test_ingest_refuses_a_hint_the_client_would_drop(tmp_path, hint):
         ingest("idx", seed, _Client())
 
 
-# --- connect states the defaults and never suggests a first-call confirm ---------------------------------------------
+# --- connect states the defaults and asks before any confirm ---------------------------------------------------------
 
 
 @pytest.mark.parametrize("required", [True, False])
@@ -413,10 +425,15 @@ async def test_a_facility_endpoint_connect_states_the_defaults(monkeypatch, requ
     assert res.block is not None and (res.block.queue, res.block.walltime, res.block.nodes) == ("main", "02:00:00", 1)
     assert "Nothing is started or billed yet. The next block's terms: partition 'main' (the registry's default); " \
            in res.notice
-    assert ("account: none set (required here)" if required else "no account needed here") in res.notice
-    assert ("ask the user which account to charge and whether that partition is OK" if required
-            else "ask the user whether that partition is OK") in res.notice
-    assert "confirm_spend=True" not in res.notice
+    assert ("account: none set (required here)" if required
+            else "no allocation account is needed — do not look for one") in res.notice
+    assert res.notice.lower().count("no allocation account is needed") == (0 if required else 1)   # said once
+    assert ("ask the user in one question which account to charge, and whether that partition is OK" if required
+            else "ask the user in one question whether that partition is OK") in res.notice
+    # their yes is the spend confirmation, sent with their answer in one call — after the question, never before it
+    call = ("ensure_endpoint_up(account=…, partition=…, confirm_spend=True)" if required
+            else "ensure_endpoint_up(partition=…, confirm_spend=True)")
+    assert res.notice.index("their yes is the spend confirmation") < res.notice.index(call)
     assert "compute" not in app.shapes and app.built == []      # stating the terms built and started nothing
 
 
@@ -428,9 +445,9 @@ async def test_an_ssh_connect_states_the_defaults(monkeypatch, allocation):
     assert res.phase == "needs_account" and res.block is not None
     assert (res.block.queue, res.block.nodes, res.block.walltime, res.block.max_node_hours) == (
         "shared", 2, "00:30:00", 1.0)
-    assert "2 nodes for up to 00:30:00 (at most 1 node-hours)" in res.notice
+    assert "2 nodes for up to 00:30:00 (at most 1 node-hour)" in res.notice          # singular
     assert ("which listed allocation to charge" if allocation else "which account to charge") in res.notice
-    assert "confirm_spend=True" not in res.notice
+    assert res.notice.index("ask the user in one question") < res.notice.index("confirm_spend=True")
     assert "compute" not in app.shapes                          # only the free login shape came up
 
 
@@ -449,11 +466,16 @@ async def test_a_warming_ssh_connect_states_the_defaults_and_promises_no_listing
     res = await connect._connect_facility(app, entry.id, run_login=run_login)
     assert res.phase == "provisioning" and res.block is not None and res.block.queue == "shared"
     assert "read your allocations" not in res.notice                 # this entry lists none
-    assert "confirm_spend=True" not in res.notice
+    assert "confirm_spend" not in res.notice                         # nothing to ask yet: the login node warms
 
 
-def test_no_connect_notice_suggests_a_first_call_confirm():
-    src = (Path(connect.__file__)).read_text()
-    # every agent-facing string in connect.py; its one docstring mention (the MEP attach's) is not a notice
-    body = src.replace('confirm_spend=True), not inside connect', '')
-    assert "confirm_spend=True" not in body
+async def test_no_connect_notice_suggests_a_confirm_before_the_question(monkeypatch):
+    # every connect answer that names the confirming call puts the user's question (or, with every term said, the
+    # one-line statement) first: their yes is the confirmation, never one the agent gives itself
+    results = [(await _mep_app(monkeypatch, fake_mep_entry(account_required=r)))[1] for r in (True, False)]
+    results += [(await _ssh_connect(monkeypatch, _ssh_entry(allocation=a)))[1] for a in (True, False)]
+    for res in results:
+        n = res.notice
+        assert "confirm_spend=True" in n, n
+        first = min(i for i in (n.find("ask the user in one question"), n.find("State these terms")) if i >= 0)
+        assert first < n.index("confirm_spend=True"), n

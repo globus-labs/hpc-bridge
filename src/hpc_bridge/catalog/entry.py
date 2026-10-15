@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from typing import Any, Literal
 
@@ -141,16 +142,44 @@ def worker_env_raw_problems(raw: Any) -> list[str]:
     return problems
 
 
+def _hidden_char(ch: str) -> bool:
+    """A character an agent-facing line must not carry: a control or format character (ESC/ANSI, NUL, bidi overrides,
+    zero-width), or a line/paragraph separator."""
+    return unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+
+
 def account_hint_raw_problems(raw: Any) -> list[str]:
     """The curator's check of a seed row's RAW `account_hint`, before the lenient parse can forgive it: a hint the
-    client would drop or cut (not text, or longer than one short line) is refused at ingest, not published shortened."""
+    client would drop, cut or clean (not text, longer than one short line, a control/format character or a line break)
+    is refused at ingest, not published altered."""
     if raw is None:
         return []
     if not isinstance(raw, str) or not raw.strip():
         return [f"account_hint must be a non-empty string, got {type(raw).__name__}"]
+    if any(_hidden_char(ch) for ch in raw):
+        return ["account_hint has a control/format character or a line break: one line of plain text only"]
     if len(" ".join(raw.split())) > ACCOUNT_HINT_MAX:
         return [f"account_hint is longer than {ACCOUNT_HINT_MAX} characters"]
     return []
+
+
+def _extra_terms_keys(extra: dict | None, key_map: dict | None) -> list[str]:
+    """`defaults.extra` keys that would set the account or the partition behind hpc-bridge's own (and the block's
+    terms): `account`/`partition` themselves, or the facility template's names for them (`compute.key_map`)."""
+    names = {"account", "partition"} | {v for k, v in (key_map or {}).items() if k in ("account", "partition")}
+    return sorted(k for k in (extra or {}) if k in names)
+
+
+def defaults_extra_raw_problems(row: Any) -> list[str]:
+    """The curator's check: a seed row's `defaults.extra` must not carry the account or the partition (the client drops
+    them on read, so they would be published only to be ignored)."""
+    if not isinstance(row, dict):
+        return []
+    extra = (row.get("defaults") or {}).get("extra") if isinstance(row.get("defaults"), dict) else None
+    key_map = (row.get("compute") or {}).get("key_map") if isinstance(row.get("compute"), dict) else None
+    bad = _extra_terms_keys(extra if isinstance(extra, dict) else None, key_map if isinstance(key_map, dict) else None)
+    return [f"defaults.extra sets {bad}: the account and the partition are ensure_endpoint_up's (account=, partition=) "
+            "and defaults.partition, so the block's terms name them"] if bad else []
 
 
 def worker_env_problems(compute: Compute) -> list[str]:
@@ -389,10 +418,12 @@ class CatalogEntry(BaseModel):
     @field_validator("account_hint", mode="before")
     @classmethod
     def _lenient_hint(cls, v: Any) -> str | None:
-        # One line of plain text, bounded: anything else costs the facility its hint, never the entry.
+        # One line of plain text, bounded: control and format characters (ESC/ANSI, NUL, bidi, zero-width) are dropped
+        # and line breaks become spaces; anything not text costs the facility its hint, never the entry.
         if not isinstance(v, str):
             return None
-        text = " ".join(v.split())
+        text = " ".join("".join(" " if unicodedata.category(ch) in ("Zl", "Zp") else ch
+                                for ch in v if unicodedata.category(ch) not in ("Cc", "Cf") or ch in "\t\n\r").split())
         return text[:ACCOUNT_HINT_MAX] or None
 
     @field_validator("ssh_host")
@@ -414,6 +445,16 @@ class CatalogEntry(BaseModel):
         if v is None:
             return v
         return str(uuid.UUID(v))  # normalize to canonical lowercase hyphenated form
+
+    @model_validator(mode="after")
+    def _no_terms_in_extra(self) -> CatalogEntry:
+        """Read leniently: an account or partition in `defaults.extra` (or the template's name for one) would reach the
+        facility past ensure_endpoint_up's choice and the block's terms — drop it, keep the entry (the ingest refuses
+        it: `defaults_extra_raw_problems`)."""
+        bad = _extra_terms_keys(self.defaults.extra, self.compute.key_map)
+        if bad and self.defaults.extra is not None:
+            self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k not in bad}
+        return self
 
     @model_validator(mode="after")
     def _reachable(self) -> CatalogEntry:

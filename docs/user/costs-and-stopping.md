@@ -1,21 +1,27 @@
 # Costs and stopping
 
-## Nothing is billed without a question
+## Nothing is billed without your say-so
 
 Connecting, listing facilities, and logging in are free. Discovery on an SSH-bootstrap facility runs
-on a free login-node worker. The first thing that costs allocation is a compute block, and the agent
-asks before starting one, once, for what you have not said: which allocation account where one is needed (the
-connect says where to find yours), whether the partition is fine, and your confirmation. The question names the
-partition and the account, where each came from (the registry's default, your own choice, a preset), the number of
-nodes and the walltime. If you named the partition and the account yourself, or said "the defaults", the agent states
-them back in one line and starts. An account set with `HPC_BRIDGE_ACCOUNT` counts as named, and the agent says it is
-the preset; an account it remembers from an earlier session is only suggested, never used without asking. A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way,
-from wherever it is submitted, so it asks before that too. Changing the partition or account later means a new
-block, so it asks again, and the switch does not cancel the old block. On an SSH-bootstrap facility it idles out on
-its own, and a stop before you confirm the new block ends it at once. On a facility-run endpoint nothing can cancel
-it: the agent gives you its job id, when hpc-bridge knows it, and the command that ends it. The partition and account you chose are kept for the
-session, after a stop too. On a facility-run, compute-only endpoint there is no free tier at all, so the question
-comes at the first command.
+on a free login-node worker. The first thing that costs allocation is a compute block. Before the
+first one on a facility, the agent asks you one question, only for what you have not said: which
+allocation account to charge, where one is needed (when the registry knows where you find yours, the
+agent passes that on), and whether the partition is fine. The question names the partition and the
+account, where each came from (the registry's default, your own choice, a preset), the number of
+nodes and the walltime, and your yes is the confirmation. If you named the partition and the account
+yourself, or said "the defaults", the agent states them back in one line and starts. An account or
+partition set with `HPC_BRIDGE_ACCOUNT` or `HPC_BRIDGE_PARTITION` counts as named, and the agent says
+it is the preset; an account it remembers from an earlier session is only suggested, never used
+without asking.
+
+A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way, from wherever
+it is submitted, so it asks before that too. Changing the partition or account later means a new
+block, so it asks again, and the switch does not cancel the old block. On an SSH-bootstrap facility
+it idles out on its own, and a stop before you confirm the new block ends it at once. On a
+facility-run endpoint nothing can cancel it: the agent gives you its job id, when hpc-bridge knows
+it, and the command that ends it. The partition and account you chose are kept for the session,
+after a stop too. On a facility-run, compute-only endpoint there is no free tier at all, so the
+question comes at the first command.
 
 ## What a block costs
 

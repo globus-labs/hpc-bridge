@@ -35,7 +35,6 @@ class Submission:
 #   none_needed        the registry entry says the facility charges no account (account_required: false)
 #   none_set           none is set, and the facility requires one (the account floor) or nothing curated says
 #                      (a facility you bring yourself: the scheduler's default account applies, if it has one)
-# A walltime source, once a walltime= parameter exists, takes the same vocabulary (DefaultSource | the two choices).
 DefaultSource = Literal["registry", "env", "byo_details", "discovered", "facility_template"]
 QueueSource = Literal["registry", "env", "byo_details", "discovered", "facility_template", "this_call", "earlier_call"]
 AccountSource = Literal["this_call", "earlier_call", "env", "none_set", "none_needed"]
@@ -53,8 +52,9 @@ class TermsOrigin:
 
 class BlockTerms(BaseModel):
     """The billed block a spend question is about — or, on the call that confirmed it, the block it started (a receipt).
-    Set on needs_confirmation and needs_account (ensure_endpoint_up and run_shell), on a confirming
-    ensure_endpoint_up's up/provisioning, and on connect_facility (the next block's defaults, before any spend)."""
+    Set on needs_confirmation and needs_account (ensure_endpoint_up and run_shell), on the ensure_endpoint_up call that
+    newly confirmed spend (its up/provisioning), and on connect_facility (the next block's defaults, before any spend).
+    Only what the facility receives: a value a facility endpoint's schema drops at the wire reads as its own default."""
 
     facility: str | None = None
     queue: str | None = None                # the partition (Slurm) or queue (PBS); None: the facility's own default
@@ -63,7 +63,7 @@ class BlockTerms(BaseModel):
     account_source: AccountSource
     account_required: bool = False          # the account floor: the facility starts no block without one
     account_hint: str | None = None         # the registry entry's: where a user finds the account to charge
-    nodes: int = 1
+    nodes: int | None = 1                   # None: not sent — the facility's own default size
     walltime: str | None = None             # HH:MM:SS (Slurm's D-HH:MM:SS too); None: the facility's own default
     max_node_hours: float | None = None     # nodes × walltime in hours: what this one block can bill at most
     compute_only: bool = False              # a facility endpoint: no free login shape, every command bills
@@ -135,9 +135,9 @@ class EndpointStatus(BaseModel):
     # either way (an unconfirmed SSH cancel, an offline manager, a facility block presumed released by now, no block
     # known), and on every other result.
     spend_stopped: bool | None = None
-    # needs_confirmation / needs_account: the block the spend question is about. On a call that passed
-    # confirm_spend=True and answers up / provisioning: the block it confirmed (a receipt — a one-call start still
-    # shows what it started). None otherwise, and for the login shape (free).
+    # needs_confirmation / needs_account: the block the spend question is about. On the call that newly confirmed spend
+    # (up / provisioning): the block it confirmed (a receipt — a one-call start still shows what it started); a poll
+    # that passes confirm_spend=True again on a block already confirmed carries none. None for the login shape (free).
     block: BlockTerms | None = None
     notice: str | None = None
 
@@ -221,7 +221,7 @@ class FacilityDetails(BaseModel):
     allocation_command: str | None = Field(
         default=None,
         description="Optional: a login-node command that lists the user's allocations/balances. "
-        "Omit if the facility has none — you'll then pass account= directly.",
+        "Omit if the facility has none — the account then comes from the user (ensure_endpoint_up(account=…)).",
         examples=["mybalance", "xdusage -p <project>"],
     )
     allocation_parser: Literal["sbank", "iris", "mybalance"] | None = Field(
@@ -239,7 +239,9 @@ class FacilityDetails(BaseModel):
         default=None,
         description="Raw scheduler directives injected verbatim into the submit script (Parsl "
         "scheduler_options) — e.g. a PBS site that holds every job without a filesystems directive needs "
-        "'#PBS -l filesystems=home:eagle'. Omit if none. Multiple directives: newline-separate them.",
+        "'#PBS -l filesystems=home:eagle'. Omit if none. Multiple directives: newline-separate them. Never the "
+        "account or partition/queue (#SBATCH -A/-p, #PBS -A/-q): those are ensure_endpoint_up(account=…) and "
+        "`partition`, so the spend question names them.",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")
@@ -255,7 +257,8 @@ class FacilityDetails(BaseModel):
 
 
 class ConnectFacilityResult(BaseModel):
-    # needs_account: login node is up; `allocations` are the choices -> ensure_endpoint_up(account=…).
+    # needs_account: the facility is bound (an SSH facility's login node is up); `block` holds the first block's terms
+    # and `allocations` the choices where the facility lists them -> ask the user, then ensure_endpoint_up(account=…).
     # provisioning: login node still warming (call again). needs_facility_details: not in the catalog
     # and no SSH host to probe -> supply `details` (or an ssh_host to discover them).
     # proposed_facility_details: probed the login node -> `proposed_details` is a draft to confirm

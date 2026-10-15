@@ -15,21 +15,24 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1455 passed, 4 skipped**; agentic harness hermetic tests **559 passed** (the CI list: 522). The live tier has
+Unit tier **1495 passed, 4 skipped**; agentic harness hermetic tests **571 passed** (the CI list: 534). The live tier has
 **59 scenarios** and a local **fake cluster with 10 profiles** (`default site mep totp pbs lmod f2b polaris internal
 hostile`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
 ## Where it stands (2026-10-14) — the spend question names the block
 
 - Every spend answer (`ensure_endpoint_up`, `run_shell`) carries `block` (`BlockTerms`: queue and account with their
-  sources, nodes, walltime, max node-hours, compute-only) and leads its notice with it; a confirming call carries it as
-  a receipt; `connect_facility` states the next block's terms and no longer suggests a first-call confirm. The skill
-  asks once, only for what the user hasn't said (vault `Concepts/Resource shapes & the spend floor.md`).
+  sources, nodes, walltime, max node-hours, compute-only — only what the facility receives) and leads its notice with
+  it; the call that newly confirms carries it as a receipt; `connect_facility` states the next block's terms and asks
+  for one question whose yes is the confirmation. The skill asks once, only for what the user hasn't said (vault
+  `Concepts/Resource shapes & the spend floor.md`).
 - **Registry: re-ingest four entries** for their new `account_hint` (until then the live index serves none and
   `hpc-bridge-registry-health` reports them "differs"): `hpc-bridge-catalog 6ff95fb8-1113-42be-a811-3d1cb5a67bd5
   src/hpc_bridge/catalog/seed/<file>` for `alcf-polaris.yaml`, `anvil.yaml`, `ncsa-delta.yaml`, `sdsc-expanse.yaml`
   (`globus-cluster.yaml` is unchanged). No other field moved, so `last_validated` stays.
 - Not yet run live: `terms_prestated` / `terms_wanted` (fake `mep`, persona cells) and the `quote_before_spend` grader.
+  The fake `mep` catalog's description no longer names the account: reset the cluster (`--reset-cluster`) before
+  those cells, since `setup.d/login-mep.sh` installs the script.
 
 ## Where it stands (2026-10-09) — hackathon readiness
 

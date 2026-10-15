@@ -277,7 +277,9 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 > ask-once rule) are built. Item 9 exists: `terms_prestated` and `terms_wanted` on fake `mep` (persona `wants_terms`),
 > and the universal grader `quote_before_spend` (report-only unless a scenario's EXPECT_OK names it; report-only in
 > benchmark mode). Of the persona-pack graders, `quote_before_spend` and `terms_used` were built as listed;
-> `no_redundant_terms_question` also counts a prose question (an ACP operator asks in prose).
+> `no_redundant_terms_question` also counts a prose question (an ACP operator asks in prose), and `terms_wanted` gates
+> `approved_with_terms` (the start followed a yes to a question naming both terms). The phrasing graders are not graded
+> where an operator's record leaves the agent's texts unplaced (hermes, claude-acp, the CLI operators).
 
 **The endpoint-install fix (branch `fix/env-setup-verify-install`, unmerged): no scenarios.**
 - A broken venv repaired in place: none. The vault planted a break by hand (`mv`, never an append, because of the uv hardlinks). The pool users on globus1 are the live instance.

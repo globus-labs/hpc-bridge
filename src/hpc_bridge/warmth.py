@@ -458,12 +458,14 @@ def _guard_refusal(out: ShellOutcome, guard: session_shell.Guard) -> session_she
 
 def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, guard: session_shell.Guard,
                          refused: session_shell.Refusal, *, reset: bool = False,
-                         at: float | None = None) -> ShellOutcome:
+                         at: float | None = None, epoch: int | None = None) -> ShellOutcome:
     """A command the guard refused: it reached another scheduler job than the block it was sent for (`guard.job`), and
     did NOT run. While that block is still the confirmed one, this is the reap `_confirm_worker` makes when a different
     job answers a check, found by the command instead: kicked (the replacement is up and billing), the old block banked
     to the latest it could have lived, spend asked again, the replacement not adopted until the user confirms it.
-    `runtime`: the shape runtime the command was sent on (None: the current one) — a released one is never marked."""
+    `runtime`: the shape runtime the command was sent on (None: the current one) — a released one is never marked.
+    `epoch`: its runtime's block_epoch when it was sent — a partition/account switch since means the terms the answer
+    names are the next block's, not the replacement's it reached."""
     rt = app.shapes.get(shape)
     what = "reset_session" if reset else "command"
     old = guard.job
@@ -490,13 +492,19 @@ def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, 
         _saw_job(app, refused.job, seen)
     if not rt.spend_confirmed:  # this reap, or one a check or another command found first
         terms = _block_terms(app, rt)
+        head = (f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
+                f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already running "
+                "and billing the allocation")
+        if epoch is not None and epoch != rt.block_epoch:  # switched since it was sent: these terms are another block
+            said = (f"{head}; {_kicked_release_note(app)}. The earlier confirmation covered job {old} only, and the "
+                    "partition or account has been switched since: a confirmation now starts a block on the new terms. "
+                    + _terms_line(app, terms, lead="The new block's terms"))
+        else:
+            said = (f"{head}. Confirm spend with the user before anything runs on it; {_kicked_release_note(app)}. "
+                    f"The earlier confirmation covered job {old} only. " + _terms_line(app, terms))
         return _with_spend(app, ShellOutcome(
             phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold", block=terms,
-            notice=(f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
-                    f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already "
-                    "running and billing the allocation. Confirm spend with the user before anything runs on it; "
-                    f"{_kicked_release_note(app)}. The earlier confirmation covered job {old} only. "
-                    + _terms_line(app, terms) + _spend_floor_guidance(app))))
+            notice=said + _spend_floor_guidance(app, terms)))
     # a late result: spend was confirmed again after this command was sent — for whichever block is up now
     now_on = f" (now for job {rt.block_job})" if rt.block_job is not None else ""
     return _with_spend(app, ShellOutcome(
@@ -771,7 +779,7 @@ def _settle_refusals(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
                 and (h.runtime is None or h.runtime is rt)
                 and (refused := _guard_refusal(_finished_outcome(h), h.guard)) is not None):
             was = rt.reaped
-            _wrong_block_outcome(app, shape, rt, h.guard, refused, reset=h.reset, at=h.done_at)
+            _wrong_block_outcome(app, shape, rt, h.guard, refused, reset=h.reset, at=h.done_at, epoch=h.epoch)
             if was is None and rt.reaped is not None:
                 rt.reap_told = False
 
@@ -1065,7 +1073,7 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
     if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
         return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,
-                                    at=handle.done_at)
+                                    at=handle.done_at, epoch=handle.epoch)
     current = app.shapes.get(handle.shape)
     # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
     # (a released runtime, or a switch since it was sent: the same runtime now stands for another block)

@@ -372,8 +372,8 @@ async def _connect_facility(
             reused=reused,
             allocations=[],
             block=terms,
-            notice=reuse_note + "login node is up; this facility has no allocation listing, so an account comes from "
-            "the user. " + (_connect_terms_note(app, terms) if terms is not None else ""),
+            notice=reuse_note + "login node is up; hpc-bridge reads no allocation listing here. "
+            + _connect_terms_note(app, terms),
         )
     out = await run_login(entry.allocation.command)
     if out.phase != "complete" or out.exit_code != 0:
@@ -390,8 +390,9 @@ async def _connect_facility(
         reused=reused,
         allocations=allocations,
         block=terms,
-        notice=reuse_note + "login node is up; your allocations are listed (`allocations`). "
-        + (_connect_terms_note(app, terms, listed=bool(allocations)) if terms is not None else ""),
+        notice=reuse_note + ("login node is up; your allocations are listed (`allocations`). " if allocations else
+                             "login node is up; the allocation listing returned none. ")
+        + _connect_terms_note(app, terms, listed=bool(allocations)),
     )
 
 def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, same: bool, old_mep: bool) -> str:
@@ -439,13 +440,14 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
     if getattr(fac, "display_name", None) or getattr(fac, "endpoint_version", None):
         tmpl = (f"Facility endpoint: {getattr(fac, 'display_name', None) or 'unnamed'}"
                 + (f" (v{fac.endpoint_version})" if getattr(fac, "endpoint_version", None) else "") + ". ")
+    # Read the terms first: fitting the config to the facility's schema notes what it drops (a key the schema has no
+    # place for) and how the worker is pinned — said here, before any spend, with the facility's other notes.
+    terms = _next_block_terms(app)
     notes = list(getattr(fac, "template_notes", []) or [])
     if notes:
         tmpl += "; ".join(notes) + ". "
-    terms = _next_block_terms(app)  # after the notes are read: fitting the config may add one, said at the first block
-    how = "" if getattr(fac, "account_required", True) else (
-        "NO allocation account is needed at this facility — do not look for one. ")
-    how += _connect_terms_note(app, terms) if terms is not None else ""
+    where = ("Allocation names and balances come from the facility's own allocation tool/portal or your own SSH "
+             "session, not from here. " if getattr(fac, "account_required", True) else "")
     return ConnectFacilityResult(
         phase="needs_account",
         facility=facility,
@@ -458,9 +460,8 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
             "terminal NO ACCOUNT then, nothing billed). This "
             "channel is COMPUTE-ONLY: hpc-bridge reaches the facility only through its compute endpoint — the "
             "facility's login nodes exist but are outside this channel, so there is no free login shape here and "
-            "every command runs on a billed scheduler block that stays warm between calls. Allocation names and "
-            "balances come from the facility's own allocation tool/portal or your own SSH session, not from here. "
-            + how
+            "every command runs on a billed scheduler block that stays warm between calls. "
+            + where + _connect_terms_note(app, terms)
         ),
     )
 
