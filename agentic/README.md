@@ -35,6 +35,8 @@ agentic/
     midrun_hooks.py      ← MIDRUN_HOOKS: when a hook is due (after a result, or DURING a call), what it does, and
                            which operator can serve it (see "Mid-run hooks" below)
     provenance.py        ← per-run provenance bundle writer (see runs/)
+    infra.py             ← the INFRA verdict: the operator produced nothing to grade because its model endpoint failed
+    alcf_probe.py        ← run_smoke.sh's check that the ALCF endpoint answers, before a free operator's cell
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
@@ -96,6 +98,44 @@ start order; `harness:trace_complete` gates on every journal row being accounted
 it (`native`, `text`, `final`, `journal`, `relay`), so `regrade.py` replays it. The server runs from this checkout
 (`uv run`); the users' `uvx --from git+…` path is covered by `agentic/install_check/`, the clean-container check of the
 install recipes.
+
+**INFRA: the model endpoint failed, not hpc-bridge.** ALCF's endpoint can be slow or broken for hours (2026-10-14/15:
+its streaming path answered HTTP 200 carrying `StreamingTimeoutError`; Pi then ended with an empty answer and no tool
+call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … like a product regression. Now:
+- **Before the cell**, `run_smoke.sh` asks the endpoint one tiny chat completion (`harness/alcf_probe.py`), the way the
+  operator will: streamed for `pi` and `hermes21`, plain for `codex` and `hermes` (Codex's relay calls `/responses`
+  unstreamed; the plain chat probe stands in for the same endpoint). Healthy means HTTP 200, a `finish_reason`, and no
+  error object in the answer. If it is down (a 5xx, 408 or 429, an error object, no `finish_reason`, a timeout, an
+  answer cut off), the probe asks again every 30 s for up to `HPCB_ALCF_WAIT_S` seconds (default 0: one probe; at most
+  14400 — 4 h; anything else, `inf` included, refuses the cell). If it is still down, the cell is not launched: the
+  bundle says `result: INFRA` with the probe's reason ("ALCF streaming unhealthy: …"), and the exit code is 4. A
+  request the endpoint refuses as wrong — any other 4xx (an expired bearer, a model-name typo, no streaming offered)
+  or no bearer at all — is not an outage: `RESULT: SETUP FAILED — …`, exit 2, nothing waited for, no bundle. The
+  bearer reaches the probe through the environment, never its argv, and is never printed or written.
+- **After the cell**, run.py records `RESULT: INFRA: <reason>` (exit code 4, the bundle's `result: "INFRA"` and
+  `infra_reason`) instead of FAILED only on POSITIVE evidence of an outage, when the agent did nothing:
+  - no tool call of any kind (hpc-bridge's or the operator's own shell, read, search): anything the agent did is
+    evidence and is graded — a raw-SSH workaround before an endpoint death still fails `no_ssh_workaround`;
+  - and one of: the error the operator's own record says its run ENDED on is an outage (Pi's last `message_end` /
+    `auto_retry_end`, Codex's `turn.failed`: an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); the final
+    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
+    badly (non-zero exit, an error, an empty answer) AND the last line of the operator's stderr names an outage (an
+    earlier line may be a retry it recovered from).
+
+  Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those), even one
+  that quotes a 5xx later in its message; a turn
+  the harness cut off (rc 124 — its partial output is kept and graded); an MCP server that failed to start (Codex
+  exits 1 on an hpc-bridge boot crash: `agent_engaged`'s to catch); an error the operator recovered from; an HTTP
+  status the agent merely quotes in prose; and any run whose safety floor, world checks or harness checks
+  (`harness:no_manager_after_teardown`, `harness:trace_complete`, `harness:midrun_hooks`, …) failed. The Claude
+  operators are INFRA only when the API itself ended the run with a server error (5xx, overloaded); a 429 stays
+  RATE_LIMITED. `regrade.py` derives the same verdict from a stored bundle (`harness/infra.py` holds the rule).
+
+Exit codes of `run.py`, which `run_smoke.sh` passes on: **0** OK · **1** FAILED (or CRASHED) · **2** SETUP FAILED,
+SKIPPED or an unknown scenario · **3** RATE_LIMITED (the suite halts) · **4** INFRA, also from the probe (counted
+apart: `run_suite.py`'s summary reads `3/4 passed · 1 infra`, and pass rates leave INFRA cells out) · **130**
+INTERRUPTED. `run_suite.py` counts exit 2 apart too (`· 1 setup failed`, or `skipped` for run.py's SKIPPED): the
+cell never ran, so it is in no pass rate, and the suite still exits non-zero. `run_smoke.sh`'s own refusals before any cell (no token, a cell the target cannot run) exit 1.
 
 **Targets.** `--target globus1` (default) is the lab cluster; `--target fake` is `agentic/fakecluster/` — a local compose
 Slurm cluster the suite brings up itself (`--reset-cluster` wipes it first). Every SSH scenario runs on either; the
@@ -204,7 +244,9 @@ index; after the turn ends, the journal is read once more, so a hook due on the 
 
 The sweep's free wave: `HPCB_OPERATOR=pi agentic/sweep_profiles.sh` leaves out `paid_only()` — the cells those
 operators cannot drive (a persona, PHASES, a hook that needs the interrupt) — and says which, per profile, in the
-summary; the default (Claude) wave runs them.
+summary; the default (Claude) wave runs them. `--operators pi,codex,hermes21` runs the free wave for several operators
+with each profile booted once; `--paid-only` runs only the `paid_only()` cells, on the Claude operator
+(`fakecluster/README.md`, "The profile sweep").
 
 **`first_result_s`** (REPORTED; `happy_path` and `fake_mep_compute` list it, nothing gates it yet): seconds from the
 first `connect_facility` call to the first completed compute `run_shell` in the same session — #173's first-result
@@ -364,8 +406,8 @@ LOCAL_SETUP = ["ssh … nobody@login true"]  # optional: commands run INSIDE THE
                                         #   world — e.g. burn fail2ban's budget from this address); a failure aborts the run
 SETUP = [{"cmd": "…", "on": "each_login"}]  # SETUP/CLEANUP entries may be dicts fanning out to every login node
 ```
-Every bundle's `record.json` (schema 2) carries `result` (OK | FAILED | RATE_LIMITED | SETUP FAILED | CRASHED),
-`failed` (the gating checks that broke), `gating` (which checks decided), a `gating` flag per grading row, and
+Every bundle's `record.json` (schema 2) carries `result` (OK | FAILED | INFRA | RATE_LIMITED | SETUP FAILED | CRASHED |
+INTERRUPTED), `infra_reason` (why an INFRA cell is one; null otherwise), `failed` (the gating checks that broke), `gating` (which checks decided), a `gating` flag per grading row, and
 harness rows (`run_completed`, `rate_limited`, `harness:prose_followups`) — so a bundle explains its own verdict
 and `regrade.py --strict` can re-derive it. `config.build` is the image's `git describe` (what actually ran);
 `config.git_sha`/`host_head` is the host's HEAD at launch; `image_id`, `sdk_version`, `human_sim_model` are recorded.

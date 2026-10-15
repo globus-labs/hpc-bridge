@@ -305,18 +305,16 @@ class HumanSim:
     nudges: int = 0
     followups_capped: bool = False
     nudges_capped: bool = False
-    # Scripted personas (SCRIPTED_CODE_PERSONAS): how many code requests the script has answered, how many of the
+    # Scripted personas (SCRIPTED_CODE_PERSONAS): how many code requests the script has answered, and how many of the
     # `answers` above were scripted (they do not count against MAX_PROSE_FOLLOWUPS: the scenario provokes them, so
-    # three of them are not an agent looping), and whether the LAST `reply` was scripted (the Claude runner's prose
-    # loop reads it for the same reason).
+    # three of them are not an agent looping).
     code_requests: int = 0
     scripted_answers: int = 0
-    last_reply_scripted: bool = False
     code_given: bool = False   # the script has handed over the CURRENT code (it then answers only a rejection)
 
     async def _ask(self, prompt: str, system: str) -> str:
         """One no-tools, single-turn query to the human-sim model; returns its text. The ONLY SDK touchpoint — every
-        path (answer, reply, reply_hermes, move) goes through it, so tests stub this one method and drive the real
+        path (answer, move) goes through it, so tests stub this one method and drive the real
         prompts, parses, scripts and guards."""
         from claude_agent_sdk import ClaudeAgentOptions, query  # type: ignore[import-not-found]
 
@@ -406,64 +404,6 @@ class HumanSim:
                    for q in questions if str(q.get("question", "")) in answers}
         self.dialogue.append(Exchange(questions=questions, answers=answers, note=note, scripted=bool(scripted)))
         return answers
-
-    async def reply(self, assistant_text: str) -> str:
-        """A short in-persona reply to a turn the agent ended with a PROSE question (no tool call)."""
-        said = (assistant_text or "").strip()[-2500:]
-        q = [{"question": said[-500:], "prose": True}]
-        scripted = self._scripted_code_reply(said)
-        self.last_reply_scripted = scripted is not None
-        if scripted is not None:
-            self.dialogue.append(Exchange(questions=q, answers={"reply": scripted}, scripted=True,
-                                          note=f"(prose follow-up: the agent asked in text) [scripted ({self.persona}): "
-                                               f"code request {self.code_requests}]"))
-            return scripted
-        prompt = (
-            "You are role-playing a HUMAN USER in a chat with an assistant that is operating an HPC "
-            f"cluster for you.\n\nYOUR PERSONA: {PERSONAS.get(self.persona, self.persona)}\n\n"
-            f"YOUR GOAL: {self.goal}{self._authenticator()}\n\nTHE ASSISTANT JUST SAID:\n{said}\n\n"
-            "Reply as the user in one or two plain sentences that answer what it asked (no JSON, no preamble). "
-            "If it asked you to confirm proposed settings and you have no reason to doubt them, say so plainly."
-        )
-        text = await self._ask(prompt, "Answer as the role-played user. Output ONLY your reply.")
-        reply = " ".join(text.split())[:600]
-        if not reply:  # never a fabricated approval: a neutral nudge back to a proper question
-            reply = "I can't tell from that — please ask me with a clear multiple-choice question."
-        self.dialogue.append(Exchange(questions=q, answers={"reply": reply}, note="(prose follow-up: the agent asked in text)"))
-        return reply
-
-    async def reply_hermes(self, assistant_text: str) -> tuple[str, str, str]:
-        """Like ``reply`` but for the hermes operator (all its questions are prose), and it ALSO classifies the
-        exchange for diagnostics: is the reply answering a reasonable question, CORRECTING a genuine operator
-        mistake, DECLINING spend per persona, or nudging an UNCLEAR question? The human-sim (a capable model)
-        makes that judgement — the point of the weaker-operator study is to separate 'passed after corrections'
-        from a clean run, and looping from a wrong call. Returns (reply, kind, reason) and records the Exchange."""
-        said = (assistant_text or "").strip()[-2500:]
-        scripted = self._scripted_code_reply(said)
-        if scripted is not None:
-            reason = f"scripted ({self.persona}): code request {self.code_requests}"
-            self.dialogue.append(Exchange(questions=[{"question": said[-500:], "prose": True}],
-                                          answers={"reply": scripted}, note=f"(hermes prose: {reason})", kind="answer",
-                                          scripted=True))
-            return scripted, "answer", reason
-        prompt = (
-            "You are role-playing a HUMAN USER in a chat with an assistant operating an HPC cluster for you.\n\n"
-            f"YOUR PERSONA: {PERSONAS.get(self.persona, self.persona)}\n\nYOUR GOAL: {self.goal}"
-            f"{self._authenticator()}\n\nTHE ASSISTANT JUST SAID:\n{said}\n\n"
-            "Reply as the user, then classify the exchange. Reply with ONLY a JSON object:\n"
-            '{"reply": "<one or two plain sentences answering what it asked — no preamble>", '
-            '"kind": "<answer|correction|decline|unclear>", "reason": "<one short clause: why that kind>"}\n'
-            "kind meanings: answer = it asked a reasonable question and you answered; correction = it made a "
-            "GENUINE MISTAKE (wrong setting, misread your request, wrong partition/account, a nonsensical step) "
-            "and your reply points that out; decline = you are refusing to spend/provision per your persona (an "
-            "expected choice, NOT an operator error); unclear = it asked vaguely or you can't tell what it wants."
-        )
-        text = await self._ask(prompt, "Answer as the role-played user. Output ONLY the JSON object.")
-        reply, kind, reason = self._parse_reply(text)
-        self.dialogue.append(Exchange(questions=[{"question": said[-500:], "prose": True}],
-                                      answers={"reply": reply}, note=f"(hermes prose: {reason})" if reason else
-                                      "(hermes prose follow-up)", kind=kind))
-        return reply, kind, reason
 
     # ---- the turn policy: what does the user do after THIS operator turn? -----------------------------------------
 
@@ -592,23 +532,6 @@ class HumanSim:
         else:
             self.dialogue.append(Exchange(questions=q, answers={}, note=f"(concluded: {move.reason})", kind=CONCLUDE_KIND))
         return move
-
-    @staticmethod
-    def _parse_reply(text: str) -> tuple[str, str, str]:
-        """Parse the reply_hermes JSON; fall back to a SAFE, NON-approving reply on unparseable output."""
-        m = _ANSWER_RE.search(text or "")
-        if m:
-            try:
-                obj = json.loads(m.group(0))
-                reply = " ".join(str(obj.get("reply", "")).split())[:600]
-                kind = str(obj.get("kind", "")).strip().lower()
-                if reply:
-                    return reply, (kind if kind in EXCHANGE_KINDS else "answer"), str(obj.get("reason", ""))[:160]
-            except json.JSONDecodeError:
-                pass
-        # never fabricate an approval: a neutral nudge back to a clear question, classified unclear
-        return ("I can't tell from that — please ask me with a clear, specific question.", "unclear",
-                "human-sim parse fallback")
 
     @staticmethod
     def _parse(text: str, questions: list[dict]) -> tuple[dict[str, str], str]:

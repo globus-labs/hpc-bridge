@@ -399,6 +399,48 @@ installed plugin only when that version changes); git tags mark releases.
   cancel on PBS now takes only the pool user's own jobs (with other users' jobs visible, it had sent the mapped
   account's pilot to a `qdel` that was refused and still said "cancelled"), and on both schedulers it reports what
   the cancel answered.
+- **INFRA: a cell whose model endpoint failed is no longer graded FAILED.** On 2026-10-14/15, ALCF's streaming
+  endpoint answered HTTP 200 carrying `StreamingTimeoutError`. Pi then ended with an empty answer and no tool call, and
+  each such cell failed `agent_engaged`, `compute_ran` and the rest, like a product regression. Now `run.py` records
+  `RESULT: INFRA: <reason>` (exit code 4; the bundle's `result` is `INFRA` and its new `infra_reason` field says why).
+  INFRA needs positive evidence of an outage, and the agent must have done nothing. The cell made no tool call of any
+  kind, and one of these holds:
+  - the error the operator's own record says the run ended on is an outage: an HTTP 5xx or 429, a timeout, a dead
+    stream, or Codex's "high demand" (Pi's last `message_end` / `auto_retry_end`, Codex's `turn.failed`);
+  - the final answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`);
+  - the run ended badly (non-zero exit, error, empty answer) and the last line of the operator's stderr names an
+    outage (an earlier line may be a retry it recovered from).
+
+  Never INFRA: a 4xx (a context overflow or an invalid tool schema, which hpc-bridge's own tools can cause), even one
+  quoting a 5xx later in its message, a turn the
+  harness cut off (rc 124), an MCP server that failed to start, an error the operator recovered from, a status code the
+  agent quotes in prose, or a run whose safety floor, world checks or harness checks failed. The Claude operators are
+  INFRA only on an API server error (5xx, overloaded). `regrade.py` derives the same verdict from a stored bundle. Of
+  the 787 stored bundles, 2 that main grades FAIL are INFRA: Pi's stream failure (`1792038870-65654`) and Codex's "high
+  demand" (`1791565794-1344`); nothing else changed. `run_suite.py` counts INFRA cells apart (`3/4 passed · 1
+  infra`) and leaves them out of the pass rates, as it now does for a cell that never ran (exit 2: `· 1 setup
+  failed`, or `skipped` for run.py's SKIPPED). A CLI operator's turn that times out now keeps what it printed, so
+  Pi's calls before the deadline are graded.
+- **`run_smoke.sh` checks the ALCF endpoint before a free operator's cell** (`agentic/harness/alcf_probe.py`). It sends
+  one tiny chat completion, streamed for `pi` and `hermes21`, plain for `codex` and `hermes`, as each operator asks.
+  Healthy means HTTP 200, a `finish_reason`, and no error in the answer. If the endpoint is down (a 5xx, 408 or 429, an
+  error in the answer, no `finish_reason`, a timeout, an answer cut off), the probe tries again every 30 s for up to
+  `HPCB_ALCF_WAIT_S` seconds (default 0: once; at most 4 h). If it is still down, the cell is not launched: its bundle is
+  INFRA with the probe's reason, and the exit code is 4. A request the endpoint refuses as wrong (another 4xx: an
+  expired bearer, a model-name typo) is SETUP FAILED, exit 2, with no wait. The bearer goes to the probe through the
+  environment, never its argv, and is redacted from anything it prints or writes.
+- **`sweep_profiles.sh --operators pi,codex,hermes21`** runs the free wave for several operators with each profile
+  booted once: 10 cluster boots for the three operators, not 30. Each summary row names its operator, each
+  profile+operator has its own log, and an operator listed twice is refused. **`--paid-only`** runs only the
+  `paid_only()` cells on the Claude operator (18 cells on 6 profiles), and does not boot a profile without one. The
+  summary ends with totals per operator: OK, FAILED, INFRA, SETUP FAILED, CRASHED (no RESULT line) and other. Without
+  the flags the sweep runs as before.
+- The simulated user's unused prose paths (`HumanSim.reply`, `reply_hermes`, `_parse_reply`, `last_reply_scripted`)
+  are gone; since #197 every runner asks `HumanSim.move`. Their tests went with them, except one: the check that only
+  a rejected code is answered by the script again now drives `move`.
+- Hermetic tests: `agentic/harness/test_infra.py` and `test_alcf_probe.py` (both in the CI list; the probe's HTTP
+  layer, clock and sleep are stubbed, and `run_smoke.sh` runs with stub `uv` and `docker`), and the sweep's loop in
+  `test_sweep_script.py` with stub `run_suite.py` and `run_smoke.sh`.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

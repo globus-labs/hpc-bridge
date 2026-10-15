@@ -29,6 +29,7 @@ SMOKE = REPO / "agentic" / "run_smoke.sh"
 sys.path.insert(0, str(REPO / "agentic" / "harness"))
 import targets  # noqa: E402  (the cluster a run targets: globus1 | fake)
 from cluster_ops import delete_endpoint_cmd, endpoint_uuid_cmd, scoped_cancel_cmd, uep_dirs_cleanup_cmd  # noqa: E402
+from infra import INFRA_RC  # noqa: E402  (a cell whose model endpoint failed: counted apart, never as a pass or a fail)
 from pool import NodeLaunches, PoolClaims  # noqa: E402  (cross-process pool-user + node claims — see pool.py)
 
 POOL = [f"hpcbridge-test-{i:02d}" for i in range(10)]
@@ -403,20 +404,42 @@ async def _run_job(scenario, model, effort, persona, ablate, claims, sem, stagge
             inflight.pop(runid, None)  # the cell ran to its own teardown
         text = out.decode(errors="replace")
         ok = proc.returncode == 0
+        infra = proc.returncode == INFRA_RC   # INFRA (run.py, or run_smoke.sh's ALCF probe): the model endpoint failed
         if proc.returncode == 3:  # RATE_LIMITED (run.py) — stop launching new jobs
             halt.set()
             print(f"⛔ halt   {label} hit the session/rate limit — skipping remaining jobs",
                   flush=True)
         result = next((ln for ln in text.splitlines() if ln.startswith("RESULT:")),
                       f"(no RESULT line; rc={proc.returncode})")
-        print(f"{'✓' if ok else '✗'} done   {label} — {result}", flush=True)
+        # exit 2: the cell never ran — run.py's SKIPPED (an operator that cannot drive it) or a SETUP FAILED (its world
+        # precondition, or the ALCF probe's refused request): counted apart, never in a pass rate
+        not_run = proc.returncode == 2
+        skipped = not_run and result.startswith("RESULT: SKIPPED")
+        print(f"{'✓' if ok else '⚠' if infra else '⏭' if skipped else '✗'} done   {label} — {result}", flush=True)
         return {"scenario": scenario, "model": model, "effort": effort, "persona": persona,
                 "ablate": ablate, "user": user, "ok": ok,
-                "skipped": False, "rate_limited": proc.returncode == 3,
+                "skipped": skipped, "setup_failed": not_run and not skipped,
+                "rate_limited": proc.returncode == 3, "infra": infra,
                 "result": result, "output": text}
     finally:
         claims.release(user)
         sem.release()
+
+
+_APART = (("rate_limited", "rate-limited"), ("infra", "infra"), ("setup_failed", "setup failed"), ("skipped", "skipped"))
+
+
+def _graded(results: list[dict]) -> list[dict]:
+    """The cells that count toward pass rates: not skipped, not rate-limited, not INFRA (the model endpoint failed —
+    the run says nothing about hpc-bridge), not SETUP FAILED (the cell never ran)."""
+    return [r for r in results if not any(r.get(k) for k, _ in _APART)]
+
+
+def _summary_line(results: list[dict]) -> str:
+    """`3/4 passed · 1 infra · 1 setup failed · 2 skipped`: the graded cells' pass count, then the cells counted apart."""
+    graded = _graded(results)
+    apart = [(sum(1 for r in results if r.get(k)), label) for k, label in _APART]
+    return f"{sum(1 for r in graded if r['ok'])}/{len(graded)} passed" + "".join(f" · {n} {label}" for n, label in apart if n)
 
 
 async def _fake_cluster_up(reset: bool, profile: str) -> bool:
@@ -549,12 +572,11 @@ async def _main(args) -> int:
     finally:
         claims.release_all()
 
+    print(f"\n==== SUITE: {_summary_line(results)} ====")
     skipped = [r for r in results if r.get("skipped")]
-    limited = [r for r in results if r.get("rate_limited")]
-    graded = [r for r in results if not r.get("skipped") and not r.get("rate_limited")]
+    infra = [r for r in results if r.get("infra")]
+    graded = _graded(results)
     passed = sum(1 for r in graded if r["ok"])
-    extra = (f" · {len(limited)} rate-limited" if limited else "") + (f" · {len(skipped)} skipped" if skipped else "")
-    print(f"\n==== SUITE: {passed}/{len(graded)} passed{extra} ====")
     cells: dict[str, list[bool]] = {}
     for r in graded:
         key = (_cell(r["model"], r["effort"]) + (f" [{r['persona']}]" if r.get("persona") else "")
@@ -564,6 +586,10 @@ async def _main(args) -> int:
         print(f"  {cell}: {sum(oks)}/{len(oks)} passed")   # the model × reasoning-level comparison
     for r in skipped:
         print(f"  ⏭ {r['scenario']} · {_cell(r['model'], r['effort'])} — {r['result']}")
+    for r in infra:   # not graded: the operator's model endpoint failed (agentic/harness/infra.py)
+        print(f"  ⚠ {r['scenario']} · {_cell(r['model'], r['effort'])} · {r['user']} — {r['result']}")
+    for r in (r for r in results if r.get("setup_failed")):   # not graded: the cell never ran
+        print(f"  ✗ {r['scenario']} · {_cell(r['model'], r['effort'])} · {r['user']} — {r['result']}")
     fails = [r for r in graded if not r["ok"]]
     if fails:
         print("\nfailures:")

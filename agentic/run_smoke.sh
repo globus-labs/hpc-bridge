@@ -129,6 +129,30 @@ GIT_DESCRIBE="$(git -C "$REPO_ROOT" describe --always --dirty --abbrev=12 2>/dev
 
 [ -f "$KEY" ] || { echo "missing scoped test key: $KEY  (globus1: generate one + register its .pub; fake: agentic/fakecluster/bin/up.sh creates it)"; exit 1; }
 
+# ---- the ALCF model endpoint, before a free operator's cell (agentic/harness/alcf_probe.py) ----
+# One tiny chat completion, asked the way the operator will ask: streamed for pi / hermes21, plain for codex (its relay
+# asks with stream false) and hermes (hermes_setup turns streaming off on ALCF; the Argo tunnel, which streams, is
+# host.docker.internal — the helper skips it). Unhealthy → re-probe for up to HPCB_ALCF_WAIT_S seconds
+# (default 0: probe once; at most 4 h); still unhealthy → the cell is NOT launched: the helper writes an INFRA bundle and
+# prints `RESULT: INFRA: …`, and this script exits 4 (INFRA), as run.py does for a cell whose model endpoint failed
+# mid-run. A request the endpoint refuses as wrong (a 4xx other than 408/429: an expired bearer, a model typo) is not
+# an outage: `RESULT: SETUP FAILED — …`, exit 2, nothing waited for.
+# The bearer reaches the helper through the environment (exported above), never its argv.
+if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "pi" ] || [ "$OPERATOR" = "hermes21" ]; then
+  case "$OPERATOR" in pi|hermes21) PROBE_MODE=--stream ;; *) PROBE_MODE=--no-stream ;; esac
+  probe_rc=0
+  uv run --directory "$REPO_ROOT" --extra integration python "$REPO_ROOT/agentic/harness/alcf_probe.py" "$PROBE_MODE" \
+    --wait-s "${HPCB_ALCF_WAIT_S:-0}" --runs-dir "$RUNS_HOST" --runid "$RUNID" --scenario "$SCENARIO" \
+    --operator "$OPERATOR" --target "$TARGET" --profile "${HPCB_T_PROFILE:-}" --pool-user "$SSH_USER" \
+    --git-sha "$GIT_SHA" || probe_rc=$?
+  case "$probe_rc" in
+    0) ;;
+    2) exit 2 ;;   # SETUP FAILED: the endpoint refused the request as wrong (bearer, model, URL) or a bad HPCB_ALCF_WAIT_S
+    4) exit 4 ;;
+    *) echo "WARN: the ALCF probe could not run (rc=$probe_rc) — launching the cell anyway" ;;
+  esac
+fi
+
 if [ -z "${HPCB_SKIP_BUILD:-}" ]; then   # the suite runner builds once, then sets this
   echo "building jail image (hpc-bridge-agentic)…"
   docker build --provenance=false -t hpc-bridge-agentic --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \

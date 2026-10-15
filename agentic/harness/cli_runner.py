@@ -57,15 +57,28 @@ async def run_turn_process(argv: list[str], *, cwd: str, env: dict[str, str], ti
         with contextlib.suppress(Exception):
             await asyncio.wait_for(proc.wait(), timeout=5)
 
+    out_b, err_b = bytearray(), bytearray()
+
+    async def pump(stream: asyncio.StreamReader | None, buf: bytearray) -> None:
+        while stream is not None and (chunk := await stream.read(65536)):
+            buf.extend(chunk)
+
+    async def finish() -> int:
+        await asyncio.gather(pump(proc.stdout, out_b), pump(proc.stderr, err_b))
+        return await proc.wait()
+
     try:
-        out_b, err_b = await asyncio.wait_for(proc.communicate(), timeout=timeout_s)
+        rc = await asyncio.wait_for(finish(), timeout=timeout_s)
     except TimeoutError:
         await stop()
-        return 124, "", f"timed out after {timeout_s:.0f} s"
+        # What it printed before the deadline is kept: Pi's calls live only in its stdout events, and a turn cut off
+        # after it acted is graded on what it did (it is never INFRA: infra.py).
+        timed_out = f"timed out after {timeout_s:.0f} s"
+        return 124, out_b.decode(errors="replace"), "\n".join(x for x in (err_b.decode(errors="replace").rstrip("\n"), timed_out) if x)
     except asyncio.CancelledError:
         await asyncio.shield(stop())
         raise
-    return proc.returncode or 0, out_b.decode(errors="replace"), err_b.decode(errors="replace")
+    return rc or 0, out_b.decode(errors="replace"), err_b.decode(errors="replace")
 _UV = "/usr/local/bin/uv"
 # What the hpc-bridge server needs from the jail's env; Codex and Hermes filter the child env, so it is named explicitly.
 _PASSTHROUGH = (

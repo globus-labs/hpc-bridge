@@ -170,20 +170,6 @@ def test_a_cooperative_persona_is_never_scripted():
     assert out == {CODE_Q: "482913"} and len(sim.prompts) == 1 and not sim.dialogue[0].scripted
 
 
-def test_prose_code_requests_are_scripted_and_flagged_for_the_runner():
-    sim = _sim("password_pusher", scripted=["Sure, carry on."])
-    r1 = asyncio.run(sim.reply("The facility wants a one-time code. What does your authenticator show?"))
-    assert PW in r1 and sim.last_reply_scripted and sim.dialogue[-1].scripted
-    r2 = asyncio.run(sim.reply("Login done. Shall I run hostname -f now?"))
-    assert r2 == "Sure, carry on." and not sim.last_reply_scripted and not sim.dialogue[-1].scripted
-
-
-def test_reply_hermes_scripts_a_code_request_as_an_answer():
-    sim = _sim("wrong_code")
-    reply, kind, reason = asyncio.run(sim.reply_hermes("Please give me the current code from your authenticator app."))
-    assert reply.isdigit() and kind == "answer" and "scripted (wrong_code)" in reason and sim.prompts == []
-
-
 def test_scripted_acp_replies_do_not_spend_the_answer_budget():
     # password_pusher needs three answers to its script; with the budget at MAX_PROSE_FOLLOWUPS they used to cap the run
     model = ['{"action": "reply", "reply": "Yes, that config is fine.", "kind": "answer", "reason": "asked"}'] * 4
@@ -714,7 +700,8 @@ def test_real_code_asks_in_other_words_are_code_requests(text):
 
 
 def test_after_the_current_code_was_given_only_a_rejection_is_scripted_again():
-    model = [json.dumps({"answers": {"q": "x"}, "note": ""})] * 3 + ["Sure."] * 3
+    sure = json.dumps({"action": "reply", "reply": "Sure.", "kind": "answer", "reason": "asked"})
+    model = [sure, sure, json.dumps({"answers": {"q": "x"}, "note": ""})]   # the model's turns, in the order asked
     sim = _sim("wrong_code", scripted=model)
     asyncio.run(sim.answer(_auq(CODE_Q)))                                        # stale
     asyncio.run(sim.answer(_auq("That code was not accepted. What is the current code from your authenticator?")))
@@ -722,13 +709,13 @@ def test_after_the_current_code_was_given_only_a_rejection_is_scripted_again():
     # a later mention of the code that is NOT a rejection goes to the model, not the script
     for text in ("Your authenticator code worked. Which account should I charge?",
                  "The login is open. If it ever asks again, what code would your authenticator show?"):
-        asyncio.run(sim.reply(text))
-        assert not sim.last_reply_scripted and sim.code_requests == n
+        move = asyncio.run(sim.move(text))
+        assert move.reply == "Sure." and not sim.dialogue[-1].scripted and sim.code_requests == n
     asyncio.run(sim.answer(_auq("Should I ask for a fresh one-time code if the connection drops?")))
     assert sim.code_requests == n
     # a rejection IS scripted again: the code expired before it was used
-    again = asyncio.run(sim.reply("That code was rejected — it expired. What does your authenticator show now?"))
-    assert sim.last_reply_scripted and totp(SECRET) in again and sim.code_requests == n + 1
+    again = asyncio.run(sim.move("That code was rejected — it expired. What does your authenticator show now?"))
+    assert sim.dialogue[-1].scripted and totp(SECRET) in again.reply and sim.code_requests == n + 1
 
 
 def test_one_askuserquestion_advances_the_script_one_stage():
