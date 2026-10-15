@@ -189,9 +189,10 @@ async def ssh_exec(
 ) -> tuple[int, str, str]:
     """Run one command on the remote host over SSH; returns (rc, stdout, stderr).
 
-    ssh forwards its stdin to the remote command, so with no payload it gets /dev/null, never the server's own
-    stdin: that is the MCP channel, and an ssh child reading it took the client's next request and ended the
-    server's stdio loop (teardown_slow_fs, 2026-10-15: a re-call during a background teardown)."""
+    With no payload ssh gets /dev/null, never the server's own stdin: that is the MCP channel. An ssh that
+    inherited it (2026-10-15, a teardown_endpoint re-call during a background teardown) either read the agent's
+    next request itself, so the call never arrived, or set the shared pipe non-blocking, so the server's next read
+    came back empty and its stdio loop ended as if the client had gone."""
     proc = await asyncio.create_subprocess_exec(
         *target.argv(remote_cmd),
         stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
