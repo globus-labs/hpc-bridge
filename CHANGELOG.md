@@ -292,7 +292,7 @@ installed plugin only when that version changes); git tags mark releases.
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).
-- Four more scenarios (63 in all), each grading its own premise so a run that missed it says so instead of passing:
+- Four more scenarios, each grading its own premise so a run that missed it says so instead of passing:
   - `fake_mep_stop_while_provisioning` (fake `mep`, free operators): the agent confirms the spend and stops at once,
     before any block is up. The stop leads with "NO CANCEL WAS ISSUED", says a check of ours is still queued (or names
     the job when the check answered first, with `scancel <id>`), is never `cold` and never `spend_stopped`; the agent
