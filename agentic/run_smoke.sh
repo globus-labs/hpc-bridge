@@ -236,7 +236,7 @@ if [ -n "${HPCB_T_CATALOG_CMD:-}" ]; then
 fi
 
 # ---- cluster-ADMIN world changes (scenario ADMIN_SETUP / ADMIN_CLEANUP; `{user}` = this cell's pool user) ----
-# Run through the target's admin channel (targets.py: fake = `docker exec` into slurmctld, as root; a real
+# Run through the target's admin channel (targets.py: fake = `docker exec` into slurmctld or pbsserver, as root; a real
 # facility has none — we are not its admin — so such a cell refuses to run here; run_suite skips it earlier).
 # SETUP runs just before the agent starts; CLEANUP runs ALWAYS afterwards (EXIT trap: normal end, a failed
 # launch, Ctrl-C, SIGTERM) so a limit set for one cell never leaks into the next cell on that pool user.

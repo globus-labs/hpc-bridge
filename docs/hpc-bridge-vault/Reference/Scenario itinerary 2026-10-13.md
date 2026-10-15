@@ -238,6 +238,22 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
   - The client's Python 3.13. **The jail is Python 3.11.**
 - `zero_config_list` does not require `polaris` in the listing.
 
+> [!note] Since built (2026-10-15, branch `harness/pbs-mep-profile`; proposal #11; codex OK live on fake/pbs_mep, pi not
+> run: ALCF's streaming endpoint timed out all night)
+> The fake `pbs_mep` profile (`polaris` + one root-run MEP on the PBS login node, mapped to `hpcbmep`) has a template
+> shaped like Polaris's: PBSProProvider, `queue` and `account` required, `#PBS -l filesystems=home` by default, the
+> facility's own endpoint venv on the workers' PATH (no worker_init from the entry), 240 s idle; its schema is strict
+> where Polaris's is open. Its catalog entry `fake-pbs-mep` mirrors the `polaris` seed. `fake_pbs_mep_compute`
+> (autonomous, free operators) covers the `key_map` rename at the wire (the job's own `$PBS_QUEUE`, the receipt's
+> `queue_source` = registry), `account_required` on PBS, the filesystems default (the polaris rule holds a pilot
+> without it), the 240 s window (read from the template; a postcheck past it) and #178's stop on PBS (`qdel <id>`).
+> Still untested: the client's Python 3.13 (the fake runs 3.11), the full-override trap through an agent (no tool takes
+> `scheduler_options` for a registry facility), `select_options`, a project the scheduler rejects, NO ACCOUNT on PBS.
+> Live 2026-10-15: an agent-free run through the server functions and the catalog seam had a worker on c1 in 19 s
+> (py3.11.16, parsl 2026.10.12), `JOB=1.pbsserver QUEUE=debug` as `hpcbmep`, and a stop naming `qdel 1.pbsserver`;
+> PBS released the pilot 251 s after the last task. `fake_pbs_mep_compute` with codex: OK, every gate and both
+> world checks (bundle `1792057718-94861`, first result 12.7 s).
+
 **#178, designed but not built (MEP stop names the block): no scenario, and the existing graders cannot catch it.**
 > [!note] Since built ([#178](https://github.com/globus-labs/hpc-bridge/issues/178))
 > `fake_mep_stop_names_block` grades the job id, the lead, `spend_stopped`, the `scancel N` command (notice and agent text) and no probe after the stop, with a world hook on the queue at stop time; `revocation_honoured` now reads `spend_stopped` and knows a MEP detach. `block_state`, the release-by time and the stop-while-provisioning case are unit-tested (`tests/test_mep_stop_names_block.py`); `fake_mep_stop_while_provisioning` is still a proposal.

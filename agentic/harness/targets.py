@@ -52,8 +52,8 @@ class Target:
     # Host-side ADMIN channel: argv prefix that runs one shell command AS THE CLUSTER ADMIN (root on the controller).
     # A scenario's ADMIN_SETUP/ADMIN_CLEANUP run through it (run_smoke.sh, `{user}` = the cell's pool user) — the
     # cluster-side world changes a pool user cannot make (an association submit limit, a drained node). Only the
-    # fake cluster has one (docker exec into slurmctld); on a real facility we are not the admin → None, and
-    # run_suite skips the cell.
+    # fake cluster has one (docker exec into the scheduler's controller: slurmctld, or pbsserver on a PBS profile); on a
+    # real facility we are not the admin → None, and run_suite skips the cell.
     admin_argv: tuple[str, ...] | None = None
     # Host-side command printing this cluster's LOCAL CATALOG (seed-format YAML) — a profile with facility MEPs minted
     # per cluster declares it ([catalog] cmd); run_smoke.sh mounts the output into the jail as HPC_BRIDGE_CATALOG_FILE.
@@ -112,6 +112,15 @@ def meets(requires: dict | None, caps: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def _admin_container(caps: dict) -> str:
+    """The fake cluster's ADMIN container — root on the scheduler's controller: `slurmctld` on the Slurm stack, the PBS
+    server (`pbsserver`: qmgr, and qdel of any user's job) on the PBS stack. Each has its own override, read only on its
+    own stack: HPCB_FAKE_CTLD (Slurm) and HPCB_FAKE_PBS_SERVER (PBS) — a Slurm controller's name would never run a qdel."""
+    if str(caps.get("scheduler", "slurm")) == "pbs":
+        return os.environ.get("HPCB_FAKE_PBS_SERVER") or "hpcb-fake-pbsserver-1"
+    return os.environ.get("HPCB_FAKE_CTLD") or "hpcb-fake-slurmctld-1"
+
+
 def get(name: str | None = None) -> Target:
     name = (name or os.environ.get("HPCB_TARGET") or DEFAULT_TARGET).strip().lower()
     home = str(Path.home())
@@ -138,7 +147,7 @@ def get(name: str | None = None) -> Target:
                         "-o", "ConnectTimeout=10", *nohostkey, "hpcbridge-test-00@localhost"),
             cleanup_host="localhost", cleanup_ssh_opts=("-p", port, *nohostkey),
             profile=profile, capabilities=caps,
-            admin_argv=("docker", "exec", os.environ.get("HPCB_FAKE_CTLD", "hpcb-fake-slurmctld-1"), "bash", "-lc"),
+            admin_argv=("docker", "exec", _admin_container(caps), "bash", "-lc"),
             catalog_cmd=(man.get("catalog") or {}).get("cmd") or None,
             totp_secret=(man.get("totp") or {}).get("secret") or None,
         )

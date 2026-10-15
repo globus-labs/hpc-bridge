@@ -38,7 +38,7 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 65 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 66 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -53,7 +53,8 @@ agentic/
                            stop + chaos: stop_while_running · esc_mid_call · draining_restop · orphaned_task ·
                              teardown_slow_fs
                            facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute ·
-                             fake_mep_stop_names_block · fake_mep_stop_while_provisioning · fake_mep_no_account
+                             fake_mep_stop_names_block · fake_mep_stop_while_provisioning · fake_mep_no_account ·
+                             fake_pbs_mep_compute
                            adversarial: canary_login_discovery · canary_compute_output · password_pusher · wrong_code
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
@@ -98,9 +99,10 @@ install recipes.
 
 **Targets.** `--target globus1` (default) is the lab cluster; `--target fake` is `agentic/fakecluster/` — a local compose
 Slurm cluster the suite brings up itself (`--reset-cluster` wipes it first). Every SSH scenario runs on either; the
-facility-MEP pair and the one-time-code path need globus1 / a real facility. `harness/targets.py` is the one place a
+real globus-labs MEP pair (`mep_compute_only`, `stranger_mep_walk`) needs globus1; the fake `mep` and `pbs_mep` profiles
+run facility endpoints of their own (Slurm, and PBS shaped like ALCF Polaris's). `harness/targets.py` is the one place a
 target's facts live; prompts say `{ssh_host}`, never a literal host. Fake-cluster endpoints are `hpc-bridge-fake-*`.
-The fake cluster has **profiles** (`--profile default|site`, see `fakecluster/README.md`): scenarios declare the
+The fake cluster has **profiles** (`--profile default|site|mep|pbs_mep|…`, see `fakecluster/README.md`): scenarios declare the
 cluster they need (`TARGETS`, `REQUIRES = {"login_nodes": 2, "accounting": "enforce", …}`) and the suite skips a cell
 the target cannot satisfy — coverage is a deliberate coupling of scenario to cluster shape, not a cross product.
 A single `run_smoke.sh` run REFUSES such a cell instead, and on the fake cluster also refuses a declared profile
@@ -357,7 +359,7 @@ MIDRUN_HOOKS = [{"after_tool": "poll_task", "nth": 1, "cmd": "…"}]   # optiona
                                  #   Esc DURING a call — see "Mid-run hooks" for the fields and which operator serves what
 ADMIN_SETUP = ["sacctmgr -i modify user where name={user} set MaxSubmitJobs=0"]   # optional: cluster-ADMIN world changes,
 ADMIN_CLEANUP = ["… MaxSubmitJobs=-1"]  #   run by run_smoke.sh through the target's admin channel (fake only: docker exec into
-                                        #   slurmctld; `{user}` = the pool user) before the agent / always after; no channel ⇒ skipped
+                                        #   slurmctld, or pbsserver on a PBS profile; `{user}` = the pool user) before the agent / always after; no channel ⇒ skipped
 LOCAL_SETUP = ["ssh … nobody@login true"]  # optional: commands run INSIDE THE JAIL before the agent (the client side of the
                                         #   world — e.g. burn fail2ban's budget from this address); a failure aborts the run
 SETUP = [{"cmd": "…", "on": "each_login"}]  # SETUP/CLEANUP entries may be dicts fanning out to every login node

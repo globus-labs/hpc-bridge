@@ -13,7 +13,7 @@ from mep_compute_only import mep_zero_ssh
 FACILITY_ID = "fake-mep-open"
 SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
-REQUIRES = {"mep": "consent-free"}
+REQUIRES = {"mep": "consent-free", "scheduler": "slurm"}   # the `mep` profile's managers (fake-mep-*); not pbs_mep's
 NEEDS_COMPUTE_NODE = True
 
 PROMPT = (

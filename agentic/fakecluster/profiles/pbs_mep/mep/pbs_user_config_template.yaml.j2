@@ -1,0 +1,41 @@
+{#- The fake PBS cluster's user-endpoint template, rendered by the manager per submission against the CLIENT's
+    user_endpoint_config. Modelled on ALCF Polaris's published template (the registry's `polaris` entry, 2026-10-13):
+    - PBSProProvider; `queue` and `account` have NO default — required (the schema refuses a config without them, and
+      the manager renders with StrictUndefined);
+    - the facility pins its own worker address (Polaris: hsn0; here eth0) — not a user key;
+    - `scheduler_options` defaults to `#PBS -l filesystems=home`; a user value REPLACES it (on this cluster a pilot
+      without a filesystems request is HELD by the polaris rule);
+    - a user `worker_init` is PREPENDED to the facility's own, which puts the facility's endpoint venv on the workers'
+      PATH (Polaris: /opt/globus-compute-agent/venv-py313/bin; here /opt/hpcb-mep/gce/bin, the manager's own install,
+      mounted read-only on the moms) — so the worker runs the user endpoint's exact packages;
+    - the block idle-releases after 240 s (Polaris's default).
+    Client strings arrive already JSON-quoted (the manager json.dumps every string), so a literal string default is
+    `| tojson`'d to match, and a client worker_init is spliced in without its quotes (`[1:-1]`: its JSON escapes stay
+    valid inside the double-quoted YAML string). -#}
+engine:
+  type: GlobusComputeEngine
+  run_in_sandbox: true
+  max_workers_per_node: {{ max_workers_per_node | default(2) }}
+  address:
+    type: address_by_interface
+    ifname: eth0
+  job_status_kwargs:
+    max_idletime: {{ max_idletime | default(240) }}
+    strategy_period: 5
+  provider:
+    type: PBSProProvider
+    queue: {{ queue }}
+    account: {{ account }}
+    walltime: {{ walltime | default("00:30:00" | tojson) }}
+    nodes_per_block: {{ nodes_per_block | default(1) }}
+    cpus_per_node: {{ cpus_per_node | default(4) }}
+{% if select_options is defined %}
+    select_options: {{ select_options }}
+{% endif %}
+    scheduler_options: {{ scheduler_options | default("#PBS -l filesystems=home" | tojson) }}
+    worker_init: "{{ (worker_init[1:-1] ~ '; ') if worker_init is defined else '' }}export TMPDIR=/tmp; export PATH=$PATH:/opt/hpcb-mep/gce/bin"
+    launcher:
+      type: SimpleLauncher
+    init_blocks: {{ init_blocks | default(0) }}
+    min_blocks: {{ min_blocks | default(0) }}
+    max_blocks: {{ max_blocks | default(1) }}

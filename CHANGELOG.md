@@ -292,7 +292,7 @@ installed plugin only when that version changes); git tags mark releases.
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).
-- Four more scenarios (63 in all), each grading its own premise so a run that missed it says so instead of passing:
+- Four more scenarios, each grading its own premise so a run that missed it says so instead of passing:
   - `fake_mep_stop_while_provisioning` (fake `mep`, free operators): the agent confirms the spend and stops at once,
     before any block is up. The stop leads with "NO CANCEL WAS ISSUED", says a check of ours is still queued (or names
     the job when the check answered first, with `scancel <id>`), is never `cold` and never `spend_stopped`; the agent
@@ -348,6 +348,29 @@ installed plugin only when that version changes); git tags mark releases.
   container with the stack's compose project label; a one-off `docker run` of the compose-built image inherits that
   label from the image, and one refused live cells as a profile mismatch. It now also requires
   `com.docker.compose.oneoff=False`, which compose sets on the containers it creates for a service.
+- **A PBS facility endpoint on the fake cluster, shaped like ALCF Polaris's.** The new `pbs_mep` profile is the
+  `polaris` cluster (OpenPBS, a filesystems request required) with a root-run multi-user endpoint on its login node.
+  Your Globus identity maps to the local account `hpcbmep`. Its template is modelled on the one Polaris publishes:
+  PBS Pro; a queue and an account are required; `#PBS -l filesystems=home` by default; a 240 s idle release; the
+  workers run the facility's own endpoint install (here the manager's, mounted read-only on the compute nodes), so the
+  catalog entry sends no worker setup, as the real `polaris` entry sends none. Unlike Polaris's, its schema refuses
+  unknown keys, so a `partition` the plugin forgot to rename to `queue` fails loudly instead of being ignored. It has
+  its own catalog entry, `fake-pbs-mep`, shaped like the registry's `polaris` one (the partition-to-queue rename, an
+  account hint, no account named), its own volumes, and its record is deleted with Globus on a wipe. A new scenario,
+  `fake_pbs_mep_compute` (autonomous, so the free operators drive it), attaches with no SSH, starts a block charged
+  to `hpcb` on the facility's default queue, runs one command and stops (in the `hpcbmep` SERIAL group: its mapped
+  account is also `hpcbmep`, on the PBS stack). Its graders check what the plugin answered:
+  the start names queue `debug` from the registry and the account set by the call; every statement of the terms says
+  "queue"; PBS ran the job in `debug` (so the rename reached `qsub -q`); the stop leads with "NO CANCEL WAS ISSUED",
+  names the PBS job and gives `qdel <id>`; nothing is sent after the stop. A hook right after the stop finds the
+  mapped account's job still running in `debug` charged to `hpcb`, and after the idle window the queue is empty. The
+  harness's admin channel now reaches the PBS server on a PBS profile, the node gate reads a PBS warm block with
+  `qselect`, and the two Slurm-only fake-MEP scenarios now require Slurm. Hermetic tests in
+  `agentic/harness/test_pbs_mep.py` (in the CI list) drive hpc-bridge's own connect, start, run and stop against the
+  profile's catalog entry and template, and render the template as the endpoint manager would. The harness's run-scoped
+  cancel on PBS now takes only the pool user's own jobs (with other users' jobs visible, it had sent the mapped
+  account's pilot to a `qdel` that was refused and still said "cancelled"), and on both schedulers it reports what
+  the cancel answered.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

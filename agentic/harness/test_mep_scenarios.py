@@ -496,12 +496,14 @@ def test_the_new_mep_scenarios_need_the_mep_profile_and_gate_only_provided_check
 
 def _hpcbmep_scenarios():
     """Every scenario that runs as the fake MEP's mapped account: a fake-MEP facility under the harness' own identity
-    (a GLOBUS_DB_SECRET is another, unmapped identity)."""
+    (a GLOBUS_DB_SECRET is another, unmapped identity) — the Slurm `mep` profile's (fake-mep-*) and the PBS `pbs_mep`
+    profile's (fake-pbs-mep), whose mapped account is also hpcbmep (the two stacks never run together)."""
     import importlib
     out = []
     for p in sorted((HERE.parent / "scenarios").glob("*.py")):
         sc = importlib.import_module(p.stem)
-        if str(getattr(sc, "FACILITY_ID", "")).startswith("fake-mep") and not getattr(sc, "GLOBUS_DB_SECRET", None):
+        fid = str(getattr(sc, "FACILITY_ID", ""))
+        if fid.startswith(("fake-mep", "fake-pbs-mep")) and not getattr(sc, "GLOBUS_DB_SECRET", None):
             out.append(sc)
     return out
 
@@ -511,10 +513,14 @@ def test_every_cell_on_the_fake_meps_mapped_account_is_in_one_serial_group():
     scs = _hpcbmep_scenarios()
     assert {"fake_mep_compute", "fake_mep_stop_names_block", "fake_mep_stop_while_provisioning", "mep_hand_batch_job",
             "mep_hand_batch_job_ask", "fake_mep_username_not_account", "term_switch_reasks", "preset_account_scoped",
-            "terms_prestated", "terms_wanted"} <= {sc.__name__ for sc in scs}
+            "terms_prestated", "terms_wanted", "fake_pbs_mep_compute"} <= {sc.__name__ for sc in scs}
     for sc in scs:
         assert sc.SERIAL == "hpcbmep", sc.__name__
-        assert any("scancel -u hpcbmep" in c for c in getattr(sc, "ADMIN_CLEANUP", [])), sc.__name__  # nothing outlives it
+        cleanup = getattr(sc, "ADMIN_CLEANUP", [])   # nothing of the mapped account outlives the cell, on either scheduler
+        if (getattr(sc, "REQUIRES", None) or {}).get("scheduler") == "pbs":
+            assert any("qselect -u hpcbmep" in c and "qdel" in c for c in cleanup), sc.__name__
+        else:
+            assert any("scancel -u hpcbmep" in c for c in cleanup), sc.__name__
     import fake_mep_no_account  # another, UNMAPPED identity: it never runs as hpcbmep — a lock of its own
     assert fake_mep_no_account.SERIAL is True
 

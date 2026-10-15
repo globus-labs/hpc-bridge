@@ -1,0 +1,23 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "hpcb-mep-pbs user_endpoint_config",
+  "description": "Polaris-shaped PBS contract, STRICT: `queue` and `account` are required, and only the keys below are accepted -- interface, compute, partition and anything else are REJECTED by the manager. (Polaris's own schema is additionalProperties:true; strict here so a key the client forgets to rename, partition for queue, fails loudly instead of being ignored.)",
+  "type": "object",
+  "additionalProperties": false,
+  "required": ["queue", "account"],
+  "properties": {
+    "queue": {"type": "string", "minLength": 1},
+    "account": {"type": "string", "minLength": 1},
+    "walltime": {"type": "string", "pattern": "^[0-9]{1,3}:[0-5][0-9]:[0-5][0-9]$"},
+    "nodes_per_block": {"type": "integer", "minimum": 1, "maximum": 2},
+    "cpus_per_node": {"type": "integer", "minimum": 1, "maximum": 4},
+    "max_workers_per_node": {"type": "integer", "minimum": 1, "maximum": 4},
+    "max_idletime": {"type": "number", "minimum": 30, "maximum": 3600},
+    "init_blocks": {"type": "integer", "minimum": 0, "maximum": 2},
+    "min_blocks": {"type": "integer", "minimum": 0, "maximum": 1},
+    "max_blocks": {"type": "integer", "minimum": 0, "maximum": 2},
+    "scheduler_options": {"type": "string"},
+    "select_options": {"type": "string"},
+    "worker_init": {"type": "string"}
+  }
+}

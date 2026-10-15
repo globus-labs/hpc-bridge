@@ -165,7 +165,8 @@ def _allowed_targets(scenario: str) -> set[str] | None:
 
 def _needs_admin(scenario: str) -> bool:
     """ADMIN_SETUP/ADMIN_CLEANUP: cluster-admin world changes run_smoke.sh applies through the target's admin channel
-    (fake: docker exec into slurmctld). A target without one (a real facility — we are not its admin) skips the cell."""
+    (fake: docker exec into slurmctld, or pbsserver on PBS). A target without one (a real facility — we are not its
+    admin) skips the cell."""
     k = _knobs(scenario)
     return bool(k.get("HPCB_KNOB_ADMIN_SETUP") or k.get("HPCB_KNOB_ADMIN_CLEANUP"))
 
@@ -214,7 +215,14 @@ def _idle_nodes() -> int | None:
 
 
 def _warm_block_running(user: str) -> bool | None:
-    """Is a block of `user` RUNNING on the cluster (a facility MEP's warm block)? None when the probe failed."""
+    """Is a block of `user` RUNNING on the cluster (a facility MEP's warm block)? None when the probe failed. PBS:
+    `qselect` (job ids in state R; a pool user sees another account's jobs where the server allows it — the pbs_mep
+    profile sets query_other_jobs), else Slurm's squeue."""
+    if str(_TARGET.capabilities.get("scheduler", "slurm")) == "pbs":
+        out = _probe_ssh(f"qselect -u {user} -s R")
+        if out is None:
+            return None
+        return bool(out.strip())
     out = _probe_ssh(f"squeue -u {user} -h -t R -o %j")
     if out is None:
         return None
@@ -328,7 +336,8 @@ def _emergency_cleanup(inflight: dict[str, tuple[str, str]]) -> None:
         try:
             eid = subprocess.run(base + [endpoint_uuid_cmd(name)], capture_output=True, text=True, timeout=60).stdout.strip()
             eids = [eid] if eid else []
-            cmd = f"{delete_endpoint_cmd(name)}; {scoped_cancel_cmd('slurm', eids)}; {uep_dirs_cleanup_cmd(eids)}"
+            sched = str(_TARGET.capabilities.get("scheduler", "slurm"))   # qstat/qdel on a PBS profile
+            cmd = f"{delete_endpoint_cmd(name)}; {scoped_cancel_cmd(sched, eids)}; {uep_dirs_cleanup_cmd(eids)}"
             r = subprocess.run(base + [cmd], capture_output=True, text=True, timeout=120)
             print(f"   {r.stdout.strip()[:160] or ('rc=' + str(r.returncode))}", flush=True)
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise during shutdown

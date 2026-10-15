@@ -1,0 +1,34 @@
+# `pbs_mep` = the `polaris` cluster (OpenPBS + the filesystems rule) plus a FACILITY MULTI-USER ENDPOINT (Globus Compute
+# MEP) run as root on its login node, whose user-endpoint template is shaped like ALCF Polaris's published one (the
+# registry's `polaris` entry, #179): PBSProProvider; `queue` and `account` REQUIRED; the facility pins its own address;
+# `scheduler_options` defaults to `#PBS -l filesystems=home` (a full override REPLACES it, so on this cluster a pilot
+# without it is HELD by the polaris rule); a user `worker_init` is PREPENDED to the facility's own, which puts the
+# facility's endpoint venv on the workers' PATH (Polaris: /opt/globus-compute-agent/venv-py313/bin; here the manager's
+# own /opt/hpcb-mep/gce, mounted read-only on the moms — the worker matches the user endpoint by construction, so the
+# catalog entry sends no worker_init, as Polaris's does); max_idletime 240 s.
+#
+# One deliberate difference from Polaris: the schema is STRICT (additionalProperties:false, Anvil's/NeSI's contract)
+# where Polaris's is open, so the plugin's `compute.key_map` rename (partition -> queue) must survive the schema filter
+# as well as reach the wire — the combination NeSI's entry needs — and a key the plugin forgets to rename is refused
+# by the manager, not silently ignored.
+#
+# Our Globus identity maps to the local account `hpcbmep` (the `mep` profile's name and uid: the two stacks never run
+# together). Every pool user may read other users' jobs (`query_other_jobs`, as on Polaris) so the harness' world
+# checks see the mapped account's block. Accounting: as the base `pbs` — `-A` accepted, not validated; the account
+# floor is the TEMPLATE's (schema-required `account`) and the plugin's (`account_required`), and a world check reads
+# the account back from the job record. The UUID is minted at the first start and persists in the `pbs-mep-state`
+# volume, so the catalog is generated per cell ([catalog] cmd); `down.sh --wipe` runs deregister.sh first.
+# Needs HPCB_MEP_EMAIL and the owner's Globus login (HPCB_MEP_GLOBUS_DB / HPCB_TEST_GLOBUS_DB), like `mep`.
+name = "pbs_mep"
+description = "polaris + a facility multi-user endpoint with a Polaris-shaped PBS template (queue + account required, filesystems=home default, 240 s idle)"
+base = "polaris"
+
+[capabilities]
+mep = "consent-free"                 # a root-run Globus Compute MEP; the mapped user needs no fresh consent
+mep_schemas = ["pbs-strict"]         # one manager: hpcb-mep-pbs (strict schema, queue + account required)
+mep_mapped_user = "hpcbmep"          # every mapped run executes as this account (WARM_BLOCK_USER for the node gate)
+
+[catalog]
+# Prints the seed-format catalog naming this cluster's MEP UUID (entry `fake-pbs-mep`). run_smoke.sh runs it on the
+# host per cell and mounts the output into the jail as HPC_BRIDGE_CATALOG_FILE (the plugin's local-catalog seam).
+cmd = "docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"

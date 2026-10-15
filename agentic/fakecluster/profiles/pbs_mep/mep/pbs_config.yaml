@@ -1,0 +1,7 @@
+# Manager (multi-user endpoint) config for `hpcb-mep-pbs` — globus-compute-endpoint 4.x: running as root is what makes
+# it a MEP (no `multi_user` key). Same shape as the `mep` profile's managers; @@EMAIL@@ is HPCB_MEP_EMAIL.
+display_name: hpc-bridge fake PBS cluster MEP (Polaris-shaped template)
+# 4.16+ refuses to start a multi-user endpoint without a contact address ("Multi-user endpoints require a contact email")
+email: @@EMAIL@@
+identity_mapping_config_path: /root/.globus_compute/hpcb-mep-pbs/identity_mapping.json
+amqp_port: 443
