@@ -32,9 +32,7 @@ from claude_agent_sdk import (  # type: ignore[import-not-found]
     PermissionResultAllow,
     query,
 )
-
-# MAX_PROSE_FOLLOWUPS: used by the prose loop below, re-exported to hermes_runner
-from human_sim import MAX_PROSE_FOLLOWUPS, HumanSim, ends_with_question
+from human_sim import HumanSim
 from invariants import Trace, logical_name
 
 # HookWatcher lives in midrun_hooks.py (SDK-free, shared with cli_runner); `runner.HookWatcher` still names it
@@ -88,7 +86,7 @@ class RunResult:
     dialogue: list[Any] = None  # interactive mode: the human-sim's Q&A Exchanges
     prose_followups: int = 0          # interactive: prose questions the sim answered (client.query follow-ups)
     followups_capped: bool = False    # the run ended because MAX_PROSE_FOLLOWUPS was hit — the agent kept asking
-    nudges: int = 0                   # ACP driver: mid-task pauses the sim told the operator to carry on from
+    nudges: int = 0                   # interactive: mid-task pauses the sim told the operator to carry on from
     nudges_capped: bool = False       # the nudge budget ran out — the operator kept pausing without finishing (diagnostic)
     human_sim_model: str | None = None  # interactive: which model played the user (bundle provenance)
     hooks_fired: list[dict] = None    # chaos: the MIDRUN_HOOKS that fired (tool, nth, call index, rc, output)
@@ -273,9 +271,6 @@ async def run_scenario(
         arrivals.append(round(time.monotonic() - t0, 3))
     final: Any = None
     turn_final: Any = None   # the CURRENT turn's ResultMessage — never a previous turn's (review 2026-09-05, 2.4)
-    followups = 0
-    scripted_followups = 0
-    capped = False
     watcher = HookWatcher(midrun_hooks)
     fired: list[dict] = []
     interjections: list[dict] = []   # `interject` hooks that fired: what the user said, after which call
@@ -382,24 +377,25 @@ async def run_scenario(
                             # its error-subtype result is the harness's doing, not a failed run
                             final = _EndedByHook(result=f"the run ended at hook {ended_by[0]!r}: Esc, nothing said after it")
                             break
-                        # The turn ended on a text-only question (no tool call): a real user would answer in
-                        # chat, so the sim does — one more `query` continues the SAME session (SDK multi-turn).
-                        if last_had_tool or getattr(final, "is_error", False) or not ends_with_question(last_text):
-                            break
-                        if followups - scripted_followups == MAX_PROSE_FOLLOWUPS:
-                            capped = True  # the agent is still asking in prose; recorded, not hidden
-                            break
+                        if last_had_tool or getattr(final, "is_error", False) or not last_text.strip():
+                            break   # a tool-call ending, an error, or nothing said to the user
+                        # The turn ended in prose (no tool call). What a person does next is the human-sim's call,
+                        # as in the ACP drivers (HumanSim.move): reply (it asked, or waits for a go-ahead), nudge (it
+                        # paused mid-task with nothing to decide) or conclude (it wrapped up). A regex on the turn's
+                        # tail used to decide, and missed a hand-over with no question mark ("Say the word once it's
+                        # open and I'll …", password_pusher 2026-10-15). The sim's guards end the run at its budgets
+                        # (MAX_PROSE_FOLLOWUPS answers, scripted code answers not counted; MAX_NUDGES nudges) and
+                        # never nudge past a standing decline. One sim call per such turn end, none for a scripted one.
                         n_said = len(human.dialogue)
-                        reply = await human.reply(last_text)
-                        followups += 1
-                        if len(human.dialogue) > n_said:   # where the reply came: (calls, agent texts) before it
+                        move = await human.move(last_text)
+                        if move.action == "conclude":
+                            print(f"  human({persona}) concludes [{move.reason}]", file=sys.stderr, flush=True)
+                            break
+                        if len(human.dialogue) > n_said:   # where the user spoke: (calls, agent texts) before it
                             so_far = build_trace(messages)
                             human.dialogue[-1].at = (len(so_far.calls), len(so_far.texts))
-                        # a scripted persona's answer to a code request (human_sim.SCRIPTED_CODE_PERSONAS) is the
-                        # scenario's own provocation, not the agent looping: reported, but not against the cap
-                        scripted_followups += int(bool(getattr(human, "last_reply_scripted", False)))
-                        print(f"  ! human({persona}) answers a PROSE question: {reply}", file=sys.stderr, flush=True)
-                        await client.query(reply)
+                        print(f"  ! human({persona}) [{move.kind}]: {move.reply}", file=sys.stderr, flush=True)
+                        await client.query(move.reply)
                     live.pop("client", None)   # before the client closes: a late hook must not interrupt a closing one
             else:
                 async for msg in query(prompt=prompt, options=options):
@@ -425,7 +421,8 @@ async def run_scenario(
         trace=insert_interjections(build_trace(messages, injected_answers=injected_answers, arrivals=arrivals), interjections),
         final=final, messages=messages, arrivals=arrivals,
         dialogue=(human.dialogue if human else []),
-        prose_followups=followups, followups_capped=capped,
+        prose_followups=(human.answers if human else 0), followups_capped=bool(human and human.followups_capped),
+        nudges=(human.nudges if human else 0), nudges_capped=bool(human and human.nudges_capped),
         human_sim_model=(human.model if human else None),
         interjections=interjections,
         hooks_fired=fired + watcher.unfired_records(),

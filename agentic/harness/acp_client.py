@@ -235,7 +235,7 @@ async def run_session(command: str, args: list[str], task: str, *, cwd: str, env
     optional) is the interactive hook: ``respond(AcpTurn) -> str | None`` — return the user's next message to send
     it as another prompt in the SAME session, or None/"" to stop. This is the clean multi-turn the transcript-replay
     faked: no per-turn conversation re-send (the agent keeps its context), and ``prompt()`` returning IS the turn
-    boundary (no `ends_with_question` guessing needed to detect turn end — only to decide whether to reply)."""
+    boundary (no guessing needed to detect turn end — only to decide whether to reply)."""
     client = BenchClient()
     resp: Any = None
     async with acp.spawn_agent_process(client, command, *args, env=env, cwd=cwd) as (conn, _proc):
