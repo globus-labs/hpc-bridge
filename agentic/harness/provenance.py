@@ -144,13 +144,15 @@ def write_run_record(
     extra_jsonl: dict[str, list[Any]] | None = None,
     arrivals: list[float | None] | None = None,
     metrics: dict[str, Any] | None = None,
+    server: dict[str, Any] | None = None,
 ) -> Path | None:
     """Write the bundle; never raises (best-effort provenance must not fail the run).
 
     `gating` (the check names that decided the verdict), `failed` and `result` (OK | FAILED | INFRA | RATE_LIMITED |
     SETUP FAILED | CRASHED | INTERRUPTED) are persisted so a bundle explains its own verdict — regrade.py and watch.sh
     read them (review 2026-09-05, 2.5: `run_completed` used to exist only on stdout). `infra_reason` says why a cell is
-    INFRA (infra.py; None otherwise)."""
+    INFRA (infra.py; None otherwise). `server`: what the harness saw of the MCP server's processes (server_stderr:
+    each start, when it went away, whether its client ran on); its stderr is `server-stderr.log`, written by run.py."""
     try:
         d = runs_dir / f"{config.get('runid', 'local')}-{config.get('scenario', 'run')}"
         d.mkdir(parents=True, exist_ok=True)
@@ -180,6 +182,7 @@ def write_run_record(
             "failed": list(failed or []),
             "events": _jsonable(events or []),   # chaos hooks that fired (tool, nth, call index, rc, output)
             "metrics": _jsonable(metrics or {}),  # measured numbers, e.g. first_result_s (run.py)
+            "server": _jsonable(server),          # the MCP server's processes as the harness saw them (server_stderr)
             "gating": sorted(gates),
             "grading": [{"name": r.name, "ok": r.ok, "detail": r.detail,
                          "gating": r.name in gates or r.name.startswith("world:")} for r in grading],

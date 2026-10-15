@@ -30,6 +30,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import server_stderr
 from acp_trace import capture_crosscheck
 from cluster_ops import (
     capture_logs_cmd,
@@ -1020,6 +1021,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     probe: tuple[list[str], list[str]] | None = None
     torn_down = checked_after_teardown = False
     metrics: dict[str, float | None] = {}
+    # The MCP server's own stderr: every operator starts it through the stderr wrapper, which appends to this run's raw
+    # log; the watch follows it while the operator runs; the bundle gets it redacted and capped (server_stderr).
+    server_log = server_stderr.prepare()
+    watch = server_stderr.ServerWatch(server_log)
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
@@ -1031,15 +1036,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             rc = 2
             result_label = "SETUP FAILED"
             return rc
-        if phases:
-            res = await _run_chain(phases, scen, model=model, effort=effort,
-                                   persona=persona, user_goal=user_goal, no_skill=no_skill)
-        else:
-            res = await _run_scenario(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
-                                      persona=persona, user_goal=user_goal, ablate_skill=no_skill,
-                                      max_turns=getattr(scen, "MAX_TURNS", 40),
-                                      extra_env=getattr(scen, "EXTRA_ENV", None) or None,
-                                      midrun_hooks=getattr(scen, "MIDRUN_HOOKS", None), hook_runner=_run_hook)
+        async with watch.watching():
+            if phases:
+                res = await _run_chain(phases, scen, model=model, effort=effort,
+                                       persona=persona, user_goal=user_goal, no_skill=no_skill)
+            else:
+                res = await _run_scenario(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
+                                          persona=persona, user_goal=user_goal, ablate_skill=no_skill,
+                                          max_turns=getattr(scen, "MAX_TURNS", 40),
+                                          extra_env=getattr(scen, "EXTRA_ENV", None) or None,
+                                          midrun_hooks=getattr(scen, "MIDRUN_HOOKS", None), hook_runner=_run_hook)
 
         print(f"\n=== TRACE: {len(res.trace.calls)} tool calls ===")
         for i, c in enumerate(res.trace.calls):
@@ -1139,8 +1145,14 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # trace source (state.db / the CLI transcript) lagged, truncated or picked the wrong session.
         if getattr(res, "acp_events", None):
             results.append(capture_crosscheck(res.acp_events, res.trace))
+        # The MCP server went away while its client ran on (a crash mid-run, not the end of a session): REPORT-ONLY, so
+        # the crash shows in the table beside whatever the agent made of it, with the last lines of its stderr.
+        server_row = server_stderr.exited_row(watch, secrets=_secret_material())
+        if server_row is not None:
+            results.append(server_row)
         # agent_engaged + run_completed always gate: a do-nothing or truncated run must never grade OK.
         critical = set(getattr(scen, "EXPECT_OK", [r.name for r in results])) | {"agent_engaged", "run_completed", *FLOOR_NAMES}
+        critical.discard(server_stderr.ROW)   # a diagnostic, never a gate — even where a scenario gates every row
         if getattr(scen, "LOCAL_BASELINE", False):
             # a calibration run that must NOT touch hpc-bridge (repl_baseline_local): its own liveness gate replaces
             # agent_engaged, which would otherwise fail it for doing exactly what it was asked
@@ -1282,7 +1294,15 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
             arrivals=(getattr(res, "arrivals", None) if res else None),
             metrics=metrics,
+            server=watch.summary(),
         )
+        try:   # the server's own stderr, redacted and capped; the raw log never leaves the jail
+            if rec is not None:
+                server_stderr.bundle_log(server_log, rec, secrets=_secret_material())
+        except Exception as exc:  # noqa: BLE001 - evidence, never a reason the bundle is lost
+            print(f"server stderr: not copied into the bundle ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        finally:
+            server_stderr.discard(server_log)
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on
             # the cluster by teardown, so this file is the only copy. See cluster_ops.capture_logs_cmd.

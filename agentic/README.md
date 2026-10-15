@@ -35,6 +35,10 @@ agentic/
     midrun_hooks.py      ← MIDRUN_HOOKS: when a hook is due (after a result, or DURING a call), what it does, and
                            which operator can serve it (see "Mid-run hooks" below)
     provenance.py        ← per-run provenance bundle writer (see runs/)
+    serve_with_stderr.py ← what every operator launches the MCP server through: appends its stderr to the run's log
+                           and execs it (see "The MCP server's own stderr" below)
+    server_stderr.py     ← the harness side: that log watched while the operator runs, `server-stderr.log` in the
+                           bundle (redacted, capped), the report-only `harness:server_exited` row
     infra.py             ← the INFRA verdict: the operator produced nothing to grade because its model endpoint failed
     alcf_probe.py        ← run_smoke.sh's check that the ALCF endpoint answers, before a free operator's cell
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
@@ -62,7 +66,8 @@ agentic/
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
-                           claude-session/ (the CLI's native transcripts, both actors)
+                           claude-session/ (the CLI's native transcripts, both actors) ·
+                           server-stderr.log (the MCP server's own stderr) · endpoint-logs.txt (the cluster side)
 ```
 
 ## Quickstart
@@ -253,6 +258,30 @@ first `connect_facility` call to the first completed compute `run_shell` in the 
 time (37–45 s on fake with the 5 s scaling pass). It is timed from the SDK's arrival stamps, and for the CLI operators from the journal's
 own (`ts` when a call started, `ts + ms` when it returned). `run.py` records it in the bundle (`record.json` →
 `metrics.first_result_s`) and on the RESULT line, e.g. `RESULT: OK  (first result 41 s)`.
+
+## The MCP server's own stderr (`server-stderr.log`)
+
+Every operator starts hpc-bridge through `harness/serve_with_stderr.py`: the Claude SDK (`runner._mcp_servers`), the
+ACP operators `claude-acp` and `hermes` with `HPCB_HERMES_ACP` (`acp_client.hpc_bridge_mcp`), `hermes`
+(`hermes_setup.build_config`), and Codex, Pi and hermes21 (`cli_runner._server_cmd`), all through
+`server_stderr.wrap`. The wrapper appends one header line per start to the run's raw log (the time, the pid, the pid
+of the MCP client that spawned it, the operator), points the server's stderr at that log, and execs the server. So
+the server keeps its stdin and stdout (the MCP channel, untouched), its pid, its exit code and the signals sent to it,
+and a client that restarts it adds a second header. The raw log stays in the jail (`HPCB_SERVER_STDERR`, a temp dir
+run.py makes), because raw stderr may carry a token. While the operator runs, past 8 MB it is cut back to its last 2 MB.
+The bundle gets `server-stderr.log`: its last 2 MB, redacted. Redaction covers the values the safety floor knows (the
+pool user's key, the Globus tokens, the Claude and ALCF credentials) and token shapes (`Bearer …`,
+`access_token`/`refresh_token`/`password`/`api_key` = …, private-key blocks, `sk-ant-…`). `record.json` → `server`
+lists every start (pid, client, operator, start and end times, how long the client outlived it, `early`).
+
+**`harness:server_exited`** (REPORTED, never gating) appears when a server went away while its MCP client ran on for
+more than 3 s, so the client lost its server mid-session. It names the server and carries the last 20 lines that
+server wrote. The trigger was 2026-10-15: `teardown_slow_fs` under Pi and Codex lost the server mid-teardown ("MCP
+connection closed", "Transport closed"), and no bundle held a line from the server. A server that ends with its
+client is not reported: each `hermes -z` turn, each `PHASES` phase, and every normal end. What this cannot see: the
+exit status, because the wrapper execs into the server and the MCP client reaps it; a boot crash that ends the client
+at once (Codex with `required = true`), whose traceback is still in the log while `agent_engaged` fails as before;
+and a client that starts the server through a shell that does not exec.
 
 ## Regression set (before merging a PR)
 

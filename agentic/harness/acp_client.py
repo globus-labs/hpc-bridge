@@ -30,6 +30,7 @@ from acp.schema import (
     RequestPermissionResponse,
     SelectedPermissionOutcome,
 )
+from server_stderr import wrap
 
 
 @dataclass
@@ -191,16 +192,15 @@ class BenchClient(Client):
         return None
 
 
-def hpc_bridge_mcp(repo_root: str, env: dict[str, str]) -> McpServerStdio:
-    """The hpc-bridge MCP server as an ACP stdio server (registered via session/new)."""
+def hpc_bridge_mcp(repo_root: str, env: dict[str, str], *, operator: str) -> McpServerStdio:
+    """The hpc-bridge MCP server as an ACP stdio server (registered via session/new), started through the harness's
+    stderr wrapper (`operator` names the run's operator in its log)."""
     passthrough = ("HOME", "HPC_BRIDGE_USER_DIR", "GLOBUS_COMPUTE_USER_DIR", "HPC_BRIDGE_SSH_USER",
                    "HPC_BRIDGE_SSH_KEY", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPC_BRIDGE_MACHINE",
                    "HPC_BRIDGE_SEARCH_INDEX", "HPC_BRIDGE_CATALOG_FILE", "HPCB_HARNESS_SSH_PORT")
     ev = [EnvVariable(name=k, value=env[k]) for k in passthrough if k in env]
-    return McpServerStdio(
-        name="hpc-bridge", command="/usr/local/bin/uv",
-        args=["run", "--directory", repo_root, "--extra", "integration", "hpc-bridge"], env=ev,
-    )
+    cmd = wrap(["/usr/local/bin/uv", "run", "--directory", repo_root, "--extra", "integration", "hpc-bridge"], operator)
+    return McpServerStdio(name="hpc-bridge", command=cmd[0], args=cmd[1:], env=ev)
 
 
 def _join_chunks(chunks: list[str]) -> str:
@@ -278,7 +278,7 @@ async def _probe() -> int:
     task = ("Call the hpc-bridge list_facilities tool once, then reply with ONLY the facility ids, "
             "comma-separated.")
     resp, cap = await run_once("hermes", ["acp"], task, cwd=repo, env=env,
-                               mcp_servers=[hpc_bridge_mcp(repo, env)])
+                               mcp_servers=[hpc_bridge_mcp(repo, env, operator="hermes")])
     print(f"stop_reason: {getattr(resp, 'stop_reason', None)}", file=sys.stderr)
     print(f"tool calls: {[c.get('title') or (c.get('raw_input') or {}) for c in cap.tool_calls]}", file=sys.stderr)
     print("AGENT SAID:", _join_chunks(cap.texts).strip()[-400:])

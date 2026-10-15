@@ -204,6 +204,18 @@ installed plugin only when that version changes); git tags mark releases.
   `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
+- Every run's bundle now keeps the hpc-bridge MCP server's own stderr, as `server-stderr.log`. On 2026-10-15,
+  `teardown_slow_fs` under Pi and Codex lost the server mid-teardown ("MCP connection closed", "Transport closed"),
+  and no bundle held a line from the server, so the crash could not be diagnosed. Every operator (Claude SDK,
+  claude-acp, hermes, Codex, Pi, hermes21) now starts the server through one wrapper,
+  `agentic/harness/serve_with_stderr.py`. The wrapper appends a header line per start (time, pid, the MCP client's
+  pid, the operator), points stderr at the run's log in the jail, and execs the server: stdin and stdout, the pid, the
+  exit code and signals are the server's own. The bundle copy keeps the last 2 MB, redacted: the secret values the
+  safety floor knows, and `Bearer`, `access_token`/`refresh_token`/`password`/`api_key`, private-key and `sk-ant-`
+  shapes. `record.json` gains `server`, every server start with when it went away. A new report-only row,
+  `harness:server_exited`, appears when a server went away while its client ran on for more than 3 s, with the last
+  20 lines that server wrote; it never gates. The exit status itself is not observable (the client reaps the
+  server). `agentic/README.md`, "The MCP server's own stderr".
 - Two scenarios with a user who gets the one-time code wrong, on purpose. Both are persona cells: the Claude operator
   gates them, `HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1` runs them free with the phrasing graders
   report-only, and the CLI operators report them SKIPPED. What the user answers to a request for a code is scripted,

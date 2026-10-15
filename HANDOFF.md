@@ -15,7 +15,7 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **950 passed** (the CI list: 926). The live tier has
+Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **979 passed** (the CI list: 955). The live tier has
 **66 scenarios** and a local **fake cluster with 12 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
@@ -31,6 +31,11 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
   src/hpc_bridge/catalog/seed/<file>` for `alcf-polaris.yaml`, `anvil.yaml`, `ncsa-delta.yaml`, `sdsc-expanse.yaml`
   (`globus-cluster.yaml` is unchanged). No other field moved, so `last_validated` stays.
 - Not yet run live: `terms_prestated` / `terms_wanted` (fake `mep`, persona cells) and the `quote_before_spend` grader.
+- **The server's stderr in every bundle (branch `harness/server-stderr`), not yet run live:** every operator starts
+  hpc-bridge through `agentic/harness/serve_with_stderr.py` (append + exec), and the bundle keeps `server-stderr.log`
+  (redacted, last 2 MB) and `record.json` → `server`. `harness:server_exited` (report-only) flags a server that went
+  away while its client ran on, the `teardown_slow_fs` Pi/Codex failure of 2026-10-15. The first live cell should show
+  a header per server start in `server-stderr.log`; re-run `teardown_slow_fs` under pi/codex to read that crash.
 - **INFRA verdict + ALCF probe (branch `harness/infra-status`), not yet run live:** a cell whose operator did nothing
   (no tool call of any kind) with an endpoint outage on record reads `RESULT: INFRA: <reason>` (exit 4, `infra_reason`
   in the bundle), not FAILED; `run_smoke.sh` probes ALCF before a free operator's cell (`HPCB_ALCF_WAIT_S`, default 0,
@@ -215,7 +220,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **Two things it is not:** it is **not** collected by `python -m pytest -q` (that's the hermetic tier), and it is **not** free — each scenario runs a real agent against a real cluster and bills your Claude subscription. Run it nightly / on demand / before merging anything that touches connect, discovery, endpoint naming, the local-discovery cache, login, or stop.
 
-**How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
+**How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`, `server-stderr.log` — the MCP server's own stderr) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
 **A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 66 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
