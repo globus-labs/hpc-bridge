@@ -30,6 +30,7 @@ from .models import ConnectFacilityResult, FacilityDetails, validate_host
 from .notices import (
     _explain_provision_error,
     _first_contact_note,
+    _hpc_bridge_error,
     _left_block_clause,
     _needs_login_result,
     _needs_preauth_result,
@@ -141,21 +142,30 @@ async def _connect_facility(
     # MEP path dispatches with it) — and, found in review, constructing the Compute SDK Client for
     # the catalog on a fresh install would run the SDK's OWN command-line login: a URL on stdout and
     # input() on stdin — i.e. the MCP transport. A phase, not a prompt: the agent shows the link, the
-    # user's browser completes it, the next call proceeds. (login_required() is a local SQLite read.)
+    # user's browser completes it, the next call proceeds. (login_required() is a local SQLite read; the check that
+    # the stored login still works adds a token refresh only for an access token past its expiry.)
     app.proposed_facility = None  # a draft belongs to the connect that made it: this one proposes again, or doesn't
     if ssh_host:
         try:
             ssh_host = validate_host(ssh_host)
         except ValueError as exc:
             return ConnectFacilityResult(phase="failed", facility=facility, notice=f"hpc-bridge error: {exc}")
-    if app.login_flow is not None and await asyncio.to_thread(app.login_flow.login_required):
+    # A stored login Globus refuses to renew is gated like a missing one (live 2026-10-14: it passed, the MEP attach
+    # said only "template not readable", and an SSH bootstrap would copy the dead token to the login node); a check
+    # that cannot reach Globus carries on as before.
+    verdict = (await login_gate._stored_login(app.login_flow))[0] if app.login_flow is not None else "works"
+    if app.login_flow is not None and verdict in ("missing", "expired"):
+        why = login_gate.EXPIRED_WHY if verdict == "expired" else None
         start, status = await login_gate._start_login_and_wait(app.login_flow)
         if status != "done":
             return _needs_login_result(facility, start, app.login_flow.error,
-                                       waited_s=config.login_wait_s() if status == "waiting" else None)
+                                       waited_s=config.login_wait_s() if status == "waiting" else None, why=why)
         # the browser flow completed while we waited — carry straight on with the connection, but NAME the
-        # identity that landed: on this (most common) path nothing else would (security review B-02)
-        login_note = "Globus login landed" + await login_gate._as_identity() + ". "
+        # identity that landed: on this (most common) path nothing else would (security review B-02). A new login may
+        # be another identity, and runners hold the old token: forget both first, as authenticate() does.
+        warmth._forget_identity_verdicts(app)
+        login_note = ("Globus login landed" + await login_gate._as_identity() + (login_gate.REPLACED if why else "")
+                      + ". ")
     else:
         login_note = ""
     entry: CatalogEntry | None = None
@@ -393,10 +403,7 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
     try:
         block, app.state = await ensure_warm(app.facility, app.profile, app.state)
     except Exception as exc:  # noqa: BLE001 - e.g. the SDK can't reach the status API
-        return ConnectFacilityResult(
-            phase="failed", facility=facility,
-            notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
-        )
+        return ConnectFacilityResult(phase="failed", facility=facility, notice=_hpc_bridge_error(exc))
     if block != "warm":
         # The manager reported OFFLINE. It isn't ours: no retry on our side brings it up, so don't
         # say "call again shortly" — name the facility as the owner.

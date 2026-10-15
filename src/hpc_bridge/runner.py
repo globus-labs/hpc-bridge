@@ -5,6 +5,7 @@ import re
 import time
 from dataclasses import dataclass
 
+from .login import login_expired
 from .session_shell import JOB_ID_EXPR
 
 
@@ -30,6 +31,9 @@ class CanaryResult:
     # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
     # while nobody was waiting; warmth is dated from it, not from when it was read.
     answered_at: float | None = None
+    # Globus Auth refused to refresh the stored login (login.login_expired): nothing can be sent until the user logs
+    # in again — not a queue wait, not the config.
+    login_expired: bool = False
 
 
 # A worker that runs this proves the compute block is live (manager_online cannot). A result
@@ -140,6 +144,11 @@ def dispatch_error_text(exc: BaseException, limit: int = 600) -> str:
     return f"{head}: {' '.join(text.split())}"[:limit]
 
 
+def _failed_canary(exc: BaseException) -> CanaryResult:
+    """A canary that failed with `exc`: its diagnosis, and whether it was the stored Globus login that failed."""
+    return CanaryResult(ok=False, error=dispatch_error_text(exc), login_expired=login_expired(exc))
+
+
 def _canary_result(res: object, answered_at: float) -> CanaryResult:
     """A worker's canary answer, parsed."""
     stdout = getattr(res, "stdout", "") or ""
@@ -246,7 +255,7 @@ class GlobusRunner:
             try:
                 fut = self.executor().submit(fn)
             except Exception as exc:  # noqa: BLE001 - shutdown Executor / broken dispatch path, not a crash
-                return CanaryResult(ok=False, error=dispatch_error_text(exc))
+                return _failed_canary(exc)
             self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
 
             def _stamp(f, runner=self):  # runs on the SDK's thread; only for the canary still current
@@ -263,7 +272,7 @@ class GlobusRunner:
                 # (By type, not identity: 3.11's asyncio re-creates a concurrent TimeoutError on the way out.)
                 if self._canary_fut is fut:
                     self._canary_fut = None
-                return CanaryResult(ok=False, error=dispatch_error_text(task_exc))
+                return _failed_canary(task_exc)
             return CanaryResult(ok=False, error="timeout")  # still queued: the NEXT probe waits on the same task
         except (CancelledError, asyncio.CancelledError):  # asyncio.to_thread raises asyncio's for a cancelled Future
             if not fut.cancelled():
@@ -274,7 +283,7 @@ class GlobusRunner:
         except Exception as exc:  # noqa: BLE001 - the task failed or the dispatch path broke
             if self._canary_fut is fut:
                 self._canary_fut = None
-            return CanaryResult(ok=False, error=dispatch_error_text(exc))
+            return _failed_canary(exc)
         answered_at = self._canary_done_at or time.monotonic()
         if self._canary_fut is fut:
             self._canary_fut = None

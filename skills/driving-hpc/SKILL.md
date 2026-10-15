@@ -8,6 +8,7 @@ description: >-
 
 - You have a **persistent session shell**: `cd` and relative paths carry across turns — **and across blocks**: the working directory and exported variables live on the facility's shared filesystem, not on the node, so a new block after an idle release or walltime picks the session up where it was (files on node-local disk do not survive). Call `reset_session` for a clean slate.
 - A call may be **cold** on first use — `ensure_endpoint_up`/`run_shell` reporting `provisioning`/`cold_start` means a worker is still warming (a compute block may be allocating, Slurm or PBS); retry shortly.
+- A notice saying **the stored Globus login no longer works** (expired or revoked) is not a cold start or a queue wait: call `authenticate(force=True)`, relay its link, then retry.
 - **Expect a command to be verbose? Redirect it to a file up front** (`cmd > out.log 2>&1`) and read ranges (`wc -l`, `head -n 100`, `sed -n '101,200p'`, `tail -n 100`): a result over Globus Compute's size limit fails outright and its exit code is lost, and long output that fits comes back cut to its end (~16,000 characters per stream), opening with a marker that says what was dropped — never read a cut result as the whole.
 
 ## SSH once, then work through the endpoint

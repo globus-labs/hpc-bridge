@@ -38,6 +38,47 @@ FLOW_TTL_S = 600.0  # a login URL / listener lives this long, then a fresh needs
 
 SEARCH_SCOPE = "urn:globus:auth:scope:search.api.globus.org:search"
 
+# What every notice says when Globus Auth refuses the stored login's refresh (`login_expired`).
+LOGIN_EXPIRED = "the stored Globus login no longer works (expired or revoked)"
+_TOKEN_PATH = "/v2/oauth2/token"
+# The throwaway app's login client (the stored-login check, the identity label): a black-holed network must not hold
+# a tool call for the SDK's default 60 s timeout times six attempts.
+CHECK_HTTP_TIMEOUT_S = 15.0
+CHECK_MAX_RETRIES = 1
+
+
+class LoginExpiredError(RuntimeError):
+    """`LoginFlow.check_stored_login` found the stored login dead (Globus Auth refused its refresh): raised before a
+    bootstrap, which would otherwise copy it to the login node. `login_expired` recognises it."""
+
+
+def login_expired(exc: BaseException | None) -> bool:
+    """Is `exc` Globus Auth refusing to refresh the stored login, so that only a new login helps? That is the SDK's
+    AuthAPIError, HTTP 400 or 401, from the token endpoint (POST …/v2/oauth2/token) or with the `invalid_grant` code:
+    the refresh token was revoked or has expired. Seen live (2026-10-14) as `('POST',
+    'https://auth.globus.org/v2/oauth2/token', None, 400, None, 'Bad Request')` on every dispatch. Not a dead login:
+    any other Globus API error (a 403 from the Compute service), another Auth call, a network error. Follows an
+    explicit `raise … from` chain."""
+    try:
+        from globus_sdk import AuthAPIError
+    except ImportError:  # pragma: no cover - the SDK is a core dependency
+        return False
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, LoginExpiredError):
+            return True
+        if isinstance(exc, AuthAPIError) and getattr(exc, "http_status", None) in (400, 401):
+            url = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], str) else ""
+            try:
+                grant = getattr(exc, "code", None) or (exc.raw_json or {}).get("error")
+            except Exception:  # noqa: BLE001 - an unreadable body: the endpoint alone decides
+                grant = None
+            if url.split("?", 1)[0].rstrip("/").endswith(_TOKEN_PATH) or grant == "invalid_grant":
+                return True
+        exc = exc.__cause__
+    return False
+
 
 def required_scopes(*, include_search: bool = False) -> dict[str, list[str]]:
     """resource_server -> scopes to request in ONE consent. Default = the MINIMUM: exactly what a
@@ -122,6 +163,34 @@ class LoginFlow:
             print(f"hpc-bridge: login_required check failed ({type(exc).__name__}: {exc}); treating as login"
                   " required", file=sys.stderr)
             return True
+
+    def check_stored_login(self, *, force_refresh: bool = False
+                           ) -> tuple[Literal["works", "expired", "unchecked"], str | None]:
+        """Non-prompting: does the stored login still WORK, not only hold every scope (`login_required`)? Each
+        required resource server's token is made valid the way a dispatch makes it: one past its expiry is refreshed
+        (one call to Globus Auth's token endpoint; none while it is still valid). `force_refresh`: refresh every one
+        regardless — a refresh token revoked while its access token is still valid is seen only then (the gate before
+        a bootstrap copies the login to a login node). 'expired' (with the error): Globus Auth refused the refresh
+        (`login_expired`), so only a new login helps. 'unchecked' (with why): no answer either way — no network,
+        Globus unreachable, the stored login changed while it was read."""
+        try:
+            app = (self.app_factory or _default_app_factory)(None)
+            # login_required() builds and caches every resource server's authorizer with the app's login-on-error
+            # handler OFF, so get_authorizer() below returns those: it can never start the SDK's own stdin login
+            if app.login_required():
+                return "unchecked", "the stored login changed while it was being checked"
+            for rs in app.scope_requirements:
+                authorizer = app.get_authorizer(rs)
+                invalidate = getattr(authorizer, "handle_missing_authorization", None)
+                if force_refresh and callable(invalidate):
+                    invalidate()  # the SDK's own "this access token is no good": the next ensure refreshes it
+                ensure = getattr(authorizer, "ensure_valid_token", None)
+                if callable(ensure):
+                    ensure()
+        except Exception as exc:  # noqa: BLE001 - a refused refresh is a verdict; anything else says nothing
+            why = f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:200]
+            return ("expired" if login_expired(exc) else "unchecked"), why
+        return "works", None
 
     def status(self) -> str:
         with self._lock:
@@ -298,13 +367,21 @@ def _default_app_factory(manager):
     manager=None it is a non-prompting instance for `login_required()` only."""
     from globus_compute_sdk.sdk.auth.globus_app import DEFAULT_CLIENT_ID
     from globus_compute_sdk.sdk.auth.token_storage import get_token_storage
-    from globus_sdk import GlobusAppConfig, UserApp
+    from globus_sdk import GlobusAppConfig, NativeAppAuthClient, UserApp
+    from globus_sdk.transport import RequestsTransport, RetryConfig
 
     config = GlobusAppConfig(
         token_storage=get_token_storage(),
         request_refresh_tokens=True,
         **({"login_flow_manager": manager} if manager is not None else {}),
     )
-    app = UserApp(app_name=f"hpc-bridge on {platform.node()}", client_id=DEFAULT_CLIENT_ID, config=config)
+    name = f"hpc-bridge on {platform.node()}"
+    if manager is not None:
+        app = UserApp(app_name=name, client_id=DEFAULT_CLIENT_ID, config=config)
+    else:  # the non-prompting instance: its token refreshes are bounded (CHECK_HTTP_TIMEOUT_S, CHECK_MAX_RETRIES)
+        client = NativeAppAuthClient(client_id=DEFAULT_CLIENT_ID, app_name=name, environment=config.environment,
+                                     transport=RequestsTransport(http_timeout=CHECK_HTTP_TIMEOUT_S),
+                                     retry_config=RetryConfig(max_retries=CHECK_MAX_RETRIES))
+        app = UserApp(app_name=name, login_client=client, config=config)
     app.add_scope_requirements(required_scopes())
     return app

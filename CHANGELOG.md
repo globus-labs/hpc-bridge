@@ -6,6 +6,36 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
+  the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
+  "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";
+  `authenticate` then answered `logged_in`, because the stored login still held every scope; and the connect said only
+  "facility template not readable (AuthAPIError)". Now:
+  - `ensure_endpoint_up` and `run_shell` say the stored Globus login no longer works (expired or revoked), that
+    nothing is wrong with the facility, its config or the partition, and that the user must log in again with
+    `authenticate(force=True)`. `run_shell` answers `failed`, not `cold_start`; `ensure_endpoint_up` stays
+    `provisioning`, because a block started earlier may still be running;
+  - `authenticate` checks that the stored login still works before it answers `logged_in`: it renews any token past
+    its expiry, as a dispatch would, and never opens a browser or asks for input to do it. When Globus refuses, it
+    answers `needs_login` with the reason and starts a new login, as for a first one. When the check cannot reach
+    Globus, it still answers `logged_in` and says the login could not be checked;
+  - the connect to a facility-run endpoint names the failed login instead of only "template not readable";
+  - a command sent to a block still taken for warm, whose dispatch fails on the login (`Dispatch error:
+    AuthAPIError`), says so too;
+  - `connect_facility` checks the same way before anything else, and answers `needs_login` with the reason, as for a
+    missing login. Before, it went on: on an SSH facility the bootstrap would have copied the dead login to the
+    login node. When the check cannot reach Globus, the connect carries on as before. A login that completes
+    during the connect now names the identity that logged in, not the previous one, and work sent afterwards uses
+    the new login;
+  - starting an endpoint over SSH without a connect (a server started with `HPC_BRIDGE_MACHINE`, or a command
+    after a teardown) checks the login first, renewing it even when it has not expired yet, so a login revoked
+    minutes ago is caught too. On a dead login nothing is started, no SSH is made and nothing is copied to the
+    login node; the answer says so;
+  - the check gives up after about 30 seconds when Globus cannot be reached (one retry, 15-second timeout),
+    instead of up to six minutes;
+  - the remaining bare "hpc-bridge error: AuthAPIError …" answers (a failed endpoint start in `ensure_endpoint_up`,
+    a failed attach to a facility-run endpoint, a tool error) say the login no longer works and point at
+    `authenticate(force=True)`.
 - **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
   Windows-on-Arm build since 46.0.3. On an Arm Python, the first start tried to build it from source, failed for
   want of OpenSSL, and Claude Code showed only `Failed to reconnect to plugin:hpc-bridge … CONNECTION_CLOSED`.
