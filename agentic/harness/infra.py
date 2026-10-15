@@ -5,16 +5,22 @@ an empty final answer and no tool call (its record: `Stream ended without finish
 agent_engaged, compute_ran, … — at a glance, a product regression. `infra_reason` names such a run, so run.py records
 `RESULT: INFRA: <reason>` (exit code INFRA_RC) instead of FAILED, and regrade.py derives the same from the bundle.
 
-Conservative by construction:
-- a run with one or more hpc-bridge calls is never INFRA: a partial run is real evidence, and it is graded;
-- INFRA never hides a failed safety-floor grader or a failed world check;
+INFRA needs POSITIVE evidence of a model-endpoint outage, and anything the agent did rules it out:
+- any tool call, of any kind (hpc-bridge's or the operator's own shell / read / search), is never INFRA: what the
+  agent did is evidence, and it is graded (a raw-SSH workaround before an endpoint death must still fail
+  `no_ssh_workaround`);
+- INFRA never hides a failed safety-floor grader, world check or harness check (`harness:no_manager_after_teardown`,
+  `harness:trace_complete`, `harness:midrun_hooks`, …);
+- a turn the harness cut off (rc 124) is never INFRA, nor a run whose record shows an MCP server failing to start (an
+  hpc-bridge boot crash is what `agent_engaged` exists to catch);
+- the evidence: the error the operator's own record says its run ENDED on (Pi's last `message_end` / `auto_retry_end`,
+  Codex's `turn.failed`) reads as an outage (an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); or the final
+  answer is itself a stream failure (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
+  badly (non-zero exit, an error, an empty answer) AND the operator's stderr names an outage. An error the operator
+  recovered from decides nothing, and a 4xx (context overflow, an invalid tool schema — hpc-bridge's own tools can
+  cause those) is not an outage;
 - the Claude operators (`claude`, `claude-acp`) are INFRA only when the API itself ended the run with a server error
-  (5xx, overloaded, unreachable). A 429 is RATE_LIMITED's, which run.py decides first;
-- the other operators (codex, pi, hermes21, hermes) are INFRA when the operator's own record ends in a model or
-  transport error, or its final answer is itself such an error; and, when it made no tool call of any kind, also when
-  it exited non-zero, errored, or gave an empty final answer. An agent that used its own tools and then ended silently
-  was acting: its ending is graded. A known signature the operator recovered from (a retry that then succeeded)
-  decides nothing.
+  (5xx, overloaded, unreachable). A 429 is RATE_LIMITED's, which run.py decides first.
 
 Every input is read from what the bundle stores (messages.jsonl, record.json), so the live verdict and the replay agree.
 """
@@ -32,26 +38,46 @@ INFRA_RC = 4                      # run.py / run_smoke.sh: 0 OK · 1 FAILED · 2
 CLAUDE_OPERATORS = frozenset({"claude", "claude-acp"})
 PREFLIGHT_ROW = "harness:alcf_stream"   # the grading row of a cell run_smoke.sh never launched (alcf_probe.py)
 
-# What a model endpoint's failure reads like. Only an operator's TERMINAL error and its final answer DECIDE INFRA; the raw
-# stdout/stderr tails, where a retry the operator recovered from leaves the same words, only label a reason.
-_SIGNATURES = (
+# A dead or timed-out model stream: evidence wherever it appears in an operator's error, or as its final answer.
+_STREAM_DEATH = (
     re.compile(r"Stream ended without finish_reason"),
     re.compile(r"StreamingTimeoutError"),
     re.compile(r"No data received from (?:the )?compute endpoint"),
+    re.compile(r"stream disconnected before completion", re.I),     # Codex
+)
+# An overloaded or failing endpoint: evidence in an operator's own ERROR record (its terminal error, its stderr) only —
+# in the agent's prose ("the docs site returned status code 503") it is not.
+_OUTAGE = (
+    *_STREAM_DEATH,
+    re.compile(r"experiencing high demand", re.I),                   # Codex, after its reconnects
     re.compile(r"\b(?:5\d\d|429) status code\b"),
     re.compile(r"\b(?:5\d\d|429)\s+(?:Internal Server Error|Bad Gateway|Service Unavailable|Gateway Time-?out|"
                r"Too Many Requests)\b", re.I),
     re.compile(r"\b(?:HTTP(?:/[\d.]+)?|status(?:[ _]code)?|error code|code)\W{0,3}(?:5\d\d|429)\b", re.I),
+    re.compile(r"\b(?:APITimeoutError|ReadTimeout|Request timed out)\b"),
 )
+# An MCP server that did not start (Codex with `required = true` exits 1 on it): a product or harness failure, never INFRA.
+_MCP_STARTUP = re.compile(r"MCP servers? failed to (?:initialize|start)|handshaking with MCP server failed|"
+                          r"MCP server [\w.-]* (?:failed|exited|closed)|failed to (?:start|connect to) (?:the )?MCP server",
+                          re.I)
 
 
-def signature(text: str) -> str | None:
-    """The first model-endpoint failure signature in `text`, as it appears there, or None."""
-    for rx in _SIGNATURES:
+def _first(patterns: Iterable[re.Pattern[str]], text: str) -> str | None:
+    for rx in patterns:
         m = rx.search(text or "")
         if m:
             return m.group(0)
     return None
+
+
+def signature(text: str) -> str | None:
+    """The first model-endpoint outage signature in an operator's ERROR text, as it appears there, or None."""
+    return _first(_OUTAGE, text)
+
+
+def stream_death(text: str) -> str | None:
+    """A dead model stream, as an operator reports it — strong enough to read in a final answer."""
+    return _first(_STREAM_DEATH, text)
 
 
 @dataclass(frozen=True)
@@ -65,7 +91,8 @@ class Outcome:
     is_error: bool | None = None  # the runner's own "the run did not complete" (hermes: non-zero exit, timeout, ACP death)
     terminal_error: str = ""      # the operator's own record of the error its run ENDED on (Pi, Codex)
     api_error: str = ""           # the Claude operators: the API server error the run ended on
-    tails: str = ""               # the operator's stdout/stderr tails: they label a reason, never decide one
+    stderr: str = ""              # the operator's stderr tail: evidence only for a run that ended badly
+    stdout: str = ""              # the operator's stdout tail: read only for an MCP server that failed to start
 
 
 def _get(obj: Any, key: str) -> Any:
@@ -170,11 +197,11 @@ def outcome_of(operator: str, trace: Trace, messages: list[Any], final: Any) -> 
         final_text = next((str(m["final"] or "") for m in messages if isinstance(m, dict) and "final" in m), "")
         rc = head.get("rc") if isinstance(head.get("rc"), int) else None
         term = pi_terminal_error(stdout) if harness == "pi" else codex_terminal_error(stdout) if harness == "codex" else ""
-        return Outcome(operator, calls, every, final_text, rc, bool(rc), term, "", stdout[-2000:] + "\n" + stderr[-2000:])
+        return Outcome(operator, calls, every, final_text, rc, bool(rc), term, "", stderr[-2000:], stdout[-4000:])
     final_text = trace.texts[-1] if trace.texts else str(_get(final, "result") or "")
     api = claude_api_error(messages, final) if operator in CLAUDE_OPERATORS else ""
     is_error = _get(final, "is_error")
-    return Outcome(operator, calls, every, final_text, None, is_error if isinstance(is_error, bool) else None, "", api, "")
+    return Outcome(operator, calls, every, final_text, None, is_error if isinstance(is_error, bool) else None, "", api)
 
 
 def bundle_final(messages: list[Any], record_final: dict | None) -> Any:
@@ -189,33 +216,33 @@ def _short(text: str, n: int = 200) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
-def _last_line(text: str) -> str:
-    return next((ln.strip() for ln in reversed((text or "").splitlines()) if ln.strip()), "")
+def _protected(name: str) -> bool:
+    """A failed check INFRA never hides: the safety floor, a world check, a harness check (the leak probe after the
+    teardown, the trace's completeness, a chaos hook)."""
+    return name in FLOOR_NAMES or name.startswith(("world:", "harness:"))
 
 
 def infra_reason(o: Outcome, failed: Iterable[str] = ()) -> str | None:
-    """Why this run is INFRA (the operator produced nothing usable because its model endpoint failed), or None — it is
-    graded as it stands. `failed`: the gating checks that broke; a broken safety floor or world check is never hidden."""
-    if o.hpcb_calls > 0:
+    """Why this run is INFRA (the operator produced nothing to grade because its model endpoint failed: there is
+    positive evidence of the outage, and the agent did nothing), or None — it is graded as it stands. `failed`: the
+    gating checks that broke."""
+    if o.tool_calls > 0 or o.hpcb_calls > 0:
+        return None   # it acted: graded, whatever happened to its model afterwards
+    if any(_protected(n) for n in failed):
         return None
-    if any(n in FLOOR_NAMES or n.startswith("world:") for n in failed):
-        return None
-    none = "0 hpc-bridge calls"
+    if o.rc == 124:
+        return None   # the harness cut the turn off: not the endpoint's doing on any evidence we hold
+    if _MCP_STARTUP.search("\n".join((o.stdout, o.stderr, o.terminal_error, o.final_text))):
+        return None   # an MCP server failed to start — hpc-bridge's (or the harness's) failure, graded
+    none = "0 tool calls"
     if o.operator in CLAUDE_OPERATORS:
         return f"{o.operator}: {_short(o.api_error)} ({none})" if o.api_error else None
-    if o.terminal_error:
+    if o.terminal_error and signature(o.terminal_error):
         return f"{o.operator}: {_short(o.terminal_error)} ({none})"
-    sig = signature(o.final_text)
-    if sig:
-        return f"{o.operator}: its final answer is a model-endpoint error, {sig!r} ({none})"
-    if o.tool_calls:
-        return None   # it acted with its own tools: an ending with no endpoint error on record is the agent's, graded
-    seen = signature(o.tails)
-    if o.rc not in (None, 0):
-        why = repr(seen) if seen else _short(_last_line(o.tails), 160)
-        return f"{o.operator} exited rc={o.rc}" + (f": {why}" if why else "") + f" ({none})"
-    if o.is_error:
-        return f"{o.operator}: the run errored before any tool call" + (f": {seen!r}" if seen else "") + f" ({none})"
-    if not o.final_text.strip():
-        return f"{o.operator}: an empty final answer" + (f" ({seen!r})" if seen else "") + f" ({none})"
+    if (sig := stream_death(o.final_text)):
+        return f"{o.operator}: its final answer is a dead model stream, {sig!r} ({none})"
+    ended_badly = (o.rc not in (None, 0)) or bool(o.is_error) or not o.final_text.strip()
+    if ended_badly and (sig := signature(o.stderr)):
+        how = f"exited rc={o.rc}" if o.rc not in (None, 0) else "errored" if o.is_error else "gave an empty final answer"
+        return f"{o.operator} {how}; its stderr: {sig!r} ({none})"
     return None

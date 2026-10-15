@@ -1219,8 +1219,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             result_label = "RATE_LIMITED"
             print("RESULT: RATE_LIMITED — session/rate limit; run not graded, suite should halt")
         elif failed and (infra := infra_reason(outcome_of(operator, res.trace, res.messages, res.final), failed)):
-            # The operator produced nothing to grade because its MODEL ENDPOINT failed (no hpc-bridge call; an empty or
-            # error answer, or the operator died): not a verdict on hpc-bridge. Its own rc, so a sweep counts it apart.
+            # The operator did nothing (no tool call of any kind) and its MODEL ENDPOINT's outage is on record (infra.py):
+            # not a verdict on hpc-bridge. Its own rc, so a sweep counts it apart.
             rc = INFRA_RC
             result_label = "INFRA"
             print(f"RESULT: INFRA: {infra}{tail}")

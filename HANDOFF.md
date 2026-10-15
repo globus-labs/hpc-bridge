@@ -15,7 +15,7 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **874 passed** (the CI list: 850). The live tier has
+Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **931 passed** (the CI list: 907). The live tier has
 **66 scenarios** and a local **fake cluster with 12 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
@@ -31,10 +31,11 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
   src/hpc_bridge/catalog/seed/<file>` for `alcf-polaris.yaml`, `anvil.yaml`, `ncsa-delta.yaml`, `sdsc-expanse.yaml`
   (`globus-cluster.yaml` is unchanged). No other field moved, so `last_validated` stays.
 - Not yet run live: `terms_prestated` / `terms_wanted` (fake `mep`, persona cells) and the `quote_before_spend` grader.
-- **INFRA verdict + ALCF probe (branch `harness/infra-status`), not yet run live:** a cell whose operator made no
-  hpc-bridge call because its model endpoint failed reads `RESULT: INFRA: <reason>` (exit 4, `infra_reason` in the
-  bundle), not FAILED; `run_smoke.sh` probes ALCF before a free operator's cell (`HPCB_ALCF_WAIT_S`, default 0) and
-  records an unhealthy endpoint as INFRA without launching. Sweep flags: `--operators pi,codex,hermes21` (each profile
+- **INFRA verdict + ALCF probe (branch `harness/infra-status`), not yet run live:** a cell whose operator did nothing
+  (no tool call of any kind) with an endpoint outage on record reads `RESULT: INFRA: <reason>` (exit 4, `infra_reason`
+  in the bundle), not FAILED; `run_smoke.sh` probes ALCF before a free operator's cell (`HPCB_ALCF_WAIT_S`, default 0,
+  at most 4 h) and records a down endpoint as INFRA without launching (a refused request — bad bearer, model typo — is
+  SETUP FAILED). Sweep flags: `--operators pi,codex,hermes21` (each profile
   booted once) and `--paid-only`; the summary counts INFRA apart. Rule and caveats: `agentic/README.md`, "INFRA".
 - **Two adversarial MFA personas** (itinerary proposal #12; branch `harness/coverage-extras-2`), not yet run live:
   `password_pusher` (fake `totp`) offers the account password for the one-time code, twice, then gives the code;

@@ -103,17 +103,29 @@ install recipes.
 its streaming path answered HTTP 200 carrying `StreamingTimeoutError`; Pi then ended with an empty answer and no tool
 call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … like a product regression. Now:
 - **Before the cell**, `run_smoke.sh` asks the endpoint one tiny chat completion (`harness/alcf_probe.py`), the way the
-  operator will: streamed for `pi` and `hermes21`, plain for `codex` (its relay asks unstreamed) and `hermes`. Healthy
-  means HTTP 200, a `finish_reason`, and no error object in the answer. If it is unhealthy, the probe asks again every
-  30 s for up to `HPCB_ALCF_WAIT_S` seconds (default 0: one probe). If it is still unhealthy, the cell is not launched:
-  the bundle says `result: INFRA` with the probe's reason ("ALCF streaming unhealthy: …"), and the exit code is 4. The
+  operator will: streamed for `pi` and `hermes21`, plain for `codex` and `hermes` (Codex's relay calls `/responses`
+  unstreamed; the plain chat probe stands in for the same endpoint). Healthy means HTTP 200, a `finish_reason`, and no
+  error object in the answer. If it is down (a 5xx, 408 or 429, an error object, no `finish_reason`, a timeout, an
+  answer cut off), the probe asks again every 30 s for up to `HPCB_ALCF_WAIT_S` seconds (default 0: one probe; at most
+  14400 — 4 h; anything else, `inf` included, refuses the cell). If it is still down, the cell is not launched: the
+  bundle says `result: INFRA` with the probe's reason ("ALCF streaming unhealthy: …"), and the exit code is 4. A
+  request the endpoint refuses as wrong — any other 4xx (an expired bearer, a model-name typo, no streaming offered)
+  or no bearer at all — is not an outage: `RESULT: SETUP FAILED — …`, exit 2, nothing waited for, no bundle. The
   bearer reaches the probe through the environment, never its argv, and is never printed or written.
 - **After the cell**, run.py records `RESULT: INFRA: <reason>` (exit code 4, the bundle's `result: "INFRA"` and
-  `infra_reason`) instead of FAILED when the operator produced nothing usable. That means no hpc-bridge call, and one
-  of: the operator's own record ends on a model error (Pi's `Stream ended without finish_reason`, Codex's
-  `turn.failed`); its final answer is itself one (`StreamingTimeoutError`, an HTTP 5xx or 429); or, when it made no tool
-  call of any kind, it exited non-zero, errored, or answered nothing. A run with even one hpc-bridge call is never INFRA:
-  a partial run is real evidence and is graded. INFRA never hides a failed safety floor or world check. The Claude
+  `infra_reason`) instead of FAILED only on POSITIVE evidence of an outage, when the agent did nothing:
+  - no tool call of any kind (hpc-bridge's or the operator's own shell, read, search): anything the agent did is
+    evidence and is graded — a raw-SSH workaround before an endpoint death still fails `no_ssh_workaround`;
+  - and one of: the error the operator's own record says its run ENDED on is an outage (Pi's last `message_end` /
+    `auto_retry_end`, Codex's `turn.failed`: an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); the final
+    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
+    badly (non-zero exit, an error, an empty answer) AND the operator's stderr names an outage.
+
+  Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those); a turn
+  the harness cut off (rc 124 — its partial output is kept and graded); an MCP server that failed to start (Codex
+  exits 1 on an hpc-bridge boot crash: `agent_engaged`'s to catch); an error the operator recovered from; an HTTP
+  status the agent merely quotes in prose; and any run whose safety floor, world checks or harness checks
+  (`harness:no_manager_after_teardown`, `harness:trace_complete`, `harness:midrun_hooks`, …) failed. The Claude
   operators are INFRA only when the API itself ended the run with a server error (5xx, overloaded); a 429 stays
   RATE_LIMITED. `regrade.py` derives the same verdict from a stored bundle (`harness/infra.py` holds the rule).
 

@@ -107,3 +107,14 @@ def test_a_cli_turn_that_times_out_is_stopped_with_its_group(tmp_path):
     while _alive(int(pidfile.read_text())) and time.monotonic() - t0 < 5:
         time.sleep(0.05)
     assert not _alive(int(pidfile.read_text()))
+
+
+def test_a_timed_out_cli_turn_keeps_what_it_printed(tmp_path):
+    # Pi's calls live only in its stdout events: a turn cut off at the deadline used to lose them all, so a run that had
+    # acted read as one with no tool call (review of the INFRA verdict, F4)
+    import cli_runner
+
+    argv = ["bash", "-c", 'echo \'{"type": "tool_execution_start", "toolName": "bash"}\'; echo warn >&2; sleep 60']
+    rc, out, err = asyncio.run(cli_runner.run_turn_process(argv, cwd=str(tmp_path), env=dict(os.environ), timeout_s=1))
+    assert rc == 124 and '"tool_execution_start"' in out
+    assert err.splitlines() == ["warn", "timed out after 1 s"]

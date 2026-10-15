@@ -107,10 +107,13 @@ def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str]) -> st
     """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None."""
     if not crit_fail_names or rec.get("rc") == 3 or rec.get("result") not in (None, "OK", "FAILED", "INFRA"):
         return None   # INFRA replaces a graded FAILED only: never RATE_LIMITED, INTERRUPTED, SETUP FAILED or CRASHED
-    world_failed = [g["name"] for g in rec.get("grading", []) if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    # what was not re-run here but did fail live — world checks, the harness rows (the leak probe after the teardown):
+    # INFRA never hides one
+    stored = list(rec.get("failed") or []) + [g["name"] for g in rec.get("grading", [])
+                                              if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
     rows = _rows(d)
     operator = (rec.get("config") or {}).get("operator") or "claude"
-    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + world_failed)
+    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored)
 
 
 def regrade(runs_dir: Path, *, strict: bool = False) -> int:

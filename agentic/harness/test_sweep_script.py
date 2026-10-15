@@ -140,13 +140,20 @@ with open(os.environ["STUB_LOG"], "a") as fh:
     fh.write(json.dumps({"tool": "run_suite", "argv": argv, "operator": os.environ.get("HPCB_OPERATOR"),
                          "wait": os.environ.get("HPCB_ALCF_WAIT_S")}) + "\n")
 infra = set(filter(None, os.environ.get("STUB_INFRA", "").split(",")))
+setup = set(filter(None, os.environ.get("STUB_SETUP", "").split(",")))
+crash = set(filter(None, os.environ.get("STUB_CRASH", "").split(",")))
 for s in scen:
     if s in infra:
         print(f"⚠ done   {s} · opus/default · u — RESULT: INFRA: ALCF streaming unhealthy: HTTP 504")
+    elif s in setup:
+        print(f"✗ done   {s} · opus/default · u — RESULT: SETUP FAILED — ALCF refused the request")
+    elif s in crash:
+        print(f"✗ done   {s} · opus/default · u — (no RESULT line; rc=1)")
     else:
         print(f"✓ done   {s} · opus/default · u — RESULT: OK")
 n_infra = sum(s in infra for s in scen)
-print(f"==== SUITE: {len(scen) - n_infra}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
+n_ok = sum(s not in infra | setup | crash for s in scen)
+print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
 printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s"}\n' "$*" "${HPCB_OPERATOR:-}" >> "$STUB_LOG"
@@ -227,6 +234,8 @@ def test_paid_only_refuses_a_free_operator(tmp_path):
     assert r.returncode == 2 and "only the claude operator" in r.stdout and not calls
     r, calls, _, _ = _sweep(tmp_path / "b", "--operators", "nope", "--profiles", "default")
     assert r.returncode == 2 and "unknown operator nope" in r.stdout and not calls
+    r, calls, _, _ = _sweep(tmp_path / "c", "--operators", "pi,codex,pi", "--profiles", "default")
+    assert r.returncode == 2 and "operator pi is listed twice" in r.stdout and not calls
 
 
 def test_without_the_flags_the_sweep_runs_as_before_and_counts_infra_apart(tmp_path):
@@ -254,3 +263,12 @@ def test_the_cells_env_keeps_the_alcf_wait(monkeypatch):
     monkeypatch.setenv("HPCB_PERSONA", "stray")
     env = mod._cell_env("hpcbridge-test-01", "r1")
     assert env["HPCB_ALCF_WAIT_S"] == "300" and "HPCB_PERSONA" not in env   # run_smoke.sh reads it per cell
+
+
+def test_the_totals_count_setup_failed_and_crashed_rows(tmp_path):
+    r, _, summary, _ = _sweep(tmp_path, "--profiles", "default", STUB_INFRA="happy_path",
+                              STUB_SETUP="gated_provision,spend_refusal", STUB_CRASH="endpoint_reuse")
+    assert r.returncode == 0, r.stdout + r.stderr
+    n = len(_cells()["default"]) + 1   # + spend_gate_enforced (the stub run_smoke.sh says OK)
+    assert (f"## totals — OK {n - 4} · FAILED 0 · INFRA 1 (the model endpoint failed: not graded) · SETUP FAILED 2 · "
+            f"CRASHED 1 (no RESULT line) · other 0") in summary

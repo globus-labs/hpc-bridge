@@ -97,8 +97,11 @@ free_op() { case "$1" in codex|pi|hermes21) return 0 ;; *) return 1 ;; esac; }
 # (default claude) as before. --paid-only is the Claude operator's: the paid_only() cells are what the others cannot drive.
 TAGGED="${OPERATORS:+1}"
 IFS=, read -ra OPS <<< "${OPERATORS:-${HPCB_OPERATOR:-claude}}"
+SEEN=","
 for op in "${OPS[@]}"; do
   case "$op" in claude|claude-acp|hermes|codex|pi|hermes21) ;; *) echo "sweep: unknown operator $op"; exit 2 ;; esac
+  case "$SEEN" in *",$op,"*) echo "sweep: operator $op is listed twice in --operators"; exit 2 ;; esac
+  SEEN="$SEEN$op,"
   if [ -n "$PAID_ONLY" ] && [ "$op" != claude ]; then
     echo "sweep: --paid-only runs the paid_only() cells, which only the claude operator drives (not $op)"; exit 2
   fi
@@ -143,7 +146,7 @@ for prof in "${PROFS[@]}"; do
       echo "    ${TAGGED:+[$op] }spend_gate_enforced (no-skill ablation):" | tee -a "$SUMMARY"
       HPCB_OPERATOR="$op" HPCB_TARGET=fake HPCB_FAKE_PROFILE=default HPCB_SKIP_BUILD=1 HPCB_NO_SKILL=1 HPCB_MODEL="$MODELS" \
         "$HERE/agentic/run_smoke.sh" spend_gate_enforced 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-default-spend_gate${TAGGED:+-$op}.log" \
-        | grep -E "RESULT:" | tail -1 | sed "s/^/    ${TAGGED:+[$op] }spend_gate_enforced — /" | tee -a "$SUMMARY"
+        | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 | sed "s/^/    ${TAGGED:+[$op] }spend_gate_enforced — /" | tee -a "$SUMMARY"
     fi
   done
 done
@@ -152,7 +155,9 @@ done
 tally() { grep -cE "$1" "$SUMMARY" || true; }
 for op in "${OPS[@]}"; do
   p="${TAGGED:+\[$op\] .*}"
-  echo "## totals${TAGGED:+ [$op]} — OK $(tally "${p}RESULT: OK") · FAILED $(tally "${p}RESULT: FAILED") · INFRA $(tally "${p}RESULT: INFRA") (the model endpoint failed: not graded)" | tee -a "$SUMMARY"
+  rows=$(tally "${p}(RESULT: |no RESULT line)"); ok=$(tally "${p}RESULT: OK"); bad=$(tally "${p}RESULT: FAILED")
+  infra=$(tally "${p}RESULT: INFRA"); setup=$(tally "${p}RESULT: SETUP FAILED"); crashed=$(tally "${p}no RESULT line")
+  echo "## totals${TAGGED:+ [$op]} — OK $ok · FAILED $bad · INFRA $infra (the model endpoint failed: not graded) · SETUP FAILED $setup · CRASHED $crashed (no RESULT line) · other $((rows - ok - bad - infra - setup - crashed)) (skipped, rate-limited, interrupted)" | tee -a "$SUMMARY"
   [ -n "$TAGGED" ] || break
 done
 echo "## not swept (by design — see excluded() in agentic/sweep_profiles.sh)" >> "$SUMMARY"
