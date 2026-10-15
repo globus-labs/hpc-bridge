@@ -23,7 +23,7 @@ from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 FACILITY_ID = "fake-mep-strict"
 NEEDS_COMPUTE_NODE = True
 WARM_BLOCK_USER = MAPPED_USER
-SERIAL = True                          # one mapped identity; and ADMIN_SETUP changes its associations
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep; and ADMIN_SETUP changes its associations
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce", "accounts": ["hpcb", "hpcb-gpu"]}
 

@@ -130,3 +130,62 @@ def test_list_valued_capabilities_are_membership_tests():
     req = importlib.import_module("hand_batch_job").REQUIRES     # `#SBATCH -p debug -A hpcb`: the site family only
     assert targets.meets(req, site)[0] and targets.meets(req, targets.load_profile("mep")["capabilities"])[0]
     assert not targets.meets(req, default)[0] and not targets.meets(req, pbs)[0]
+
+
+# --- run_smoke.sh: which profile the RUNNING fake stack has (review of 975b709) ----------------------------------------
+
+_DOCKER_STUB = r'''#!/usr/bin/env python3
+"""A stand-in `docker`: `ps -q --filter label=k=v …` lists the table's containers carrying EVERY label filter (docker
+ANDs label filters), in table order; `inspect … <id>` prints that container's /etc/hpcb/profile mount source."""
+import json, os, sys
+table = json.load(open(os.environ["DOCKER_TABLE"]))
+args = sys.argv[1:]
+if args[:1] == ["ps"]:
+    want = [args[i + 1].removeprefix("label=") for i, a in enumerate(args) if a == "--filter"]
+    for c in table:
+        if all(c["labels"].get(w.split("=", 1)[0]) == w.split("=", 1)[1] for w in want):
+            print(c["id"])
+elif args[:1] == ["inspect"]:
+    print(next(c["profile"] for c in table if c["id"] == args[-1]))
+'''
+
+
+def _running_profile(tmp_path, table, project=None):
+    """Run run_smoke.sh's running_fake_profile() against the stub, with `table` as the docker host's containers."""
+    import json
+    import os
+    import re
+    script = (HERE.parent / "run_smoke.sh").read_text()
+    fn = re.search(r"^running_fake_profile\(\) \{.*?\n\}\n", script, re.S | re.M)
+    assert fn, "run_smoke.sh lost running_fake_profile()"
+    bin_ = tmp_path / "bin"
+    bin_.mkdir(exist_ok=True)
+    (bin_ / "docker").write_text(_DOCKER_STUB)
+    (bin_ / "docker").chmod(0o755)
+    (tmp_path / "table.json").write_text(json.dumps(table))
+    env = {"PATH": f"{bin_}:{os.environ['PATH']}", "DOCKER_TABLE": str(tmp_path / "table.json")}
+    if project:
+        env["HPCB_FAKE_PROJECT"] = project
+    r = subprocess.run(["bash", "-c", fn.group(0) + "running_fake_profile"], capture_output=True, text=True, env=env,
+                       timeout=30)
+    return r.stdout.strip()
+
+
+_PROJECT = "com.docker.compose.project"
+_ONEOFF = "com.docker.compose.oneoff"
+
+
+def test_the_running_profile_is_read_off_the_stacks_own_service_containers(tmp_path):
+    # live 2026-10-14: a one-off `docker run` of the compose-built hpcb-fake image inherited the IMAGE's project label,
+    # was listed first (newest), and run_smoke refused live cells: "the fake cluster is up with profile 'm-totp'".
+    # Compose sets oneoff=False itself on the service containers it creates — never on an image, so never inherited.
+    table = [
+        {"id": "stray", "labels": {_PROJECT: "hpcb-fake"}, "profile": "/repo/.merged/m-totp"},          # docker run
+        {"id": "run1", "labels": {_PROJECT: "hpcb-fake", _ONEOFF: "True"}, "profile": "/repo/.merged/totp"},  # compose run
+        {"id": "login", "labels": {_PROJECT: "hpcb-fake", _ONEOFF: "False"}, "profile": "/repo/.merged/mep"},
+        {"id": "ctld", "labels": {_PROJECT: "hpcb-fake", _ONEOFF: "False"}, "profile": "/repo/.merged/mep"},  # every role
+        {"id": "pbs", "labels": {_PROJECT: "hpcb-pbs", _ONEOFF: "False"}, "profile": "/repo/.merged/pbs"},
+    ]
+    assert _running_profile(tmp_path, table) == "mep"                      # one line, though every role mounts it
+    assert _running_profile(tmp_path, table, project="hpcb-pbs") == "pbs"   # HPCB_FAKE_PROJECT names the stack
+    assert _running_profile(tmp_path, table[:2]) == ""                      # no stack up: nothing to compare against

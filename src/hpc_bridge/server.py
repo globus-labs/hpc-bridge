@@ -1061,21 +1061,13 @@ async def stop_endpoint(ctx: Context) -> EndpointStatus:
     return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context), "stop_endpoint")
 
 
-# How long ONE teardown_endpoint call waits for the login-node ops (gce stop + delete over SSH) before handing
-# back `tearing_down`. Well inside any MCP client's tool window: Expanse's stop + delete take ~3 min on its
-# filesystem (live 2026-09-04) and the call used to fall into the client's 120 s background rescue — a client
-# without one would cancel the request and could interrupt the ops half-way. The ops now run in a server-side
-# task; a later call reports the result.
-_TEARDOWN_SYNC_WAIT_S = 60.0
-
-
 async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
     """FULLY tear the endpoint down: release the billed block, then `gce stop` + delete the login
     manager over SSH (the facility's `teardown()`), and clear ALL shape/state so nothing lingers.
     The rare, explicit 'destroy it' op — normally the login endpoint STAYS ONLINE for zero-SSH reuse
     and costs nothing; a later run_shell would re-bootstrap a fresh endpoint from scratch.
 
-    The SSH ops run in a task (`app.teardown_task`): this call waits `_TEARDOWN_SYNC_WAIT_S` for them and
+    The SSH ops run in a task (`app.teardown_task`): this call waits `config.teardown_wait_s()` (60 s) for them and
     otherwise returns `tearing_down`; calling again waits again / reports the finished result.
 
     Everything that decides WHAT is torn down happens in ONE locked section with no await before it: the SSH
@@ -1165,7 +1157,7 @@ async def _await_teardown(app: AppCtx, task: asyncio.Task) -> EndpointStatus:
     """Wait a bounded time for the in-flight teardown; its result when it finished, else `tearing_down`. Two calls
     may wait on the same task: each gets the result, and only the slot still holding THIS task is cleared. A task
     that finishes with nobody waiting stays in the slot for the next call (`_replayable_teardown` decides)."""
-    done, _pending = await asyncio.wait({task}, timeout=_TEARDOWN_SYNC_WAIT_S)
+    done, _pending = await asyncio.wait({task}, timeout=config.teardown_wait_s())
     if task in done:
         if app.teardown_task is task:
             app.teardown_task = None  # reported to a caller: nothing left to confirm or replay

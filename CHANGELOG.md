@@ -32,6 +32,11 @@ installed plugin only when that version changes); git tags mark releases.
   on: the default queue and where it comes from, whether an account is needed (and where to find it), the nodes and
   the walltime. Nothing is started or billed by it. What fitting the configuration to a facility endpoint's template
   drops is said there too, before any spend.
+- **A test seam for the teardown's wait, `HPC_BRIDGE_TEARDOWN_WAIT_S`.** `teardown_endpoint` waits up to 60 s for the
+  login-node ops (`gce stop` + delete over SSH, which run in the server) before it answers `tearing_down`; that wait
+  was a constant, so a cluster whose whole teardown takes seconds never showed the `tearing_down` path. The variable
+  only shortens the wait, within 0–60 s, read at each call; a value outside that, or not a number, keeps 60 and says
+  so once on stderr. Never set in normal use: the agentic scenario `teardown_slow_fs` sets it to 1.
 
 ### Changed
 - **The agent asks you once, only for what you haven't said, and your yes is the confirmation.** `connect_facility`
@@ -249,6 +254,62 @@ installed plugin only when that version changes); git tags mark releases.
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).
+- Four more scenarios (63 in all), each grading its own premise so a run that missed it says so instead of passing:
+  - `fake_mep_stop_while_provisioning` (fake `mep`, free operators): the agent confirms the spend and stops at once,
+    before any block is up. The stop leads with "NO CANCEL WAS ISSUED", says a check of ours is still queued (or names
+    the job when the check answered first, with `scancel <id>`), is never `cold` and never `spend_stopped`; the agent
+    relays how to find and end it and checks nothing afterwards. The world check finds that a pilot was submitted
+    during the cell (sacct since a stamp the setup writes) and that none is left, polled for up to 720 s. A block
+    already up when the stop came is reported as a broken premise.
+  - `mep_hand_batch_job` (fake `mep`, free operators): a 45-minute job submitted with `sbatch` from inside a facility
+    endpoint's block comes back with the "from inside the compute block (a new job beside this block)" notice; the
+    agent cancels that job (its id or name, never `scancel -u`), and none is left in the mapped account's queue. Its
+    persona twin `mep_hand_batch_job_ask`, with a new persona `batch_job_needs_ask` that approves a batch job only when
+    the question names its walltime (and otherwise asks "How long would that job hold its node?"), gates a new
+    grader, `batch_job_asked`: the submission followed its own approved question naming the job's 45 minutes, which
+    `spend_follows_question` cannot check when a block was approved first.
+  - `teardown_slow_fs` (fake, any profile but `totp`, free operators): with `HPC_BRIDGE_TEARDOWN_WAIT_S=1` the first
+    `teardown_endpoint` answers `tearing_down`; the agent calls it again, and nothing else, until `down`, which must be
+    the finished teardown's own report for the same endpoint. The world check finds the endpoint dir and the token
+    store hpc-bridge seeded gone, and two decoys it did not create (another endpoint's `uep.*` dir and a file) still
+    there.
+
+  The MEP graders are tested in `agentic/harness/test_mep_scenarios.py` and the teardown ones in the new
+  `test_teardown_scenarios.py` (now in the CI list), both against results the product itself builds.
+- **The fake-MEP cells run one at a time across scenarios.** `SERIAL` can name a group (`SERIAL = "hpcbmep"`), and
+  `run_suite.py` holds one lock per group; `SERIAL = True` still locks a scenario only against itself. The ten
+  scenarios that run as the fake MEP's mapped account share the group, and each cancels that account's jobs afterwards.
+  Before, two of them could run at once as `hpcbmep`: one's block answered the other's check, and each one's
+  `scancel -u hpcbmep` killed the other's block. Review fixes to the new scenarios:
+  - `fake_mep_stop_while_provisioning` starts from an empty `hpcbmep` queue (or refuses the cell), and counts only
+    pilots submitted since its start;
+  - `batch_job_asked` reads a question naming the job's 45 minutes as about the job, however the minutes are written
+    (Unicode hyphens, `45m`, "forty-five minutes", `2700 s`), and keeps that approval through a later plain yes;
+  - `stop_says_what_is_left` accepts a late answer with no job id, and `left_relayed` wants the commands as commands;
+  - `teardown_slow_fs` accepts a teardown whose stop was not confirmed in time but whose delete went through;
+  - `complete_preauth` counts as an hpc-bridge call, for `agent_engaged` too.
+
+  The other cells that share a state got a group as well: the two hostile canary cells (`hostile-canaries`: the
+  canary channels are per-node), the two fail2ban cells (`fail2ban`: one ban state and log), and the two lab-MEP cells
+  (`glabs-gc`: one mapped account; `mep_compute_only` had no `SERIAL` at all). `saturation` keeps its own lock: the node
+  gate already keeps every compute cell off while it holds every node, and a true run-alone flag is a TODO.
+  `teardown_reported_clean` accepts a teardown whose stop was not confirmed but whose delete went through, as
+  `teardown_down_is_ours` does.
+- A unit test that read the wall clock failed in the minutes before local midnight: a bound ~11 minutes ahead is
+  tomorrow, and the notice rightly names its date. The clock-time tests now freeze the notices' wall clock at noon.
+- `fake_mep_stop_while_provisioning` stops while the block is still provisioning every time. Live (2026-10-15, Codex)
+  the fake cluster started the block inside the confirming call's 8 s wait, so that call answered `up` and the
+  cell reported a block "already up" though nothing was. Now the cell holds the mapped account's jobs pending
+  (`MaxJobs=0` on its association, set through the admin channel and checked) while it runs: the confirming call
+  can only answer `provisioning`, and the stop always finds a check of ours still queued. A detached timer on the
+  controller lifts the hold 240 s later, well after the stop, so the pilot starts, runs the check and idles out
+  inside the world check's window; the cleanup restores the limit whatever happened. If the confirming call
+  still answers `up`, the premise grader says, from the call's duration, whether the block came up during the
+  call or was up before it.
+- **`run_smoke.sh` reads the running fake profile only off the stack's own service containers.** It took the first
+  container with the stack's compose project label; a one-off `docker run` of the compose-built image inherits that
+  label from the image, and one refused live cells as a profile mismatch. It now also requires
+  `com.docker.compose.oneoff=False`, which compose sets on the containers it creates for a service.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

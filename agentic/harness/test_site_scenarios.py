@@ -171,3 +171,15 @@ def test_site_scenarios_require_the_site_profile_and_gate_only_provided_checks()
         assert not targets.meets(sc.REQUIRES, targets.GLOBUS1_CAPABILITIES)[0], sc.__name__
         provided = universal | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
         assert set(sc.EXPECT_OK) <= provided, (sc.__name__, set(sc.EXPECT_OK) - provided)
+
+
+def test_hand_batch_job_runs_only_where_its_script_can_submit():
+    # itinerary 2026-10-13 §2.3 #3: the script hard-codes `#SBATCH -p debug -A hpcb`; with no REQUIRES the cell FAILed
+    # for the world's reasons on `default` (one partition, `main`) and `pbs` (no sbatch). Its REQUIRES says so — pinned.
+    import hand_batch_job as sc
+    assert "#SBATCH -p debug" in sc._SCRIPT and "#SBATCH -A hpcb" in sc._SCRIPT
+    for prof in ("site", "mep"):
+        assert targets.meets(sc.REQUIRES, targets.load_profile(prof)["capabilities"])[0], prof
+    for prof in ("default", "pbs", "polaris"):
+        assert not targets.meets(sc.REQUIRES, targets.load_profile(prof)["capabilities"])[0], prof
+    assert sc.TARGETS == ("fake",)

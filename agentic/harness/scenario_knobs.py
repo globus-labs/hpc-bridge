@@ -4,6 +4,8 @@
     HPCB_KNOB_NO_GLOBUS_DB=1                       # NO_GLOBUS_DB = True  -> mount no storage.db (logged-out run)
     HPCB_KNOB_GLOBUS_DB_SECRET=HPCB_TEST_GLOBUS_DB_NOACCOUNT   # GLOBUS_DB_SECRET -> mount THAT env var's path instead
     HPCB_KNOB_SERIAL=1                             # SERIAL = True -> shares a facility-side identity; run one at a time
+    HPCB_KNOB_SERIAL_GROUP=hpcbmep                 # SERIAL = "<group>" -> one at a time across EVERY scenario of that
+                                                   #   group (they share one identity: one block, one queue, one scancel)
     HPCB_KNOB_COOLDOWN_S=660                       # COOLDOWN_S -> run_suite waits this long after each cell (fail2ban findtime)
     HPCB_KNOB_NEEDS_NODE=<n>                       # nodes the cell occupies: NEEDS_COMPUTE_NODE (True=1, an int, False=0),
                                                    #   else DERIVED: 1 when `compute_ran` is among EXTRA_INVARIANTS
@@ -42,8 +44,11 @@ def main(argv: list[str]) -> int:
     secret = getattr(mod, "GLOBUS_DB_SECRET", None)
     if secret:
         print(f"HPCB_KNOB_GLOBUS_DB_SECRET={shlex.quote(str(secret))}")
-    if getattr(mod, "SERIAL", False):
+    serial = getattr(mod, "SERIAL", False)
+    if serial:
         print("HPCB_KNOB_SERIAL=1")
+    if isinstance(serial, str):   # a GROUP: every scenario naming it shares one lock (one facility identity)
+        print(f"HPCB_KNOB_SERIAL_GROUP={shlex.quote(serial)}")
     cooldown = int(getattr(mod, "COOLDOWN_S", 0) or 0)
     if cooldown > 0:
         print(f"HPCB_KNOB_COOLDOWN_S={cooldown}")

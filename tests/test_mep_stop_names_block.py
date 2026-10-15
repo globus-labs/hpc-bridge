@@ -34,6 +34,34 @@ from tests.test_mep_server import _Status
 from tests.test_server import _FakeRunner, _Res
 
 IDLE = 600
+
+
+class _FrozenWall:
+    """`notices.time` with the WALL clock frozen (monotonic and the rest stay real): a clock time a notice states is the
+    same at any hour and in any time zone. A bound ~11 min ahead at 23:55 is tomorrow and carries its date
+    ("Oct 15 00:06"), which a test expecting today's "%H:%M" read as a failure (2026-10-14, 23:55 CDT)."""
+
+    def __init__(self, at: float) -> None:
+        self.at = at
+
+    def time(self) -> float:
+        return self.at
+
+    def localtime(self, secs=None):
+        return time.localtime(self.at if secs is None else secs)
+
+    def __getattr__(self, name):
+        return getattr(time, name)
+
+
+@pytest.fixture
+def noon(monkeypatch):
+    """Freeze notices' wall clock at 12:00:30 local, today (30 s in, so a bound a few ms short of a whole number of
+    minutes ahead still lands on its minute). Returns that instant."""
+    t = time.localtime()
+    at = time.mktime((t.tm_year, t.tm_mon, t.tm_mday, 12, 0, 30, 0, 0, -1))
+    monkeypatch.setattr(notices, "time", _FrozenWall(at))
+    return at
 _TIMEOUT = CanaryResult(ok=False, error="timeout")
 _HEAD = "NO CANCEL WAS ISSUED: hpc-bridge has no cancel channel on a facility endpoint."
 
@@ -214,13 +242,13 @@ async def test_an_unknown_job_names_the_mapped_account_for_squeue(monkeypatch):
     assert "others on a shared account may show the same prefix" in res.notice and "start time and partition" in res.notice
 
 
-async def test_the_latest_end_is_the_release_bound_as_a_clock_time(monkeypatch):
+async def test_the_latest_end_is_the_release_bound_as_a_clock_time(monkeypatch, noon):
     app, _r = await _warm(monkeypatch, "100")
     rt = app.shapes["compute"]
     bound = _last_activity(app, "compute", rt) + IDLE + _RELEASE_BOUND_S
     res = await _stop_endpoint(app)
-    want = time.strftime("%H:%M", time.localtime(time.time() + (bound - time.monotonic())))
-    assert f"until {want} (in ~11 min) at the latest, possibly sooner (not verified)" in res.notice
+    # the wall clock frozen at 12:00:30: the bound, ~11 min ahead, is 12:11 today — whatever the real hour
+    assert "until 12:11 (in ~11 min) at the latest, possibly sooner (not verified)" in res.notice
     assert app.left_blocks[-1].until == pytest.approx(bound, abs=0.5)
 
 
@@ -557,7 +585,7 @@ async def test_a_second_teardown_after_a_detach_still_names_the_block(monkeypatc
         assert not spend_released(res.model_dump())
 
 
-async def test_a_queued_check_is_kept_dated_and_a_block_expires_past_its_walltime(monkeypatch):
+async def test_a_queued_check_is_kept_dated_and_a_block_expires_past_its_walltime(monkeypatch, noon):
     # a queued check never expires (the queue wait is unbounded and the facility keeps starting blocks while it
     # waits): it stays, dated and hedged, and stop and teardown never fall back to a bare "no endpoint was up"
     app, _r = await _attached(monkeypatch, canary=_TIMEOUT)
@@ -570,7 +598,7 @@ async def test_a_queued_check_is_kept_dated_and_a_block_expires_past_its_walltim
         assert res.notice.startswith(_HEAD) and "no endpoint was up" not in res.notice
         assert "A check of ours was still queued there (partition 'main' at" in res.notice
         assert "may have run since" in res.notice and "session_spend does not count it" in res.notice
-        when = time.strftime("%b %d", time.localtime(time.time() - 3 * 86400))
+        when = time.strftime("%b %d", time.localtime(noon - 3 * 86400))
         assert when in res.notice and res.spend_stopped is False and res.block_state == "provisioning"
     # a confirmed block past its walltime's end cannot still run: dropped
     app2, _r2 = await _warm(monkeypatch, "100")
@@ -582,11 +610,11 @@ async def test_a_queued_check_is_kept_dated_and_a_block_expires_past_its_walltim
     assert res.status == "down" and res.notice == "no endpoint was up" and app2.left_blocks == []
 
 
-def test_a_clock_time_off_today_carries_its_date():
+def test_a_clock_time_off_today_carries_its_date(noon):
     now = time.monotonic()
-    assert notices._clock_time(now + 60, now, rel=False).count(":") == 1
+    assert notices._clock_time(now + 60, now, rel=False) == "12:01"   # today: the time alone
     two_days = notices._clock_time(now - 2 * 86400, now)
-    assert time.strftime("%b", time.localtime(time.time() - 2 * 86400)) in two_days and "min ago" in two_days
+    assert two_days == time.strftime("%b %d %H:%M", time.localtime(noon - 2 * 86400)) + " (~2880 min ago)"
 
 
 async def test_a_check_that_answered_after_its_wait_names_its_block(monkeypatch):
