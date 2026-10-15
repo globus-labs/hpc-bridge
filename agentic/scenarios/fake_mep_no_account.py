@@ -19,7 +19,7 @@ GLOBUS_DB_SECRET = "HPCB_TEST_GLOBUS_DB_NOACCOUNT"
 FACILITY_ID = "fake-mep-open"
 SERIAL = True
 TARGETS = ("fake",)
-REQUIRES = {"mep": "consent-free"}
+REQUIRES = {"mep": "consent-free", "scheduler": "slurm"}   # the `mep` profile's managers (fake-mep-*); not pbs_mep's
 PROMPT = (
     "Connect me to the HPC facility `{facility}` (catalogued: connect_facility(facility='{facility}'), no ssh_host, "
     "no details) and bring up a compute block on partition `compute` charged to account `hpcb` so I can run "

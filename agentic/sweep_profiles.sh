@@ -7,7 +7,8 @@
 #   HPCB_OPERATOR=pi agentic/sweep_profiles.sh      # the FREE wave: codex / pi / hermes21 on the ALCF model
 #
 # The agent model defaults to run_suite's DEFAULT_MODEL (claude-opus-5); the human-sim is Haiku. Never Fable unless
-# asked. `mep` is skipped unless HPCB_MEP_EMAIL is set in agentic/.env (its managers register a contact address).
+# asked. `mep` and `pbs_mep` are skipped unless HPCB_MEP_EMAIL is set in agentic/.env (their managers register a
+# contact address).
 # What is NOT swept, and why, is the list in excluded() below (the summary prints it): every scenario that can run on
 # the fake target is in cells() or there — test_sweep_script.py enforces it, so a new scenario cannot drop out of the
 # sweeps unnoticed. The paid wave is the default (the Claude operator runs every cell); with HPCB_OPERATOR=codex|pi|hermes21
@@ -15,7 +16,7 @@
 # hook that needs the SDK interrupt). test_sweep_script.py keeps that list equal to what run.py would report SKIPPED.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,polaris,internal,hostile,mep"
+MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,polaris,internal,hostile,mep,pbs_mep"
 while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;; *) echo "unknown arg $1"; exit 2;; esac; done
 [ -f "$HERE/agentic/.env" ] && while IFS= read -r line || [ -n "$line" ]; do case "$line" in ''|\#*) continue ;; esac; k="${line%%=*}"; [ -z "${!k+x}" ] && export "$line"; done < "$HERE/agentic/.env"
 STAMP="$(date +%Y%m%d-%H%M)"
@@ -34,6 +35,7 @@ cells() {  # cells <profile> -> the scenario list (and concurrency) for that pro
     internal) echo "internal_hostnames 1" ;;
     hostile)  echo "canary_login_discovery,canary_compute_output 1" ;;  # per-node canary channels are shared → SERIAL, one at a time
     mep)      echo "fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,fake_mep_username_not_account,term_switch_reasks,preset_account_scoped,terms_prestated,terms_wanted 1" ;;
+    pbs_mep)  echo "fake_pbs_mep_compute 1" ;;
     *) echo "" ;;
   esac
 }
@@ -89,7 +91,7 @@ for prof in "${PROFS[@]}"; do
     [ -z "$dropped" ] || echo "## $prof — free wave leaves out (paid_only): $dropped" | tee -a "$SUMMARY"
     [ -n "$scen" ] || { echo "## $prof — SKIPPED (every cell is paid-only)" | tee -a "$SUMMARY"; continue; }
   fi
-  if [ "$prof" = mep ] && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
+  if { [ "$prof" = mep ] || [ "$prof" = pbs_mep ]; } && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
     echo "## $prof — SKIPPED (HPCB_MEP_EMAIL unset in agentic/.env)" | tee -a "$SUMMARY"; continue
   fi
   echo "## $prof — $(date +%H:%M) — $scen" | tee -a "$SUMMARY"

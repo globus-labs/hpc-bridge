@@ -1,0 +1,30 @@
+# `pbs_mep` overlay (on top of docker-compose.pbs.yml): the MEP manager's state + the owner's login on the login node,
+# the version/identity knobs, and the facility's endpoint install shared READ-ONLY with the moms — the workers run the
+# manager's own venv (Polaris's shape: its template puts the facility's venv on the workers' PATH).
+# Volumes of its own (`pbs-mep-state`, `pbs-mep-tools`), not the `mep` profile's: both stacks are the compose project
+# `hpcb-fake`, and a PBS manager must never adopt (or deregister) the Slurm managers' state. `pbs-mep-tools` also lets
+# deregister.sh delete the manager's Globus registration from a one-off container while the stack is down.
+services:
+  login:
+    environment:
+      HPCB_MEP_IDENTITY: ${HPCB_MEP_IDENTITY:-gusellerm@uchicago.edu}
+      HPCB_MEP_GCE_VERSION: ${HPCB_MEP_GCE_VERSION:-4.16.0}
+      HPCB_MEP_EMAIL: ${HPCB_MEP_EMAIL-}     # REQUIRED to start the manager (a real contact address — it is registered with Globus)
+    volumes:
+      - pbs-mep-state:/root/.globus_compute
+      - pbs-mep-tools:/opt/hpcb-mep
+      # the MEP OWNER's Globus login (a storage.db) — staged read-only, copied into the state volume once.
+      # Long syntax: a `${VAR:?message}` inside the short `src:dst:mode` form is split on the message's colons.
+      - type: bind
+        source: ${HPCB_MEP_GLOBUS_DB:?HPCB_MEP_GLOBUS_DB unset - set it or HPCB_TEST_GLOBUS_DB in agentic/.env}
+        target: /run/hpcb/mep-storage.db
+        read_only: true
+  c1:
+    volumes:
+      - pbs-mep-tools:/opt/hpcb-mep:ro
+  c2:
+    volumes:
+      - pbs-mep-tools:/opt/hpcb-mep:ro
+volumes:
+  pbs-mep-state:
+  pbs-mep-tools:

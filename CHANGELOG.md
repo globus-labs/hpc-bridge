@@ -249,6 +249,25 @@ installed plugin only when that version changes); git tags mark releases.
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).
+- **A PBS facility endpoint on the fake cluster, shaped like ALCF Polaris's.** The new `pbs_mep` profile is the
+  `polaris` cluster (OpenPBS, a filesystems request required) with a root-run multi-user endpoint on its login node.
+  Your Globus identity maps to the local account `hpcbmep`. Its template is modelled on the one Polaris publishes:
+  PBS Pro; a queue and an account are required; `#PBS -l filesystems=home` by default; a 240 s idle release; the
+  workers run the facility's own endpoint install (here the manager's, mounted read-only on the compute nodes), so the
+  catalog entry sends no worker setup, as the real `polaris` entry sends none. Unlike Polaris's, its schema refuses
+  unknown keys, so a `partition` the plugin forgot to rename to `queue` fails loudly instead of being ignored. It has
+  its own catalog entry, `fake-pbs-mep`, shaped like the registry's `polaris` one (the partition-to-queue rename, an
+  account hint, no account named), its own volumes, and its record is deleted with Globus on a wipe. A new scenario,
+  `fake_pbs_mep_compute` (autonomous, so the free operators drive it), attaches with no SSH, starts a block charged
+  to `hpcb` on the facility's default queue, runs one command and stops. Its graders check what the plugin answered:
+  the start names queue `debug` from the registry and the account set by the call; every statement of the terms says
+  "queue"; PBS ran the job in `debug` (so the rename reached `qsub -q`); the stop leads with "NO CANCEL WAS ISSUED",
+  names the PBS job and gives `qdel <id>`; nothing is sent after the stop. A hook right after the stop finds the
+  mapped account's job still running in `debug` charged to `hpcb`, and after the idle window the queue is empty. The
+  harness's admin channel now reaches the PBS server on a PBS profile, the node gate reads a PBS warm block with
+  `qselect`, and the two Slurm-only fake-MEP scenarios now require Slurm. Hermetic tests in
+  `agentic/harness/test_pbs_mep.py` (in the CI list) drive hpc-bridge's own connect, start, run and stop against the
+  profile's catalog entry and template, and render the template as the endpoint manager would.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 
