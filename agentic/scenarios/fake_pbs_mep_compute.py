@@ -35,8 +35,8 @@ DEFAULT_QUEUE = "debug"               # the entry's defaults.partition — NOT t
 ACCOUNT = "hpcb"
 NEEDS_COMPUTE_NODE = True
 WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate
-SERIAL = True                          # one mapped identity (hpcbmep) — cells would share the user endpoint. Once the
-                                       # SERIAL groups land (#194): "hpcbmep", the fake-MEP cells' group
+SERIAL = "hpcbmep"                     # the fake-MEP cells' group: one mapped account, one user endpoint, one queue (here
+                                       # the PBS stack's hpcbmep; the Slurm `mep` stack never runs beside it)
 TARGETS = ("fake",)
 # pbs: the PBS stack; mep: a facility endpoint; site_rule: the polaris rule HOLDS a pilot with no filesystems request,
 # which is what makes the template's `filesystems=home` default load-bearing here

@@ -5,6 +5,7 @@ may name its BASE compose file (`compose = "docker-compose.pbs.yml"` — a diffe
 may declare `base = "<other>"`: it then LAYERS on that profile — files merged (the derived profile's win),
 [capabilities] merged (derived keys win), every compose.override.yml in the chain passed to compose (base first), and
 setup.d scripts from every layer kept (the entrypoint sources setup.d/<role>.sh then setup.d/<role>-*.sh, sorted).
+`base` may also be a LIST, layered in that order: `base = ["totp", "f2b"]` is f2b layered on totp (see chain()).
 
   profile.py manifest <name>            -> the MERGED manifest as JSON (targets.py, REQUIRES matching)
   profile.py build <name> <outdir>      -> materialise the merged dir at <outdir> (what compose mounts as /etc/hpcb/profile)
@@ -25,22 +26,32 @@ PROFILES_DIR = Path(__file__).resolve().parent.parent / "profiles"
 _SKIP = {"profile.toml", "compose.override.yml"}  # merged/handled separately, never copied as files
 
 
+def _bases(d: Path) -> list[str]:
+    """The profile's `base`: one name, a list of names (layered in that order), or none."""
+    with (d / "profile.toml").open("rb") as fh:
+        b = tomllib.load(fh).get("base") or []
+    return [b] if isinstance(b, str) else [str(x) for x in b]
+
+
 def chain(name: str) -> list[Path]:
-    """[base…, derived]: the profile dirs to layer, base first. Raises SystemExit on an unknown profile or a cycle."""
+    """[base…, derived]: the profile dirs to layer, base first. Each base brings its own chain before it, in the order
+    `base` lists them, and a profile two bases share is layered ONCE, where it first appears: `totp_f2b` (base =
+    ["totp", "f2b"], both on `site`) is site, totp, f2b, totp_f2b. Raises SystemExit on an unknown profile or a cycle."""
     out: list[Path] = []
-    seen: set[str] = set()
-    while name:
-        if name in seen:
-            raise SystemExit(f"profile.py: inheritance cycle at {name!r}")
-        seen.add(name)
-        d = PROFILES_DIR / name
+
+    def visit(n: str, stack: tuple[str, ...]) -> None:
+        if n in stack:
+            raise SystemExit(f"profile.py: inheritance cycle at {n!r}")
+        d = PROFILES_DIR / n
         if not (d / "profile.toml").is_file():
             have = sorted(p.name for p in PROFILES_DIR.iterdir() if (p / "profile.toml").is_file())
-            raise SystemExit(f"profile.py: unknown fake-cluster profile {name!r} (have: {have})")
-        out.append(d)
-        with (d / "profile.toml").open("rb") as fh:
-            name = str(tomllib.load(fh).get("base") or "")
-    out.reverse()
+            raise SystemExit(f"profile.py: unknown fake-cluster profile {n!r} (have: {have})")
+        for b in _bases(d):
+            visit(b, (*stack, n))
+        if d not in out:
+            out.append(d)
+
+    visit(name, ())
     return out
 
 

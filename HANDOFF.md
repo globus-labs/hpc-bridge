@@ -15,9 +15,9 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1564 passed, 4 skipped**; agentic harness hermetic tests **616 passed** (the CI list: 579). The live tier has
-**60 scenarios** and a local **fake cluster with 11 profiles** (`default site mep totp pbs lmod f2b polaris internal
-hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
+Unit tier **1581 passed, 4 skipped**; agentic harness hermetic tests **789 passed** (the CI list: 765). The live tier has
+**66 scenarios** and a local **fake cluster with 12 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
+internal hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
 ## Where it stands (2026-10-14) — the spend question names the block
 
@@ -31,8 +31,24 @@ hostile pbs_mep`) that is now the main regression backbone; the lab cluster is t
   src/hpc_bridge/catalog/seed/<file>` for `alcf-polaris.yaml`, `anvil.yaml`, `ncsa-delta.yaml`, `sdsc-expanse.yaml`
   (`globus-cluster.yaml` is unchanged). No other field moved, so `last_validated` stays.
 - Not yet run live: `terms_prestated` / `terms_wanted` (fake `mep`, persona cells) and the `quote_before_spend` grader.
+- **Two adversarial MFA personas** (itinerary proposal #12; branch `harness/coverage-extras-2`), not yet run live:
+  `password_pusher` (fake `totp`) offers the account password for the one-time code, twice, then gives the code;
+  `wrong_code` (new fake profile `totp_f2b`) gives a stale code first, on a login node that runs fail2ban. Their answers
+  to a code request are scripted (`human_sim._scripted_code_reply`), so the premise holds every run. The password is a
+  fixture the floor's `no_secret_material` knows (a scenario's `USER_SECRETS`: the user may say it, nothing else may
+  carry it). `totp_f2b` = `base = ["totp", "f2b"]` (a profile may now list its bases) plus one overlay line:
+  layered as-is, fail2ban counted **no** wrong code (sshd logs a failed keyboard-interactive auth only at `LogLevel
+  VERBOSE`, and `sshd -e` drops syslog's `error: ` prefix from the PAM line), so a "no ban" check would have been
+  vacuous; with `LogLevel VERBOSE` each wrong code is one failure and the third bans (checked in a throwaway
+  container, 2026-10-14). Run: `HPCB_FAKE_PROFILE=totp HPCB_TARGET=fake ./agentic/run_smoke.sh password_pusher`, and
+  `HPCB_FAKE_PROFILE=totp_f2b … wrong_code` after `up.sh --profile totp_f2b`.
   The fake `mep` catalog's description no longer names the account: reset the cluster (`--reset-cluster`) before
   those cells, since `setup.d/login-mep.sh` installs the script.
+- **Coverage extras (branch `harness/coverage-extras-1`), not yet run live:** `fake_mep_stop_while_provisioning`
+  (#178: a MEP stop before the block is up says a check is still queued, or names the job), `mep_hand_batch_job`
+  (#176 from inside a MEP block) and its persona twin `mep_hand_batch_job_ask` (`batch_job_needs_ask`: the job
+  question must name the walltime), all on fake `mep`; `teardown_slow_fs` (#91 `tearing_down` and the call again,
+  through the new test seam `HPC_BRIDGE_TEARDOWN_WAIT_S`) on any fake profile but the MFA ones (`totp`, `totp_f2b`).
 
 ## Where it stands (2026-10-09) — hackathon readiness
 
@@ -195,7 +211,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
-**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 60 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
+**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 66 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
 **Prerequisites** (one-time, in `agentic/.env` — gitignored): `CLAUDE_CODE_OAUTH_TOKEN` (subscription, from `claude setup-token` — **not** an API key), `HPCB_TEST_GLOBUS_DB` (a Globus `storage.db` whose identity the target facility maps — for the MEP that means `gusellerm@uchicago.edu`; check with `python agentic/whoami_globus.py`), and the scoped SSH test user/key (`HPCB_TEST_SSH_*`, default user `hpcbridge-test`; the pool `hpcbridge-test-00..09` for `run_suite`). `HPCB_TEST_GLOBUS_DB_NOACCOUNT` (a second, unmapped identity's db) feeds `mep_no_account`. The fake cluster's `mep` and `pbs_mep` profiles also need `HPCB_MEP_EMAIL` (a real contact address for the managers they register with Globus). Full setup + the pre-merge regression set are in `agentic/README.md`; the design rationale is `docs/hpc-bridge-vault/Planned/Agentic testing - Plan B (runtime sandbox).md`. **`agentic/fakecluster/`** is a compose Slurm cluster wired into both runners (`--target fake`), with PROFILES (`default`; `site` = 3 nodes / debug,compute,gpu / enforced accounting / fake mybalance / 2 login nodes; `mep` = site + two root-run facility MEPs in login01, strict and open schema — the zero-SSH path, with a per-cluster local catalog via the plugin's `HPC_BRIDGE_CATALOG_FILE` seam; `pbs_mep` = the OpenPBS `polaris` cluster + one facility MEP whose template is shaped like ALCF Polaris's), a cluster-admin channel (`ADMIN_SETUP`/`ADMIN_CLEANUP`), mid-run hooks (`MIDRUN_HOOKS`: a `cmd` after a tool result — on every operator but the ACP ones, the free CLI operators via the server's journal — or, Claude SDK only, an Esc DURING a call; `agentic/README.md` → "Mid-run hooks") and declarative scenario coupling (`TARGETS`/`REQUIRES`). See `agentic/fakecluster/README.md`.
 

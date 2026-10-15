@@ -23,7 +23,10 @@ sed -i -e 's/^UsePAM no/UsePAM yes/' -e 's/^KbdInteractiveAuthentication no/KbdI
 grep -q '^AuthenticationMethods' "$D" || echo 'AuthenticationMethods publickey,keyboard-interactive:pam' >> "$D"
 # `-p 2200` (not `-o Port=`): a command-line port makes sshd IGNORE the config's Port lines — `-o Port=2200` merely
 # ADDED a listener and this daemon took :22 too, so the MFA sshd could not bind (crash loop, 2026-09-06).
-if /usr/sbin/sshd -p 2200 -o UsePAM=no -o KbdInteractiveAuthentication=no -o AuthenticationMethods=publickey -o PidFile=/run/sshd-harness.pid; then
+# A profile layering totp with f2b (`totp_f2b`) runs f2b's script first, which starts the same key-only daemon.
+if (exec 3<>/dev/tcp/127.0.0.1/2200) 2>/dev/null; then   # listening already (a pidfile can outlive a container restart)
+  echo "[totp] enrolled ${#POOL_USERS[@]} users; :22 = key + one-time code (PAM google-authenticator); :2200 = key-only harness sshd (already running)"
+elif /usr/sbin/sshd -p 2200 -o UsePAM=no -o KbdInteractiveAuthentication=no -o AuthenticationMethods=publickey -o PidFile=/run/sshd-harness.pid; then
   echo "[totp] enrolled ${#POOL_USERS[@]} users; :22 = key + one-time code (PAM google-authenticator); :2200 = key-only harness sshd"
 else
   echo "[totp] WARNING: the harness sshd on :2200 did not start"

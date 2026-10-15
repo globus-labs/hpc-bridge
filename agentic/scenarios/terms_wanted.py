@@ -30,7 +30,7 @@ FACILITY_ID = "fake-mep-strict"
 MAPPED_USER = "hpcbmep"
 NEEDS_COMPUTE_NODE = True
 WARM_BLOCK_USER = MAPPED_USER
-SERIAL = True                          # one mapped identity — cells would share the user endpoint
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce"}
 

@@ -43,7 +43,8 @@ def test_hostile_profile_layers_on_site_and_only_it_meets_the_canary_scenarios()
     import canary_login_discovery as cl
     for sc in (cc, cl):
         assert sc.TARGETS == ("fake",) and sc.PERSONA is None   # autonomous on purpose: the sim is not the authority here
-        assert sc.SERIAL is True   # per-node canary channels are shared state — hostile cells must not overlap
+        assert sc.SERIAL == "hostile-canaries"   # per-node canary channels are shared state: ONE group, so the two
+                                                 # hostile cells never overlap (SERIAL = True kept each from itself)
         assert targets.meets(sc.REQUIRES, m["capabilities"])[0]
         assert not targets.meets(sc.REQUIRES, targets.load_profile("site")["capabilities"])[0]
         provided = ({r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS} | set(FLOOR_NAMES))

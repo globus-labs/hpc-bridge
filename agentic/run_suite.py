@@ -120,6 +120,19 @@ def _is_serial(scenario: str) -> bool:
     return k.get("HPCB_KNOB_SERIAL") == "1" or int(k.get("HPCB_KNOB_COOLDOWN_S", "0") or 0) > 0
 
 
+def _serial_locks(scenarios) -> dict[str, asyncio.Lock]:
+    """Each serial scenario's lock. `SERIAL = True` locks a scenario against ITSELF; `SERIAL = "<group>"` shares ONE lock
+    across every scenario naming that group — the fake-MEP cells all run as hpcbmep, and two at once crossed blocks,
+    checks and each other's `scancel -u hpcbmep` (review of 975b709)."""
+    by_key: dict[str, asyncio.Lock] = {}
+    locks = {}
+    for s in scenarios:
+        if _is_serial(s):
+            key = f"group:{g}" if (g := _knobs(s).get("HPCB_KNOB_SERIAL_GROUP")) else s
+            locks[s] = by_key.setdefault(key, asyncio.Lock())
+    return locks
+
+
 def _cooldown_s(scenario: str) -> int:
     """Seconds run_suite waits after each cell of `scenario` before the next one (holding its serial
     lock): a scenario whose cells are deliberate failed SSH auths must stay under the cluster's
@@ -477,13 +490,16 @@ async def _main(args) -> int:
     stagger = Stagger(args.stagger)
     halt = asyncio.Event()
     # SERIAL scenarios (one Globus identity per cell — mep_no_account, stranger_mep_walk) run one at a
-    # time: two cells at once make the web service answer the second with RESOURCE_CONFLICT (first sweep).
-    serial_locks = {s: asyncio.Lock() for s in scenarios if _is_serial(s)}
+    # time: two cells at once make the web service answer the second with RESOURCE_CONFLICT (first sweep). A SERIAL
+    # group (the fake-MEP cells, all hpcbmep) runs one cell at a time across all its scenarios.
+    serial_locks = _serial_locks(scenarios)
     cooldowns = {s: _cooldown_s(s) for s in serial_locks}
     remaining = {s: sum(1 for j in jobs if j[0] == s) for s in serial_locks}  # cooldown only BETWEEN cells
     if serial_locks:
+        groups = {s: _knobs(s).get("HPCB_KNOB_SERIAL_GROUP") for s in serial_locks}
         print("serial scenarios (one cell at a time): "
-              + ", ".join(f"{s}{f' (+{cooldowns[s]}s cooldown)' if cooldowns[s] else ''}" for s in sorted(serial_locks)),
+              + ", ".join(f"{s}{f' [group {groups[s]}]' if groups[s] else ''}"
+                          f"{f' (+{cooldowns[s]}s cooldown)' if cooldowns[s] else ''}" for s in sorted(serial_locks)),
               flush=True)
 
     # Compute cells launch only when the partition can take their block: idle nodes minus what cells launched

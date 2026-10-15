@@ -890,7 +890,7 @@ async def test_teardown_hands_back_tearing_down_when_the_login_node_ops_outlive_
         return ShellOutcome(phase="complete", exit_code=0, stdout="released 0\n", block_state="warm")
 
     monkeypatch.setattr(server, "_run_shell", fake_run_shell)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     res = await _teardown_endpoint(app)
     assert res.status == "tearing_down" and res.endpoint_id == "eid-1" and "call teardown_endpoint again" in res.notice.lower()
     assert torn == [] and app.teardown_task is not None and app.state.endpoint_id == "eid-1"  # in flight; nothing cleared
@@ -925,7 +925,7 @@ async def test_finished_teardown_does_not_clear_a_facility_bound_meanwhile(monke
         return ShellOutcome(phase="complete", exit_code=0, stdout="released 0\n", block_state="warm")
 
     monkeypatch.setattr(server, "_run_shell", fake_run_shell)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     assert (await _teardown_endpoint(app)).status == "tearing_down"
     app.state = EndpointState(endpoint_id="eid-2")  # a connect_facility meanwhile bound a fresh endpoint
     app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"})
@@ -933,6 +933,109 @@ async def test_finished_teardown_does_not_clear_a_facility_bound_meanwhile(monke
     res = await _teardown_endpoint(app)
     assert res.status == "down" and res.endpoint_id == "eid-1"
     assert app.state.endpoint_id == "eid-2" and "login" in app.shapes  # the new binding survives
+
+
+# -- the HPC_BRIDGE_TEARDOWN_WAIT_S test seam (config.teardown_wait_s) -------------------------------------------------
+# The agentic scenario `teardown_slow_fs` shortens the wait so the server-task path (`tearing_down`, then a call again)
+# shows on the fake cluster, whose whole teardown takes ~5 s — inside the 60 s default, so it never answered
+# `tearing_down` live.
+
+@pytest.mark.parametrize(("raw", "want", "said"), [
+    (None, 60.0, False), ("", 60.0, False), ("  ", 60.0, False), ("1", 1.0, False), (" 2.5 ", 2.5, False),
+    ("0", 0.0, False), ("60", 60.0, False),
+    ("abc", 60.0, True), ("0x10", 60.0, True),    # not a number: the default, said once (not at every call)
+    ("-1", 60.0, True),                           # below the range: the default
+    ("600", 60.0, True),                          # longer would risk the MCP client's tool window: capped
+    ("inf", 60.0, True), ("nan", 60.0, True)])
+def test_the_teardown_wait_seam_only_shortens_the_wait_within_bounds(monkeypatch, capsys, raw, want, said):
+    from hpc_bridge import config
+    from hpc_bridge.config import TEARDOWN_WAIT_S, teardown_wait_s
+    monkeypatch.setattr(config, "_TEARDOWN_SEAM_NOTED", set())
+    if raw is None:
+        monkeypatch.delenv("HPC_BRIDGE_TEARDOWN_WAIT_S", raising=False)
+    else:
+        monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", raw)
+    assert TEARDOWN_WAIT_S == 60.0 and teardown_wait_s() == want
+    err = capsys.readouterr().err
+    assert ("is not a number of seconds in [0, 60]" in err) is said and len(err.splitlines()) == int(said)
+    teardown_wait_s()
+    assert capsys.readouterr().err == ""   # said once, not at every teardown call
+
+
+@pytest.mark.parametrize(("raw", "want"), [(None, 60.0), ("1", 1.0), ("0.05", 0.05)])
+async def test_one_teardown_call_waits_as_long_as_the_seam_says(monkeypatch, raw, want):
+    # what the wait IS: the bound on asyncio.wait over the server-side teardown task, read at each call
+    import asyncio
+
+    from hpc_bridge import server
+    from hpc_bridge.server import ShapeRuntime, _teardown_endpoint
+
+    release = asyncio.Event()
+
+    class _F(FakeFacility):
+        async def teardown(self, eid, *, wipe_credentials=False):
+            await release.wait()
+            return {"deleted": True, "credentials_wiped": True}
+
+    app = AppCtx(facility=_F(), profile=Profile(), state=EndpointState(endpoint_id="eid-1"))
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"})
+    waits: list[float | None] = []
+    real_wait = asyncio.wait
+
+    async def spy_wait(fs, *, timeout=None, **kw):
+        waits.append(timeout)
+        return await real_wait(fs, timeout=0, **kw)   # never actually wait the default minute
+
+    if raw is None:
+        monkeypatch.delenv("HPC_BRIDGE_TEARDOWN_WAIT_S", raising=False)
+    else:
+        monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", raw)
+    monkeypatch.setattr(server.asyncio, "wait", spy_wait)
+    try:
+        assert (await _teardown_endpoint(app)).status == "tearing_down"
+        monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "2")   # read at EACH call, not once at import
+        assert (await _teardown_endpoint(app)).status == "tearing_down"
+    finally:
+        release.set()
+        await real_wait({app.teardown_task}, timeout=5)
+    assert waits == [want, 2.0]
+
+
+async def test_a_short_teardown_wait_hands_back_tearing_down_and_the_next_call_the_result(monkeypatch):
+    # the path the scenario exercises, end to end at the seam: a 1 s wait outlived by the login-node ops answers
+    # `tearing_down` (nothing cleared yet); the ops finish with nobody waiting; the next call replays THAT teardown's
+    # `down` for the same endpoint — the state cleared by the `ours` branch — and starts no second teardown
+    import asyncio
+
+    from hpc_bridge import server
+    from hpc_bridge.models import ShellOutcome
+    from hpc_bridge.server import ShapeRuntime, _teardown_endpoint
+
+    release = asyncio.Event()
+    torn = []
+
+    class _F(FakeFacility):
+        async def teardown(self, eid, *, wipe_credentials=False):
+            await release.wait()
+            torn.append(eid)
+            return {"deleted": True, "credentials_wiped": True, "ssh_closed": True}
+
+    app = AppCtx(facility=_F(), profile=Profile(), state=EndpointState(endpoint_id="eid-1"))
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"})
+
+    async def fake_run_shell(a, command, session_id="default", shape="compute"):
+        return ShellOutcome(phase="complete", exit_code=0, stdout="released 0\n", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", fake_run_shell)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
+    first = await asyncio.wait_for(_teardown_endpoint(app), 5)   # the 60 s default would time this out
+    assert first.status == "tearing_down" and first.endpoint_id == "eid-1" and torn == []
+    release.set()
+    await asyncio.wait({app.teardown_task}, timeout=5)           # the ops finish with nobody waiting
+    assert app.state.endpoint_id is None and app.shapes == {}     # ...and cleared the state: it was still ours
+    res = await asyncio.wait_for(_teardown_endpoint(app), 5)
+    assert res.status == "down" and res.endpoint_id == "eid-1" and "fully torn down" in res.notice
+    assert torn == ["eid-1"] and app.teardown_task is None        # the finished result, replayed; no second teardown
 
 
 def _ssh_fake_facility(teardown_report=None, *, auth_method="ssh-key", torn=None):

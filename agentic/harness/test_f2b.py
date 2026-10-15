@@ -21,7 +21,7 @@ def test_f2b_profile_layers_on_site_with_the_jail_and_the_harness_port():
     import f2b_banned
     import f2b_stranger
     for sc in (f2b_stranger, f2b_banned):
-        assert sc.TARGETS == ("fake",) and sc.SERIAL is True
+        assert sc.TARGETS == ("fake",) and sc.SERIAL == "fail2ban"   # one fail2ban state and log: one group
         assert targets.meets(sc.REQUIRES, m["capabilities"])[0]
         assert not targets.meets(sc.REQUIRES, targets.load_profile("site")["capabilities"])[0]
         provided = {r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}

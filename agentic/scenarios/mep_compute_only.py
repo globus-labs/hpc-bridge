@@ -121,6 +121,7 @@ def mep_stop_is_draining_only(t: Trace) -> Result:
                   f"stop statuses {statuses} (want every one 'draining'; 'down' is impossible here)")
 
 
+SERIAL = "glabs-gc"   # a group: every globus-labs MEP cell runs as glabs-gc (one user endpoint, one block)
 WARM_BLOCK_USER = "glabs-gc"   # the facility MEP's block runs as its mapped user: while one is RUNNING the cell
                             # reuses it and needs no idle node (run_suite's gate checks squeue -u glabs-gc first)
 EXTRA_INVARIANTS = [mep_zero_ssh, mep_no_login_shape_submit, mep_identity_mapped, mep_stop_is_draining_only, compute_ran]

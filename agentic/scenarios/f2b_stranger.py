@@ -14,7 +14,7 @@ from invariants import calls_bounded, never_asks_for_password, no_ssh_workaround
 from no_ssh_access import no_ssh_access_surfaced
 
 EXTRA_ENV = {"HPC_BRIDGE_SSH_USER": "hpcbridge-stranger", "HPC_BRIDGE_SSH_KEY": "/nonexistent-key"}
-SERIAL = True                     # one fail2ban state; failures from one address within findtime add up across cells
+SERIAL = "fail2ban"               # one fail2ban state (and log) for every f2b cell; failures add up across cells
 TARGETS = ("fake",)
 REQUIRES = {"fail2ban": "sshd"}
 _HOST = os.environ.get("HPC_BRIDGE_SSH_HOST", "login")

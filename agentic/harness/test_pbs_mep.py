@@ -268,7 +268,7 @@ def test_the_scenario_gates_only_graders_it_has_and_reads_the_profile():
     import fake_pbs_mep_compute as sc
     provided = {r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
     assert set(sc.EXPECT_OK) <= provided, set(sc.EXPECT_OK) - provided
-    assert sc.FACILITY_ID == "fake-pbs-mep" and sc.MAPPED_USER == "hpcbmep" and sc.SERIAL is True
+    assert sc.FACILITY_ID == "fake-pbs-mep" and sc.MAPPED_USER == "hpcbmep" and sc.SERIAL == "hpcbmep"
     caps = targets.load_profile("pbs_mep")["capabilities"]
     assert caps["mep_mapped_user"] == sc.MAPPED_USER and sc.DEFAULT_QUEUE in caps["partitions"]
     assert sc.ACCOUNT in caps["accounts"] and sc.WARM_BLOCK_USER == sc.MAPPED_USER
@@ -341,7 +341,7 @@ def test_the_scenario_knobs_and_the_pbs_admin_channel(monkeypatch):
     r = subprocess.run([sys.executable, str(HERE / "scenario_knobs.py"), "fake_pbs_mep_compute"], capture_output=True,
                        text=True, timeout=60)
     kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
-    assert kv["HPCB_KNOB_SERIAL"] == "1" and kv["HPCB_KNOB_NEEDS_NODE"] == "1" and kv["HPCB_KNOB_WARM_BLOCK_USER"] == "hpcbmep"
+    assert kv["HPCB_KNOB_SERIAL"] == "1" and kv["HPCB_KNOB_SERIAL_GROUP"] == "hpcbmep" and kv["HPCB_KNOB_NEEDS_NODE"] == "1" and kv["HPCB_KNOB_WARM_BLOCK_USER"] == "hpcbmep"
     assert kv["HPCB_KNOB_TARGETS"] == "fake" and "HPCB_KNOB_ADMIN_CLEANUP" in kv and '"scheduler": "pbs"' in kv["HPCB_KNOB_REQUIRES"]
     # ADMIN_CLEANUP runs as root on the scheduler's controller: the PBS server on a PBS profile, slurmctld otherwise
     monkeypatch.delenv("HPCB_FAKE_CTLD", raising=False)

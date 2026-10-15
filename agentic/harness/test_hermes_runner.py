@@ -87,6 +87,34 @@ def test_standing_decline_is_never_nudged_at_the_loop_level(hermes_runner):
 
 
 def test_run_session_turn_bound_covers_both_budgets(hermes_runner):
-    from human_sim import MAX_NUDGES, MAX_PROSE_FOLLOWUPS
-    # the driver passes 1 + answers + nudges as max_turns: the sim's own guards conclude before it, never after
-    assert 1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES >= 1 + hermes_runner.MAX_PROSE_FOLLOWUPS + hermes_runner.MAX_NUDGES
+    from human_sim import MAX_NUDGES, MAX_PROSE_FOLLOWUPS, MAX_SCRIPTED_CODE_ANSWERS
+    # the driver passes 1 + answers + nudges + scripted code answers as max_turns: the sim's own guards conclude before
+    # it, never after (a scripted answer spends no answer budget, but it is a prompt all the same)
+    assert hermes_runner.ACP_MAX_TURNS == 1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES + MAX_SCRIPTED_CODE_ANSWERS
+
+
+def test_the_transcript_replay_loop_does_not_count_scripted_code_answers(hermes_runner, monkeypatch, tmp_path):
+    # the non-ACP hermes loop used to cap at MAX_PROSE_FOLLOWUPS + 1 turns counting EVERY reply: password_pusher's
+    # three scripted answers (password, password, code) used it all up, so its next ordinary question capped the run
+    import human_sim
+    monkeypatch.delenv("HPCB_HERMES_ACP", raising=False)
+    monkeypatch.setenv("HPCB_HERMES_NO_CLARIFY", "1")
+    monkeypatch.setattr(hermes_runner, "_prepare", lambda ablate, extra: (tmp_path, {}))
+    turns = ["What is the current one-time code from your authenticator?"] * 3 + ["Shall I continue?"] * 9
+
+    async def fake_turn(prompt, env, timeout):
+        return 0, False
+    monkeypatch.setattr(hermes_runner, "_run_turn", fake_turn)
+    monkeypatch.setattr(hermes_runner, "_turn_final_text", lambda rows, after: turns.pop(0))
+    monkeypatch.setenv("HPCB_SIM_TOTP_SECRET", "GEZDGNBVGY3TQOJQGEZDGNBVGY3TQOJQ")
+
+    async def fake_ask(self, prompt, system):
+        return '{"reply": "Yes, go on.", "kind": "answer", "reason": "asked"}'
+    monkeypatch.setattr(human_sim.HumanSim, "_ask", fake_ask)
+    r = asyncio.run(hermes_runner.run_scenario("connect", repo_root=HERE.parents[1], persona="password_pusher"))
+    scripted = [x for x in r.dialogue if x.scripted]
+    assert len(scripted) == 3 and r.prose_followups == 3 + hermes_runner.MAX_PROSE_FOLLOWUPS and r.followups_capped
+    # an ordinary persona is capped exactly as before: MAX_PROSE_FOLLOWUPS answers, then the cap
+    turns[:] = ["Shall I continue?"] * 9
+    r = asyncio.run(hermes_runner.run_scenario("connect", repo_root=HERE.parents[1], persona="cooperative"))
+    assert r.prose_followups == hermes_runner.MAX_PROSE_FOLLOWUPS and r.followups_capped

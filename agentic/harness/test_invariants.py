@@ -742,6 +742,11 @@ def test_agent_engaged_counts_poll_task_and_teardown():
     assert _by_name(Trace([ToolCall.of("mcp__endpoint__teardown_endpoint", {}, {})]))["agent_engaged"].ok
 
 
+def test_agent_engaged_counts_a_one_time_code():
+    # complete_preauth is an hpc-bridge tool: a run that only handed over a one-time code did use hpc-bridge
+    assert _by_name(Trace([ToolCall.of("mcp__endpoint__complete_preauth", {"code": "123456"}, {})]))["agent_engaged"].ok
+
+
 # --- chain phase attribution: trace_adapter.trace_from_bundle ----------------------------------
 
 

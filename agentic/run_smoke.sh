@@ -88,12 +88,19 @@ eval "$KNOBS"
 if [ -n "${HPCB_KNOB_TARGETS:-}" ] && [[ ",$HPCB_KNOB_TARGETS," != *",$HPCB_T_NAME,"* ]]; then
   echo "ERROR: scenario '$SCENARIO' runs only on target(s) $HPCB_KNOB_TARGETS, not '$HPCB_T_NAME'"; exit 1
 fi
-if [ "$HPCB_T_NAME" = fake ]; then
-  RUNNING_PROFILE=""
-  for cid in $(docker ps -q --filter "label=com.docker.compose.project=${HPCB_FAKE_PROJECT:-hpcb-fake}" 2>/dev/null); do
+running_fake_profile() {  # the profile the running fake stack was started with, off its /etc/hpcb/profile mount
+  # Only compose's own SERVICE containers count: compose sets com.docker.compose.oneoff=False on each container it
+  # creates for a service (True for `compose run`), never on an image. A one-off `docker run` of the compose-built image
+  # inherits the IMAGE's project label, and one listed first refused live cells with its own mount (2026-10-14).
+  local cid src
+  for cid in $(docker ps -q --filter "label=com.docker.compose.project=${HPCB_FAKE_PROJECT:-hpcb-fake}" \
+                 --filter "label=com.docker.compose.oneoff=False" 2>/dev/null); do
     src="$(docker inspect -f '{{range .Mounts}}{{if eq .Destination "/etc/hpcb/profile"}}{{.Source}}{{end}}{{end}}' "$cid" 2>/dev/null)"
-    [ -n "$src" ] && { RUNNING_PROFILE="$(basename "$src")"; break; }
+    [ -n "$src" ] && { basename "$src"; return 0; }
   done
+}
+if [ "$HPCB_T_NAME" = fake ]; then
+  RUNNING_PROFILE="$(running_fake_profile)"
   if [ -n "$RUNNING_PROFILE" ] && [ "$RUNNING_PROFILE" != "$HPCB_T_PROFILE" ]; then
     echo "ERROR: the fake cluster is up with profile '$RUNNING_PROFILE', but this run declares '$HPCB_T_PROFILE' — set HPCB_FAKE_PROFILE=$RUNNING_PROFILE"; exit 1
   fi

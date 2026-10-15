@@ -355,6 +355,44 @@ def test_admin_knobs_are_printed_and_gate_the_target():
     assert mod._needs_admin("submit_policy_rejected") and not mod._needs_admin("happy_path")
 
 
+def test_serial_group_knob_names_the_identity_the_cells_share():
+    # SERIAL = "hpcbmep": every fake-MEP cell runs as that one mapped account — one block, one queue, one scancel -u
+    rc, k = _knobs("fake_mep_compute")
+    assert rc == 0 and k["HPCB_KNOB_SERIAL"] == "1" and k["HPCB_KNOB_SERIAL_GROUP"] == "hpcbmep"
+    rc, k = _knobs("no_ssh_access")      # SERIAL = True: a lock of its own, no group
+    assert rc == 0 and k["HPCB_KNOB_SERIAL"] == "1" and "HPCB_KNOB_SERIAL_GROUP" not in k
+
+
+def test_a_serial_group_is_one_lock_across_its_scenarios(monkeypatch):
+    # review of 975b709: SERIAL = True locked a scenario only against ITSELF, so two different fake-MEP cells ran at
+    # once as hpcbmep — one's block answered the other's check, and each one's `scancel -u hpcbmep` killed the other's
+    mod = _run_suite()
+    knobs = {"mep_a": {"HPCB_KNOB_SERIAL": "1", "HPCB_KNOB_SERIAL_GROUP": "hpcbmep"},
+             "mep_b": {"HPCB_KNOB_SERIAL": "1", "HPCB_KNOB_SERIAL_GROUP": "hpcbmep"},
+             "own_1": {"HPCB_KNOB_SERIAL": "1"}, "own_2": {"HPCB_KNOB_SERIAL": "1"},
+             "cooled": {"HPCB_KNOB_COOLDOWN_S": "660"}, "free": {}}
+    monkeypatch.setattr(mod, "_knobs", lambda s: knobs[s])
+    locks = mod._serial_locks(list(knobs))
+    assert locks["mep_a"] is locks["mep_b"] and "free" not in locks
+    assert len({id(locks[s]) for s in ("mep_a", "own_1", "own_2", "cooled")}) == 4   # SERIAL = True: its own lock
+
+    async def drive():
+        live = peak = 0
+
+        async def cell(s):
+            nonlocal live, peak
+            async with locks[s]:
+                live += 1
+                peak = max(peak, live)
+                await asyncio.sleep(0.01)
+                live -= 1
+
+        await asyncio.gather(cell("mep_a"), cell("mep_b"), cell("mep_a"), cell("mep_b"))
+        return peak
+
+    assert asyncio.run(drive()) == 1   # never two cells of the group at once
+
+
 def test_idle_probe_counts_free_pbs_nodes_on_a_pbs_target(monkeypatch):
     spec = importlib.util.spec_from_file_location("run_suite", HERE.parent / "run_suite.py")
     mod = importlib.util.module_from_spec(spec)
@@ -368,3 +406,22 @@ def test_idle_probe_counts_free_pbs_nodes_on_a_pbs_target(monkeypatch):
     assert mod._idle_nodes() == 2 and "pbsnodes" in seen[0] and "sinfo" not in seen[0]
     monkeypatch.setattr(mod, "_probe_ssh", lambda cmd: "pbsnodes: Server has no node list\n")
     assert mod._idle_nodes() is None   # an error message is not a state column
+
+
+def test_every_serial_group_is_shared_and_the_groups_are_the_shared_identities_and_states():
+    # a group named by one scenario only is a typo or a stale name: it would lock nothing against anything
+    import importlib
+    from collections import defaultdict
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    groups = defaultdict(set)
+    for p in sorted((HERE.parent / "scenarios").glob("*.py")):
+        serial = getattr(importlib.import_module(p.stem), "SERIAL", False)
+        if isinstance(serial, str):
+            groups[serial].add(p.stem)
+    assert set(groups) == {"hpcbmep", "glabs-gc", "hostile-canaries", "fail2ban"}, dict(groups)
+    assert all(len(members) >= 2 for members in groups.values()), dict(groups)
+    assert groups["glabs-gc"] == {"mep_compute_only", "stranger_mep_walk"}
+    assert groups["hostile-canaries"] == {"canary_login_discovery", "canary_compute_output"}
+    assert groups["fail2ban"] == {"f2b_stranger", "f2b_banned", "wrong_code"}   # one fail2ban log; totp_f2b runs all three
+    for s in ("mep_compute_only", "stranger_mep_walk"):
+        assert _knobs(s)[1].get("HPCB_KNOB_SERIAL_GROUP") == "glabs-gc", s

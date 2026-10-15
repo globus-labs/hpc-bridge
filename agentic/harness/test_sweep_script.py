@@ -56,8 +56,8 @@ def test_sweep_names_existing_scenarios_that_their_profile_can_run():
     import importlib
     sys.path.insert(0, str(HERE.parent / "scenarios"))
     cells = _cells()
-    assert set(cells) == {"default", "site", "totp", "pbs", "lmod", "f2b", "polaris", "internal", "hostile", "mep",
-                          "pbs_mep"}
+    assert set(cells) == {"default", "site", "totp", "pbs", "lmod", "f2b", "totp_f2b", "polaris", "internal", "hostile",
+                          "mep", "pbs_mep"}
     for prof, names in cells.items():
         caps = targets.load_profile(prof)["capabilities"]
         for n in names:

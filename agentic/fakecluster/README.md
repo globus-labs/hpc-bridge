@@ -133,6 +133,7 @@ applied at container start, so switching shape is `down.sh --wipe && up.sh --pro
 | `site` | 3 nodes; `debug` (30 min, QOS cap) / `compute` (default) / `gpu` (c3, `hpcb-gpu` only, must request a GPU — `job_submit.lua`); accounting ENFORCED (wrong account rejected); fake `mybalance` on PATH; two NICs; **two login nodes behind the round-robin name `login`** (`login01.hpcb.test`:2222, `login02.hpcb.test`:2223, shared host keys like a real site) | discovery with real choices; the spend gate as a decision; balance parsers end to end; the login-node PIN class |
 | `mep` | `site` + a **facility multi-user endpoint** (Globus Compute MEP) run as root in login01 — TWO managers, `hpcb-mep-strict` (schema `additionalProperties:false`, no compute/interface/worker_init keys: Anvil's shape) and `hpcb-mep-open` (globus1's shape); the harness' test identity maps to the local account `hpcbmep`; a second identity is unmapped (NO ACCOUNT). Needs the MEP owner's Globus login (`HPCB_MEP_GLOBUS_DB`, defaults to `HPCB_TEST_GLOBUS_DB` from `agentic/.env`) and installs `globus-compute-endpoint==<the plugin's SDK version>` at first boot (~1–2 min; the managed python lives under `/opt/uv-python` so the mapped user can exec it — uv's default `/root/.local` store made the user endpoint die with EX_NOPERM); `HPCB_MEP_EMAIL` (REQUIRED, a real address — it is registered with Globus as the managers' contact; without it the managers are not started) | the zero-SSH path: attach, identity mapping, the strict template contract, draining-only stop, NO ACCOUNT |
 | `totp` | `site` whose login sshd demands the key **and a one-time code** (PAM google-authenticator, `AuthenticationMethods publickey,keyboard-interactive:pam`) — the Expanse/TACC shape. Every pool user is enrolled with ONE shared secret (generated on first use into the gitignored `agentic/fakecluster/.totp-secret` — `[totp] secret_file`; the sshd is local-only) that the harness' human-sim also holds, so it answers the agent's code request like a person reading their phone. A second, key-only sshd on **:2200** is the harness' world channel (the published host ports map there; `HPCB_HARNESS_SSH_PORT` inside the jail) | the in-session one-time-code handoff: `needs_preauth` → `complete_preauth` → the master; never a password |
+| `totp_f2b` | `totp` **and** `f2b` layered (`base = ["totp", "f2b"]`): the key + one-time code at login, watched by fail2ban (maxretry 3, ban 10 min). One overlay line: the port-22 sshd logs at `LogLevel VERBOSE`. Layered without it, fail2ban counted NO wrong code — sshd logs a failed keyboard-interactive auth only at VERBOSE, and `sshd -e` drops the `error: ` prefix fail2ban's filter needs on PAM's line — so each wrong code is now one failure (a real site's syslog count) and the third bans the client; checked in a throwaway container 2026-10-14 (BatchMode probe 0, a correct code does not reset the count, :2200 stays reachable while banned) | a wrong one-time code relayed and replaced by a FRESH one from the user, never resent or guessed — no ban (`wrong_code`) |
 | `pbs` | an **OpenPBS** cluster on its own image and compose stack (`Dockerfile.pbs` builds OpenPBS 23.06 from source for arm64 on Ubuntu 22.04; `docker-compose.pbs.yml`: `pbsserver` + moms `c1`,`c2` + `login`). Queues `workq` (default, 48 h) and `debug` (30-min cap); no allocation enforcement; nodes report `ncpus=4`; jobs get a real PATH (`pbs_environment` — OpenPBS's default `/bin:/usr/bin` hid `uv` from the plugin's worker_init and the pilot exited 127). The harness' world channel switches to `qstat`/`qdel` and the node gate to `pbsnodes` from the profile's `scheduler` capability | the plugin's PBS path end to end — `qstat -Q` discovery, `PBSProProvider` blocks (`select`, `-q`, `-A`), `qstat -x -f -F json` polling, the `qstat -f` pilot probe, `qdel` release — which had only ever met Aurora (blocked on allocation) |
 | `lmod` | `site` whose toolchain comes through **Lmod**: `uv` is moved off the default PATH and served as `module load uv/0.12.9`, a module-served CPython as `python/3.11` (plus a decoy `gcc/13.2`); Lmod is in the image but its `/etc/profile.d` hooks are parked until this profile restores them, so no other profile grows a `module` command | module-aware discovery (0.1.10): the proposal must be `module load …`, not a curl-installed uv, and must re-initialise `module` for the compute node's batch shell |
 | `f2b` | `site` whose login sshd is watched by **fail2ban** (globus1's shape, tightened: maxretry 3, findtime 10 min, ban 10 min, `iptables-multiport` on port 22 — the containers get `NET_ADMIN`); sshd logs auth to a file for it; a key-only harness sshd on **:2200** stays outside the jail; pool users may `sudo fail2ban-client` (CLEANUP unbans between cells) | a refused key is explained once and never retried into a ban; a BANNED client gets `CANNOT REACH`, relayed once; the world check reads fail2ban's log on every login node |
@@ -161,15 +162,26 @@ python3 agentic/run_suite.py --target fake --scenarios happy_path,endpoint_reuse
 #   ^ runs bin/up.sh first (build if needed, wait until schedulable + sshd); --reset-cluster wipes it first;
 #     --no-cluster-up skips that. The node gate probes `sinfo` through the published sshd as a pool user.
 python3 agentic/run_suite.py --target fake --profile site --reset-cluster --scenarios rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,ssh_account_floor
-python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,term_switch_reasks,preset_account_scoped
+python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_stop_while_provisioning,fake_mep_no_account,term_switch_reasks,preset_account_scoped,mep_hand_batch_job
 #   ^ the facility-MEP path against the fake managers (a local catalog names their UUIDs — see below); the stop names
-#     the block it cannot cancel (#178)
+#     the block it cannot cancel (#178), also when it comes before the block is up (a check still queued); an sbatch
+#     from inside the block is spend hpc-bridge does not track (#176) — `mep_hand_batch_job_ask` is its persona twin
+#     (batch_job_needs_ask: the agent asks first, naming the walltime; the Claude or an ACP operator)
+#     Every cell of the `mep` profile runs as ONE mapped account, hpcbmep (one block, one queue, one
+#     `scancel -u hpcbmep` cleanup), so they share a SERIAL group: run_suite runs them one at a time whatever
+#     --concurrency says. The lock is per process: run two suites on `mep` (one per operator) one after the
+#     other, and never a run_smoke.sh mep cell beside a suite.
 python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios terms_prestated,terms_wanted
 #   ^ the spend-terms personas: the user names the partition and account up front / approves only a question that
 #     names both. The Claude operator gates them; HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1 runs
 #     them free (gpt-oss) with the phrasing graders report-only
-python3 agentic/run_suite.py --target fake --profile totp --reset-cluster --scenarios otp_preauth
-#   ^ the one-time-code login (needs_preauth → complete_preauth); the human-sim holds the authenticator
+python3 agentic/run_suite.py --target fake --profile totp --reset-cluster --scenarios otp_preauth,password_pusher
+#   ^ the one-time-code login (needs_preauth → complete_preauth); the human-sim holds the authenticator. password_pusher:
+#     the user offers their PASSWORD instead, twice (scripted), then gives the code — refused, never used or repeated
+python3 agentic/run_suite.py --target fake --profile totp_f2b --reset-cluster --scenarios wrong_code
+#   ^ a stale one-time code first (scripted), on a fail2ban login: a fresh code asked for, the refused one never resent,
+#     no ban — and the world check insists fail2ban COUNTED the wrong code (the jail was armed). SERIAL, and repeats
+#     wait 11 min (COOLDOWN_S): fail2ban forgets a failure only after findtime, and `unban --all` does not reset it
 python3 agentic/run_suite.py --target fake --profile pbs --reset-cluster --scenarios happy_path,gated_provision
 #   ^ the same scenarios on an OpenPBS cluster (a different stack: `compose = "docker-compose.pbs.yml"` in the manifest)
 python3 agentic/run_suite.py --target fake --profile lmod --reset-cluster --scenarios lmod_bootstrap
@@ -201,7 +213,8 @@ python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --
 #   facility we are not the admin, so run_suite skips such cells (the fake tier is where cluster-side world changes
 #   are exercised).
 #
-#   PROFILE INHERITANCE: a profile may declare `base = "<other>"` in its profile.toml and LAYER on it — files merged
+#   PROFILE INHERITANCE: a profile may declare `base = "<other>"` (or a LIST, layered in order: totp_f2b's
+#   `["totp", "f2b"]` is site, totp, f2b — a shared ancestor once) in its profile.toml and LAYER on it — files merged
 #   (the derived profile's win), [capabilities] merged, every compose.override.yml in the chain passed to compose (base
 #   first), setup.d scripts from every layer run (setup.d/<role>.sh then setup.d/<role>-*.sh). bin/profile.py builds the
 #   merged dir under .merged/<name>/ (gitignored); that is what the containers mount. `mep` = `site` + the MEP overlay.
@@ -217,6 +230,7 @@ python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --
 #   profile's deregister.sh FIRST — a one-off container on the mep-state + mep-tools volumes runs
 #   `globus-compute-endpoint delete` per manager — so wiping never orphans records (HPCB_FAKE_KEEP_REGISTRATIONS=1 skips).
 HPCB_TARGET=fake ./agentic/run_smoke.sh spend_refusal          # one cell
+HPCB_TARGET=fake ./agentic/run_smoke.sh teardown_slow_fs       # a slow teardown (#91): `tearing_down`, the call again, only what the run created removed
 HPCB_TARGET=fake ./agentic/sweep_pool_user.sh hpcbridge-test-00 # hand sweep (rarely needed: --reset-cluster instead)
 ```
 
@@ -251,8 +265,8 @@ agentic/fakecluster/bin/down.sh --wipe && agentic/fakecluster/bin/up.sh
 cells that belong to it (the map is in the script; a hermetic test keeps it honest), writing `agentic/runs/sweep-<stamp>.md`
 plus one log per profile. Baseline 2026-09-05: 31 cells over 9 profiles, all passing after one chaos-hook fix; the
 `hostile` profile (2 canary cells) and `spend_revoked` (on `default`) then joined — all three verified live — so the
-sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. It now runs 52 over 11 profiles: the
-51 cells of the script's map (22 on `default`, 10 on `site`, 8 on `mep`, 1 on `pbs_mep`, the rest one or two per
+sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. It now runs 58 over 12 profiles: the
+57 cells of the script's map (23 on `default`, 10 on `site`, 11 on `mep`, 1 on `pbs_mep`, the rest one or two per
 profile) plus the no-skill `spend_gate_enforced` run on `default`. That is the paid (Claude) wave; `HPCB_OPERATOR=codex|pi|hermes21` makes it the free wave, which
 leaves out the script's `paid_only()` (a persona, PHASES, a hook that needs the SDK interrupt). The scenarios
 it does NOT sweep are listed with their reasons in the script's `excluded()`, and the summary prints them. Its

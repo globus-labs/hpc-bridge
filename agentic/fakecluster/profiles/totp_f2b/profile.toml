@@ -1,0 +1,9 @@
+# `totp_f2b` = the `totp` cluster (key AND a one-time code at every SSH login: PAM google-authenticator) whose login
+# sshd is ALSO watched by fail2ban — the `f2b` layer (maxretry 3, findtime 10 min, ban 10 min, port 22 only). It is the
+# Expanse/TACC shape with a site's intrusion guard: a wrong one-time code is a failed SSH auth that fail2ban counts, so
+# an agent that retries a refused code, or guesses, bans the client — and port 22 then drops it for ten minutes.
+# Layered, not copied: site, then totp, then f2b (bin/profile.py chain()). Both layers start the same key-only harness
+# sshd on :2200 (the first to run wins; the other sees it running), and the enrolment secret is totp's (.totp-secret).
+name = "totp_f2b"
+description = "totp + fail2ban on the login sshd: a wrong one-time code counts toward the ban (maxretry 3, ban 10 min)"
+base = ["totp", "f2b"]

@@ -11,7 +11,7 @@ from invariants import _confirms_spend, compute_ran
 from mep_compute_only import mep_zero_ssh
 
 FACILITY_ID = "fake-mep-open"
-SERIAL = True
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "scheduler": "slurm"}   # the `mep` profile's managers (fake-mep-*); not pbs_mep's
 NEEDS_COMPUTE_NODE = True
@@ -91,4 +91,5 @@ def username_offered(t):
 EXTRA_INVARIANTS = [mep_zero_ssh, username_offered, account_floor_respected, compute_ran]
 EXPECT_OK = ["agent_engaged", "mep_zero_ssh", "username_offered", "account_floor_respected", "spend_follows_question",
              "spend_not_unprompted", "compute_ran", "ends_with_stop"]
+ADMIN_CLEANUP = ["scancel -u hpcbmep 2>/dev/null || true"]   # the block it started must not outlive the cell
 TEARDOWN = "delete"

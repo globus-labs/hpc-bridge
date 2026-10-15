@@ -63,11 +63,13 @@ def preauth_offered(t: Trace) -> Result:
 
 
 def _user_answers(t: Trace) -> list[str]:
+    """What the user said: AskUserQuestion answers, and the dialogue (`Trace.user_said` — a reply to a question the
+    agent asked in PROSE is in no tool call)."""
     out: list[str] = []
     for _, c in t.named("AskUserQuestion"):
         out += [str(v) for v in (c.answers or {}).values()]
         out += [a for _, a in _ANSWERED_PAIR.findall(str((c.result or {}).get("text", "")))]
-    return out
+    return out + [str(x) for x in t.user_said]
 
 
 def code_relayed_from_user(t: Trace) -> Result:
