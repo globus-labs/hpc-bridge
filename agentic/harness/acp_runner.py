@@ -109,7 +109,7 @@ async def run_scenario(
         server_env.update({k: v for k, v in extra_env.items() if v is not None})
     if ablate_skill:
         server_env["HPC_BRIDGE_OMIT_INSTRUCTIONS"] = "1"     # the guidance ablation: no pointer, no resource nudge
-    mcp = [acp_client.hpc_bridge_mcp(repo, server_env)]
+    mcp = [acp_client.hpc_bridge_mcp(repo, server_env, operator="claude-acp")]
     interactive = persona is not None
     full_prompt = _lead(ablate_skill, interactive=interactive) + "\n\n" + prompt
     model_id = os.environ.get("HPCB_CLAUDE_ACP_MODEL", "").strip() or (model if model and model != "default" else None)

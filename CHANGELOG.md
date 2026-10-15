@@ -204,6 +204,24 @@ installed plugin only when that version changes); git tags mark releases.
   `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
+- Every run's bundle now keeps the hpc-bridge MCP server's own stderr, as `server-stderr.log`. On 2026-10-15,
+  `teardown_slow_fs` under Pi and Codex lost the server mid-teardown ("MCP connection closed", "Transport closed"),
+  and no bundle held a line from the server, so the crash could not be diagnosed. Every operator (Claude SDK,
+  claude-acp, hermes, Codex, Pi, hermes21) now starts the server through one wrapper,
+  `agentic/harness/serve_with_stderr.py`. The wrapper appends a header line per start (time, pid, the MCP client's
+  pid, the operator), points stderr at the run's log in the jail, and execs the server: stdin and stdout, the pid, the
+  exit code and signals are the server's own. The bundle copy keeps the last 2 MB, redacted: the secret values the
+  safety floor knows, and `Bearer`, `access_token`/`refresh_token`/`password`/`api_key`, private-key and `sk-ant-`
+  shapes. `record.json` gains `server`, every server start with when it went away. Three report-only rows, which
+  never gate: `harness:server_channel_closed` (an hpc-bridge call's result says the MCP channel closed under it, in
+  the client's words or as the journal's `run_stdio_async` cancel; it fires on both incident bundles and on no other
+  of the 887 stored on 2026-10-15), `harness:server_exited` (the process went while its client ran on for more than
+  3 s) and `harness:server_orphaned` (the process ran on for more than 3 s after its client went), each with the last 20
+  stderr lines where it has them. Redaction also covers the Globus tokens the run started with and the mounted
+  identity's originals (the SDK refreshes them out of the store mid-run), JWTs and long opaque tokens, while a plain
+  word after a token or password key keeps its meaning. A run that cannot make the log still writes its bundle. The
+  exit status itself is not observable (the client reaps the server). `agentic/README.md`, "The MCP server's own
+  stderr".
 - Two scenarios with a user who gets the one-time code wrong, on purpose. Both are persona cells: the Claude operator
   gates them, `HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1` runs them free with the phrasing graders
   report-only, and the CLI operators report them SKIPPED. What the user answers to a request for a code is scripted,

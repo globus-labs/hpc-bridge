@@ -38,6 +38,7 @@ from invariants import ToolCall, Trace
 from midrun_hooks import HookWatcher, fired_record, follow_journal, hook_label, trigger_text, unsupported_hook_needs
 from proctree import kill_group
 from responses_relay import start_relay
+from server_stderr import wrap
 
 HARNESSES = ("codex", "pi", "hermes21")
 
@@ -105,8 +106,9 @@ class CliFinal:
     total_cost_usd: float | None = None
 
 
-def _server_cmd(repo: str) -> list[str]:
-    return [_UV, "run", "--directory", repo, "--extra", "integration", "hpc-bridge"]
+def _server_cmd(repo: str, harness: str) -> list[str]:
+    """The server from this checkout, started through the harness's stderr wrapper (server_stderr.wrap)."""
+    return wrap([_UV, "run", "--directory", repo, "--extra", "integration", "hpc-bridge"], harness)
 
 
 def _install_skill(repo: Path, *dirs: Path) -> None:
@@ -132,13 +134,14 @@ def setup_codex(work: Path, repo: str, env: dict[str, str], base_url: str | None
     home = work / "codex"
     home.mkdir(parents=True, exist_ok=True)
     names = _server_env_names(env, extra)
+    server = _server_cmd(repo, "codex")
     lines = [
         f"model = {json.dumps(model)}", 'model_provider = "alcf"', 'approval_policy = "never"',
         'sandbox_mode = "danger-full-access"', "tool_output_token_limit = 20000", "",
         "[model_providers.alcf]", 'name = "ALCF"', f"base_url = {json.dumps(base)}",
         'env_key = "ALCF_INFERENCE_TOKEN"', 'wire_api = "responses"', "",
-        "[mcp_servers.hpc-bridge]", f"command = {json.dumps(_server_cmd(repo)[0])}",
-        f"args = {json.dumps(_server_cmd(repo)[1:])}", f"env_vars = {json.dumps(names)}",
+        "[mcp_servers.hpc-bridge]", f"command = {json.dumps(server[0])}",
+        f"args = {json.dumps(server[1:])}", f"env_vars = {json.dumps(names)}",
         "startup_timeout_sec = 180", "tool_timeout_sec = 600", "required = true",
         'default_tools_approval_mode = "approve"',
     ]
@@ -155,7 +158,7 @@ def setup_pi(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str]
         "baseUrl": base, "api": "openai-completions", "apiKey": "$ALCF_INFERENCE_TOKEN",
         "compat": {"supportsDeveloperRole": False, "supportsStore": False, "maxTokensField": "max_tokens"},
         "models": [{"id": model, "reasoning": True, "contextWindow": 131072, "maxTokens": 32768}]}}}, indent=1))
-    cmd = _server_cmd(repo)
+    cmd = _server_cmd(repo, "pi")
     (home / "mcp.json").write_text(json.dumps({"mcpServers": {"hpc-bridge": {
         "command": cmd[0], "args": cmd[1:], "exposure": "direct", "timeout": 300}}}, indent=1))
     return {"PI_CODING_AGENT_DIR": str(home), "PI_OFFLINE": "1", "PI_SKIP_VERSION_CHECK": "1", "PI_TELEMETRY": "0"}
@@ -165,7 +168,7 @@ def setup_hermes21(work: Path, repo: str, env: dict[str, str], *, extra: Iterabl
     base, model = _model()
     home = work / "hermes"
     home.mkdir(parents=True, exist_ok=True)
-    cmd = _server_cmd(repo)
+    cmd = _server_cmd(repo, "hermes21")
     cfg = {
         "model": {"provider": "custom", "base_url": base, "api_key": "${ALCF_INFERENCE_TOKEN}", "default": model,
                   "context_length": 131072, "max_tokens": 4096},

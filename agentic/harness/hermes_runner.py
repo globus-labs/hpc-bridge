@@ -187,7 +187,7 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
         pass
 
     repo = "/work/hpc-bridge"
-    mcp = [acp_client.hpc_bridge_mcp(repo, os.environ)]
+    mcp = [acp_client.hpc_bridge_mcp(repo, os.environ, operator="hermes")]
     interactive = persona is not None
     full_prompt = _lead(ablate_skill, interactive=interactive) + "\n\n" + prompt
     db = home / "state.db"

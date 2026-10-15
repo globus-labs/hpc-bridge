@@ -30,6 +30,7 @@ from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
 from pathlib import Path
 
+import server_stderr
 from acp_trace import capture_crosscheck
 from cluster_ops import (
     capture_logs_cmd,
@@ -590,6 +591,24 @@ def _secret_material() -> dict[str, list[str]]:
     return out
 
 
+# The identity run_smoke.sh mounts read-only; entrypoint.sh copies it into the run's store, whose tokens the SDK then
+# refreshes in place — so this file still holds the ORIGINAL tokens the run started from.
+_MOUNTED_GLOBUS_DB = Path("/run/secrets/storage.db")
+
+
+def _redaction_material(at_start: dict[str, list[str]] | None = None) -> dict[str, list[str]]:
+    """What the server's stderr is redacted against before it enters the bundle: the floor's material now, as it was
+    when the run started (`at_start` — a token the SDK refreshed away mid-run is no longer in the store at the end),
+    and the mounted identity's original tokens."""
+    out: dict[str, set[str]] = {}
+    for part in (at_start or {}, _secret_material()):
+        for label, values in part.items():
+            out.setdefault(label, set()).update(values)
+    if _MOUNTED_GLOBUS_DB.is_file():
+        out.setdefault("globus token", set()).update(_tokens_from_storage_db(_MOUNTED_GLOBUS_DB))
+    return {label: sorted(values) for label, values in out.items() if values}
+
+
 # An exit path (interrupted, crashed, setup failed) races `docker stop --stop-timeout 120` (run_smoke.sh): past it the
 # container dies and the bundle with it. Stopping the operator, the teardown, the final probe and CLEANUP share at most
 # these many seconds there (90 s in all).
@@ -1020,6 +1039,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     probe: tuple[list[str], list[str]] | None = None
     torn_down = checked_after_teardown = False
     metrics: dict[str, float | None] = {}
+    # The MCP server's own stderr: every operator starts it through the stderr wrapper, which appends to this run's raw
+    # log; the watch follows it while the operator runs; the bundle gets it redacted and capped (server_stderr).
+    # prepare() never raises: with no room for a log it returns None and the servers start unwrapped. The secrets the
+    # log is redacted against are snapshotted now as well — the SDK may refresh a token out of the store mid-run.
+    server_log = server_stderr.prepare()
+    watch = server_stderr.ServerWatch(server_log)
+    try:
+        secrets_at_start = _secret_material()
+    except Exception:  # noqa: BLE001 - the end-of-run material and the token shapes still apply
+        secrets_at_start = {}
     try:
         _seed_facility_cache(scen)
         _trust_host_key(scen)
@@ -1031,15 +1060,16 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             rc = 2
             result_label = "SETUP FAILED"
             return rc
-        if phases:
-            res = await _run_chain(phases, scen, model=model, effort=effort,
-                                   persona=persona, user_goal=user_goal, no_skill=no_skill)
-        else:
-            res = await _run_scenario(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
-                                      persona=persona, user_goal=user_goal, ablate_skill=no_skill,
-                                      max_turns=getattr(scen, "MAX_TURNS", 40),
-                                      extra_env=getattr(scen, "EXTRA_ENV", None) or None,
-                                      midrun_hooks=getattr(scen, "MIDRUN_HOOKS", None), hook_runner=_run_hook)
+        async with watch.watching():
+            if phases:
+                res = await _run_chain(phases, scen, model=model, effort=effort,
+                                       persona=persona, user_goal=user_goal, no_skill=no_skill)
+            else:
+                res = await _run_scenario(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
+                                          persona=persona, user_goal=user_goal, ablate_skill=no_skill,
+                                          max_turns=getattr(scen, "MAX_TURNS", 40),
+                                          extra_env=getattr(scen, "EXTRA_ENV", None) or None,
+                                          midrun_hooks=getattr(scen, "MIDRUN_HOOKS", None), hook_runner=_run_hook)
 
         print(f"\n=== TRACE: {len(res.trace.calls)} tool calls ===")
         for i, c in enumerate(res.trace.calls):
@@ -1139,8 +1169,13 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # trace source (state.db / the CLI transcript) lagged, truncated or picked the wrong session.
         if getattr(res, "acp_events", None):
             results.append(capture_crosscheck(res.acp_events, res.trace))
+        # The MCP server's troubles, REPORT-ONLY, so they show in the table beside whatever the agent made of them, with
+        # the last lines of its stderr: the channel closed under a call (the trace / the journal), the process went
+        # while its client ran on, or it ran on after its client went (server_stderr.rows).
+        results += server_stderr.rows(watch, res.trace, res.messages, secrets=_redaction_material(secrets_at_start))
         # agent_engaged + run_completed always gate: a do-nothing or truncated run must never grade OK.
         critical = set(getattr(scen, "EXPECT_OK", [r.name for r in results])) | {"agent_engaged", "run_completed", *FLOOR_NAMES}
+        critical -= server_stderr.ROWS   # diagnostics, never gates — even where a scenario gates every row
         if getattr(scen, "LOCAL_BASELINE", False):
             # a calibration run that must NOT touch hpc-bridge (repl_baseline_local): its own liveness gate replaces
             # agent_engaged, which would otherwise fail it for doing exactly what it was asked
@@ -1282,7 +1317,15 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
             arrivals=(getattr(res, "arrivals", None) if res else None),
             metrics=metrics,
+            server=watch.summary(),
         )
+        try:   # the server's own stderr, redacted and capped; the raw log never leaves the jail
+            if rec is not None:
+                server_stderr.bundle_log(server_log, rec, secrets=_redaction_material(secrets_at_start))
+        except Exception as exc:  # noqa: BLE001 - evidence, never a reason the bundle is lost
+            print(f"server stderr: not copied into the bundle ({type(exc).__name__}: {exc})", file=sys.stderr, flush=True)
+        finally:
+            server_stderr.discard(server_log)
         if rec is not None and endpoint_logs:
             # The evidence a post-mortem needs (manager + UEP logs, block stdout/stderr) — deleted on
             # the cluster by teardown, so this file is the only copy. See cluster_ops.capture_logs_cmd.

@@ -17,6 +17,7 @@ import os
 from pathlib import Path
 
 import yaml
+from server_stderr import wrap
 
 # Credentials / config the hpc-bridge MCP server needs, passed through hermes' allowlist (only those actually set).
 # NB: HPC_BRIDGE_OMIT_INSTRUCTIONS is intentionally excluded from the default — hermes wants the guidance; the
@@ -54,6 +55,9 @@ def build_config(extra_env: dict[str, str] | None = None) -> dict:
     # the Argo path (host.docker.internal tunnel), or when HPCB_HERMES_STREAM is set, turn it ON so spend is
     # trackable against a budget. Verified: streaming over Argo tool-calls fine and shows up in argo-dash.
     streaming = bool(os.environ.get("HPCB_HERMES_STREAM")) or ("host.docker.internal" in base_url)
+    # absolute uv: hermes' env filter must not hide it on PATH; started through the harness's stderr wrapper
+    server = wrap(["/usr/local/bin/uv", "run", "--directory", "/work/hpc-bridge", "--extra", "integration", "hpc-bridge"],
+                  "hermes")
     cfg = {
         "model": {
             "provider": "custom",
@@ -66,8 +70,8 @@ def build_config(extra_env: dict[str, str] | None = None) -> dict:
         },
         "mcp_servers": {
             "hpc-bridge": {
-                "command": "/usr/local/bin/uv",          # absolute: hermes' env filter must not hide uv on PATH
-                "args": ["run", "--directory", "/work/hpc-bridge", "--extra", "integration", "hpc-bridge"],
+                "command": server[0],
+                "args": server[1:],
                 "env": env,
                 "connect_timeout": 180.0,
             }

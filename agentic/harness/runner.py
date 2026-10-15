@@ -37,6 +37,7 @@ from invariants import Trace, logical_name
 
 # HookWatcher lives in midrun_hooks.py (SDK-free, shared with cli_runner); `runner.HookWatcher` still names it
 from midrun_hooks import HookWatcher, fired_record, hook_actions, hook_label, trigger_text
+from server_stderr import wrap
 from trace_adapter import build_trace, insert_interjections
 
 # Logical hpc-bridge tool names (see Modules/server.md). Registered under SDK key
@@ -141,12 +142,14 @@ def _scrubbed_agent_env():
 
 def _mcp_servers(repo_root: Path, extra_env: dict[str, str] | None = None) -> dict:
     # Direct registration (not as a plugin) — matches the .mcp.json launch command
-    # (the trailing "hpc-bridge" is the console script, unchanged by the server rename).
+    # (the trailing "hpc-bridge" is the console script, unchanged by the server rename), started through the harness's
+    # stderr wrapper so the server's own stderr lands in the bundle (server_stderr.wrap).
+    cmd = wrap(["uv", "run", "--directory", str(repo_root), "--extra", "integration", "hpc-bridge"], "claude")
     return {
         "endpoint": {
             "type": "stdio",
-            "command": "uv",
-            "args": ["run", "--directory", str(repo_root), "--extra", "integration", "hpc-bridge"],
+            "command": cmd[0],
+            "args": cmd[1:],
             # extra_env: per-scenario overrides for the SERVER only (e.g. a bogus SSH login name to
             # play a stranger) — the harness process keeps its own pool credentials for postchecks/teardown.
             "env": {**_server_env(), **(extra_env or {})},
