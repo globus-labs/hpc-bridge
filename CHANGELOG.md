@@ -24,7 +24,15 @@ installed plugin only when that version changes); git tags mark releases.
     AuthAPIError`), says so too;
   - `connect_facility` checks the same way before anything else, and answers `needs_login` with the reason, as for a
     missing login. Before, it went on: on an SSH facility the bootstrap would have copied the dead login to the
-    login node. When the check cannot reach Globus, the connect carries on as before;
+    login node. When the check cannot reach Globus, the connect carries on as before. A login that completes
+    during the connect now names the identity that logged in, not the previous one, and work sent afterwards uses
+    the new login;
+  - starting an endpoint over SSH without a connect (a server started with `HPC_BRIDGE_MACHINE`, or a command
+    after a teardown) checks the login first, renewing it even when it has not expired yet, so a login revoked
+    minutes ago is caught too. On a dead login nothing is started, no SSH is made and nothing is copied to the
+    login node; the answer says so;
+  - the check gives up after about 30 seconds when Globus cannot be reached (one retry, 15-second timeout),
+    instead of up to six minutes;
   - the remaining bare "hpc-bridge error: AuthAPIError …" answers (a failed endpoint start in `ensure_endpoint_up`,
     a failed attach to a facility-run endpoint, a tool error) say the login no longer works and point at
     `authenticate(force=True)`.

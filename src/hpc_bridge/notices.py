@@ -17,7 +17,7 @@ from .config import SYNC_WAIT_S, _task_ceiling_s
 from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _with_spend
 from .lifecycle import BlockState
-from .login import LOGIN_EXPIRED, LoginStart, login_expired
+from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import ConnectFacilityResult, ShellOutcome, Submission
 from .runner import CanaryResult
 from .scheduler_ops import _submission_refused
@@ -58,6 +58,8 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     ('seed storage.db (mkdir) failed: u@host: Permission denied (publickey,…)') — a stranger with no
     account or key on the facility must instead hear WHICH host and login name were tried, where the
     name came from, and the two remedies (found on the stranger's walk, 2026-09-03)."""
+    if login_expired(exc):  # the gate before a bootstrap: nothing was copied, no SSH was made
+        return _hpc_bridge_error(exc)
     raw = str(exc)
     # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
     # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
@@ -955,8 +957,11 @@ def _hpc_bridge_error(exc: BaseException) -> str:
     """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
     renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
     if login_expired(exc):
-        return (f"hpc-bridge error: {type(exc).__name__}: {LOGIN_EXPIRED} — Globus refused to refresh it. Nothing is "
-                "wrong with the facility or its config: the user must log in to Globus again — call "
+        # the gate before a bootstrap raised it: no SSH was made and nothing was copied or started
+        gated = " Nothing was started, and no login was copied to the login node." \
+            if isinstance(exc, LoginExpiredError) else ""
+        return (f"hpc-bridge error: {type(exc).__name__}: {LOGIN_EXPIRED} — Globus refused to refresh it.{gated} "
+                "Nothing is wrong with the facility or its config: the user must log in to Globus again — call "
                 "authenticate(force=True) and give the user its link — then retry.")
     return f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500]
 

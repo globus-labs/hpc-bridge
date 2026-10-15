@@ -163,11 +163,21 @@ def test_a_dispatch_failing_on_a_dead_login_says_so():
 # ---- authenticate() checks that the stored login still works ------------------------------------------------------
 
 class _Authorizer:
-    def __init__(self, fail=None):
-        self.fail, self.ensured = fail, 0
+    """`valid`: the access token is still within its lifetime, so ensure_valid_token makes no refresh call unless
+    handle_missing_authorization (the SDK's "this token is no good") invalidated it first."""
+
+    def __init__(self, fail=None, valid=False):
+        self.fail, self.valid, self.ensured, self.refreshes = fail, valid, 0, 0
+
+    def handle_missing_authorization(self):
+        self.valid = False
+        return True
 
     def ensure_valid_token(self):  # the SDK refreshes here only when the access token has expired
         self.ensured += 1
+        if self.valid:
+            return
+        self.refreshes += 1
         if self.fail is not None:
             raise self.fail
 
@@ -175,9 +185,9 @@ class _Authorizer:
 class _StoredApp:
     """The non-prompting app: holds every scope (login_required False); its tokens refresh — or don't."""
 
-    def __init__(self, fail=None, required=False):
+    def __init__(self, fail=None, required=False, valid=False):
         self.required, self.logins = required, 0
-        self.authorizers = {rs: _Authorizer(fail) for rs in ("auth.globus.org", "funcx_service")}
+        self.authorizers = {rs: _Authorizer(fail, valid) for rs in ("auth.globus.org", "funcx_service")}
 
     @property
     def scope_requirements(self):
@@ -414,3 +424,160 @@ async def test_connect_mep_attach_error_names_a_dead_login(monkeypatch):
     errors["exc"] = RuntimeError("status API down")
     res = await _mep_connect(_app_with(None), monkeypatch)
     assert res.phase == "failed" and res.notice == "hpc-bridge error: RuntimeError: status API down"
+
+
+# ---- the bootstrap gate: no SSH to copy a login Globus refuses to renew -----------------------------------------
+
+class _BootstrapFacility(FakeFacility):
+    """An SSH-style facility: no endpoint until `bootstrap` (which, for real, SSHes in and may copy the login)."""
+
+    def __init__(self):
+        super().__init__()
+        self.workers, self.bootstraps = 1, 0
+
+    async def bootstrap(self, profile):
+        self.bootstraps += 1
+        return await self.provision(profile)
+
+
+def _pinned_app(stored):
+    """A server started with HPC_BRIDGE_MACHINE (or after a teardown): a facility bound, no endpoint, no connect."""
+    app = AppCtx(facility=_BootstrapFacility(), profile=Profile())
+    app.login_flow = _flow(stored)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "ok\n", ""))
+    return app
+
+
+class _ToolCtx:
+    def __init__(self, app):
+        self.request_context = type("R", (), {"lifespan_context": app})()
+
+    async def report_progress(self, *a, **k):
+        pass
+
+
+@pytest.mark.parametrize("valid", [False, True], ids=["access-token-expired", "access-token-still-valid"])
+async def test_bootstrap_on_a_dead_login_makes_no_ssh_and_says_why(valid):
+    app = _pinned_app(_StoredApp(fail=_dead_refresh(), valid=valid))
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "down" and app.facility.bootstraps == 0  # no SSH, nothing copied
+    assert DEAD in res.notice and "authenticate(force=True)" in res.notice and "no login was copied" in res.notice
+    # a refresh token revoked within the access token's lifetime is caught too: this gate forces the refresh
+    assert sum(a.refreshes for a in app.login_flow.app_factory(None).authorizers.values()) == 1
+
+
+async def test_run_shell_before_a_bootstrap_on_a_dead_login():
+    app = _pinned_app(_StoredApp(fail=_dead_refresh()))
+    _shape_runtime(app, "compute").spend_confirmed = True
+    out = await server.run_shell("echo hi", _ToolCtx(app), shape="compute")
+    assert out.phase == "failed" and DEAD in out.notice and "authenticate(force=True)" in out.notice
+    assert app.facility.bootstraps == 0
+
+
+@pytest.mark.parametrize("stored", [_StoredApp(valid=True), _StoredApp(fail=requests.ConnectionError("no route"))],
+                         ids=["works", "unchecked"])
+async def test_bootstrap_carries_on_when_the_login_works_or_cannot_be_checked(stored):
+    app = _pinned_app(stored)
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "up" and app.facility.bootstraps == 1
+
+
+def test_a_forced_check_sees_a_refresh_token_revoked_while_the_access_token_is_valid():
+    app = _StoredApp(fail=_dead_refresh(), valid=True)
+    assert _flow(app).check_stored_login() == ("works", None)  # the lazy check makes no call: nothing to see
+    assert sum(a.refreshes for a in app.authorizers.values()) == 0
+    verdict, why = _flow(app).check_stored_login(force_refresh=True)
+    assert verdict == "expired" and "oauth2/token" in why
+
+
+async def test_connect_ssh_bootstrap_on_a_login_revoked_within_its_access_token(monkeypatch):
+    # connect's own gate is lazy (no refresh while the access token is valid); the forced gate before the
+    # bootstrap is what stops the copy
+    fac = _BootstrapFacility()
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")]))
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: fac)
+    app = _app_with(_flow(_StoredApp(fail=_dead_refresh(), valid=True)))
+    res = await server._connect_facility(app, "anvil")
+    assert res.phase == "failed" and fac.bootstraps == 0
+    assert DEAD in res.notice and "authenticate(force=True)" in res.notice
+
+
+# ---- the real SDK app: bounded, and the forced refresh -----------------------------------------------------------
+
+@pytest.fixture
+def real_app(monkeypatch, tmp_path):
+    """`_default_app_factory(None)` — the real UserApp — over an in-memory token store (never the real storage.db),
+    with every HTTP request answered by `net` (no network)."""
+    import time
+
+    from globus_compute_sdk.sdk.auth import token_storage as gc_storage
+    from globus_sdk.token_storage import MemoryTokenStorage, TokenStorageData
+
+    from hpc_bridge.login import required_scopes
+
+    monkeypatch.setenv("GLOBUS_COMPUTE_USER_DIR", str(tmp_path / "gc"))
+    net = {"calls": [], "answer": None, "sleeps": []}
+
+    def store(*, valid):
+        st = MemoryTokenStorage()
+        at = int(time.time()) + (3600 if valid else -10)
+        st.store_token_data_by_resource_server({
+            rs: TokenStorageData(resource_server=rs, identity_id="ident-1", scope=" ".join(scopes),
+                                 access_token="AT-" + rs, refresh_token="RT-" + rs, expires_at_seconds=at,
+                                 token_type="Bearer")
+            for rs, scopes in required_scopes().items()})
+        monkeypatch.setattr(gc_storage, "get_token_storage", lambda: st)
+
+    def send(self, req, **kw):
+        net["calls"].append((req.method, req.url, kw.get("timeout")))
+        assert req.url.startswith(TOKEN_URL), req.url  # only the token endpoint may be asked
+        return net["answer"](req)
+
+    monkeypatch.setattr(requests.Session, "send", send)
+    monkeypatch.setattr("globus_sdk.transport.requests.time.sleep", lambda s: net["sleeps"].append(s))
+    net["store"] = store
+    return net
+
+
+def test_the_real_check_is_bounded_on_a_black_holed_network(real_app):
+    def black_hole(req):
+        raise requests.ConnectTimeout("connect timed out")
+
+    real_app["store"](valid=False)
+    real_app["answer"] = black_hole
+    verdict, why = LoginFlow().check_stored_login()
+    assert verdict == "unchecked" and why
+    timeouts = [c[2] for c in real_app["calls"]]
+    assert len(timeouts) == 2, timeouts  # one try and ONE retry, not the SDK's six
+    assert all(t is not None and t <= 15 for t in timeouts), timeouts  # not the SDK's 60 s each
+
+
+def test_the_real_forced_check_sees_a_revoked_refresh_token(real_app):
+    real_app["store"](valid=True)
+    real_app["answer"] = lambda req: _response("POST", req.url, 400, {"error": "invalid_grant"}, "Bad Request")
+    assert LoginFlow().check_stored_login() == ("works", None) and real_app["calls"] == []
+    verdict, why = LoginFlow().check_stored_login(force_refresh=True)
+    assert verdict == "expired" and "oauth2/token" in why and len(real_app["calls"]) == 1
+
+
+# ---- a relogin that lands inside connect forgets the old identity ----------------------------------------------
+
+@pytest.mark.parametrize("stored", [_StoredApp(fail=_dead_refresh()), _StoredApp(required=True)],
+                         ids=["expired", "missing"])
+async def test_a_relogin_landing_in_connect_forgets_the_old_identity(stored, monkeypatch):
+    from hpc_bridge import login as login_mod
+    from hpc_bridge import login_gate
+
+    async def landed(flow, mode=None):
+        return object(), "done"
+
+    monkeypatch.setattr(login_gate, "_start_login_and_wait", landed)
+    monkeypatch.setattr(login_mod, "_IDENTITY_LABEL", "old@uni.edu")  # cached while the old login worked
+    # the label helper's own semantics: the cache if set, else a fetch (which names whoever logged in now)
+    monkeypatch.setattr(login_gate, "globus_identity_label", lambda: login_mod._IDENTITY_LABEL or "new@uni.edu")
+    app = _app_with(_flow(stored))
+    rt = _shape_runtime(app, "compute")
+    rt.runner, rt.runner_stale = _FakeRunner("old-eid", _Res(0, "", "")), False  # built on the old token
+    res = await _mep_connect(app, monkeypatch)
+    assert res.notice.startswith("Globus login landed as new@uni.edu"), res.notice[:80]
+    assert rt.runner_stale is True

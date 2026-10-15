@@ -161,7 +161,9 @@ async def _connect_facility(
             return _needs_login_result(facility, start, app.login_flow.error,
                                        waited_s=config.login_wait_s() if status == "waiting" else None, why=why)
         # the browser flow completed while we waited — carry straight on with the connection, but NAME the
-        # identity that landed: on this (most common) path nothing else would (security review B-02)
+        # identity that landed: on this (most common) path nothing else would (security review B-02). A new login may
+        # be another identity, and runners hold the old token: forget both first, as authenticate() does.
+        warmth._forget_identity_verdicts(app)
         login_note = ("Globus login landed" + await login_gate._as_identity() + (login_gate.REPLACED if why else "")
                       + ". ")
     else:
