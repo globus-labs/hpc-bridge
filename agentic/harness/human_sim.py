@@ -166,6 +166,17 @@ _CONFIRM_RE = re.compile(
     r"which (partition|account|queue) (should|would|do you))\b",
     re.I,
 )
+# A turn that hands the next step to the user with no question mark: "Tell me when it's up and I'll call
+# connect_facility again", "give me a fresh one-time code and I'll proceed" — the first live Claude password_pusher run
+# (2026-10-15) ended on those two lines, the user never got a turn, and the run stopped three calls in. Read on the
+# turn's TAIL, and kept to phrases that wait on the user for something specific: "tell me IF you need anything else"
+# closes a wrap-up and stays out.
+_WAITS_RE = re.compile(
+    r"\btell me (when|once)\b|\bonce you(?:['’]ve| have)\b[^.!?\n]{0,80}\btell me\b"
+    r"|\b(give|send) me (?:(a|the|your) )?(?:(fresh|new|current) )?(?:(one[- ]time|verification|mfa|otp|totp|duo) )?"
+    r"(code|passcode)\b",
+    re.I,
+)
 
 
 def _norm(s: str) -> str:
@@ -174,14 +185,15 @@ def _norm(s: str) -> str:
 
 def ends_with_question(text: str) -> bool:
     """Does the agent's turn ask the user something in prose (no AskUserQuestion/clarify tool)? Checks the tail
-    for a trailing '?'/ask phrase, AND the whole message for a strong confirmation-request phrase (which models
-    often put up front, before a config block)."""
+    for a trailing '?'/ask phrase or a hand-over that waits on the user ("tell me when it's up"), AND the whole
+    message for a strong confirmation-request phrase (which models often put up front, before a config block)."""
     body = (text or "").strip()
     if not body:
         return False
     tail = body[-600:]
     last = tail.rstrip("*_ \n").splitlines()[-1] if tail.rstrip("*_ \n") else ""
-    return bool(_ASKS_RE.search(last)) or bool(_ASKS_RE.search(tail[-300:])) or bool(_CONFIRM_RE.search(body))
+    return (bool(_ASKS_RE.search(last)) or bool(_ASKS_RE.search(tail[-300:])) or bool(_WAITS_RE.search(tail))
+            or bool(_CONFIRM_RE.search(body)))
 
 
 def rekey_answers(answers: dict[str, str], questions: list[dict]) -> tuple[dict[str, str], list[str]]:

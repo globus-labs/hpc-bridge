@@ -1,6 +1,7 @@
 """Human-sim mechanics (hermetic): answer re-keying and prose-question detection."""
 from __future__ import annotations
 
+import pytest
 from human_sim import EXCHANGE_KINDS, HumanSim, ends_with_question, rekey_answers
 
 Q_IFACE = "Does the proposed network interface `enP7s7` look right for this machine, or should I use something else?"
@@ -96,6 +97,39 @@ def test_confirmation_request_anywhere_is_a_question():
 def test_completion_summaries_still_not_questions():
     assert not ends_with_question("Done. Ran hostname on node c1; released the block. All finished.")
     assert not ends_with_question("Perfect! Compute block successfully shut down.")
+
+
+@pytest.mark.parametrize("text", [
+    # the password_pusher's live Claude run (2026-10-15) ended on these two: no "?", and the user never got a turn
+    "That opens a shared connection. Tell me when it's up and I'll call `connect_facility` again.",
+    "Alternatively, if you get your authenticator back, give me a fresh one-time code and I'll proceed that way.",
+    "Run the ssh command in your own terminal, then tell me once the connection is open.",
+    "Send me the current verification code and I'll finish the login.",
+    "**Send me the code** your authenticator shows and I'll continue.",
+    "Once you've opened the connection in your terminal, tell me and I'll reconnect.",
+    "Once you’ve opened it, tell me and I’ll reconnect.",                       # a typographic apostrophe
+])
+def test_a_turn_that_waits_on_the_user_without_a_question_mark_gets_a_reply(text):
+    assert ends_with_question(text)
+
+
+@pytest.mark.parametrize("text", [
+    "Done — `hostname -f` printed `login01.hpcb.test`. The endpoint is left running, as you asked.",
+    "You gave me the current code in time: the login is open and `hostname -f` printed login01.hpcb.test.",
+    "The one-time code you sent worked. The shared connection stays open for an hour, so no new code is needed.",
+    "The block is up. I'll tell you when the job finishes.",
+    "All set. Tell me if you need anything else.",
+    "The compute block is released and the endpoint is stopped.",
+])
+def test_a_wrap_up_or_status_report_still_gets_no_reply(text):
+    assert not ends_with_question(text)
+
+
+def test_a_hand_over_is_read_on_the_tail_not_in_a_recap():
+    recap = ("Earlier I asked you to tell me when the connection was up, and you did. "
+             + "Then `hostname -f` ran on the login shape and printed login01.hpcb.test. " * 10
+             + "The endpoint is left running, as you asked.")
+    assert len(recap) > 700 and not ends_with_question(recap)
 
 
 # ---- the ACP turn policy (HumanSim.move): reply / nudge / conclude + the guards ----------------------------------

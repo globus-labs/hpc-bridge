@@ -162,6 +162,16 @@ def test_scripted_code_answers_do_not_spend_the_prose_cap(runner, monkeypatch):
     assert r.prose_followups == 3 + runner.MAX_PROSE_FOLLOWUPS and r.followups_capped is True
 
 
+def test_a_turn_that_waits_on_the_user_without_a_question_mark_continues(runner):
+    # the password_pusher's live run (2026-10-15) ended here: "Tell me when it's up …" has no "?", so the user never
+    # got a turn and the run stopped three calls in
+    wait = "Run that in your own terminal. Tell me when it's up and I'll call `connect_facility` again."
+    _Client.turns = [[AssistantMessage([TextBlock(wait)]), ResultMessage()],
+                     [AssistantMessage([TextBlock("hostname -f printed login01.")]), ResultMessage()]]
+    r = _run(runner, persona="password_pusher")
+    assert r.prose_followups == 1 and _Client.queries[1:] == ["Yes, that is fine."]
+
+
 def test_a_prose_reply_is_stamped_with_where_it_came(runner, monkeypatch):
     # (calls, agent texts) before the reply: graders then tell the agent's words AFTER the user spoke from those before
     from human_sim import Exchange
