@@ -11,14 +11,16 @@ from __future__ import annotations
 import asyncio
 import re
 import time
+from collections.abc import Collection
+from typing import Literal
 
 from . import config
-from .config import SYNC_WAIT_S, _task_ceiling_s
+from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
 from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
-from .cost import _with_spend
+from .cost import _block_nodes, _with_spend
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
-from .models import ConnectFacilityResult, ShellOutcome, Submission
+from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
 from .runner import CanaryResult
 from .scheduler_ops import _submission_refused
 
@@ -169,18 +171,180 @@ def _idle_window_text(app: AppCtx) -> str:
         return f"~{idle}s"
     return "the facility's own idle window (its template sets none hpc-bridge can read)"
 
-def _needs_confirmation_notice(app: AppCtx, where: str, rt: ShapeRuntime | None = None) -> str:
-    """The spend-floor notice. Names the free login shape as the alternative ONLY where one exists —
-    on a compute-only facility every shape is billed, so pointing at shape='login' is a dead-end. The size is the
-    block's own (its config), not the never-set profile default (review 2026-09-05 #6b)."""
-    from .cost import _block_nodes
+def _wire_keys(app: AppCtx, uec: dict) -> set[str]:
+    """The config keys (hpc-bridge's names) the facility actually receives for `uec`: a facility endpoint renames keys
+    (its `key_map`) and drops what its published schema forbids at the wire (`dispatch_uec`), so a value in the runtime
+    config may never reach it. Every other facility sends the config as it is."""
+    fac = app.facility
+    wire = getattr(fac, "dispatch_uec", None)
+    try:
+        sent = wire(dict(uec)) if callable(wire) else uec
+    except Exception:  # noqa: BLE001 - a facility that cannot say: read the config as sent
+        sent = uec
+    kmap = getattr(fac, "key_map", None) or {}
+    return {k for k, v in uec.items() if v not in (None, "") and kmap.get(k, k) in sent}
 
-    uec = rt.user_endpoint_config if rt is not None else {}
-    size = f"{_block_nodes(rt, app) if rt is not None else app.profile.nodes_per_block} node(s)"
-    if uec.get("walltime"):
-        size += f" × walltime {uec['walltime']}"
-    head = f"scheduler compute block{where} ({size}): spend not yet confirmed. "
-    return _reask_prefix(app, rt) + head + _spend_floor_guidance(app)
+def _dropped_term_notice(app: AppCtx, key: str, value: str) -> str | None:
+    """A partition or account the bound facility would drop at the wire (a facility endpoint whose published schema has
+    no such setting): refuse to set it — the block would run on the facility's own default while hpc-bridge said
+    otherwise. None when the facility takes it."""
+    if key in _wire_keys(app, {key: value, "compute": True}):
+        return None
+    word = "account" if key == "account" else _queue_word(app)
+    wire = (getattr(app.facility, "key_map", None) or {}).get(key, key)
+    return (f"this facility's endpoint takes no {word}: its published template has no `{wire}` setting, so "
+            f"{value!r} would be dropped on the way and the facility's own default used. Nothing in this call was set "
+            f"or started: leave {key}= out and send the rest of it again (the account, confirm_spend, as it was), "
+            f"telling the user the block runs on the facility's own default {word}.")
+
+def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) -> BlockTerms:
+    """The block `rt` would start, or did (BlockTerms): its queue and account and where each came from, its size and
+    walltime — only what the facility actually receives (`_wire_keys`): a value its schema drops is the facility's own
+    default (None), never ours. `named`: the keys ("partition", "account") THIS call passed; a key chosen by an earlier
+    call this binding is in `app.compute_choice` (a runtime seeded after a stop carries it too); anything else is the
+    facility's default, whose source was recorded with the binding (`app.terms_origin`)."""
+    uec = rt.user_endpoint_config
+    origin = app.terms_origin
+    sent = _wire_keys(app, uec)
+
+    def chosen(key: str) -> Literal["this_call", "earlier_call"] | None:
+        return "this_call" if key in named else "earlier_call" if key in app.compute_choice else None
+
+    queue = str(uec["partition"]) if "partition" in sent else None
+    queue_source: QueueSource
+    if queue is None:
+        queue_source = "facility_template"
+    else:
+        queue_source = chosen("partition") or (origin.partition if origin is not None else "registry")
+    account = str(uec["account"]) if "account" in sent else None
+    account_source: AccountSource
+    if account is not None:  # a configured default account is only ever the HPC_BRIDGE_ACCOUNT preset
+        account_source = chosen("account") or "env"
+    elif origin is not None and origin.account_needed is False and not getattr(app.facility, "account_required", False):
+        account_source = "none_needed"
+    else:
+        account_source = "none_set"
+    nodes = _block_nodes(rt, app) if "nodes_per_block" in sent else None  # not sent: the facility's own size
+    walltime = str(uec["walltime"]) if "walltime" in sent else None
+    secs = _parse_hhmmss(walltime)
+    return BlockTerms(
+        facility=app.machine or config.machine() or getattr(app.facility, "name", None),
+        queue=queue, queue_source=queue_source, account=account, account_source=account_source,
+        account_required=bool(getattr(app.facility, "account_required", False)),
+        account_hint=origin.account_hint if origin is not None else None,
+        nodes=nodes, walltime=walltime,
+        max_node_hours=round(nodes * secs / 3600, 2) if nodes is not None and secs > 0 else None,
+        compute_only=not _has_login_shape(app),
+    )
+
+# How a source reads in a notice (BlockTerms' vocabulary: models.py).
+_QUEUE_FROM = {
+    "registry": "the registry's default",
+    "env": "the HPC_BRIDGE_PARTITION preset",
+    "byo_details": "from the facility details you confirmed",
+    "discovered": "proposed by the login-node probe",
+    "this_call": "set by this call",
+    "earlier_call": "chosen earlier this session",
+}
+_ACCOUNT_FROM = {"this_call": "set by this call", "earlier_call": "chosen earlier this session",
+                 "env": "the HPC_BRIDGE_ACCOUNT preset"}
+
+def _queue_word(app: AppCtx) -> str:
+    """'queue' on PBS, 'partition' elsewhere — the facility's own word for it."""
+    fac = app.facility
+    sched = getattr(fac, "scheduler", None) or getattr(getattr(fac, "profile", None), "scheduler", None)
+    return "queue" if sched == "pbs" else "partition"
+
+def _needs_an_account(t: BlockTerms) -> bool:
+    """The block cannot start without an account, and none is set: the user must name one."""
+    return t.account is None and t.account_required
+
+def _hint_sentence(t: BlockTerms) -> str:
+    """Where the user finds the account to charge — the registry entry's own words, quoted as data, said only when an
+    account is needed and none is set."""
+    if not (_needs_an_account(t) and t.account_hint):
+        return ""
+    return f'Where the user finds the account (the facility registry\'s words): "{t.account_hint}". '
+
+def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: str = "Block terms") -> str:
+    """The block in one sentence, queue and account first, each with where it came from — the same words for
+    ensure_endpoint_up, run_shell and connect_facility, so the question to the user can name them — then, where the
+    account is missing, where the user finds it (`_hint_sentence`). On a facility endpoint it adds what compute-only
+    means for spend (`compute_note`; connect's own notice already says it)."""
+    word = _queue_word(app)
+    where = (f"{word} '{t.queue}' ({_QUEUE_FROM.get(t.queue_source, t.queue_source)})" if t.queue
+             else f"the facility's default {word} (hpc-bridge sends none)")
+    if t.account:
+        acct = f"account '{t.account}' ({_ACCOUNT_FROM.get(t.account_source, t.account_source)})"
+    elif t.account_source == "none_needed":
+        acct = "no allocation account is needed — do not look for one"
+    elif t.account_required:
+        acct = "account: none set (required here)"
+    else:
+        acct = "no account set (the scheduler's default account applies, if it has one)"
+    size = (f"{t.nodes} node{'' if t.nodes == 1 else 's'}" if t.nodes is not None else "the facility's default size")
+    if t.walltime:
+        nh = t.max_node_hours
+        size += f" for up to {t.walltime}" + (f" (at most {nh:g} node-hour{'' if nh == 1 else 's'})" if nh else "")
+    else:
+        size += " for the facility's default walltime"
+    line = f"{lead}: {where}; {acct}; {size}. " + _hint_sentence(t)
+    if t.compute_only and compute_note:
+        line += ("Compute-only through this channel: every command bills, and the block stays warm between commands "
+                 "until the facility's idle window ends it. ")
+    return line
+
+def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False) -> str:
+    """connect_facility's statement of the next block's terms, before any spend, and the one question to ask: only for
+    what the user has not said — a preset (HPC_BRIDGE_ACCOUNT / HPC_BRIDGE_PARTITION) counts as said — and their yes
+    to it IS the spend confirmation, sent with their answer in one ensure_endpoint_up call. `listed`: the result lists
+    allocations to choose from. With no terms (they could not be read), a short instruction alone."""
+    if terms is None:
+        return ("Nothing is started or billed yet. Before the first block, ask the user in one question for what they "
+                "have not said (the account to charge where one is needed, and whether the default partition is OK); "
+                "their yes is the spend confirmation: send it with their answer in one call, "
+                "ensure_endpoint_up(account=…, partition=…, confirm_spend=True).")
+    word = _queue_word(app)
+    asks: list[str] = []
+    args: list[str] = []
+    # never ask for (or offer to send) what the facility would drop at the wire: it would only be refused
+    takes_account = _dropped_term_notice(app, "account", "x") is None
+    takes_partition = _dropped_term_notice(app, "partition", "x") is None
+    if terms.account is None and (terms.account_required or listed) and takes_account:
+        asks.append(("which listed allocation" if listed else "which account") + " to charge")
+        args.append("account=…")
+    elif terms.account is None and terms.account_source == "none_set" and takes_account:  # a cluster you bring
+        asks.append("which account to charge, if their cluster charges one")
+        args.append("account=…")
+    if terms.queue_source != "env" and takes_partition:
+        asks.append(f"whether that {word} is OK")
+        args.append("partition=…")
+    presets = [n for n, src in (("HPC_BRIDGE_PARTITION", terms.queue_source), ("HPC_BRIDGE_ACCOUNT",
+                                                                               terms.account_source)) if src == "env"]
+    many = len(presets) > 1
+    said = (f"The {' and the '.join(presets)} preset{'s count' if many else ' counts'} as the user's own answer. "
+            if presets else "")
+    call = f"ensure_endpoint_up({', '.join([*args, 'confirm_spend=True'])})"
+    if not asks and presets:  # only a preset — the user's own answer, set ahead — removes the question
+        ask = f"State these terms to the user in one line and start: {call}."
+    elif not asks:  # nothing to choose here (the facility decides its queue, no account needed): still the user's yes
+        ask = (f"Before the first block, ask the user one yes-or-no question — start on these terms? — unless they "
+               f"already said; their yes is the spend confirmation: {call}.")
+    else:
+        ask = (f"Before the first block, ask the user in one question {', and '.join(asks)} (naming these terms), "
+               f"unless they already said; their yes is the spend confirmation: send it with their answer in one "
+               f"call, {call}.")
+    return ("Nothing is started or billed yet. "
+            + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
+
+def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
+    """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
+    spend is asked again if it is, then what to do. After a reap a check found (`reap_kicked`), a replacement may
+    already be starting, so it does not say nothing was started. The size is the block's own (its config), not the
+    never-set profile default (review 2026-09-05 #6b)."""
+    terms = terms or _block_terms(app, rt)
+    started = "Spend not yet confirmed. " if rt.reap_kicked else "Spend not yet confirmed: nothing was started. "
+    return _terms_line(app, terms) + _reask_prefix(app, rt) + started + _spend_floor_guidance(app, terms)
 
 def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     """Why spend is being asked AGAIN: the confirmation covered one block, and that block is gone — or the partition or
@@ -190,6 +354,7 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     if rt is None:
         return ""
     out = ""
+    word = _queue_word(app) if app is not None else "partition"
     left = rt.switch_left if app is not None and _still_left(app, rt.switch_left) else None
     if rt.reaped is not None:
         # Found by a check (kicked): a replacement may already be running, and billing from when it started.
@@ -200,15 +365,16 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     if rt.switched_terms is not None:
         uec = rt.user_endpoint_config
         if rt.switched_terms == (uec.get("partition"), uec.get("account")):
-            return out + ("Confirm spend again with the user: a partition or account switch dropped the confirmation, "
-                          f"and the terms are back to the ones it covered ({_terms(*rt.switched_terms)}). Confirming "
+            return out + (f"Confirm spend again with the user: a {word} or account switch dropped the confirmation, "
+                          "and the terms are back to the ones it covered "
+                          f"({_terms(*rt.switched_terms, word)}). Confirming "
                           "again uses that block if it is still up, or starts a new one. ")
-        out += ("Confirm spend again with the user: the partition or account has changed since spend was confirmed, "
+        out += (f"Confirm spend again with the user: the {word} or account has changed since spend was confirmed, "
                 "and that is a different block (the earlier confirmation covered only the one on "
-                f"{_terms(*rt.switched_terms)}). ")
+                f"{_terms(*rt.switched_terms, word)}). ")
     elif rt.reap_terms is not None and rt.reap_terms != (rt.user_endpoint_config.get("partition"),
                                                          rt.user_endpoint_config.get("account")):  # a switch since
-        out += "The partition or account was switched since, so a confirmation now starts a block on the new terms. "
+        out += f"The {word} or account was switched since, so a confirmation now starts a block on the new terms. "
     if app is not None and (rt.switched_terms is not None or left is not None):
         out += _switch_fate(app, left, confirmed=False)
     return out
@@ -231,7 +397,7 @@ def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool) -> str
                     "endpoint, this new one included. ")
         return (f"Nothing cancels the previous block on a switch, even one still queued: {idle}. To end it now, call "
                 "stop_endpoint before confirming the new block: it cancels this endpoint's blocks and keeps the new "
-                "partition and account for the next one. ")
+                f"{_queue_word(app)} and account for the next one. ")
     if left is None:
         return ""
     clause = _left_block_clause(left, getattr(app.facility, "scheduler", None), subject="that block")
@@ -245,21 +411,24 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     uec = rt.user_endpoint_config
     if terms is None or terms == (uec.get("partition"), uec.get("account")):
         return ""
-    return (f"This confirmation is for a new block: the partition or account changed from {_terms(*terms)}. "
+    word = _queue_word(app)
+    return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
             + _switch_fate(app, rt.switch_left, confirmed=True))
 
-def _spend_floor_guidance(app: AppCtx | None) -> str:
+def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
     (they used to drift). Names the free login shape only where one exists: on a compute-only
-    facility every shape is billed, so pointing at shape='login' is a dead-end."""
+    facility every shape is billed, so pointing at shape='login' is a dead-end. With no account set where one is needed,
+    the one question asks for it too, and the one call sends it — else the confirm would only meet the account floor."""
+    if terms is not None and _needs_an_account(terms):
+        ask = ("Ask the user which account to charge and whether these terms are OK, then call "
+               "ensure_endpoint_up(account=…, confirm_spend=True)")
+    else:
+        ask = "Ask the user, naming these terms, then call ensure_endpoint_up(confirm_spend=True)"
     if app is not None and not _has_login_shape(app):
-        return ("This facility is compute-only through this channel: hpc-bridge reaches it only via its compute "
-                "endpoint, so there is no free login shape here (the facility's login nodes are outside this "
-                "channel) and every command bills a block, which then stays warm between calls. Confirm with the "
-                "user, then call ensure_endpoint_up(confirm_spend=True) before running work.")
-    return ("Surface the allocation balance (e.g. run_shell('mybalance', shape='login')) and call "
-            "ensure_endpoint_up(confirm_spend=True) to proceed — or use shape='login' for free "
-            "login-node work.")
+        return f"No free login shape here (the facility's login nodes are outside this channel). {ask}."
+    return (f"{ask} (with the allocation balance where the facility's balance tool shows one: it runs free on "
+            "shape='login'). Login-node work (shape='login') needs no confirmation.")
 
 def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | None = None,
                   waited_s: float | None = None, why: str | None = None) -> str:
@@ -559,14 +728,14 @@ _UNTIL_WHY = {
 # At most this many earlier queued checks are named one by one (most recent first); the rest are counted.
 _CHECKS_NAMED = 5
 
-def _terms(partition: str | None, account: str | None) -> str:
-    """A block's partition (and account), for a notice."""
-    where = f"partition {partition!r}" if partition else "the default partition"
+def _terms(partition: str | None, account: str | None, word: str = "partition") -> str:
+    """A block's partition (and account), for a notice — in the facility's word for it (`_queue_word`)."""
+    where = f"{word} {partition!r}" if partition else f"the default {word}"
     return where + (f", account {account!r}" if account else "")
 
-def _where(b: LeftBlock) -> str:
+def _where(b: LeftBlock, word: str = "partition") -> str:
     """The partition (and account) a left block or check belongs to, for a notice."""
-    return _terms(b.partition, b.account)
+    return _terms(b.partition, b.account, word)
 
 def _left_block_clause(left: LeftBlock, scheduler: str | None, *, subject: str = "its block") -> str:
     """What a facility endpoint did not do to a block it let go of (a reconnect, a switch): "its block, scheduler job
@@ -591,6 +760,7 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
     binding starts it at 0): an earlier one was counted in the spend reported when it was left, and a block a queued
     check may start is never counted. `op`: "stop" (draining, final) or "detach"."""
     cancel, check, by_user = _scheduler_cmds(getattr(app.facility, "scheduler", None))
+    word = _queue_word(app)
     if app.worker_user:
         find = f"`{by_user.format(user=app.worker_user)}`"
     else:
@@ -606,7 +776,8 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
         state, own = _left_state(b, now), b is current
         if state == "queued":
             if own:
-                out.append(f"A check of ours is still queued there ({_where(b)}): the facility will start (or keep) a "
+                out.append(f"A check of ours is still queued there ({_where(b, word)}): the facility will start "
+                           "(or keep) a "
                            "block for it, which bills until its idle window passes — session_spend does not count "
                            f"that block; its job id is unknown here. The user finds it with {find} and {unknown_end}")
             else:
@@ -642,7 +813,7 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
             out.append("A check of ours is also still queued there, so the facility may keep this block or start "
                        "another.")
     if checks:  # earlier queued checks, newest first: dated and hedged, never dropped (the queue wait is unbounded)
-        named = [f"{_where(b)} at {_clock_time(b.left_at, now, rel=False)}" for b in checks[:_CHECKS_NAMED]]
+        named = [f"{_where(b, word)} at {_clock_time(b.left_at, now, rel=False)}" for b in checks[:_CHECKS_NAMED]]
         more = f", and {len(checks) - _CHECKS_NAMED} more" if len(checks) > _CHECKS_NAMED else ""
         one = len(checks) == 1
         out.append(f"{'A check' if one else 'Checks'} of ours {'was' if one else 'were'} still queued there "
@@ -710,40 +881,50 @@ def _unapplied_presets_note(*, named: bool, facility_endpoint: bool, own_partiti
         return "(HPC_BRIDGE_PARTITION gives way to the partition given in details=, so it was not used here.) "
     return ""
 
-def _needs_account_notice(app: AppCtx | None = None) -> str:
+def _needs_account_notice(app: AppCtx, terms: BlockTerms | None = None) -> str:
     """The account floor fired: the facility requires an allocation account and none is set — nothing started.
-    Names what an account is NOT (a login name — the live confusion) and where the real one comes from: on a facility
-    with a login shape (SSH), connect_facility's allocations or the facility's own tool run free there."""
-    if app is not None and _has_login_shape(app):
-        source = ("from connect_facility's allocations when it listed some, from the facility's allocation tool, which "
-                  "runs free on the login shape with run_shell(…, shape='login'), or from its portal")
+    Leads with the block's terms (and, where the registry entry has one, its hint for where the user finds the
+    account). Names what an account is NOT (a login name — the live confusion) and where the real one comes from: on a
+    facility with a login shape (SSH), connect_facility's allocations or the facility's own tool run free there. The
+    ACCESS remark is a fallback for an entry with no hint: ALCF and NCSA accounts are not ACCESS ids."""
+    if _has_login_shape(app):
+        source = ("connect_facility's allocations when it listed some, the facility's allocation tool, which runs free "
+                  "on the login shape with run_shell(…, shape='login'), or its portal")
     else:
-        source = "from the facility's allocation tool or portal"
-    return ("this facility requires an allocation account for every block and none is set — nothing was started. "
-            "A LOGIN NAME is not an account: an account is the project/allocation the scheduler charges, a project "
-            f"id {source}, or the ACCESS project id. Ask the user which one to "
-            "charge, then call ensure_endpoint_up(account=…, partition=…, confirm_spend=True).")
+        source = "the facility's allocation tool or portal"
+    hint = terms is not None and terms.account_hint
+    access = "" if hint else " (on an ACCESS machine, usually the ACCESS project id)"
+    head = _terms_line(app, terms) if terms is not None else ""
+    return (head + "This facility requires an allocation account for every block and none is set — "
+            "nothing was started. A LOGIN NAME is not an account: an account is the project/allocation the scheduler "
+            f"charges, from {source}{access}. Ask the user which one to charge, then call "
+            "ensure_endpoint_up(account=…, confirm_spend=True).")
 
 
-def _needs_account_outcome(app: AppCtx | None = None) -> ShellOutcome:
+def _needs_account_outcome(app: AppCtx, rt: ShapeRuntime) -> ShellOutcome:
     """A billed shape on an account-required facility with no account: the command is NOT dispatched and no block
-    is started."""
+    is started. Its `block` and notice name the terms, as ensure_endpoint_up's do."""
+    terms = _block_terms(app, rt)
     return ShellOutcome(
         phase="needs_account",
         block_state="cold",
-        notice="scheduler compute shape: " + _needs_account_notice(app),
+        block=terms,
+        notice=_needs_account_notice(app, terms),
     )
 
 
-def _needs_confirmation_outcome(app: AppCtx | None = None, rt: ShapeRuntime | None = None) -> ShellOutcome:
+def _needs_confirmation_outcome(app: AppCtx, rt: ShapeRuntime) -> ShellOutcome:
     """A billed shape whose spend wasn't acknowledged: the command is NOT dispatched and no
     block is started by it. The agent must run the budget gate and confirm via ensure_endpoint_up.
-    After a reap found by a check, that check may already be bringing a block up — say so in block_state."""
+    After a reap found by a check, that check may already be bringing a block up — say so in block_state. Its `block`
+    and the head of its notice name the terms, in the words ensure_endpoint_up's use."""
+    terms = _block_terms(app, rt)
     return ShellOutcome(
         phase="needs_confirmation",
-        block_state="provisioning" if rt is not None and rt.reap_kicked else "cold",
-        notice=_reask_prefix(app, rt) + "scheduler compute shape: spend not confirmed, so nothing ran. "
-        + _spend_floor_guidance(app),
+        block_state="provisioning" if rt.reap_kicked else "cold",
+        block=terms,
+        notice=(_terms_line(app, terms) + _reask_prefix(app, rt) + "Spend not confirmed, so nothing ran. "
+                + _spend_floor_guidance(app, terms)),
     )
 
 # A task whose call the client cancelled: the agent never saw its id, so a notice naming one says where it came from.

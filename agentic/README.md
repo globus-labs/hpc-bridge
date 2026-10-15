@@ -38,13 +38,14 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 57 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 59 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
                            spend + account: gated_provision · spend_refusal · spend_gate_enforced · spend_revoked · rich_gate ·
                              partition_choice · saturation · hand_batch_job · fake_mep_username_not_account ·
-                             term_switch_reasks · preset_account_scoped · ssh_account_floor
+                             term_switch_reasks · preset_account_scoped · ssh_account_floor · terms_prestated ·
+                             terms_wanted
                            blocks + reaps: block_reaped_resume · reap_replaced_block · gpu_rule · submit_policy_rejected ·
                              slurm_worker_died · polaris_filesystems
                            long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·

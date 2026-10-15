@@ -19,7 +19,7 @@ from .catalog.entry import CatalogEntry
 from .facility.base import Facility
 from .lifecycle import EndpointState
 from .login import LoginFlow
-from .models import FacilityDetails, Submission
+from .models import FacilityDetails, Submission, TermsOrigin
 from .profile import Profile
 from .runner import CanaryResult, GlobusRunner
 from .session_shell import Guard
@@ -239,6 +239,11 @@ class AppCtx:
     # its result carries both. Forgotten with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a
     # teardown or a detach); a new Globus login keeps them, as it keeps a live shape's.
     compute_choice: dict[str, str] = field(default_factory=dict)
+    # Where the bound facility's DEFAULT partition and account came from (the registry, an env preset, a facility you
+    # bring yourself), whether its entry says an account is needed, and its account hint: recorded with the binding
+    # (connect_facility, the startup pin), read for every block's terms (notices._block_terms). None: unknown (local
+    # dev).
+    terms_origin: TermsOrigin | None = None
     # When each scheduler job on the bound endpoint was first proven up (a check or a command reporting it), keyed
     # (endpoint id, job): never moved later, so a block dated by its job keeps its real age (for its walltime) however
     # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).

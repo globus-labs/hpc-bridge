@@ -44,8 +44,10 @@ def _no_dns_in_unit_tests(monkeypatch):
 
 @pytest.fixture(autouse=True)
 def _no_startup_pin_leaks(monkeypatch):
-    """`binding._PINNED` remembers what HPC_BRIDGE_MACHINE resolved to at a startup pin (process-wide in the server):
-    each test starts with none, so a pin one test made never names a machine for another."""
+    """`binding._PINNED` remembers what HPC_BRIDGE_MACHINE resolved to at a startup pin (process-wide in the server), and
+    `_PINNED_ORIGIN` where its default terms came from: each test starts with none, so a pin one test made never names a
+    machine for another."""
     from hpc_bridge import binding
 
     monkeypatch.setattr(binding, "_PINNED", {})
+    monkeypatch.setattr(binding, "_PINNED_ORIGIN", {})

@@ -5,6 +5,7 @@ import datetime
 import hashlib
 import json
 import re
+import unicodedata
 import uuid
 from typing import Any, Literal
 
@@ -141,6 +142,99 @@ def worker_env_raw_problems(raw: Any) -> list[str]:
     return problems
 
 
+# Characters a hint may not carry: it is quoted (") in agent-facing text, and a tag-like `<…>` or markup could pass for
+# something other than the registry's words. Read leniently: backticks and double quotes become ', angle brackets go.
+_HINT_MARKUP = frozenset('"`<>')
+
+
+def _hidden_char(ch: str) -> bool:
+    """A character an agent-facing line must not carry: a control or format character (ESC/ANSI, NUL, bidi overrides,
+    zero-width), or a line/paragraph separator."""
+    return unicodedata.category(ch) in ("Cc", "Cf", "Zl", "Zp")
+
+
+def account_hint_raw_problems(raw: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `account_hint`, before the lenient parse can forgive it: a hint the
+    client would drop, cut or clean (not text, longer than one short line, a control/format character or a line break)
+    is refused at ingest, not published altered."""
+    if raw is None:
+        return []
+    if not isinstance(raw, str) or not raw.strip():
+        return [f"account_hint must be a non-empty string, got {type(raw).__name__}"]
+    if any(_hidden_char(ch) for ch in raw):
+        return ["account_hint has a control/format character or a line break: one line of plain text only"]
+    if any(ch in _HINT_MARKUP for ch in raw):
+        return ["account_hint has a quote, a backtick or an angle bracket: plain text only (single quotes are fine)"]
+    if len(" ".join(raw.split())) > ACCOUNT_HINT_MAX:
+        return [f"account_hint is longer than {ACCOUNT_HINT_MAX} characters"]
+    return []
+
+
+# Slurm short options that take no argument: in a bundle ("-vA x") the scan goes on past them; any other letter takes
+# the rest of the token as its argument, so the scan stops there.
+_SLURM_NO_ARG = frozenset("hHIkOQsvVW")
+_DIRECTIVE = re.compile(r"\s*#(SBATCH|PBS)\s+(.*)")
+
+
+def scheduler_terms_directive(opts: str | None) -> str | None:
+    """The first directive line in `opts` that sets the account or the partition/queue behind the block's terms, or
+    None: Slurm's -A/--account and -p/--partition — long options by any prefix sbatch accepts (--acco…, --part…),
+    short ones bundled too ("-vA x"; its -q is the QOS) — and PBS's -A and -q."""
+    for line in (opts or "").splitlines():
+        m = _DIRECTIVE.match(line)
+        if m is None:
+            continue
+        kind, rest = m.groups()
+        for tok in rest.split():
+            if kind == "PBS":
+                if re.match(r"-[Aq]", tok):
+                    return line.strip()
+                continue
+            if re.match(r"--(?:acco|part)[a-z-]*(?:=|$)", tok):
+                return line.strip()
+            if re.match(r"-[^-]", tok):
+                for ch in tok[1:]:
+                    if ch in "Ap":
+                        return line.strip()
+                    if ch not in _SLURM_NO_ARG:
+                        break
+    return None
+
+
+def _without_terms_directives(opts: str | None) -> str | None:
+    """`opts` with every account/partition directive line dropped (None when nothing is left)."""
+    kept = [ln for ln in (opts or "").splitlines() if scheduler_terms_directive(ln) is None]
+    return "\n".join(kept) or None
+
+
+def _extra_terms_keys(extra: dict | None, key_map: dict | None) -> list[str]:
+    """`defaults.extra` keys that would set the account or the partition behind hpc-bridge's own (and the block's
+    terms): `account`/`partition` themselves, or the facility template's names for them (`compute.key_map`)."""
+    names = {"account", "partition"} | {v for k, v in (key_map or {}).items() if k in ("account", "partition")}
+    return sorted(k for k in (extra or {}) if k in names)
+
+
+def defaults_extra_raw_problems(row: Any) -> list[str]:
+    """The curator's check: a seed row's `defaults.extra` must not carry the account or the partition, and no
+    `scheduler_options` (compute's, or extra's) may set them by directive (the client drops them on read, so they would
+    be published only to be ignored)."""
+    if not isinstance(row, dict):
+        return []
+    extra = (row.get("defaults") or {}).get("extra") if isinstance(row.get("defaults"), dict) else None
+    compute: dict = row["compute"] if isinstance(row.get("compute"), dict) else {}
+    key_map = compute.get("key_map")
+    bad = _extra_terms_keys(extra if isinstance(extra, dict) else None, key_map if isinstance(key_map, dict) else None)
+    problems = [f"defaults.extra sets {bad}: the account and the partition are ensure_endpoint_up's (account=, "
+                "partition=) and defaults.partition, so the block's terms name them"] if bad else []
+    extra_opts = extra.get("scheduler_options") if isinstance(extra, dict) else None
+    for where, opts in (("compute.scheduler_options", compute.get("scheduler_options")),
+                        ("defaults.extra.scheduler_options", extra_opts)):
+        if isinstance(opts, str) and (line := scheduler_terms_directive(opts)):
+            problems.append(f"{where} sets the account or the partition/queue ({line!r}): the block's terms must "
+                            "name them")
+    return problems
+
+
 def worker_env_problems(compute: Compute) -> list[str]:
     """The curator's strict check of `worker_env` against env_setup (run at ingest; clients read leniently)."""
     we = compute.worker_env
@@ -273,6 +367,7 @@ class CatalogSummary(BaseModel):
 
 
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # the derived endpoint name is hpc-bridge-<id>
+ACCOUNT_HINT_MAX = 200  # an account hint is one short line of agent-facing text
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -352,6 +447,10 @@ class CatalogEntry(BaseModel):
     # scheduler doesn't enforce accounting (e.g. the lab cluster) — then the agent must NOT be sent
     # hunting for an allocation; it may confirm spend and proceed without one.
     account_required: bool = True
+    # Where a user finds the account to charge (the facility's own words or tool), e.g. "your ACCESS project id,
+    # lowercased (e.g. cis250223)". Agent-facing: the spend question and connect_facility carry it. Optional, and read
+    # LENIENTLY (a malformed one is dropped, never the entry); a plugin before it ignores the key.
+    account_hint: str | None = None
     compute: Compute
     defaults: Defaults
 
@@ -368,6 +467,18 @@ class CatalogEntry(BaseModel):
             return handler(v)
         except (ValueError, TypeError):
             return None
+
+    @field_validator("account_hint", mode="before")
+    @classmethod
+    def _lenient_hint(cls, v: Any) -> str | None:
+        # One line of plain text, bounded: control and format characters (ESC/ANSI, NUL, bidi, zero-width) are dropped
+        # and line breaks become spaces; anything not text costs the facility its hint, never the entry.
+        if not isinstance(v, str):
+            return None
+        text = " ".join("".join(" " if unicodedata.category(ch) in ("Zl", "Zp") else ch
+                                for ch in v if unicodedata.category(ch) not in ("Cc", "Cf") or ch in "\t\n\r").split())
+        text = text.replace('"', "'").replace("`", "'").replace("<", "").replace(">", "")
+        return text[:ACCOUNT_HINT_MAX] or None
 
     @field_validator("ssh_host")
     @classmethod
@@ -388,6 +499,25 @@ class CatalogEntry(BaseModel):
         if v is None:
             return v
         return str(uuid.UUID(v))  # normalize to canonical lowercase hyphenated form
+
+    @model_validator(mode="after")
+    def _no_terms_in_extra(self) -> CatalogEntry:
+        """Read leniently: an account or partition in `defaults.extra` (or the template's name for one), or a
+        `scheduler_options` directive setting one (compute's or extra's), would reach the facility past
+        ensure_endpoint_up's choice and the block's terms — drop it (the key, or the directive line), keep the entry.
+        The ingest refuses them (`defaults_extra_raw_problems`)."""
+        bad = _extra_terms_keys(self.defaults.extra, self.compute.key_map)
+        if bad and self.defaults.extra is not None:
+            self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k not in bad}
+        if scheduler_terms_directive(self.compute.scheduler_options):
+            self.compute.scheduler_options = _without_terms_directives(self.compute.scheduler_options)
+        extra_opts = (self.defaults.extra or {}).get("scheduler_options")
+        if isinstance(extra_opts, str) and scheduler_terms_directive(extra_opts) and self.defaults.extra is not None:
+            kept = _without_terms_directives(extra_opts)
+            self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k != "scheduler_options"}
+            if kept:
+                self.defaults.extra["scheduler_options"] = kept
+        return self
 
     @model_validator(mode="after")
     def _reachable(self) -> CatalogEntry:

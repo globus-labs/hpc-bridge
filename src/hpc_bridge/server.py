@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import inspect
 import itertools
 import json
 import os
@@ -95,9 +96,11 @@ from .notices import (  # noqa: F401 - re-exported
     _SSH_AUTH_DENIED,
     _allocating_notice,
     _billed_bounds_note,
+    _block_terms,
     _busy_session_outcome,
     _cold_outcome,
     _dispatch_error_suffix,
+    _dropped_term_notice,
     _error_outcome,
     _explain_provision_error,
     _hpc_bridge_error,
@@ -132,6 +135,7 @@ from .notices import (  # noqa: F401 - re-exported
     _submit_rejected,
     _submit_rejected_notice,
     _switch_receipt,
+    _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
     _worker_notice,
@@ -195,6 +199,8 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
         scratch_root=scratch,
         charge_factor=config.charge_factor(),
         login_flow=LoginFlow(),
+        # the startup pin's default terms (registry or preset; recorded only by a pin that succeeded); None unpinned
+        terms_origin=binding._PINNED_ORIGIN.get(config.machine() or ""),
     )
     try:
         yield app
@@ -352,11 +358,25 @@ async def _ensure_endpoint_up(
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid account {account!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
         )
+    if partition is not None or account is not None:
+        # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
+        # startup-pinned one has not read its template yet (that happens at its first block): read it first.
+        load = getattr(app.facility, "load_template", None)
+        if inspect.iscoroutinefunction(load):
+            await load()
+        dropped = next((n for k, v in (("partition", partition), ("account", account))
+                        if v is not None and (n := _dropped_term_notice(app, k, v))), None)  # all or nothing
+        if dropped:
+            async with app.lock:
+                return _dropped_term_status(app, shape, dropped)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
         # silently dropping the user's selection.
         ignored = partition is not None and not rt.user_endpoint_config.get("compute")
+        # what THIS call named for the block (BlockTerms' "this_call"); the login shape has neither
+        named = {k for k, v in (("partition", partition), ("account", account))
+                 if v is not None and rt.user_endpoint_config.get("compute")}
         epoch = rt.block_epoch
         reject = _apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
         if reject:  # a live task blocks repointing the block (the swap would cancel it) — change nothing
@@ -378,6 +398,7 @@ async def _ensure_endpoint_up(
         def said(notice: str | None) -> str | None:
             return receipt + (notice or "") if receipt and rt.spend_confirmed else notice
 
+        was_confirmed = rt.spend_confirmed  # after a switch dropped it: this call's own confirmation is what is new
         try:
             # force_canary: a status probe must re-verify the worker (and kick a cold block),
             # never trust the TTL — that's exactly the cold-start gap callers are asking about.
@@ -393,7 +414,7 @@ async def _ensure_endpoint_up(
                 notice=said(_hpc_bridge_error(exc)),
             )
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
-            where = f" on {active_partition!r}" if active_partition else ""
+            terms = _block_terms(app, rt, named=named)
             return EndpointStatus(
                 status="needs_confirmation",
                 block_state="provisioning" if rt.reap_kicked else "cold",
@@ -401,9 +422,11 @@ async def _ensure_endpoint_up(
                 session_spend=_total_session_spend(app),  # a reap this call found has just banked the old block
                 partition=active_partition,
                 account=active_account,
-                notice=_needs_confirmation_notice(app, where, rt),
+                block=terms,
+                notice=_needs_confirmation_notice(app, rt, terms),
             )
         if block == "needs_account":  # the account floor (account_required facility, no account) — nothing was started
+            terms = _block_terms(app, rt, named=named)
             return EndpointStatus(
                 status="needs_account",
                 block_state="cold",
@@ -411,9 +434,15 @@ async def _ensure_endpoint_up(
                 session_spend=_total_session_spend(app),
                 partition=active_partition,
                 account=None,
-                notice=_needs_account_notice(app),
+                block=terms,
+                notice=_needs_account_notice(app, terms),
             )
         billable = _billable(rt)
+        # The receipt: the call that newly confirmed a billed block names what it confirmed, so a one-call start (no
+        # needs_confirmation answer before it) still shows its queue, account and size. A poll that passes
+        # confirm_spend=True again on a block already confirmed confirmed nothing new: no receipt.
+        receipt_terms = (_block_terms(app, rt, named=named)
+                         if confirm_spend and billable and not was_confirmed and rt.spend_confirmed else None)
         eid = app.state.endpoint_id
         spend = _total_session_spend(app)
         provisioning_elapsed = 0.0
@@ -457,7 +486,7 @@ async def _ensure_endpoint_up(
                 rt.provisioning_since = None  # the cold-start clock restarts once work can be sent again
                 return EndpointStatus(
                     status="provisioning", block_state=block, endpoint_id=eid, session_spend=spend,
-                    partition=active_partition, account=active_account,
+                    partition=active_partition, account=active_account, block=receipt_terms,  # what it confirmed
                     notice=said(_login_expired_notice(rt.last_canary.error)),
                 )
             if rt.last_canary is not None and _no_account_failure(rt.last_canary.error):
@@ -511,8 +540,31 @@ async def _ensure_endpoint_up(
         session_spend=spend,
         partition=active_partition,
         account=active_account,
+        block=receipt_terms,
         notice=said(notice),
     )
+
+
+def _dropped_term_status(app: AppCtx, shape: str, dropped: str) -> EndpointStatus:
+    """A refused partition/account (the facility would drop it at the wire): nothing changed, so the answer is the
+    shape's standing state, never a `down` that would read as the block gone while it bills. A confirmed block is `up`
+    (or `provisioning` until first seen warm) on its current terms; an unconfirmed shape is the spend question for
+    those terms. No probe: a refusal sends nothing."""
+    rt = _shape_runtime(app, shape)
+    terms = _block_terms(app, rt) if _billable(rt) else None
+    uec = rt.user_endpoint_config
+    # the refusal says what to send again; the current terms follow — never "ask which account": the call carried it
+    stood = f" {_terms_line(app, terms, lead='The current terms')}" if terms is not None else ""
+    if rt.spend_confirmed or terms is None:
+        warm = rt.block_since is not None or rt.warm_confirmed_at is not None
+        return EndpointStatus(status="up" if warm else "provisioning", block_state="warm" if warm else "provisioning",
+                              endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
+                              partition=uec.get("partition"), account=uec.get("account"),
+                              notice=(dropped + stood).strip())
+    return EndpointStatus(status="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
+                          endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
+                          partition=uec.get("partition"), account=uec.get("account"), block=terms,
+                          notice=(dropped + stood).strip())
 
 
 _T = TypeVar("_T")
@@ -560,13 +612,16 @@ async def ensure_endpoint_up(
     connect_facility or a teardown forgets it). Omit it to keep the facility default. Ignored for
     shape="login" (a login-node LocalProvider has no partition).
 
-    Pass `account` (the allocation chosen from connect_facility's options) to charge the scheduler
-    block to it; like `partition`, it persists for the session and is ignored for shape="login".
+    Pass `account` (the allocation the user named, or chose from connect_facility's listing where it had one)
+    to charge the scheduler block to it; like `partition`, it persists for the session and is ignored for
+    shape="login".
 
     `confirm_spend` is the deterministic budget floor: a scheduler compute block will not start until
-    you pass confirm_spend=True (after surfacing the allocation balance to the user — see the
+    you pass confirm_spend=True (once the user has agreed to the block's terms — see the
     driving-hpc skill). Without it the call returns status="needs_confirmation" and provisions
-    nothing. The acknowledgement covers the block it starts: it holds while that block lives, and once the
+    nothing. Every spend answer carries `block`: the block's queue and account (each with where it came from),
+    nodes and walltime — name them to the user; a confirming call's result carries it too, as a receipt.
+    The acknowledgement covers the block it starts: it holds while that block lives, and once the
     block is gone (idle-released, past its walltime, or cancelled) the next call returns needs_confirmation
     with the reason — even one that passes confirm_spend=True — so the user is asked again for the new block.
     A different partition or account is a different block too: the call that changes them answers
@@ -676,7 +731,7 @@ async def list_facilities(query: str = "") -> list[CatalogSummary]:
     name/description.
 
     Returns agent-safe summaries (no executable config or raw UUIDs). Pick one and call
-    connect_facility(facility=…) to bring up its login node and see your allocations. No SSH, no
+    connect_facility(facility=…) to bind it and see the terms its first block would start on. No SSH, no
     provisioning, no spend."""
     return await _list_facilities(query)
 
@@ -693,8 +748,9 @@ async def _connect_facility(
 async def connect_facility(
     facility: str, ctx: Context, ssh_host: str | None = None, details: FacilityDetails | None = None
 ) -> ConnectFacilityResult:
-    """Select an HPC facility and bring up its (free) login node, then list the allocations a scheduler
-    block can be charged to.
+    """Select an HPC facility and bring up its (free) login node, and state the terms its first billed block would
+    start on (`block`: the default queue and its source, whether an account is needed and where to find it, size and
+    walltime) — nothing is billed here.
 
     **This is the ENTRY POINT for reaching any facility — ALWAYS call it first** (before login_shell,
     and before reasoning about SSH/Duo yourself): it decides whether SSH is even needed. Don't
@@ -707,9 +763,11 @@ async def connect_facility(
 
     `facility` is an id/subject/alias from list_facilities() (e.g. "anvil"). This binds the facility,
     stands up the login shape (SSH cold-bootstrap once, or reuse an online endpoint — no scheduler
-    account needed), runs the allocation command over Compute, and returns phase="needs_account".
-    Pick one, then ensure_endpoint_up(account=…, partition=…, confirm_spend=True). phase=
-    "provisioning" ⇒ login node still warming — call again shortly.
+    account needed), lists your allocations where the facility has a listing it can read (otherwise the
+    account is the user's to name), and returns phase="needs_account". Before the first block ask the
+    user, in one question, for what they have not said (the account, whether the queue is OK): their yes
+    is the spend confirmation, sent with their answer in one ensure_endpoint_up call.
+    phase="provisioning" ⇒ login node still warming — call again shortly.
 
     NOT in the catalog and not cached → discover, don't interrogate. Pass `ssh_host` (login
     host/alias; SSH user+key come from the environment) and the tool PROBES the login node →
@@ -1357,7 +1415,7 @@ async def _ready_session(
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
         return _with_spend(app, _needs_confirmation_outcome(app, rt))
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
-        return _with_spend(app, _needs_account_outcome(app))
+        return _with_spend(app, _needs_account_outcome(app, rt))
     if not_warm is not None:
         return _cold_outcome(not_warm, _shape_runtime(app, shape).last_canary)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
@@ -1581,7 +1639,9 @@ async def run_shell(
     node via a LocalProvider (lightweight, no allocation). A batch job submitted from either shape
     (sbatch/qsub/salloc, or srun from the login node) bills the allocation like a block, outside
     hpc-bridge's tracking, so it needs the user's spend confirmation first. Sessions (cwd/env)
-    persist per session_id within a shape.
+    persist per session_id within a shape. A billed shape whose spend is not confirmed answers
+    phase="needs_confirmation" (nothing runs), with `block`: the block's queue and account, each with
+    where it came from, and its size — name them to the user.
 
     LONG WORK: run it as a normal (foreground) command — do NOT background/detach it. A command
     still running past the sync-wait comes back phase="running" with a task_id; poll it with

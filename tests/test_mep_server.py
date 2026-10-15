@@ -71,7 +71,12 @@ async def test_connect_account_required_mep_says_pass_account(monkeypatch):
     app = _app(fac)
     res = await _connect(app, monkeypatch)
     assert res.phase == "needs_account"
-    assert "ensure_endpoint_up(account=" in res.notice
+    # the account comes from the user, in the one question; their yes is sent with it in one confirming call
+    ask = res.notice.index("ask the user in one question which account to charge")
+    assert ask < res.notice.index("ensure_endpoint_up(account=…, partition=…, confirm_spend=True)")
+    assert res.block is not None and res.block.account_required and res.block.account is None
+    # the facility requires one, so the terms never say "no account needed" (whatever the entry it came from said)
+    assert res.block.account_source == "none_set" and "no account needed" not in res.notice
 
 
 async def test_connect_offline_mep_is_failed_not_call_again(monkeypatch):
@@ -117,7 +122,7 @@ async def test_needs_confirmation_on_mep_does_not_point_at_login(monkeypatch):
     await _connect(app, monkeypatch)
     res = await _ensure_endpoint_up(app, shape="compute")  # no confirm_spend
     assert res.status == "needs_confirmation"
-    assert "shape='login'" not in res.notice and "compute-only" in res.notice
+    assert "shape='login'" not in res.notice and "compute-only" in res.notice.lower()
     out = await _run_shell(app, "hostname", shape="compute")
     assert out.phase == "needs_confirmation" and "shape='login'" not in out.notice
 

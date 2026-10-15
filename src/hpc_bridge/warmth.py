@@ -56,9 +56,12 @@ from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .login import LoginExpiredError
 from .models import ShellOutcome, Submission
 from .notices import (
+    _block_terms,
     _no_account_failure,
+    _queue_word,
     _spend_floor_guidance,
     _submit_rejected,
+    _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
 )
@@ -79,28 +82,33 @@ def _shape_reject(app: AppCtx, shape: str) -> str | None:
         )
     return None
 
+def _seed_uec(app: AppCtx, shape: str) -> dict:
+    """The user_endpoint_config a NEW runtime of `shape` starts with: the facility's defaults (SlurmFacility) merged
+    with the shape's template vars, fitted to a facility MEP's schema, and — on the compute shape — the session's
+    partition/account choice. Builds nothing: connect_facility reads the next block's terms from it too."""
+    defaults: dict = {}
+    ct = getattr(app.facility, "config_template", None)
+    if ct is not None:
+        result = ct(app.profile)
+        if isinstance(result, tuple):  # SlurmFacility -> (template_str, defaults)
+            defaults = result[1]
+        # LocalFacility/FakeFacility return a plain dict (rendered engine) -> no UEP defaults
+    if not isinstance(defaults, dict):
+        defaults = {}
+    uec = {**defaults, **shape_config(shape)}
+    # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
+    uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
+    if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
+        uec.update(app.compute_choice)
+    return uec
+
 def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
-    """Resolve (and lazily build) the per-shape runtime, seeding its user_endpoint_config
-    from facility defaults (SlurmFacility) merged with the shape's template vars."""
+    """Resolve (and lazily build) the per-shape runtime, seeded by `_seed_uec`."""
     if shape not in SHAPES:
         raise ValueError(f"unknown shape {shape!r}")
     rt = app.shapes.get(shape)
     if rt is None:
-        defaults: dict = {}
-        ct = getattr(app.facility, "config_template", None)
-        if ct is not None:
-            result = ct(app.profile)
-            if isinstance(result, tuple):  # SlurmFacility -> (template_str, defaults)
-                defaults = result[1]
-            # LocalFacility/FakeFacility return a plain dict (rendered engine) -> no UEP defaults
-        if not isinstance(defaults, dict):
-            defaults = {}
-        uec = {**defaults, **shape_config(shape)}
-        # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
-        uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
-        if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
-            uec.update(app.compute_choice)
-        rt = ShapeRuntime(user_endpoint_config=uec)
+        rt = ShapeRuntime(user_endpoint_config=_seed_uec(app, shape))
         app.shapes[shape] = rt
     return rt
 
@@ -453,12 +461,14 @@ def _guard_refusal(out: ShellOutcome, guard: session_shell.Guard) -> session_she
 
 def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, guard: session_shell.Guard,
                          refused: session_shell.Refusal, *, reset: bool = False,
-                         at: float | None = None) -> ShellOutcome:
+                         at: float | None = None, epoch: int | None = None) -> ShellOutcome:
     """A command the guard refused: it reached another scheduler job than the block it was sent for (`guard.job`), and
     did NOT run. While that block is still the confirmed one, this is the reap `_confirm_worker` makes when a different
     job answers a check, found by the command instead: kicked (the replacement is up and billing), the old block banked
     to the latest it could have lived, spend asked again, the replacement not adopted until the user confirms it.
-    `runtime`: the shape runtime the command was sent on (None: the current one) — a released one is never marked."""
+    `runtime`: the shape runtime the command was sent on (None: the current one) — a released one is never marked.
+    `epoch`: its runtime's block_epoch when it was sent — a partition/account switch since means the terms the answer
+    names are the next block's, not the replacement's it reached."""
     rt = app.shapes.get(shape)
     what = "reset_session" if reset else "command"
     old = guard.job
@@ -484,13 +494,21 @@ def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, 
         rt.last_canary = dataclasses.replace(prev, worker_host=None, worker_job=refused.job, answered_at=seen)
         _saw_job(app, refused.job, seen)
     if not rt.spend_confirmed:  # this reap, or one a check or another command found first
+        terms = _block_terms(app, rt)
+        head = (f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
+                f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already running "
+                "and billing the allocation")
+        if epoch is not None and epoch != rt.block_epoch:  # switched since it was sent: these terms are another block
+            said = (f"{head}; {_kicked_release_note(app)}. The earlier confirmation covered job {old} only, and the "
+                    f"{_queue_word(app)} or account has been switched since: a confirmation now starts a block on the "
+                    "new terms. "
+                    + _terms_line(app, terms, lead="The new block's terms"))
+        else:
+            said = (f"{head}. Confirm spend with the user before anything runs on it; {_kicked_release_note(app)}. "
+                    f"The earlier confirmation covered job {old} only. " + _terms_line(app, terms))
         return _with_spend(app, ShellOutcome(
-            phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
-            notice=(f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
-                    f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already "
-                    "running and billing the allocation. Confirm spend with the user before anything runs on it; "
-                    f"{_kicked_release_note(app)}. The earlier confirmation covered job {old} only. "
-                    + _spend_floor_guidance(app))))
+            phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold", block=terms,
+            notice=said + _spend_floor_guidance(app, terms)))
     # a late result: spend was confirmed again after this command was sent — for whichever block is up now
     now_on = f" (now for job {rt.block_job})" if rt.block_job is not None else ""
     return _with_spend(app, ShellOutcome(
@@ -687,6 +705,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if partition is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("partition") == partition:
+        app.compute_choice["partition"] = partition  # named, though unchanged: the session's choice now (its source)
         return None
     live = _live_task_handles(app, shape)
     if live:
@@ -709,6 +728,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if account is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("account") == account:
+        app.compute_choice["account"] = account  # named, though unchanged: the session's choice now (its source)
         return None
     live = _live_task_handles(app, shape)
     if live:
@@ -770,7 +790,7 @@ def _settle_refusals(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
                 and (h.runtime is None or h.runtime is rt)
                 and (refused := _guard_refusal(_finished_outcome(h), h.guard)) is not None):
             was = rt.reaped
-            _wrong_block_outcome(app, shape, rt, h.guard, refused, reset=h.reset, at=h.done_at)
+            _wrong_block_outcome(app, shape, rt, h.guard, refused, reset=h.reset, at=h.done_at, epoch=h.epoch)
             if was is None and rt.reaped is not None:
                 rt.reap_told = False
 
@@ -1064,7 +1084,7 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
     if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
         return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,
-                                    at=handle.done_at)
+                                    at=handle.done_at, epoch=handle.epoch)
     current = app.shapes.get(handle.shape)
     # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
     # (a released runtime, or a switch since it was sent: the same runtime now stands for another block)

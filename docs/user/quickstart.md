@@ -32,7 +32,8 @@ Two things happen in the same step:
 - **The attach.** For a zero-SSH facility the agent attaches to the facility's endpoint immediately.
   Nothing has been started or billed yet, and the attach says nothing about whether your identity is
   accepted: that is tested by the next step. For an SSH-bootstrap facility this step instead brings
-  up a free login-node worker and lists your allocations.
+  up a free login-node worker. Either way the agent learns the terms the first block would start on: the default
+  partition, whether an account is needed and where you find yours, the size and the walltime.
 
 Both together took about 30 seconds on the first run.
 
@@ -41,7 +42,8 @@ Both together took about 30 seconds on the first run.
 > Run `hostname` on a compute node
 
 Every command on a compute node runs on a billed scheduler block, so the agent asks before starting
-one: partition, and your allocation account where the facility needs one. Say yes. The block is
+one, naming the partition, your allocation account where the facility needs one, the size and the walltime. Say yes,
+or name another partition or project. (Had you named them in your request, it would state them and start.) The block is
 allocated by the facility's scheduler, which took about two minutes on a quiet cluster; the agent
 polls and tells you when it is warm. Then your command runs on the node and you see its output, the
 node's hostname, and the exit code.
