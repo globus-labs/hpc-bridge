@@ -4,6 +4,8 @@ from __future__ import annotations
 import sys
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "scenarios"))
@@ -107,3 +109,377 @@ def test_fake_mep_scenarios_need_the_mep_profile_and_gate_only_provided_checks()
         provided = universal | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
         assert set(sc.EXPECT_OK) <= provided, (sc.__name__, set(sc.EXPECT_OK) - provided)
     assert fake_mep_no_account.GLOBUS_DB_SECRET == "HPCB_TEST_GLOBUS_DB_NOACCOUNT" and fake_mep_no_account.FACILITY_ID == "fake-mep-open"
+
+
+# --- fake_mep_stop_while_provisioning ---------------------------------------------------------------------------------
+
+
+def _product_stop(job=None):
+    """A facility-endpoint stop's result AS THE PRODUCT BUILDS IT (server._left_blocks_status), so the graders are held
+    to its exact words: no job -> a check of ours still queued (no block seen); a job -> the block a late answer named."""
+    import time
+
+    from hpc_bridge import server
+    from hpc_bridge.context import AppCtx, LeftBlock
+    from hpc_bridge.profile import Profile
+
+    class _Fac:
+        scheduler = "slurm"
+
+    app = AppCtx(facility=_Fac(), profile=Profile())
+    now = time.monotonic()
+    left = LeftBlock(endpoint_id="eid-mep", job=job, until=now + 600 if job else None, left_at=now, how="stop",
+                     kind="block" if job else "check", bound="idle" if job else None, partition="compute",
+                     account="hpcb")
+    st = server._left_blocks_status(app, "eid-mep", left, "", op="stop", spent=0.0)
+    return ToolCall.of("mcp__endpoint__stop_endpoint", {}, st.model_dump())
+
+
+_PROV_SAID = ["The stop issued no cancel: a check of ours is still queued, so the facility will start a block for it. "
+              "Find it with `squeue -u <your account>` on the facility and end it with `scancel <id>`."]
+
+
+def _prov_trace(stop=None, *, before=(), after=(), texts=None):
+    calls = [_connect("needs_account"),
+             _ensure("provisioning", "allocating", shape="compute", partition="compute", account="hpcb",
+                     confirm_spend=True), *before, stop or _product_stop(), *after]
+    return Trace(calls, list(_PROV_SAID if texts is None else texts))
+
+
+def _restop(**over):
+    """The product's queued-check stop with some fields overridden (what a regressed product might answer)."""
+    return ToolCall.of("mcp__endpoint__stop_endpoint", {}, dict(_product_stop().result, **over))
+
+
+def test_the_product_stop_while_provisioning_reads_as_the_scenario_expects():
+    # the contract with the product's words: a queued check (no job) and a late-answered block (job 4242)
+    r = _product_stop().result
+    assert r["status"] == "draining" and r["block_state"] == "provisioning" and r["block_job_id"] is None
+    assert r["spend_stopped"] is False and r["notice"].startswith("NO CANCEL WAS ISSUED")
+    assert "A check of ours is still queued there" in r["notice"] and "squeue -u <your account there>" in r["notice"]
+    late = _product_stop("4242").result
+    assert late["block_job_id"] == "4242" and late["block_state"] == "warm" and "scancel 4242" in late["notice"]
+
+
+def test_fake_mep_stop_while_provisioning_passes_both_honest_stops():
+    import fake_mep_stop_while_provisioning as sc
+    graders = (sc.mep_zero_ssh, sc.stopped_while_provisioning, sc.stop_says_what_is_left, sc.no_cancel_claimed,
+               sc.left_relayed, sc.no_probe_after_stop, sc.mep_stop_is_draining_only)
+    for t in (_prov_trace(), _prov_trace(_product_stop("4242"), texts=["Job 4242 bills on: `scancel 4242` ends it."])):
+        for g in graders:
+            assert g(t).ok, (g.__name__, g(t).detail)
+    assert "queued" in sc.stop_says_what_is_left(_prov_trace()).detail
+    assert "4242" in sc.stop_says_what_is_left(_prov_trace(_product_stop("4242"))).detail
+
+
+def test_fake_mep_stop_while_provisioning_calls_a_block_already_up_a_broken_premise():
+    import fake_mep_stop_while_provisioning as sc
+    up = _ensure("up", shape="compute", confirm_spend=True)
+    for before in ([up], [_run("compute", "c2\nhpcbmep\n")]):
+        r = sc.stopped_while_provisioning(_prov_trace(_product_stop("4242"), before=before))
+        assert not r.ok and "premise not met" in r.detail and "fake_mep_stop_names_block" in r.detail
+    # no confirmed start before the stop: nothing was provisioning; no stop at all
+    assert not sc.stopped_while_provisioning(Trace([_connect("needs_account"), _product_stop()])).ok
+    unconfirmed = Trace([_connect("needs_account"), _ensure("needs_confirmation", shape="compute"), _product_stop()])
+    assert not sc.stopped_while_provisioning(unconfirmed).ok
+    assert not sc.stopped_while_provisioning(Trace([_connect("needs_account")])).ok
+
+
+def test_fake_mep_stop_while_provisioning_fails_a_stop_that_hides_what_is_left():
+    import fake_mep_stop_while_provisioning as sc
+    # 'cold' (as if nothing could start), a queued check not said, a queued check called 'warm'
+    assert not sc.stop_says_what_is_left(_prov_trace(_restop(block_state="cold"))).ok
+    assert not sc.stop_says_what_is_left(_prov_trace(_restop(notice="NO CANCEL WAS ISSUED: … 'draining' is final."))).ok
+    assert not sc.stop_says_what_is_left(_prov_trace(_restop(block_state="warm"))).ok
+    # a job named without its cancel command
+    late = dict(_product_stop("4242").result, notice="NO CANCEL WAS ISSUED: scheduler job 4242 may still be running")
+    assert not sc.stop_says_what_is_left(_prov_trace(ToolCall.of("mcp__endpoint__stop_endpoint", {}, late))).ok
+    # a named job said to be 'cold' — as if it could no longer bill
+    cold_job = dict(_product_stop("4242").result, block_state="cold")
+    r = sc.stop_says_what_is_left(_prov_trace(ToolCall.of("mcp__endpoint__stop_endpoint", {}, cold_job)))
+    assert not r.ok and "cold" in r.detail
+    # the lead and spend_stopped (the sibling's grader), the status
+    assert not sc.no_cancel_claimed(_prov_trace(_restop(spend_stopped=True))).ok
+    assert not sc.no_cancel_claimed(_prov_trace(_restop(notice="stopped submitting; draining"))).ok
+    assert not sc.mep_stop_is_draining_only(_prov_trace(_restop(status="down"))).ok
+    # the agent kept the commands to itself (or half of them); a probe after the stop
+    assert not sc.left_relayed(_prov_trace(texts=["Stopped; it is draining."])).ok
+    assert not sc.left_relayed(_prov_trace(texts=["Run `scancel <id>` on the facility."])).ok   # no way to find it
+    assert not sc.left_relayed(_prov_trace(_product_stop("4242"), texts=["Run `squeue`, then `scancel <id>`."])).ok
+    assert not sc.no_probe_after_stop(_prov_trace(after=[_ensure("up", shape="compute", confirm_spend=True)])).ok
+
+
+def test_fake_mep_stop_while_provisioning_world_and_coupling():
+    import fake_mep_stop_while_provisioning as sc
+    assert sc.TARGETS == ("fake",) and sc.SERIAL is True and sc.PERSONA is None and sc.FACILITY_ID == "fake-mep-strict"
+    assert sc.NEEDS_COMPUTE_NODE is True and not hasattr(sc, "WARM_BLOCK_USER")   # a running block breaks the premise
+    (hook,) = sc.MIDRUN_HOOKS
+    assert hook["after_tool"] == "stop_endpoint" and "squeue -u hpcbmep" in hook["cmd"] and "expect_any_host" not in hook
+    assert [pc["name"] for pc in sc.POSTCHECKS] == ["mep_pilot_submitted", "mep_pilot_idle_released"]
+    poll = sc.POSTCHECKS[1]
+    assert sc.POSTCHECK_DELAY_S + sc._POLL * 15 <= 720 and poll["timeout"] > sc._POLL * 15   # the MEP settle bound
+    assert sc.ADMIN_CLEANUP == ["scancel -u hpcbmep 2>/dev/null || true"] and sc._STAMP in sc.CLEANUP[0]
+
+
+def _world(home, cmd, *, squeue_runs=("",), sacct=""):
+    """Run a scenario's world command with HOME=`home` against stubs: the i-th squeue call prints squeue_runs[i] (the
+    last repeats; calls are counted in squeue.n), sacct prints `sacct` and logs its args, sleep returns at once."""
+    import os
+    import stat
+    import subprocess
+    home.mkdir(parents=True, exist_ok=True)
+    bin_, runs = home / "bin", home / "runs"
+    bin_.mkdir(exist_ok=True)
+    runs.mkdir(exist_ok=True)
+    for i, out in enumerate(squeue_runs):
+        (runs / str(i)).write_text(out)
+    (runs / "last").write_text(squeue_runs[-1])
+    stubs = {
+        "squeue": (f'n=$(cat "{home}/squeue.n" 2>/dev/null || echo 0); echo $((n+1)) > "{home}/squeue.n"; '
+                   f'f="{runs}/$n"; [ -f "$f" ] || f="{runs}/last"; cat "$f"'),
+        "sacct": f'echo "$@" >> "{home}/sacct.args"; printf "%s" "{sacct}"',
+        "sleep": "true",
+    }
+    for name, body in stubs.items():
+        (bin_ / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_ / name).chmod((bin_ / name).stat().st_mode | stat.S_IEXEC)
+    env = {"PATH": f"{bin_}:{os.environ['PATH']}", "HOME": str(home)}
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=60)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_fake_mep_stop_while_provisioning_world_checks_read_the_queue_right(tmp_path):
+    import fake_mep_stop_while_provisioning as sc
+    submitted, released = sc.POSTCHECKS
+    rc, out = _world(tmp_path, sc.SETUP[0])
+    assert rc == 0 and "stamped 20" in out
+    stamp = (tmp_path / ".hpcb-stop-while-provisioning.start").read_text().strip()
+    # a pilot submitted since the stamp: present (sacct asked from the stamp); none: absent — "gone" proves nothing then
+    rc, out = _world(tmp_path, submitted["cmd"], sacct="77|parsl.GlobusComputeEngine-x.block-0.1|CANCELLED by 0\\n")
+    assert rc == 0 and submitted["expect_present"] in out and f"-S {stamp}" in (tmp_path / "sacct.args").read_text()
+    rc, out = _world(tmp_path, submitted["cmd"])
+    assert rc == 0 and submitted["expect_present"] not in out and "no pilot of the mapped account since" in out
+    rc, out = _world(tmp_path / "unstamped", submitted["cmd"], sacct="77|parsl.Gl|RUNNING\\n")
+    assert "NO_STAMP" in out and submitted["expect_present"] not in out   # no stamp: never a pass on old pilots
+    # the poll: the pilot leaves on the third look -> nothing left; it never leaves -> still listed after _POLL looks
+    rc, out = _world(tmp_path / "a", released["cmd"], squeue_runs=("parsl.Gl\n", "parsl.Gl\n", ""))
+    assert rc == 0 and released["expect_absent"] not in out and (tmp_path / "a" / "squeue.n").read_text().strip() == "4"
+    rc, out = _world(tmp_path / "b", released["cmd"], squeue_runs=("parsl.Gl\n",))
+    assert released["expect_absent"] in out and int((tmp_path / "b" / "squeue.n").read_text()) == sc._POLL + 1
+
+
+# --- mep_hand_batch_job and its persona twin --------------------------------------------------------------------------
+
+
+def _product_submit(cmd="sbatch hpcb_hand.sh", stdout="Submitted batch job 77\n", *, shape="compute", exit_code=0):
+    """The sbatch's result with the notice THE PRODUCT appends (notices._with_submission_notice)."""
+    from hpc_bridge.models import ShellOutcome
+    from hpc_bridge.notices import _with_submission_notice
+    from hpc_bridge.scheduler_ops import _submission
+    out = _with_submission_notice(ShellOutcome(phase="complete", exit_code=exit_code, stdout=stdout, block_state="warm"),
+                                  _submission(cmd, inside_job=shape != "login"), shape)
+    return ToolCall.of("mcp__endpoint__run_shell", {"shape": shape, "command": cmd}, out.model_dump())
+
+
+def _shell(cmd, stdout="", shape="compute", phase="complete"):
+    return ToolCall.of("mcp__endpoint__run_shell", {"shape": shape, "command": cmd},
+                       {"phase": phase, "exit_code": 0, "stdout": stdout})
+
+
+def _hand_trace(*, submit=None, cancel="scancel 77; squeue -u $USER", before_submit=()):
+    import mep_hand_batch_job as sc
+    calls = [_connect("needs_account"),
+             _ensure("provisioning", shape="compute", partition="compute", account="hpcb", confirm_spend=True),
+             _ensure("up", shape="compute", confirm_spend=True),
+             _shell(sc.SCRIPT), *before_submit, submit or _product_submit()]
+    if cancel:
+        calls.append(_shell(cancel, "JOBID NAME\n 61 parsl.Gl\n"))
+    calls.append(_product_stop("61"))
+    return Trace(calls, ["Job 77 was submitted from inside the block and cancelled. The block, job 61: `scancel 61`."])
+
+
+def test_the_product_says_a_submission_from_the_block_came_from_inside_it():
+    r = _product_submit().result
+    assert "from inside the compute block (a new job beside this block)" in r["notice"] and "scancel" in r["notice"]
+    assert "from the login node" in _product_submit(shape="login").result["notice"]
+
+
+def test_mep_hand_batch_job_graders():
+    import mep_hand_batch_job as sc
+    good = _hand_trace()
+    for g in sc.EXTRA_INVARIANTS:
+        assert g(good).ok, (g.__name__, g(good).detail)
+    assert sc.submitted_job(good) == (4, "77")
+    # the script write is not a submission (its heredoc body is blanked); a login-shape submission is not the block's
+    assert sc._block_submits(Trace([_shell(sc.SCRIPT)])) == []
+    r = sc.inside_block_notice(_hand_trace(submit=_product_submit(shape="login")))
+    assert not r.ok and "no submission from the block" in r.detail
+    # a block submission the product worded as from the login node (where it came from got lost)
+    login_words = _product_submit(shape="login")
+    misplaced = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "sbatch hpcb_hand.sh"},
+                            login_words.result)
+    assert "from the login node" in misplaced.result["notice"] and not sc.inside_block_notice(_hand_trace(submit=misplaced)).ok
+    # the product's "may have submitted" (a longer line that exited non-zero, no job id printed): not the cell's sbatch
+    maybe = _product_submit(cmd="sbatch hpcb_hand.sh; false", stdout="", exit_code=1)
+    assert sc._INSIDE in maybe.result["notice"] and "may have submitted" in maybe.result["notice"]
+    r = sc.inside_block_notice(_hand_trace(submit=maybe))
+    assert not r.ok and "with a job id" in r.detail
+    stripped = _product_submit()
+    stripped.result["notice"] = "submitted."
+    assert not sc.inside_block_notice(_hand_trace(submit=stripped)).ok
+    tracked = _product_submit()   # where it came from, but not that hpc-bridge leaves it untracked
+    tracked.result["notice"] = f"`sbatch` here submitted a scheduler job {sc._INSIDE}. Cancel it with `scancel <jobid>`."
+    r = sc.inside_block_notice(_hand_trace(submit=tracked))
+    assert not r.ok and "neither tracks nor stops it" in r.detail
+    refused = _product_submit(stdout="sbatch: error: invalid account\n", exit_code=1)
+    assert not sc.inside_block_notice(_hand_trace(submit=refused)).ok
+    assert not sc.job_cancelled(_hand_trace(submit=refused)).ok
+    # the cancel must name THAT job (id or name) and come after it — never `scancel -u`, never another id
+    for cancel in ("scancel 77", "scancel -n hpcb-handjob", "scancel --name=hpcb-handjob && squeue -u $USER"):
+        assert sc.job_cancelled(_hand_trace(cancel=cancel)).ok, cancel
+    for cancel in ("scancel -u $USER", "scancel 770", "squeue -u $USER", None):
+        assert not sc.job_cancelled(_hand_trace(cancel=cancel)).ok, cancel
+    assert not sc.job_cancelled(_hand_trace(cancel=None, before_submit=[_shell("scancel 77")])).ok
+
+
+def test_mep_hand_batch_job_world_and_coupling(tmp_path):
+    import mep_hand_batch_job as sc
+    for other in ("site", "default"):
+        assert not targets.meets(sc.REQUIRES, targets.load_profile(other)["capabilities"])[0], other
+    assert sc.WARM_BLOCK_USER == "hpcbmep" and sc.PERSONA is None and not getattr(sc, "MIDRUN_HOOKS", None)
+    # longer than the block (30 min), and a job NOT cancelled is still queued when the world checks run
+    assert sc.WALLTIME_MIN > 30 and "sleep 2400" in sc.SCRIPT and sc.POSTCHECK_DELAY_S + 600 < 2400
+    assert f"#SBATCH -t 00:{sc.WALLTIME_MIN}:00" in sc.SCRIPT and "#SBATCH -p compute" in sc.SCRIPT
+    gone, released = sc.POSTCHECKS
+    assert gone["expect_absent"] == sc.JOB_NAME and "squeue -u hpcbmep" in gone["cmd"]
+    assert released["expect_absent"] == "parsl" and sc.ADMIN_CLEANUP == ["scancel -u hpcbmep 2>/dev/null || true"]
+    _rc, out = _world(tmp_path, gone["cmd"], squeue_runs=("parsl.Gl\nhpcb-handjob\n",))
+    assert sc.JOB_NAME in out   # a job left in the queue is seen by its name
+
+
+def _q(question, answer, *labels):
+    return ToolCall.of("AskUserQuestion", {"questions": [{"question": question,
+                                                          "options": [{"label": lb} for lb in labels]}]},
+                       {"text": f'Your questions have been answered: "{question}"="{answer}".'},
+                       answers={question: answer})
+
+
+_BLOCK_Q = _q("Start 1 node on partition `compute`, charged to `hpcb`, up to 30 min?", "Yes", "Yes", "No")
+
+
+def _ask_trace(*questions, after=()):
+    t = _hand_trace(before_submit=list(questions))
+    t.calls[1:1] = [_BLOCK_Q]           # the block's own question comes before its start
+    t.calls.extend(after)
+    return t
+
+
+def _universal(t):
+    return {r.name: r for r in check_all(t)}
+
+
+@pytest.mark.parametrize("walltime", ["45 minutes", "45 min", "a 45-minute job", "00:45:00", "0:45", "0.75 h"])
+def test_batch_job_asked_passes_an_approved_question_naming_the_walltime(walltime):
+    import mep_hand_batch_job_ask as sc
+    t = _ask_trace(_q(f"Submit the batch job hpcb_hand.sh on `compute` (1 node, {walltime}, account hpcb)?", "Yes"))
+    r = sc.batch_job_asked(t)
+    assert r.ok, r.detail
+    assert _universal(t)["spend_follows_question"].ok and _universal(t)["no_spend_after_decline"].ok
+
+
+def test_batch_job_asked_follows_the_persona_through_its_question_back():
+    import mep_hand_batch_job_ask as sc
+    bare = _q("OK to submit the batch job hpcb_hand.sh now?", "How long would that job hold its node?")
+    named = _q("It asks 45 minutes on 1 `compute` node, charged to hpcb — submit the batch job?", "Yes, go ahead")
+    t = _ask_trace(bare, named)
+    assert sc.batch_job_asked(t).ok and _universal(t)["no_spend_after_decline"].ok
+    # stopping at the question back: the job went in on a question the user never approved
+    r = sc.batch_job_asked(_ask_trace(bare))
+    assert not r.ok and "was not approved" in r.detail
+
+
+def test_batch_job_asked_does_not_let_the_blocks_yes_cover_the_job():
+    # spend_follows_question's known limit: the block's question before the FIRST start passes it, the job unasked
+    import mep_hand_batch_job_ask as sc
+    t = _ask_trace()
+    assert _universal(t)["spend_follows_question"].ok
+    r = sc.batch_job_asked(t)
+    assert not r.ok and "without an answered question about the batch job" in r.detail
+    # a job question naming the BLOCK's 30 min; a declined one; one asked only after the submission
+    assert not sc.batch_job_asked(_ask_trace(_q("Submit the batch job (up to 30 min)?", "Yes"))).ok
+    assert not sc.batch_job_asked(_ask_trace(_q("Submit the 45-minute batch job?", "No, not now"))).ok
+    assert not sc.batch_job_asked(_ask_trace(after=[_q("I submitted the 45-minute batch job — OK?", "Yes")])).ok
+    # 145 minutes, 1:45 and 10:45 are not 45 minutes
+    for w in ("145 minutes", "1:45:00", "10:45"):
+        assert not sc.batch_job_asked(_ask_trace(_q(f"Submit the batch job ({w})?", "Yes"))).ok, w
+
+
+def test_batch_job_asked_counts_one_question_for_block_and_job_that_names_the_jobs_walltime():
+    import mep_hand_batch_job_ask as sc
+    both = _q("Start 1 `compute` node for hpcb (up to 30 min), then submit the 45-minute batch job from it?", "Yes")
+    t = _hand_trace()
+    t.calls[1:1] = [both]
+    assert sc.batch_job_asked(t).ok and _universal(t)["spend_follows_question"].ok
+
+
+def test_mep_hand_batch_job_ask_is_the_twin_with_a_persona():
+    import mep_hand_batch_job as twin
+    import mep_hand_batch_job_ask as sc
+    from human_sim import PERSONAS
+    assert sc.PERSONA == "batch_job_needs_ask" and sc.PERSONA in PERSONAS
+    for k in ("FACILITY_ID", "NEEDS_COMPUTE_NODE", "WARM_BLOCK_USER", "SERIAL", "TARGETS", "REQUIRES",
+              "POSTCHECK_DELAY_S", "POSTCHECKS", "ADMIN_CLEANUP", "TEARDOWN"):
+        assert getattr(sc, k) == getattr(twin, k), k
+    assert "ALREADY approved" not in sc.PROMPT and "AUTOMATED" not in sc.PROMPT and twin.SCRIPT_BLOCK in sc.PROMPT
+    assert "Check with me before" in sc.PROMPT and "{facility}" in sc.USER_GOAL
+    assert {"spend_follows_question", "batch_job_asked", "no_spend_after_decline"} <= set(sc.EXPECT_OK)
+    assert "spend_follows_question" not in twin.EXPECT_OK     # the autonomous twin is never asked
+
+
+def test_the_batch_job_persona_holds_out_for_the_walltime_with_a_question_back():
+    # the persona as the human-sim runs it (its one SDK touchpoint stubbed): the rule is in its prompt, and its canned
+    # line is a question back — never read as a standing refusal
+    import asyncio
+
+    from human_sim import HumanSim
+    from invariants import _DECLINE
+    sim = HumanSim(persona="batch_job_needs_ask", goal="Your project is hpcb.")
+    prompts: list[str] = []
+    script = ['{"action": "reply", "reply": "How long would that job hold its node?", "kind": "unclear", '
+              '"reason": "no walltime"}']
+
+    async def fake_ask(prompt, system):
+        prompts.append(prompt)
+        return script.pop(0)
+
+    sim._ask = fake_ask
+    bare = asyncio.run(sim.move("OK to submit the batch job now?"))
+    assert bare.reply == "How long would that job hold its node?"
+    assert "approve one only if the question about it says how long" in prompts[0]
+    assert "a question back, not a refusal (kind: unclear)" in prompts[0]
+    assert sim.dialogue[-1].kind == "unclear" and not sim._standing_decline()
+    assert not _DECLINE.search(bare.reply)
+
+
+def test_the_lab_mep_world_checks_wait_past_its_release():
+    # itinerary 2026-10-13 §2.3 #7: the lab MEP releases a block 600–660 s after its last task (30 s period); a check at
+    # +660 s sat on that edge and flaked. Both lab-MEP cells wait 720 s — pinned, so a revert to 660 fails here.
+    import mep_compute_only
+    import stranger_mep_walk
+    for sc in (mep_compute_only, stranger_mep_walk):
+        assert sc.POSTCHECK_DELAY_S >= 720, sc.__name__
+        assert any("glabs-gc" in pc["cmd"] and pc.get("expect_absent") == "parsl" for pc in sc.POSTCHECKS), sc.__name__
+
+
+def test_the_new_mep_scenarios_need_the_mep_profile_and_gate_only_provided_checks():
+    import fake_mep_stop_while_provisioning
+    import mep_hand_batch_job
+    import mep_hand_batch_job_ask
+    mep = targets.load_profile("mep")["capabilities"]
+    universal = {r.name for r in check_all(Trace([]))}
+    for sc in (fake_mep_stop_while_provisioning, mep_hand_batch_job, mep_hand_batch_job_ask):
+        assert sc.TARGETS == ("fake",) and sc.SERIAL is True, sc.__name__
+        assert targets.meets(sc.REQUIRES, mep)[0], sc.__name__
+        assert not targets.meets(sc.REQUIRES, targets.load_profile("site")["capabilities"])[0], sc.__name__
+        assert not targets.meets(sc.REQUIRES, targets.GLOBUS1_CAPABILITIES)[0], sc.__name__
+        assert set(sc.EXPECT_OK) <= universal | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}, sc.__name__

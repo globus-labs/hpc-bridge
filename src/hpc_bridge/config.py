@@ -201,6 +201,32 @@ def canary_timeout_s() -> float:
     return use
 
 
+# How long ONE teardown_endpoint call waits for the login-node ops (gce stop + delete over SSH) before handing back
+# `tearing_down`. Well inside any MCP client's tool window: Expanse's stop + delete take ~3 min on its filesystem (live
+# 2026-09-04) and the call used to fall into the client's 120 s background rescue — a client without one would cancel
+# the request and could interrupt the ops half-way. The ops run in a server-side task; a later call reports the result.
+TEARDOWN_WAIT_S = 60.0
+_TEARDOWN_SEAM_NOTED: set[str] = set()   # out-of-range seam values already reported (once each)
+
+
+def teardown_wait_s() -> float:
+    """How long one teardown_endpoint call waits for the login-node ops: TEARDOWN_WAIT_S, unless
+    HPC_BRIDGE_TEARDOWN_WAIT_S overrides it. A TEST SEAM, never set in normal use: the agentic harness shortens it so
+    the server-task path (`tearing_down`, then a call again) shows on a cluster whose whole teardown takes seconds
+    (scenario `teardown_slow_fs`). Read at each teardown call. It only SHORTENS the wait, within [0, TEARDOWN_WAIT_S]:
+    a longer one risks the MCP client's tool window, the reason the ops run in a server task. A value below the range,
+    invalid or not finite keeps the default; one above it is capped; either is said once on stderr."""
+    raw = env("HPC_BRIDGE_TEARDOWN_WAIT_S")
+    val = _env_float("HPC_BRIDGE_TEARDOWN_WAIT_S", TEARDOWN_WAIT_S)
+    in_range = math.isfinite(val) and val >= 0
+    use = min(val, TEARDOWN_WAIT_S) if in_range else TEARDOWN_WAIT_S
+    if raw is not None and use != val and raw not in _TEARDOWN_SEAM_NOTED:
+        _TEARDOWN_SEAM_NOTED.add(raw)
+        print(f"hpc-bridge: HPC_BRIDGE_TEARDOWN_WAIT_S={raw!r} is outside [0, {TEARDOWN_WAIT_S:g}] s; using {use:g}",
+              file=sys.stderr)
+    return use
+
+
 # --- long-task submit/poll bounds (#21) ---
 # The client blocks up to SYNC_WAIT_S for a task's result; a task still running past it is NOT cut —
 # the caller gets a poll handle (poll_task) and the task runs on up to its ceiling. _runner_for clamps

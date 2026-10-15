@@ -32,6 +32,11 @@ installed plugin only when that version changes); git tags mark releases.
   on: the default queue and where it comes from, whether an account is needed (and where to find it), the nodes and
   the walltime. Nothing is started or billed by it. What fitting the configuration to a facility endpoint's template
   drops is said there too, before any spend.
+- **A test seam for the teardown's wait, `HPC_BRIDGE_TEARDOWN_WAIT_S`.** `teardown_endpoint` waits up to 60 s for the
+  login-node ops (`gce stop` + delete over SSH, which run in the server) before it answers `tearing_down`; that wait
+  was a constant, so a cluster whose whole teardown takes seconds never showed the `tearing_down` path. The variable
+  only shortens the wait, within 0–60 s, read at each call; a value outside that, or not a number, keeps 60 and says
+  so once on stderr. Never set in normal use: the agentic scenario `teardown_slow_fs` sets it to 1.
 
 ### Changed
 - **The agent asks you once, only for what you haven't said, and your yes is the confirmation.** `connect_facility`
@@ -249,6 +254,28 @@ installed plugin only when that version changes); git tags mark releases.
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).
+- Four more scenarios (63 in all), each grading its own premise so a run that missed it says so instead of passing:
+  - `fake_mep_stop_while_provisioning` (fake `mep`, free operators): the agent confirms the spend and stops at once,
+    before any block is up. The stop leads with "NO CANCEL WAS ISSUED", says a check of ours is still queued (or names
+    the job when the check answered first, with `scancel <id>`), is never `cold` and never `spend_stopped`; the agent
+    relays how to find and end it and checks nothing afterwards. The world check finds that a pilot was submitted
+    during the cell (sacct since a stamp the setup writes) and that none is left, polled for up to 720 s. A block
+    already up when the stop came is reported as a broken premise.
+  - `mep_hand_batch_job` (fake `mep`, free operators): a 45-minute job submitted with `sbatch` from inside a facility
+    endpoint's block comes back with the "from inside the compute block (a new job beside this block)" notice; the
+    agent cancels that job (its id or name, never `scancel -u`), and none is left in the mapped account's queue. Its
+    persona twin `mep_hand_batch_job_ask`, with a new persona `batch_job_needs_ask` that approves a batch job only when
+    the question names its walltime (and otherwise asks "How long would that job hold its node?"), gates a new
+    grader, `batch_job_asked`: the submission followed its own approved question naming the job's 45 minutes, which
+    `spend_follows_question` cannot check when a block was approved first.
+  - `teardown_slow_fs` (fake, any profile but `totp`, free operators): with `HPC_BRIDGE_TEARDOWN_WAIT_S=1` the first
+    `teardown_endpoint` answers `tearing_down`; the agent calls it again, and nothing else, until `down`, which must be
+    the finished teardown's own report for the same endpoint. The world check finds the endpoint dir and the token
+    store hpc-bridge seeded gone, and two decoys it did not create (another endpoint's `uep.*` dir and a file) still
+    there.
+
+  The MEP graders are tested in `agentic/harness/test_mep_scenarios.py` and the teardown ones in the new
+  `test_teardown_scenarios.py` (now in the CI list), both against results the product itself builds.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

@@ -24,7 +24,7 @@ echo "# profile sweep $STAMP — target fake, models $MODELS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call 2" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs 2" ;;
     site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job,ssh_account_floor 3" ;;
     totp)     echo "otp_preauth 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
@@ -33,7 +33,7 @@ cells() {  # cells <profile> -> the scenario list (and concurrency) for that pro
     polaris)  echo "polaris_filesystems 1" ;;
     internal) echo "internal_hostnames 1" ;;
     hostile)  echo "canary_login_discovery,canary_compute_output 1" ;;  # per-node canary channels are shared → SERIAL, one at a time
-    mep)      echo "fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,fake_mep_username_not_account,term_switch_reasks,preset_account_scoped,terms_prestated,terms_wanted 1" ;;
+    mep)      echo "fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,fake_mep_username_not_account,term_switch_reasks,preset_account_scoped,terms_prestated,terms_wanted,fake_mep_stop_while_provisioning,mep_hand_batch_job,mep_hand_batch_job_ask 1" ;;
     *) echo "" ;;
   esac
 }
@@ -70,6 +70,7 @@ otp_preauth
 fake_mep_username_not_account
 terms_prestated
 terms_wanted
+mep_hand_batch_job_ask
 PAID
 }
 

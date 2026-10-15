@@ -241,6 +241,16 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 **#178, designed but not built (MEP stop names the block): no scenario, and the existing graders cannot catch it.**
 > [!note] Since built ([#178](https://github.com/globus-labs/hpc-bridge/issues/178))
 > `fake_mep_stop_names_block` grades the job id, the lead, `spend_stopped`, the `scancel N` command (notice and agent text) and no probe after the stop, with a world hook on the queue at stop time; `revocation_honoured` now reads `spend_stopped` and knows a MEP detach. `block_state`, the release-by time and the stop-while-provisioning case are unit-tested (`tests/test_mep_stop_names_block.py`); `fake_mep_stop_while_provisioning` is still a proposal.
+
+> [!note] Since built (2026-10-14, branch `harness/coverage-extras-1`; not yet run live)
+> `fake_mep_stop_while_provisioning` (fake `mep`, autonomous, free operators): the agent confirms and stops at once.
+> Graded: the premise (`stopped_while_provisioning`: no `up` and no work before the stop — a block already up is
+> named as the sibling's world, never a silent pass); the stop says a check of ours is still queued (or names the
+> job a late answer gave, with `scancel <id>`) and is never `cold` (`stop_says_what_is_left`); the lead and
+> `spend_stopped` (`no_cancel_claimed`); the commands relayed (`left_relayed`); `no_probe_after_stop`; `draining`.
+> World: a pilot of the mapped account WAS submitted during the cell (sacct since a SETUP stamp, so "gone" is not
+> vacuous) and none is left, polled after a 240 s settle, up to 720 s. No `WARM_BLOCK_USER`: a running block would
+> break the premise. Hermetic: `agentic/harness/test_mep_scenarios.py`, against the product's own stop result.
 - `mep_stop_is_draining_only` checks the status only.
 - `revocation_honoured` counts any `down` as released, so a MEP teardown detach (`down` while the block bills) would pass it.
 - Unchecked by any scenario:
@@ -294,6 +304,16 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 - The product's "from inside the compute block (a new job beside this block)" branch (`notices.py:569-590`) appears in no bundle.
 - Also missing: the persona case where the work exceeds the walltime, so the agent must ask before `sbatch` (an open gap in the vault's #176 list).
 
+> [!note] Since built (2026-10-14, branch `harness/coverage-extras-1`; not yet run live)
+> `mep_hand_batch_job` (fake `mep`, autonomous, free operators): a 45-minute job script written on the block, `sbatch`,
+> `scancel`, stop. Graded: `inside_block_notice` (the product's "from inside the compute block (a new job beside this
+> block)" notice on the submission) and `job_cancelled` (that job's id or name, never `scancel -u`). World: no
+> `hpcb-handjob` in `squeue -u hpcbmep`; the job sleeps 40 min, so one left uncancelled is still listed. Its persona
+> twin `mep_hand_batch_job_ask` (persona `batch_job_needs_ask`; a variant scenario, since the twin's prompt
+> pre-approves) gates `spend_follows_question` and `batch_job_asked`: the hand submission followed its OWN approved
+> question naming the job's walltime. `spend_follows_question` alone cannot see that, as it checks only the first
+> start (the block).
+
 **Personas.**
 - Built: `cooperative`, `budget_hawk`, `declines_spend`, `gives_username`, the TOTP authenticator, and the `interject` revoker.
 - Missing:
@@ -308,6 +328,16 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 ## 2.2 Other behaviours with no scenario (carried over from the September reviews, still open)
 
 - **`tearing_down` and the #91 re-call contract.** 0 bundles. `_TEARDOWN_SYNC_WAIT_S` still has no config accessor.
+
+> [!note] Since built (2026-10-14, branch `harness/coverage-extras-1`; not yet run live)
+> The wait is `config.teardown_wait_s()` now, with the test seam `HPC_BRIDGE_TEARDOWN_WAIT_S` (it only shortens the
+> wait, within [0, 60] s; [[Configuration]]). `teardown_slow_fs` (fake, any profile but `totp`, autonomous) sets it to
+> 1. Graded: the premise (`teardown_handed_back`: the FIRST teardown answered `tearing_down`); `teardown_awaited`
+> (called again, nothing else, until `down`); `teardown_down_is_ours` (that `down` is the finished teardown's own
+> report for the same endpoint). The code's `ours` guards the session state: a binding made meanwhile is not the
+> teardown's to clear. Its other branch cannot be reached through the tools, since connect refuses during a teardown
+> (0.1.18), so it stays hermetic. World, "only what the run created": the seeded token store and the endpoint dir are
+> gone, and the decoys (a sibling `uep.<other uuid>.*` dir and a file) are kept.
 - **Notices never provoked:** TIMED OUT, REMOTE FILESYSTEM and ControlPath. MEP OFFLINE and the ≥300 s allocating hint appear only incidentally.
 - **Smaller tools and fallbacks:** `list_facilities(query)`, the registry-unreachable fallback, `reset_session` on the compute shape, the TRANSIENT_CONFLICT cap.
 - **Managers leaking after teardown.** 14 were found running on 10-11 under `hpcbridge-test`, from runs whose teardown said "deleted". No check runs after the harness's own teardown, so this is invisible to every verdict.
@@ -424,6 +454,11 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
   - The MEP postchecks: 660 → 720 s.
   - `hand_batch_job`: add REQUIRES.
   - `zero_config_list`: take the needles from the `list_facilities` result.
+
+> [!note] Since built (before 2026-10-14)
+> All four were already on `main` when the coverage-extras branch looked. `hand_batch_job`'s REQUIRES, the 720 s MEP
+> postchecks and `zero_config_list`'s needles from the result (`listing_relayed`) came in #182; `revocation_honoured`
+> reading `spend_stopped` and a MEP detach (`spend_released`, with its test) came in #188.
 
 ---
 
