@@ -38,6 +38,36 @@ FLOW_TTL_S = 600.0  # a login URL / listener lives this long, then a fresh needs
 
 SEARCH_SCOPE = "urn:globus:auth:scope:search.api.globus.org:search"
 
+# What every notice says when Globus Auth refuses the stored login's refresh (`login_expired`).
+LOGIN_EXPIRED = "the stored Globus login no longer works (expired or revoked)"
+_TOKEN_PATH = "/v2/oauth2/token"
+
+
+def login_expired(exc: BaseException | None) -> bool:
+    """Is `exc` Globus Auth refusing to refresh the stored login, so that only a new login helps? That is the SDK's
+    AuthAPIError, HTTP 400 or 401, from the token endpoint (POST …/v2/oauth2/token) or with the `invalid_grant` code:
+    the refresh token was revoked or has expired. Seen live (2026-10-14) as `('POST',
+    'https://auth.globus.org/v2/oauth2/token', None, 400, None, 'Bad Request')` on every dispatch. Not a dead login:
+    any other Globus API error (a 403 from the Compute service), another Auth call, a network error. Follows an
+    explicit `raise … from` chain."""
+    try:
+        from globus_sdk import AuthAPIError
+    except ImportError:  # pragma: no cover - the SDK is a core dependency
+        return False
+    seen: set[int] = set()
+    while exc is not None and id(exc) not in seen:
+        seen.add(id(exc))
+        if isinstance(exc, AuthAPIError) and getattr(exc, "http_status", None) in (400, 401):
+            url = exc.args[1] if len(exc.args) > 1 and isinstance(exc.args[1], str) else ""
+            try:
+                grant = getattr(exc, "code", None) or (exc.raw_json or {}).get("error")
+            except Exception:  # noqa: BLE001 - an unreadable body: the endpoint alone decides
+                grant = None
+            if url.split("?", 1)[0].rstrip("/").endswith(_TOKEN_PATH) or grant == "invalid_grant":
+                return True
+        exc = exc.__cause__
+    return False
+
 
 def required_scopes(*, include_search: bool = False) -> dict[str, list[str]]:
     """resource_server -> scopes to request in ONE consent. Default = the MINIMUM: exactly what a
@@ -122,6 +152,27 @@ class LoginFlow:
             print(f"hpc-bridge: login_required check failed ({type(exc).__name__}: {exc}); treating as login"
                   " required", file=sys.stderr)
             return True
+
+    def check_stored_login(self) -> tuple[Literal["works", "expired", "unchecked"], str | None]:
+        """Non-prompting: does the stored login still WORK, not only hold every scope (`login_required`)? Each
+        required resource server's token is made valid the way a dispatch makes it: one past its expiry is refreshed
+        (one call to Globus Auth's token endpoint; none while it is still valid). 'expired' (with the error): Globus
+        Auth refused the refresh (`login_expired`), so only a new login helps. 'unchecked' (with why): no answer
+        either way — no network, Globus unreachable, the stored login changed while it was read."""
+        try:
+            app = (self.app_factory or _default_app_factory)(None)
+            # login_required() builds and caches every resource server's authorizer with the app's login-on-error
+            # handler OFF, so get_authorizer() below returns those: it can never start the SDK's own stdin login
+            if app.login_required():
+                return "unchecked", "the stored login changed while it was being checked"
+            for rs in app.scope_requirements:
+                ensure = getattr(app.get_authorizer(rs), "ensure_valid_token", None)
+                if callable(ensure):
+                    ensure()
+        except Exception as exc:  # noqa: BLE001 - a refused refresh is a verdict; anything else says nothing
+            why = f"{type(exc).__name__}: {' '.join(str(exc).split())}"[:200]
+            return ("expired" if login_expired(exc) else "unchecked"), why
+        return "works", None
 
     def status(self) -> str:
         with self._lock:

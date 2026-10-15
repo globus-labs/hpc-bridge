@@ -106,6 +106,7 @@ from .notices import (  # noqa: F401 - re-exported
     _left_job,
     _left_spend_stopped,
     _local_dill,
+    _login_expired_notice,
     _login_notice,
     _needs_account_notice,
     _needs_account_outcome,
@@ -447,6 +448,16 @@ async def _ensure_endpoint_up(
                             "another session with the SAME Globus identity is starting or holding a user endpoint here "
                             "(a concurrent hpc-bridge run?), or the facility's manager is wedged. Stop retrying: end the "  # noqa: E501
                             "other session or wait a few minutes, then call ensure_endpoint_up again. Nothing was started."),  # noqa: E501
+                )
+            if rt.last_canary is not None and rt.last_canary.login_expired:
+                # Globus Auth refused to refresh the stored login: nothing can be sent until the user logs in again.
+                # Not "allocating nodes…", not a config fault (live 2026-10-14). The block's state is not known, so it
+                # stays `provisioning`, never a `down` that could hide a block still billing.
+                rt.provisioning_since = None  # the cold-start clock restarts once work can be sent again
+                return EndpointStatus(
+                    status="provisioning", block_state=block, endpoint_id=eid, session_spend=spend,
+                    partition=active_partition, account=active_account,
+                    notice=said(_login_expired_notice(rt.last_canary.error)),
                 )
             if rt.last_canary is not None and _no_account_failure(rt.last_canary.error):
                 # The manager refused to start a user endpoint for THIS identity: no local account. Not

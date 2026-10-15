@@ -6,6 +6,22 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
+  the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
+  "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";
+  `authenticate` then answered `logged_in`, because the stored login still held every scope; and the connect said only
+  "facility template not readable (AuthAPIError)". Now:
+  - `ensure_endpoint_up` and `run_shell` say the stored Globus login no longer works (expired or revoked), that
+    nothing is wrong with the facility, its config or the partition, and that the user must log in again with
+    `authenticate(force=True)`. `run_shell` answers `failed`, not `cold_start`; `ensure_endpoint_up` stays
+    `provisioning`, because a block started earlier may still be running;
+  - `authenticate` checks that the stored login still works before it answers `logged_in`: it renews any token past
+    its expiry, as a dispatch would, and never opens a browser or asks for input to do it. When Globus refuses, it
+    answers `needs_login` with the reason and starts a new login, as for a first one. When the check cannot reach
+    Globus, it still answers `logged_in` and says the login could not be checked;
+  - the connect to a facility-run endpoint names the failed login instead of only "template not readable";
+  - a command sent to a block still taken for warm, whose dispatch fails on the login (`Dispatch error:
+    AuthAPIError`), says so too.
 - **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
   Windows-on-Arm build since 46.0.3. On an Arm Python, the first start tried to build it from source, failed for
   want of OpenSSL, and Claude Code showed only `Failed to reconnect to plugin:hpc-bridge … CONNECTION_CLOSED`.

@@ -17,7 +17,7 @@ from .config import SYNC_WAIT_S, _task_ceiling_s
 from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _with_spend
 from .lifecycle import BlockState
-from .login import LoginStart
+from .login import LOGIN_EXPIRED, LoginStart
 from .models import ConnectFacilityResult, ShellOutcome, Submission
 from .runner import CanaryResult
 from .scheduler_ops import _submission_refused
@@ -266,13 +266,13 @@ def _login_wait_s_UNUSED() -> float:
     return config.login_wait_s()
 
 def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | None = None,
-                  waited_s: float | None = None) -> str:
+                  waited_s: float | None = None, why: str | None = None) -> str:
     """The agent-facing instructions for a login, by mode. Same discipline as needs_preauth: relay
     the link, never ask for a password, never handle a token; in paste mode only a one-time code
-    (not a token) passes through the chat."""
+    (not a token) passes through the chat. `why`: the reason a login is needed, when it is known."""
     for_what = f" before {facility!r} can be reached" if facility else ""
-    head = (f"A Globus login is needed{for_what} (first use, or a stored credential missing a scope an "
-            "endpoint needs). ")
+    why = why or "first use, or a stored credential missing a scope an endpoint needs"
+    head = f"A Globus login is needed{for_what} ({why}). "
     tail = (" The login happens ONLY in the browser: never ask the user for a Globus password, and "
             "never paste the link into a shell.")
     prefix = f"({flow_error}) " if flow_error else ""
@@ -354,6 +354,15 @@ def _dispatch_error_suffix(canary: CanaryResult | None) -> str:
         return (f" — last dispatch was refused as TRANSIENT: {canary.error}. The endpoint is still processing "
                 "a previous start request — wait ~10 s and call again (not a config problem)")
     return f" — last dispatch failed: {canary.error}. Not a queue wait: fix the config/partition and retry"
+
+def _login_expired_notice(error: str | None) -> str:
+    """The stored Globus login failed under a dispatch (CanaryResult.login_expired): Globus Auth refused to refresh it.
+    Live 2026-10-14 every dispatch read "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix
+    the config/partition and retry": the wrong remedy, and nothing pointed at the login."""
+    return (f"{LOGIN_EXPIRED[:1].upper()}{LOGIN_EXPIRED[1:]}: Globus refused to refresh it "
+            f"({(error or '').strip()[:240]}). No work can be sent until the user logs in again. Not a queue wait, and "
+            "nothing is wrong with the facility, its config or the partition: call authenticate(force=True), give the "
+            "user its link, then retry.")
 
 def _transient_dispatch_failure(error: str | None) -> bool:
     """The web service's 409 RESOURCE_CONFLICT ('Endpoint … is already in use: possibly due to concurrent
@@ -665,6 +674,8 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
 
 
 def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> ShellOutcome:
+    if canary is not None and canary.login_expired:  # nothing can be sent: not a cold start to wait out
+        return ShellOutcome(phase="failed", block_state=block, notice=_login_expired_notice(canary.error))
     if canary is not None and _no_account_failure(canary.error):
         from .login import globus_identity_label
 
