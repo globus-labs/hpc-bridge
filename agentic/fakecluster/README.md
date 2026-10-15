@@ -180,7 +180,8 @@ python3 agentic/run_suite.py --target fake --profile polaris --reset-cluster --s
 #   ^ a PBS site rule: the pilot is HELD with a comment; the tool relays it; the agent adds -l filesystems=…
 python3 agentic/run_suite.py --target fake --profile pbs_mep --reset-cluster --scenarios fake_pbs_mep_compute
 #   ^ a Polaris-shaped facility endpoint on PBS: the registry's default queue reaches `qsub -q` through key_map; the
-#     stop names the PBS job and `qdel` (needs HPCB_MEP_EMAIL; the first boot installs the endpoint, ~1–2 min)
+#     stop names the PBS job and `qdel` (needs HPCB_MEP_EMAIL). Live 2026-10-15: READY 14 s after a wipe; codex OK
+#     (first result 12.7 s; PBS released the pilot 251 s after the last task)
 python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --scenarios internal_hostnames
 #   ^ internal login hostnames: the pin must not use a name the client cannot resolve; both nodes clean after teardown
 #   ^ a different cluster shape (see Profiles); switching profiles needs --reset-cluster. These five are the
