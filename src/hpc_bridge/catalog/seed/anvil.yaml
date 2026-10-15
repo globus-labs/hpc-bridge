@@ -20,6 +20,7 @@
   auth_method: ssh-key
   allocation: null
   account_required: true
+  account_hint: "your ACCESS project id, lowercased (e.g. cis250223)"
   compute:
     scheduler: slurm
     interface: ib0                  # informational: the facility template pins its own address

@@ -141,6 +141,18 @@ def worker_env_raw_problems(raw: Any) -> list[str]:
     return problems
 
 
+def account_hint_raw_problems(raw: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `account_hint`, before the lenient parse can forgive it: a hint the
+    client would drop or cut (not text, or longer than one short line) is refused at ingest, not published shortened."""
+    if raw is None:
+        return []
+    if not isinstance(raw, str) or not raw.strip():
+        return [f"account_hint must be a non-empty string, got {type(raw).__name__}"]
+    if len(" ".join(raw.split())) > ACCOUNT_HINT_MAX:
+        return [f"account_hint is longer than {ACCOUNT_HINT_MAX} characters"]
+    return []
+
+
 def worker_env_problems(compute: Compute) -> list[str]:
     """The curator's strict check of `worker_env` against env_setup (run at ingest; clients read leniently)."""
     we = compute.worker_env
@@ -273,6 +285,7 @@ class CatalogSummary(BaseModel):
 
 
 _SAFE_SLUG = re.compile(r"^[A-Za-z0-9][A-Za-z0-9._-]{0,63}$")  # the derived endpoint name is hpc-bridge-<id>
+ACCOUNT_HINT_MAX = 200  # an account hint is one short line of agent-facing text
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
 
@@ -352,6 +365,10 @@ class CatalogEntry(BaseModel):
     # scheduler doesn't enforce accounting (e.g. the lab cluster) — then the agent must NOT be sent
     # hunting for an allocation; it may confirm spend and proceed without one.
     account_required: bool = True
+    # Where a user finds the account to charge (the facility's own words or tool), e.g. "your ACCESS project id,
+    # lowercased (e.g. cis250223)". Agent-facing: the spend question and connect_facility carry it. Optional, and read
+    # LENIENTLY (a malformed one is dropped, never the entry); a plugin before it ignores the key.
+    account_hint: str | None = None
     compute: Compute
     defaults: Defaults
 
@@ -368,6 +385,15 @@ class CatalogEntry(BaseModel):
             return handler(v)
         except (ValueError, TypeError):
             return None
+
+    @field_validator("account_hint", mode="before")
+    @classmethod
+    def _lenient_hint(cls, v: Any) -> str | None:
+        # One line of plain text, bounded: anything else costs the facility its hint, never the entry.
+        if not isinstance(v, str):
+            return None
+        text = " ".join(v.split())
+        return text[:ACCOUNT_HINT_MAX] or None
 
     @field_validator("ssh_host")
     @classmethod

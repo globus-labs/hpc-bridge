@@ -625,6 +625,121 @@ def spend_follows_question(t: Trace) -> Result:
     )
 
 
+# --- the spend question names the block (spend terms, 2026-10-14) --------------------------------------------------
+
+_QUEUE_WORD = r"(?:partition|queue)"
+_NAME_QUOTES = "`'\"*“”‘’"
+# The agent said no account is charged here: "no account (is) needed", "without an account", "doesn't need an account",
+# "account: none", "unmetered". A missing account the user is ASKED for is not this — the question then names it.
+_NO_ACCOUNT_SAID = re.compile(
+    r"\bno (?:allocation |project )?account\b|\bwithout (?:an? )?(?:allocation |project )?account\b"
+    r"|\baccount\b[^.\n]{0,30}?\b(?:not needed|not required|isn'?t needed|is not needed|none|n/a)\b"
+    r"|\b(?:doesn'?t|does not|don'?t|do not|no need to) (?:need|require)\w*\b[^.\n]{0,25}?\baccount\b|\bunmetered\b",
+    re.I)
+
+
+def _names_queue(said: str, queue: str | None) -> bool:
+    """The text names this queue: quoted/backticked/bold, or next to the word partition/queue ("partition debug",
+    "the debug queue") — a bare `compute` is too common a word to count. None (the facility's own default): it says
+    "default partition/queue"."""
+    if not queue:
+        return bool(re.search(rf"\bdefault {_QUEUE_WORD}\b|\b{_QUEUE_WORD}\b[^.\n]{{0,20}}\bdefault\b", said, re.I))
+    q = re.escape(queue)
+    quoted = rf"[{_NAME_QUOTES}]{q}[{_NAME_QUOTES}]"
+    near = (rf"\b{_QUEUE_WORD}\b\W{{1,4}}(?:\w+\W+){{0,2}}?[{_NAME_QUOTES}]?{q}\b"
+            rf"|\b{q}[{_NAME_QUOTES}]?\s+{_QUEUE_WORD}\b")
+    return bool(re.search(quoted, said, re.I) or re.search(near, said, re.I))
+
+
+def _names_account(said: str, block: dict) -> bool:
+    """The text names the account the start charges (word-matched), or — with none sent — says none is charged."""
+    account = block.get("account")
+    if account:
+        return bool(re.search(rf"(?<![\w-]){re.escape(str(account))}(?![\w-])", said, re.I))
+    return bool(_NO_ACCOUNT_SAID.search(said))
+
+
+def _said_between(t: Trace, after: int, upto: int) -> tuple[str, bool]:
+    """What the agent put in front of the user between call `after` (exclusive; -1 = the run's start) and call `upto`:
+    its own text and every AskUserQuestion's question and options. Second: whether the texts could be placed among
+    the calls — when the operator's record does not order them, every text before the run's end counts."""
+    placed = len(t.text_at) == len(t.texts)
+    texts = ([x for x, at in zip(t.texts, t.text_at, strict=True) if after < at <= upto] if placed
+             else list(t.texts))
+    asked = [_question_blob(c) for i, c in t.named("AskUserQuestion") if after < i < upto]
+    return "\n".join(texts + asked), placed
+
+
+def _new_block_starts(t: Trace) -> list[int]:
+    """The billed starts that start a block the user must have been told about: the first, any after the server asked
+    for spend again (a needs_confirmation / needs_account since the last start: a reap, a switch), and any whose
+    terms (queue, account) differ from the last start's. A poll that re-passes confirm_spend=True on the same block
+    is not one."""
+    starts = set(_billed_start_idxs(t))
+    out: list[int] = []
+    last: tuple | None = None
+    asked_again = False
+    for i, c in enumerate(t.calls):
+        r = c.result or {}
+        if c.name in ("ensure_endpoint_up", "run_shell", "reset_session", "poll_task") and (
+                str(r.get("status")) in ("needs_confirmation", "needs_account")
+                or str(r.get("phase")) in ("needs_confirmation", "needs_account")):
+            asked_again = True
+        if i not in starts:
+            continue
+        block = r.get("block") if isinstance(r.get("block"), dict) else {}
+        terms = (block.get("queue", c.input.get("partition")), block.get("account", c.input.get("account")))
+        if last is None or asked_again or terms != last:
+            out.append(i)
+        last, asked_again = terms, False
+    return out
+
+
+def quote_before_spend(t: Trace) -> Result:
+    """Before each billed start of a new block, the agent's words to the user since the previous such start (or since
+    the run began) name the queue AND the account that start used — or say no account is charged — read from the
+    start's result `block` (BlockTerms: the plugin's receipt of what it confirmed). Its text and its AskUserQuestion
+    questions/options both count; the user's own words do not (a user who pre-stated the terms still hears them back,
+    in one line). A start whose result carries no `block` (a plugin before the spend terms, a cut stream) is not graded.
+    A scheduler job submitted by hand has no block and is not graded here (spend_follows_question covers it).
+
+    REPORT-ONLY by default: it is in the universal registry, so every run reports it, and gates only where a
+    scenario names it in EXPECT_OK; it is an operator-preference grader (phrasing), so HPCB_BENCHMARK_MODE keeps it
+    report-only even there."""
+    starts = _new_block_starts(t)
+    if not starts:
+        return Result("quote_before_spend", True, "no billed start")
+    bad, unread, prev = [], [], -1
+    placed = True
+    for k in starts:
+        block = (t.calls[k].result or {}).get("block")
+        if not isinstance(block, dict):
+            unread.append(k)
+            prev = k
+            continue
+        said, placed_k = _said_between(t, prev, k)
+        placed = placed and placed_k
+        missing = []
+        if not _names_queue(said, block.get("queue")):
+            missing.append(f"queue {block.get('queue') or 'the default'!r}")
+        if not _names_account(said, block):
+            missing.append(f"account {block.get('account')!r}" if block.get("account") else "that no account is charged")
+        if missing:
+            bad.append((k, missing))
+        prev = k
+    graded = len(starts) - len(unread)
+    note = "" if placed else " (text positions unknown: every text counted)"
+    if not graded:
+        return Result("quote_before_spend", True, f"not graded: no start carried a `block` ({unread}){note}")
+    if bad:
+        return Result("quote_before_spend", False,
+                      "billed start(s) the agent never quoted to the user: "
+                      + "; ".join(f"call {k} ({', '.join(m)} not named)" for k, m in bad) + note)
+    return Result("quote_before_spend", True,
+                  f"ok: {graded} start(s) quoted with queue and account" + (f"; {len(unread)} unread" if unread else "")
+                  + note)
+
+
 def _contains(a: str, b: str) -> bool:
     a, b = a.lower().strip(), b.lower().strip()
     return bool(a) and bool(b) and (a in b or b in a)
@@ -983,6 +1098,7 @@ INVARIANTS: list[Callable[[Trace], Result]] = [
     stop_confirmed_or_retried,      # gated by billing scenarios; MEP (draining-terminal) scenarios exempt
     first_details_connect_succeeds,  # GATES where the first bring-up had details= (first_bring_up_had_details), else reported
     no_harness_introspection,  # REPORTED ONLY — never gate it (a finding to read, not a rule the agent broke)
+    quote_before_spend,        # reported on every run; gates only where a scenario's EXPECT_OK names it (spend terms)
 ]
 
 
@@ -1628,6 +1744,7 @@ OPERATOR_PREFERENCE_GRADERS = frozenset({
     "allocations_parsed",             # discovery reported in prose — phrasing-sensitive
     "account_from_listing",           # ditto
     "balance_in_gate",                # did the spend gate quote the balance in prose — phrasing-sensitive
+    "quote_before_spend",             # did the agent name the queue and account in prose — phrasing-sensitive
 })
 
 _GUIDANCE_URI = "hpcbridge://guidance/operations"

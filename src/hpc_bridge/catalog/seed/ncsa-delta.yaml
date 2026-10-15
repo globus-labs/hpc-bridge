@@ -16,6 +16,7 @@
   auth_method: ssh-key
   allocation: null
   account_required: true            # Slurm enforces accounting: --account <ncsa-project-code> is required
+  account_hint: "your NCSA project code for a GPU allocation (e.g. bgta-delta-gpu); `accounts`, run in your own SSH session on a Delta login node, lists yours"
   compute:
     scheduler: slurm
     interface: eth1                 # informational: the facility template pins its own address

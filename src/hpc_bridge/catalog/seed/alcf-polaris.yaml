@@ -19,6 +19,7 @@
   auth_method: ssh-key
   allocation: null
   account_required: true            # the template requires `account`: the ALCF project to charge
+  account_hint: "your ALCF project name, as listed in the ALCF portal (e.g. Diaspora)"
   compute:
     scheduler: pbs
     interface: hsn0                 # informational: the facility template pins its own address

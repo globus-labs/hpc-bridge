@@ -5,6 +5,35 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## Unreleased
 
+### Added
+- **The spend question names the block.** You were never told which queue a block would use, nor which project it
+  would charge. Now every spend answer, from `ensure_endpoint_up` and from `run_shell`, carries the block's terms in a
+  `block` field and at the head of its notice: the queue and the account, each with where it came from (the registry's
+  default, an `HPC_BRIDGE_PARTITION` / `HPC_BRIDGE_ACCOUNT` preset, the details of a cluster you brought, the login-node
+  probe's pick, this call, an earlier call), or that no account is needed or none is set; the nodes, the walltime, and
+  the most node-hours the block can bill. On a facility's own endpoint it adds that every command bills and the block
+  stays warm between commands until the facility's idle window ends it. The same words in both tools. A call that
+  confirms spend carries the same `block` in its answer, so a start made in one call still shows what it started.
+- **Each registry facility says where to find your account.** A registry entry can now carry an `account_hint`, and
+  the spend question and `connect_facility` pass it on: Polaris, your ALCF project name as the ALCF portal lists it
+  (e.g. `Diaspora`); Anvil, your ACCESS project id in lower case (e.g. `cis250223`); Expanse, `expanse-client user -r
+  expanse`, which the agent can run itself on the free login node; Delta, `accounts` in your own SSH session on a
+  Delta login node. `globus-labs` needs no account. A plugin before this one ignores the field; a malformed hint is
+  dropped, never the facility, and the curator's ingest refuses one.
+- **`connect_facility` states the defaults before any spend.** Its answer gives the terms the first block would start
+  on: the default queue and where it comes from, whether an account is needed (and where to find it), the nodes and
+  the walltime. Nothing is started or billed by it.
+
+### Changed
+- **The agent asks you first, once, and only for what you haven't said.** `connect_facility` no longer tells the agent
+  to confirm spend in its first `ensure_endpoint_up` call: it says to ask you for the account and whether the queue is
+  fine, unless you already said. The skill says the same: before the first block on a facility it asks once, naming
+  the queue, the account, the size and the walltime; if you named both, or said "defaults", it states the terms in one
+  line and starts. An `HPC_BRIDGE_ACCOUNT` preset counts as named, and it says it is the preset. An account it
+  remembers from an earlier session is only offered as the suggestion, never used without asking. After a block is
+  gone it asks a plain yes or no on the same terms. The skill and the tool descriptions no longer say that
+  `connect_facility` lists your allocations: no registry facility has a listing hpc-bridge can read.
+
 ### Fixed
 - **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
   Windows-on-Arm build since 46.0.3. On an Arm Python, the first start tried to build it from source, failed for
@@ -150,6 +179,15 @@ installed plugin only when that version changes); git tags mark releases.
 
   Their graders are tested hermetically in `agentic/harness/test_spend_terms_scenarios.py`; it and the existing
   `test_mep_scenarios.py` and `test_site_scenarios.py` are now in the CI list.
+- A new grader, `quote_before_spend`: before each billed start of a new block, the agent's words to you since the
+  last one name the queue and the account that start used (or say no account is charged), read from the start's
+  `block`. A poll that confirms the same block again is not a new start. It is reported on every run and gates only
+  where a scenario lists it in `EXPECT_OK`; in benchmark mode (`HPCB_BENCHMARK_MODE`) it stays report-only.
+- Two persona scenarios on the fake `mep` profile, for the Claude operator and, report-only, hermes-acp:
+  `terms_prestated` (you name the partition and account in the request: the agent states them back and starts without
+  a question, and the start charges exactly those) and `terms_wanted`, with a new persona `wants_terms` that approves
+  a spend question only when it names both the queue and the account, and otherwise asks "Which queue and which
+  project would this charge?".
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

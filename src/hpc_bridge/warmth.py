@@ -54,9 +54,11 @@ from .cost import (
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .models import ShellOutcome, Submission
 from .notices import (
+    _block_terms,
     _no_account_failure,
     _spend_floor_guidance,
     _submit_rejected,
+    _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
 )
@@ -77,28 +79,33 @@ def _shape_reject(app: AppCtx, shape: str) -> str | None:
         )
     return None
 
+def _seed_uec(app: AppCtx, shape: str) -> dict:
+    """The user_endpoint_config a NEW runtime of `shape` starts with: the facility's defaults (SlurmFacility) merged
+    with the shape's template vars, fitted to a facility MEP's schema, and — on the compute shape — the session's
+    partition/account choice. Builds nothing: connect_facility reads the next block's terms from it too."""
+    defaults: dict = {}
+    ct = getattr(app.facility, "config_template", None)
+    if ct is not None:
+        result = ct(app.profile)
+        if isinstance(result, tuple):  # SlurmFacility -> (template_str, defaults)
+            defaults = result[1]
+        # LocalFacility/FakeFacility return a plain dict (rendered engine) -> no UEP defaults
+    if not isinstance(defaults, dict):
+        defaults = {}
+    uec = {**defaults, **shape_config(shape)}
+    # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
+    uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
+    if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
+        uec.update(app.compute_choice)
+    return uec
+
 def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
-    """Resolve (and lazily build) the per-shape runtime, seeding its user_endpoint_config
-    from facility defaults (SlurmFacility) merged with the shape's template vars."""
+    """Resolve (and lazily build) the per-shape runtime, seeded by `_seed_uec`."""
     if shape not in SHAPES:
         raise ValueError(f"unknown shape {shape!r}")
     rt = app.shapes.get(shape)
     if rt is None:
-        defaults: dict = {}
-        ct = getattr(app.facility, "config_template", None)
-        if ct is not None:
-            result = ct(app.profile)
-            if isinstance(result, tuple):  # SlurmFacility -> (template_str, defaults)
-                defaults = result[1]
-            # LocalFacility/FakeFacility return a plain dict (rendered engine) -> no UEP defaults
-        if not isinstance(defaults, dict):
-            defaults = {}
-        uec = {**defaults, **shape_config(shape)}
-        # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
-        uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
-        if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
-            uec.update(app.compute_choice)
-        rt = ShapeRuntime(user_endpoint_config=uec)
+        rt = ShapeRuntime(user_endpoint_config=_seed_uec(app, shape))
         app.shapes[shape] = rt
     return rt
 
@@ -482,13 +489,14 @@ def _wrong_block_outcome(app: AppCtx, shape: str, runtime: ShapeRuntime | None, 
         rt.last_canary = dataclasses.replace(prev, worker_host=None, worker_job=refused.job, answered_at=seen)
         _saw_job(app, refused.job, seen)
     if not rt.spend_confirmed:  # this reap, or one a check or another command found first
+        terms = _block_terms(app, rt)
         return _with_spend(app, ShellOutcome(
-            phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
+            phase="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold", block=terms,
             notice=(f"Your {what} did NOT run: the previous block (job {old}) is gone — idle-released, cancelled, "
                     f"preempted or failed — and the {what} reached a new block ({new}) instead, which is already "
                     "running and billing the allocation. Confirm spend with the user before anything runs on it; "
                     f"{_kicked_release_note(app)}. The earlier confirmation covered job {old} only. "
-                    + _spend_floor_guidance(app))))
+                    + _terms_line(app, terms) + _spend_floor_guidance(app))))
     # a late result: spend was confirmed again after this command was sent — for whichever block is up now
     now_on = f" (now for job {rt.block_job})" if rt.block_job is not None else ""
     return _with_spend(app, ShellOutcome(
@@ -678,6 +686,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if partition is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("partition") == partition:
+        app.compute_choice["partition"] = partition  # named, though unchanged: the session's choice now (its source)
         return None
     live = _live_task_handles(app, shape)
     if live:
@@ -700,6 +709,7 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if account is None or not rt.user_endpoint_config.get("compute"):
         return None
     if rt.user_endpoint_config.get("account") == account:
+        app.compute_choice["account"] = account  # named, though unchanged: the session's choice now (its source)
         return None
     live = _live_task_handles(app, shape)
     if live:

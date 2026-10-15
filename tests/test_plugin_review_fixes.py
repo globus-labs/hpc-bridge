@@ -311,7 +311,7 @@ def test_spend_and_notice_follow_the_blocks_node_count():
     assert _block_nodes(rt, app) == 4
     rt.warm_since = time.monotonic() - 3600
     assert _session_spend(rt, app) == pytest.approx(estimate_spend(3600, 4, 1.0), rel=0.01)
-    assert "(4 node(s) × walltime 01:00:00)" in _needs_confirmation_notice(app, " on 'debug'", rt)
+    assert "4 nodes for up to 01:00:00 (at most 4 node-hours)" in _needs_confirmation_notice(app, rt)
 
 
 def test_a_block_without_a_node_count_bills_one():

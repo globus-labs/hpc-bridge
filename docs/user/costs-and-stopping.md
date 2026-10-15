@@ -4,8 +4,12 @@
 
 Connecting, listing facilities, and logging in are free. Discovery on an SSH-bootstrap facility runs
 on a free login-node worker. The first thing that costs allocation is a compute block, and the agent
-asks before starting one: which partition, which allocation account where one is needed, and your
-confirmation. A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way,
+asks before starting one, once, for what you have not said: which allocation account where one is needed (the
+connect says where to find yours), whether the partition is fine, and your confirmation. The question names the
+partition and the account, where each came from (the registry's default, your own choice, a preset), the number of
+nodes and the walltime. If you named the partition and the account yourself, or said "the defaults", the agent states
+them back in one line and starts. An account set with `HPC_BRIDGE_ACCOUNT` counts as named, and the agent says it is
+the preset; an account it remembers from an earlier session is only suggested, never used without asking. A batch job the agent submits for you (`sbatch`, `qsub`) costs allocation the same way,
 from wherever it is submitted, so it asks before that too. Changing the partition or account later means a new
 block, so it asks again, and the switch does not cancel the old block. On an SSH-bootstrap facility it idles out on
 its own, and a stop before you confirm the new block ends it at once. On a facility-run endpoint nothing can cancel

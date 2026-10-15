@@ -163,6 +163,10 @@ python3 agentic/run_suite.py --target fake --profile site --reset-cluster --scen
 python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,term_switch_reasks,preset_account_scoped
 #   ^ the facility-MEP path against the fake managers (a local catalog names their UUIDs — see below); the stop names
 #     the block it cannot cancel (#178)
+python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios terms_prestated,terms_wanted
+#   ^ the spend-terms personas: the user names the partition and account up front / approves only a question that
+#     names both. The Claude operator gates them; HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1 runs
+#     them free (gpt-oss) with the phrasing graders report-only
 python3 agentic/run_suite.py --target fake --profile totp --reset-cluster --scenarios otp_preauth
 #   ^ the one-time-code login (needs_preauth → complete_preauth); the human-sim holds the authenticator
 python3 agentic/run_suite.py --target fake --profile pbs --reset-cluster --scenarios happy_path,gated_provision

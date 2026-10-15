@@ -208,7 +208,7 @@ async def test_the_partition_preset_says_it_never_applies_to_a_facility_endpoint
     res, account, _app = await _connect_mep_capturing(monkeypatch)
     assert account == "hpcb-gpu"                                       # the account is the named machine's
     assert ("(HPC_BRIDGE_PARTITION never applies to a facility endpoint, whose entry sets the partition, so it was not "
-            "used here.)") in res.notice and "gpu'" not in res.notice
+            "used here.)") in res.notice and "'gpu'" not in res.notice   # (the account 'hpcb-gpu' is named: it is used)
 
 
 def test_details_win_over_the_partition_preset_of_the_machine_they_define(monkeypatch):

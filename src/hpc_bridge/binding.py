@@ -22,7 +22,7 @@ from .config import _env_endpoint_id, _require_env
 from .endpoint import EndpointCLI
 from .facility.base import Facility
 from .facility.local import LocalFacility
-from .models import FacilityDetails, validate_host
+from .models import DefaultSource, FacilityDetails, TermsOrigin, validate_host
 from .state import FacilityStore
 
 # The facility_key of an entry built from a user's own details (`_entry_from_details`): a bring-your-own facility.
@@ -30,6 +30,8 @@ SESSION_KEY = "session"
 # What HPC_BRIDGE_MACHINE resolved to at the startup pin (its value -> the entry's subject): the pin resolves aliases
 # too, and the presets must follow the machine it named, however it was named (`_names_machine`).
 _PINNED: dict[str, str] = {}
+# Where the startup pin's default terms came from (its value -> TermsOrigin), for lifespan to bind with the facility.
+_PINNED_ORIGIN: dict[str, TermsOrigin] = {}
 
 
 def _names_machine(entry) -> bool:
@@ -101,6 +103,25 @@ def _unsupported_entry_reason(entry) -> str | None:
         return f"scheduler {entry.compute.scheduler!r} not supported yet (slurm/pbs only)"
     return None
 
+def _partition_preset(entry) -> str | None:
+    """HPC_BRIDGE_PARTITION, when it is this entry's default partition: an SSH facility from the registry that
+    HPC_BRIDGE_MACHINE names. Never a facility endpoint (its defaults are the entry's) nor one you bring yourself
+    (its details= give the partition)."""
+    if entry.compute_mep_uuid or entry.facility_key == SESSION_KEY or not _names_machine(entry):
+        return None
+    return config.partition()
+
+def _terms_origin(entry, *, discovered: bool = False) -> TermsOrigin:
+    """Where the default terms of the facility built from `entry` come from (BlockTerms' sources): its partition from
+    the registry, the HPC_BRIDGE_PARTITION preset, or — a facility you bring yourself — its details (`discovered`: the
+    probe's proposal, kept); whether the registry says an account is needed (None for your own: nothing curated says);
+    and the entry's account hint."""
+    byo = entry.facility_key == SESSION_KEY
+    partition: DefaultSource = (("discovered" if discovered else "byo_details") if byo
+                                else "env" if _partition_preset(entry) else "registry")
+    return TermsOrigin(partition=partition, account_needed=None if byo else bool(entry.account_required),
+                       account_hint=getattr(entry, "account_hint", None))
+
 def _facility_from_entry(entry, *, account: str, pinned_host: str | None = None) -> Facility:
     """Build the facility for a catalog entry + per-user runtime values — shared by the startup
     path (make_facility) and the runtime path (connect_facility). `account` may be empty for the
@@ -130,12 +151,11 @@ def _facility_from_entry(entry, *, account: str, pinned_host: str | None = None)
     # Login name: optional env override, else read live from ~/.ssh/config (`ssh -G`) — never a
     # *required* boot-env var. The key is deferred to the config's IdentityFile in _slurm_facility.
     user = (config.ssh_user() or "") or _ssh_config_user(alias)
-    preset = _names_machine(entry) and entry.facility_key != SESSION_KEY
     profile = profile_from_catalog_entry(
         entry,
         user=user,
         account=account,
-        partition=config.partition() if preset else None,
+        partition=_partition_preset(entry),
         venv=config.remote_venv(),
     )
     return _slurm_facility(profile, alias=alias, user=user, auth_method=getattr(entry, "auth_method", "ssh-key"))
@@ -175,10 +195,12 @@ def _pinned_facility(machine: str, entry, **kw) -> Facility:
     — names no machine for the presets."""
     _PINNED[machine] = entry.subject
     try:
-        return _facility_from_entry(entry, **kw)
+        fac = _facility_from_entry(entry, **kw)
     except Exception:
         _PINNED.pop(machine, None)
         raise
+    _PINNED_ORIGIN[machine] = _terms_origin(entry)
+    return fac
 
 def _default_local_facility(*, unbound: bool = False) -> LocalFacility:
     """The facility the server holds when no machine is pinned (or the pin failed at boot) — make_facility's and

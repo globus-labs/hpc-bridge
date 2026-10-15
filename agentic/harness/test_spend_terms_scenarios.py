@@ -1,6 +1,7 @@
-"""Hermetic: the spend-terms scenarios (term_switch_reasks, preset_account_scoped, ssh_account_floor) — their graders on
-synthetic traces (a run the plugin gets right passes, one an unfixed plugin would produce fails, a broken premise is
-labelled as one), their REQUIRES against the profile manifests, and the local catalog ssh_account_floor writes."""
+"""Hermetic: the spend-terms scenarios (term_switch_reasks, preset_account_scoped, ssh_account_floor, and the persona
+pair terms_prestated / terms_wanted) — their graders on synthetic traces (a run the plugin gets right passes, one an
+unfixed plugin would produce fails, a broken premise is labelled as one), their REQUIRES against the profile manifests,
+the local catalog ssh_account_floor writes, and the universal `quote_before_spend` grader."""
 from __future__ import annotations
 
 import sys
@@ -247,3 +248,149 @@ def test_each_runs_where_it_can_and_gates_only_checks_it_provides(name, profile,
     provided = {r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
     assert set(sc.EXPECT_OK) <= provided, set(sc.EXPECT_OK) - provided
     assert sc.PERSONA is None and not getattr(sc, "MIDRUN_HOOKS", None)   # autonomous: the free operators drive it
+
+
+# --- quote_before_spend: the agent names the block's queue and account before it starts --------------------------------
+
+
+def _block(queue="debug", account="hpcb"):
+    return {"facility": "fake-mep-strict", "queue": queue, "queue_source": "this_call", "account": account,
+            "account_source": "this_call" if account else "none_needed", "account_required": bool(account),
+            "nodes": 1, "walltime": "00:30:00", "max_node_hours": 0.5, "compute_only": True}
+
+
+def _start(status="up", block=None, **inp):
+    """A confirming ensure_endpoint_up whose result carries the receipt `block` (BlockTerms)."""
+    inp = {"shape": "compute", "confirm_spend": True, **inp}
+    res = {"status": status, "notice": "worker live"}
+    if block is not None:
+        res["block"] = block
+    return ToolCall.of("mcp__endpoint__ensure_endpoint_up", inp, res)
+
+
+def _ask(question, *labels, answer="Yes"):
+    return ToolCall.of("AskUserQuestion", {"questions": [{"question": question,
+                                                          "options": [{"label": lb} for lb in labels]}]},
+                       {"text": f'Your questions have been answered: "{question}"="{answer}".'},
+                       answers={question: answer})
+
+
+def _quote(calls, texts, at=None):
+    from invariants import quote_before_spend
+    return quote_before_spend(Trace(calls, texts, at if at is not None else []))
+
+
+def test_quote_before_spend_reads_the_terms_from_the_starts_block():
+    calls = [_connect(), _start(block=_block()), _run("c1\n"), _stop()]
+    said = "Starting 1 node on partition `debug`, charged to hpcb, for up to 30 min."
+    assert _quote(calls, [said], [1]).ok
+    # the terms said only AFTER the start (its report) do not count
+    late = _quote(calls, ["Connected.", said], [1, 2])
+    assert not late.ok and "call 1 (queue 'debug', account 'hpcb' not named)" in late.detail
+    # one of the two is not enough
+    assert "account 'hpcb'" in _quote(calls, ["Starting on the `debug` partition."], [1]).detail
+    assert "queue 'debug'" in _quote(calls, ["Charging it to hpcb now."], [1]).detail
+
+
+def test_quote_before_spend_counts_the_question_the_user_saw():
+    calls = [_connect(), _ask("Start 1 node on `debug`, charged to hpcb?", "Yes", "No"), _start(block=_block()),
+             _stop()]
+    assert _quote(calls, ["Done."], [3]).ok
+
+
+def test_quote_before_spend_does_not_take_a_common_word_for_the_queue():
+    # "a compute node" is not naming the `compute` partition; "the compute partition" is
+    calls = [_connect(), _start(block=_block(queue="compute")), _stop()]
+    assert not _quote(calls, ["I'll start a compute node charged to hpcb."], [1]).ok
+    assert _quote(calls, ["I'll start a node on the compute partition, charged to hpcb."], [1]).ok
+    assert _quote(calls, ["Queue: **compute**; account hpcb."], [1]).ok
+
+
+def test_quote_before_spend_accepts_no_account_said_where_none_is_charged():
+    calls = [_connect(), _start(block=_block(queue="main", account=None)), _stop()]
+    assert _quote(calls, ["Starting a block on `main` — no account is needed here."], [1]).ok
+    assert not _quote(calls, ["Starting a block on `main`."], [1]).ok
+
+
+def test_quote_before_spend_grades_each_new_block_but_not_a_confirming_poll():
+    from invariants import quote_before_spend
+    b = _block()
+    poll = [_connect(), _start("provisioning", b), _start("provisioning", b), _start("up", b), _stop()]
+    t = Trace(poll, ["Starting on `debug`, charged to hpcb."], [1])
+    assert quote_before_spend(t).ok                     # the polls re-pass confirm_spend on the same block
+    # a re-ask (the block was reaped) makes the next start a new block: it must be quoted again
+    reask = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "x"},
+                        {"phase": "needs_confirmation", "notice": "Block terms: … the previous block …"})
+    again = [_connect(), _start("up", b), reask, _start("up", b), _stop()]
+    r = quote_before_spend(Trace(again, ["Starting on `debug`, charged to hpcb.", "It was reaped; starting again."],
+                                 [1, 3]))
+    assert not r.ok and "call 3" in r.detail
+    # ...and a switch to other terms is a new block too
+    switched = [_connect(), _start("up", b), _start("up", _block(queue="compute")), _stop()]
+    r = quote_before_spend(Trace(switched, ["Starting on `debug`, charged to hpcb.", "Switching."], [1, 2]))
+    assert not r.ok and "call 2 (queue 'compute', account 'hpcb' not named)" in r.detail   # said since the last start
+
+
+def test_quote_before_spend_does_not_grade_a_start_without_a_block():
+    r = _quote([_connect(), _start(), _stop()], ["Starting."], [1])
+    assert r.ok and r.detail.startswith("not graded: no start carried a `block`")
+    assert _quote([_connect(), _stop()], []).detail == "no billed start"
+
+
+def test_quote_before_spend_is_reported_everywhere_and_report_only_in_benchmark_mode():
+    from invariants import OPERATOR_PREFERENCE_GRADERS
+    assert "quote_before_spend" in {r.name for r in check_all(Trace([]))}
+    assert "quote_before_spend" in OPERATOR_PREFERENCE_GRADERS
+
+
+# --- terms_prestated / terms_wanted ----------------------------------------------------------------------------------
+
+
+def test_terms_prestated_passes_a_one_line_statement_and_fails_a_question():
+    import terms_prestated as sc
+    from invariants import quote_before_spend
+    good = Trace([_connect(), _start(block=_block()), _run("c1\n"), _stop()],
+                 ["Starting 1 node on partition `debug`, charged to hpcb (up to 30 min).", "hostname: c1. Stopped."],
+                 [1, 4])
+    for g in (sc.no_redundant_terms_question, sc.terms_used("debug", "hpcb"), quote_before_spend):
+        assert g(good).ok, (g.__name__, g(good).detail)
+    asked = Trace([_connect(), _ask("Start 1 node on `debug`, charged to hpcb?", "Yes", "No"), _start(block=_block()),
+                   _stop()], ["ok"], [3])
+    r = sc.no_redundant_terms_question(asked)
+    assert not r.ok and "AskUserQuestion at [1]" in r.detail
+    prose = Trace([_connect(), _start(block=_block()), _stop()], ["Shall I start the node on `debug` for hpcb?"], [1])
+    assert not sc.no_redundant_terms_question(prose).ok
+    # the start charged something else
+    wrong = Trace([_connect(), _start(block=_block(queue="compute")), _stop()], [], [])
+    assert not sc.terms_used("debug", "hpcb")(wrong).ok and sc.terms_used(None, "hpcb")(wrong).ok
+    assert not sc.no_redundant_terms_question(Trace([_connect(), _stop()])).ok   # premise: nothing started
+
+
+def test_terms_used_falls_back_to_what_the_call_passed():
+    import terms_prestated as sc
+    t = Trace([_connect(), _start(partition="debug", account="hpcb"), _stop()])
+    r = sc.terms_used("debug", "hpcb")(t)
+    assert r.ok and "its input" in r.detail
+
+
+@pytest.mark.parametrize("name", ["terms_prestated", "terms_wanted"])
+def test_the_persona_pair_runs_on_the_mep_profile_and_gates_only_checks_it_provides(name):
+    import importlib
+
+    from human_sim import PERSONAS
+    sc = importlib.import_module(name)
+    assert sc.TARGETS == ("fake",) and sc.SERIAL and sc.FACILITY_ID == "fake-mep-strict"
+    assert targets.meets(sc.REQUIRES, targets.load_profile("mep")["capabilities"])[0]
+    for other in ("site", "default"):
+        assert not targets.meets(sc.REQUIRES, targets.load_profile(other)["capabilities"])[0], (name, other)
+    provided = {r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
+    assert set(sc.EXPECT_OK) <= provided, set(sc.EXPECT_OK) - provided
+    assert "quote_before_spend" in sc.EXPECT_OK and sc.PERSONA in PERSONAS
+    assert ("spend_follows_question" in sc.EXPECT_OK) is (name == "terms_wanted")   # the pre-stated user is not asked
+
+
+def test_the_wants_terms_persona_withholds_approval_until_both_terms_are_named():
+    from human_sim import PERSONAS
+    text = PERSONAS["wants_terms"]
+    assert "Which queue and which project would this charge?" in text
+    assert "BOTH the queue" in text and "account" in text and "no account" in text

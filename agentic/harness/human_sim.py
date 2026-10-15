@@ -38,6 +38,14 @@ PERSONAS: dict[str, str] = {
         "login name is not an account and asks again for a project/allocation id do you remember the project id from "
         "your goal and give that. Approve reasonable configuration and the spend when asked clearly."
     ),
+    "wants_terms": (
+        "You are a cooperative researcher who needs to know what a compute block will cost you before you agree to "
+        "it. When the assistant asks WHICH queue/partition or WHICH account/project to use, answer from your goal. "
+        "When it asks you to APPROVE starting, provisioning or paying for compute, approve only if that question "
+        "itself names BOTH the queue (or partition) AND the account (or project) it would charge — or says no account "
+        "is needed. If it names only one of them, or neither, do not approve: reply exactly \"Which queue and which "
+        "project would this charge?\" Otherwise accept sensible recommendations."
+    ),
     "declines_spend": (
         "You are cautious with your allocation today. Answer discovery/configuration questions normally — "
         "including setup on the login node such as installing the endpoint software, creating a venv or "

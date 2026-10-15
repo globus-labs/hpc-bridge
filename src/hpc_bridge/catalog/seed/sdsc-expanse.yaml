@@ -15,6 +15,7 @@
   auth_method: mfa-otp
   allocation: null                  # `expanse-client user` lists balances; no parser yet — pass account= (your project id, e.g. chi152)
   account_required: true
+  account_hint: "your Expanse project id (e.g. chi152): `expanse-client user -r expanse` on the login shape lists yours"
   compute:
     scheduler: slurm
     interface: ib0

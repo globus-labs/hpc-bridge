@@ -21,13 +21,15 @@ import os
 from . import binding, config, login_gate, warmth
 from .catalog.entry import CatalogEntry
 from .catalog.parsers import PARSERS
-from .context import DEFAULT_SHAPE, AppCtx, LeftBlock, _facility_shapes, _has_login_shape
+from .context import DEFAULT_SHAPE, AppCtx, LeftBlock, ShapeRuntime, _facility_shapes, _has_login_shape
 from .discovery import discover_facility_details
 from .dispatch import for_agent
 from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
 from .lifecycle import EndpointState, ensure_warm
-from .models import ConnectFacilityResult, FacilityDetails, validate_host
+from .models import BlockTerms, ConnectFacilityResult, FacilityDetails, validate_host
 from .notices import (
+    _block_terms,
+    _connect_terms_note,
     _explain_provision_error,
     _first_contact_note,
     _left_block_clause,
@@ -131,6 +133,23 @@ def _drop_dead_pin(fac) -> bool:
     except Exception:  # noqa: BLE001 - best-effort hygiene; the structured failure is what matters
         return False
     return True
+
+def _discovered_partition(app: AppCtx, facility: str, entry: CatalogEntry) -> bool:
+    """A facility you bring yourself whose partition is the one the login-node probe proposed for it this session
+    (kept by the details= the user confirmed): its default partition was discovered, not named."""
+    draft = app.proposed_drafts.get(facility)
+    return (entry.facility_key == binding.SESSION_KEY and draft is not None and draft.ssh_host == entry.ssh_host
+            and draft.partition == entry.defaults.partition)
+
+def _next_block_terms(app: AppCtx) -> BlockTerms | None:
+    """The terms the bound facility's next billed block would start on — read from the config a new compute runtime
+    would get (`warmth._seed_uec`); nothing is built or started. None if it cannot be read (the connect goes on)."""
+    if DEFAULT_SHAPE not in _facility_shapes(app.facility):
+        return None
+    try:
+        return _block_terms(app, ShapeRuntime(user_endpoint_config=warmth._seed_uec(app, DEFAULT_SHAPE)))
+    except Exception:  # noqa: BLE001 - a preview must never fail the connect it describes
+        return None
 
 async def _connect_facility(
     app: AppCtx, facility: str, ssh_host: str | None = None, details: FacilityDetails | None = None,
@@ -285,6 +304,8 @@ async def _connect_facility(
             app.worker_user = None
         app.facility = fac
         app.machine = facility
+        # where this binding's default partition and account come from, for every block's terms (BlockTerms)
+        app.terms_origin = binding._terms_origin(entry, discovered=_discovered_partition(app, facility, entry))
         # The session-shell root follows the bound facility — else run_shell would use the local
         # ~/.hpc-bridge path on the remote node (same resolution as lifespan's).
         app.scratch_root = binding._resolve_scratch_root(fac)
@@ -334,12 +355,15 @@ async def _connect_facility(
     reused = app.state.reused and facility not in app.bootstrapped_facilities
     if prior_spend > 0 or left is not None:  # say what it cost, and name a block left billing, rather than lose them
         reuse_note = _prior_note(prior_spend, left, sched, same=False, old_mep=old_mep) + reuse_note
+    terms = _next_block_terms(app)
     if block != "warm":  # login node still coming up — nothing to read yet
         return ConnectFacilityResult(
             phase="provisioning",
             facility=facility,
             reused=reused,
-            notice=reuse_note + "bringing up the login node; call connect_facility again shortly to read your allocations",  # noqa: E501
+            block=terms,
+            notice=reuse_note + "bringing up the login node; call connect_facility again shortly"
+            + (" to read your allocations" if entry.allocation is not None else "") + ".",
         )
     if entry.allocation is None:  # no auto-listable allocations -> the human supplies the account
         return ConnectFacilityResult(
@@ -347,8 +371,9 @@ async def _connect_facility(
             facility=facility,
             reused=reused,
             allocations=[],
-            notice=reuse_note + "login node is up; this facility has no allocation listing — charge a block by "
-            "passing the account directly: ensure_endpoint_up(account=…, partition=…, confirm_spend=True).",
+            block=terms,
+            notice=reuse_note + "login node is up; this facility has no allocation listing, so an account comes from "
+            "the user. " + (_connect_terms_note(app, terms) if terms is not None else ""),
         )
     out = await run_login(entry.allocation.command)
     if out.phase != "complete" or out.exit_code != 0:
@@ -364,7 +389,9 @@ async def _connect_facility(
         facility=facility,
         reused=reused,
         allocations=allocations,
-        notice=reuse_note + "pick an allocation, then ensure_endpoint_up(account=…, partition=…, confirm_spend=True)",
+        block=terms,
+        notice=reuse_note + "login node is up; your allocations are listed (`allocations`). "
+        + (_connect_terms_note(app, terms, listed=bool(allocations)) if terms is not None else ""),
     )
 
 def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, same: bool, old_mep: bool) -> str:
@@ -415,17 +442,16 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
     notes = list(getattr(fac, "template_notes", []) or [])
     if notes:
         tmpl += "; ".join(notes) + ". "
-    if getattr(fac, "account_required", True):
-        how = ("pass the account directly: ensure_endpoint_up(account=…, partition=…, "
-               "confirm_spend=True) — no allocation listing exists on a multi-user endpoint.")
-    else:
-        how = ("NO allocation account is needed at this facility — do not look for one. Confirm spend and go: "
-               "ensure_endpoint_up(partition=…, confirm_spend=True).")
+    terms = _next_block_terms(app)  # after the notes are read: fitting the config may add one, said at the first block
+    how = "" if getattr(fac, "account_required", True) else (
+        "NO allocation account is needed at this facility — do not look for one. ")
+    how += _connect_terms_note(app, terms) if terms is not None else ""
     return ConnectFacilityResult(
         phase="needs_account",
         facility=facility,
         reused=True,  # attached to the facility's always-on endpoint: zero SSH, nothing bootstrapped
         allocations=[],
+        block=terms,
         notice=tmpl + (
             "attached to the facility's multi-user endpoint (zero SSH, nothing to bootstrap). Attaching "
             "does NOT test your identity mapping — the first block start does (no account there ⇒ a "

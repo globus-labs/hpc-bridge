@@ -272,6 +272,13 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 > graded, for the later spend-terms change: the `block.queue` / `queue_source` / `account_source` fields and
 > `old_block_released` (nothing cancels the old block on a switch yet; the notice says so).
 
+> [!note] Since built (2026-10-14, branch `feat/spend-terms`; not yet run live)
+> A (the `block` terms on every spend answer and the receipt), C (connect states the defaults) and D (the skill's
+> ask-once rule) are built. Item 9 exists: `terms_prestated` and `terms_wanted` on fake `mep` (persona `wants_terms`),
+> and the universal grader `quote_before_spend` (report-only unless a scenario's EXPECT_OK names it; report-only in
+> benchmark mode). Of the persona-pack graders, `quote_before_spend` and `terms_used` were built as listed;
+> `no_redundant_terms_question` also counts a prose question (an ACP operator asks in prose).
+
 **The endpoint-install fix (branch `fix/env-setup-verify-install`, unmerged): no scenarios.**
 - A broken venv repaired in place: none. The vault planted a break by hand (`mv`, never an append, because of the uv hardlinks). The pool users on globus1 are the live instance.
 - The architecture mismatch named ("built on x86_64 … does not run on spark1 (aarch64)"): none. The fake cluster has one architecture.

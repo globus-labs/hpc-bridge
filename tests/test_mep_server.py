@@ -71,7 +71,11 @@ async def test_connect_account_required_mep_says_pass_account(monkeypatch):
     app = _app(fac)
     res = await _connect(app, monkeypatch)
     assert res.phase == "needs_account"
-    assert "ensure_endpoint_up(account=" in res.notice
+    # the account comes from the user, asked first — never a confirm in the first call (spend terms, C)
+    assert "ask the user which account to charge" in res.notice and "confirm_spend=True" not in res.notice
+    assert res.block is not None and res.block.account_required and res.block.account is None
+    # the facility requires one, so the terms never say "no account needed" (whatever the entry it came from said)
+    assert res.block.account_source == "none_set" and "no account needed" not in res.notice
 
 
 async def test_connect_offline_mep_is_failed_not_call_again(monkeypatch):
