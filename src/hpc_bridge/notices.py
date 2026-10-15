@@ -191,8 +191,9 @@ def _dropped_term_notice(app: AppCtx, key: str, value: str) -> str | None:
     word = "account" if key == "account" else _queue_word(app)
     wire = (getattr(app.facility, "key_map", None) or {}).get(key, key)
     return (f"this facility's endpoint takes no {word}: its published template has no `{wire}` setting, so "
-            f"{value!r} would be dropped on the way and the facility's own default used. Nothing was set or started; "
-            f"leave {key}= out.")
+            f"{value!r} would be dropped on the way and the facility's own default used. Nothing in this call was set "
+            f"or started: leave {key}= out and send the rest of it again (the account, confirm_spend, as it was), "
+            f"telling the user the block runs on the facility's own default {word}.")
 
 def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) -> BlockTerms:
     """The block `rt` would start, or did (BlockTerms): its queue and account and where each came from, its size and
@@ -322,8 +323,11 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
     said = (f"The {' and the '.join(presets)} preset{'s count' if many else ' counts'} as the user's own answer. "
             if presets else "")
     call = f"ensure_endpoint_up({', '.join([*args, 'confirm_spend=True'])})"
-    if not asks:
+    if not asks and presets:  # only a preset — the user's own answer, set ahead — removes the question
         ask = f"State these terms to the user in one line and start: {call}."
+    elif not asks:  # nothing to choose here (the facility decides its queue, no account needed): still the user's yes
+        ask = (f"Before the first block, ask the user one yes-or-no question — start on these terms? — unless they "
+               f"already said; their yes is the spend confirmation: {call}.")
     else:
         ask = (f"Before the first block, ask the user in one question {', and '.join(asks)} (naming these terms), "
                f"unless they already said; their yes is the spend confirmation: send it with their answer in one "

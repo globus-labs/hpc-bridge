@@ -37,7 +37,7 @@ async def test_a_refused_partition_on_a_warm_block_answers_up_with_its_spend(mon
         # the block is still up and billing: never a `down`, a cold block or a zero spend
         assert (sw.status, sw.block_state, sw.account) == ("up", "warm", "nesi99999")
         assert sw.session_spend > 0                         # the warm block's spend so far (charge factor 1)
-        assert "takes no partition" in sw.notice and "The current terms stand. Block terms:" in sw.notice
+        assert "takes no partition" in sw.notice and "The current terms: the facility's default partition" in sw.notice
         assert _snap(app) == before                         # nothing set, nothing sent
     assert (await _ensure_endpoint_up(app, shape="compute")).status == "up"
 
@@ -182,3 +182,33 @@ def test_ingest_refuses_hint_markup(tmp_path, raw):
     with pytest.raises(ValueError, match="account_hint has a quote, a backtick or an angle bracket"):
         ingest("idx", seed, _Client())
 
+
+
+# --- round 4 ------------------------------------------------------------------------------------------------------------
+
+
+async def test_with_nothing_to_choose_the_user_still_says_yes(monkeypatch):
+    # a template that takes neither a partition nor an account, and no account needed: only a preset removes the
+    # question, so here the agent still asks a plain yes or no on the terms
+    schema = {"additionalProperties": False, "properties": {"walltime": {}, "nodes_per_block": {}}}
+    entry = fake_mep_entry(id="bare", account_required=False)
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([entry]))
+    monkeypatch.setattr(binding, "_facility_from_entry",
+                        lambda e, *, account: MEPFacility.from_entry(e, account=account or None,
+                                                                     client_factory=lambda: _Meta(schema)))
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    _runners(app)
+    from hpc_bridge import server
+    res = await server._connect_facility(app, entry.id)
+    assert "State these terms to the user in one line and start" not in res.notice
+    assert ("ask the user one yes-or-no question — start on these terms? — unless they already said; their yes is the "
+            "spend confirmation: ensure_endpoint_up(confirm_spend=True).") in res.notice
+
+
+async def test_a_refusal_says_to_send_the_rest_again_not_to_ask_for_the_account(monkeypatch):
+    app, _ = await _nesi(monkeypatch)
+    res = await _ensure_endpoint_up(app, shape="compute", partition="gpu", account="nesi99999", confirm_spend=True)
+    assert res.status == "needs_confirmation"
+    assert "leave partition= out and send the rest of it again (the account, confirm_spend, as it was)" in res.notice
+    assert "runs on the facility's own default partition" in res.notice
+    assert "which account to charge" not in res.notice     # the call carried it; nothing was set, so re-send it

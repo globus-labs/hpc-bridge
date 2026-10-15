@@ -599,3 +599,28 @@ def test_a_listing_of_partitions_is_not_naming_the_queue():
     assert not r.ok and "queue 'debug' not named" in r.detail
     one = "| Partition | Account |\n|---|---|\n| debug | hpcb |"            # the terms of one block still count
     assert _quote(calls, [one], [1]).ok
+
+
+# --- round 4: an identity or setup question is not the spend question -------------------------------------------------
+
+
+@pytest.mark.parametrize("question", [
+    "Which account do you log in with on the cluster (your username)?", "What's the account name?",
+    "Which project directory should the results go to?", "Which Globus account did you sign in with?",
+    "What account should I SSH as?", "Which project is this for, so I can name the output folder?",
+    "Which project should I use?", "Which account is yours, for later?", "What project are you on?",
+])
+def test_a_which_account_question_without_terms_is_not_a_spend_question(question):
+    from invariants import _is_spend_question
+    assert not _is_spend_question(question)
+
+
+@pytest.mark.parametrize("later", ["Which project should I use?", "Which account is yours, for later?",
+                                   "What project are you on?"])
+def test_a_which_project_answer_never_supersedes_a_spend_decline(later):
+    from invariants import no_spend_after_decline
+    decline = _ask_opts("Start 1 node on `debug` (up to 30 min), charged to your allocation?", ["Yes", "No"],
+                        "No — I'd rather not spend allocation today.")
+    t = Trace([_connect(), decline, _ask_opts(later, ["hpcb", "hpcb-gpu"], "hpcb"),
+               _start("provisioning", block=_block(), account="hpcb")], [], [])
+    assert not no_spend_after_decline(t).ok

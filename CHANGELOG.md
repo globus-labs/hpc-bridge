@@ -17,8 +17,8 @@ installed plugin only when that version changes); git tags mark releases.
   what it started. The terms are only what the facility receives: where a facility's endpoint has no setting for the
   partition or the node count (its published template drops them), they read as the facility's own default, and a
   partition or account it would drop is refused with a notice instead of being set — the answer then reports the
-  block as it stands (up and billing, or the spend question on its current terms), never a `down` — and the connect
-  neither asks about nor offers it. A facility named by `HPC_BRIDGE_MACHINE` reads its template before that check, so
+  block as it stands (up and billing, or the spend question on its current terms), never a `down`, and says to send
+  the rest of the call again without it — and the connect neither asks about nor offers it. A facility named by `HPC_BRIDGE_MACHINE` reads its template before that check, so
   its first call refuses too. On a PBS facility every one of these texts says "queue".
 - **Each registry facility says where to find your account.** A registry entry can now carry an `account_hint`, and
   the spend question and `connect_facility` pass it on, as the registry's own words: Polaris, your ALCF project name
@@ -38,7 +38,8 @@ installed plugin only when that version changes); git tags mark releases.
   no longer tells the agent to confirm spend unasked: it says to ask you, in one question, for the account and whether
   the queue is fine, unless you already said, and to send your answer and your yes in one `ensure_endpoint_up` call.
   A preset (`HPC_BRIDGE_ACCOUNT`, `HPC_BRIDGE_PARTITION`) counts as said: with both, the agent states the terms in one
-  line and starts. Where an account is needed and none is set, the spend question asks for it in the same breath. The
+  line and starts. Only a preset removes the question: where there is nothing to choose (the facility decides its
+  queue and needs no account), the agent still asks a plain yes or no on the terms. Where an account is needed and none is set, the spend question asks for it in the same breath. The
   skill says the same, with example questions; an account the agent remembers from an earlier session is only offered
   as the suggestion, never used without asking; after a block is gone it asks a plain yes or no, naming the terms
   again. The skill and the tool descriptions no longer say that `connect_facility` lists your allocations: no registry
@@ -212,8 +213,9 @@ installed plugin only when that version changes); git tags mark releases.
   queue, approves a spend question only when it names both the queue and the account, and otherwise asks "Which queue
   and which project would this charge?" (a question back, not a refusal). Its grader `approved_with_terms` checks
   that the start followed a yes to a question naming both — counting the one question the plugin teaches ("Which
-  project should it charge? I'd use `compute` …", answered with the project id), which is now a spend question even
-  with no spend word in it. The persona takes its own project id given to such a question as its yes. A markdown
+  project should it charge? I'd use `compute` …", answered with the project id), which is now a spend question when it
+  carries a cue about the block (a queue, starting, a charge, a node or block, a backticked name); "What account should
+  I SSH as?" stays an identity question, so a later answer to one never supersedes a spend decline. The persona takes its own project id given to such a question as its yes. A markdown
   table counts as naming the queue only when it names that one queue (a listing of every partition does not). The
   fake `mep` profile's catalog no longer gives the account away in its description (takes effect after a cluster
   reset).

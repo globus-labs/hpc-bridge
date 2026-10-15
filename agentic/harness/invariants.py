@@ -920,16 +920,19 @@ _NO_COST = re.compile(
 # A question asking WHICH project/account to charge (spend terms, 2026-10-14): the one question the skill teaches
 # ("Which project should Polaris charge? I'd use `debug` …"), whose answer is the spend confirmation.
 _WHICH_ACCOUNT_Q = re.compile(r"\b(?:which|what)\b[^?]{0,40}?\b(?:project|account|allocation)s?\b", re.I)
+# ...only with a cue that it is about the block's terms (a queue, starting or running, a charge, a node or block, a
+# backticked name): "What account should I SSH as?" or "Which project directory should the results go to?" is not one.
+_TERMS_CUE = re.compile(r"\b(?:partition|queue|start|run|ok(?:ay)?|charged?|nodes?|blocks?)\b|`", re.I)
 
 
 def _is_spend_question(q: str) -> bool:
     """Main's rule — spend vocabulary, not vetoed by setup wording — plus (2026-10-10) a properly asked batch-job
     question: it asks to submit/run a job AND names a positive cost, which overrides the setup veto ("Submit a 2-hour
     batch job (~2 SU) writing to your scratch dir?"), and (2026-10-14) a question asking which project or account to
-    charge ("Which project, and is `compute` OK?"), under the same setup veto. Every question main called a spend
+    charge with a cue about the block's terms ("Which project, and is `compute` OK?"), under the same setup veto. Every question main called a spend
     question still is one."""
     costed_job = bool(_JOB_ASK.search(q) and _COST_CUE.search(q) and not _NO_COST.search(q))
-    spendy = bool(_SPENDY_Q.search(q) or _WHICH_ACCOUNT_Q.search(q))
+    spendy = bool(_SPENDY_Q.search(q) or (_WHICH_ACCOUNT_Q.search(q) and _TERMS_CUE.search(q)))
     return costed_job or (spendy and not _SETUP_Q.search(q))
 
 

@@ -363,7 +363,7 @@ async def _ensure_endpoint_up(
         if inspect.iscoroutinefunction(load):
             await load()
         dropped = next((n for k, v in (("partition", partition), ("account", account))
-                        if v is not None and (n := _dropped_term_notice(app, k, v))), None)
+                        if v is not None and (n := _dropped_term_notice(app, k, v))), None)  # all or nothing
         if dropped:
             async with app.lock:
                 return _dropped_term_status(app, shape, dropped)
@@ -541,9 +541,10 @@ def _dropped_term_status(app: AppCtx, shape: str, dropped: str) -> EndpointStatu
     rt = _shape_runtime(app, shape)
     terms = _block_terms(app, rt) if _billable(rt) else None
     uec = rt.user_endpoint_config
+    # the refusal says what to send again; the current terms follow — never "ask which account": the call carried it
+    stood = f" {_terms_line(app, terms, lead='The current terms')}" if terms is not None else ""
     if rt.spend_confirmed or terms is None:
         warm = rt.block_since is not None or rt.warm_confirmed_at is not None
-        stood = f" The current terms stand. {_terms_line(app, terms)}" if terms is not None else ""
         return EndpointStatus(status="up" if warm else "provisioning", block_state="warm" if warm else "provisioning",
                               endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
                               partition=uec.get("partition"), account=uec.get("account"),
@@ -551,7 +552,7 @@ def _dropped_term_status(app: AppCtx, shape: str, dropped: str) -> EndpointStatu
     return EndpointStatus(status="needs_confirmation", block_state="provisioning" if rt.reap_kicked else "cold",
                           endpoint_id=app.state.endpoint_id, session_spend=_total_session_spend(app),
                           partition=uec.get("partition"), account=uec.get("account"), block=terms,
-                          notice=f"{dropped} {_needs_confirmation_notice(app, rt, terms)}")
+                          notice=(dropped + stood).strip())
 
 
 _T = TypeVar("_T")
