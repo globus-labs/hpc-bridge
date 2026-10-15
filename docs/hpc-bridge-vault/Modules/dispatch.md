@@ -12,6 +12,7 @@
 | `TimeoutError` | 124 | "timed out — run ensure_endpoint_up and retry, or move to a batch job (billed like a block, so only with the user's spend confirmation)" |
 | result over Compute's 10 MiB limit | `None` | "the command RAN, but its result (N bytes serialized; the limit is L) was over the limit — no output, no exit code; write it to a file and read ranges; check for its side effects before running it again" |
 | `TaskExecutionFailed` (other) | 1 | "the remote task failed to execute" |
+| the stored Globus login refused ([[login]] `login_expired`) | 1 | "Dispatch error: AuthAPIError: the stored Globus login no longer works (expired or revoked) … authenticate(force=True)" |
 | other | 1 | "Dispatch error: \<type\>" |
 
 **`for_agent(res)`** (`:139`) is what `run_shell`, `poll_task`, `reset_session` and `login_shell` return ([[server]] applies it in the tool wrappers; [[connect]] uses it for a failed allocation command's stderr): each stream of **command output** cut to its marked end by [[cost]] `cut_streams`, with the cut's notice appended to any notice already there. Command output comes only in a `complete` outcome — the SDK's snippet, so `SNIPPET_LINES` ([[runner]]) is passed and text that long is counted "at least" — or a `login_shell` result (SSH output, counted exactly). Any other outcome is returned as is: a failure's text is an exception's, already bounded by `failure_outcome`, and the redirect-to-a-file remedy would be wrong for it.
@@ -23,7 +24,7 @@
 > The endpoint fails a task whose serialized result is over 10 MiB and sends `repr(MaxResultSizeExceeded(size, limit))`; the SDK hands that to the client wrapped in a **`TaskExecutionFailed`** — it never raises `MaxResultSizeExceeded` itself, so matching that class alone never fired and the agent saw "The remote task failed to execute." with a made-up exit code 1. `_result_over_limit` (`:59`) matches the name inside the text, or the error's own message ("Task result of NB exceeded current limit of NB"), and the outcome says the command ran, that its output and exit code are lost, how to re-run it into a file, and to check for its side effects first. It is marked `_worker_answered`, so [[warmth]] `_note_dispatch` refreshes the block's liveness instead of voiding it (the worker ran the command).
 
 > [!note] Pure layer
-> SDK exceptions are matched by **class name** (and the oversize one by its text), not by importing `globus_compute_sdk` — keeping this translation layer free of the heavy integration dependency.
+> SDK exceptions are matched by **class name** (and the oversize one by its text), not by importing `globus_compute_sdk` (the dead-login check is [[login]]'s, which imports the lighter `globus_sdk` only when a failure is classified) — keeping this translation layer free of the heavy integration dependency.
 
 ## See also
 [[models]] · [[runner]] · [[server]] · [[cost]] · [[warmth]]

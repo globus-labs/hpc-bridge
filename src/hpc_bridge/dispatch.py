@@ -5,6 +5,7 @@ from typing import Protocol, TypeVar
 
 from .cost import cut_streams
 from .lifecycle import BlockState
+from .login import LOGIN_EXPIRED, login_expired
 from .models import LoginShellResult, ShellOutcome
 from .runner import MAX_OUTPUT_CHARS, SNIPPET_LINES
 
@@ -125,12 +126,15 @@ def failure_outcome(exc: Exception, block_state: BlockState) -> ShellOutcome:
             stderr_snippet=_error_text(exc),
             notice="The remote task failed to execute.",
         )
+    login = (f": {LOGIN_EXPIRED} — Globus refused to refresh it. Nothing is wrong with the facility or its config: "
+             "the user must log in to Globus again — call authenticate(force=True) and give the user its link — then "
+             "run it again") if login_expired(exc) else ""
     return ShellOutcome(
         phase="failed",
         block_state=block_state,
         exit_code=1,
         stderr_snippet=_error_text(exc),
-        notice=f"Dispatch error: {name}",
+        notice=f"Dispatch error: {name}{login}",
     )
 
 

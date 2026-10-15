@@ -90,6 +90,12 @@ process on the login node yourself, and the next connect builds a fresh environm
 **"reports OFFLINE"** on a facility-run endpoint. The facility's endpoint is down. Only the facility
 can restart it.
 
+**"the stored Globus login no longer works (expired or revoked)"**. Globus refused to renew the login stored on
+this machine: it was revoked (for instance at app.globus.org) or it has expired. Every command and every block start
+fails until you log in again, and a connect to a facility-run endpoint may add that the facility template was not
+readable. Nothing is wrong with the facility, its configuration or the partition. Ask the agent to force a fresh
+Globus login (`authenticate(force=True)`), complete it in the browser, then carry on.
+
 **A pilot "already FINISHED" whose job said "hpc-bridge: endpoint venv <path> (built on <arch>) does not run on
 <node> (<arch>)"**. The compute node cannot use the environment hpc-bridge built on the login node, and the job
 stopped there rather than fail later; a new block fails the same way. If the two architectures differ (built on

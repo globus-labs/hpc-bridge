@@ -220,6 +220,9 @@ class _StubFlow:
     def complete_with_code(self, code):
         self.required = False
 
+    def check_stored_login(self, force_refresh=False):  # a stored login here always works (tests/test_login_expired.py covers the rest)
+        return "works", None
+
 
 async def test_connect_gates_on_login_before_any_ssh(monkeypatch):
     from hpc_bridge import server

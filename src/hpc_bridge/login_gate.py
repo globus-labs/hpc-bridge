@@ -10,10 +10,11 @@ kept free of any import of the server or the runtime; this module is the seam be
 from __future__ import annotations
 
 import asyncio
+from typing import Literal
 
 from . import config
 from .context import AppCtx
-from .login import LoginFlow, LoginMode, LoginStart, globus_identity_label
+from .login import LOGIN_EXPIRED, LoginFlow, LoginMode, LoginStart, globus_identity_label
 from .models import LoginStatus
 from .notices import _login_notice
 from .warmth import _forget_identity_verdicts
@@ -32,20 +33,45 @@ async def _start_login_and_wait(flow: LoginFlow, mode: LoginMode | None = None) 
         status = "waiting"
     return start, status
 
+# Why a login is needed when the stored one no longer works; and what a login that replaced it says.
+EXPIRED_WHY = f"{LOGIN_EXPIRED}: Globus refused to refresh it"
+REPLACED = f" ({LOGIN_EXPIRED}; this one replaces it)"
+
+
+async def _stored_login(flow: LoginFlow) -> tuple[Literal["missing", "works", "expired", "unchecked"], str | None]:
+    """Where the stored login stands: 'missing' (none, or one short of a scope: `login_required`), else whether it
+    still WORKS (`check_stored_login`). Holding every scope is not working: a revoked or expired refresh token passes
+    login_required() and fails every dispatch (live 2026-10-14), so the stored login is used once, as a dispatch would
+    use it. The gate of authenticate() and of connect_facility."""
+    if await asyncio.to_thread(flow.login_required):
+        return "missing", None
+    return await asyncio.to_thread(flow.check_stored_login)
+
+
 async def _authenticate(app: AppCtx, force: bool = False, mode: LoginMode | None = None) -> LoginStatus:
     flow = app.login_flow
     if flow is None:
         flow = app.login_flow = LoginFlow()
-    if not force and not await asyncio.to_thread(flow.login_required):
-        return LoginStatus(phase="logged_in", notice="Globus login present with every scope hpc-bridge needs.")
+    why = None
+    if not force:
+        verdict, detail = await _stored_login(flow)
+        if verdict == "works":
+            return LoginStatus(phase="logged_in", notice="Globus login present with every scope hpc-bridge needs.")
+        if verdict == "unchecked":  # no answer either way: never call a login dead for a network error
+            return LoginStatus(phase="logged_in", notice=(
+                "Globus login present with every scope hpc-bridge needs; whether it still works could not be checked "
+                f"just now ({detail}). If dispatches then fail with a Globus login error, call "
+                "authenticate(force=True)."))
+        why = EXPIRED_WHY if verdict == "expired" else None
     start, status = await _start_login_and_wait(flow, mode)
     if status == "done":
         _forget_identity_verdicts(app)
-        return LoginStatus(phase="logged_in",
-                           notice="Globus login completed in the browser" + await _as_identity() + "; carry on.")
+        replaced = REPLACED if why else ""
+        return LoginStatus(phase="logged_in", notice=(
+            "Globus login completed in the browser" + await _as_identity() + replaced + "; carry on."))
     return LoginStatus(phase="needs_login", login_url=start.login_url, login_mode=start.mode,
                        notice=_login_notice(start, flow.error,
-                                            waited_s=config.login_wait_s() if status == "waiting" else None))
+                                            waited_s=config.login_wait_s() if status == "waiting" else None, why=why))
 
 async def _complete_login(app: AppCtx, code: str) -> LoginStatus:
     flow = app.login_flow

@@ -16,6 +16,7 @@ re-exports every name for imports.
 """
 from __future__ import annotations
 
+import asyncio
 import dataclasses
 import inspect
 import re
@@ -52,6 +53,7 @@ from .cost import (
     estimate_spend,
 )
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
+from .login import LoginExpiredError
 from .models import ShellOutcome, Submission
 from .notices import (
     _block_terms,
@@ -614,6 +616,13 @@ async def _provision(
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
+            # A bootstrap may copy the stored login to the login node: never one Globus refuses to renew (a startup
+            # pin or a call after a teardown reaches here without connect's gate). Forced, so a refresh token revoked
+            # while its access token is still valid is caught too; a check that cannot reach Globus carries on.
+            if app.login_flow is not None:
+                verdict, why = await asyncio.to_thread(app.login_flow.check_stored_login, force_refresh=True)
+                if verdict == "expired":
+                    raise LoginExpiredError(why)  # no SSH: the caller reports it (notices._hpc_bridge_error)
             handle = await bootstrap(app.profile)
             app.state = EndpointState(endpoint_id=handle.endpoint_id, reused=handle.reused)
     try:

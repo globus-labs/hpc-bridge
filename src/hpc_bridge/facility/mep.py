@@ -4,6 +4,7 @@ import asyncio
 import re
 import sys
 
+from ..login import LOGIN_EXPIRED, login_expired
 from ..profile import Profile
 from .base import EndpointHandle, endpoint_metadata
 
@@ -214,6 +215,11 @@ class MEPFacility:
         try:
             md = await endpoint_metadata(self._client_factory, self.endpoint_id)
         except Exception as exc:  # noqa: BLE001 - metadata is a courtesy; the canary still decides
+            if login_expired(exc):  # not the facility: no block can start either until the user logs in again
+                self._note(f"facility template not readable: {LOGIN_EXPIRED} — Globus refused to refresh it. The "
+                           "user must log in to Globus again — call authenticate(force=True) and give the user its "
+                           "link — before any block can start here")
+                return
             self.template_notes.append(
                 f"facility template not readable ({type(exc).__name__}): sending the entry's config as-is")
             return

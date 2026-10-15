@@ -19,7 +19,7 @@ from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
 from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _block_nodes, _with_spend
 from .lifecycle import BlockState
-from .login import LoginStart
+from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
 from .runner import CanaryResult
 from .scheduler_ops import _submission_refused
@@ -60,6 +60,8 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     ('seed storage.db (mkdir) failed: u@host: Permission denied (publickey,…)') — a stranger with no
     account or key on the facility must instead hear WHICH host and login name were tried, where the
     name came from, and the two remedies (found on the stranger's walk, 2026-09-03)."""
+    if login_expired(exc):  # the gate before a bootstrap: nothing was copied, no SSH was made
+        return _hpc_bridge_error(exc)
     raw = str(exc)
     # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
     # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
@@ -428,20 +430,14 @@ def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -
     return (f"{ask} (with the allocation balance where the facility's balance tool shows one: it runs free on "
             "shape='login'). Login-node work (shape='login') needs no confirmation.")
 
-def _login_wait_s_UNUSED() -> float:
-    """How long a tool call waits for a browser login to land before returning needs_login. Long enough
-    for a real IdP round-trip (password + Duo), short enough to stay well under the flow's TTL and any
-    MCP tool timeout (run_shell already blocks far longer)."""
-    return config.login_wait_s()
-
 def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | None = None,
-                  waited_s: float | None = None) -> str:
+                  waited_s: float | None = None, why: str | None = None) -> str:
     """The agent-facing instructions for a login, by mode. Same discipline as needs_preauth: relay
     the link, never ask for a password, never handle a token; in paste mode only a one-time code
-    (not a token) passes through the chat."""
+    (not a token) passes through the chat. `why`: the reason a login is needed, when it is known."""
     for_what = f" before {facility!r} can be reached" if facility else ""
-    head = (f"A Globus login is needed{for_what} (first use, or a stored credential missing a scope an "
-            "endpoint needs). ")
+    why = why or "first use, or a stored credential missing a scope an endpoint needs"
+    head = f"A Globus login is needed{for_what} ({why}). "
     tail = (" The login happens ONLY in the browser: never ask the user for a Globus password, and "
             "never paste the link into a shell.")
     prefix = f"({flow_error}) " if flow_error else ""
@@ -462,13 +458,13 @@ def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | 
     ) + tail
 
 def _needs_login_result(facility: str, start: LoginStart, flow_error: str | None,
-                        waited_s: float | None = None) -> ConnectFacilityResult:
+                        waited_s: float | None = None, why: str | None = None) -> ConnectFacilityResult:
     return ConnectFacilityResult(
         phase="needs_login",
         facility=facility,
         login_url=start.login_url,
         login_mode=start.mode,
-        notice=_login_notice(start, flow_error, facility=facility, waited_s=waited_s),
+        notice=_login_notice(start, flow_error, facility=facility, waited_s=waited_s, why=why),
     )
 
 def _multiplexing_off_notice(host: str, resume: str = "connect_facility") -> str:
@@ -523,6 +519,15 @@ def _dispatch_error_suffix(canary: CanaryResult | None) -> str:
         return (f" — last dispatch was refused as TRANSIENT: {canary.error}. The endpoint is still processing "
                 "a previous start request — wait ~10 s and call again (not a config problem)")
     return f" — last dispatch failed: {canary.error}. Not a queue wait: fix the config/partition and retry"
+
+def _login_expired_notice(error: str | None) -> str:
+    """The stored Globus login failed under a dispatch (CanaryResult.login_expired): Globus Auth refused to refresh it.
+    Live 2026-10-14 every dispatch read "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix
+    the config/partition and retry": the wrong remedy, and nothing pointed at the login."""
+    return (f"{LOGIN_EXPIRED[:1].upper()}{LOGIN_EXPIRED[1:]}: Globus refused to refresh it "
+            f"({(error or '').strip()[:240]}). No work can be sent until the user logs in again. Not a queue wait, and "
+            "nothing is wrong with the facility, its config or the partition: call authenticate(force=True), give the "
+            "user its link, then retry.")
 
 def _transient_dispatch_failure(error: str | None) -> bool:
     """The web service's 409 RESOURCE_CONFLICT ('Endpoint … is already in use: possibly due to concurrent
@@ -836,6 +841,8 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
 
 
 def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> ShellOutcome:
+    if canary is not None and canary.login_expired:  # nothing can be sent: not a cold start to wait out
+        return ShellOutcome(phase="failed", block_state=block, notice=_login_expired_notice(canary.error))
     if canary is not None and _no_account_failure(canary.error):
         from .login import globus_identity_label
 
@@ -1127,10 +1134,22 @@ def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
         ),
     ))
 
+def _hpc_bridge_error(exc: BaseException) -> str:
+    """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
+    renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
+    if login_expired(exc):
+        # the gate before a bootstrap raised it: no SSH was made and nothing was copied or started
+        gated = " Nothing was started, and no login was copied to the login node." \
+            if isinstance(exc, LoginExpiredError) else ""
+        return (f"hpc-bridge error: {type(exc).__name__}: {LOGIN_EXPIRED} — Globus refused to refresh it.{gated} "
+                "Nothing is wrong with the facility or its config: the user must log in to Globus again — call "
+                "authenticate(force=True) and give the user its link — then retry.")
+    return f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500]
+
 def _error_outcome(exc: Exception) -> ShellOutcome:
     return ShellOutcome(
         phase="failed",
         block_state="cold",
         exit_code=1,
-        notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
+        notice=_hpc_bridge_error(exc),
     )
