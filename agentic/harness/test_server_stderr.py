@@ -35,6 +35,8 @@ UV_CMD = ["run", "--directory", REPO, "--extra", "integration", "hpc-bridge"]
 STUB_SERVER = r'''
 import os, signal, sys, time
 mode = sys.argv[1]
+if os.environ.get("SAY"):    # what a test wants the server to have said on stderr first
+    sys.stderr.write(os.environ["SAY"] + "\n"); sys.stderr.flush()
 if mode == "cat":            # the stdio channel, verbatim
     sys.stdout.buffer.write(sys.stdin.buffer.read())
 elif mode == "mcp":          # one answer per request line, a diagnostic per request on stderr
@@ -87,7 +89,7 @@ def _wrapped(log, stub, *args, operator="codex"):
 
 
 def _headers(log: Path) -> list[dict]:
-    return [m.groupdict() for line in log.read_text().splitlines() if (m := serve_with_stderr.HEADER_RE.match(line))]
+    return [m.groupdict() for line in log.read_text().splitlines() if (m := serve_with_stderr.HEADER_RE.search(line))]
 
 
 # ---------------------------------------------------------------- the wrapper, as a process
@@ -450,6 +452,7 @@ def test_a_server_that_goes_while_its_client_runs_on_is_an_early_exit(tmp_path, 
         assert rec["client_outlived_s"] is None and rec["client_ended_at"] == rec["ended_at"] == 1005.0
     else:
         assert rec["client_outlived_s"] == client_lives_on_s
+        assert rec["server_outlived_client_s"] is None and rec["orphaned"] is False   # the server went first
 
 
 def test_a_zombie_server_has_exited(tmp_path):
@@ -536,9 +539,11 @@ TEARDOWN = "keep"
 '''   # no EXPECT_OK: every row present gates by default — except harness:server_exited, which never does
 
 
-def _drive_run(monkeypatch, tmp_path, *, server_mode, client_mode):
+def _drive_run(monkeypatch, tmp_path, *, server_mode, client_mode, trace=None, messages=(), during=None, env=None,
+               mounted=None):
     """run.py's `_run` with the world stubbed (no ssh, no teardown) and an operator that is a stub MCP client running
-    the stub server through the same `wrap` every operator uses. Returns (rc, the bundle dir)."""
+    the stub server through the same `wrap` every operator uses; it returns `trace` / `messages` as its record, and
+    calls `during()` once it is running, before the client starts. Returns (rc, the bundle dir)."""
     _sdk_stub(monkeypatch)
     import run
     from runner import RunResult
@@ -553,10 +558,13 @@ def _drive_run(monkeypatch, tmp_path, *, server_mode, client_mode):
     client.write_text(STUB_CLIENT)
 
     async def operator(prompt, *, repo_root, **kw):
+        if during is not None:
+            during()
         cmd = server_stderr.wrap([sys.executable, str(server), server_mode], "claude")
         proc = await asyncio.create_subprocess_exec(sys.executable, str(client), client_mode, *cmd)
         await proc.wait()
-        return RunResult(trace=Trace([], []), final=types.SimpleNamespace(is_error=False, result="done"), messages=[])
+        return RunResult(trace=trace if trace is not None else Trace([], []),
+                         final=types.SimpleNamespace(is_error=False, result="done"), messages=list(messages))
 
     real_sleep = asyncio.sleep
 
@@ -579,8 +587,12 @@ def _drive_run(monkeypatch, tmp_path, *, server_mode, client_mode):
     monkeypatch.setenv("ALCF_INFERENCE_TOKEN", "alcf-bearer-0123456789abcdef")
     monkeypatch.setenv("PLANT", "alcf-bearer-0123456789abcdef")
     monkeypatch.setenv("CLIENT_LINGER_S", "2.5")
-    for k in ("HPC_BRIDGE_SSH_KEY", "GLOBUS_COMPUTE_USER_DIR", "HPC_BRIDGE_USER_DIR", server_stderr.LOG_ENV):
+    for k in ("HPC_BRIDGE_SSH_KEY", "GLOBUS_COMPUTE_USER_DIR", "HPC_BRIDGE_USER_DIR", server_stderr.LOG_ENV, "SAY"):
         monkeypatch.delenv(k, raising=False)
+    for k, v in (env or {}).items():
+        monkeypatch.setenv(k, v)
+    # the jail's mounted identity (entrypoint.sh copies it into the run's store): absent unless a test plants one
+    monkeypatch.setattr(run, "_MOUNTED_GLOBUS_DB", mounted or tmp_path / "no-mounted-store.db", raising=False)
     rc = asyncio.run(run._run("zz_server_stderr_probe", "m", None, None, False))
     assert server_stderr.LOG_ENV not in os.environ     # the run's log is its own: not left for the next
     return rc, tmp_path / "runs" / "t1-zz_server_stderr_probe"
@@ -609,3 +621,223 @@ def test_a_server_that_runs_to_the_end_of_its_session_is_not_reported(monkeypatc
     (proc,) = rec["server"]["processes"]
     assert proc["early"] is False and proc["ended_at"] is not None
     assert not [g for g in rec["grading"] if g["name"] == "harness:server_exited"]
+
+
+# ---------------------------------------------------------------- the channel, orphans, races and redaction (review)
+
+
+def _incident_messages(harness, tools, closing_native, closing_journal):
+    """A CLI-operator bundle (cli_runner's messages: the head, the harness's own events, hpc-bridge's journal) with the
+    calls of a 2026-10-15 teardown_slow_fs incident: earlier results shortened, the closing call's verbatim."""
+    msgs = [{"harness": harness, "argv": [harness], "rc": 0, "seconds": 70.0, "trace_stats": {}, "stdout_tail": "",
+             "stderr_tail": ""}]
+    for name in tools[:-1]:
+        msgs.append({"native": {"name": name, "hpcb": True, "args": {}, "result": {"text": "{}"}, "ran": True}})
+    msgs.append({"native": closing_native})
+    for k, name in enumerate(tools[:-1]):
+        msgs.append({"journal": {"ts": 1000.0 + k, "seq": k + 1, "pid": 63, "tool": name, "args": {},
+                                 "result": {"status": "tearing_down"} if name == "teardown_endpoint" else {"phase": "ok"},
+                                 "ms": 5}})
+    msgs.append({"journal": closing_journal})
+    return msgs
+
+
+_STDIO_CANCEL = ("CancelledError: Cancelled via cancel scope ffff824db640 by <Task pending name='mcp.server.fastmcp."
+                 "server.FastMCP.run_stdio_async' coro=<FastMCP.run_stdio_async() running at /work/hpc-bridge/.venv/lib/"
+                 "python3.11/site-packages/anyio/_backends/_asyncio.py:2531> cb=[_run_until_complete_cb() at /usr/local/"
+                 "lib/python3.11/asyncio/base_events.py:181, <2 more>, WorkerThread.stop()]>")
+PI_INCIDENT = _incident_messages(          # agentic/runs/1792089281-36366-10989-teardown_slow_fs
+    "pi", ["connect_facility"] * 3 + ["ensure_endpoint_up"] * 2 + ["run_shell"] + ["teardown_endpoint"] * 6,
+    {"name": "teardown_endpoint", "hpcb": True, "args": {}, "result": {"text": "MCP connection closed", "is_error": True},
+     "ran": True, "call_id": "chatcmpl-tool-90cdc093fc38b20e"},
+    {"t": "2026-10-15T18:35:46+0000", "ts": 1792089346.442954, "seq": 12, "pid": 63, "tool": "teardown_endpoint",
+     "args": {}, "error": _STDIO_CANCEL, "ms": 0})
+CODEX_INCIDENT = _incident_messages(       # agentic/runs/1792090675-26191-97531-teardown_slow_fs
+    "codex", ["connect_facility"] * 3 + ["ensure_endpoint_up"] * 2 + ["run_shell"] + ["teardown_endpoint"] * 2,
+    {"name": "teardown_endpoint", "hpcb": True, "args": {}, "result": {"text": "Wall time: 2.4719 seconds\nOutput:\n"
+     "tool call error: tool call failed for `hpc-bridge/teardown_endpoint`\n\nCaused by:\n    Transport closed"},
+     "ran": None, "call_id": "call_9939770cb2f651aa"},
+    {"t": "2026-10-15T18:58:54+0000", "ts": 1792090734.147393, "seq": 8, "pid": 147, "tool": "teardown_endpoint",
+     "args": {}, "error": _STDIO_CANCEL.replace("ffff824db640", "ffffb54eb5b0"), "ms": 0})
+
+
+def _cli_trace(messages):
+    import cli_runner
+
+    return cli_runner.trace_from_bundle_messages(messages)
+
+
+@pytest.mark.parametrize(("messages", "index"), [(PI_INCIDENT, 11), (CODEX_INCIDENT, 7)], ids=["pi", "codex"])
+def test_the_channel_closing_under_a_call_is_reported_for_both_incidents(messages, index):
+    row = server_stderr.channel_closed_row(_cli_trace(messages), messages)
+    assert row is not None and row.name == "harness:server_channel_closed" and row.ok is False
+    assert f"under call {index} (teardown_endpoint)" in row.detail and "run_stdio_async" in row.detail
+
+
+def test_the_channel_closing_is_read_in_each_clients_own_words():
+    from invariants import ToolCall
+
+    up = ToolCall.of("mcp__endpoint__connect_facility", {}, {"phase": "provisioning"})
+    sdk = Trace([up, ToolCall.of("mcp__endpoint__run_shell", {"command": "x"},
+                                 {"text": "MCP error -32000: Connection closed"})])   # Claude Code's MCP client
+    assert "under call 1 (run_shell)" in server_stderr.channel_closed_row(sdk, []).detail
+    # Pi's call that never reached the server: the trace says so; the harness's own event has Pi's words
+    msgs = [{"native": {"name": "connect_facility", "hpcb": True, "args": {}, "result": {"text": "{}"}}},
+            {"native": {"name": "stop_endpoint", "hpcb": True, "args": {}, "result": {"text": "MCP connection closed",
+                                                                                     "is_error": True}}},
+            {"journal": {"ts": 1.0, "seq": 1, "tool": "connect_facility", "args": {}, "result": {"phase": "ok"}}}]
+    assert "under call 1 (stop_endpoint)" in server_stderr.channel_closed_row(_cli_trace(msgs), msgs).detail
+
+
+def test_server_output_that_mentions_a_closed_connection_and_an_esc_cancel_are_not_the_channel():
+    from invariants import ToolCall
+
+    calls = [
+        ToolCall.of("mcp__endpoint__run_shell", {"command": "ssh x"},   # the server's structured answer, quoting ssh
+                    {"phase": "complete", "exit_code": 255, "stdout": "", "stderr_snippet": "Connection closed by 10.0.0.1"}),
+        ToolCall.of("mcp__endpoint__login_shell", {}, {"stdout": "Connection closed: (200, 'Normal shutdown')"}),
+        ToolCall.of("mcp__endpoint__run_shell", {}, {"phase": "complete", "text": "Connection closed by peer"}),
+        ToolCall.of("mcp__endpoint__list_facilities", {},                # a list answer, as the trace wraps one
+                    {"value": [{"id": "x", "access": "SSH: Connection closed after 10 min idle"}]}),
+        ToolCall.of("Bash", {"command": "ssh x"}, {"text": "Connection closed by remote host"}),   # not hpc-bridge's
+        ToolCall.of("mcp__hpc-bridge__run_shell", {}, {"text": "CancelledError: Cancelled via cancel scope 1 by "
+                                                               "<Task pending name='Task-9' coro=<_handle_request()>>",
+                                                       "is_error": True}),                     # Esc: one call cancelled
+    ]
+    assert server_stderr.channel_closed_row(Trace(calls), []) is None
+
+
+def test_a_server_left_running_after_its_client_went_is_an_orphan(tmp_path):
+    world = _World()
+    w = _watch(tmp_path, world, (500, 400), (501, 401))
+    w.poll()
+    del world.alive[400]                        # 500's client went; the server runs on
+    del world.alive[401]
+    w.poll()
+    world.t += 0.5
+    del world.alive[501]                        # 501 followed its client within the grace: a normal end
+    w.poll()
+    world.t += 10
+    w.finish()
+    assert [p.pid for p in w.orphans()] == [500] and w.early() == []
+    procs = w.summary()["processes"]
+    assert procs[0]["orphaned"] is True and procs[0]["server_outlived_client_s"] == 10.5
+    assert procs[1]["orphaned"] is False and procs[1]["server_outlived_client_s"] == 0.5
+    (row,) = server_stderr.rows(w)
+    assert row.name == "harness:server_orphaned" and "pid 500" in row.detail and row.ok is False
+    log = (tmp_path / "log").read_text()
+    assert "pid=500 still runs: its client pid=400 is gone" in log and "pid=501 still runs" not in log
+
+
+def test_a_start_logged_while_the_watch_trims_is_still_read(tmp_path):
+    """header_race.py's shape: a restart's header lands between the watch reading the log and trimming it."""
+    log = tmp_path / "race.raw"
+    log.write_text(serve_with_stderr.header(1001, 500, "pi", now=100.0) + ("noise " * 30 + "\n") * 2000)
+    alive = {1001: (500, "S"), 500: (1, "S")}
+    clock = [200.0]
+
+    def table():
+        if 1002 not in alive and clock[0] == 200.0:
+            with log.open("a") as fh:
+                fh.write(serve_with_stderr.header(1002, 500, "pi", now=200.0))
+            alive[1002] = (500, "S")
+        return dict(alive)
+
+    w = server_stderr.ServerWatch(log, ceiling=200_000, keep=50_000, clock=lambda: clock[0], table=table)
+    w.poll()
+    clock[0] = 210.0
+    del alive[1002]
+    w.poll()
+    clock[0] = 260.0
+    w.finish()
+    assert [p.pid for p in w.processes] == [1001, 1002] and [p.pid for p in w.early()] == [1002]
+
+
+def test_a_start_after_an_unterminated_line_is_its_own_line_and_still_read(tmp_path, stub):
+    log = tmp_path / "log"
+    log.write_text("previous server died mid-li")              # no newline: its last write was cut off
+    subprocess.run(_wrapped(log, stub, "exit", "0", operator="pi"), stdin=subprocess.DEVNULL, timeout=30)
+    lines = log.read_text().splitlines()
+    assert lines[0] == "previous server died mid-li" and lines[1].startswith("=== hpc-bridge MCP server start")
+    fresh = tmp_path / "fresh"
+    subprocess.run(_wrapped(fresh, stub, "exit", "0"), stdin=subprocess.DEVNULL, timeout=30)
+    assert fresh.read_text().startswith("=== hpc-bridge MCP server start")   # no blank line before a first start
+    glued = tmp_path / "glued"                                # a log written before the wrapper ended the line
+    glued.write_text("cut off" + serve_with_stderr.header(4242, 1, "codex"))
+    w = server_stderr.ServerWatch(glued, table=lambda: {4242: (1, "S")})
+    w.poll()
+    assert [p.pid for p in w.processes] == [4242]
+
+
+def test_a_run_whose_log_cannot_be_made_still_writes_its_bundle(monkeypatch, tmp_path):
+    def no_tmp(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(server_stderr.tempfile, "mkdtemp", no_tmp)
+    _rc, bundle = _drive_run(monkeypatch, tmp_path, server_mode="mcp", client_mode="normal")
+    rec = json.loads((bundle / "record.json").read_text())
+    assert rec["result"] == "FAILED" and rec["server"]["processes"] == []   # the run went on, its server unwrapped
+    assert not (bundle / "server-stderr.log").exists()
+
+
+def test_redaction_keeps_words_that_follow_a_key():
+    text = ("token: expired - re-login needed\nBearer authentication failed for funcx_service\n"
+            "password: not required on this facility\nthe tokens_file is at /x; token_type=Bearer\n"
+            "password: required\n"
+            "password: hunter22\nAuthorization: Bearer AgX7kP2mQ9rT4vW8yZ1bC3dF5gH6jK0lN\n")
+    out = server_stderr.redact(text)
+    for kept in ("token: expired", "Bearer authentication failed", "password: not required", "token_type=Bearer",
+                 "password: required"):
+        assert kept in out, kept
+    assert "hunter22" not in out and "AgX7kP2mQ9rT4vW8yZ1bC3dF5gH6jK0lN" not in out
+
+
+def test_redaction_knows_globus_token_shapes_and_keeps_ids():
+    opaque = "Rq7Xv2LmP9sT4wK8yB3nD6fH1jG5cZ0aE2uI4oQ7tY9rW3eN6mK8bV1xC5zA0sD2"   # an opaque "v2" token
+    jwt = "eyJhbGciOiJSUzI1NiIsInR5cCI6IkpXVCJ9.eyJzdWIiOiIxMjM0NTY3ODkwIn0.SflKxwRJSMeKKF2QT4fwpMeJf36POk6yJV_adQssw5c"
+    keep = ("endpoint_id=5eb7396a-2541-4758-9618-26f2dee4fe7e task 7f3e9c2a-1111-2222-3333-444455556666 "
+            "sha256 9f86d081884c7d659a2feaa0c55ad015a3bf4f1b2b0b822cd15d6c15b0f00a08 "
+            "endpoint hpc-bridge-fake-1792089281-36366-10989 scope https://auth.globus.org/scopes/facd7ccc/all "
+            "at /work/hpc-bridge/.venv/lib/python3.11/site-packages/anyio/_backends/_asyncio.py:2531")
+    out = server_stderr.redact(f"refreshed: {opaque}\nid: {jwt}\n{keep}\n")
+    assert opaque not in out and "eyJzdWIi" not in out and keep in out
+
+
+def _token_store(path, access, refresh):
+    import sqlite3
+
+    con = sqlite3.connect(path)
+    con.execute("create table if not exists token_storage (namespace text, data text)")
+    con.execute("delete from token_storage")
+    con.execute("insert into token_storage values (?, ?)",
+                ("DEFAULT", json.dumps({"access_token": access, "refresh_token": refresh})))
+    con.commit()
+    con.close()
+
+
+def test_tokens_refreshed_away_and_the_mounted_originals_are_redacted_too(monkeypatch, tmp_path):
+    live = tmp_path / "gcud"
+    live.mkdir()
+    started, refreshed, mounted = "startedValueAAAAbbbb1111", "refreshedValueCCCCdddd2222", "mountedValueEEEEffff3333"
+    _token_store(live / "storage.db", started, "rf-" + started)
+    _token_store(tmp_path / "mounted.db", mounted, "rf-" + mounted)
+
+    def refresh_mid_run():   # the SDK refreshes: the value the run started with is gone from the store
+        _token_store(live / "storage.db", refreshed, "rf-" + refreshed)
+
+    said = f"using {started} then {refreshed}; the image had {mounted}"
+    _rc, bundle = _drive_run(monkeypatch, tmp_path, server_mode="mcp", client_mode="normal", during=refresh_mid_run,
+                             env={"GLOBUS_COMPUTE_USER_DIR": str(live), "SAY": said}, mounted=tmp_path / "mounted.db")
+    log = (bundle / "server-stderr.log").read_text()
+    assert "using <redacted globus token> then <redacted globus token>; the image had <redacted globus token>" in log
+
+
+def test_run_reports_a_closed_channel_while_the_server_process_lived_on(monkeypatch, tmp_path):
+    _rc, bundle = _drive_run(monkeypatch, tmp_path, server_mode="mcp", client_mode="normal",
+                             trace=_cli_trace(CODEX_INCIDENT), messages=CODEX_INCIDENT)
+    rec = json.loads((bundle / "record.json").read_text())
+    (row,) = [g for g in rec["grading"] if g["name"] == "harness:server_channel_closed"]
+    assert row["gating"] is False and "under call 7 (teardown_endpoint)" in row["detail"]
+    assert "stub server: up" in row["detail"]                               # the server's last words, from its log
+    assert not [g for g in rec["grading"] if g["name"] in ("harness:server_exited", "harness:server_orphaned")]
+    assert "harness:server_channel_closed" not in rec["failed"]

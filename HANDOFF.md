@@ -15,7 +15,7 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **979 passed** (the CI list: 955). The live tier has
+Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **991 passed** (the CI list: 967). The live tier has
 **66 scenarios** and a local **fake cluster with 12 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 
@@ -33,9 +33,11 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
 - Not yet run live: `terms_prestated` / `terms_wanted` (fake `mep`, persona cells) and the `quote_before_spend` grader.
 - **The server's stderr in every bundle (branch `harness/server-stderr`), not yet run live:** every operator starts
   hpc-bridge through `agentic/harness/serve_with_stderr.py` (append + exec), and the bundle keeps `server-stderr.log`
-  (redacted, last 2 MB) and `record.json` → `server`. `harness:server_exited` (report-only) flags a server that went
-  away while its client ran on, the `teardown_slow_fs` Pi/Codex failure of 2026-10-15. The first live cell should show
-  a header per server start in `server-stderr.log`; re-run `teardown_slow_fs` under pi/codex to read that crash.
+  (redacted, last 2 MB) and `record.json` → `server`. Report-only rows: `harness:server_channel_closed` (the MCP
+  channel closed under a call — the `teardown_slow_fs` Pi/Codex failure of 2026-10-15; over the 887 bundles stored
+  that day it fires on exactly those two), `harness:server_exited` (the process went while its client ran on) and
+  `harness:server_orphaned` (it ran on after its client went). The first live cell should show a header per server
+  start in `server-stderr.log`; re-run `teardown_slow_fs` under pi/codex to read that crash.
 - **INFRA verdict + ALCF probe (branch `harness/infra-status`), not yet run live:** a cell whose operator did nothing
   (no tool call of any kind) with an endpoint outage on record reads `RESULT: INFRA: <reason>` (exit 4, `infra_reason`
   in the bundle), not FAILED; `run_smoke.sh` probes ALCF before a free operator's cell (`HPCB_ALCF_WAIT_S`, default 0,

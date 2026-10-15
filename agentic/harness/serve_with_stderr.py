@@ -21,8 +21,9 @@ import sys
 import time
 
 # One line per server start. `server_stderr.ServerWatch` reads `pid` (the server keeps it: exec) and `client` (whether
-# the client outlived its server); `ts` is epoch seconds, `at` the same instant for a reader.
-HEADER_RE = re.compile(r"^=== hpc-bridge MCP server start (?P<at>\S+) ts=(?P<ts>\d+(?:\.\d+)?) pid=(?P<pid>\d+) "
+# the client outlived its server); `ts` is epoch seconds, `at` the same instant for a reader. Readers SEARCH a line for
+# it: a log written before the wrapper ended an unterminated line may carry a start glued to the end of one.
+HEADER_RE = re.compile(r"=== hpc-bridge MCP server start (?P<at>\S+) ts=(?P<ts>\d+(?:\.\d+)?) pid=(?P<pid>\d+) "
                        r"client=(?P<client>\d+) operator=(?P<operator>\S*) ===$")
 USAGE = "usage: serve_with_stderr.py --log PATH --operator NAME -- CMD [ARG...]\n"
 
@@ -47,6 +48,20 @@ def _parse(argv: list[str]) -> tuple[str, str, list[str]] | None:
     return opts["--log"], opts.get("--operator", ""), cmd
 
 
+def _line_break(log: str) -> str:
+    """A newline when the log ends inside a line (an earlier server died mid-write), so this start is a line of its
+    own; nothing for a new log or one that ends a line."""
+    try:
+        with open(log, "rb") as fh:
+            fh.seek(0, os.SEEK_END)
+            if fh.tell() == 0:
+                return ""
+            fh.seek(-1, os.SEEK_END)
+            return "" if fh.read(1) == b"\n" else "\n"
+    except OSError:
+        return ""
+
+
 def _say(text: str) -> None:
     """A line on stderr — wherever it points now; never a reason not to start the server."""
     try:
@@ -67,7 +82,7 @@ def main(argv: list[str]) -> int:
         _say(f"serve_with_stderr: cannot open {log} ({exc}); the server's stderr is not captured\n")
     else:
         try:
-            os.write(fd, header(os.getpid(), os.getppid(), operator).encode())
+            os.write(fd, (_line_break(log) + header(os.getpid(), os.getppid(), operator)).encode())
             if fd == 2:   # stderr was closed, so the log took its number: keep it across the exec
                 os.set_inheritable(2, True)
             else:
