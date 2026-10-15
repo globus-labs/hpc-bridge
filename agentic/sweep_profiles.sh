@@ -157,7 +157,7 @@ for op in "${OPS[@]}"; do
   p="${TAGGED:+\[$op\] .*}"
   rows=$(tally "${p}(RESULT: |no RESULT line)"); ok=$(tally "${p}RESULT: OK"); bad=$(tally "${p}RESULT: FAILED")
   infra=$(tally "${p}RESULT: INFRA"); setup=$(tally "${p}RESULT: SETUP FAILED"); crashed=$(tally "${p}no RESULT line")
-  echo "## totals${TAGGED:+ [$op]} — OK $ok · FAILED $bad · INFRA $infra (the model endpoint failed: not graded) · SETUP FAILED $setup · CRASHED $crashed (no RESULT line) · other $((rows - ok - bad - infra - setup - crashed)) (skipped, rate-limited, interrupted)" | tee -a "$SUMMARY"
+  echo "## totals${TAGGED:+ [$op]} — OK $ok · FAILED $bad · INFRA $infra (the model endpoint failed: not graded) · SETUP FAILED $setup · CRASHED $crashed (no RESULT line) · other $((rows - ok - bad - infra - setup - crashed)) (a RESULT of SKIPPED, RATE_LIMITED or INTERRUPTED; the suite's own skips are on its SUITE lines)" | tee -a "$SUMMARY"
   [ -n "$TAGGED" ] || break
 done
 echo "## not swept (by design — see excluded() in agentic/sweep_profiles.sh)" >> "$SUMMARY"

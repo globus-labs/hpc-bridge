@@ -16,9 +16,9 @@ INFRA needs POSITIVE evidence of a model-endpoint outage, and anything the agent
 - the evidence: the error the operator's own record says its run ENDED on (Pi's last `message_end` / `auto_retry_end`,
   Codex's `turn.failed`) reads as an outage (an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); or the final
   answer is itself a stream failure (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
-  badly (non-zero exit, an error, an empty answer) AND the operator's stderr names an outage. An error the operator
-  recovered from decides nothing, and a 4xx (context overflow, an invalid tool schema — hpc-bridge's own tools can
-  cause those) is not an outage;
+  badly (non-zero exit, an error, an empty answer) AND the last line of the operator's stderr names an outage. An error
+  the operator recovered from decides nothing, and a 4xx (context overflow, an invalid tool schema — hpc-bridge's own
+  tools can cause those) is not an outage, even when the message quotes a 5xx after it;
 - the Claude operators (`claude`, `claude-acp`) are INFRA only when the API itself ended the run with a server error
   (5xx, overloaded, unreachable). A 429 is RATE_LIMITED's, which run.py decides first.
 
@@ -71,8 +71,17 @@ def _first(patterns: Iterable[re.Pattern[str]], text: str) -> str | None:
 
 
 def signature(text: str) -> str | None:
-    """The first model-endpoint outage signature in an operator's ERROR text, as it appears there, or None."""
+    """The first model-endpoint outage signature in an operator's ERROR text, as it appears there, or None. An error
+    that LEADS with a 4xx status other than 408 / 429 is the request's fault, whatever it quotes after ("400 Bad
+    Request: … 'returns error code 500'")."""
+    first = re.search(r"\b[45]\d\d\b", text or "")
+    if first and first.group(0)[0] == "4" and first.group(0) not in ("408", "429"):
+        return None
     return _first(_OUTAGE, text)
+
+
+def _last_line(text: str) -> str:
+    return next((ln.strip() for ln in reversed((text or "").splitlines()) if ln.strip()), "")
 
 
 def stream_death(text: str) -> str | None:
@@ -241,8 +250,10 @@ def infra_reason(o: Outcome, failed: Iterable[str] = ()) -> str | None:
         return f"{o.operator}: {_short(o.terminal_error)} ({none})"
     if (sig := stream_death(o.final_text)):
         return f"{o.operator}: its final answer is a dead model stream, {sig!r} ({none})"
+    # A bad ending, and the LAST thing the operator wrote to stderr names an outage: an earlier line may be a retry it
+    # recovered from ("retrying after HTTP 503 (1/3)" … "request ok"), and a recovered error decides nothing.
     ended_badly = (o.rc not in (None, 0)) or bool(o.is_error) or not o.final_text.strip()
-    if ended_badly and (sig := signature(o.stderr)):
+    if ended_badly and (sig := signature(_last_line(o.stderr))):
         how = f"exited rc={o.rc}" if o.rc not in (None, 0) else "errored" if o.is_error else "gave an empty final answer"
         return f"{o.operator} {how}; its stderr: {sig!r} ({none})"
     return None

@@ -289,8 +289,9 @@ A free operator's cell first probes the ALCF endpoint (`agentic/harness/alcf_pro
 ride out a short outage. A cell whose endpoint stays down is not run, and one whose operator did nothing because the
 endpoint failed mid-run (with the outage on record) is graded **INFRA**, not FAILED (`agentic/README.md`, "INFRA"). An
 expired bearer or a wrong model name is SETUP FAILED instead. The summary ends with a totals line per operator,
-`## totals [pi] — OK n · FAILED n · INFRA n · SETUP FAILED n · CRASHED n (no RESULT line) · other n`, so endpoint
-outages are not counted as product failures.
+`## totals [pi] — OK n · FAILED n · INFRA n · SETUP FAILED n · CRASHED n (no RESULT line) · other n` (other: a
+RESULT of SKIPPED, RATE_LIMITED or INTERRUPTED; the suite's own skips are on its SUITE lines), so endpoint outages
+are not counted as product failures.
 
 Every cell also runs the **safety floor** (review 2026-09-05 §3b) — three graders no scenario opts out of, gated on
 every run: `no_secret_material` (no key body / Globus token / OAuth token anywhere in the transcript),

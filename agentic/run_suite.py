@@ -411,27 +411,34 @@ async def _run_job(scenario, model, effort, persona, ablate, claims, sem, stagge
                   flush=True)
         result = next((ln for ln in text.splitlines() if ln.startswith("RESULT:")),
                       f"(no RESULT line; rc={proc.returncode})")
-        print(f"{'✓' if ok else '⚠' if infra else '✗'} done   {label} — {result}", flush=True)
+        # exit 2: the cell never ran — run.py's SKIPPED (an operator that cannot drive it) or a SETUP FAILED (its world
+        # precondition, or the ALCF probe's refused request): counted apart, never in a pass rate
+        not_run = proc.returncode == 2
+        skipped = not_run and result.startswith("RESULT: SKIPPED")
+        print(f"{'✓' if ok else '⚠' if infra else '⏭' if skipped else '✗'} done   {label} — {result}", flush=True)
         return {"scenario": scenario, "model": model, "effort": effort, "persona": persona,
                 "ablate": ablate, "user": user, "ok": ok,
-                "skipped": False, "rate_limited": proc.returncode == 3, "infra": infra,
+                "skipped": skipped, "setup_failed": not_run and not skipped,
+                "rate_limited": proc.returncode == 3, "infra": infra,
                 "result": result, "output": text}
     finally:
         claims.release(user)
         sem.release()
 
 
+_APART = (("rate_limited", "rate-limited"), ("infra", "infra"), ("setup_failed", "setup failed"), ("skipped", "skipped"))
+
+
 def _graded(results: list[dict]) -> list[dict]:
     """The cells that count toward pass rates: not skipped, not rate-limited, not INFRA (the model endpoint failed —
-    the run says nothing about hpc-bridge)."""
-    return [r for r in results if not r.get("skipped") and not r.get("rate_limited") and not r.get("infra")]
+    the run says nothing about hpc-bridge), not SETUP FAILED (the cell never ran)."""
+    return [r for r in results if not any(r.get(k) for k, _ in _APART)]
 
 
 def _summary_line(results: list[dict]) -> str:
-    """`3/4 passed · 1 infra · 2 skipped`: the graded cells' pass count, then the cells counted apart."""
+    """`3/4 passed · 1 infra · 1 setup failed · 2 skipped`: the graded cells' pass count, then the cells counted apart."""
     graded = _graded(results)
-    apart = [(sum(1 for r in results if r.get(k)), label)
-             for k, label in (("rate_limited", "rate-limited"), ("infra", "infra"), ("skipped", "skipped"))]
+    apart = [(sum(1 for r in results if r.get(k)), label) for k, label in _APART]
     return f"{sum(1 for r in graded if r['ok'])}/{len(graded)} passed" + "".join(f" · {n} {label}" for n, label in apart if n)
 
 
@@ -581,6 +588,8 @@ async def _main(args) -> int:
         print(f"  ⏭ {r['scenario']} · {_cell(r['model'], r['effort'])} — {r['result']}")
     for r in infra:   # not graded: the operator's model endpoint failed (agentic/harness/infra.py)
         print(f"  ⚠ {r['scenario']} · {_cell(r['model'], r['effort'])} · {r['user']} — {r['result']}")
+    for r in (r for r in results if r.get("setup_failed")):   # not graded: the cell never ran
+        print(f"  ✗ {r['scenario']} · {_cell(r['model'], r['effort'])} · {r['user']} — {r['result']}")
     fails = [r for r in graded if not r["ok"]]
     if fails:
         print("\nfailures:")

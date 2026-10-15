@@ -475,3 +475,95 @@ def test_and_the_outages_beside_them_are_infra():
         assert infra_reason(outcome_of(op, _tr([]), msgs, None), ["agent_engaged"]), op
     assert infra_reason(outcome_of("claude", _tr([]), [_AM("server_error", "API Error: 529 overloaded")],
                                    {"is_error": True}), ["agent_engaged"])
+
+
+# ---- the second review's shapes (of 7d88039) ---------------------------------------------------------------------------
+
+_PI_STREAM = '{"type":"auto_retry_end","success":false,"attempt":3,"finalError":"Stream ended without finish_reason"}'
+_SSH1 = [("Bash", {"command": "ssh u@login hostname"}, {"text": "login01"})]
+REVIEW2 = [
+    # (name, operator, trace, messages, final, failed, INFRA?)
+    ("N1 pi: final quotes StreamingTimeoutError (the final-answer rule reads it)", "pi",
+     _tr([], ["Earlier the API gave StreamingTimeoutError, so I stopped."]),
+     [_head("pi", 0), {"final": "Earlier the API gave StreamingTimeoutError, so I stopped."}], None, ["agent_engaged"], True),
+    ("N1b hermes: final quotes a dead stream", "hermes", _tr([], ["I can't: Stream ended without finish_reason"]), [],
+     {"is_error": False}, ["agent_engaged"], True),
+    ("N2 codex: MCP startup failure and a 503 on stderr, rc 1", "codex", _tr([]),
+     [_head("codex", 1, "", "HTTP 503 Service Unavailable\nError: required MCP servers failed to initialize: hpc-bridge"),
+      {"final": ""}], None, ["agent_engaged", "run_completed"], False),
+    ("N2b pi: stream death, and the MCP server exited", "pi", _tr([]),
+     [_head("pi", 0, _PI_STREAM, "MCP server hpc-bridge exited with code 1"), {"final": ""}], None, ["agent_engaged"], False),
+    ("N3 claude: a Bash call, then API 529", "claude", _tr(_SSH1, ["x"]),
+     [_AM(None, "x"), _AM("server_error", "API Error: 529 overloaded")], {"is_error": True}, ["agent_engaged"], False),
+    ("N3b claude: an hpc call, then api_error_status 503", "claude", _tr([("list_facilities", {}, {"text": "[]"})], ["x"]),
+     [], {"is_error": True, "api_error_status": 503}, ["agent_engaged"], False),
+    ("N3c claude: no call, API 529", "claude", _tr([]), [_AM("server_error", "API Error: 529 overloaded")],
+     {"is_error": True}, ["agent_engaged"], True),
+    ("N4 hermes21: empty final, stderr 'Error: 429', rc 0", "hermes21", _tr([]),
+     [_head("hermes21", 0, "", "Error: 429"), {"final": ""}], None, ["agent_engaged"], False),
+    ("N4b hermes21: empty final, stderr ends 'HTTP 429 Too Many Requests', rc 0", "hermes21", _tr([]),
+     [_head("hermes21", 0, "", "HTTP 429 Too Many Requests"), {"final": ""}], None, ["agent_engaged"], True),
+    ("N5 hermes21: a RECOVERED 503 retry on stderr, then an empty final, rc 0", "hermes21", _tr([]),
+     [_head("hermes21", 0, "", "WARNING retrying after HTTP 503 (1/3)\nINFO request ok"), {"final": ""}], None,
+     ["agent_engaged"], False),
+    ("N6 pi: a recovered retry, then an empty final", "pi", _tr([]),
+     [_head("pi", 0, _PI_STREAM.replace('"success":false', '"success":true')), {"final": ""}], None, ["agent_engaged"],
+     False),
+    ("N7 codex: high demand after a Bash call", "codex", _tr(_SSH1),
+     [_head("codex", 1, '{"type":"turn.failed","error":{"message":"experiencing high demand"}}'), {"final": ""}], None,
+     ["agent_engaged"], False),
+    ("N8 pi: the run ended on 'Request timed out'", "pi", _tr([]),
+     [_head("pi", 0, '{"type":"auto_retry_end","success":false,"finalError":"Request timed out."}'), {"final": ""}],
+     None, ["agent_engaged"], True),
+    ("N9 codex: a 400 that quotes 'error code 500'", "codex", _tr([]),
+     [_head("codex", 1, json.dumps({"type": "turn.failed", "error": {"message": (
+         "400 Bad Request: tools[2] description invalid near 'returns error code 500'")}})), {"final": ""}], None,
+     ["agent_engaged"], False),
+    ("N10 codex: a context overflow, status code 400", "codex", _tr([]),
+     [_head("codex", 1, json.dumps({"type": "turn.failed", "error": {"message": (
+         "This model's maximum context length is 131072; status code 400")}})), {"final": ""}], None,
+     ["agent_engaged"], False),
+    ("N11 claude-acp: a transcript API error 500", "claude-acp", _tr([]),
+     [{"type": "assistant", "isApiErrorMessage": True, "apiErrorStatus": 500, "error": "unknown",
+       "message": {"content": [{"type": "text", "text": "API Error: 500"}]}}], {"is_error": False}, ["agent_engaged"], True),
+    ("N12 pi: rc 124 with a stream death in stdout", "pi", _tr([]),
+     [_head("pi", 124, _PI_STREAM, "timed out after 2700 s"), {"final": ""}], None, ["agent_engaged"], False),
+    ("N13 pi: stream death, but harness:prose_followups failed", "pi", _tr([]),
+     [_head("pi", 0, _PI_STREAM), {"final": ""}], None, ["agent_engaged", "harness:prose_followups"], False),
+]
+
+
+@pytest.mark.parametrize("name,op,trace,messages,final,failed,infra", REVIEW2, ids=[c[0] for c in REVIEW2])
+def test_the_second_reviews_shapes(name, op, trace, messages, final, failed, infra):
+    assert bool(infra_reason(outcome_of(op, trace, messages, final), failed)) is infra
+
+
+def test_run_suite_counts_exit_2_apart_as_setup_failed_or_skipped(monkeypatch):
+    mod = _run_suite()
+    out = {"text": b""}
+
+    class _Proc:
+        returncode = 2
+
+        async def communicate(self):
+            return out["text"], b""
+
+    async def fake_exec(*a, **k):
+        return _Proc()
+
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+    claims = type("C", (), {"claim_any": lambda self, pool: "hpcbridge-test-01", "release": lambda self, u: None})()
+
+    def job():
+        return asyncio.run(mod._run_job("happy_path", "m", None, None, None, claims, asyncio.Semaphore(1),
+                                        mod.Stagger(0), asyncio.Event()))
+
+    out["text"] = b"RESULT: SETUP FAILED \xe2\x80\x94 ALCF streaming refused the request: HTTP 401\n"
+    setup = job()
+    assert setup["setup_failed"] and not setup["skipped"] and not setup["ok"]
+    out["text"] = b"RESULT: SKIPPED \xe2\x80\x94 the pi operator does not support a persona yet\n"
+    skipped = job()
+    assert skipped["skipped"] and not skipped["setup_failed"]
+    results = [setup, skipped, {"ok": True}, {"ok": False}]
+    assert mod._summary_line(results) == "1/2 passed · 1 setup failed · 1 skipped"
+    assert mod._graded(results) == [{"ok": True}, {"ok": False}]   # neither is in the pass rate

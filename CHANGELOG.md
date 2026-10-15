@@ -408,15 +408,18 @@ installed plugin only when that version changes); git tags mark releases.
   - the error the operator's own record says the run ended on is an outage: an HTTP 5xx or 429, a timeout, a dead
     stream, or Codex's "high demand" (Pi's last `message_end` / `auto_retry_end`, Codex's `turn.failed`);
   - the final answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`);
-  - the run ended badly (non-zero exit, error, empty answer) and the operator's stderr names an outage.
+  - the run ended badly (non-zero exit, error, empty answer) and the last line of the operator's stderr names an
+    outage (an earlier line may be a retry it recovered from).
 
-  Never INFRA: a 4xx (a context overflow or an invalid tool schema, which hpc-bridge's own tools can cause), a turn the
+  Never INFRA: a 4xx (a context overflow or an invalid tool schema, which hpc-bridge's own tools can cause), even one
+  quoting a 5xx later in its message, a turn the
   harness cut off (rc 124), an MCP server that failed to start, an error the operator recovered from, a status code the
   agent quotes in prose, or a run whose safety floor, world checks or harness checks failed. The Claude operators are
   INFRA only on an API server error (5xx, overloaded). `regrade.py` derives the same verdict from a stored bundle. Of
   the 787 stored bundles, 2 that main grades FAIL are INFRA: Pi's stream failure (`1792038870-65654`) and Codex's "high
   demand" (`1791565794-1344`); nothing else changed. `run_suite.py` counts INFRA cells apart (`3/4 passed · 1
-  infra`) and leaves them out of the pass rates. A CLI operator's turn that times out now keeps what it printed, so
+  infra`) and leaves them out of the pass rates, as it now does for a cell that never ran (exit 2: `· 1 setup
+  failed`, or `skipped` for run.py's SKIPPED). A CLI operator's turn that times out now keeps what it printed, so
   Pi's calls before the deadline are graded.
 - **`run_smoke.sh` checks the ALCF endpoint before a free operator's cell** (`agentic/harness/alcf_probe.py`). It sends
   one tiny chat completion, streamed for `pi` and `hermes21`, plain for `codex` and `hermes`, as each operator asks.

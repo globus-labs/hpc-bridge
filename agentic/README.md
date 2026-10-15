@@ -119,9 +119,11 @@ call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … l
   - and one of: the error the operator's own record says its run ENDED on is an outage (Pi's last `message_end` /
     `auto_retry_end`, Codex's `turn.failed`: an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); the final
     answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
-    badly (non-zero exit, an error, an empty answer) AND the operator's stderr names an outage.
+    badly (non-zero exit, an error, an empty answer) AND the last line of the operator's stderr names an outage (an
+    earlier line may be a retry it recovered from).
 
-  Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those); a turn
+  Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those), even one
+  that quotes a 5xx later in its message; a turn
   the harness cut off (rc 124 — its partial output is kept and graded); an MCP server that failed to start (Codex
   exits 1 on an hpc-bridge boot crash: `agent_engaged`'s to catch); an error the operator recovered from; an HTTP
   status the agent merely quotes in prose; and any run whose safety floor, world checks or harness checks
@@ -132,7 +134,8 @@ call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … l
 Exit codes of `run.py`, which `run_smoke.sh` passes on: **0** OK · **1** FAILED (or CRASHED) · **2** SETUP FAILED,
 SKIPPED or an unknown scenario · **3** RATE_LIMITED (the suite halts) · **4** INFRA, also from the probe (counted
 apart: `run_suite.py`'s summary reads `3/4 passed · 1 infra`, and pass rates leave INFRA cells out) · **130**
-INTERRUPTED. `run_smoke.sh`'s own refusals before any cell (no token, a cell the target cannot run) exit 1.
+INTERRUPTED. `run_suite.py` counts exit 2 apart too (`· 1 setup failed`, or `skipped` for run.py's SKIPPED): the
+cell never ran, so it is in no pass rate, and the suite still exits non-zero. `run_smoke.sh`'s own refusals before any cell (no token, a cell the target cannot run) exit 1.
 
 **Targets.** `--target globus1` (default) is the lab cluster; `--target fake` is `agentic/fakecluster/` — a local compose
 Slurm cluster the suite brings up itself (`--reset-cluster` wipes it first). Every SSH scenario runs on either; the
