@@ -38,21 +38,22 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 61 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 65 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
                            spend + account: gated_provision · spend_refusal · spend_gate_enforced · spend_revoked · rich_gate ·
-                             partition_choice · saturation · hand_batch_job · fake_mep_username_not_account ·
-                             term_switch_reasks · preset_account_scoped · ssh_account_floor · terms_prestated ·
-                             terms_wanted
+                             partition_choice · saturation · hand_batch_job · mep_hand_batch_job ·
+                             mep_hand_batch_job_ask · fake_mep_username_not_account · term_switch_reasks ·
+                             preset_account_scoped · ssh_account_floor · terms_prestated · terms_wanted
                            blocks + reaps: block_reaped_resume · reap_replaced_block · gpu_rule · submit_policy_rejected ·
                              slurm_worker_died · polaris_filesystems
                            long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·
                              repl_interaction · repl_baseline_local
-                           stop + chaos: stop_while_running · esc_mid_call · draining_restop · orphaned_task
+                           stop + chaos: stop_while_running · esc_mid_call · draining_restop · orphaned_task ·
+                             teardown_slow_fs
                            facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute ·
-                             fake_mep_stop_names_block · fake_mep_no_account
+                             fake_mep_stop_names_block · fake_mep_stop_while_provisioning · fake_mep_no_account
                            adversarial: canary_login_discovery · canary_compute_output · password_pusher · wrong_code
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
@@ -242,8 +243,10 @@ python3 agentic/repl_sweep.py --repeat 6 --targets fake,globus1   # add the lab 
 ```
 
 Keep `--concurrency 3` (globus1 SSH headroom + the subscription 5h/7d cap; big sweeps → API creds). Compute cells
-are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs every node
-and runs alone. Cleanup guarantees: `run.py` tears down its own endpoint + blocks in its `finally` (also on
+are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs every node, so
+the node gate keeps every compute cell off while it runs (a cell needing no node may still run beside it; a true
+run-alone flag is a TODO in `saturation.py`). SERIAL groups — `hpcbmep` (the fake MEP), `glabs-gc` (the lab MEP),
+`hostile-canaries`, `fail2ban` — run one cell at a time across their scenarios. Cleanup guarantees: `run.py` tears down its own endpoint + blocks in its `finally` (also on
 `docker stop`, which now reaches it via SIGTERM) and deletes the run's endpoint RECORDS from the Globus Compute service
 through the SDK (the login-node `gce delete` deregisters only while the pool user still holds the credentials — four
 `hpc-bridge-fake-<runid>` records had accumulated in the owner's console by 2026-09-06); `run_suite` cleans up the cells it abandons on Ctrl-C (it mints
@@ -342,6 +345,8 @@ NEEDS_COMPUTE_NODE = True        # nodes the cell occupies (True=1, an int, Fals
                                  #   minus blocks claimed by launches in the last 300 s cover the need.
 WARM_BLOCK_USER = "glabs-gc"        # optional: a facility MEP's running block (that user's) satisfies the need instead
 SERIAL = True                    # one cell at a time (a shared facility identity, or a cell that holds every node)
+SERIAL = "hpcbmep"               #   or a GROUP: one cell at a time across EVERY scenario naming it (the fake-MEP
+                                 #   cells all run as hpcbmep); the lock is per run_suite process
 TARGETS = ("fake",)              # optional: only these targets (chaos scenarios kill things)
 REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matched against the target/profile manifest); a
                                  #   list-valued capability is a membership test — {"partitions": ["debug"], "accounts": ["hpcb"]};

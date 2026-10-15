@@ -8,7 +8,7 @@ import os
 
 from invariants import Result, Trace, calls_bounded, never_asks_for_password, no_ssh_workaround, texts_mention
 
-SERIAL = True
+SERIAL = "fail2ban"   # one fail2ban state: its bans would land in f2b_stranger's "no ban recorded" log check
 TARGETS = ("fake",)
 REQUIRES = {"fail2ban": "sshd"}
 _HOST = os.environ.get("HPC_BRIDGE_SSH_HOST", "login")

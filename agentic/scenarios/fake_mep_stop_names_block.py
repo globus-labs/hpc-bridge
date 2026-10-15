@@ -27,7 +27,7 @@ from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 FACILITY_ID = "fake-mep-strict"       # the local catalog's id for the strict-schema manager (as fake_mep_compute)
 NEEDS_COMPUTE_NODE = True
 WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate
-SERIAL = True                          # one mapped identity — cells would share the user endpoint
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce"}
 

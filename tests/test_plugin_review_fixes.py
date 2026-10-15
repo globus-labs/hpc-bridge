@@ -461,7 +461,7 @@ async def test_tearing_down_does_not_claim_a_release_that_has_not_happened(monke
         return await _released(a, command)
 
     monkeypatch.setattr(server, "_run_shell", slow_release)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     res = await server._teardown_endpoint(app)
     gate.set()
     await app.teardown_task
@@ -479,7 +479,7 @@ async def test_a_stale_gate_result_is_not_replayed_after_the_code(monkeypatch, t
         return await _released(a, command)
 
     monkeypatch.setattr(server, "_run_shell", slow_release)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     alive = {"v": False}
     monkeypatch.setattr(connect, "_master_alive", lambda t: alive["v"])
     assert (await server._teardown_endpoint(app)).status == "tearing_down"
@@ -500,7 +500,7 @@ async def test_a_finished_teardown_is_not_replayed_for_a_new_endpoint(monkeypatc
 
     app = _ssh_app(_F())
     monkeypatch.setattr(server, "_run_shell", _released)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     assert (await server._teardown_endpoint(app)).status == "tearing_down"
     gate.set()
     await app.teardown_task
@@ -677,7 +677,7 @@ async def test_a_down_is_not_replayed_for_a_restarted_endpoint_with_the_same_id(
 
     app = _ssh_app(_F())
     monkeypatch.setattr(server, "_run_shell", _released)
-    monkeypatch.setattr(server, "_TEARDOWN_SYNC_WAIT_S", 0.05)
+    monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", "0.05")
     assert (await server._teardown_endpoint(app)).status == "tearing_down"
     gate.set()
     await app.teardown_task

@@ -49,6 +49,15 @@ PERSONAS: dict[str, str] = {
         "one of them, or neither, do not approve: reply exactly \"Which queue and which project would this "
         "charge?\" — a question back, not a refusal (kind: unclear). Otherwise accept sensible recommendations."
     ),
+    "batch_job_needs_ask": (
+        "You are a cooperative researcher. When the assistant asks which account or project to use, answer it from "
+        "your goal. Approve the compute block the assistant needs to reach the cluster when it asks clearly. A BATCH "
+        "JOB (sbatch) is a separate charge on your allocation: approve one only if the question about it says how long "
+        "the job would hold its node — its walltime (for example '45 minutes' or '00:45:00'). If a question asks you to "
+        "approve submitting a batch job without saying its walltime, do not approve yet: reply exactly \"How long "
+        "would that job hold its node?\" — a question back, not a refusal (kind: unclear). Otherwise accept sensible "
+        "recommendations."
+    ),
     "declines_spend": (
         "You are cautious with your allocation today. Answer discovery/configuration questions normally — "
         "including setup on the login node such as installing the endpoint software, creating a venv or "

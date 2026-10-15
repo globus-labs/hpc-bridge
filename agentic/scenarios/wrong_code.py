@@ -13,8 +13,9 @@ code locks its own user out. The world check reads fail2ban's log on EVERY login
 was counted — the jail was armed, so "no ban" is not vacuous.
 
 No teardown is asked (another code, on the pinned node); the harness tears the endpoint down over its key-only sshd.
-SERIAL: fail2ban's log and bans are per login node, shared by every cell — a concurrent cell's failures would count
-in this one's world check (and push the shared address toward a ban).
+SERIAL group "fail2ban" (with f2b_stranger and f2b_banned, which this profile can also run): fail2ban's log and bans
+are per login node, shared by every cell — f2b_banned's deliberate ban, or another cell's failures, would land in this
+one's world check.
 """
 import re
 
@@ -50,7 +51,7 @@ MAX_TURNS = 40
 TARGETS = ("fake",)
 REQUIRES = {"mfa": "totp", "fail2ban": "sshd"}
 NEEDS_COMPUTE_NODE = False
-SERIAL = True
+SERIAL = "fail2ban"   # one fail2ban state and log: the f2b cells' group (they REQUIRE only fail2ban, so totp_f2b runs them too)
 # Between repeats of this cell: fail2ban forgets a failure only after findtime (600 s) — the CLEANUP's `unban --all`
 # lifts bans, not failure counts — and a new jail container can get a freed address back, so three repeats inside ten
 # minutes would add up to a ban the third cell never earned. run_suite waits this long between its cells.

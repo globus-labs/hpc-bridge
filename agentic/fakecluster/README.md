@@ -161,9 +161,15 @@ python3 agentic/run_suite.py --target fake --scenarios happy_path,endpoint_reuse
 #   ^ runs bin/up.sh first (build if needed, wait until schedulable + sshd); --reset-cluster wipes it first;
 #     --no-cluster-up skips that. The node gate probes `sinfo` through the published sshd as a pool user.
 python3 agentic/run_suite.py --target fake --profile site --reset-cluster --scenarios rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,ssh_account_floor
-python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,term_switch_reasks,preset_account_scoped
+python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios fake_mep_compute,fake_mep_stop_names_block,fake_mep_stop_while_provisioning,fake_mep_no_account,term_switch_reasks,preset_account_scoped,mep_hand_batch_job
 #   ^ the facility-MEP path against the fake managers (a local catalog names their UUIDs — see below); the stop names
-#     the block it cannot cancel (#178)
+#     the block it cannot cancel (#178), also when it comes before the block is up (a check still queued); an sbatch
+#     from inside the block is spend hpc-bridge does not track (#176) — `mep_hand_batch_job_ask` is its persona twin
+#     (batch_job_needs_ask: the agent asks first, naming the walltime; the Claude or an ACP operator)
+#     Every cell of the `mep` profile runs as ONE mapped account, hpcbmep (one block, one queue, one
+#     `scancel -u hpcbmep` cleanup), so they share a SERIAL group: run_suite runs them one at a time whatever
+#     --concurrency says. The lock is per process: run two suites on `mep` (one per operator) one after the
+#     other, and never a run_smoke.sh mep cell beside a suite.
 python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios terms_prestated,terms_wanted
 #   ^ the spend-terms personas: the user names the partition and account up front / approves only a question that
 #     names both. The Claude operator gates them; HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1 runs
@@ -216,6 +222,7 @@ python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --
 #   profile's deregister.sh FIRST — a one-off container on the mep-state + mep-tools volumes runs
 #   `globus-compute-endpoint delete` per manager — so wiping never orphans records (HPCB_FAKE_KEEP_REGISTRATIONS=1 skips).
 HPCB_TARGET=fake ./agentic/run_smoke.sh spend_refusal          # one cell
+HPCB_TARGET=fake ./agentic/run_smoke.sh teardown_slow_fs       # a slow teardown (#91): `tearing_down`, the call again, only what the run created removed
 HPCB_TARGET=fake ./agentic/sweep_pool_user.sh hpcbridge-test-00 # hand sweep (rarely needed: --reset-cluster instead)
 ```
 
@@ -250,8 +257,8 @@ agentic/fakecluster/bin/down.sh --wipe && agentic/fakecluster/bin/up.sh
 cells that belong to it (the map is in the script; a hermetic test keeps it honest), writing `agentic/runs/sweep-<stamp>.md`
 plus one log per profile. Baseline 2026-09-05: 31 cells over 9 profiles, all passing after one chaos-hook fix; the
 `hostile` profile (2 canary cells) and `spend_revoked` (on `default`) then joined — all three verified live — so the
-sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. It now runs 53 over 11 profiles: the 52
-cells of the script's map (22 on `default`, 10 on `site`, 8 on `mep`, the rest one or two per profile) plus the no-skill
+sweep ran 34 cells over 10 profiles — see the vault's `Planned/V1 release.md`. It now runs 57 over 11 profiles: the 56
+cells of the script's map (23 on `default`, 10 on `site`, 11 on `mep`, the rest one or two per profile) plus the no-skill
 `spend_gate_enforced` run on `default`. That is the paid (Claude) wave; `HPCB_OPERATOR=codex|pi|hermes21` makes it the free wave, which
 leaves out the script's `paid_only()` (a persona, PHASES, a hook that needs the SDK interrupt). The scenarios
 it does NOT sweep are listed with their reasons in the script's `excluded()`, and the summary prints them. Its

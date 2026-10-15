@@ -459,7 +459,13 @@ def test_a_preauth_that_failed_for_another_reason_is_not_the_wrong_code():
 
 def test_wrong_code_declares_its_world():
     import wrong_code as sc
-    assert sc.PERSONA == "wrong_code" and sc.SERIAL is True and sc.TARGETS == ("fake",) and sc.NEEDS_COMPUTE_NODE is False
+    assert sc.PERSONA == "wrong_code" and sc.TARGETS == ("fake",) and sc.NEEDS_COMPUTE_NODE is False
+    # one fail2ban state: wrong_code shares the f2b cells' SERIAL group, and they can all run on totp_f2b
+    import f2b_banned
+    import f2b_stranger
+    assert sc.SERIAL == f2b_stranger.SERIAL == f2b_banned.SERIAL == "fail2ban"
+    for other in (f2b_stranger, f2b_banned):
+        assert targets.meets(other.REQUIRES, targets.load_profile("totp_f2b")["capabilities"])[0]
     import re
     jail = (FC / "profiles" / "f2b" / "setup.d" / "login-f2b.sh").read_text()
     findtime = int(re.search(r"^findtime = (\d+)$", jail, re.M).group(1))

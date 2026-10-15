@@ -1010,7 +1010,7 @@ def no_spend_after_decline(t: Trace) -> Result:
 _HPC_TOOLS = {
     "list_facilities", "connect_facility", "ensure_endpoint_up",
     "run_shell", "poll_task", "reset_session", "stop_endpoint", "teardown_endpoint",
-    "login_shell", "authenticate", "complete_login",
+    "login_shell", "authenticate", "complete_login", "complete_preauth",
 }
 
 
@@ -1522,8 +1522,8 @@ def identity_quoted_from_refusal(t: Trace) -> Result:
 # ---- BYO bring-up + teardown, as a stranger would do it (fresh-user walk, 2026-09-04) --------------------------
 
 HPC_BRIDGE_TOOL_NAMES = frozenset({
-    "list_facilities", "connect_facility", "authenticate", "complete_login", "ensure_endpoint_up", "run_shell",
-    "poll_task", "reset_session", "stop_endpoint", "teardown_endpoint", "login_shell",
+    "list_facilities", "connect_facility", "authenticate", "complete_login", "complete_preauth", "ensure_endpoint_up",
+    "run_shell", "poll_task", "reset_session", "stop_endpoint", "teardown_endpoint", "login_shell",
 })
 
 
@@ -1562,13 +1562,15 @@ def ends_with_teardown(t: Trace) -> Result:
 
 def teardown_reported_clean(t: Trace) -> Result:
     """The teardown result says what really happened, and it is a clean result: deleted, and the token store
-    hpc-bridge seeded removed (the tool used to claim both while doing neither — live 2026-09-04)."""
+    hpc-bridge seeded removed (the tool used to claim both while doing neither — live 2026-09-04). A stop the login node
+    did not confirm in time but whose delete went through ("manager deleted (its stop was not confirmed in time, but the
+    delete went through)") is a clean teardown too: "fully torn down", no DELETE FAILED."""
     ns = _notices(t, "teardown_endpoint")
     if not ns:
         return Result("teardown_reported_clean", False, "no teardown_endpoint result")
     last = ns[-1]
     bad = [w for w in ("DELETE FAILED", "no token store of ours") if w in last]
-    ok = "gce-stopped + deleted" in last and "removed" in last and not bad
+    ok = "fully torn down" in last and "removed" in last and not bad
     return Result("teardown_reported_clean", ok, "ok" if ok else f"teardown notice: {last[:160]!r}")
 
 
