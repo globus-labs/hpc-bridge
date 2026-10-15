@@ -55,6 +55,11 @@ installed plugin only when that version changes); git tags mark releases.
   to give the partition in the details and the account to `ensure_endpoint_up`. A configuration cached from an earlier
   session that carries one is refused with that reason. A registry entry may not set them either, in
   `defaults.extra` or by a directive in its `scheduler_options`: dropped on read, refused at ingest.
+- **A password you paste is never said back to you.** In a live test, the agent refused a password the user pasted
+  in place of a one-time code, then asked them to change it by quoting the password back. The skill now says to
+  refuse it, to say that it is now in the transcript and should be changed (without restating it), and to give the
+  `preauth_command` for the user's own terminal. When `complete_preauth` refuses something that is not a one-time
+  code, its notice says the same: if it was the user's password, tell them to change it, and never repeat it.
 
 ### Fixed
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew

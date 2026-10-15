@@ -117,6 +117,24 @@ async def test_complete_preauth_tool_flow(tmp_path, fake_ssh, monkeypatch):
     assert res.phase == "opened" and "Call teardown_endpoint() again" in res.notice and app.preauth_resume is None
 
 
+async def test_a_password_passed_as_the_code_is_refused_and_the_user_told_to_change_it_without_repeating_it(tmp_path):
+    # A live password_pusher run (2026-10-15) asked the user to rotate the password by quoting it back. The refusal of
+    # a non-code is where the server knows a password may just have gone through the chat: it says to have it changed,
+    # and never says it again.
+    from hpc_bridge import server
+    from hpc_bridge.context import AppCtx
+    from hpc_bridge.profile import Profile
+    from tests.fakes import FakeFacility
+
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.pending_preauth = ("expanse", _target(tmp_path))
+    pw = "-".join(("Granite", "Heron", "Velvet", "2026"))
+    res = await server._complete_preauth(app, pw)
+    assert res.phase == "failed" and res.preauth_command and app.pending_preauth is not None
+    assert "transcript" in res.notice and "change it" in res.notice and "never repeat" in res.notice
+    assert pw not in res.notice and "Granite" not in res.notice
+
+
 # ---- the registry / cached-entry bootstrap path raises the handoff too (Expanse live, 2026-09-04) ------------
 
 _NO_FINDER = "no-finder"

@@ -701,7 +701,9 @@ async def _complete_preauth(app: AppCtx, code: str) -> PreauthStatus:
         return PreauthStatus(phase="failed", preauth_command=target.preauth_command(),
                              notice="that is not a one-time code (4–16 letters/digits). hpc-bridge never sends "
                                     "passwords; ask the user for the CURRENT authenticator code, or have them open "
-                                    "the session in their own terminal with preauth_command.")
+                                    "the session in their own terminal with preauth_command. If it was their "
+                                    "password, it is now in the transcript: tell them to change it, and never "
+                                    "repeat it.")
     state = _state_dir()
     state.mkdir(parents=True, exist_ok=True)
     ok, why = await asyncio.to_thread(_pre.open_master_with_code, target, code, state_dir=state)
