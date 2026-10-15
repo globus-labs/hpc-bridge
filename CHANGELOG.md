@@ -399,6 +399,36 @@ installed plugin only when that version changes); git tags mark releases.
   cancel on PBS now takes only the pool user's own jobs (with other users' jobs visible, it had sent the mapped
   account's pilot to a `qdel` that was refused and still said "cancelled"), and on both schedulers it reports what
   the cancel answered.
+- **INFRA: a cell whose model endpoint failed is no longer graded FAILED.** On 2026-10-14/15, ALCF's streaming
+  endpoint answered HTTP 200 carrying `StreamingTimeoutError`. Pi then ended with an empty answer and no tool call, and
+  each such cell failed `agent_engaged`, `compute_ran` and the rest, like a product regression. Now `run.py` records
+  `RESULT: INFRA: <reason>` (exit code 4; the bundle's `result` is `INFRA` and its new `infra_reason` field says why).
+  A cell is INFRA when the operator made no hpc-bridge call and either its own record ends on a model error (Pi's
+  `Stream ended without finish_reason`, Codex's `turn.failed`), or its final answer is one (`StreamingTimeoutError`, an
+  HTTP 5xx or 429), or, having made no tool call at all, it exited non-zero, errored, or answered nothing. A cell with
+  even one hpc-bridge call is graded as before. INFRA never hides a failed safety floor or world check. The Claude
+  operators are INFRA only on an API server error (5xx, overloaded). `regrade.py` derives the same verdict from a
+  stored bundle. Over the 787 stored bundles, 5 that main grades FAIL are INFRA: Pi's stream failure, Codex's two
+  endpoint refusals, a hermes run on Llama with no reply at all, and a hermes ACP session that died before its first
+  call. Each made no tool call; nothing else changed. `run_suite.py` counts INFRA cells apart (`3/4 passed · 1
+  infra`) and leaves them out of the pass rates.
+- **`run_smoke.sh` checks the ALCF endpoint before a free operator's cell** (`agentic/harness/alcf_probe.py`). It sends
+  one tiny chat completion, streamed for `pi` and `hermes21`, plain for `codex` and `hermes`, as each operator asks.
+  Healthy means HTTP 200, a `finish_reason`, and no error in the answer. If the endpoint is unhealthy, the probe tries
+  again every 30 s for up to `HPCB_ALCF_WAIT_S` seconds (default 0: once). If it is still unhealthy, the cell is not
+  launched: its bundle is INFRA with the probe's reason, and the exit code is 4. The bearer goes to the probe through
+  the environment, never its argv, and is redacted from anything it prints or writes.
+- **`sweep_profiles.sh --operators pi,codex,hermes21`** runs the free wave for several operators with each profile
+  booted once: 10 cluster boots for the three operators, not 30. Each summary row names its operator, and each
+  profile+operator has its own log. **`--paid-only`** runs only the `paid_only()` cells on the Claude operator (18
+  cells on 6 profiles), and does not boot a profile without one. The summary ends with OK, FAILED and INFRA totals,
+  per operator. Without the flags the sweep runs as before.
+- The simulated user's unused prose paths (`HumanSim.reply`, `reply_hermes`, `_parse_reply`, `last_reply_scripted`)
+  are gone; since #197 every runner asks `HumanSim.move`. Their tests went with them, except one: the check that only
+  a rejected code is answered by the script again now drives `move`.
+- Hermetic tests: `agentic/harness/test_infra.py` and `test_alcf_probe.py` (both in the CI list; the probe's HTTP
+  layer, clock and sleep are stubbed, and `run_smoke.sh` runs with stub `uv` and `docker`), and the sweep's loop in
+  `test_sweep_script.py` with stub `run_suite.py` and `run_smoke.sh`.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

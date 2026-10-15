@@ -3,8 +3,18 @@
 # it — the regression baseline across cluster shapes. Sequential (one cluster at a time); each profile's cells run
 # through run_suite with the usual node gate. Results land in agentic/runs/ (bundles) and a per-sweep summary file.
 #
-#   agentic/sweep_profiles.sh [--models claude-opus-5] [--profiles default,site,...]
+#   agentic/sweep_profiles.sh [--models claude-opus-5] [--profiles default,site,...] [--operators a,b,…] [--paid-only]
 #   HPCB_OPERATOR=pi agentic/sweep_profiles.sh      # the FREE wave: codex / pi / hermes21 on the ALCF model
+#   agentic/sweep_profiles.sh --operators pi,codex,hermes21   # the free wave for three operators, each profile booted
+#                                                    # ONCE (--reset-cluster) and its cells run for each operator in turn;
+#                                                    # every summary row is tagged [operator], one log per profile+operator
+#   agentic/sweep_profiles.sh --paid-only            # the Claude operator on the paid_only() cells only — the half the
+#                                                    # free wave cannot drive; a profile with none is not booted
+#
+# A free operator's cell first probes the ALCF endpoint (run_smoke.sh → agentic/harness/alcf_probe.py) and waits up to
+# HPCB_ALCF_WAIT_S seconds (default 0) for it to be healthy; if it is not, the cell is not run and is recorded INFRA. A
+# cell whose operator produced nothing because its model endpoint failed mid-run is INFRA too (run.py). The summary
+# counts INFRA apart from OK and FAILED ("## totals"): not a verdict on hpc-bridge.
 #
 # The agent model defaults to run_suite's DEFAULT_MODEL (claude-opus-5); the human-sim is Haiku. Never Fable unless
 # asked. `mep` and `pbs_mep` are skipped unless HPCB_MEP_EMAIL is set in agentic/.env (their managers register a
@@ -17,7 +27,9 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep"
-while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;; *) echo "unknown arg $1"; exit 2;; esac; done
+OPERATORS=""; PAID_ONLY=""
+while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;;
+  --operators) OPERATORS="$2"; shift 2;; --paid-only) PAID_ONLY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
 [ -f "$HERE/agentic/.env" ] && while IFS= read -r line || [ -n "$line" ]; do case "$line" in ''|\#*) continue ;; esac; k="${line%%=*}"; [ -z "${!k+x}" ] && export "$line"; done < "$HERE/agentic/.env"
 STAMP="$(date +%Y%m%d-%H%M)"
 SUMMARY="$HERE/agentic/runs/sweep-$STAMP.md"; mkdir -p "$HERE/agentic/runs"
@@ -79,36 +91,69 @@ mep_hand_batch_job_ask
 PAID
 }
 
-OPERATOR="${HPCB_OPERATOR:-claude}"
-case "$OPERATOR" in
-  codex|pi|hermes21) FREE_WAVE=1; echo "free wave: operator $OPERATOR — leaving out paid_only()" | tee -a "$SUMMARY" ;;
-  *) FREE_WAVE= ;;
-esac
+free_op() { case "$1" in codex|pi|hermes21) return 0 ;; *) return 1 ;; esac; }
+
+# The operators, in the order each profile runs them: --operators (each row then tagged [operator]), else HPCB_OPERATOR
+# (default claude) as before. --paid-only is the Claude operator's: the paid_only() cells are what the others cannot drive.
+TAGGED="${OPERATORS:+1}"
+IFS=, read -ra OPS <<< "${OPERATORS:-${HPCB_OPERATOR:-claude}}"
+for op in "${OPS[@]}"; do
+  case "$op" in claude|claude-acp|hermes|codex|pi|hermes21) ;; *) echo "sweep: unknown operator $op"; exit 2 ;; esac
+  if [ -n "$PAID_ONLY" ] && [ "$op" != claude ]; then
+    echo "sweep: --paid-only runs the paid_only() cells, which only the claude operator drives (not $op)"; exit 2
+  fi
+  if free_op "$op"; then echo "free wave: operator $op — leaving out paid_only()" | tee -a "$SUMMARY"; FREE_WAVE=1; fi
+done
+[ -z "${FREE_WAVE:-}" ] || echo "free wave: HPCB_ALCF_WAIT_S=${HPCB_ALCF_WAIT_S:-0} — each cell probes the ALCF endpoint first; an unhealthy one is recorded INFRA, not run" | tee -a "$SUMMARY"
+[ -z "$PAID_ONLY" ] || echo "paid only: the paid_only() cells, Claude operator" | tee -a "$SUMMARY"
+
+cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator runs here (order kept)
+  if [ -n "$PAID_ONLY" ]; then tr ',' '\n' <<< "$2" | grep -xF -f <(paid_only) | paste -sd, -
+  elif free_op "$1"; then tr ',' '\n' <<< "$2" | grep -vxF -f <(paid_only) | paste -sd, -
+  else echo "$2"; fi
+}
 
 IFS=, read -ra PROFS <<< "$PROFILES"
 for prof in "${PROFS[@]}"; do
-  read -r scen conc <<< "$(cells "$prof")"
-  [ -n "$scen" ] || { echo "sweep: unknown profile $prof"; continue; }
-  if [ -n "$FREE_WAVE" ]; then
-    dropped="$(tr ',' '\n' <<< "$scen" | grep -xF -f <(paid_only) | paste -sd, -)"
-    scen="$(tr ',' '\n' <<< "$scen" | grep -vxF -f <(paid_only) | paste -sd, -)"
-    [ -z "$dropped" ] || echo "## $prof — free wave leaves out (paid_only): $dropped" | tee -a "$SUMMARY"
-    [ -n "$scen" ] || { echo "## $prof — SKIPPED (every cell is paid-only)" | tee -a "$SUMMARY"; continue; }
-  fi
+  read -r all conc <<< "$(cells "$prof")"
+  [ -n "$all" ] || { echo "sweep: unknown profile $prof"; continue; }
   if { [ "$prof" = mep ] || [ "$prof" = pbs_mep ]; } && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
     echo "## $prof — SKIPPED (HPCB_MEP_EMAIL unset in agentic/.env)" | tee -a "$SUMMARY"; continue
   fi
-  echo "## $prof — $(date +%H:%M) — $scen" | tee -a "$SUMMARY"
-  python3 "$HERE/agentic/run_suite.py" --target fake --profile "$prof" --reset-cluster --models "$MODELS" \
-      --scenarios "$scen" --concurrency "$conc" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$prof.log" \
-      | grep -E "done |skip |SUITE|passed" | sed 's/^/    /' | tee -a "$SUMMARY"
-  if [ "$prof" = default ]; then
-    # the server-side spend floor needs the skill WITHHELD (the agent follows the literal order) — run_smoke.sh honours HPCB_NO_SKILL
-    echo "    spend_gate_enforced (no-skill ablation):" | tee -a "$SUMMARY"
-    HPCB_TARGET=fake HPCB_FAKE_PROFILE=default HPCB_SKIP_BUILD=1 HPCB_NO_SKILL=1 HPCB_MODEL="$MODELS" \
-      "$HERE/agentic/run_smoke.sh" spend_gate_enforced 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-default-spend_gate.log" \
-      | grep -E "RESULT:" | tail -1 | sed 's/^/    spend_gate_enforced — /' | tee -a "$SUMMARY"
-  fi
+  RESET=--reset-cluster   # the profile's first run boots it clean; its other operators reuse that cluster
+  for op in "${OPS[@]}"; do
+    tag="${TAGGED:+ [$op]}"
+    scen="$(cells_for "$op" "$all")"
+    if [ -z "$PAID_ONLY" ] && free_op "$op"; then
+      dropped="$(tr ',' '\n' <<< "$all" | grep -xF -f <(paid_only) | paste -sd, -)"
+      [ -z "$dropped" ] || echo "## $prof$tag — free wave leaves out (paid_only): $dropped" | tee -a "$SUMMARY"
+    fi
+    if [ -z "$scen" ]; then
+      if [ -n "$PAID_ONLY" ]; then echo "## $prof — SKIPPED (--paid-only: no paid_only() cell here; not booted)" | tee -a "$SUMMARY"
+      else echo "## $prof$tag — SKIPPED (every cell is paid-only)" | tee -a "$SUMMARY"; fi
+      continue
+    fi
+    echo "## $prof$tag — $(date +%H:%M) — $scen" | tee -a "$SUMMARY"
+    HPCB_OPERATOR="$op" python3 "$HERE/agentic/run_suite.py" --target fake --profile "$prof" ${RESET:+"$RESET"} --models "$MODELS" \
+        --scenarios "$scen" --concurrency "$conc" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$prof${TAGGED:+-$op}.log" \
+        | grep -E "done |skip |SUITE|passed" | sed "s/^/    ${TAGGED:+[$op] }/" | tee -a "$SUMMARY"
+    RESET=
+    if [ "$prof" = default ] && [ -z "$PAID_ONLY" ]; then
+      # the server-side spend floor needs the skill WITHHELD (the agent follows the literal order) — run_smoke.sh honours HPCB_NO_SKILL
+      echo "    ${TAGGED:+[$op] }spend_gate_enforced (no-skill ablation):" | tee -a "$SUMMARY"
+      HPCB_OPERATOR="$op" HPCB_TARGET=fake HPCB_FAKE_PROFILE=default HPCB_SKIP_BUILD=1 HPCB_NO_SKILL=1 HPCB_MODEL="$MODELS" \
+        "$HERE/agentic/run_smoke.sh" spend_gate_enforced 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-default-spend_gate${TAGGED:+-$op}.log" \
+        | grep -E "RESULT:" | tail -1 | sed "s/^/    ${TAGGED:+[$op] }spend_gate_enforced — /" | tee -a "$SUMMARY"
+    fi
+  done
+done
+# INFRA apart from OK and FAILED: the operator's model endpoint failed (or the ALCF probe found it unhealthy and the cell
+# was not run) — nothing about hpc-bridge. Counted off the RESULT the rows above carry, per operator when tagged.
+tally() { grep -cE "$1" "$SUMMARY" || true; }
+for op in "${OPS[@]}"; do
+  p="${TAGGED:+\[$op\] .*}"
+  echo "## totals${TAGGED:+ [$op]} — OK $(tally "${p}RESULT: OK") · FAILED $(tally "${p}RESULT: FAILED") · INFRA $(tally "${p}RESULT: INFRA") (the model endpoint failed: not graded)" | tee -a "$SUMMARY"
+  [ -n "$TAGGED" ] || break
 done
 echo "## not swept (by design — see excluded() in agentic/sweep_profiles.sh)" >> "$SUMMARY"
 excluded | sed 's/^/    /' >> "$SUMMARY"

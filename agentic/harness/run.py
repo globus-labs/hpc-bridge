@@ -8,6 +8,10 @@ The scenario's PROMPT may contain ``{facility}`` — we fill it with a per-run u
 (``globus1-<runid>``) so each run is a distinct SESSION FACILITY. NB: since #27 the server keys the
 endpoint NAME on the ssh_host (not the facility id), so concurrent runs isolate by their distinct
 pool USER, and teardown deletes this user's ``hpc-bridge-*`` endpoints by enumeration (name-agnostic).
+
+Exit codes (the RESULT line and the bundle's `result` say the same): 0 OK · 1 FAILED (or CRASHED) · 2 SETUP FAILED,
+SKIPPED or an unknown scenario · 3 RATE_LIMITED · 4 INFRA (the operator produced nothing to grade because its model
+endpoint failed — infra.py; run_smoke.sh's ALCF probe exits 4 too) · 130 INTERRUPTED.
 """
 from __future__ import annotations
 
@@ -40,6 +44,7 @@ from cluster_ops import (
     token_store_cleanup_cmd,
     uep_dirs_cleanup_cmd,
 )
+from infra import INFRA_RC, infra_reason, outcome_of
 from invariants import (
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -1010,6 +1015,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     gating: set[str] = set()
     failed: list[str] = []
     result_label = "CRASHED"  # replaced below; a bundle written from an exception path says so (INTERRUPTED on a signal)
+    infra: str | None = None  # why the cell is INFRA, not FAILED (infra.py)
     endpoint_logs = ""
     probe: tuple[list[str], list[str]] | None = None
     torn_down = checked_after_teardown = False
@@ -1212,6 +1218,12 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             rc = 3
             result_label = "RATE_LIMITED"
             print("RESULT: RATE_LIMITED — session/rate limit; run not graded, suite should halt")
+        elif failed and (infra := infra_reason(outcome_of(operator, res.trace, res.messages, res.final), failed)):
+            # The operator produced nothing to grade because its MODEL ENDPOINT failed (no hpc-bridge call; an empty or
+            # error answer, or the operator died): not a verdict on hpc-bridge. Its own rc, so a sweep counts it apart.
+            rc = INFRA_RC
+            result_label = "INFRA"
+            print(f"RESULT: INFRA: {infra}{tail}")
         elif failed:
             result_label = "FAILED"
             print(f"RESULT: FAILED — critical checks broke: {failed}{tail}")
@@ -1264,6 +1276,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             gating=sorted(gating),
             failed=failed,
             result=result_label,
+            infra_reason=infra,
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
             # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
             extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),

@@ -8,7 +8,9 @@ against every past run without re-running any agent:
 For each bundle: rebuild the Trace, run the universal registry + the scenario's
 EXTRA_INVARIANTS, and diff per-invariant verdicts against what record.json stored (world:
 postchecks are skipped — they measured the live cluster, which is gone). Reports verdict
-flips and fresh critical failures, then a summary.
+flips and fresh critical failures, then a summary. A failing bundle whose operator produced
+nothing to grade because its model endpoint failed is reported INFRA, as run.py decides it
+live (infra.py), and does not count as "would now grade FAIL".
 """
 from __future__ import annotations
 
@@ -21,6 +23,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parents[0] / "scenarios"))
 
+from infra import PREFLIGHT_ROW, bundle_final, infra_reason, outcome_of  # noqa: E402
 from invariants import (  # noqa: E402
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -81,11 +84,41 @@ def bundle_trace(d: Path, rec: dict) -> Trace:
     return trace_from_bundle(d)
 
 
+def _rows(d: Path) -> list:
+    """messages.jsonl's rows as stored (unparseable lines skipped)."""
+    out = []
+    for line in (d / "messages.jsonl").read_text().splitlines():
+        if line.strip():
+            try:
+                out.append(json.loads(line))
+            except json.JSONDecodeError:
+                continue
+    return out
+
+
+def _preflight(rec: dict) -> str | None:
+    """A cell run_smoke.sh never launched — its ALCF probe found the model endpoint unhealthy (alcf_probe.py) — keeps the
+    probe's reason: there is no run to re-derive anything from."""
+    pre = next((g for g in rec.get("grading", []) if g.get("name") == PREFLIGHT_ROW and not g.get("ok")), None)
+    return None if pre is None else str(pre.get("detail") or "the model endpoint was unhealthy before launch")
+
+
+def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str]) -> str | None:
+    """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None."""
+    if not crit_fail_names or rec.get("rc") == 3 or rec.get("result") not in (None, "OK", "FAILED", "INFRA"):
+        return None   # INFRA replaces a graded FAILED only: never RATE_LIMITED, INTERRUPTED, SETUP FAILED or CRASHED
+    world_failed = [g["name"] for g in rec.get("grading", []) if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    rows = _rows(d)
+    operator = (rec.get("config") or {}).get("operator") or "claude"
+    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + world_failed)
+
+
 def regrade(runs_dir: Path, *, strict: bool = False) -> int:
     """Replay every bundle. `strict`: exit 1 when any bundle would now grade FAIL (a CI guard over a golden
     corpus). The completion gate is re-derived from the persisted `rc`/`final` — a bundle with rc=1 and every
-    trace row PASS used to re-grade as OK (review 2026-09-05, 2.5)."""
-    bundles = flips = now_failing = 0
+    trace row PASS used to re-grade as OK (review 2026-09-05, 2.5). An INFRA bundle is reported, never counted as
+    "would now grade FAIL"."""
+    bundles = flips = now_failing = now_infra = 0
     for d in sorted(runs_dir.iterdir()):
         if not (d / "record.json").exists() or not (d / "messages.jsonl").exists():
             continue
@@ -95,6 +128,11 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         scen_name = cfg.get("scenario", "?")
         old = {g["name"]: g["ok"] for g in rec.get("grading", [])
                if not g["name"].startswith("world:")}
+        pre = _preflight(rec)
+        if pre is not None:   # run_smoke.sh never launched the cell (its ALCF probe): nothing to re-grade
+            now_infra += 1
+            print(f"[INFRA] {d.name}  (not launched)\n        INFRA: {pre[:200]}")
+            continue
 
         t = insert_interjections(bundle_trace(d, rec), [e for e in rec.get("events") or [] if e.get("interject")])
         t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
@@ -133,11 +171,20 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         crit_fail_names = [r.name for r in results if not r.ok and r.name in critical]
         label = (f"{cfg.get('persona') or 'auto'}"
                  f"{', ~skill' if cfg.get('ablate_skill') else ''}")
-        tag = "FAIL" if crit_fail_names else "OK  "
-        if crit_fail_names:
+        infra = bundle_infra(d, rec, t, crit_fail_names)
+        tag = "INFRA" if infra else "FAIL" if crit_fail_names else "OK  "
+        if infra:
+            now_infra += 1
+        elif crit_fail_names:
             now_failing += 1
-        mark = "  <-- verdict change" if (changed or fresh_crit_fails) else ""
+        stored = rec.get("result")
+        infra_change = stored in ("FAILED", "INFRA") and (stored == "INFRA") != bool(infra)
+        mark = "  <-- verdict change" if (changed or fresh_crit_fails or infra_change) else ""
         print(f"[{tag}] {d.name}  ({label}){mark}")
+        if infra:
+            print(f"        INFRA: {infra[:200]}")
+        if infra_change:
+            print(f"        stored {stored} -> now {tag.strip()}")
         for n, o, w in changed:
             flips += 1
             print(f"        flip {n}: {'PASS' if o else 'FAIL'} -> {'PASS' if w else 'FAIL'}"
@@ -145,7 +192,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         for r in fresh_crit_fails:
             print(f"        new critical FAIL {r.name} — {r.detail[:110]}")
     print(f"\n{bundles} bundles re-graded · {flips} per-invariant verdict flips · "
-          f"{now_failing} would now grade FAIL")
+          f"{now_failing} would now grade FAIL · {now_infra} INFRA (the model endpoint failed: not graded)")
     return 1 if (strict and now_failing) else 0
 
 

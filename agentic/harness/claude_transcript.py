@@ -25,7 +25,8 @@ from typing import Any
 from invariants import ToolCall, Trace
 from trace_adapter import _result_to_dict
 
-# The human-sim's prompts all open with this (human_sim.answer / reply / reply_hermes / move).
+# The human-sim's prompts all open with this (human_sim.answer / move; the retired reply / reply_hermes did too, and
+# older bundles carry their sessions).
 SIM_PROMPT_PREFIX = "You are role-playing a HUMAN USER"
 
 
