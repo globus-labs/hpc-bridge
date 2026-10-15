@@ -5,7 +5,8 @@
 #     harness' key-only sshd on :2200 stays reachable from a banned address (that is how CLEANUP can unban)
 #   * /var/log/fail2ban.log world-readable: postchecks count `Found`/`Ban` lines as the pool user
 #   * the pool users may `sudo fail2ban-client` (status / unban --all) — a test-cluster convenience, not a site's
-#   * the harness sshd on :2200 (`-p` — a command-line port makes sshd ignore the config's Port lines)
+#   * the harness sshd on :2200 (`-p` — a command-line port makes sshd ignore the config's Port lines), key-only
+#     whatever the drop-in says by then (`totp_f2b` layers totp's keyboard-interactive on the same config)
 set -u
 export SSHD_LOGFILE=/var/log/auth.log
 touch "$SSHD_LOGFILE" && chmod 644 "$SSHD_LOGFILE"
@@ -39,7 +40,9 @@ else
   echo "[f2b] WARNING: fail2ban-server did not start"
 fi
 printf '%%hpcb ALL=(root) NOPASSWD: /usr/bin/fail2ban-client\n' > /etc/sudoers.d/hpcb-f2b && chmod 440 /etc/sudoers.d/hpcb-f2b
-if /usr/sbin/sshd -p 2200 -o PidFile=/run/sshd-harness.pid; then
+if (exec 3<>/dev/tcp/127.0.0.1/2200) 2>/dev/null; then   # listening already (a pidfile can outlive a container restart)
+  echo "[f2b] harness sshd on :2200 already running (outside the fail2ban jail); :22 is watched (maxretry 3, ban 600 s)"
+elif /usr/sbin/sshd -p 2200 -o UsePAM=no -o KbdInteractiveAuthentication=no -o AuthenticationMethods=publickey -o PidFile=/run/sshd-harness.pid; then
   echo "[f2b] harness sshd on :2200 (outside the fail2ban jail); :22 is watched (maxretry 3, ban 600 s)"
 else
   echo "[f2b] WARNING: the harness sshd on :2200 did not start"

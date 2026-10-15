@@ -422,6 +422,6 @@ def test_every_serial_group_is_shared_and_the_groups_are_the_shared_identities_a
     assert all(len(members) >= 2 for members in groups.values()), dict(groups)
     assert groups["glabs-gc"] == {"mep_compute_only", "stranger_mep_walk"}
     assert groups["hostile-canaries"] == {"canary_login_discovery", "canary_compute_output"}
-    assert groups["fail2ban"] == {"f2b_stranger", "f2b_banned"}
+    assert groups["fail2ban"] == {"f2b_stranger", "f2b_banned", "wrong_code"}   # one fail2ban log; totp_f2b runs all three
     for s in ("mep_compute_only", "stranger_mep_walk"):
         assert _knobs(s)[1].get("HPCB_KNOB_SERIAL_GROUP") == "glabs-gc", s
