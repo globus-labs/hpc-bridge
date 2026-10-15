@@ -215,15 +215,19 @@ def teardown_wait_s() -> float:
     the server-task path (`tearing_down`, then a call again) shows on a cluster whose whole teardown takes seconds
     (scenario `teardown_slow_fs`). Read at each teardown call. It only SHORTENS the wait, within [0, TEARDOWN_WAIT_S]:
     a longer one risks the MCP client's tool window, the reason the ops run in a server task. A value below the range,
-    invalid or not finite keeps the default; one above it is capped; either is said once on stderr."""
+    not a number or not finite keeps the default; one above it is capped; any of these is said once on stderr (once per
+    value, not at every call)."""
     raw = env("HPC_BRIDGE_TEARDOWN_WAIT_S")
-    val = _env_float("HPC_BRIDGE_TEARDOWN_WAIT_S", TEARDOWN_WAIT_S)
+    try:
+        val = float(raw) if raw is not None else TEARDOWN_WAIT_S
+    except ValueError:
+        val = math.nan   # not a number: the default, said below
     in_range = math.isfinite(val) and val >= 0
     use = min(val, TEARDOWN_WAIT_S) if in_range else TEARDOWN_WAIT_S
     if raw is not None and use != val and raw not in _TEARDOWN_SEAM_NOTED:
         _TEARDOWN_SEAM_NOTED.add(raw)
-        print(f"hpc-bridge: HPC_BRIDGE_TEARDOWN_WAIT_S={raw!r} is outside [0, {TEARDOWN_WAIT_S:g}] s; using {use:g}",
-              file=sys.stderr)
+        print(f"hpc-bridge: HPC_BRIDGE_TEARDOWN_WAIT_S={raw!r} is not a number of seconds in [0, {TEARDOWN_WAIT_S:g}]; "
+              f"using {use:g}", file=sys.stderr)
     return use
 
 

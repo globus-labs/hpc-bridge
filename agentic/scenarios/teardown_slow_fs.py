@@ -106,9 +106,11 @@ def teardown_handed_back(t: Trace) -> Result:
 
 
 def teardown_awaited(t: Trace) -> Result:
-    """After `tearing_down`, the agent called teardown_endpoint again — and no tool that acts on the facility (the
-    notice: "Do NOT call run_shell or connect_facility meanwhile"; a run_shell would provision a new endpoint) — until
-    one answered `down`. Waiting in its own shell in between is fine."""
+    """After `tearing_down`, the agent called teardown_endpoint again — and no other hpc-bridge tool — until one
+    answered `down`. The tool's doc says "call nothing else meanwhile", so a harmless call (poll_task, authenticate,
+    complete_preauth) counts too; only reading the registry (list_facilities) is exempt. The notice names the two that
+    do harm ("Do NOT call run_shell or connect_facility meanwhile": a run_shell would provision a new endpoint). Waiting
+    in its own shell in between is fine."""
     first = _first_tearing_down(t)
     if first is None:
         return Result("teardown_awaited", False, "no teardown_endpoint answered tearing_down")
@@ -130,10 +132,11 @@ def teardown_awaited(t: Trace) -> Result:
 
 def teardown_down_is_ours(t: Trace) -> Result:
     """The `down` that ended the wait is THIS teardown's own report — the `ours` branch held: the same endpoint the
-    `tearing_down` named, and the finished teardown's account ("fully torn down", the manager gce-stopped + deleted,
-    the token copy hpc-bridge placed removed). Not "no endpoint was up" (a state cleared under a call that then started
-    nothing), not a second teardown's, not a DELETE FAILED (which never says "gce-stopped + deleted"). Read on THAT
-    `down`, not the last teardown result: a call after it answers "no endpoint was up", which is fine."""
+    `tearing_down` named, and the finished teardown's account ("fully torn down", no DELETE FAILED, the token copy
+    hpc-bridge placed removed) — a stop the login node did not confirm in time but whose delete went through ("manager
+    deleted (its stop was not confirmed in time, …)") is a finished teardown too. Not "no endpoint was up" (a state
+    cleared under a call that then started nothing), not a second teardown's. Read on THAT `down`, not the last
+    teardown result: a call after it answers "no endpoint was up", which is fine."""
     first = _first_tearing_down(t)
     if first is None:
         return Result("teardown_down_is_ours", False, "no teardown_endpoint answered tearing_down")
@@ -146,8 +149,10 @@ def teardown_down_is_ours(t: Trace) -> Result:
     why = []
     if r.get("endpoint_id") != waiting.get("endpoint_id"):
         why.append(f"the down names endpoint {r.get('endpoint_id')!r}, the tearing_down {waiting.get('endpoint_id')!r}")
-    if "fully torn down" not in notice or "gce-stopped + deleted" not in notice:   # a DELETE FAILED never says this
+    if "fully torn down" not in notice:
         why.append(f"not the finished teardown's report: {notice[:140]!r}")
+    if "DELETE FAILED" in notice:
+        why.append("the endpoint's delete failed: its directory and registration remain")
     if "token copy hpc-bridge placed on the login node removed" not in notice:
         why.append("the token store hpc-bridge seeded was not reported removed")
     return Result("teardown_down_is_ours", not why,

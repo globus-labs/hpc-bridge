@@ -165,6 +165,10 @@ python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scena
 #     the block it cannot cancel (#178), also when it comes before the block is up (a check still queued); an sbatch
 #     from inside the block is spend hpc-bridge does not track (#176) — `mep_hand_batch_job_ask` is its persona twin
 #     (batch_job_needs_ask: the agent asks first, naming the walltime; the Claude or an ACP operator)
+#     Every cell of the `mep` profile runs as ONE mapped account, hpcbmep (one block, one queue, one
+#     `scancel -u hpcbmep` cleanup), so they share a SERIAL group: run_suite runs them one at a time whatever
+#     --concurrency says. The lock is per process: run two suites on `mep` (one per operator) one after the
+#     other, and never a run_smoke.sh mep cell beside a suite.
 python3 agentic/run_suite.py --target fake --profile mep --reset-cluster --scenarios terms_prestated,terms_wanted
 #   ^ the spend-terms personas: the user names the partition and account up front / approves only a question that
 #     names both. The Claude operator gates them; HPCB_OPERATOR=hermes HPCB_HERMES_ACP=1 HPCB_BENCHMARK_MODE=1 runs

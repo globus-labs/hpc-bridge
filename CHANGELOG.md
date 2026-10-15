@@ -276,6 +276,22 @@ installed plugin only when that version changes); git tags mark releases.
 
   The MEP graders are tested in `agentic/harness/test_mep_scenarios.py` and the teardown ones in the new
   `test_teardown_scenarios.py` (now in the CI list), both against results the product itself builds.
+- **The fake-MEP cells run one at a time across scenarios.** `SERIAL` can name a group (`SERIAL = "hpcbmep"`), and
+  `run_suite.py` holds one lock per group; `SERIAL = True` still locks a scenario only against itself. The ten
+  scenarios that run as the fake MEP's mapped account share the group, and each cancels that account's jobs afterwards.
+  Before, two of them could run at once as `hpcbmep`: one's block answered the other's check, and each one's
+  `scancel -u hpcbmep` killed the other's block. Review fixes to the new scenarios:
+  - `fake_mep_stop_while_provisioning` starts from an empty `hpcbmep` queue (or refuses the cell), and counts only
+    pilots submitted since its start;
+  - `batch_job_asked` reads a question naming the job's 45 minutes as about the job, however the minutes are written
+    (Unicode hyphens, `45m`, "forty-five minutes", `2700 s`), and keeps that approval through a later plain yes;
+  - `stop_says_what_is_left` accepts a late answer with no job id, and `left_relayed` wants the commands as commands;
+  - `teardown_slow_fs` accepts a teardown whose stop was not confirmed in time but whose delete went through;
+  - `complete_preauth` counts as an hpc-bridge call.
+- **`run_smoke.sh` reads the running fake profile only off the stack's own service containers.** It took the first
+  container with the stack's compose project label; a one-off `docker run` of the compose-built image inherits that
+  label from the image, and one refused live cells as a profile mismatch. It now also requires
+  `com.docker.compose.oneoff=False`, which compose sets on the containers it creates for a service.
 
 ## 0.1.24 — 2026-10-13 — the endpoint's environment is checked, not trusted
 

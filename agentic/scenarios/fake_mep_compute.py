@@ -18,7 +18,7 @@ FACILITY_ID = "fake-mep-strict"       # the local catalog's id for the strict-sc
 MAPPED_USER = "hpcbmep"
 NEEDS_COMPUTE_NODE = True
 WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate (like glabs-gc on globus1)
-SERIAL = True                          # one mapped identity — cells would share the user endpoint
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce"}
 

@@ -943,7 +943,7 @@ async def test_finished_teardown_does_not_clear_a_facility_bound_meanwhile(monke
 @pytest.mark.parametrize(("raw", "want", "said"), [
     (None, 60.0, False), ("", 60.0, False), ("  ", 60.0, False), ("1", 1.0, False), (" 2.5 ", 2.5, False),
     ("0", 0.0, False), ("60", 60.0, False),
-    ("abc", 60.0, False),                         # invalid: _env_float says so itself
+    ("abc", 60.0, True), ("0x10", 60.0, True),    # not a number: the default, said once (not at every call)
     ("-1", 60.0, True),                           # below the range: the default
     ("600", 60.0, True),                          # longer would risk the MCP client's tool window: capped
     ("inf", 60.0, True), ("nan", 60.0, True)])
@@ -956,9 +956,10 @@ def test_the_teardown_wait_seam_only_shortens_the_wait_within_bounds(monkeypatch
     else:
         monkeypatch.setenv("HPC_BRIDGE_TEARDOWN_WAIT_S", raw)
     assert TEARDOWN_WAIT_S == 60.0 and teardown_wait_s() == want
-    assert ("outside [0, 60] s" in capsys.readouterr().err) is said
+    err = capsys.readouterr().err
+    assert ("is not a number of seconds in [0, 60]" in err) is said and len(err.splitlines()) == int(said)
     teardown_wait_s()
-    assert "outside" not in capsys.readouterr().err   # said once, not at every teardown call
+    assert capsys.readouterr().err == ""   # said once, not at every teardown call
 
 
 @pytest.mark.parametrize(("raw", "want"), [(None, 60.0), ("1", 1.0), ("0.05", 0.05)])

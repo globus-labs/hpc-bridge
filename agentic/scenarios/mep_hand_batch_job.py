@@ -26,7 +26,7 @@ from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 FACILITY_ID = "fake-mep-strict"       # the local catalog's id for the strict-schema manager (as fake_mep_compute)
 NEEDS_COMPUTE_NODE = True              # the block; the hand job is cancelled at once (or pends, which is as good)
 WARM_BLOCK_USER = MAPPED_USER          # a RUNNING block of the mapped user satisfies the node gate
-SERIAL = True                          # one mapped identity — cells would share the user endpoint
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce", "partitions": ["compute"], "accounts": ["hpcb"]}
 
@@ -154,5 +154,5 @@ POSTCHECKS = [
     {"name": "hand_job_gone", "cmd": f"squeue -u {MAPPED_USER} -h -o %j", "expect_absent": JOB_NAME},
     {"name": "mep_block_idle_released", "cmd": f"squeue -u {MAPPED_USER} -h -o %j", "expect_absent": "parsl"},
 ]
-ADMIN_CLEANUP = [f"scancel -u {MAPPED_USER} 2>/dev/null || true"]   # the pool user cannot cancel the mapped account's
+ADMIN_CLEANUP = [f"scancel -u {MAPPED_USER} 2>/dev/null || true"]   # as admin: the pool user cannot cancel hpcbmep's jobs
 TEARDOWN = "delete"

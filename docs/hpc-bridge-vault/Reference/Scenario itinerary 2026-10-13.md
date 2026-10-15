@@ -251,6 +251,8 @@ Since the 09-08/09 campaign, no persona cell has run on any operator except `blo
 > World: a pilot of the mapped account WAS submitted during the cell (sacct since a SETUP stamp, so "gone" is not
 > vacuous) and none is left, polled after a 240 s settle, up to 720 s. No `WARM_BLOCK_USER`: a running block would
 > break the premise. Hermetic: `agentic/harness/test_mep_scenarios.py`, against the product's own stop result.
+> Every fake-MEP cell now shares the SERIAL group `hpcbmep` (one lock per group in `run_suite.py`): they all run
+> as that one account, and `SERIAL = True` had kept a scenario only from overlapping itself.
 - `mep_stop_is_draining_only` checks the status only.
 - `revocation_honoured` counts any `down` as released, so a MEP teardown detach (`down` while the block bills) would pass it.
 - Unchecked by any scenario:

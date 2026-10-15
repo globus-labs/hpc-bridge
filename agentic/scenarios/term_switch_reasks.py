@@ -26,7 +26,7 @@ from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 FACILITY_ID = "fake-mep-strict"
 NEEDS_COMPUTE_NODE = 2                 # the debug block bills on (idling out) while the compute block starts
 WARM_BLOCK_USER = MAPPED_USER
-SERIAL = True                          # one mapped identity — cells would share the user endpoint
+SERIAL = "hpcbmep"     # a GROUP: every fake-MEP cell runs as hpcbmep — one block, one queue, one scancel -u
 TARGETS = ("fake",)
 REQUIRES = {"mep": "consent-free", "accounting": "enforce", "partitions": ["debug", "compute"]}
 

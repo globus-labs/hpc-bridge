@@ -215,3 +215,32 @@ def test_teardown_slow_fs_decoys_are_not_ours_and_the_world_check_reads_them(tmp
     assert not (gce / sc._DECOY_UEP).exists() and not (gce / sc._DECOY_FILE).exists()
     gone = {pc["name"]: pc for pc in sc.POSTCHECKS}
     assert gone["token_store_gone"]["expect_empty"] and gone["endpoint_dir_gone"]["expect_empty"]
+
+
+# --- review of 975b709 ------------------------------------------------------------------------------------------------
+
+
+def test_teardown_down_is_ours_accepts_the_products_unconfirmed_stop_whose_delete_went_through(monkeypatch, results):
+    # server._finish_teardown's honest down when the stop timed out but the delete happened: a finished teardown too
+    import teardown_slow_fs as sc
+    down = _product_teardown(monkeypatch, report={"stopped": None, "deleted": True, "credentials_wiped": True,
+                                                  "ssh_closed": True})[1]
+    assert down["status"] == "down" and "but the delete went through" in down["notice"]
+    r = sc.teardown_down_is_ours(_trace(_td(results[0]), _td(down)))
+    assert r.ok, r.detail
+
+
+def test_teardown_awaited_counts_every_other_hpc_bridge_call_harmless_ones_too(results):
+    # the tool's doc: "call nothing else meanwhile" — a poll, a login check or a one-time code counts as well
+    import teardown_slow_fs as sc
+    from invariants import HPC_BRIDGE_TOOL_NAMES
+    waiting, down, _after = results
+    assert "complete_preauth" in HPC_BRIDGE_TOOL_NAMES
+    for name in ("poll_task", "authenticate", "complete_preauth"):
+        t = _trace(_td(waiting), ToolCall.of(f"mcp__endpoint__{name}", {}, {}), _td(down))
+        r = sc.teardown_awaited(t)
+        assert not r.ok and name in r.detail, name
+    assert "call nothing else meanwhile" in sc.teardown_awaited.__doc__
+    # complete_preauth is an hpc-bridge call: one after the teardown is the last hpc-bridge call
+    t = _trace(_td(waiting), _td(down), ToolCall.of("mcp__endpoint__complete_preauth", {"code": "123456"}, {}))
+    assert not sc.ends_with_teardown(t).ok

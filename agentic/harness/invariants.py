@@ -1477,8 +1477,8 @@ def identity_quoted_from_refusal(t: Trace) -> Result:
 # ---- BYO bring-up + teardown, as a stranger would do it (fresh-user walk, 2026-09-04) --------------------------
 
 HPC_BRIDGE_TOOL_NAMES = frozenset({
-    "list_facilities", "connect_facility", "authenticate", "complete_login", "ensure_endpoint_up", "run_shell",
-    "poll_task", "reset_session", "stop_endpoint", "teardown_endpoint", "login_shell",
+    "list_facilities", "connect_facility", "authenticate", "complete_login", "complete_preauth", "ensure_endpoint_up",
+    "run_shell", "poll_task", "reset_session", "stop_endpoint", "teardown_endpoint", "login_shell",
 })
 
 

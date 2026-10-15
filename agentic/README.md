@@ -343,6 +343,8 @@ NEEDS_COMPUTE_NODE = True        # nodes the cell occupies (True=1, an int, Fals
                                  #   minus blocks claimed by launches in the last 300 s cover the need.
 WARM_BLOCK_USER = "glabs-gc"        # optional: a facility MEP's running block (that user's) satisfies the need instead
 SERIAL = True                    # one cell at a time (a shared facility identity, or a cell that holds every node)
+SERIAL = "hpcbmep"               #   or a GROUP: one cell at a time across EVERY scenario naming it (the fake-MEP
+                                 #   cells all run as hpcbmep); the lock is per run_suite process
 TARGETS = ("fake",)              # optional: only these targets (chaos scenarios kill things)
 REQUIRES = {"login_nodes": 2}    # optional: cluster capabilities needed (matched against the target/profile manifest); a
                                  #   list-valued capability is a membership test — {"partitions": ["debug"], "accounts": ["hpcb"]};
