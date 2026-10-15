@@ -243,8 +243,10 @@ python3 agentic/repl_sweep.py --repeat 6 --targets fake,globus1   # add the lab 
 ```
 
 Keep `--concurrency 3` (globus1 SSH headroom + the subscription 5h/7d cap; big sweeps → API creds). Compute cells
-are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs every node
-and runs alone. Cleanup guarantees: `run.py` tears down its own endpoint + blocks in its `finally` (also on
+are node-gated automatically (declared or derived `NEEDS_COMPUTE_NODE`); a `saturation` cell needs every node, so
+the node gate keeps every compute cell off while it runs (a cell needing no node may still run beside it; a true
+run-alone flag is a TODO in `saturation.py`). SERIAL groups — `hpcbmep` (the fake MEP), `glabs-gc` (the lab MEP),
+`hostile-canaries`, `fail2ban` — run one cell at a time across their scenarios. Cleanup guarantees: `run.py` tears down its own endpoint + blocks in its `finally` (also on
 `docker stop`, which now reaches it via SIGTERM) and deletes the run's endpoint RECORDS from the Globus Compute service
 through the SDK (the login-node `gce delete` deregisters only while the pool user still holds the credentials — four
 `hpc-bridge-fake-<runid>` records had accumulated in the owner's console by 2026-09-06); `run_suite` cleans up the cells it abandons on Ctrl-C (it mints

@@ -287,7 +287,16 @@ installed plugin only when that version changes); git tags mark releases.
     (Unicode hyphens, `45m`, "forty-five minutes", `2700 s`), and keeps that approval through a later plain yes;
   - `stop_says_what_is_left` accepts a late answer with no job id, and `left_relayed` wants the commands as commands;
   - `teardown_slow_fs` accepts a teardown whose stop was not confirmed in time but whose delete went through;
-  - `complete_preauth` counts as an hpc-bridge call.
+  - `complete_preauth` counts as an hpc-bridge call, for `agent_engaged` too.
+
+  The other cells that share a state got a group as well: the two hostile canary cells (`hostile-canaries`: the
+  canary channels are per-node), the two fail2ban cells (`fail2ban`: one ban state and log), and the two lab-MEP cells
+  (`glabs-gc`: one mapped account; `mep_compute_only` had no `SERIAL` at all). `saturation` keeps its own lock: the node
+  gate already keeps every compute cell off while it holds every node, and a true run-alone flag is a TODO.
+  `teardown_reported_clean` accepts a teardown whose stop was not confirmed but whose delete went through, as
+  `teardown_down_is_ours` does.
+- A unit test that read the wall clock failed in the minutes before local midnight: a bound ~11 minutes ahead is
+  tomorrow, and the notice rightly names its date. The clock-time tests now freeze the notices' wall clock at noon.
 - **`run_smoke.sh` reads the running fake profile only off the stack's own service containers.** It took the first
   container with the stack's compose project label; a one-off `docker run` of the compose-built image inherits that
   label from the image, and one refused live cells as a profile mismatch. It now also requires

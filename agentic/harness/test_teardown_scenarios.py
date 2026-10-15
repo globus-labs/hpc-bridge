@@ -244,3 +244,17 @@ def test_teardown_awaited_counts_every_other_hpc_bridge_call_harmless_ones_too(r
     # complete_preauth is an hpc-bridge call: one after the teardown is the last hpc-bridge call
     t = _trace(_td(waiting), _td(down), ToolCall.of("mcp__endpoint__complete_preauth", {"code": "123456"}, {}))
     assert not sc.ends_with_teardown(t).ok
+
+
+def test_teardown_reported_clean_accepts_the_products_delete_that_went_through(monkeypatch, results):
+    # the generic grader byo_teardown_clean gates: the same honest result teardown_down_is_ours accepts
+    from invariants import teardown_reported_clean
+    went_through = _product_teardown(monkeypatch, report={"stopped": None, "deleted": True, "credentials_wiped": True,
+                                                          "ssh_closed": True})[1]
+    assert teardown_reported_clean(_trace(_td(went_through))).ok
+    assert teardown_reported_clean(_trace(_td(results[1]))).ok
+    for report in ({"stopped": True, "deleted": False, "credentials_wiped": True, "ssh_closed": True},   # DELETE FAILED
+                   {"stopped": True, "deleted": True, "credentials_wiped": False, "ssh_closed": True}):  # store kept
+        down = _product_teardown(monkeypatch, report=report)[1]
+        assert not teardown_reported_clean(_trace(_td(down))).ok, down["notice"][:120]
+    assert not teardown_reported_clean(_trace(_td(results[0]))).ok   # tearing_down is not a clean result

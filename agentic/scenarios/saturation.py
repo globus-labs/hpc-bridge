@@ -108,5 +108,10 @@ TEARDOWN = "delete"
 # The run-scoped teardown cancels ONLY this run's `uep.<eid>` blocks (cluster_ops.scoped_cancel_cmd) — the sleepers
 # are the HARNESS's jobs, so the scenario names its own cleanup (run by run.py after postchecks, whatever happened).
 CLEANUP = ['scancel -u "$(whoami)" -n hpcb-sat 2>/dev/null; echo "sleepers cancelled: $(squeue -u \"$(whoami)\" -h -n hpcb-sat | wc -l) left"']
-SERIAL = True                # holds every node: never alongside another cell
+# It must run beside no other cell. SERIAL = True only keeps two saturation cells apart; what keeps the others off is
+# the node gate: it admits this cell only when every node is idle (NEEDS_COMPUTE_NODE = all of them, in-flight
+# launches counted), and admits no compute cell while the sleepers hold them. A cell that needs no node (login shape
+# only) may still run beside it, which does not touch its premise. TODO(run-alone): an exclusive flag in run_suite
+# that waits for the suite to drain and holds every other cell back, if a login-only neighbour ever matters.
+SERIAL = True
 NEEDS_COMPUTE_NODE = _NODES  # SETUP needs EVERY node idle to saturate them for real (else the sleepers PEND)

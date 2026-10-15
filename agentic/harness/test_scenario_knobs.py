@@ -406,3 +406,22 @@ def test_idle_probe_counts_free_pbs_nodes_on_a_pbs_target(monkeypatch):
     assert mod._idle_nodes() == 2 and "pbsnodes" in seen[0] and "sinfo" not in seen[0]
     monkeypatch.setattr(mod, "_probe_ssh", lambda cmd: "pbsnodes: Server has no node list\n")
     assert mod._idle_nodes() is None   # an error message is not a state column
+
+
+def test_every_serial_group_is_shared_and_the_groups_are_the_shared_identities_and_states():
+    # a group named by one scenario only is a typo or a stale name: it would lock nothing against anything
+    import importlib
+    from collections import defaultdict
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    groups = defaultdict(set)
+    for p in sorted((HERE.parent / "scenarios").glob("*.py")):
+        serial = getattr(importlib.import_module(p.stem), "SERIAL", False)
+        if isinstance(serial, str):
+            groups[serial].add(p.stem)
+    assert set(groups) == {"hpcbmep", "glabs-gc", "hostile-canaries", "fail2ban"}, dict(groups)
+    assert all(len(members) >= 2 for members in groups.values()), dict(groups)
+    assert groups["glabs-gc"] == {"mep_compute_only", "stranger_mep_walk"}
+    assert groups["hostile-canaries"] == {"canary_login_discovery", "canary_compute_output"}
+    assert groups["fail2ban"] == {"f2b_stranger", "f2b_banned"}
+    for s in ("mep_compute_only", "stranger_mep_walk"):
+        assert _knobs(s)[1].get("HPCB_KNOB_SERIAL_GROUP") == "glabs-gc", s

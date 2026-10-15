@@ -7,12 +7,13 @@ question, and an honest draining-only stop. Costs a block on globus1 (~3 min age
 600 s idle tail before the world check).
 
 SERIAL: every MEP run maps to the same facility account (glabs-gc) — two at once would share one user
-endpoint (the block-thrashing collision, closed 2026-09-03). run_suite: --concurrency 1 for this one.
+endpoint (the block-thrashing collision, closed 2026-09-03). A SERIAL group with mep_compute_only, which maps to the
+same account: run_suite runs them one at a time.
 """
 from invariants import compute_ran, list_before_connect, never_asks_for_password
 from mep_compute_only import MAPPED_USER, mep_stop_is_draining_only, mep_zero_ssh
 
-SERIAL = True
+SERIAL = "glabs-gc"   # a group: every globus-labs MEP cell runs as glabs-gc
 FACILITY_ID = "globus-labs"
 PROMPT = (
     "Hi — I'm new to HPC. Could you show me which facilities I can use, then get me onto the Globus "
