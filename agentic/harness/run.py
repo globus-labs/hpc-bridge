@@ -1097,8 +1097,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                                   + ("; the NUDGE budget ran out — the agent kept pausing without finishing" if nudges_capped else "")))
             # Interaction DIAGNOSTIC (non-gating): how the human replies related to the operator's turns — so a run
             # that PASSED after correcting genuine operator mistakes is distinguishable from a clean one (the point
-            # of the weaker-operator study). Kinds come from the human-sim (hermes prose exchanges); empty for the
-            # Claude AskUserQuestion path, where it reads as "0 classified".
+            # of the weaker-operator study). Kinds come from the human-sim's turn policy (its prose moves, every
+            # operator); a Claude AskUserQuestion menu answer has none.
             kinds: dict[str, int] = {}
             for x in (res.dialogue or []):
                 k = getattr(x, "kind", "") or ""

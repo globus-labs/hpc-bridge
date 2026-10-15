@@ -113,8 +113,52 @@ def test_the_transcript_replay_loop_does_not_count_scripted_code_answers(hermes_
     monkeypatch.setattr(human_sim.HumanSim, "_ask", fake_ask)
     r = asyncio.run(hermes_runner.run_scenario("connect", repo_root=HERE.parents[1], persona="password_pusher"))
     scripted = [x for x in r.dialogue if x.scripted]
-    assert len(scripted) == 3 and r.prose_followups == 3 + hermes_runner.MAX_PROSE_FOLLOWUPS and r.followups_capped
+    assert len(scripted) == 3 and r.prose_followups == 3 + human_sim.MAX_PROSE_FOLLOWUPS and r.followups_capped
     # an ordinary persona is capped exactly as before: MAX_PROSE_FOLLOWUPS answers, then the cap
     turns[:] = ["Shall I continue?"] * 9
     r = asyncio.run(hermes_runner.run_scenario("connect", repo_root=HERE.parents[1], persona="cooperative"))
-    assert r.prose_followups == hermes_runner.MAX_PROSE_FOLLOWUPS and r.followups_capped
+    assert r.prose_followups == human_sim.MAX_PROSE_FOLLOWUPS and r.followups_capped
+
+
+def _replay(hermes_runner, monkeypatch, tmp_path, turns, outputs, persona="cooperative"):
+    """Drive hermes' transcript-replay loop: `turns` are the operator's closing texts, turn by turn; `outputs` the
+    human-sim model's, in order. Returns (result, the number of sim model calls, the number of hermes turns)."""
+    import human_sim
+    monkeypatch.delenv("HPCB_HERMES_ACP", raising=False)
+    monkeypatch.setenv("HPCB_HERMES_NO_CLARIFY", "1")
+    monkeypatch.setattr(hermes_runner, "_prepare", lambda ablate, extra: (tmp_path, {}))
+    turns, outputs, n = list(turns), list(outputs), {"ask": 0, "turn": 0}
+
+    async def fake_turn(prompt, env, timeout):
+        n["turn"] += 1
+        return 0, False
+
+    async def fake_ask(self, prompt, system):
+        n["ask"] += 1
+        return outputs.pop(0)
+    monkeypatch.setattr(hermes_runner, "_run_turn", fake_turn)
+    monkeypatch.setattr(hermes_runner, "_turn_final_text", lambda rows, after: turns.pop(0))
+    monkeypatch.setattr(human_sim.HumanSim, "_ask", fake_ask)
+    r = asyncio.run(hermes_runner.run_scenario("connect", repo_root=HERE.parents[1], persona=persona))
+    return r, n["ask"], n["turn"]
+
+
+def test_the_transcript_replay_loop_lets_the_sim_answer_a_hand_over_without_a_question_mark(hermes_runner, monkeypatch,
+                                                                                          tmp_path):
+    # it used a regex on the turn's tail, which missed "Say the word once it's open and I'll …" (2026-10-15)
+    r, asks, turns = _replay(hermes_runner, monkeypatch, tmp_path,
+                             ["Run that in your own terminal. Say the word once it's open and I'll reconnect.",
+                              "`hostname -f` printed login01.hpcb.test."],
+                             ['{"action": "reply", "reply": "It is open.", "kind": "answer", "reason": "it waits"}',
+                              '{"action": "conclude", "reply": "", "reason": "done"}'])
+    assert (turns, asks, r.prose_followups) == (2, 2, 1)
+    assert [x.kind for x in r.dialogue] == ["answer", "conclude"]
+    assert [c.name for c in r.trace.calls] == ["AskUserQuestion"]   # the prose exchange, stamped for the graders
+
+
+def test_the_transcript_replay_loop_nudges_a_pause_and_stops_on_a_tool_ending(hermes_runner, monkeypatch, tmp_path):
+    r, asks, turns = _replay(hermes_runner, monkeypatch, tmp_path,
+                             ["The login node is up. Next I'll check the partitions.", ""],
+                             ['{"action": "nudge", "reply": "Please carry on.", "reason": "it paused"}'])
+    assert (turns, asks, r.nudges, r.prose_followups) == (2, 1, 1, 0)   # the empty (tool-call) ending asks nothing
+    assert [c.name for c in r.trace.calls] == ["user_nudge"]           # a nudge is never a question answered

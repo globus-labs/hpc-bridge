@@ -36,7 +36,7 @@ from pathlib import Path
 
 import hermes_setup
 from hermes_trace import exchanges_from_messages, load_messages, stamp_exchanges, trace_from_messages
-from human_sim import ACP_MAX_TURNS, MAX_PROSE_FOLLOWUPS
+from human_sim import ACP_MAX_TURNS
 from runner import HPC_BRIDGE_TOOLS, RunResult  # shared dataclass + logical tool names
 
 _HERMES_BIN = "hermes"
@@ -143,7 +143,7 @@ class AcpResponder:
     person does next (`HumanSim.move` — reply / nudge / conclude) and send that, keeping the replies IN ORDER for the
     post-run stamping. `exchanges_from_messages` pairs each `user` row after the first with `replies[N]`, and a nudge
     is a user row like any answer, so nudges are recorded too (kind "nudge" → stamped as `user_nudge`, never as a
-    question). Turn CONTINUATION no longer hinges on `ends_with_question`; the guards (a standing decline is never
+    question). Turn CONTINUATION no longer hinges on a regex on the turn's tail; the guards (a standing decline is never
     nudged; each budget ends in conclude) live in the sim so they are tested there."""
 
     def __init__(self, human, persona: str | None) -> None:
@@ -290,17 +290,16 @@ async def run_scenario(
                          messages=rows)
 
     # ---- interactive: multi-turn prose loop with the persona'd human-sim (clarify already dropped in _prepare) ----
-    from human_sim import HumanSim, ends_with_question
+    from human_sim import HumanSim
     human = HumanSim(persona=persona, goal=user_goal, totp_secret=os.environ.get("HPCB_SIM_TOTP_SECRET") or None)
     lead = _lead(ablate_skill, interactive=True)
-    exchanges: list[dict] = []           # {call_index, question, answer, kind} -> stamped as synthetic AskUserQuestion
+    exchanges: list[dict] = []           # {call_index, question, answer, kind} -> stamped (a nudge as `user_nudge`)
     transcript: list[tuple[str, str]] = []
     per_turn_timeout = max(180, min(600, max_turns * 20))
-    # The first turn + up to MAX_PROSE_FOLLOWUPS answered follow-ups. A scripted persona's answers to a code request
-    # (human_sim.SCRIPTED_CODE_PERSONAS) are the scenario's provocation, not the operator looping: they do not count,
-    # and the sim stops scripting after MAX_SCRIPTED_CODE_ANSWERS, so the loop stays bounded.
-    budgeted = 0
-    capped = False
+    # After every turn that ends in prose, the human-sim decides what the user does next (HumanSim.move: reply / nudge /
+    # conclude), as in the ACP drivers — a regex on the turn's tail used to decide. The sim's guards bound the loop:
+    # MAX_PROSE_FOLLOWUPS answers (a scripted persona's answers to a code request are the scenario's provocation and do
+    # not count; the script stops after MAX_SCRIPTED_CODE_ANSWERS), MAX_NUDGES nudges, no nudge past a standing decline.
     rc, timed_out, prev_max = 1, False, 0
     print(f"  hermes: model={alcf_model} home={home} (interactive, persona={persona})", file=sys.stderr, flush=True)
     turn = -1
@@ -313,20 +312,18 @@ async def run_scenario(
         last_text = _turn_final_text(rows, prev_max)
         prev_max = max((int(r.get("id") or 0) for r in rows), default=prev_max)
         transcript.append(("assistant", last_text))
-        print(f"  hermes turn {turn + 1}: rc={rc} ({time.time() - t0:.0f}s) "
-              f"{'asked a question' if ends_with_question(last_text) else 'no question'}", file=sys.stderr, flush=True)
-        if rc != 0 or timed_out or not ends_with_question(last_text):
+        print(f"  hermes turn {turn + 1}: rc={rc} ({time.time() - t0:.0f}s)", file=sys.stderr, flush=True)
+        if rc != 0 or timed_out or not last_text.strip():
+            break   # an error, a timeout, or a turn that closed on tool calls (it said nothing to the user)
+        move = await human.move(last_text)
+        if move.action == "conclude":
+            print(f"  human({persona}) concludes [{move.reason}]", file=sys.stderr, flush=True)
             break
-        if budgeted == MAX_PROSE_FOLLOWUPS:
-            capped = True   # the operator is still asking — recorded, not hidden (a looping failure)
-            break
-        reply, kind, reason = await human.reply_hermes(last_text)
-        budgeted += 0 if (human.dialogue and human.dialogue[-1].scripted) else 1
         calls_so_far = len(trace_from_messages(rows).calls)
         exchanges.append({"call_index": max(0, calls_so_far - 1), "question": last_text[-1000:],
-                          "answer": reply, "kind": kind})
-        transcript.append(("user", reply))
-        print(f"  human({persona}) [{kind}{f': {reason}' if reason else ''}]: {reply}",
+                          "answer": move.reply, "kind": move.kind})
+        transcript.append(("user", move.reply))
+        print(f"  human({persona}) [{move.kind}{f': {move.reason}' if move.reason else ''}]: {move.reply}",
               file=sys.stderr, flush=True)
 
     rows = load_messages(db) if db.is_file() else []
@@ -336,6 +333,6 @@ async def run_scenario(
         trace=trace,
         final=HermesFinal(result=answer, is_error=(rc != 0) or timed_out,
                           session_id=(rows[0].get("session_id") if rows else None)),
-        messages=rows, dialogue=human.dialogue, prose_followups=len(exchanges), followups_capped=capped,
-        human_sim_model=human.model,
+        messages=rows, dialogue=human.dialogue, prose_followups=human.answers, followups_capped=human.followups_capped,
+        nudges=human.nudges, nudges_capped=human.nudges_capped, human_sim_model=human.model,
     )

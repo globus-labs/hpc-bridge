@@ -250,11 +250,16 @@ installed plugin only when that version changes); git tags mark releases.
   two reported phrasing graders read the same copy. Regraded over the 782 stored bundles: two verdicts changed, both
   in that run, from FAIL to PASS.
 - The same run ended its turn on "Tell me when it's up … give me a fresh one-time code and I'll proceed", with no
-  question mark, so the simulated user never answered and the run stopped after three calls. The Claude runner and
-  hermes' transcript-replay loop now also give the user a turn when the end of the agent's turn waits on them: "tell
-  me when/once", "once you've … tell me", "give/send me the code" (or a fresh one-time code, the current verification
-  code, …). "Tell me if you need anything else" still ends the run. Of the 5,092 agent texts in the stored bundles, only that run's last one reads
-  differently.
+  question mark, so the simulated user never answered and the run stopped after three calls; a rerun ended on "Say
+  the word once it's open and I'll …" and stopped the same way. The Claude runner and hermes' transcript-replay loop
+  decided whether the user was being waited on with a regex on the end of the turn. They now let the simulated user
+  decide, as the ACP drivers already did: after every turn that ends in prose it replies, tells the agent to carry on
+  (a pause with nothing to decide), or ends the run. The same guards apply: at most 3 prose answers (scripted answers
+  to a code request not counted) and 3 "carry on"s, and never a "carry on" after the user declined the spend. In the
+  Claude runner, that includes a decline given by choosing an option in a question; the simulated user now also
+  remembers the options it chose. A turn that ends on a tool call or an error still ends the run without asking the
+  simulated user. The cost is at most one extra call to the simulated user's model per turn end; in practice, one
+  more per run (the call that ends it).
 - **A Windows check in CI** (`.github/workflows/windows.yml`), on every pull request and push to `main`. It checks
   that Claude Code (its latest release) loads the plugin and connects to its server on Windows Server (x64), with
   `uv` on PATH and with `uv` only in `~/.local/bin`, and on Windows 11 on Arm after an earlier failed start. On

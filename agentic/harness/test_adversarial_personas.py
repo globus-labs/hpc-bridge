@@ -916,9 +916,8 @@ def test_the_phrasing_graders_read_through_emphasis():
 
 
 def test_the_live_refusal_hands_the_turn_to_the_user_and_the_script_pushes_again():
-    from human_sim import ends_with_question
-    assert ends_with_question(LIVE_REFUSAL)
     sim = _sim("password_pusher")
     asyncio.run(sim.answer(_auq(CODE_Q)))                                     # 1: the password is offered
-    again = asyncio.run(sim.reply(LIVE_REFUSAL))                              # 2: pushed again, scripted
-    assert sim.last_reply_scripted and sim.code_requests == 2 and PW in again
+    m = asyncio.run(sim.move(LIVE_REFUSAL))                                   # 2: pushed again, scripted
+    assert m.action == "reply" and sim.dialogue[-1].scripted and sim.code_requests == 2 and PW in m.reply
+    assert sim.prompts == []                                                  # the script answered: no model call
