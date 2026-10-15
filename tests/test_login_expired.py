@@ -15,7 +15,7 @@ from hpc_bridge.login import LOGIN_EXPIRED, LoginFlow, login_expired
 from hpc_bridge.profile import Profile
 from hpc_bridge.runner import CanaryResult, GlobusRunner
 from hpc_bridge.server import AppCtx, _authenticate, _cold_outcome, _ensure_endpoint_up, _run_shell, _shape_runtime
-from tests.fakes import FakeCatalog, FakeFacility, fake_mep_entry
+from tests.fakes import FakeCatalog, FakeFacility, fake_entry, fake_mep_entry
 from tests.test_server import _FakeRunner, _Res
 
 TOKEN_URL = "https://auth.globus.org/v2/oauth2/token"
@@ -295,3 +295,122 @@ async def test_connect_on_a_dead_login_names_it(monkeypatch):
     res = await server._connect_facility(app, "globus1")
     assert res.phase == "needs_account"  # it still attaches (the MEP's status is best-effort)
     assert DEAD in res.notice and "authenticate(force=True)" in res.notice
+
+
+# ---- connect gates on a stored login that no longer works, before anything else --------------------------------
+
+def _record(calls, name, result=None):
+    def fn(*a, **k):
+        calls.append(name)
+        return result
+    return fn
+
+
+@pytest.mark.parametrize("route", ["registry-ssh", "registry-mep", "details", "cached", "session-reconnect"])
+async def test_connect_on_a_dead_stored_login_asks_for_a_login_before_anything(route, monkeypatch):
+    from hpc_bridge.facility import remote
+    from hpc_bridge.models import FacilityDetails
+
+    calls = []
+    entries = {"registry-ssh": [fake_entry(id="anvil", facility_key="purdue")], "registry-mep": [fake_mep_entry()]}
+    monkeypatch.setattr(binding, "make_catalog", _record(calls, "catalog", FakeCatalog(entries.get(route, []))))
+    monkeypatch.setattr(binding, "_facility_from_entry", _record(calls, "facility"))
+    monkeypatch.setattr(binding, "_facility_store", _record(calls, "local cache"))
+    monkeypatch.setattr(remote, "build_minimal_storage_db", _record(calls, "token copy"))
+    app = _app_with(_flow(_StoredApp(fail=_dead_refresh())))
+    kw = {}
+    facility = {"registry-ssh": "anvil", "registry-mep": "globus1"}.get(route, "byo")
+    if route == "details":
+        kw["details"] = FacilityDetails(ssh_host="h.example.edu", interface="ib0", env_setup="true",
+                                        scratch_root="/s/{user}", partition="main")
+    if route == "session-reconnect":
+        app.session_facilities["byo"] = fake_entry(id="byo", facility_key="session")
+    res = await server._connect_facility(app, facility, **kw)
+    assert res.phase == "needs_login" and res.login_url and res.login_mode == "paste"
+    assert DEAD in res.notice and "first use" not in res.notice
+    assert calls == []  # no registry read, no local cache, no facility, nothing bootstrapped, no token copied
+    assert app.login_flow.status() == "waiting"
+
+
+async def _mep_connect(app, monkeypatch):
+    fac = MEPFacility.from_entry(fake_mep_entry(), client_factory=_OkClient)
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_mep_entry()]))
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: fac)
+    return await server._connect_facility(app, "globus1")
+
+
+class _OkClient:
+    def get_endpoint_status(self, endpoint_id):
+        return {"status": "online"}
+
+    def get_endpoint_metadata(self, endpoint_id):
+        return {}
+
+
+@pytest.mark.parametrize("stored", [_StoredApp(), _StoredApp(fail=requests.ConnectionError("Max retries exceeded"))],
+                         ids=["works", "unchecked"])
+async def test_connect_on_a_working_or_unchecked_login_carries_on(stored, monkeypatch):
+    flow = _flow(stored)
+    res = await _mep_connect(_app_with(flow), monkeypatch)
+    assert res.phase == "needs_account" and DEAD not in res.notice
+    assert flow.status() == "idle"  # no login armed
+
+
+async def test_connect_on_a_missing_login_keeps_the_first_use_reason(monkeypatch):
+    res = await _mep_connect(_app_with(_flow(_StoredApp(required=True))), monkeypatch)
+    assert res.phase == "needs_login" and "first use" in res.notice and DEAD not in res.notice
+
+
+async def test_connect_carries_on_when_the_relogin_lands_and_says_what_it_replaced(monkeypatch):
+    from hpc_bridge import login_gate
+
+    async def landed(flow, mode=None):
+        return object(), "done"
+
+    monkeypatch.setattr(login_gate, "_start_login_and_wait", landed)
+    monkeypatch.setattr(login_gate, "globus_identity_label", lambda: "alice@uni.edu")
+    res = await _mep_connect(_app_with(_flow(_StoredApp(fail=_dead_refresh()))), monkeypatch)
+    assert res.phase == "needs_account"
+    assert res.notice.startswith("Globus login landed as alice@uni.edu (") and DEAD in res.notice.split(". ")[0]
+
+
+# ---- the bare "hpc-bridge error: AuthAPIError …" sites name the dead login -------------------------------------
+
+def test_error_outcome_names_a_dead_login():
+    out = server._error_outcome(_dead_refresh())
+    assert DEAD in out.notice and "authenticate(force=True)" in out.notice and "oauth2/token" not in out.notice
+    assert out.notice.startswith("hpc-bridge error: AuthAPIError: ")
+    assert server._error_outcome(RuntimeError("boom")).notice == "hpc-bridge error: RuntimeError: boom"
+
+
+async def test_ensure_endpoint_up_provision_error_names_a_dead_login(monkeypatch):
+    from hpc_bridge import warmth
+
+    errors = {"exc": _dead_refresh()}
+
+    async def provision(app, shape, **kw):
+        raise errors["exc"]
+
+    monkeypatch.setattr(warmth, "_provision", provision)
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "down" and DEAD in res.notice and "authenticate(force=True)" in res.notice
+    errors["exc"] = RuntimeError("boom")
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.notice == "hpc-bridge error: RuntimeError: boom"
+
+
+async def test_connect_mep_attach_error_names_a_dead_login(monkeypatch):
+    from hpc_bridge import connect as connect_mod
+
+    errors = {"exc": _dead_refresh()}
+
+    async def ensure_warm(*a, **k):
+        raise errors["exc"]
+
+    monkeypatch.setattr(connect_mod, "ensure_warm", ensure_warm)
+    res = await _mep_connect(_app_with(None), monkeypatch)
+    assert res.phase == "failed" and DEAD in res.notice and "authenticate(force=True)" in res.notice
+    errors["exc"] = RuntimeError("status API down")
+    res = await _mep_connect(_app_with(None), monkeypatch)
+    assert res.phase == "failed" and res.notice == "hpc-bridge error: RuntimeError: status API down"

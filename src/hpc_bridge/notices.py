@@ -17,7 +17,7 @@ from .config import SYNC_WAIT_S, _task_ceiling_s
 from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _with_spend
 from .lifecycle import BlockState
-from .login import LOGIN_EXPIRED, LoginStart
+from .login import LOGIN_EXPIRED, LoginStart, login_expired
 from .models import ConnectFacilityResult, ShellOutcome, Submission
 from .runner import CanaryResult
 from .scheduler_ops import _submission_refused
@@ -259,12 +259,6 @@ def _spend_floor_guidance(app: AppCtx | None) -> str:
             "ensure_endpoint_up(confirm_spend=True) to proceed — or use shape='login' for free "
             "login-node work.")
 
-def _login_wait_s_UNUSED() -> float:
-    """How long a tool call waits for a browser login to land before returning needs_login. Long enough
-    for a real IdP round-trip (password + Duo), short enough to stay well under the flow's TTL and any
-    MCP tool timeout (run_shell already blocks far longer)."""
-    return config.login_wait_s()
-
 def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | None = None,
                   waited_s: float | None = None, why: str | None = None) -> str:
     """The agent-facing instructions for a login, by mode. Same discipline as needs_preauth: relay
@@ -293,13 +287,13 @@ def _login_notice(start: LoginStart, flow_error: str | None, *, facility: str | 
     ) + tail
 
 def _needs_login_result(facility: str, start: LoginStart, flow_error: str | None,
-                        waited_s: float | None = None) -> ConnectFacilityResult:
+                        waited_s: float | None = None, why: str | None = None) -> ConnectFacilityResult:
     return ConnectFacilityResult(
         phase="needs_login",
         facility=facility,
         login_url=start.login_url,
         login_mode=start.mode,
-        notice=_login_notice(start, flow_error, facility=facility, waited_s=waited_s),
+        notice=_login_notice(start, flow_error, facility=facility, waited_s=waited_s, why=why),
     )
 
 def _multiplexing_off_notice(host: str, resume: str = "connect_facility") -> str:
@@ -957,10 +951,19 @@ def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
         ),
     ))
 
+def _hpc_bridge_error(exc: BaseException) -> str:
+    """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
+    renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
+    if login_expired(exc):
+        return (f"hpc-bridge error: {type(exc).__name__}: {LOGIN_EXPIRED} — Globus refused to refresh it. Nothing is "
+                "wrong with the facility or its config: the user must log in to Globus again — call "
+                "authenticate(force=True) and give the user its link — then retry.")
+    return f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500]
+
 def _error_outcome(exc: Exception) -> ShellOutcome:
     return ShellOutcome(
         phase="failed",
         block_state="cold",
         exit_code=1,
-        notice=f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500],
+        notice=_hpc_bridge_error(exc),
     )

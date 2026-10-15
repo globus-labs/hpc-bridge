@@ -100,6 +100,7 @@ from .notices import (  # noqa: F401 - re-exported
     _dispatch_error_suffix,
     _error_outcome,
     _explain_provision_error,
+    _hpc_bridge_error,
     _identity_from_error,
     _idle_window_text,
     _left_block_state,
@@ -389,7 +390,7 @@ async def _ensure_endpoint_up(
                 session_spend=_total_session_spend(app),  # _provision stopped the clock: a down leaves none running
                 partition=active_partition,
                 account=active_account,
-                notice=said(f"hpc-bridge error: {type(exc).__name__}: {exc}"[:500]),
+                notice=said(_hpc_bridge_error(exc)),
             )
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             where = f" on {active_partition!r}" if active_partition else ""

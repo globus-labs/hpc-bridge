@@ -21,7 +21,13 @@ installed plugin only when that version changes); git tags mark releases.
     Globus, it still answers `logged_in` and says the login could not be checked;
   - the connect to a facility-run endpoint names the failed login instead of only "template not readable";
   - a command sent to a block still taken for warm, whose dispatch fails on the login (`Dispatch error:
-    AuthAPIError`), says so too.
+    AuthAPIError`), says so too;
+  - `connect_facility` checks the same way before anything else, and answers `needs_login` with the reason, as for a
+    missing login. Before, it went on: on an SSH facility the bootstrap would have copied the dead login to the
+    login node. When the check cannot reach Globus, the connect carries on as before;
+  - the remaining bare "hpc-bridge error: AuthAPIError …" answers (a failed endpoint start in `ensure_endpoint_up`,
+    a failed attach to a facility-run endpoint, a tool error) say the login no longer works and point at
+    `authenticate(force=True)`.
 - **The plugin starts on Windows on Arm.** One of the server's dependencies, `cryptography`, has published no
   Windows-on-Arm build since 46.0.3. On an Arm Python, the first start tried to build it from source, failed for
   want of OpenSSL, and Claude Code showed only `Failed to reconnect to plugin:hpc-bridge … CONNECTION_CLOSED`.
