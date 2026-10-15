@@ -220,7 +220,8 @@ def test_fake_mep_stop_while_provisioning_world_and_coupling():
     assert [pc["name"] for pc in sc.POSTCHECKS] == ["mep_pilot_submitted", "mep_pilot_idle_released"]
     poll = sc.POSTCHECKS[1]
     assert sc.POSTCHECK_DELAY_S + sc._POLL * 15 <= 720 and poll["timeout"] > sc._POLL * 15   # the MEP settle bound
-    assert sc.ADMIN_CLEANUP == ["scancel -u hpcbmep 2>/dev/null || true"] and sc._STAMP in sc.CLEANUP[0]
+    assert sc.ADMIN_CLEANUP[-1] == "scancel -u hpcbmep 2>/dev/null || true" and sc._STAMP in sc.CLEANUP[0]
+    assert "set MaxJobs=-1" in sc.ADMIN_CLEANUP[0]   # the hold never outlives the cell
 
 
 def _world(home, cmd, *, squeue_runs=("",), sacct="", scancel_clears=False):
@@ -540,7 +541,7 @@ def test_the_stop_while_provisioning_cell_starts_from_an_empty_mapped_queue(tmp_
     # the premise must not depend on cell order: ADMIN_SETUP cancels whatever of hpcbmep is left, waits for an empty
     # queue, and refuses the cell (non-zero) if it never empties
     import fake_mep_stop_while_provisioning as sc
-    (setup,) = sc.ADMIN_SETUP
+    setup = sc.ADMIN_SETUP[0]
     rc, out = _world(tmp_path / "a", setup, squeue_runs=("61 parsl.Gl\n",), scancel_clears=True)
     assert rc == 0 and "hpcbmep queue empty" in out and "-u hpcbmep" in (tmp_path / "a" / "scancel.args").read_text()
     rc, out = _world(tmp_path / "b", setup, squeue_runs=("61 parsl.Gl\n",), scancel_clears=False)
@@ -566,12 +567,20 @@ def test_stop_says_what_is_left_accepts_a_block_whose_job_id_is_unknown():
     assert not r2.ok and "its job id is unknown here" in r2.detail
 
 
+def _confirming(status, latency=None):
+    """The confirming ensure_endpoint_up, with the call's latency (t_call/t_result) when the operator recorded one."""
+    c = _ensure(status, shape="compute", confirm_spend=True)
+    if latency is not None:
+        c.t_call, c.t_result = 10.0, 10.0 + latency
+    return c
+
+
 def test_stopped_while_provisioning_says_who_saw_the_block_up():
     import fake_mep_stop_while_provisioning as sc
-    # the confirming call itself answered up: the cluster already had a block (the world, not the agent)
-    world = Trace([_connect("needs_account"), _ensure("up", shape="compute", confirm_spend=True), _product_stop("61")])
+    # the confirming call answered up at once: a block of the mapped account was already up (the world, not the agent)
+    world = Trace([_connect("needs_account"), _confirming("up", 1.2), _product_stop("61")])
     r = sc.stopped_while_provisioning(world)
-    assert not r.ok and "the confirming call (call 1) answered 'up'" in r.detail and "already" in r.detail
+    assert not r.ok and "already up BEFORE the confirming call" in r.detail and "1.2 s" in r.detail
     # the confirming call answered provisioning; a later poll answered up: the agent called again although told not to
     polled = _prov_trace(_product_stop("61"), before=[_ensure("up", shape="compute", confirm_spend=True)])
     r = sc.stopped_while_provisioning(polled)
@@ -614,3 +623,112 @@ def test_batch_job_asked_keeps_an_approval_naming_the_walltime_unless_a_later_jo
     # the 30-minute block question names no job walltime: still not an approval of the job
     assert not sc.batch_job_asked(_ask_trace(_q("Start the compute block (30 min)? I will then submit the job from it.",
                                                 "Yes"))).ok
+
+
+
+# --- live 2026-10-15 (codex, a59ab24): the block came up INSIDE the confirming call's 8 s wait ---------------------------
+
+
+def test_stopped_while_provisioning_tells_a_block_started_during_the_confirming_call_from_one_already_up():
+    # the live record: call 1 took 7.1 s and answered up (worker live on c1) — nothing was up before it; the fake
+    # cluster started the block inside the call's own wait
+    import fake_mep_stop_while_provisioning as sc
+    during = sc.stopped_while_provisioning(Trace([_connect("needs_account"), _confirming("up", 7.1), _product_stop("19")]))
+    assert not during.ok and "premise not met" in during.detail
+    assert "came up DURING the confirming call" in during.detail and "7.1 s" in during.detail
+    assert "hold" in during.detail and "BEFORE" not in during.detail
+    before = sc.stopped_while_provisioning(Trace([_connect("needs_account"), _confirming("up", 0.9), _product_stop("19")]))
+    assert not before.ok and "already up BEFORE the confirming call" in before.detail and "DURING" not in before.detail
+    # an operator that records no call timing: said as unknown, never guessed
+    unknown = sc.stopped_while_provisioning(Trace([_connect("needs_account"), _confirming("up"), _product_stop("19")]))
+    assert not unknown.ok and "no call timing" in unknown.detail
+    # a provisioning answer, however long it took, is the premise met
+    assert sc.stopped_while_provisioning(Trace([_connect("needs_account"), _confirming("provisioning", 9.0),
+                                                _product_stop()])).ok
+
+
+def _admin(home, cmd, *, hold_takes=True):
+    """Run one of the scenario's admin commands (as on slurmctld) against stubs, with HOME and TMPDIR = `home`:
+    sacctmgr logs its args and keeps hpcbmep's MaxJobs (0 once set, unless `hold_takes` is False; cleared by -1);
+    squeue prints nothing; sleep logs its seconds and returns at once; scancel logs its args."""
+    import os
+    import stat
+    import subprocess
+    home.mkdir(parents=True, exist_ok=True)
+    bin_ = home / "bin"
+    bin_.mkdir(exist_ok=True)
+    stubs = {
+        "sacctmgr": (f'echo "$@" >> "{home}/sacctmgr.args"; case "$*" in '
+                     f'*"set MaxJobs=0"*) {"echo 0" if hold_takes else "echo -1"} > "{home}/maxjobs";; '
+                     f'*"set MaxJobs=-1"*) : > "{home}/maxjobs";; '
+                     f'*"show assoc"*) cat "{home}/maxjobs" 2>/dev/null;; esac'),
+        "squeue": "true",
+        "scancel": f'echo "$@" >> "{home}/scancel.args"',
+        "sleep": f'echo "$1" >> "{home}/sleep.args"',
+    }
+    for name, body in stubs.items():
+        (bin_ / name).write_text(f"#!/bin/sh\n{body}\n")
+        (bin_ / name).chmod((bin_ / name).stat().st_mode | stat.S_IEXEC)
+    env = {"PATH": f"{bin_}:{os.environ['PATH']}", "HOME": str(home), "TMPDIR": str(home)}
+    # `bash -c`, not the admin channel's `bash -lc`: on macOS /etc/profile's path_helper would put the stubs last
+    r = subprocess.run(["bash", "-c", cmd], capture_output=True, text=True, env=env, timeout=30)
+    return r.returncode, r.stdout + r.stderr
+
+
+def test_the_hold_keeps_the_pilot_pending_until_well_after_the_stop(tmp_path):
+    # the premise made deterministic: while the cell runs, hpcbmep's jobs are accepted but held PENDING (MaxJobs=0), so
+    # the confirming call's check can only time out; a detached timer on slurmctld lifts the hold _LIFT_S later, the
+    # pilot starts, runs the queued check, and idles out inside the world check's window
+    import time
+
+    import fake_mep_stop_while_provisioning as sc
+    empty, hold, lifter = sc.ADMIN_SETUP
+    assert "scancel -u hpcbmep" in empty
+    rc, out = _admin(tmp_path, hold)
+    assert rc == 0 and "MaxJobs=0" in out
+    assert "where name=hpcbmep set MaxJobs=0" in (tmp_path / "sacctmgr.args").read_text()
+    rc, out = _admin(tmp_path / "ignored", hold, hold_takes=False)
+    assert rc != 0                                   # a hold that did not take refuses the cell
+    rc, out = _admin(tmp_path, lifter)
+    assert rc == 0 and f"lift in {sc._LIFT_S} s" in out
+    pid = (tmp_path / "hpcb-swp-lift.pid").read_text().strip()
+    assert pid.isdigit()
+    for _ in range(100):                             # the detached timer (sleep stubbed) lifts the hold
+        if "MaxJobs=-1" in (tmp_path / "sacctmgr.args").read_text():
+            break
+        time.sleep(0.05)
+    log = (tmp_path / "sacctmgr.args").read_text().splitlines()
+    assert any("MaxJobs=0" in ln for ln in log) and "where name=hpcbmep set MaxJobs=-1" in log[-1]
+    assert (tmp_path / "sleep.args").read_text().split() == [str(sc._LIFT_S)]
+    # the cleanup restores the limit and cancels whatever of hpcbmep is left, whatever happened
+    for c in sc.ADMIN_CLEANUP:
+        assert _admin(tmp_path, c)[0] == 0
+    assert "set MaxJobs=-1" in (tmp_path / "sacctmgr.args").read_text().splitlines()[-1]
+    assert "-u hpcbmep" in (tmp_path / "scancel.args").read_text()
+    # the hold must end well after the stop (seconds after the confirming call) and early enough for the release to
+    # land inside the world check: start (<= 90 s, a first block installs its worker env) + 180 s idle + 15 s period
+    assert sc._LIFT_S >= 120 and sc._LIFT_S + 90 + 180 + 15 <= sc.POSTCHECK_DELAY_S + sc._POLL * 15
+
+
+def test_a_stale_lifter_from_an_aborted_cell_cannot_lift_the_next_cells_hold(tmp_path):
+    # the hold command first stops a timer an earlier cell left behind (its pid file), so it cannot lift this cell's
+    # hold early — but only a process that IS a lifter: /tmp survives a container restart, PIDs do not, and a stale pid
+    # could name slurmctld itself
+    import subprocess
+
+    import fake_mep_stop_while_provisioning as sc
+    lifter = subprocess.Popen(["sh", "-c", "sleep 30; : sacctmgr -i modify user where name=hpcbmep set MaxJobs=-1"])
+    bystander = subprocess.Popen(["sleep", "30"])
+    try:
+        (tmp_path / "hpcb-swp-lift.pid").write_text(f"{lifter.pid}\n")
+        rc, _out = _admin(tmp_path, sc.ADMIN_SETUP[1])
+        assert rc == 0 and lifter.wait(timeout=5) != 0               # the stale lifter: killed
+        (tmp_path / "hpcb-swp-lift.pid").write_text(f"{bystander.pid}\n")
+        for cmd in (sc.ADMIN_SETUP[1], sc.ADMIN_CLEANUP[0]):
+            assert _admin(tmp_path, cmd)[0] == 0
+            assert bystander.poll() is None                           # a pid that is not a lifter: left alone
+            (tmp_path / "hpcb-swp-lift.pid").write_text(f"{bystander.pid}\n")
+    finally:
+        for proc in (lifter, bystander):
+            if proc.poll() is None:
+                proc.kill()

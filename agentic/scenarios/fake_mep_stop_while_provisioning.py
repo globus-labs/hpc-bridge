@@ -8,18 +8,20 @@ unknown here; the user finds it with `squeue -u …` and ends it with `scancel <
 between the two calls, names the block's scheduler job and `scancel <id>`; `spend_stopped` is never true and
 `block_state` is not 'cold'; status `draining`, final. The agent relays it and does not check from here afterwards.
 
-The premise is graded, never assumed (`stopped_while_provisioning`): if the confirming call already answered `up` (a
-block of the mapped account still running from elsewhere) this is the sibling's world, and the cell says so. That is
-also why WARM_BLOCK_USER is NOT set here: a running `hpcbmep` block may not stand in for an idle node.
+The premise is made deterministic, and still graded, never assumed. ADMIN_SETUP empties the mapped account's queue
+(or refuses the cell) and HOLDS its jobs pending (MaxJobs=0; a detached timer lifts it 240 s on — see ADMIN_SETUP), so
+the confirming call's check can only time out. If the confirming call answered `up` anyway, `stopped_while_provisioning`
+says which world it was, from the call's duration: a block that came up DURING the call (the cluster faster than the
+hold — live 2026-10-15, before the hold), or one already up BEFORE it; either way the sibling's world, never a silent
+pass. That is also why WARM_BLOCK_USER is NOT set here: a running `hpcbmep` block may not stand in for an idle node.
 
-World: ADMIN_SETUP empties the mapped account's queue first (or refuses the cell), so the premise does not depend on
-what ran before; SETUP stamps the cell's start on the shared /home; a hook right after the stop records the mapped
-account's queue (evidence, no expectation: the pilot may not be submitted yet); the postchecks then find that the queued
-check DID make the facility submit a pilot during this cell (sacct, SUBMITTED since the stamp — so "gone" is not
-vacuous) and that no
-pilot of the mapped account is left: polled every 15 s after a 240 s settle, up to 720 s after the agent's turn (the
-block must first start — on a first-ever block its worker environment installs itself — run the check, then idle out
-the template's 180 s window; 720 s is the MEP settle the lab MEP's checks use).
+World: SETUP stamps the cell's start on the shared /home; a hook right after the stop records the mapped
+account's queue (evidence, no expectation: the pilot held pending, or not submitted yet); the postchecks then find
+that the queued check DID make the facility submit a pilot during this cell (sacct, SUBMITTED since the stamp — so
+"gone" is not vacuous) and that no pilot of the mapped account is left: polled every 15 s after a 240 s settle, up to
+720 s after the agent's turn. Once the hold lifts, the block must start — on a first-ever block its worker environment
+installs itself — run the check, then idle out the template's 180 s window; 720 s is the MEP settle the lab MEP's
+checks use.
 
 Autonomous, `cmd` hook only: the free CLI operators (codex / pi / hermes21) drive it too. Fake cluster only. ~4 min of
 agent work, then up to 12 min of world checks.
@@ -60,6 +62,10 @@ TAGS = ["mep", "zero-ssh", "fake", "issue-178", "stop", "provisioning", "free-op
 MAX_TURNS = 30
 
 _QUEUED = "check of ours is still queued"
+# A confirming call that answered `up` after this long started its block inside its own wait: the product's check waits
+# up to 8 s for a cold block (CANARY_TIMEOUT_S), while a block already warm answers in a Globus Compute round trip
+# (~1-2 s, the REPL benchmark). Live 2026-10-15 (codex): 7.1 s, "worker live on c1", the queue empty before the call.
+_UP_DURING_S = 4.0
 
 
 def _res(c) -> dict:
@@ -79,10 +85,19 @@ def stopped_while_provisioning(t: Trace) -> Result:
         return Result("stopped_while_provisioning", False, f"no confirmed compute start before the stop (call {s})")
     k, first = starts[0][0], str(_res(starts[0][1]).get("status"))
     sibling = "that is fake_mep_stop_names_block's world, not this one"
-    if first == "up":   # the world: a block of the mapped account was up before this cell asked for one
-        return Result("stopped_while_provisioning", False,
-                      f"premise not met: the confirming call (call {k}) answered 'up' — a block of the mapped account "
-                      f"was already up (the cluster's state, not the agent's); {sibling}")
+    if first == "up":   # the world, not the agent: which world, the call's own duration says
+        lat = starts[0][1].latency_s
+        if lat is None:
+            why = (f"the confirming call (call {k}) answered 'up' — a block was up before it or came up inside its wait "
+                   "(no call timing in this operator's record to tell which)")
+        elif lat >= _UP_DURING_S:
+            why = (f"the block came up DURING the confirming call (call {k} took {lat:.1f} s and answered 'up': a "
+                   "block started and answered inside the call's own wait) — the cluster was faster than the scenario, "
+                   "and the hold on the mapped account's jobs did not keep the pilot pending")
+        else:
+            why = (f"a block of the mapped account was already up BEFORE the confirming call (call {k} answered 'up' "
+                   f"in {lat:.1f} s, a warm block's round trip) — the cluster's state, not the agent's")
+        return Result("stopped_while_provisioning", False, f"premise not met: {why}; {sibling}")
     ups = [i for i, c in t.named("ensure_endpoint_up") if i < s and str(_res(c).get("status")) == "up"]
     if ups:             # the agent: it called again, although told not to, until the block came up
         return Result("stopped_while_provisioning", False,
@@ -163,19 +178,44 @@ EXPECT_OK = [
 
 # The premise must not depend on what ran before: start from an empty queue of the mapped account (whatever a killed
 # or hand-run cell left), or refuse the cell (run_smoke.sh: a failed ADMIN_SETUP is not launched).
-ADMIN_SETUP = [f"scancel -u {MAPPED_USER} 2>/dev/null; for i in $(seq 1 30); do squeue -u {MAPPED_USER} -h | grep -q . "
-               f"|| break; sleep 2; done; if squeue -u {MAPPED_USER} -h | grep -q .; then "
-               f"echo '{MAPPED_USER} queue not empty after 60 s'; exit 1; fi; echo '{MAPPED_USER} queue empty'"]
+# Then the premise is made deterministic (live 2026-10-15, codex: the fast fake cluster started the block INSIDE the
+# confirming call's 8 s wait, which answered `up`). While the cell runs, the mapped account's jobs are accepted but held
+# PENDING: MaxJobs=0 on its association (a job over an association limit pends, AssocMaxJobsLimit; only MaxSubmitJobs
+# refuses one). The confirming call's check can then only time out (`provisioning`), and the stop finds a check of ours
+# still queued. A detached timer on slurmctld lifts the hold _LIFT_S after the cell starts — well after the stop, which
+# comes seconds after the confirming call — and the pilot starts, runs the queued check and idles out inside the world
+# check's window. Scoped to hpcbmep: a reservation or a drain would hold every user's jobs. The pool user cannot lift
+# it from a mid-run hook (no admin rights) and slurmctld cannot see /home, hence a timer. ADMIN_CLEANUP restores the
+# limit and stops the timer whatever happened (run_smoke.sh runs it from its EXIT trap).
+_LIFT_S = 240
+_LIFTER = "${TMPDIR:-/tmp}/hpcb-swp-lift.pid"   # the timer's pid, on slurmctld
+_HOLD_OFF = f"sacctmgr -i modify user where name={MAPPED_USER} set MaxJobs=-1 >/dev/null 2>&1"
+# Kill only a process that IS a lifter: /tmp survives a container restart, PIDs do not — a stale pid could name slurmctld.
+_STOP_LIFTER = (f'p={_LIFTER}; pid=$(cat "$p" 2>/dev/null); [ -n "$pid" ] && ps -o args= -p "$pid" 2>/dev/null '
+                f'| grep -q "MaxJobs=-1" && kill "$pid" 2>/dev/null; rm -f "$p"')
+ADMIN_SETUP = [
+    f"scancel -u {MAPPED_USER} 2>/dev/null; for i in $(seq 1 30); do squeue -u {MAPPED_USER} -h | grep -q . "
+    f"|| break; sleep 2; done; if squeue -u {MAPPED_USER} -h | grep -q .; then "
+    f"echo '{MAPPED_USER} queue not empty after 60 s'; exit 1; fi; echo '{MAPPED_USER} queue empty'",
+    # the hold — first stopping a timer an aborted cell left, which would lift it early — and proof that it took
+    f"{_STOP_LIFTER}; sacctmgr -i modify user where name={MAPPED_USER} set MaxJobs=0 >/dev/null 2>&1; "
+    f"m=$(sacctmgr -nP show assoc where user={MAPPED_USER} format=MaxJobs 2>/dev/null); "
+    f"if [ -n \"$m\" ] && [ -z \"$(printf '%s\\n' \"$m\" | grep -vx 0)\" ]; then echo 'hold: {MAPPED_USER} MaxJobs=0'; "
+    f"else echo \"hold did not take: MaxJobs=$m\"; exit 1; fi",
+    # the timer that lifts it, detached from the admin channel's session
+    f"p={_LIFTER}; nohup sh -c 'sleep {_LIFT_S}; {_HOLD_OFF}' >/dev/null 2>&1 </dev/null & echo $! > \"$p\"; "
+    f"echo \"lift in {_LIFT_S} s (pid $(cat \"$p\"))\"",
+]
 # The cell's start, on the shared /home (every login node sees it): the sacct check counts only pilots SUBMITTED since
 # (`sacct -S` also lists a job submitted before it that was still running after it).
 _STAMP = "~/.hpcb-stop-while-provisioning.start"
 SETUP = [f"date +%Y-%m-%dT%H:%M:%S > {_STAMP} && echo stamped $(cat {_STAMP})"]
 
-# Right after the stop: what the mapped account's queue held (evidence for the bundle — the pilot may be pending,
-# running, or not submitted yet, so nothing is expected of it).
+# Right after the stop: what the mapped account's queue held (evidence for the bundle — with the hold, the pilot PENDING
+# with reason AssocMaxJobsLimit, or not submitted yet — so nothing is expected of it).
 MIDRUN_HOOKS = [
     {"name": "queue_at_stop", "after_tool": "stop_endpoint", "nth": 1,
-     "cmd": f"squeue -u {MAPPED_USER} -h -o '%i %j %T'; echo queue-listed", "timeout": 60},
+     "cmd": f"squeue -u {MAPPED_USER} -h -o '%i %j %T %r'; echo queue-listed", "timeout": 60},
 ]
 POSTCHECK_DELAY_S = 240
 _POLL = 32   # × 15 s after the 240 s settle: at most 720 s after the agent's turn
@@ -194,5 +234,6 @@ POSTCHECKS = [
      "expect_absent": "parsl", "timeout": _POLL * 15 + 60},
 ]
 CLEANUP = [f"rm -f {_STAMP}; echo cleaned"]
-ADMIN_CLEANUP = [f"scancel -u {MAPPED_USER} 2>/dev/null || true"]
+ADMIN_CLEANUP = [f"{_STOP_LIFTER}; {_HOLD_OFF}; echo 'hold lifted'",
+                 f"scancel -u {MAPPED_USER} 2>/dev/null || true"]
 TEARDOWN = "delete"

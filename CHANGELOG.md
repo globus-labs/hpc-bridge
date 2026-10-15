@@ -297,6 +297,15 @@ installed plugin only when that version changes); git tags mark releases.
   `teardown_down_is_ours` does.
 - A unit test that read the wall clock failed in the minutes before local midnight: a bound ~11 minutes ahead is
   tomorrow, and the notice rightly names its date. The clock-time tests now freeze the notices' wall clock at noon.
+- `fake_mep_stop_while_provisioning` stops while the block is still provisioning every time. Live (2026-10-15, Codex)
+  the fake cluster started the block inside the confirming call's 8 s wait, so that call answered `up` and the
+  cell reported a block "already up" though nothing was. Now the cell holds the mapped account's jobs pending
+  (`MaxJobs=0` on its association, set through the admin channel and checked) while it runs: the confirming call
+  can only answer `provisioning`, and the stop always finds a check of ours still queued. A detached timer on the
+  controller lifts the hold 240 s later, well after the stop, so the pilot starts, runs the check and idles out
+  inside the world check's window; the cleanup restores the limit whatever happened. If the confirming call
+  still answers `up`, the premise grader says, from the call's duration, whether the block came up during the
+  call or was up before it.
 - **`run_smoke.sh` reads the running fake profile only off the stack's own service containers.** It took the first
   container with the stack's compose project label; a one-off `docker run` of the compose-built image inherits that
   label from the image, and one refused live cells as a profile mismatch. It now also requires
