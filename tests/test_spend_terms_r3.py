@@ -213,3 +213,12 @@ async def test_a_refusal_says_to_send_the_rest_again_not_to_ask_for_the_account(
     assert "runs on the facility's own default partition" in res.notice
     assert "which account to charge" not in res.notice     # the call carried it; nothing was set, so re-send it
 
+
+async def test_a_confirm_that_meets_a_dead_login_still_carries_its_receipt():
+    # merged with #192: a confirmed start whose check finds the Globus login dead answers `provisioning` — and, like
+    # any confirming call's provisioning, names the block it confirmed
+    from tests.test_login_expired import _auth_failing_app
+    app = _auth_failing_app()
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "provisioning" and "authenticate(force=True)" in res.notice
+    assert res.block is not None and res.block.queue_source == "facility_template"

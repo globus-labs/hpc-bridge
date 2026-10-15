@@ -486,7 +486,7 @@ async def _ensure_endpoint_up(
                 rt.provisioning_since = None  # the cold-start clock restarts once work can be sent again
                 return EndpointStatus(
                     status="provisioning", block_state=block, endpoint_id=eid, session_spend=spend,
-                    partition=active_partition, account=active_account,
+                    partition=active_partition, account=active_account, block=receipt_terms,  # what it confirmed
                     notice=said(_login_expired_notice(rt.last_canary.error)),
                 )
             if rt.last_canary is not None and _no_account_failure(rt.last_canary.error):
