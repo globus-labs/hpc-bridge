@@ -38,7 +38,7 @@ from claude_transcript import (
 )
 from hermes_runner import AcpResponder, _lead
 from hermes_trace import stamp_exchanges
-from human_sim import MAX_NUDGES, MAX_PROSE_FOLLOWUPS
+from human_sim import ACP_MAX_TURNS
 from invariants import Trace
 from runner import RunResult
 
@@ -131,7 +131,7 @@ async def run_scenario(
     try:
         resp, cap = await acp_client.run_session(ADAPTER_BIN, [], full_prompt, cwd=repo, env=_child_env(),
                                                  mcp_servers=mcp, respond=respond,
-                                                 max_turns=1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES, **kwargs)
+                                                 max_turns=ACP_MAX_TURNS, **kwargs)
         stop = str(getattr(resp, "stop_reason", "") or "")
     except Exception as e:  # noqa: BLE001 - transport/agent death: grade the partial transcript as a fail
         print(f"  claude-ACP aborted: {e}", file=sys.stderr, flush=True)

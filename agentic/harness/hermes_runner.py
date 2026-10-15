@@ -36,7 +36,7 @@ from pathlib import Path
 
 import hermes_setup
 from hermes_trace import exchanges_from_messages, load_messages, stamp_exchanges, trace_from_messages
-from human_sim import MAX_NUDGES, MAX_PROSE_FOLLOWUPS
+from human_sim import ACP_MAX_TURNS, MAX_PROSE_FOLLOWUPS
 from runner import HPC_BRIDGE_TOOLS, RunResult  # shared dataclass + logical tool names
 
 _HERMES_BIN = "hermes"
@@ -214,7 +214,7 @@ async def _run_acp(prompt: str, *, home: Path, child_env: dict[str, str], alcf_m
         # by the sim itself — it only guards a respond hook that keeps returning text)
         resp, cap = await acp_client.run_session("hermes", ["acp"], full_prompt, cwd=repo, env=child_env,
                                                  mcp_servers=mcp, respond=respond,
-                                                 max_turns=1 + MAX_PROSE_FOLLOWUPS + MAX_NUDGES)
+                                                 max_turns=ACP_MAX_TURNS)
         stop = str(getattr(resp, "stop_reason", "") or "")
     except asyncio.CancelledError:
         raise
@@ -296,11 +296,16 @@ async def run_scenario(
     exchanges: list[dict] = []           # {call_index, question, answer, kind} -> stamped as synthetic AskUserQuestion
     transcript: list[tuple[str, str]] = []
     per_turn_timeout = max(180, min(600, max_turns * 20))
-    max_turns_i = MAX_PROSE_FOLLOWUPS + 1   # first turn + up to N follow-ups
+    # The first turn + up to MAX_PROSE_FOLLOWUPS answered follow-ups. A scripted persona's answers to a code request
+    # (human_sim.SCRIPTED_CODE_PERSONAS) are the scenario's provocation, not the operator looping: they do not count,
+    # and the sim stops scripting after MAX_SCRIPTED_CODE_ANSWERS, so the loop stays bounded.
+    budgeted = 0
     capped = False
     rc, timed_out, prev_max = 1, False, 0
     print(f"  hermes: model={alcf_model} home={home} (interactive, persona={persona})", file=sys.stderr, flush=True)
-    for turn in range(max_turns_i):
+    turn = -1
+    while True:
+        turn += 1
         full_prompt = _interactive_prompt(lead, prompt, transcript)
         t0 = time.time()
         rc, timed_out = await _run_turn(full_prompt, child_env, per_turn_timeout)
@@ -312,10 +317,11 @@ async def run_scenario(
               f"{'asked a question' if ends_with_question(last_text) else 'no question'}", file=sys.stderr, flush=True)
         if rc != 0 or timed_out or not ends_with_question(last_text):
             break
-        if turn == max_turns_i - 1:
+        if budgeted == MAX_PROSE_FOLLOWUPS:
             capped = True   # the operator is still asking — recorded, not hidden (a looping failure)
             break
         reply, kind, reason = await human.reply_hermes(last_text)
+        budgeted += 0 if (human.dialogue and human.dialogue[-1].scripted) else 1
         calls_so_far = len(trace_from_messages(rows).calls)
         exchanges.append({"call_index": max(0, calls_so_far - 1), "question": last_text[-1000:],
                           "answer": reply, "kind": kind})

@@ -162,6 +162,22 @@ def test_scripted_code_answers_do_not_spend_the_prose_cap(runner, monkeypatch):
     assert r.prose_followups == 3 + runner.MAX_PROSE_FOLLOWUPS and r.followups_capped is True
 
 
+def test_a_prose_reply_is_stamped_with_where_it_came(runner, monkeypatch):
+    # (calls, agent texts) before the reply: graders then tell the agent's words AFTER the user spoke from those before
+    from human_sim import Exchange
+
+    async def appending_reply(self, text):
+        self.dialogue.append(Exchange(questions=[{"question": text, "prose": True}], answers={"reply": "my reply"}))
+        return "my reply"
+
+    monkeypatch.setattr(runner.HumanSim, "reply", appending_reply)
+    _Client.turns = [[AssistantMessage([TextBlock("Working.")]), AssistantMessage([TextBlock("What is the code?")]),
+                      ResultMessage()],
+                     [AssistantMessage([TextBlock("Thanks, all done.")]), ResultMessage()]]
+    r = _run(runner)
+    assert [x.at for x in r.dialogue] == [(0, 2)]
+
+
 def test_every_message_gets_an_arrival_stamp_in_order(runner):
     # the REPL benchmark's turn latency comes from these stamps: one per message, monotonic, seconds since start
     _Client.turns = [[AssistantMessage([TextBlock("working")]), AssistantMessage([TextBlock("done")]), ResultMessage()]]
@@ -558,7 +574,8 @@ def test_the_graded_trace_carries_what_the_user_said_and_the_scenarios_user_secr
     (tmp_path / "scen_said.py").write_text(
         "from invariants import Result\n"
         f"USER_SECRETS = {{'user password': [{said!r}]}}\n"
-        f"def user_said_it(t):\n    return Result('user_said_it', any({said!r} in w for w in t.user_said), 'x')\n"
+        f"def user_said_it(t):\n    return Result('user_said_it', any({said!r} in w for w in t.user_said)"
+        " and t.user_said_at == [(1, 0)], 'x')\n"
         'PROMPT = "x"\nPERSONA = "cooperative"\nEXTRA_INVARIANTS = [user_said_it]\n'
         'EXPECT_OK = ["agent_engaged", "user_said_it"]\nTEARDOWN = "keep"\nTRUST_HOST_KEY = False\nPOSTCHECK_DELAY_S = 0\n')
     monkeypatch.setattr(run_mod, "SCENARIOS_DIR", tmp_path)
@@ -573,7 +590,7 @@ def test_the_graded_trace_carries_what_the_user_said_and_the_scenarios_user_secr
             calls.append(ToolCall.of("mcp__endpoint__complete_preauth", {"code": said}, {"phase": "failed"}))
         return run_mod.RunResult(trace=Trace(calls), messages=[],
                                  dialogue=[Exchange(questions=[{"question": "code?", "prose": True}],
-                                                    answers={"reply": f"use my password {said}"})],
+                                                    answers={"reply": f"use my password {said}"}, at=(1, 0))],
                                  final=type("F", (), {"is_error": False, "total_cost_usd": 0.0})())
 
     monkeypatch.setattr(run_mod, "run_scenario", fake_run_scenario)

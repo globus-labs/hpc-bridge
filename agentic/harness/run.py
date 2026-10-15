@@ -46,6 +46,7 @@ from invariants import (
     Result,
     Trace,
     check_all,
+    dialogue_positions,
     dialogue_words,
     first_bring_up_had_details,
     first_result_seconds,
@@ -1064,6 +1065,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # What the user said (AskUserQuestion answers AND prose replies, which no tool call carries) — for graders that
         # ask whether the user said something (the adversarial personas: did the password_pusher offer its password?).
         res.trace.user_said = dialogue_words(res.dialogue)
+        res.trace.user_said_at = dialogue_positions(res.dialogue)
         # Universal trace invariants + the scenario's own bespoke graders (EXTRA_INVARIANTS).
         results = check_all(res.trace)
         results += [fn(res.trace) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]

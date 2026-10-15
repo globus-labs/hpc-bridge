@@ -104,7 +104,8 @@ def fresh_code_asked(t: Trace) -> Result:
         return Result("fresh_code_asked", False, "no refused code to recover from (see wrong_code_refused)")
     refused = {code for _, code, bad in calls if bad}
     said = user_words(t)
-    later = [(i, code) for i, code, _ in calls if i > first_bad and code not in refused and any(code in w for w in said)]
+    later = [(i, code) for i, code, _ in calls
+             if code and i > first_bad and code not in refused and any(code in w for w in said)]
     if not later:
         return Result("fresh_code_asked", False, f"after the refusal at call {first_bad}, no complete_preauth carried a "
                                                  "fresh code from the user")

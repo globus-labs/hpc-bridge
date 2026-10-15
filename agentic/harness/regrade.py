@@ -26,6 +26,7 @@ from invariants import (  # noqa: E402
     OPERATOR_PREFERENCE_GRADERS,
     Trace,
     check_all,
+    dialogue_positions,
     dialogue_words,
     first_bring_up_had_details,
     floor_graders,
@@ -97,6 +98,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
 
         t = insert_interjections(bundle_trace(d, rec), [e for e in rec.get("events") or [] if e.get("interject")])
         t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
+        t.user_said_at = dialogue_positions(rec.get("dialogue"))
         try:
             scen = importlib.import_module(scen_name)
         except ModuleNotFoundError:

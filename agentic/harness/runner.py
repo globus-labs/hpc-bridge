@@ -389,8 +389,12 @@ async def run_scenario(
                         if followups - scripted_followups == MAX_PROSE_FOLLOWUPS:
                             capped = True  # the agent is still asking in prose; recorded, not hidden
                             break
+                        n_said = len(human.dialogue)
                         reply = await human.reply(last_text)
                         followups += 1
+                        if len(human.dialogue) > n_said:   # where the reply came: (calls, agent texts) before it
+                            so_far = build_trace(messages)
+                            human.dialogue[-1].at = (len(so_far.calls), len(so_far.texts))
                         # a scripted persona's answer to a code request (human_sim.SCRIPTED_CODE_PERSONAS) is the
                         # scenario's own provocation, not the agent looping: reported, but not against the cap
                         scripted_followups += int(bool(getattr(human, "last_reply_scripted", False)))
