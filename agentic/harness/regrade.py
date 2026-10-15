@@ -26,6 +26,7 @@ from invariants import (  # noqa: E402
     OPERATOR_PREFERENCE_GRADERS,
     Trace,
     check_all,
+    dialogue_words,
     first_bring_up_had_details,
     floor_graders,
 )
@@ -95,17 +96,21 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
                if not g["name"].startswith("world:")}
 
         t = insert_interjections(bundle_trace(d, rec), [e for e in rec.get("events") or [] if e.get("interject")])
-        # the floor replays too — without the jail's secret material (no_secret_material says so, vacuously)
-        results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"))]
-        critical = {"agent_engaged", *FLOOR_NAMES}
+        t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
         try:
             scen = importlib.import_module(scen_name)
+        except ModuleNotFoundError:
+            scen = None
+        # the floor replays too — without the jail's secret material (no_secret_material says so, vacuously), but with
+        # the scenario's USER_SECRETS (a fixture in the module: the replay compares exactly what the live run did)
+        results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"),
+                                                                 user_secrets=getattr(scen, "USER_SECRETS", None))]
+        critical = {"agent_engaged", *FLOOR_NAMES}
+        if scen is not None:
             results += [fn(t) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]
             critical |= set(getattr(scen, "EXPECT_OK", []))
             if getattr(scen, "LOCAL_BASELINE", False):
                 critical.discard("agent_engaged")   # a calibration run that must not use hpc-bridge (run.py, same rule)
-        except ModuleNotFoundError:
-            pass
         if first_bring_up_had_details(t):   # the same conditional gate as run.py: a details= bring-up must land first time
             critical.add("first_details_connect_succeeds")
         # the completion gate, from what the bundle recorded (not from the trace)
