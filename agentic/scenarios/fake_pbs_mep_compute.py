@@ -14,9 +14,11 @@ queue PBS ran it in, the mapped user -> a stop that issues no cancel and says so
 Graded on what the plugin delivers: the receipt's `block` (queue `debug` from the registry, account `hpcb` set by the
 call) and the PBS word "queue" in every terms line; the queue PBS reports from inside the job; #178's stop graders
 (fake_mep_stop_names_block), with `qdel`. World: right after the stop, a hook lists the mapped account's RUNNING job in
-queue `debug` charged to `hpcb` (no cancel was issued; the queue and the account reached the scheduler); after the
-idle window the queue is empty (the 240 s release held). On this cluster a pilot without a filesystems request is HELD
-(the polaris rule), so a compute result also proves the template's filesystems default rendered.
+queue `debug` charged to `hpcb` (no cancel was issued; the queue and the account reached the scheduler) — or, when
+the operator waited past the idle window before stopping, a block that had idled out before the stop (the premise
+not met, said so); after the idle window the queue is empty (the 240 s release held). On this cluster a pilot without
+a filesystems request is HELD (the polaris rule), so a compute result also proves the template's filesystems
+default rendered.
 
 Autonomous, `cmd` hook only: the free CLI operators (codex / pi / hermes21) drive it too. Fake cluster only. ~6 min.
 """
@@ -94,7 +96,11 @@ def default_queue_receipt(t: Trace) -> Result:
         return Result("default_queue_receipt", False, "no confirmed start carried a `block` receipt")
     k, b = got
     why = []
-    if b.get("queue") != DEFAULT_QUEUE or b.get("queue_source") != "registry":
+    if b.get("queue_source") in ("this_call", "earlier_call"):
+        # the prompt says not to; the start is fine, but it says nothing about the default reaching PBS
+        why.append(f"the agent named the queue itself ({b.get('queue')!r}, queue_source {b.get('queue_source')!r}): "
+                   "the registry-default path was not exercised")
+    elif b.get("queue") != DEFAULT_QUEUE or b.get("queue_source") != "registry":
         why.append(f"queue {b.get('queue')!r} from {b.get('queue_source')!r} (want {DEFAULT_QUEUE!r} from 'registry')")
     if b.get("account") != ACCOUNT or b.get("account_source") not in ("this_call", "earlier_call"):
         why.append(f"account {b.get('account')!r} from {b.get('account_source')!r} (want {ACCOUNT!r}, set by a call)")
@@ -198,14 +204,39 @@ EXPECT_OK = [
 ]
 
 # Right after the stop: the mapped account's block is STILL RUNNING — no cancel was issued — in queue `debug`, charged
-# to `hpcb` (qselect filters on both, so the queue and the account reached PBS). Fails (harness:midrun_hooks) unless
-# `qstat -f` shows a parsl job. Pool users can see hpcbmep's jobs: the profile sets query_other_jobs.
-_AT_STOP = (f"ids=$(qselect -u {MAPPED_USER} -q {DEFAULT_QUEUE} -A {ACCOUNT} -s R 2>/dev/null | tr '\\n' ' '); "
-            f"echo \"running in queue {DEFAULT_QUEUE}, account {ACCOUNT}: ${{ids:-none}}\"; "
-            "[ -z \"$ids\" ] || qstat -f $ids")
+# to `hpcb` (qselect filters on both, so the queue and the account reached PBS). Pool users can see hpcbmep's jobs: the
+# profile sets query_other_jobs. The premise can fail on its own: an operator that waits past the 240 s idle window
+# between the run and the stop finds the block already released, which is not the plugin's doing — so a block that
+# FINISHED at least 30 s before this check (job history: qselect -x, its mtime) also passes, said as the premise not
+# met. One that is exiting now, or finished within the last 30 s, ended at the stop: that fails (the check fires right
+# after the stop's result). The token `BLOCK_AT_STOP:` is printed only on a pass.
+_Q = f"-u {MAPPED_USER} -q {DEFAULT_QUEUE} -A {ACCOUNT}"
+_AGE = ("python3 -c 'import sys, time; print(int(time.time() - time.mktime(time.strptime(sys.argv[1], "
+        "\"%a %b %d %H:%M:%S %Y\"))))' \"$end\" 2>/dev/null || echo -1")
+_AT_STOP = (
+    f"ids=$(qselect {_Q} -s R 2>/dev/null); "
+    "if [ -n \"$ids\" ] && qstat -f $ids 2>/dev/null | grep -q 'Job_Name = parsl'; then "
+    f"echo \"BLOCK_AT_STOP: still running in queue {DEFAULT_QUEUE}, account {ACCOUNT} (no cancel was issued):\" $ids; "
+    "qstat -f $ids | grep -E 'Job_Name|queue =|Account_Name|job_state'; "
+    f"elif ex=$(qselect {_Q} -s E 2>/dev/null) && [ -n \"$ex\" ]; then "
+    "echo \"no block at the stop: job(s)\" $ex \"EXITING right now — ended at the stop\"; "
+    f"else last=$(qselect -x {_Q} -s F 2>/dev/null | sort -t. -k1,1n | tail -n 1); "
+    f"if [ -z \"$last\" ]; then echo \"no block at the stop: no parsl job of {MAPPED_USER} in {DEFAULT_QUEUE}/{ACCOUNT}, "
+    "running or finished\"; "
+    "else info=$(qstat -x -f \"$last\" 2>/dev/null); "
+    "end=$(printf '%s\\n' \"$info\" | sed -n 's/^ *mtime = //p' | head -n 1); "
+    f"age=$({_AGE}); "
+    "if ! printf '%s\\n' \"$info\" | grep -q 'Job_Name = parsl'; then "
+    f"echo \"no block at the stop: the newest finished job of {MAPPED_USER} in {DEFAULT_QUEUE}/{ACCOUNT}, $last, is not a "
+    "parsl block\"; "
+    "elif [ \"$age\" -ge 30 ]; then "
+    "echo \"BLOCK_AT_STOP: premise not met — job $last had already idled out ${age} s before this check (before the "
+    "stop: there was nothing left to cancel)\"; "
+    "else echo \"no block at the stop: job $last finished ${age} s before this check — at the stop\"; fi; fi; fi"
+)
 MIDRUN_HOOKS = [
     {"name": "block_listed_at_stop", "after_tool": "stop_endpoint", "nth": 1, "cmd": _AT_STOP,
-     "expect_any_host": "Job_Name = parsl", "timeout": 60},
+     "expect_any_host": "BLOCK_AT_STOP:", "timeout": 60},
 ]
 # Only the facility's idle-release (max_idletime 240 s in the template) reclaims the block: wait past it (the idle clock
 # starts at the last command, before the stop and the agent's reply), then check the mapped account's queue. An exit 3

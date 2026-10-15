@@ -105,6 +105,95 @@ def test_harness_cancel_matches_the_products_marker_scoping():
             assert ("scancel $ids" in cmd) if scheduler == "slurm" else ("qdel $ids" in cmd)
 
 
+MEP = "6ec15113-4ed0-4076-85f9-e8ccc549840e"   # a facility endpoint's uuid: its pilot belongs to the MAPPED account
+OTHER = "11111111-2222-3333-4444-555555555555"
+
+
+def _stub_cluster(tmp_path, *, qstat="", squeue="", user="hpcbridge-test-00", cancel_rc=0, cancel_err=""):
+    """A PATH of stand-ins for one login node: `qstat` / `squeue` print a canned listing, `whoami` names the pool user,
+    `qdel` / `scancel` log their arguments and exit `cancel_rc` with `cancel_err` on stderr, and `sed` does what the
+    GNU one-liner does (join `qstat -f`'s 80-column continuations: drop every newline+tab) — BSD sed cannot run it, and
+    the expression itself is pinned to the product's by the parity test. Returns (env, the cancel log path)."""
+    import os
+    import sys
+    d = tmp_path / "bin"
+    d.mkdir(parents=True)
+    log = tmp_path / "cancel.log"   # under tmp_path, beside bin/
+    (tmp_path / "qstat.txt").write_text(qstat)
+    (tmp_path / "squeue.txt").write_text(squeue)
+    py = sys.executable
+    stubs = {
+        "qstat": f"#!{py}\nimport sys; sys.stdout.write(open({str(tmp_path / 'qstat.txt')!r}).read())\n",
+        "squeue": f"#!{py}\nimport sys; sys.stdout.write(open({str(tmp_path / 'squeue.txt')!r}).read())\n",
+        "whoami": f"#!/bin/sh\necho {user}\n",
+        "sed": f"#!{py}\nimport sys; sys.stdout.write(sys.stdin.read().replace('\\n\\t', ''))\n",
+    }
+    for cancel in ("qdel", "scancel"):
+        stubs[cancel] = (f"#!{py}\nimport sys\nopen({str(log)!r}, 'a').write(' '.join(sys.argv[1:]) + '\\n')\n"
+                         f"sys.stderr.write({cancel_err!r})\nsys.exit({cancel_rc})\n")
+    for name, body in stubs.items():
+        (d / name).write_text(body)
+        (d / name).chmod(0o755)
+    return {**os.environ, "PATH": f"{d}:{os.environ['PATH']}"}, log
+
+
+def _sh(cmd, env):
+    import subprocess
+    return subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True, timeout=30).stdout.strip()
+
+
+def _job(jid, owner, eid, name="parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792055222.1"):
+    """One `qstat -f` record, wrapped at 80 columns the way PBS prints it (the marker itself split by a continuation)."""
+    path = f"login:/home/{owner}/.globus_compute/uep.{eid}.0a1b2c/submit_scripts/{name}.stdout"
+    out = f"    Output_Path = {path}"
+    wrapped = "\n\t".join(out[i:i + 79] for i in range(0, len(out), 79))
+    return f"Job Id: {jid}\n    Job_Name = {name[:60]}\n\t{name[60:]}\n    Job_Owner = {owner}@login\n{wrapped}\n"
+
+
+def test_pbs_cancel_takes_only_the_pool_users_own_pilot(tmp_path):
+    # with query_other_jobs on, `qstat -f` lists the MAPPED account's pilot too, and it carries the facility endpoint's
+    # uuid among the run's ids: the pool user's qdel of it is refused, and the line used to say "cancelled" anyway
+    listing = (_job("5.pbsserver", "hpcbridge-test-00", EID) + _job("6.pbsserver", "hpcbmep", MEP)
+               + _job("7.pbsserver", "hpcbridge-test", EID))   # a pool user whose name is a prefix of ours
+    env, log = _stub_cluster(tmp_path, qstat=listing)
+    assert _sh(scoped_cancel_cmd("pbs", [EID, MEP]), env) == "cancelled: 5.pbsserver"
+    assert log.read_text() == "5.pbsserver\n"
+
+
+def test_pbs_cancel_reports_what_qdel_answered(tmp_path):
+    env, log = _stub_cluster(tmp_path, qstat=_job("5.pbsserver", "hpcbridge-test-00", EID), cancel_rc=35,
+                             cancel_err="qdel: Unauthorized Request  5.pbsserver\n")
+    out = _sh(scoped_cancel_cmd("pbs", [EID]), env)
+    assert out == "cancel FAILED (rc=35) for 5.pbsserver: qdel: Unauthorized Request  5.pbsserver", out
+    env, log = _stub_cluster(tmp_path / "none", qstat=_job("6.pbsserver", "hpcbmep", MEP))
+    assert _sh(scoped_cancel_cmd("pbs", [EID, MEP]), env) == "cancelled: none" and not log.exists()   # nothing to qdel
+
+
+def test_slurm_cancel_reports_what_scancel_answered(tmp_path):
+    squeue = (f"41   /home/hpcbridge-test-00/.globus_compute/uep.{EID}.0a1b/submit_scripts/p.stdout\n"
+              f"42   /home/hpcbridge-test-00/.globus_compute/uep.{OTHER}.0a1b/submit_scripts/p.stdout\n")
+    env, log = _stub_cluster(tmp_path, squeue=squeue)
+    assert _sh(scoped_cancel_cmd("slurm", [EID]), env) == "cancelled: 41" and log.read_text() == "41\n"
+    env, _log = _stub_cluster(tmp_path / "x", squeue=squeue, cancel_rc=1, cancel_err="scancel: error: Kill job error\n")
+    assert _sh(scoped_cancel_cmd("slurm", [EID]), env) == "cancel FAILED (rc=1) for 41: scancel: error: Kill job error"
+
+
+def test_harness_and_product_pick_the_same_own_jobs_by_marker(tmp_path):
+    # the product's release (server._release_cmd) and the harness' run-scoped cancel, run on the SAME listing: for the
+    # pool user's own jobs they select exactly the same ids by the `uep.<eid>` marker (unwrapping the same way); the
+    # harness alone also drops jobs other users own (the product never holds a foreign uuid)
+    import sys
+    from pathlib import Path
+    sys.path.insert(0, str(Path(__file__).resolve().parents[2] / "src"))
+    from hpc_bridge.server import _release_cmd
+    listing = _job("5.pbsserver", "hpcbridge-test-00", EID) + _job("8.pbsserver", "hpcbridge-test-00", OTHER)
+    env, log = _stub_cluster(tmp_path, qstat=listing)
+    assert _sh(_release_cmd("pbs", EID), env) == "released 5.pbsserver"
+    assert _sh(scoped_cancel_cmd("pbs", [EID]), env) == "cancelled: 5.pbsserver"
+    assert log.read_text() == "5.pbsserver\n5.pbsserver\n"
+    assert "sed ':a;N;$!ba;s/\\n\\t//g'" in _release_cmd("pbs", EID) and "sed ':a;N;$!ba;s/\\n\\t//g'" in scoped_cancel_cmd("pbs", [EID])
+
+
 def test_run_scoped_cancel_never_matches_the_saturation_sleepers():
     # saturation's SETUP submits `hpcb-sat` sleepers; the run-scoped cancel keys on `uep.<eid>` markers only, so it
     # must not (and does not) reclaim them — the scenario declares its own CLEANUP for that (review 2026-09-05, 2.1)

@@ -109,14 +109,24 @@ def scoped_cancel_cmd(scheduler: str, eids: list[str]) -> str:
     # awk matches ANY of the markers and exits 0 on no-match (a `grep` would exit 1 under pipefail).
     pick = f"awk -v m={markers} 'BEGIN{{n=split(m,a,\" \")}} {{for(i=1;i<=n;i++) if(index($0,a[i])){{print $1; break}}}}'"
     if scheduler == "pbs":
+        # Only THIS pool user's jobs: `qstat -f` lists every user's where the server lets users read others' jobs
+        # (`query_other_jobs`: Polaris, the fake `pbs_mep` profile), and a facility endpoint's uuid among the run's ids
+        # matches the MAPPED account's pilot (its output lives under uep.<that uuid>) — a qdel the server refuses, which
+        # this line used to report as "cancelled". The record's `Job_Owner = <user>@<host>` line scopes it (the `@`
+        # keeps hpcbridge-test from matching hpcbridge-test-00); `qstat -f -u` would list nothing on PBS Pro.
         listing = (
             "qstat -f 2>/dev/null | sed ':a;N;$!ba;s/\\n\\t//g' "
-            f"| awk -v m={markers} 'BEGIN{{RS=\"Job Id: \"; n=split(m,a,\" \")}} "
-            "{for(i=1;i<=n;i++) if(index($0,a[i])){print $1; break}}'"
+            f"| awk -v m={markers} -v u=\"Job_Owner = $(whoami)@\" 'BEGIN{{RS=\"Job Id: \"; n=split(m,a,\" \")}} "
+            "index($0,u){for(i=1;i<=n;i++) if(index($0,a[i])){print $1; break}}'"
         )
-        return f'ids=$({listing}); [ -n "$ids" ] && qdel $ids 2>/dev/null; echo "cancelled: ${{ids:-none}}"'
-    listing = f'squeue -u "$(whoami)" -h -O "JobID:24,StdOut:1024" 2>/dev/null | {pick}'
-    return f'ids=$({listing}); [ -n "$ids" ] && scancel $ids 2>/dev/null; echo "cancelled: ${{ids:-none}}"'
+        cancel = "qdel"
+    else:
+        listing = f'squeue -u "$(whoami)" -h -O "JobID:24,StdOut:1024" 2>/dev/null | {pick}'
+        cancel = "scancel"
+    # the cancel's REAL outcome: a refused or failed cancel is said as one, with the scheduler's words
+    return (f'ids=$({listing}); if [ -z "$ids" ]; then echo "cancelled: none"; '
+            f'elif out=$({cancel} $ids 2>&1); then echo "cancelled: $(echo $ids)"; '
+            f'else echo "cancel FAILED (rc=$?) for $(echo $ids): $(printf %s "$out" | tr "\\n" " " | cut -c1-200)"; fi')
 
 
 def stop_here_cmd(endpoint_name: str, *, listing: str | None = None, gce: str = GCE) -> str:

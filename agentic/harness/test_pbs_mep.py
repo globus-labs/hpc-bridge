@@ -274,14 +274,67 @@ def test_the_scenario_gates_only_graders_it_has_and_reads_the_profile():
     assert sc.ACCOUNT in caps["accounts"] and sc.WARM_BLOCK_USER == sc.MAPPED_USER
     # the world checks: the stop leaves the block running in debug charged to hpcb; past the idle window it is gone
     (hook,) = sc.MIDRUN_HOOKS
-    assert hook["after_tool"] == "stop_endpoint" and hook["nth"] == 1 and hook["expect_any_host"] == "Job_Name = parsl"
-    assert "qselect -u hpcbmep -q debug -A hpcb -s R" in hook["cmd"]
+    assert hook["after_tool"] == "stop_endpoint" and hook["nth"] == 1 and hook["expect_any_host"] == "BLOCK_AT_STOP:"
+    assert "qselect -u hpcbmep -q debug -A hpcb -s R" in hook["cmd"]   # the queue and the account reached PBS
     from hpc_bridge.facility.mep import _template_idle_s
     idle = _template_idle_s((MEPDIR / "pbs_user_config_template.yaml.j2").read_text())
     assert idle == 240 and idle + 30 <= sc.POSTCHECK_DELAY_S, (sc.POSTCHECK_DELAY_S, idle)   # 240 s + a margin
     (pc,) = sc.POSTCHECKS
     assert "qstat -u hpcbmep -w" in pc["cmd"] and pc["expect_absent"] == "parsl" and "exit 3" in pc["cmd"]
     assert sc.ADMIN_CLEANUP == ['ids=$(qselect -u hpcbmep 2>/dev/null); [ -z "$ids" ] || qdel $ids 2>/dev/null; true']
+
+
+def _pbs_stubs(tmp_path, jobs):
+    """A login node's `qselect` / `qstat` answering from `jobs` ({id: (state, name, finished_s_ago)}): qselect honours
+    -s <states> and -x (finished jobs only with -x), qstat -f / -x -f print the records with PBS's ctime-style mtime."""
+    import sys
+    d = tmp_path / "bin"
+    d.mkdir(parents=True)
+    state = tmp_path / "jobs.json"
+    state.write_text(json.dumps({k: [st, name, ago] for k, (st, name, ago) in jobs.items()}))
+    py = sys.executable
+    (d / "qselect").write_text(f"""#!{py}
+import json, sys
+a = sys.argv[1:]; jobs = json.load(open({str(state)!r}))
+want = a[a.index('-s') + 1] if '-s' in a else 'QRHEF'
+for j, (st, _n, _ago) in sorted(jobs.items(), key=lambda kv: int(kv[0].split('.')[0])):
+    if st in want and (st != 'F' or '-x' in a):
+        print(j)
+""")
+    (d / "qstat").write_text(f"""#!{py}
+import json, sys, time
+jobs = json.load(open({str(state)!r}))
+for j in [x for x in sys.argv[1:] if not x.startswith('-')]:
+    st, name, ago = jobs[j]
+    if st == 'F' and '-x' not in sys.argv:
+        continue
+    print(f"Job Id: {{j}}\\n    Job_Name = {{name}}\\n    job_state = {{st}}\\n    queue = debug\\n    Account_Name = hpcb\\n"
+          f"    mtime = {{time.ctime(time.time() - ago)}}")
+""")
+    for f in ("qselect", "qstat"):
+        (d / f).chmod(0o755)
+    return {**os.environ, "PATH": f"{d}:{os.environ['PATH']}"}
+
+
+@pytest.mark.parametrize("jobs, passes, says", [
+    ({"9.pbsserver": ("R", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 0)}, True, "still running"),
+    # the operator waited past the idle window: the block idled out before the stop — not the plugin's doing
+    ({"9.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 120),
+      "3.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.16", 4000)}, True, "premise not met"),
+    # it ended at the stop (a cancel the stop must not issue): finished seconds ago, or exiting right now
+    ({"9.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 5),
+      "3.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.16", 4000)}, False, "at the stop"),
+    ({"9.pbsserver": ("E", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 0)}, False, "EXITING"),
+    ({}, False, "no parsl job"),
+    ({"9.pbsserver": ("F", "hpcb-handjob", 120)}, False, "not a parsl block"),   # not a block of ours
+])
+def test_the_stop_time_hook_tells_a_block_left_running_from_one_ended_at_the_stop(tmp_path, jobs, passes, says):
+    import fake_pbs_mep_compute as sc
+    (hook,) = sc.MIDRUN_HOOKS
+    out = subprocess.run(["bash", "-c", hook["cmd"]], env=_pbs_stubs(tmp_path, jobs), capture_output=True, text=True,
+                         timeout=30)
+    assert out.returncode == 0, out.stderr
+    assert (hook["expect_any_host"] in out.stdout) is passes and says in out.stdout, out.stdout
 
 
 def test_the_scenario_knobs_and_the_pbs_admin_channel(monkeypatch):
@@ -292,12 +345,17 @@ def test_the_scenario_knobs_and_the_pbs_admin_channel(monkeypatch):
     assert kv["HPCB_KNOB_TARGETS"] == "fake" and "HPCB_KNOB_ADMIN_CLEANUP" in kv and '"scheduler": "pbs"' in kv["HPCB_KNOB_REQUIRES"]
     # ADMIN_CLEANUP runs as root on the scheduler's controller: the PBS server on a PBS profile, slurmctld otherwise
     monkeypatch.delenv("HPCB_FAKE_CTLD", raising=False)
+    monkeypatch.delenv("HPCB_FAKE_PBS_SERVER", raising=False)
     for prof, ctld in (("pbs_mep", "hpcb-fake-pbsserver-1"), ("polaris", "hpcb-fake-pbsserver-1"),
                        ("mep", "hpcb-fake-slurmctld-1"), ("default", "hpcb-fake-slurmctld-1")):
         monkeypatch.setenv("HPCB_FAKE_PROFILE", prof)
         assert targets.get("fake").admin_argv == ("docker", "exec", ctld, "bash", "-lc"), prof
-    monkeypatch.setenv("HPCB_FAKE_CTLD", "other")
-    assert targets.get("fake").admin_argv[2] == "other"   # the override still wins
+    # each override applies on its own stack only: a Slurm controller's name never reaches a PBS profile's qdel
+    monkeypatch.setenv("HPCB_FAKE_CTLD", "other-ctld")
+    monkeypatch.setenv("HPCB_FAKE_PBS_SERVER", "other-pbs")
+    for prof, ctld in (("default", "other-ctld"), ("mep", "other-ctld"), ("pbs_mep", "other-pbs"), ("pbs", "other-pbs")):
+        monkeypatch.setenv("HPCB_FAKE_PROFILE", prof)
+        assert targets.get("fake").admin_argv[2] == ctld, prof
 
 
 def test_the_node_gate_reads_a_pbs_warm_block_with_qselect(monkeypatch):
@@ -468,7 +526,8 @@ def test_the_graders_fail_what_they_guard(tmp_path, monkeypatch):
 
     # the agent picked the queue itself: the receipt is "this_call", not the registry's default
     named = Trace(edited(1, block=lambda r: {**r["block"], "queue_source": "this_call"}), _relay(calls))
-    assert not sc.default_queue_receipt(named).ok
+    r = sc.default_queue_receipt(named)
+    assert not r.ok and "the agent named the queue itself" in r.detail and "registry-default path was not exercised" in r.detail
     # the account never reached the receipt
     assert not sc.default_queue_receipt(Trace(edited(1, block=lambda r: {**r["block"], "account": None}))).ok
     # a terms line in the Slurm word on a PBS facility

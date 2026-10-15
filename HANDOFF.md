@@ -15,7 +15,7 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1564 passed, 4 skipped**; agentic harness hermetic tests **606 passed** (the CI list: 569). The live tier has
+Unit tier **1564 passed, 4 skipped**; agentic harness hermetic tests **616 passed** (the CI list: 579). The live tier has
 **60 scenarios** and a local **fake cluster with 11 profiles** (`default site mep totp pbs lmod f2b polaris internal
 hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
 

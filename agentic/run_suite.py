@@ -323,7 +323,8 @@ def _emergency_cleanup(inflight: dict[str, tuple[str, str]]) -> None:
         try:
             eid = subprocess.run(base + [endpoint_uuid_cmd(name)], capture_output=True, text=True, timeout=60).stdout.strip()
             eids = [eid] if eid else []
-            cmd = f"{delete_endpoint_cmd(name)}; {scoped_cancel_cmd('slurm', eids)}; {uep_dirs_cleanup_cmd(eids)}"
+            sched = str(_TARGET.capabilities.get("scheduler", "slurm"))   # qstat/qdel on a PBS profile
+            cmd = f"{delete_endpoint_cmd(name)}; {scoped_cancel_cmd(sched, eids)}; {uep_dirs_cleanup_cmd(eids)}"
             r = subprocess.run(base + [cmd], capture_output=True, text=True, timeout=120)
             print(f"   {r.stdout.strip()[:160] or ('rc=' + str(r.returncode))}", flush=True)
         except Exception as exc:  # noqa: BLE001 - cleanup must not raise during shutdown
