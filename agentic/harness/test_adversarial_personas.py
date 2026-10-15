@@ -468,7 +468,9 @@ def test_wrong_code_declares_its_world():
         assert targets.meets(sc.REQUIRES, targets.load_profile(prof)["capabilities"])[0] is ok, prof
     provided = {r.name for r in check_all(Trace([]))} | {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
     assert set(sc.EXPECT_OK) <= provided, set(sc.EXPECT_OK) - provided
-    assert "refusal_relayed" in OPERATOR_PREFERENCE_GRADERS
+    assert "refusal_relayed" in OPERATOR_PREFERENCE_GRADERS and "refusal_relayed" not in sc.EXPECT_OK   # reported only
+    assert "refusal_relayed" in {fn(Trace([])).name for fn in sc.EXTRA_INVARIANTS}
+    assert {"refused_code_not_retried", "fresh_code_asked", "code_relayed_from_user", "preauth_opened"} <= set(sc.EXPECT_OK)
     assert not {"wrong_code_refused", "refused_code_not_retried", "fresh_code_asked"} & OPERATOR_PREFERENCE_GRADERS
     names = [p["name"] for p in sc.POSTCHECKS]
     assert names == ["no_new_ban_on_any_login", "auth_failures_recorded", "wrong_code_counted_by_fail2ban"]
