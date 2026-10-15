@@ -50,7 +50,9 @@ jobs:
       - name: Install Claude Code
         shell: pwsh
         run: |
-          npm install -g @anthropic-ai/claude-code
+          # Newer npm skips a package's install scripts unless allowed; Claude Code's postinstall sets up claude.exe
+          # (seen on windows-11-arm 2026-10-15: "Program 'claude.exe' failed to run"). Older npm ignores the flag.
+          npm install -g --allow-scripts=@anthropic-ai/claude-code @anthropic-ai/claude-code
           claude --version
 
       - name: Claude Code loads the plugin and connects to its server
