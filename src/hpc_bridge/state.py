@@ -182,7 +182,8 @@ class SentCheckStore:
     answered, or a command whose result the client lost), by task id, so a server that restarts — Claude Code relaunched
     — still sees them: a new process bound to the same endpoint must not answer a stop `down` while one is queued.
     One small file per endpoint, `~/.hpc-bridge/sent-checks/<endpoint id>.json`, 0600, holding only
-    `{task_id, partition, account, sent_at, what}` rows — never a command's text.
+    `{task_id, no_id, partition, account, sent_at, what, ceiling_at, block}` rows (`block`: a check's block-request
+    number, by which a stop finds its user endpoint on the login node) — never a command's text.
 
     Several processes can share it (two sessions on one endpoint, a restart): every write re-reads the file and MERGES
     under an exclusive lock on a sibling `.lock` file (`fcntl.flock`; `msvcrt.locking` on Windows), never blocking for

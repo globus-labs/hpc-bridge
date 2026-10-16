@@ -228,6 +228,10 @@ class GlobusRunner:
         # looks a task up (`sent_checks`): a stop answers `down` only once each has resolved, since a check still
         # queued can make the endpoint start a block for it.
         self._sent: list[tuple[Any, float]] = []
+        # The block request each of those was sent for (the `hpcb_block` of this runner's config AT ITS SEND, by future
+        # id): a stop matches a check to its own compute user endpoint by it (server._settle_by_evidence). Read at the
+        # send, never later — the shape's config can be the same dict and gets a new request's number after it.
+        self._sent_blocks: dict[int, Any] = {}
         self._client: Any = None
         # Called right after a canary is submitted, before its wait (warmth._confirm_worker records it on disk).
         self.on_sent: Any = None
@@ -295,6 +299,8 @@ class GlobusRunner:
                 return _failed_canary(exc)
             self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
             self._sent = [(f, at) for f, at in self._sent if _may_be_queued(f)] + [(fut, time.time())]
+            self._sent_blocks = {id(f): self._sent_blocks.get(id(f)) for f, _ in self._sent[:-1]}
+            self._sent_blocks[id(fut)] = (self.user_endpoint_config or {}).get("hpcb_block")
             self._client = _task_client(self._ex) or self._client
             if self.on_sent is not None:  # the caller records it NOW, before the wait (a restart must still see it)
                 try:
@@ -356,6 +362,11 @@ class GlobusRunner:
         by task id (warmth._check_states)."""
         client = self.task_client()
         return [(f, client, at) for f, at in self._sent if _may_be_queued(f)]
+
+    def sent_block(self, fut: Any) -> Any:
+        """The block request (`hpcb_block`) a canary in `sent_checks` was sent for, as this runner's config read at its
+        send; None when it had none (the login shape, a facility endpoint, an endpoint of an earlier plugin)."""
+        return self._sent_blocks.get(id(fut))
 
     @property
     def canary_pending(self) -> bool:

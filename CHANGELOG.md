@@ -66,6 +66,27 @@ installed plugin only when that version changes); git tags mark releases.
   a block, and waits for that on an endpoint hpc-bridge set up (`HPC_BRIDGE_STOP_CHECK_WAIT_S`).
 
 ### Fixed
+- **A stop no longer stays `draining` for good when the endpoint loses its report on hpc-bridge's own check.** Seen
+  live twice (2026-10-16, the fake `site` cluster: `submit_policy_rejected`, `slurm_worker_died`): after a rejected
+  submission or a pilot that died, the user endpoint holding hpc-bridge's check went into an error state ("bad
+  state") and shut down within half a second, before its report that the check had failed was sent (a race in
+  globus-compute-endpoint 4.18: it stops sending results without waiting for the last one). The Globus Compute service
+  then listed the check as queued for good, so every `stop_endpoint` answered `draining`, and only `teardown_endpoint`
+  ended it. Now, when the service still lists a check as queued after the stop's wait, the stop looks on the login
+  node (free, over the login endpoint, one command) at the user endpoint that check went to, and answers `down` only
+  when that user endpoint went into bad state after the check was sent, logged its shutdown, and has no process left
+  there: it cannot run the check, and no block can start for it. The notice says so, and that the endpoint's report
+  of the failure was lost on its own side. Anything less keeps `draining`, and the notice says what was missing: no
+  such user endpoint found, or more than one; a log or the process list that cannot be read; no bad state since its
+  last start, or one logged before the check was sent; a process or a pid file still alive; the login channel cold or
+  busy; no time left in the call. To find the right user endpoint, each block request's number now reaches that user
+  endpoint's own log: the template runs `true hpcb_block=<number>` as the user endpoint's `endpoint_setup` when it
+  starts (globus-compute-endpoint logs that command), and the number is a whole number now, so only digits reach that
+  shell. hpc-bridge's record of its checks (`~/.hpc-bridge/sent-checks/`) keeps each check's number, so a restarted
+  server can look too. A command whose result was lost is never settled this way: it runs your work, so the stop
+  still names it. Nor is a check the service has not registered yet (no task id): it could still start that user
+  endpoint again. An endpoint configured before this change has no number in its logs, and its stops behave as before
+  until it is torn down and connected again.
 - **`stop_endpoint` answers from what is left of hpc-bridge's own work, and no longer contradicts the answer
   before it.** A stop could say spend stopped while the endpoint was about to start another block. Seen live
   (2026-10-16, `queued_check_relaunch`): hpc-bridge's check (the small task it sends to see whether a block is up)

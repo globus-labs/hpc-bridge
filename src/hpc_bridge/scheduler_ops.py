@@ -16,13 +16,15 @@ import itertools
 import re
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
+from datetime import datetime
 from typing import NamedTuple
 
 from . import config
 from .config import PROVISION_GRACE_S
 from .context import AppCtx
 from .facility.endpoint_venv import WORKER_SAID
+from .facility.remote import BLOCK_REQUEST_LOG
 from .models import ShellOutcome, Submission
 
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
@@ -413,6 +415,172 @@ async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: f
 async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
     """`_augment_provisioning`'s notice alone."""
     return (await _augment_provisioning(app, eid, notice, elapsed_s, run_login))[0]
+
+
+# --- a check's OWN compute user endpoint, read on the login node ------------------------------------------------------
+# globus-compute-endpoint 4.18 acks a task once it hands it to the engine; at bad state its watcher stops the user
+# endpoint about 0.3 s later, and the result publisher stops without blocking (`stop(block=False)`), so the failed
+# check's result can be left unsent (`ResultPublisher<✗; o:1; t:0> Connection closed`; live 2026-10-16,
+# submit_policy_rejected and slurm_worker_died). The service then lists that check as pending for good, and nothing can
+# run it again: its user endpoint is gone, the task was acked, and nothing of ours sends to that block request again.
+# So where the service cannot say, a stop reads the evidence itself, over the FREE login shape (the user endpoints run
+# where their manager runs, which is where the login shape's own user endpoint runs): the check's user endpoint — the
+# one directory whose log names the check's block request (facility.remote.BLOCK_REQUEST_LOG) — went into parsl's bad
+# state AFTER the check was sent and shut down, and no process of it is left. Anything less is no evidence.
+
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_UEP_LOG_TIME = re.compile(r"\d{4}-\d\d-\d\d \d\d:\d\d:\d\d")
+# When the check was sent is placed on the login node's clock (`HPCB_NOW` less its age, the age measured here BEFORE the
+# command runs, so the send is never placed earlier than it was — no clock skew between the two hosts enters), and a
+# log line's local time is read against that clock's own local time in the same `date` call. Both are in the zone the
+# user endpoints log in: every user endpoint, the login shape's whose worker runs this command included, is forked by
+# the same manager with its environment (a non-privileged manager keeps it), and a ShellFunction's bash reads no
+# profile. A bad state logged this soon after the send still does not count (whole-second clocks); real ones come
+# later — the user endpoint's start, a 5 s scaling pass and the refused submit (~10 s), or parsl's 60 s status poll
+# after a pilot that died.
+_EVIDENCE_SLACK_S = 2.0
+
+
+def _uep_evidence_cmd(eid: str, blocks: Collection[int]) -> str:
+    """Login-shape one-liner that reports, for each block request in `blocks`, the compute user endpoint whose log names
+    it (`uep.<eid>.<uuid>/endpoint.log` holding `running endpoint_setup command: true hpcb_block=<n>`), and in its log
+    the last start, the last token line, the last `Setting bad state` (and when, the login node's local time) since that
+    start, and a `---------- Endpoint shutdown:` after it; then whether a process of that user endpoint is still
+    running (its directory name in a process's arguments — the user endpoint's title carries it) and whether its pid
+    file is still being refreshed (every 15 s while it lives). Rows: `HPCB_NOW <epoch> <date> <time>`,
+    `HPCB_UEP <n> <uuid> <starts> <start line> <token line> <bad line> <shutdown line> <date> <time>` (0 / `-`: none),
+    `HPCB_PS <uuid> <count>`, `HPCB_PID <uuid> none|old|fresh|unknown`, `HPCB_FAIL ps|read <uuid>`. Read-only.
+
+    Built from validated values only: `eid` must be a UUID and every block a whole number in range (anything else is a
+    ValueError); the user endpoint's id is read from its directory name on the login node and used only if it is a
+    UUID's characters, and only inside double quotes or as awk data. The process list is read BEFORE the loop, so no
+    process of this command is in it (the script text names no user endpoint's id)."""
+    if not _UUID.fullmatch(eid or ""):
+        raise ValueError(f"not an endpoint id: {eid!r}")
+    if not blocks or not all(isinstance(b, int) and not isinstance(b, bool) and 0 < b < 2 ** 48 for b in blocks):
+        raise ValueError("block requests must be whole numbers in range")
+    nums = sorted(set(blocks))
+    want = shlex.quote(" ".join(str(n) for n in nums))
+    pre = shlex.quote(BLOCK_REQUEST_LOG)
+    begins, shut = shlex.quote("========== Endpoint begins: "), shlex.quote("---------- Endpoint shutdown: ")
+    awk = ("BEGIN{n=split(w,W,\" \");for(i=1;i<=n;i++)ok[W[i]]=1;nb=0;lb=0;lt=0;lx=0;ls=0;xs=\"-\"} "
+           "index($0,p){t=substr($0,index($0,p)+length(p));if(t in ok){hit[t]=1;lt=NR};next} "
+           "index($0,b)==1{nb++;lb=NR;lx=0;ls=0;xs=\"-\";next} "
+           "index($0,s)==1{if(lx)ls=NR;next} "
+           "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/"
+           "&&index($0,\"Setting bad state\"){lx=NR;ls=0;xs=$1\" \"substr($2,1,8)} "
+           "END{for(t in hit)print \"HPCB_UEP \" t \" \" u \" \" nb \" \" lb \" \" lt \" \" lx \" \" ls \" \" xs}")
+    return (
+        'r="${GLOBUS_COMPUTE_USER_DIR:-$HOME/.globus_compute}"; '
+        "echo \"HPCB_NOW $(date '+%s %Y-%m-%d %H:%M:%S')\"; "
+        'if pl=$(ps -ww -U "$(id -u)" -o args= 2>/dev/null); then pok=1; else pok=0; echo "HPCB_FAIL ps"; fi; '
+        f'for f in "$r"/uep.{eid}.*/endpoint.log; do [ -e "$f" ] || continue; '
+        f'd=${{f%/endpoint.log}}; u=${{d##*/uep.{eid}.}}; '
+        'case "$u" in *[!0-9a-fA-F-]*|"") continue;; esac; [ ${#u} -eq 36 ] || continue; '
+        'if [ ! -r "$f" ]; then echo "HPCB_FAIL read $u"; continue; fi; '
+        f'if ! o=$(awk -v u="$u" -v w={want} -v p={pre} -v b={begins} -v s={shut} {shlex.quote(awk)} "$f"); '
+        'then echo "HPCB_FAIL read $u"; continue; fi; [ -n "$o" ] || continue; printf \'%s\\n\' "$o"; '
+        f'if [ "$pok" = 1 ]; then n=$(printf \'%s\\n\' "$pl" | awk -v m="uep.{eid}.$u" '
+        "'index($0,m){n++} END{print n+0}'); echo \"HPCB_PS $u $n\"; fi; "
+        'k="$d/daemon.pid"; if [ ! -e "$k" ]; then echo "HPCB_PID $u none"; '
+        'elif q=$(find "$k" -mmin -2 2>/dev/null); then if [ -n "$q" ]; then echo "HPCB_PID $u fresh"; '
+        'else echo "HPCB_PID $u old"; fi; else echo "HPCB_PID $u unknown"; fi; done; true'
+    )
+
+
+class UepEvidence(NamedTuple):
+    """What the login node says of one check's compute user endpoint. `lost`: it went into bad state after the check was
+    sent and shut down, and nothing of it runs — the check can never run, nor start a block. Otherwise `why` says what
+    was missing (for the stop's `draining`). `uep` (its directory name) and `bad_at` (its bad state's time, as its log
+    wrote it on the login node's clock) name it when matched."""
+
+    lost: bool
+    why: str
+    uep: str | None = None
+    bad_at: str | None = None
+
+
+def _read_uep_evidence(stdout: str, eid: str, wanted: Collection[tuple[str, int, float]]) -> dict[str, UepEvidence]:
+    """`_uep_evidence_cmd`'s rows, read for each wanted check — (its key, its block request, its age in seconds measured
+    here before the command ran) — into a verdict. Strict: a row that is not exactly the command's shape is ignored,
+    and every doubt reads as no evidence (the clock, the process list or a log that could not be read; no user endpoint,
+    or more than one, naming the block request; one starting again; no bad state since its last start, or one logged
+    before the check was sent; no shutdown after it; a process of it, or a pid file still refreshed)."""
+    now_epoch: int | None = None
+    now_local: datetime | None = None
+    ps_failed, read_failed = False, False
+    rows: dict[int, list[list[str]]] = {}
+    ps: dict[str, int] = {}
+    pid: dict[str, str] = {}
+    for line in stdout.splitlines():
+        w = line.split()
+        if not w:
+            continue
+        if w[0] == "HPCB_NOW" and len(w) == 4 and w[1].isdigit() and _UEP_LOG_TIME.fullmatch(f"{w[2]} {w[3]}"):
+            try:
+                now_epoch, now_local = int(w[1]), datetime.strptime(f"{w[2]} {w[3]}", "%Y-%m-%d %H:%M:%S")
+            except ValueError:
+                now_epoch = now_local = None
+        elif w[0] == "HPCB_FAIL" and len(w) >= 2:
+            ps_failed |= w[1] == "ps"
+            read_failed |= w[1] == "read"
+        elif w[0] == "HPCB_UEP" and len(w) in (9, 10) and w[1].isdigit() and _UUID.fullmatch(w[2]) \
+                and all(x.isdigit() for x in w[3:8]):
+            rows.setdefault(int(w[1]), []).append(w[2:])
+        elif w[0] == "HPCB_PS" and len(w) == 3 and _UUID.fullmatch(w[1]) and w[2].isdigit():
+            ps[w[1]] = int(w[2])
+        elif w[0] == "HPCB_PID" and len(w) == 3 and _UUID.fullmatch(w[1]):
+            pid[w[1]] = w[2]
+    claimed: dict[str, int] = {}  # a user endpoint whose log names more than one of these block requests: not ours
+    for found in rows.values():
+        for r in found:
+            claimed[r[0]] = claimed.get(r[0], 0) + 1
+    out: dict[str, UepEvidence] = {}
+    for key, block, age in wanted:
+        out[key] = _uep_verdict(eid, rows.get(block, []), claimed, ps, pid, age, now_epoch, now_local,
+                                ps_failed=ps_failed, read_failed=read_failed)
+    return out
+
+
+def _uep_verdict(eid: str, found: list[list[str]], claimed: dict[str, int], ps: dict[str, int], pid: dict[str, str],
+                 age: float, now_epoch: int | None, now_local: datetime | None, *, ps_failed: bool,
+                 read_failed: bool) -> UepEvidence:
+    if now_epoch is None or now_local is None:
+        return UepEvidence(False, "the login node's clock could not be read")
+    if ps_failed:
+        return UepEvidence(False, "its process list could not be read")
+    if read_failed:  # that log may be the one naming this block request
+        return UepEvidence(False, "a user endpoint's log there could not be read")
+    if not found:
+        return UepEvidence(False, "no user endpoint there names the check's block request yet")
+    if len(found) > 1 or claimed.get(found[0][0], 0) > 1:
+        return UepEvidence(False, "more than one user endpoint there names the check's block request")
+    uuid, starts, start_at, token_at, bad_line, shut_line = found[0][0], *map(int, found[0][1:6])
+    uep = f"uep.{eid}.{uuid}"
+    if starts == 0:
+        return UepEvidence(False, "its user endpoint has no start in its log", uep)
+    if token_at > start_at:
+        return UepEvidence(False, "its user endpoint is starting again", uep)
+    if bad_line == 0 or len(found[0]) != 8 or not _UEP_LOG_TIME.fullmatch(" ".join(found[0][6:8])):
+        return UepEvidence(False, "its user endpoint's log shows no bad state since it last started", uep)
+    bad_at = " ".join(found[0][6:8])
+    try:
+        bad = now_epoch + (datetime.strptime(bad_at, "%Y-%m-%d %H:%M:%S") - now_local).total_seconds()
+    except ValueError:
+        return UepEvidence(False, "its user endpoint's log shows no bad state since it last started", uep)
+    if bad < now_epoch - age + _EVIDENCE_SLACK_S:
+        return UepEvidence(False, "its user endpoint's bad state was logged before the check was sent", uep, bad_at)
+    if bad > now_epoch + _EVIDENCE_SLACK_S:  # a log ahead of the clock that reads it: the two do not agree
+        return UepEvidence(False, "its user endpoint's log is ahead of the login node's clock", uep, bad_at)
+    if shut_line <= bad_line:
+        return UepEvidence(False, "its user endpoint has not logged its shutdown", uep, bad_at)
+    if ps.get(uuid) != 0:
+        return UepEvidence(False, "a process of its user endpoint is still running there", uep, bad_at)
+    if pid.get(uuid) not in ("none", "old"):
+        why = ("its user endpoint's pid file is still being refreshed" if pid.get(uuid) == "fresh"
+               else "its user endpoint's pid file could not be read")
+        return UepEvidence(False, why, uep, bad_at)
+    return UepEvidence(True, "", uep, bad_at)
 
 
 # --- a scheduler SUBMISSION in the agent's own command ------------------------------------------------------------
