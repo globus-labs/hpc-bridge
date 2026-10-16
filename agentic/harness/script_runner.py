@@ -50,6 +50,15 @@ STARTUP_TIMEOUT_S = 180.0   # the server's start (`uv run` + imports): Codex's s
 SCRIPT_TIMEOUT_S = float(os.environ.get("HPCB_SCRIPT_TIMEOUT_S", "1800"))
 
 
+def _read_timeout(session: Any) -> float | timedelta:
+    """CALL_TIMEOUT_S in the form this `mcp` takes. The jail's newer client types `read_timeout_seconds` as a float and
+    adds it to one (a timedelta raised `TypeError: float + timedelta` before the first call left — live 2026-10-15, the
+    first queued_check_relaunch run); the host's older client wants a timedelta."""
+    import inspect
+    ann = str(inspect.signature(session.call_tool).parameters["read_timeout_seconds"].annotation)
+    return timedelta(seconds=CALL_TIMEOUT_S) if "timedelta" in ann else CALL_TIMEOUT_S
+
+
 class ScriptAbort(Exception):
     """The script cannot go on — a premise of the cell is unmet (the login shape never came up, no pilot appeared). The
     run ends errored with this reason as its final message, so `run_completed` fails rather than graders passing on a
@@ -118,7 +127,7 @@ class ScriptOps:
         t_start = time.time()
         print(f"  → {tool}({_short(args, 90)})", flush=True)
         try:
-            res = await self._session.call_tool(tool, args, read_timeout_seconds=timedelta(seconds=CALL_TIMEOUT_S))
+            res = await self._session.call_tool(tool, args, read_timeout_seconds=_read_timeout(self._session))
             out = tool_result(res)
         except asyncio.CancelledError:
             raise
