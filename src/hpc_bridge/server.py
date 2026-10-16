@@ -9,7 +9,6 @@ import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
-from dataclasses import replace
 from pathlib import Path
 from typing import Any, Literal, TypeVar
 
@@ -57,9 +56,8 @@ from .connect import (  # noqa: F401 - re-exported for imports; PATCH connect.di
 from .context import (  # noqa: F401 - re-exported: tools + tests import them from here
     DEFAULT_SHAPE,
     AppCtx,
-    DeadPilot,
     LeftBlock,
-    PilotWatch,
+    SentCheck,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
@@ -101,8 +99,8 @@ from .notices import (  # noqa: F401 - re-exported
     _billed_bounds_note,
     _block_terms,
     _busy_session_outcome,
+    _check_pending_notice,
     _cold_outcome,
-    _dead_pilot_stop_notice,
     _dispatch_error_suffix,
     _dropped_term_notice,
     _error_outcome,
@@ -111,7 +109,6 @@ from .notices import (  # noqa: F401 - re-exported
     _hpc_bridge_error,
     _identity_from_error,
     _idle_window_text,
-    _landing_notice,
     _left_block_state,
     _left_job,
     _left_spend_stopped,
@@ -140,7 +137,7 @@ from .notices import (  # noqa: F401 - re-exported
     _scheduler_submit_notice,
     _shape_reject_outcome,
     _spend_floor_guidance,
-    _StopOutcome,
+    _stop_down_notice,
     _submit_rejected,
     _submit_rejected_notice,
     _switch_receipt,
@@ -203,7 +200,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
     scratch = binding._resolve_scratch_root(facility)
     app = AppCtx(
         facility=facility,
-        profile=Profile(mode=_env_mode()),  # type: ignore[arg-type]
+        profile=Profile(mode=_env_mode(), uep_idle_heartbeats=config.uep_idle_heartbeats()),  # type: ignore[arg-type]
         state=EndpointState(endpoint_id=endpoint_id),
         scratch_root=scratch,
         charge_factor=config.charge_factor(),
@@ -552,16 +549,15 @@ async def _ensure_endpoint_up(
     if status == "provisioning" and billable and eid and _has_login_shape(app):
         # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
         # (and when a worker last answered, so the record can tell one that answered DURING the probe)
-        probe_epoch, probe_terms, answered = rt.block_epoch, warmth._terms_of(rt), rt.warm_confirmed_at
+        probe_epoch, answered = rt.block_epoch, rt.warm_confirmed_at
         notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
                                                                   _login_runner(app), confirmed_at=rt.confirmed_at)
         if probe is not None and probe.dead is not None:
             # A pilot that ran and died before any worker answered: the check it was started for is still queued, and
-            # the endpoint keeps submitting pilots for it. A stop must say so, not "still being submitted" (live
-            # 2026-10-15, slurm_worker_died) — on the runtime and terms the probe was for, else the endpoint's watch.
+            # the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of that check, which
+            # its own state decides) — on the runtime and terms the probe was for (live 2026-10-15, slurm_worker_died).
             async with app.lock:
-                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, probe_terms, answered, *probe.dead,
-                                          probe.jobs)
+                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
     return EndpointStatus(
         status=status,
         block_state=block,
@@ -992,58 +988,25 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     async with app.lock:  # under the lock: a run_shell provisioning right now has counted its dispatch before we look
         if busy := _busy_block_refusal(app, eid):  # releasing would not end our work: the endpoint relaunches for it
             return busy
-        # Was a block REQUESTED but never CONFIRMED running? Then a scheduler submit may still be in flight — a
-        # one-shot scancel that finds nothing has NOT confirmed the block gone: the pilot's sbatch can land a moment
-        # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
-        # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
         rt_pre = app.shapes.get(DEFAULT_SHAPE)
-        # A block asked for and never seen up (no confirmation, no identity): its sbatch may still land. A reap found by
-        # a canary voided the acknowledgement, but that canary may itself have requested the pilot; a partition or
-        # account switch voids it too, while the old terms' pilot may still be landing. A block that was seen up and
-        # only had its confirmation voided (a failed dispatch, a rebuild, a new login) is not one. Nor is a submission
-        # the scheduler REJECTED (warmth._void_rejected): no job id was issued, parsl failed every task of that user
-        # endpoint (our check among them) and never scales a bad-state executor out again, and the user endpoint stops
-        # itself — nothing of it can land, so "released none" below is the confirm. That keeps #24 (never `down`
-        # unless the cancel is confirmed or nothing was ever requested): the request was made, and produced nothing
-        # there is to cancel, which the release then checks. `switch_unseen` still counts: the old terms' pilot is
-        # another user endpoint's (warmth._repoint), and when it alone is waited for, the stop names it and the watch
-        # keeps ITS terms (`old_terms`), not the new ones'.
         rejected = rt_pre is not None and rt_pre.rejected is not None
-        own_expects = rt_pre is not None and (
-            (rt_pre.spend_confirmed or rt_pre.reap_kicked) and rt_pre.warm_confirmed_at is None
-            and rt_pre.block_since is None and not rejected)
-        old_terms = (rt_pre.unseen_terms if rt_pre is not None and rt_pre.switch_unseen and not own_expects else None)
-        shape_expects = own_expects or (rt_pre is not None and rt_pre.switch_unseen)
-        # A pilot of ours that may land although the shape goes (AppCtx.pilot_watch, kept past the drop below): one
-        # that died before it ran our check — the shape's, or one a switch left — or a block an earlier stop waited for.
-        # While its window is open the release polls for it; past it the stop no longer waits, but a dead pilot's
-        # history is still read before a `down`.
-        started = time.monotonic()
-        watch = warmth._stop_watch(app, eid, rt_pre, started)
-        expect_block = shape_expects or (watch is not None and not warmth._watch_expired(watch, started))
-        first_dead = rt_pre is not None and rt_pre.dead_pilot is not None  # its first stop answers `draining`
-        # a dead-pilot watch nobody looked at for many windows (a reconnect hours later): what the endpoint submitted
-        # meanwhile is history, not a sign of now — it is taken as known, and this stop is the watch's first again
-        stale = watch is not None and not first_dead and warmth._watch_stale(watch, started)
-        own_job = rt_pre.block_job if rt_pre is not None else None        # the shape's confirmed block: not a pilot
-        terms = old_terms or (warmth._terms_of(rt_pre) if rt_pre is not None else
-                              watch.terms if watch is not None else (None, None))
+        # The evidence (#24): every check of ours sent to a compute user endpoint that no worker has answered — the
+        # current runner's and the ones the endpoint kept from runners a stop, switch, rebuild or re-bind retired. While
+        # one is queued the endpoint can start a block to run it: after a cancel parsl submits another block for a task
+        # still outstanding (live 2026-10-16, `queued_check_relaunch`: "released 4", `down`, job 5 submitted 53 s
+        # later). So `down` needs the release confirmed AND every such check resolved (or never sent), whatever the
+        # shape's own state says. (Our own commands are the busy refusal's: a stop never releases under them.)
+        checks = warmth._our_checks(app, eid, rt_pre)
+        # On a fresh compute user endpoint (warmth._fresh_block) a cancelled or dead first pilot makes parsl give our
+        # check up (bad state) within one scheduler status poll: worth waiting for, so one call usually ends `down`. An
+        # endpoint of an earlier plugin keeps one user endpoint, where a cancel is followed by another block instead.
+        wait = config.stop_check_wait_s() if getattr(app.facility, "fresh_ueps", False) is True else 0.0
         # an earlier scheduler command of ours already occupying the internal login session (the cancel would wait)
         internal_before = _busy_session(app, "login", _INTERNAL_SESSION)
     # Cancel the scheduler block over the login shape (AMQP) — no SSH. OFF the lock: the release rides run_shell.
-    confirmed, detail = await scheduler_ops._release_blocks_over_login(
-        app, eid, _login_runner(app), expect_block=expect_block)
-    dead = watch.dead if watch is not None else None
-    # A pilot that dies can come and go between two looks, and the release lists live jobs only: read every pilot the
-    # endpoint has (sacct / `qstat -x`, finished ones included — where the dead pilot itself was read).
-    probe = (await scheduler_ops._probe_pilots_over_login(app, eid, PROVISION_GRACE_S, _login_runner(app))
-             if dead is not None else None)
-    outcome: _StopOutcome = "waiting"
-    new: list[str] = []
-    cancelled: list[str] = []
-    uncancelled: list[str] = []
-    died: tuple[str, str] | None = None
-    release_looked = confirmed or scheduler_ops._NO_PILOT_YET in detail  # it read the scheduler (not a cold channel)
+    started = time.monotonic()
+    confirmed, detail, states, ran = await _release_until_settled(app, eid, checks, wait)
+    waited = time.monotonic() - started
     async with app.lock:  # look again and drop in ONE step: a dispatch may have reached the block during the release
         if work := _block_work(app, then="stop_endpoint again"):
             # Its command was sent to a block being cancelled: the endpoint may relaunch one to run it. Keep the shape
@@ -1054,66 +1017,28 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
                 notice=(f"{detail}. Spend is NOT confirmed stopped: {what} — it reached the block while it was being "
                         f"released, so the endpoint may relaunch a block to run it. {action}"),
             )
-        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
-        now = time.monotonic()
-        handed = app.pilot_watch.get(eid)
-        late = dead is None and handed is not None and handed.dead is not None
-        if late:
-            # a pilot the provisioning probe found dead while this stop's release ran, handed over by the drop: this is
-            # its first stop (`draining`), and the release was its only look (no history read)
-            assert handed is not None and handed.dead is not None
-            watch, dead, first_dead = handed, handed.dead, True
-        if watch is not None and dead is not None:
-            # What this stop learned: pilots it cancelled, and pilots the endpoint submitted since (live or finished) —
-            # each a sign the check is still queued and the endpoint is still submitting for it. While that check may
-            # be outstanding a confirmed cancel is NOT `down`: parsl reads a cancelled pilot as CANCELLED (Slurm) or
-            # COMPLETED (PBS), neither of which trips its block-error handler, and with a task outstanding and no block
-            # pending or running it submits another on its next scaling pass (strategy cases 2b/4a).
-            # (cancelled by a confirmed release, or by one where the scheduler refused some: those are not lost)
-            cancelled = [j for j in scheduler_ops._released_jobs(detail) if j != own_job]
-            listed = probe.jobs if probe is not None else frozenset()
-            fresh = [j for j in listed if j not in dead.known and j != own_job
-                     and (not stale or (probe is not None and j in probe.live))]   # live now: a sign whatever its age
-            new = list(dict.fromkeys(cancelled + sorted(fresh)))
-            died = next((d for d in reversed(probe.died) if d[0] in new), None) if probe is not None else None
-            seen = replace(dead, known=dead.known | listed | frozenset(cancelled))  # every pilot job seen so far
-            uncancelled = [j for j in new if probe is not None and j in probe.live and j not in cancelled]
-            # a look needs the release to have read the scheduler, and the history read to have worked (a failed sacct
-            # or qstat is not "no new pilot")
-            looked = release_looked and (late or (probe is not None and not probe.failed))
-            if new:
-                outcome = "more"
-                app.pilot_watch[eid] = PilotWatch(since=now, terms=watch.terms, dead=seen)  # a fresh sign: wait again
-            elif not looked:
-                outcome = "unlooked"
-                app.pilot_watch[eid] = replace(watch, dead=seen)
-            elif first_dead or stale or not warmth._watch_expired(watch, now):
-                outcome = "waiting"
-                app.pilot_watch[eid] = replace(watch, since=now if stale else watch.since, dead=seen)
-            else:  # nothing new for a whole window: had the check still been queued, a pilot would be listed by now
-                outcome = "gone"
-                app.pilot_watch.pop(eid, None)
-        elif confirmed:  # it cancelled what it waited for, or nothing was expected
-            app.pilot_watch.pop(eid, None)
-        elif expect_block:  # `draining` below: a pilot may still land, so a second stop polls for it again
-            # its window from now, when this stop answers — not from before its own polling, which would spend a third
-            # of it before the agent reads the answer
-            app.pilot_watch[eid] = (watch if watch is not None and not shape_expects else
-                                    PilotWatch(since=now, terms=terms))
-    if dead is not None:
-        return await _stop_after_dead_pilot(app, eid, dead, outcome, confirmed=confirmed, detail=detail,
-                                            own_job=own_job, new=new, cancelled=cancelled, died=died,
-                                            uncancelled=uncancelled, internal_before=internal_before)
-    if confirmed:
+        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total, its checks with the endpoint
+        warmth._settle_checks(app, eid, checks, states)
+        # a check sent while the release ran (a concurrent ensure_endpoint_up) was not looked at: count it as queued
+        seen = {id(c.future) for c in checks}
+        late = [c for c in app.sent_checks.get(eid, []) if id(c.future) not in seen]
+    pending = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")] + late
+    unknown = "unknown" in states
+    gave_up = [c for c, st in zip(checks, states, strict=True) if st == "failed"]
+    if confirmed and not pending:
         return EndpointStatus(
-            status="down",  # cancel CONFIRMED: a block was found + cancelled, or none was ever requested
+            status="down",  # the cancel CONFIRMED, and no check of ours is left that could start a block
             block_state="cold",
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
             spend_stopped=True,  # the one result that may say so
-            notice=(_rejected_stop_notice() if rejected and detail == "released none" else
-                    f"compute block released over AMQP ({detail}); the login endpoint stays online for "
-                    "reuse (reconnecting is zero-SSH)."),
+            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran),
+        )
+    if confirmed:  # the scheduler holds nothing of ours now, but a check still queued can start a block
+        released = detail if detail != "released none" else None
+        return EndpointStatus(
+            status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+            notice=_check_pending_notice(app, pending, released=released, unknown=unknown, waited_s=waited),
         )
     if await _endpoint_gone(app):
         return await _orphaned_stop(app, eid)
@@ -1136,14 +1061,10 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
                   "the backstop). The login endpoint stays online for reuse.")
     elif (failure := scheduler_ops._release_failure(detail)) is not None:
         # a scheduler command itself failed (unreachable, or a cancel refused): not a cold channel, quoted as it is
-        notice = _failed_release_notice(failure, landing=expect_block)
-    elif expect_block:
-        # the block was still being submitted and no pilot appeared in the scheduler within the release window;
-        # one may land shortly (the stop-during-provisioning race, 0.1.14). The next stop polls for it again
-        # (AppCtx.pilot_watch), and answers `down` once none has landed within config.pilot_watch_s(). It names the
-        # block when that is the old terms' one (a switch), or the one an earlier stop waited for.
-        named = old_terms or (watch.terms if rt_pre is None and watch is not None else None)
-        notice = _landing_notice(app, detail, named, switched=old_terms is not None, rejected=rejected)
+        notice = _failed_release_notice(failure, queued=bool(pending))
+    elif pending:  # the release could not look (a cold channel), and a check of ours is still queued
+        notice = _check_pending_notice(app, pending, released=None, unknown=unknown, waited_s=0.0,
+                                       reason="the login release channel was cold, and ")
     else:
         notice = (f"{detail}. Spend is NOT confirmed stopped — the login release channel was cold. "
                   "idle-release (~10 min, min_blocks=0) is the backstop; call stop_endpoint again in a few "
@@ -1157,13 +1078,46 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     )
 
 
+# How often a stop that waits for our checks looks again: each look is a release (cancelling whatever pilot landed) and
+# a lookup of each check.
+_SETTLE_STEP_S = 10.0
+_sleep = asyncio.sleep  # indirection so tests can run the settle loop without waiting
+
+
+async def _release_until_settled(app: AppCtx, eid: str, checks: list[SentCheck],
+                                 wait_s: float) -> tuple[bool, str, list[warmth.CheckState], bool]:
+    """Release this endpoint's blocks, and — for up to `wait_s` while a check of ours is still queued — release again
+    and look again every `_SETTLE_STEP_S`: a pilot that lands is cancelled, and a fresh user endpoint whose first pilot
+    was cancelled (or died) gives our check up. A check a worker ANSWERED meanwhile ran on a block that came up for it:
+    one more release cancels that block. Returns (release confirmed, its detail — every job cancelled on the way, or
+    the last attempt's words —, each check's state, whether one ran)."""
+    run_login = _login_runner(app)
+    deadline = time.monotonic() + wait_s
+    cancelled: list[str] = []
+    ran = False
+    while True:
+        confirmed, detail = await scheduler_ops._release_blocks_over_login(app, eid, run_login)
+        cancelled += [j for j in scheduler_ops._released_jobs(detail) if j not in cancelled]
+        states = await warmth._check_states(checks)
+        ran = ran or "ok" in states
+        if not confirmed or not any(st in ("pending", "unknown") for st in states) or time.monotonic() >= deadline:
+            break
+        await _sleep(min(_SETTLE_STEP_S, max(0.0, deadline - time.monotonic())))
+    if ran and confirmed:  # a block came up for a check during the stop: it ran it, and is cancelled now
+        confirmed, detail = await scheduler_ops._release_blocks_over_login(app, eid, run_login)
+        cancelled += [j for j in scheduler_ops._released_jobs(detail) if j not in cancelled]
+    if confirmed:
+        detail = f"released {' '.join(cancelled)}" if cancelled else "released none"
+    return confirmed, detail, states, ran
+
+
 async def _orphaned_stop(app: AppCtx, eid: str) -> EndpointStatus:
     """The login endpoint is OFFLINE/gone (the #44 liveness check poll_task got, applied here — found in review): "call
     again in a few seconds" would loop forever. A block whose manager is gone exits on its own (workers lose their
-    manager), and so do the user endpoints that submit pilots, so nothing spends through hpc-bridge — and nothing is
-    left to watch for."""
+    manager), and so do the user endpoints that hold our checks, so nothing spends through hpc-bridge — and nothing is
+    left to wait for."""
     async with app.lock:
-        app.pilot_watch.pop(eid, None)
+        app.sent_checks.pop(eid, None)
     return EndpointStatus(
         status="down", block_state="cold", endpoint_id=eid,
         session_spend=_total_session_spend(app),
@@ -1173,56 +1127,15 @@ async def _orphaned_stop(app: AppCtx, eid: str) -> EndpointStatus:
     )
 
 
-async def _stop_after_dead_pilot(app: AppCtx, eid: str, dead: DeadPilot, outcome: _StopOutcome, *,
-                                 confirmed: bool, detail: str, own_job: str | None, new: list[str],
-                                 cancelled: list[str], died: tuple[str, str] | None, uncancelled: list[str],
-                                 internal_before: str | None) -> EndpointStatus:
-    """The answer of a stop that met a pilot which ran and died before it ran our check (`_stop_endpoint` decided the
-    `outcome` and kept or dropped the watch): `down` only once a whole window passed with no new pilot, the cancel of
-    a replacement never — that check may still be queued, and the endpoint submits another for it."""
-    released = detail if confirmed and own_job is not None and own_job in scheduler_ops._released_jobs(detail) else None
-    if outcome == "gone":
-        return EndpointStatus(
-            status="down", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
-            spend_stopped=True,  # nothing of ours is in the scheduler, and the endpoint has stopped submitting
-            notice=_dead_pilot_stop_notice(dead, outcome, released=released, window_s=config.pilot_watch_s()),
-        )
-    why = ""
-    if outcome == "unlooked" or uncancelled:  # say why this stop could not look, or could not cancel what it saw
-        if outcome == "unlooked" and not confirmed and await _endpoint_gone(app):
-            return await _orphaned_stop(app, eid)
-        internal = _busy_session(app, "login", _INTERNAL_SESSION)
-        held = app.tasks.get(internal) if internal is not None else None
-        ours = held is not None and held.command == scheduler_ops._release_cmd_for(app, eid)
-        if ours and internal != internal_before:
-            why = (f"the cancel was sent (task_id={internal!r}) but has not finished — it is queued behind other work "
-                   "on the login node, or the scheduler is slow")
-        elif internal is not None:
-            why = ("the login release channel is busy with another scheduler command of hpc-bridge's own "
-                   f"(task_id={internal!r})")
-        elif (failure := scheduler_ops._release_failure(detail)) is not None:
-            why = f"a scheduler command failed: {failure!r}"
-        elif not confirmed and scheduler_ops._NO_PILOT_YET not in detail:
-            why = "the login release channel was cold"
-        elif outcome != "unlooked":  # the release read the scheduler and found none: the pilot came after its look
-            why = "it appeared after the release's last look"
-        else:
-            why = "the scheduler's list of this endpoint's pilots could not be read"
-    return EndpointStatus(
-        status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
-        notice=_dead_pilot_stop_notice(dead, outcome, released=released, new=new, cancelled=cancelled, died=died,
-                                       uncancelled=uncancelled, why=why),
-    )
-
-
 @mcp.tool()
 async def stop_endpoint(ctx: Context) -> EndpointStatus:
     """Stop spending on the HPC compute block. On an endpoint hpc-bridge stood up over SSH it cancels the billed
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
     reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
-    `spend_stopped` true) means nothing of ours is left to bill there — the cancel was confirmed, or there was nothing
-    to cancel — and `draining` that this is not confirmed yet: call it again when its notice says (a pilot may still
-    land, or one died and the endpoint can submit another). On a facility multi-user
+    `spend_stopped` true) means nothing of ours is left to bill there — the cancel was confirmed (or there was nothing
+    to cancel) and no check of hpc-bridge's is still queued on the endpoint — and `draining` that this is not confirmed
+    yet: the cancel was not confirmed, or such a check is still queued and the endpoint can start a block to run it.
+    Call it again when its notice says; a check that stays queued ends with teardown_endpoint. On a facility multi-user
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
     the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
@@ -1390,7 +1303,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         # — unless a connect meanwhile bound a NEW endpoint: that state is its, not this teardown's to clear
         ours = app.state.endpoint_id in (eid, None)
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
-        app.pilot_watch.pop(eid, None)  # the endpoint is deleted, and its user endpoints with it: no pilot is to come
+        app.sent_checks.pop(eid, None)  # the endpoint is deleted, and its user endpoints with our checks with it
     return EndpointStatus(
         status="down",
         block_state="cold",

@@ -60,62 +60,68 @@ installed plugin only when that version changes); git tags mark releases.
   refuse it, to say that it is now in the transcript and should be changed (without restating it), and to give the
   `preauth_command` for the user's own terminal. When `complete_preauth` refuses something that is not a one-time
   code, its notice says the same: if it was the user's password, tell them to change it, and never repeat it.
+- **`HPC_BRIDGE_PROVISIONING_RELEASE_ATTEMPTS` is no longer read.** A stop while a block was still being started
+  used to poll the scheduler a fixed number of times for its pilot, then answer `down` once it had cancelled one. It
+  now goes by hpc-bridge's own check instead (see Fixed): it answers `down` only once that check can no longer start
+  a block, and waits for that on an endpoint hpc-bridge set up (`HPC_BRIDGE_STOP_CHECK_WAIT_S`).
 
 ### Fixed
-- **`stop_endpoint` no longer contradicts what it just said about a block that failed before it ran.** Seen live
-  (2026-10-15, the fake `site` cluster under Pi and Hermes): `ensure_endpoint_up` answered that the scheduler REJECTED
-  the block's submission ("the new block was not created: nothing is queued"), or that its pilot job had already
-  FINISHED with exit status 42, and the `stop_endpoint` that followed answered `draining`: "the compute block was
-  still being submitted … one may land shortly … idle-release is the backstop". The agents believed the earlier answer
-  and did not call again. Now:
-  - after a rejected submission the stop answers `down` (`spend_stopped` true), saying there was nothing to cancel
-    because the scheduler rejected the submission and no block was created. It still looks once, and it still waits
-    for a pilot of the terms the session switched away from, which may still land;
+- **`stop_endpoint` answers from what is left of hpc-bridge's own work, and no longer contradicts the answer
+  before it.** A stop could say spend stopped while the endpoint was about to start another block. Seen live
+  (2026-10-16, `queued_check_relaunch`): hpc-bridge's check (the small task it sends to see whether a block is up)
+  was still queued; the stop cancelled the block being started for it, answered `down` ("released 4"), and 53 s
+  later the endpoint submitted another block for that check. And (2026-10-15, the fake `site` cluster under Pi and
+  Hermes) `ensure_endpoint_up` answered that the scheduler REJECTED the block's submission ("the new block was not
+  created: nothing is queued"), or that its pilot job had already FINISHED with exit status 42, and the
+  `stop_endpoint` that followed answered `draining`: "the compute block was still being submitted … one may land
+  shortly … idle-release is the backstop". The agents believed the earlier answer and did not call again. Now:
+  - the stop answers `down` (`spend_stopped` true) only when its cancel was confirmed and every check hpc-bridge
+    sent to the endpoint has either been run or been dropped by the endpoint. It asks the Globus Compute service
+    about each one by its task id, so a check that failed only on hpc-bridge's side still counts as waiting. While
+    one is still waiting, the stop answers `draining`: it names the check (its queue and account, its task id), says
+    the endpoint can start a block to run it, and says to call `stop_endpoint` again in about a minute (each call
+    cancels what it finds and looks again) and that `teardown_endpoint` ends a check that stays queued. The stop
+    still sees those checks after a partition or account switch, a `connect_facility` to the same endpoint, and a
+    teardown that stopped to ask for a one-time code. A check sent by another call while the stop was cancelling
+    counts as waiting too. When the endpoint has gone offline, nothing is left to start a block, and the stop
+    answers `down` as before;
+  - an endpoint hpc-bridge sets up now runs each block request in its own compute user endpoint, a small process on
+    the login node that exits ten minutes after its last task (`idle_heartbeats_soft` in the endpoint's template;
+    `HPC_BRIDGE_UEP_IDLE_HEARTBEATS`, default 20 heartbeats of 30 s). The block it starts is its first, so when a
+    stop cancels that block, or the block dies before it connects, the endpoint drops the check instead of starting
+    another block. On such an endpoint the stop waits up to 90 s for that (`HPC_BRIDGE_STOP_CHECK_WAIT_S`),
+    cancelling anything that lands meanwhile, so one call usually ends `down`. Confirming spend again while a block
+    is still up keeps the same user endpoint, and the login endpoint's own process never changes. An endpoint set
+    up by an earlier plugin keeps one compute user endpoint (one per block request would never exit there): its
+    stops do not wait, and answer `draining` until the check is dropped. To get the new behaviour there, remove the
+    endpoint (`teardown_endpoint`) and connect again. A facility's own endpoint is unchanged;
+  - after a rejected submission the stop answers `down`, saying there was nothing to cancel because the scheduler
+    rejected the submission and no block was created;
   - a rejected submission also drops the spend confirmation, as a reaped block does: the next `ensure_endpoint_up` or
     `run_shell` without `confirm_spend` asks again, saying the last submission was rejected and that the same terms
     would be refused again. Before, the next call submitted the same request again. On a facility's own endpoint the
     stop no longer names a block confirmed before the rejection as still billing: with one block, the endpoint
     submits a new one only once that one is gone;
-  - after a pilot that ran and died, the stop answers `draining` and names that pilot and its exit status: no new
-    pilot appeared during its check, but hpc-bridge's last check may still be queued on the endpoint, which can
-    submit another pilot for it, likely dying the same way; call `stop_endpoint` again in about a minute. It no
-    longer says "still being submitted", and no longer offers idle-release as a backstop: an endpoint is not idle
-    while a check waits. On PBS a dead pilot reads as completed to the endpoint, which then submits another for as
-    long as the check waits;
-  - a second stop looks again. Before, the first stop let go of the compute block's state, so the second one found
-    nothing to wait for and answered `down`; this also covered the stop that said a block was still being submitted.
-    Now the endpoint remembers that a pilot may still land, and the next stop polls for it again and reads the
-    endpoint's pilot history, so a pilot that came and died between two stops is still seen. It answers `down` once
-    no new pilot has appeared for two minutes (`HPC_BRIDGE_PILOT_WATCH_S`). A stop that cancels a new pilot for that
-    check stays `draining`: cancelling a pilot does not end the check, so the endpoint submits another. Its notice
-    says that only removing the endpoint ends the check. A stop that could not cancel a new pilot it saw (the release
-    channel was cold) says so instead of implying it did;
-  - after a switch whose new terms the scheduler rejected, the stop still looks for the block asked for on the old
-    terms, and names it: "the block asked for on partition 'debug' before the partition or account was switched was
-    still being submitted", never "the compute block". The same holds after a block that stopped answering a check
-    (whose check may have asked for a new block on the old terms). The answer that switched, confirmed and met the
-    rejection no longer opens with a receipt for a new block "this new one included"; it says what became of the old
-    block, then the rejection;
-  - a pilot that died stays watched when the compute block's state is dropped some other way than a stop: a
-    `connect_facility` to the same endpoint, or a teardown that stopped to ask for a one-time code;
+  - after a pilot that ran and died, the stop names that pilot and its exit status: `down` once the endpoint has
+    dropped the check it was started for, `draining` while that check is still queued. It no longer says "still
+    being submitted", and no longer offers idle-release as a backstop: an endpoint is not idle while a check waits;
+  - after a switch, the stop names a check still queued for the old terms ("hpc-bridge's check for the block on
+    partition 'debug'"), whatever the new terms did, and nothing of terms the scheduler rejected. The answer that
+    switched, confirmed and met the rejection no longer opens with a receipt for a new block "this new one
+    included"; it says what became of the old block, then the rejection;
   - the stop's cancel command used to read an unreachable scheduler (`squeue` or `qstat` failing) as an empty
     listing, so it answered "released none", a confirmed release; a cancel the scheduler refused also read as
-    released. Now each says which command failed, and the stop does not count it as confirmed. The pilot check says
-    so too, and a stop that could not read the pilot history stays `draining`;
+    released. Now each says which command failed, with its own words (not "the login release channel was cold"),
+    and the stop does not count it as confirmed. The release cancels one job at a time: when PBS refuses to delete a
+    job that is already exiting, the stop names that job and the ones it did cancel. The pilot check says when a
+    command failed too;
   - a pilot that died in an earlier session, still in the scheduler's history (Slurm's accounting keeps six hours
     here, PBS's job history about two weeks), is no longer reported as this block's FINISHED pilot. A check that
     waits a long time for the login node can no longer make this block's own dead pilot look like an earlier one;
   - a pilot that died after the block's own check failed with an error (the block kept its identity) is now
-    recorded, so the stop answers `draining` for it, as it did for a pilot of a block never seen up;
-  - a failed scheduler command in the stop (`squeue` or `qstat` unreachable) is said as one, with its own words,
-    not as "the login release channel was cold". The release cancels one job at a time: when PBS refuses to delete a
-    job that is already exiting, the stop names that job and the ones it did cancel, and still does not answer
-    `down`;
+    recorded, so the stop names it;
   - a rejected submission now stops the spend clock and asks for spend again whatever the block count. parsl lets
-    the rejection reach hpc-bridge only once every block of that endpoint has failed, so no block of it is still up;
-  - when a stop comes long after the last one (ten windows), the pilots the endpoint submitted meanwhile are taken
-    as history, not as new pilots: that stop answers `draining` once and the next one can answer `down`. A pilot
-    that is running now still counts.
+    the rejection reach hpc-bridge only once every block of that endpoint has failed, so no block of it is still up.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";

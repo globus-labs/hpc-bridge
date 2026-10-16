@@ -78,39 +78,34 @@ def release_backoff_s() -> float:
     return float(env("HPC_BRIDGE_RELEASE_BACKOFF_S") or "6")
 
 
-def provisioning_release_attempts() -> int:
-    """Release attempts when a block was REQUESTED but never confirmed running (stop-during-provisioning): the pilot's
-    sbatch may not be in the scheduler yet, so a one-shot scancel finds nothing — keep polling for it to land and
-    cancel it (× release_backoff_s ≈ a ~30 s window by default) rather than falsely reporting 'down' (issue: the
-    spend_revoked race, 2026-09-05)."""
-    return max(release_attempts(), int(env("HPC_BRIDGE_PROVISIONING_RELEASE_ATTEMPTS") or "6"))
+# How long a stop waits for our checks still queued on a FRESH compute user endpoint to resolve (server._stop_endpoint):
+# once it has cancelled that endpoint's first pilot (or one died before it connected), parsl reads the job as MISSING
+# at its next scheduler status poll (at most every 60 s for Slurm and PBS — `status_polling_interval`, parsl 2026.4.20
+# to 2026.10.12), on its JobStatusPoller tick (`strategy_period: 5` in hpc-bridge's templates), trips its block-error
+# handler (bad state) and fails every task it holds — our check among them. 60 + 5 s, plus 25 s for the failure to
+# reach the web service and for our task lookups: 90 s, so one stop usually ends `down` instead of a second call. It
+# bounds the call; a check still queued at the end is said as such (`draining`), never presumed gone. Read at each
+# stop; 0 turns the wait off.
+STOP_CHECK_WAIT_S = 90.0
+_STOP_CHECK_WAIT_MAX_S = 300.0
 
 
-# How long after the last sign of a pilot of ours a later stop still expects one to land (AppCtx.pilot_watch): until it
-# passes, a stop that finds nothing answers `draining`; after it, a check that finds nothing new is a confirmed `down`.
-# It is the longest an endpoint takes to put the next pilot in the scheduler once the last one ended, from parsl's own
-# cadence (parsl 2026.4.20 to 2026.10.12, globus-compute-endpoint 4.15 / 4.18 — the code is the same): it learns a
-# pilot ended only from its provider's status poll, at most every 60 s (`status_polling_interval` of SlurmProvider,
-# PBSProProvider and TorqueProvider), run on the JobStatusPoller's tick (`strategy_period`: 5 s on the endpoints
-# hpc-bridge configures, 30 s on ones configured before that, which reuse never rewrites); on that same tick it submits
-# the next pilot while a task of ours is outstanding (strategy cases 2b/4a); sbatch / qsub return in about a second and
-# the job is listed at once (parsl waits up to its cmd_timeout, 10 s on Slurm, 120 s on PBS: a bound, not the norm).
-# 60 + 30 + 30 s of submit-and-listing slack. It counts from when a stop ANSWERS, after its own poll (about 36 s).
-# On Slurm with accounting, a fresh user endpoint's first dead pilot usually trips parsl's block-error handler at once
-# (threshold max(1, init_blocks), every block it ever had FAILED): the check FAILS instead of staying queued, no pilot
-# follows, and the window simply runs out — the next stop answers `down`. On PBS a dead pilot reads COMPLETED, and the
-# pilots keep coming: the window never runs out while they do.
-# What it does NOT cover: the time a user endpoint takes to SPAWN (the manager starting it for our first task, its
-# imports, its first scaling pass). For a block "still being submitted", the `down` at the window's end is a CLOCK, not
-# evidence: our check may still be queued, and a pilot can land after it. That is the queued-check hazard (a cancelled
-# or late pilot is resubmitted while our check waits), to be revisited when hpc-bridge can see or end that check — the
-# seam is the canary future the runner holds (PilotWatch, warmth._drop_compute_shape_locked).
-PILOT_WATCH_S = 120.0
+def stop_check_wait_s() -> float:
+    """The stop's bounded wait for our queued checks: STOP_CHECK_WAIT_S, unless HPC_BRIDGE_STOP_CHECK_WAIT_S overrides
+    it (within [0, 300] s: past that a tool call outlives a client's window)."""
+    return min(max(0.0, _env_float("HPC_BRIDGE_STOP_CHECK_WAIT_S", STOP_CHECK_WAIT_S)), _STOP_CHECK_WAIT_MAX_S)
 
 
-def pilot_watch_s() -> float:
-    """The pilot watch window: PILOT_WATCH_S, unless HPC_BRIDGE_PILOT_WATCH_S overrides it (never negative)."""
-    return max(0.0, _env_float("HPC_BRIDGE_PILOT_WATCH_S", PILOT_WATCH_S))
+# Heartbeats (30 s each) an idle COMPUTE user endpoint stays up before it exits (Profile.uep_idle_heartbeats), written
+# into the UEP template when hpc-bridge configures an endpoint — so a change applies to endpoints configured after it.
+UEP_IDLE_HEARTBEATS = 20
+
+
+def uep_idle_heartbeats() -> int:
+    """HPC_BRIDGE_UEP_IDLE_HEARTBEATS, else UEP_IDLE_HEARTBEATS: a whole number >= 0. 0 keeps every compute user
+    endpoint running once started — and then hpc-bridge does not start a fresh one per block request."""
+    raw = _env_float("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", UEP_IDLE_HEARTBEATS)
+    return int(raw) if math.isfinite(raw) and raw >= 0 else UEP_IDLE_HEARTBEATS
 
 
 def charge_factor() -> float:

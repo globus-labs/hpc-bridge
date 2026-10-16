@@ -436,3 +436,32 @@ async def test_a_canary_answer_carries_the_job_into_the_result():
     ex = _QueueExecutor(_CanaryFuture(result=_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 a000\nHPCB_JOB 4242\n")))
     res = await GlobusRunner("eid", executor_factory=lambda: ex).canary(timeout=0.1)
     assert res.ok and res.worker_job == "4242"
+
+
+async def test_the_checks_a_runner_sent_stay_listed_until_a_worker_answers_them(monkeypatch):
+    # #24's evidence: every canary this runner sent that may still be queued on the endpoint, with the client call that
+    # looks its task up — kept from the send, so it works after the runner's close
+    pytest.importorskip("globus_compute_sdk")
+    from types import SimpleNamespace
+
+    from hpc_bridge import runner as runner_mod
+
+    lost, later, unsent = _CanaryFuture(pending=True), _CanaryFuture(pending=True), _CanaryFuture(pending=True)
+    lost.task_id, later.task_id = "t-1", "t-2"
+    ex = _QueueExecutor(lost, later, unsent)
+    ex.client = SimpleNamespace(get_task=lambda tid: {"pending": True, "task_id": tid})
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    assert r.sent_checks() == []
+    await r.canary(timeout=0.1)
+    [(fut, lookup)] = r.sent_checks()
+    assert fut is lost and lookup("t-1")["task_id"] == "t-1"
+    monkeypatch.setattr(runner_mod, "_CANARY_MAX_WAIT_S", -1.0)
+    await r.canary(timeout=0.1)                                    # abandoned for a fresh one: both may be queued
+    assert [f for f, _ in r.sent_checks()] == [lost, later]
+    lost.resolve(_ShellRes("HPCB_CANARY\n"))                       # a worker answered it: it ran, not queued
+    later.resolve(exc=RuntimeError("SDK thread quit unexpectedly."))  # a client-side failure: the task may live on
+    assert [f for f, _ in r.sent_checks()] == [later]
+    await r.canary(timeout=0.1)                                    # one that ends before it was registered: never sent
+    unsent.resolve(exc=RuntimeError("Executor is shutdown"))
+    r.close()
+    assert [(f, look is not None) for f, look in r.sent_checks()] == [(later, True)]

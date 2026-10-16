@@ -79,16 +79,11 @@ class ShapeRuntime:
     reap_kicked: bool = False
     # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
     # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
-    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
-    # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
-    # (server._stop_endpoint's expect_block) — also after a reap a check found (`reap_kicked`), whose check may have
-    # asked the old terms' user endpoint for a block; `unseen_terms` are that block's partition and account, which a
-    # stop names and watches for. A confirmation clears them — `switch_unseen` / `unseen_terms` only once a block is
-    # up (a submission on the new terms that the scheduler rejects leaves the old terms' pilot still to look for).
+    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name.
+    # A confirmation clears them. (A block the old terms asked for that may still land is not tracked here: the check
+    # that asked for it is — the old runner's SentCheck, which the endpoint keeps when the switch retires that runner.)
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
-    switch_unseen: bool = False
-    unseen_terms: tuple[str | None, str | None] | None = None
     # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
     # while they differ from these — back on them, the block the reap found is that confirmation's again.
     reap_terms: tuple[str | None, str | None] | None = None
@@ -183,32 +178,26 @@ class LeftBlock:
 @dataclass(frozen=True)
 class DeadPilot:
     """A pilot that ran and died before it ran hpc-bridge's check: the block started and its worker exited (a failed
-    worker_init, an environment the compute node lacks). The check is still queued on the endpoint, and parsl submits
-    another pilot for it on its next scaling pass — on PBS forever (a finished job reads COMPLETED, which never trips
-    parsl's block-error handler), on Slurm until every block that user endpoint ever had has FAILED. Idle-release never
-    ends that: the endpoint is not idle while the check waits."""
+    worker_init, an environment the compute node lacks). Kept to NAME it — a stop says what became of the check it was
+    started for; that check's own state (SentCheck) is the evidence."""
 
     job: str                     # the pilot's scheduler job, as the FINISHED notice named it
     exit_status: str             # its exit status, as reported
-    # every pilot job of this endpoint the probe listed with it (live or finished): a stop tells a pilot the endpoint
-    # submitted since from these
-    known: frozenset[str] = frozenset()
+    known: frozenset[str] = frozenset()  # every pilot job of this endpoint the probe listed with it
 
 
-@dataclass(frozen=True)
-class PilotWatch:
-    """A pilot of ours that may still land on an SSH endpoint after a stop let the compute shape go (or a switch moved
-    it to other terms), kept per endpoint in `AppCtx.pilot_watch` so a later stop looks again instead of reading
-    "released none" as done (#24): a block still being submitted when a stop ended `draining`, or a dead pilot whose
-    check is still queued (`dead`). A stop that finds nothing within `config.pilot_watch_s()` of `since` answers `down`;
-    one that finds a pilot refreshes it. Times: time.monotonic()."""
+@dataclass
+class SentCheck:
+    """A check (canary) hpc-bridge sent to a COMPUTE user endpoint and has not seen a worker answer — #24's evidence.
+    While it is queued the endpoint can start a block to run it: after a stop cancelled one, parsl submits another for a
+    task still outstanding (live 2026-10-16, `queued_check_relaunch`). So a stop answers `down` only once every such
+    check has resolved (warmth._check_states). Kept past its runner's close and the shape's drop, per endpoint, in
+    `AppCtx.sent_checks`."""
 
-    since: float                                  # the last sign of a pilot: when a stop looked, or found one
-    terms: tuple[str | None, str | None]          # the partition and account of the block it is for
-    dead: DeadPilot | None = None                 # None: a block still being submitted
-    # Not built — the seam for the queued-check fix: the watch only infers from the scheduler that our check may still
-    # be queued. The check's own future (GlobusRunner's pending canary, which the SDK's result watcher keeps resolving
-    # after the runner closes) would SAY so; it would be carried here, taken before the drop closes the runner.
+    future: Any                  # the SDK's future: `task_id` once the web service registered the task
+    lookup: Callable[[str], Any] | None  # the SDK client's `get_task` (task id → {"pending", "status"}), or None
+    terms: tuple[str | None, str | None] = (None, None)  # the partition and account of the block it asked for
+    dead: DeadPilot | None = None  # a pilot that died before it ran this check, to name
 
 
 @dataclass
@@ -298,12 +287,11 @@ class AppCtx:
     # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
     # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
     job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
-    # Per SSH endpoint id: a pilot of ours that may still land there though the compute shape is gone (PilotWatch). It
-    # outlives the stop's drop of the shape, so a second stop polls and checks again (server._stop_endpoint). Set by a
-    # stop that answered `draining` waiting for a pilot, and by a switch away from a dead pilot (warmth._repoint);
-    # dropped by a stop that answers `down`, a worker answering a check on its terms or a rejected submission there
-    # (warmth._check_resolved), and the teardown of that endpoint. Keyed by endpoint, so a reconnect to it keeps it.
-    pilot_watch: dict[str, PilotWatch] = field(default_factory=dict)
+    # Per endpoint id: the checks of ours its compute user endpoints may still hold (SentCheck), taken from each compute
+    # runner as it is retired (a stop, a switch, a rebuild, a re-bind: warmth._retire_runner), so a later stop still
+    # sees them. A stop drops the ones it found resolved; a teardown drops the endpoint's. Keyed by endpoint, so a
+    # reconnect to the same one keeps them.
+    sent_checks: dict[str, list[SentCheck]] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

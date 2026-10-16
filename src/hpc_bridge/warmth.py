@@ -20,8 +20,10 @@ import asyncio
 import dataclasses
 import inspect
 import re
+import secrets
 import time
 from dataclasses import replace
+from typing import Any, Literal
 
 from . import dispatch, session_shell
 from .config import (
@@ -32,14 +34,13 @@ from .config import (
     _parse_hhmmss,
     _task_ceiling_s,
     canary_timeout_s,
-    pilot_watch_s,
 )
 from .context import (
     DEFAULT_SHAPE,
     AppCtx,
     DeadPilot,
     LeftBlock,
-    PilotWatch,
+    SentCheck,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
@@ -166,7 +167,7 @@ def _runner_for(app: AppCtx, shape: str) -> GlobusRunner:
             # _apply_account), so reaching here with a live task means the ENDPOINT changed — that
             # block (and its tasks) is gone; drop the handles before closing so no dead future is polled.
             _drain_shape_tasks(app, shape)
-            rt.runner.close()
+            _retire_runner(app, rt)
             _bank_warm_interval(rt, app)
         ceiling_s = _task_ceiling_s(rt.user_endpoint_config)
         sync_wait_s = max(min(SYNC_WAIT_S, ceiling_s - TASK_CEILING_MARGIN_S), 5.0)
@@ -315,14 +316,12 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     warm block's interval (found in review). A block the clock presumes released is banked to that time, not to
     now. Callers hold app.lock."""
     untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
-    _hand_dead_pilot_to_watch(app, app.shapes.get(DEFAULT_SHAPE))  # a re-bind keeps it for this endpoint
     app.tasks.clear()
     _retain_inflight(app, app.shapes.get(DEFAULT_SHAPE))  # counted only if the same endpoint is bound again
     for name, rt in app.shapes.items():
         if bank:
             _bank_warm_interval(rt, app, until=untils.get(name))
-        if rt.runner is not None:
-            rt.runner.close()
+        _retire_runner(app, rt)  # its checks stay with the endpoint: a re-bind to it keeps them
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
     app.compute_choice.clear()  # chosen for this binding: a stop keeps them, a new binding or a teardown does not
@@ -617,13 +616,15 @@ async def _provision(
         # facility's configured default (the startup pin's), both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
+        kicked_up = rt.reap_kicked and rt.last_canary is not None and rt.last_canary.ok  # a replacement already up
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
-        # (`switch_unseen` is not cleared here but once a block is up: until then the old terms' pilot may still land,
-        # and a rejected submission on the new terms must not end the stop's look for it — server._stop_endpoint)
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
+        new_request = not kicked_up  # this confirmation asks for a block (not one already answering)
         rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
         rt.confirmed_at = time.monotonic()  # a pilot that died before this is an earlier session's, not this block's
+    else:
+        new_request = False
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -643,6 +644,8 @@ async def _provision(
         adopt = getattr(app.facility, "adopt_endpoint", None)
         if app.state.endpoint_id and inspect.iscoroutinefunction(adopt):
             await adopt(app.state.endpoint_id)
+        if new_request:
+            _fresh_block(app, shape, rt)  # after adopt: whether this endpoint's template allows it is known now
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)
@@ -689,8 +692,6 @@ async def _provision(
         rt.block_since, rt.block_job = since, job
     if block == "warm":
         _forget_presumed(rt)
-        # a block is up: the stop it meets cancels every live pilot of the endpoint, as before
-        rt.switch_unseen, rt.unseen_terms = False, None
     if checked and block != "warm" and _rejected_now(rt):  # this call's check: the scheduler refused the submission
         _void_rejected(app, rt)
     if rt.reaped is not None and not rt.reap_told:  # the check just found the block gone (_confirm_worker)
@@ -726,91 +727,131 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     _forget_presumed(rt)
     _check_resolved(app, rt)
 
-# -- pilots that may still land after a stop (AppCtx.pilot_watch) ------------------------------------------------------
+# -- our checks still queued on a compute user endpoint (#24's evidence) -----------------------------------------------
 
 def _terms_of(rt: ShapeRuntime) -> tuple[str | None, str | None]:
     uec = rt.user_endpoint_config
     return uec.get("partition"), uec.get("account")
 
+def _runner_terms(runner: object, rt: ShapeRuntime) -> tuple[str | None, str | None]:
+    """The partition and account a runner's checks asked for: its own config's (what it was built with — the shape's
+    may have been switched since), else the shape's."""
+    uec = getattr(runner, "user_endpoint_config", None)
+    if isinstance(uec, dict) and uec.get("compute"):
+        return uec.get("partition"), uec.get("account")
+    return _terms_of(rt)
+
 def _check_resolved(app: AppCtx, rt: ShapeRuntime) -> None:
-    """Our check is no longer waiting for a pilot: a worker answered it, or the endpoint failed it with a rejected
-    submission. The pilots that died before it are history (`rt.dead_pilot`), and so is a watch for a pilot of these
-    terms on this endpoint — one on other terms (left by a switch) is another user endpoint's, and stays."""
+    """Our check is no longer waiting for a pilot (a worker answered it, or the endpoint failed it with a rejected
+    submission): the pilot that died before it is history."""
     rt.dead_pilot = None
-    eid = app.state.endpoint_id
-    watch = app.pilot_watch.get(eid) if eid is not None else None
-    if eid is not None and watch is not None and watch.terms == _terms_of(rt):
-        app.pilot_watch.pop(eid, None)
 
 def _note_dead_pilot(rt: ShapeRuntime, job: str, exit_status: str, jobs: frozenset[str]) -> None:
     """The pilot probe reported pilot `job` FINISHED (exit status `exit_status`) before any worker answered: record it
-    on the shape (the newest named; every pilot job listed so far is known). Callers hold app.lock, on the runtime the
-    probe was made for."""
+    on the shape, to name (the newest; every pilot job listed so far is known). Callers hold app.lock, on the runtime
+    the probe was made for."""
     known = jobs | (rt.dead_pilot.known if rt.dead_pilot is not None else frozenset())
     rt.dead_pilot = DeadPilot(job=job, exit_status=exit_status, known=known | {job})
 
-def _merge_watch(old: PilotWatch | None, new: PilotWatch) -> PilotWatch:
-    """One watch per endpoint: the later sign of a pilot, the newer terms, and the newer dead pilot with every job known
-    to either."""
-    if old is None:
-        return new
-    dead = new.dead or old.dead
-    if new.dead is not None and old.dead is not None:
-        dead = replace(new.dead, known=new.dead.known | old.dead.known)
-    return PilotWatch(since=max(old.since, new.since), terms=new.terms, dead=dead)
-
-def _stop_watch(app: AppCtx, eid: str, rt: ShapeRuntime | None, now: float) -> PilotWatch | None:
-    """The pilot watch an SSH stop works with: the endpoint's (an earlier stop's or a switch's), merged with a dead
-    pilot the shape carries — whose window starts at this stop: its first stop answers `draining` whatever it finds.
-    Stored by the stop once it has looked, not here."""
-    # watches of an endpoint the session has left (a bind elsewhere) go: only the bound endpoint's is this stop's
-    app.pilot_watch = {k: w for k, w in app.pilot_watch.items() if k == eid}
-    watch = app.pilot_watch.get(eid)
-    if rt is not None and rt.dead_pilot is not None:
-        watch = _merge_watch(watch, PilotWatch(since=now, terms=_terms_of(rt), dead=rt.dead_pilot))
-    return watch
-
-def _hand_dead_pilot_to_watch(app: AppCtx, rt: ShapeRuntime | None) -> None:
-    """A shape dropped with a dead pilot on it — a stop, a re-bind (connect_facility to the same endpoint, which the
-    FINISHED notice of a facility you brought points at), a teardown's release step: its check is still queued on the
-    endpoint, so the endpoint's watch keeps the pilot, its window from now (a stop then keeps or drops what it learned).
-    Callers hold app.lock, before the endpoint is unbound."""
-    eid = app.state.endpoint_id
-    if rt is not None and rt.dead_pilot is not None and eid is not None:
-        app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid),
-                                            PilotWatch(since=time.monotonic(), terms=_terms_of(rt), dead=rt.dead_pilot))
-
 def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
-                       terms: tuple[str | None, str | None], answered: float | None, job: str, exit_status: str,
-                       jobs: frozenset[str]) -> None:
-    """The provisioning probe — run off the lock — found pilot `job` dead: record it where it belongs. On the runtime
-    and terms the probe was for (the same shape, `block_epoch` unchanged) — whether or not the shape kept a block's
-    identity (a check that failed with an error keeps it, and the endpoint may already be submitting pilots that die:
-    review r2, S2) — unless a worker answered DURING the probe (`warm_confirmed_at` moved past `answered`, read before
-    it): our check ran, so those pilots are history (`_check_resolved` dropped them). If a switch or a drop came while
-    the probe ran, the pilot is the OLD terms': the endpoint's watch keeps it under the probe's terms — never the new
-    terms' shape. A verdict is never dropped otherwise. Callers hold app.lock."""
-    if app.state.endpoint_id != eid:
-        return  # a re-bind elsewhere: that endpoint's pilots are not this binding's to watch
-    if app.shapes.get(shape) is rt and rt.block_epoch == epoch:
-        if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
-            _note_dead_pilot(rt, job, exit_status, jobs)
+                       answered: float | None, job: str, exit_status: str, jobs: frozenset[str]) -> None:
+    """The provisioning probe — run off the lock — found pilot `job` dead: record it, to name, on the runtime and terms
+    the probe was for (the same shape, `block_epoch` unchanged) — whether or not the shape kept a block's identity (a
+    check that failed with an error keeps it: review r2, S2) — unless a worker answered DURING the probe
+    (`warm_confirmed_at` past `answered`, read before it): our check ran, so that pilot is history. After a switch or a
+    drop meanwhile it belongs to the old terms' runner, whose checks the endpoint already keeps: nothing to record on
+    this shape (it names a pilot; the checks are the evidence). Callers hold app.lock."""
+    if app.state.endpoint_id != eid or app.shapes.get(shape) is not rt or rt.block_epoch != epoch:
         return
-    dead = DeadPilot(job=job, exit_status=exit_status, known=jobs | {job})
-    app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid), PilotWatch(since=time.monotonic(), terms=terms,
-                                                                              dead=dead))
+    if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
+        _note_dead_pilot(rt, job, exit_status, jobs)
 
-# A dead-pilot watch nobody has looked at for this many windows is stale: a stop then takes the pilots listed meanwhile
-# as known (a reconnect hours later must not count that day's pilots as a sign of now) and restarts the watch — still
-# `draining` once, since a check queued all along may still be submitting pilots.
-_WATCH_STALE_WINDOWS = 10
+def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
+    """Close a shape's runner — and, for a billed shape, first hand the checks it sent that no worker has answered to
+    the endpoint (`AppCtx.sent_checks`), with the terms they asked for and the pilot that died there: closing it drops
+    only tasks never handed to the web service, so one still queued on a user endpoint can start a block there after
+    this runtime is gone, and a stop must still see it. Callers hold app.lock."""
+    runner = rt.runner
+    if runner is None:
+        return
+    eid = getattr(runner, "endpoint_id", None)
+    if _billable(rt) and eid is not None and _has_login_shape(app):  # (a facility endpoint's stop never looks)
+        sent: list[tuple[Any, Any]] = getattr(runner, "sent_checks", list)()
+        if sent:
+            kept = app.sent_checks.setdefault(eid, [])
+            known = {id(c.future) for c in kept}
+            kept.extend(SentCheck(future=f, lookup=look, terms=_runner_terms(runner, rt), dead=rt.dead_pilot)
+                        for f, look in sent if id(f) not in known)
+            del kept[:-_SENT_CHECKS_MAX]
+    runner.close()
 
-def _watch_stale(watch: PilotWatch, now: float) -> bool:
-    return watch.dead is not None and now - watch.since > _WATCH_STALE_WINDOWS * pilot_watch_s()
+# More than any session sends while checks stay queued; the oldest go first.
+_SENT_CHECKS_MAX = 64
 
-def _watch_expired(watch: PilotWatch, now: float) -> bool:
-    """No sign of a pilot for the whole window (`config.pilot_watch_s`): one would have been in the scheduler by now."""
-    return now - watch.since > pilot_watch_s()
+def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> list[SentCheck]:
+    """Every check of ours a stop must see resolve before `down`: the ones the endpoint kept from retired runners, and
+    the ones the current compute runner sent. Callers hold app.lock."""
+    checks = list(app.sent_checks.get(eid, []))
+    known = {id(c.future) for c in checks}
+    if rt is not None and rt.runner is not None and _billable(rt):
+        checks += [SentCheck(future=f, lookup=look, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot)
+                   for f, look in getattr(rt.runner, "sent_checks", list)() if id(f) not in known]
+    return checks
+
+CheckState = Literal["ok", "failed", "pending", "unknown", "unsent"]
+
+def _check_state(c: SentCheck) -> CheckState:
+    """Where one check of ours stands — `ok` (a worker ran it), `failed` (the endpoint gave it up: a rejection, a bad
+    state after its first pilot died or was cancelled), `pending` (still queued: the endpoint can start a block for
+    it), `unsent` (cancelled before the web service took it), or `unknown` (its task could not be looked up: read as
+    pending). A future that FAILED locally may be the client's failure alone (the result watcher quitting, a cancel),
+    so a registered task is asked about by id. Blocking (a web call): run it off the event loop and the lock."""
+    f = c.future
+    done, cancelled = f.done(), f.cancelled()
+    if done and not cancelled and f.exception() is None:
+        return "ok"
+    task_id = getattr(f, "task_id", None)
+    if task_id is None:  # never registered: the close cancelled it unsent — or the submitter still holds it
+        return "unsent" if done else "pending"
+    if c.lookup is None:
+        return "failed" if done and not cancelled else "pending"
+    try:
+        task = c.lookup(task_id)
+    except Exception:  # noqa: BLE001 - a lookup that fails says nothing: the honest side is "still queued"
+        return "unknown"
+    if not isinstance(task, dict) or task.get("pending", True):
+        return "pending"
+    return "ok" if str(task.get("status", "")).lower() == "success" else "failed"
+
+async def _check_states(checks: list[SentCheck]) -> list[CheckState]:
+    """`_check_state` for each, off the event loop (each may be a web call)."""
+    return [await asyncio.to_thread(_check_state, c) for c in checks]
+
+def _settle_checks(app: AppCtx, eid: str, checks: list[SentCheck], states: list[CheckState]) -> None:
+    """After a stop looked: the endpoint keeps only the checks still queued (or unknown). Callers hold app.lock."""
+    resolved = {id(c.future) for c, s in zip(checks, states, strict=True) if s in ("ok", "failed", "unsent")}
+    kept = [c for c in app.sent_checks.get(eid, []) if id(c.future) not in resolved]
+    if kept:
+        app.sent_checks[eid] = kept
+    else:
+        app.sent_checks.pop(eid, None)
+
+def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+    """A confirmation that asks for a NEW block gets its own compute user endpoint: a fresh `hpcb_block` token in the
+    config, which the web service keys user endpoints on, so this block's pilot is that endpoint's first. A first
+    pilot cancelled by a stop, or dead before it connects, reads MISSING to parsl, which then fails our queued check
+    (bad state) instead of starting another block for it; a later pilot of an old user endpoint does not (live
+    2026-10-16, `queued_check_relaunch`). Only where it is safe and ours: an endpoint hpc-bridge stood up whose template
+    lets an idle compute user endpoint exit (`fresh_ueps`; a facility's own endpoint keeps its template, and one of an
+    earlier plugin would keep every such endpoint running), a billed shape, and no block of ours up on it — a
+    confirmation over a block already answering, or with our work on it, must not move to a new user endpoint and
+    abandon that block. The runner is rebuilt for the new config. Callers hold app.lock."""
+    if not (getattr(app.facility, "fresh_ueps", False) is True and _has_login_shape(app) and _billable(rt)):
+        return
+    if rt.block_since is not None or rt.inflight or _live_task_handles(app, shape):
+        return
+    rt.user_endpoint_config["hpcb_block"] = secrets.token_hex(4)
+    rt.runner_stale = True
 
 # Partition names come from the discovery gate (agent/user-supplied), then flow into a Jinja
 # template rendered on the login node — so validate the token at the boundary (no shell/YAML
@@ -889,7 +930,6 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     uec = rt.user_endpoint_config
     terms = (uec.get("partition"), uec.get("account"))
     confirmed = _billable(rt) and rt.spend_confirmed
-    unseen = rt.block_since is None and rt.warm_confirmed_at is None  # asked for, never seen up: its pilot may land
     if _has_login_shape(app):  # an SSH endpoint: a block idles out — banked to that latest end, not named
         _leave_block(app, shape, rt, how="switch", remember=False)
     elif (left := _leave_switched(app, shape, rt)) is not None:  # a facility endpoint: it bills on, and is named
@@ -899,22 +939,13 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
         rt.switched_terms = terms
     elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
         rt.reap_terms = terms
-    # A block asked for on the old terms and never seen up may still land: confirmed and unseen (the sbatch may be in
-    # flight), or after a reap a check found (`reap_kicked`), whose check may itself have asked the old terms' user
-    # endpoint for a block — it says so, "stop_endpoint releases it". That check is still queued there whatever the
-    # new terms do: neither the confirmation that clears `reap_kicked` nor a rejection of the new terms ends it.
-    if unseen and (confirmed or rt.reap_kicked):
-        if not rt.switch_unseen:
-            rt.unseen_terms = terms
-        rt.switch_unseen = True
-    eid = app.state.endpoint_id
-    if rt.dead_pilot is not None and eid is not None:
-        # The new terms are a different block, so the shape forgets the pilot that died. The old terms' user endpoint
-        # does not: its check is still queued there and it keeps submitting pilots for it, which a stop must still look
-        # for (its window starts now) — `switch_unseen`'s twin for a pilot that keeps dying.
-        app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid),
-                                            PilotWatch(since=time.monotonic(), terms=terms, dead=rt.dead_pilot))
-        rt.dead_pilot = None
+    # A check of the old terms still queued may have asked their user endpoint for a block that can still land: the
+    # old runner is retired NOW, before the terms change, and the endpoint keeps its checks (`_retire_runner`) — with
+    # the old terms and the pilot that died there, if one did — so a stop still sees, cancels and names them. (A switch
+    # is refused while our work is on the block, so no task of ours is cut off by it.)
+    if _has_login_shape(app):
+        _retire_runner(app, rt)
+        rt.runner = None
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
     uec[key] = value
     app.compute_choice[key] = value
@@ -1068,8 +1099,7 @@ def _leave_switched(app: AppCtx, shape: str, rt: ShapeRuntime) -> LeftBlock | No
     partition (review of a6de41e, X). Returns the block left, for the spend question to name."""
     left = _leave_block(app, shape, rt, how="switch")
     _bank_warm_interval(rt, app)  # (a no-op once _leave_block banked it)
-    if rt.runner is not None:
-        rt.runner.close()
+    _retire_runner(app, rt)
     rt.runner, rt.runner_stale = None, False
     rt.last_canary, rt.reap_kicked = None, False
     return left
@@ -1132,15 +1162,11 @@ def _drop_compute_shape_locked(app: AppCtx) -> float:
     _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
     compute = app.shapes.pop(DEFAULT_SHAPE, None)
     _retain_inflight(app, compute)
-    _hand_dead_pilot_to_watch(app, compute)  # a stop decides what to keep of it; a teardown's release step keeps it
     if compute is None:
         return 0.0
-    # (the runner closes below, and with it our reference to a canary still queued on the endpoint — a future fix that
-    # watches that check takes it here first: see PilotWatch)
     # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago
     _bank_warm_interval(compute, app, until=until)
-    if compute.runner is not None:
-        compute.runner.close()
+    _retire_runner(app, compute)  # its checks still queued stay with the endpoint, for the stop that follows
     app.released_spend += compute.spend_accrued  # still part of the session: _total_session_spend counts it
     return compute.spend_accrued
 

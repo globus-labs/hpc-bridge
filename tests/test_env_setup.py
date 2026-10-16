@@ -594,6 +594,25 @@ async def test_a_reused_endpoint_keeps_the_worker_init_it_was_configured_with():
     assert fac.dispatch_uec({"compute": False}) == {"compute": False}  # nothing added where nothing was sent
 
 
+async def test_a_reused_endpoint_gives_fresh_compute_user_endpoints_only_if_its_template_lets_them_exit():
+    # the upgrade path: an endpoint configured by an earlier plugin keeps one compute user endpoint (a fresh one per
+    # block request would never exit there); its published template says which it is — no SSH, once per endpoint
+    from hpc_bridge.profile import Profile
+
+    wi = ev.short_env_setup("/home/u/hpc-bridge/gce-venv")
+    ours = _facility(wi).config_template(Profile())[0]
+    fac = _facility(wi, client=lambda: _Client(ours))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.fresh_ueps is True
+    earlier = "\n".join(line for line in ours.splitlines() if "idle_heartbeats_soft" not in line)
+    fac = _facility(wi, client=lambda: _Client(earlier))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.fresh_ueps is False
+    fac = _facility(wi, client=lambda: _Client(exc=RuntimeError("503")))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.fresh_ueps is False                                     # unreadable: never presumed
+
+
 @pytest.mark.parametrize("current", ["", "module load gce && source /x/bin/activate"], ids=["emptied", "hand-written"])
 async def test_replacing_hpc_bridges_line_on_a_running_endpoint_warns(current):
     started = ev.short_env_setup("/home/u/hpc-bridge/gce-venv")

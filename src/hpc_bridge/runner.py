@@ -4,6 +4,7 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
+from typing import Any
 
 from .login import login_expired
 from .session_shell import JOB_ID_EXPR
@@ -144,6 +145,24 @@ def dispatch_error_text(exc: BaseException, limit: int = 600) -> str:
     return f"{head}: {' '.join(text.split())}"[:limit]
 
 
+def _answered(fut) -> bool:
+    """A canary future a worker answered: done with a result (a failure or a cancel may be the client's alone)."""
+    return bool(fut.done() and not fut.cancelled() and fut.exception() is None)
+
+
+def _may_be_queued(fut) -> bool:
+    """A canary future that may still be a task queued on the endpoint: no worker answered it, and it did not end
+    before the web service registered it (no `task_id`: never sent — a close cancelled it, or the submit failed)."""
+    if _answered(fut):
+        return False
+    return not (fut.done() and getattr(fut, "task_id", None) is None)
+
+
+def _task_lookup(executor) -> Any:
+    """The SDK client's `get_task` (task id -> {"pending", "status", …}) behind an Executor, or None."""
+    return getattr(getattr(executor, "client", None), "get_task", None) if executor is not None else None
+
+
 def _failed_canary(exc: BaseException) -> CanaryResult:
     """A canary that failed with `exc`: its diagnosis, and whether it was the stored Globus login that failed."""
     return CanaryResult(ok=False, error=dispatch_error_text(exc), login_expired=login_expired(exc))
@@ -194,6 +213,11 @@ class GlobusRunner:
         self._canary_fut = None
         self._canary_done_at: float | None = None
         self._canary_submitted_at: float | None = None
+        # Every canary this runner SENT that may still be queued, and the client call that looks a task up
+        # (`sent_checks`): a stop answers `down` only once each has resolved, since a check still queued can make the
+        # endpoint start a block for it.
+        self._sent: list = []
+        self._lookup: Any = None
 
     def _default_factory(self):
         from globus_compute_sdk import Executor
@@ -257,6 +281,8 @@ class GlobusRunner:
             except Exception as exc:  # noqa: BLE001 - shutdown Executor / broken dispatch path, not a crash
                 return _failed_canary(exc)
             self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
+            self._sent = [f for f in self._sent if _may_be_queued(f)] + [fut]
+            self._lookup = _task_lookup(self._ex) or self._lookup
 
             def _stamp(f, runner=self):  # runs on the SDK's thread; only for the canary still current
                 if runner._canary_fut is f:
@@ -297,6 +323,15 @@ class GlobusRunner:
         if fut is None or not fut.done() or fut.cancelled() or fut.exception() is not None:
             return None
         return _canary_result(fut.result(), self._canary_done_at or time.monotonic())
+
+    def sent_checks(self) -> list[tuple[Any, Any]]:
+        """(future, lookup) for each canary this runner sent that may still be queued (no worker answered it): its SDK
+        future — `task_id` once the web service registered it — and the SDK client's `get_task`, kept from the send,
+        so it works after this runner's close. `close()` cancels only tasks never handed to the web service; one it
+        took stays queued on the endpoint whatever happens here, and its future can also fail on the client's side
+        (the result watcher quitting), so the caller asks the service by task id (warmth._check_states)."""
+        lookup = _task_lookup(self._ex) or self._lookup
+        return [(f, lookup) for f in self._sent if _may_be_queued(f)]
 
     @property
     def canary_pending(self) -> bool:

@@ -903,11 +903,23 @@ class RemoteEndpointCLI:
             return False
 
 
+# The COMPUTE user endpoint (both templates) exits once idle (`idle_heartbeats_soft`, Profile.uep_idle_heartbeats;
+# its hard idle limit then applies too), and its config carries `hpcb_block`: a token hpc-bridge changes per block
+# request (warmth._fresh_block). The web service keys a user endpoint on its config, so each block request gets a
+# FRESH user endpoint and every pilot is its first: one cancelled, or dead before it connects, reads MISSING to parsl,
+# which then fails our queued check (bad state) instead of starting another block for it — live 2026-10-16,
+# `queued_check_relaunch`. The template need not use the token (an unused key is ignored, and the default schema
+# allows any); it names it in a comment. An endpoint configured before this change has neither line, and is never
+# given fresh user endpoints (`fresh_ueps`): one of its user endpoints would never exit.
 # `strategy_period: 5` (both templates; 30 on endpoints configured before this change): a new user endpoint scales
 # out only on its first scaling pass, one period after it starts, and a first SSH result pays that wait twice
 # (login shape, then compute). It is not the scheduler query rate (parsl polls Slurm/PBS at most every 60 s).
 # warmth._IDLE_GRACE_S is two of these passes plus 5 s; a test ties them.
 _SLURM_TEMPLATE = """\
+{% if compute | default(true) %}
+# hpc-bridge block request {{ hpcb_block | default("") }}
+idle_heartbeats_soft: @@IDLEHB@@
+{% endif %}
 engine:
   type: GlobusComputeEngine
   run_in_sandbox: true
@@ -956,6 +968,10 @@ engine:
 # from stdin — an empty "STDIN" job that exited 127, which the pilot probe then reported as "never submitted" (found on
 # the fake OpenPBS cluster, 2026-09-06: every facility we had met before required an account, so it never showed).
 _PBS_TEMPLATE = """\
+{% if compute | default(true) %}
+# hpc-bridge block request {{ hpcb_block | default("") }}
+idle_heartbeats_soft: @@IDLEHB@@
+{% endif %}
 engine:
   type: GlobusComputeEngine
   run_in_sandbox: true
@@ -1000,6 +1016,18 @@ engine:
     max_blocks: {{ max_blocks | default(@@MAXBLK@@) }}
 {% endif %}
 """
+
+
+# The compute branch's idle-exit line (this plugin's templates; an endpoint configured earlier has none).
+_IDLE_HEARTBEATS_LINE = re.compile(r"^\s*idle_heartbeats_soft:\s*(\d+)\s*$", re.M)
+
+
+def gives_fresh_ueps(template: object) -> bool:
+    """Whether an endpoint's published UEP template lets an idle compute user endpoint EXIT (`idle_heartbeats_soft`
+    above 0): only then may hpc-bridge start a fresh one per block request (warmth._fresh_block) — under a template
+    without it (an earlier plugin's, or one set to 0) each would stay running on the login node for good."""
+    m = _IDLE_HEARTBEATS_LINE.search(str(template or ""))
+    return m is not None and int(m.group(1)) > 0
 
 
 # Our template's worker_init line; its default literal is the endpoint's own worker_init as configured (one JSON
@@ -1067,6 +1095,11 @@ class SlurmFacility:
         self.endpoint_worker_init: str | None = None
         self.worker_init_note = ""  # set when the endpoint's own differs from this facility's env_setup
         self._adopted: str | None = None  # the endpoint id whose worker_init is known (READ, or started here)
+        # Whether the bound endpoint's template is one that gives each block request its own compute user endpoint and
+        # lets it exit when idle (this plugin's: `idle_heartbeats_soft` on the compute branch). Read with the
+        # worker_init (adopt_endpoint), set when provision writes it; False until known — a template of an earlier
+        # plugin keeps one compute user endpoint, which never exits (warmth._fresh_block).
+        self.fresh_ueps = False
 
     @property
     def scratch_root(self) -> str | None:
@@ -1085,12 +1118,13 @@ class SlurmFacility:
         an edit and gets no note."""
         if endpoint_id == self._adopted:
             return
-        self.endpoint_worker_init, self.worker_init_note = None, ""
+        self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, "", False
         try:
             md = await endpoint_metadata(self._client_factory, endpoint_id)
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
             return
         self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
+        self.fresh_ueps = gives_fresh_ueps(md.get("user_config_template"))
         own = configured_worker_init(md.get("user_config_template"), prefer=self.profile.worker_init)
         if own is None:
             return
@@ -1145,6 +1179,7 @@ class SlurmFacility:
             "@@MAXW@@": str(p.max_workers_per_node),
             "@@IFACE@@": json.dumps(p.interface),
             "@@IDLE@@": repr(float(hpc.max_idletime_s)),
+            "@@IDLEHB@@": str(hpc.uep_idle_heartbeats),
             "@@PARTITION@@": json.dumps(p.partition),
             "@@ACCOUNT@@": json.dumps(p.account),
             "@@WALLTIME@@": json.dumps(p.walltime),
@@ -1305,13 +1340,14 @@ class SlurmFacility:
         await self.cli.write_config(name, manager, uep)
         # the template on disk is this profile's now: forget what an earlier read learned, also if `start` fails below
         # (the daemon may register anyway, and a retry's reuse must read it again)
-        self._adopted, self.endpoint_worker_init, self.worker_init_note = None, None, ""
+        self._adopted, self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, None, "", False
         eid, host, addr = await self.cli.start(name)
         # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
         # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so
         # the web service would still serve the OLD template (review 2026-10-13), and every task would carry the old
         # line. Recorded as known (a teardown runs the CLI in it, even after a reconnect changed env_setup).
         self._adopted, self.endpoint_worker_init, self.worker_init_note = eid, self.profile.worker_init, ""
+        self.fresh_ueps = hpc.uep_idle_heartbeats > 0  # the template just written is this plugin's
         # the node's FQDN when routable from here, else the address this connection reached, else the alias
         host = await asyncio.to_thread(_routable_pin, host, addr)
         if host:

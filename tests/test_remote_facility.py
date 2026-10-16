@@ -441,6 +441,21 @@ async def test_provision_fresh_configures_writes_and_starts():
     assert "run_in_sandbox: true" in cli.written["uep"]  # ShellFunctions expect a sandbox (per-task dir)
 
 
+async def test_provision_knows_its_endpoint_gives_fresh_compute_user_endpoints():
+    # it just wrote this plugin's template: no read needed (the web service may still serve the old one for seconds)
+    cli = _FakeRemoteCLI(status=None)
+    fac = SlurmFacility(_profile(), cli=cli)
+    assert fac.fresh_ueps is False
+    await fac.provision(Profile(mode="interactive"))
+    assert fac.fresh_ueps is True and "idle_heartbeats_soft: 20" in cli.written["uep"]
+    never = SlurmFacility(_profile(), cli=_FakeRemoteCLI(status=None))
+    await never.provision(Profile(mode="interactive", uep_idle_heartbeats=0))
+    assert never.fresh_ueps is False                                    # its user endpoints would never exit
+    reused = SlurmFacility(_profile(), cli=_FakeRemoteCLI(status="running"))
+    await reused.provision(Profile(mode="interactive"))
+    assert reused.fresh_ueps is False                                   # not written here: known once its template is read
+
+
 async def test_provision_skips_configure_when_already_configured():
     cli = _FakeRemoteCLI(status="configured")  # Initialized/Stopped from a prior run
     handle = await SlurmFacility(_profile(), cli=cli).provision(Profile(mode="interactive"))
@@ -906,6 +921,33 @@ def test_template_scaling_pass_is_5s_for_first_result_latency(profile, shape):
     assert cfg["engine"]["job_status_kwargs"]["strategy_period"] == 5
 
 
+def _render_text(template_str, user_opts):
+    env = jinja2.Environment(undefined=jinja2.StrictUndefined)
+    return env.from_string(template_str).render(**_sanitize_user_json(user_opts))
+
+
+@pytest.mark.parametrize("profile", [_profile, _pbs_profile], ids=["slurm", "pbs"])
+def test_the_compute_user_endpoint_exits_when_idle_and_carries_its_block_request(profile):
+    # a fresh compute user endpoint per block request (warmth._fresh_block): the web service keys it on the config, so
+    # the block number makes a new one; it must exit once idle, or each would stay on the login node for good
+    f = SlurmFacility(profile(), cli=None)
+    tmpl, defaults = f.config_template(Profile(mode="batch"))
+    uec = {**defaults, **shape_config("compute"), "hpcb_block": "3f9a0c1e"}
+    assert _render(tmpl, uec)["idle_heartbeats_soft"] == 20           # 10 min of 30 s heartbeats: the block's idle
+    assert '# hpc-bridge block request "3f9a0c1e"' in _render_text(tmpl, uec)
+    assert _render(tmpl, {**defaults, **shape_config("compute")})["idle_heartbeats_soft"] == 20   # no number: renders
+    # the login user endpoint is unchanged: it never exits on idle, and has no block number
+    login = {**defaults, **shape_config("login")}
+    assert "idle_heartbeats_soft" not in _render(tmpl, login) and "block request" not in _render_text(tmpl, login)
+    tmpl40, _ = f.config_template(Profile(mode="batch", uep_idle_heartbeats=40))
+    assert _render(tmpl40, uec)["idle_heartbeats_soft"] == 40
+    # what the stop's upgrade check reads from a published template: ours does; an earlier plugin's, or 0, does not
+    assert remote.gives_fresh_ueps(tmpl) and remote.gives_fresh_ueps(tmpl40)
+    older = "\n".join(line for line in tmpl.splitlines() if "idle_heartbeats_soft" not in line)
+    assert not remote.gives_fresh_ueps(older) and not remote.gives_fresh_ueps(None)
+    assert not remote.gives_fresh_ueps(f.config_template(Profile(uep_idle_heartbeats=0))[0])
+
+
 def test_template_idle_timeout_follows_profile():
     f = SlurmFacility(_profile(), cli=None)
     tmpl, defaults = f.config_template(Profile(mode="interactive", max_idletime_s=300))
@@ -1293,7 +1335,7 @@ def _render_pbs(account_default: str, **uec):
     tpl = rm._PBS_TEMPLATE
     for k, v in {"@@MAXW@@": "1", "@@IFACE@@": '"eth0"', "@@IDLE@@": "60.0", "@@PARTITION@@": '"debug"',
                  "@@ACCOUNT@@": account_default, "@@WALLTIME@@": '"00:30:00"', "@@WORKER_INIT@@": '"true"',
-                 "@@EAGER@@": "0", "@@NODES@@": "1", "@@MAXBLK@@": "1"}.items():
+                 "@@EAGER@@": "0", "@@NODES@@": "1", "@@MAXBLK@@": "1", "@@IDLEHB@@": "20"}.items():
         tpl = tpl.replace(k, v)
     return yaml.safe_load(jinja2.Template(tpl).render(uec))["engine"]["provider"]
 

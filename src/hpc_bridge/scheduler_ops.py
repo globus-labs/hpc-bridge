@@ -64,9 +64,7 @@ def _release_cmd_for(app: AppCtx, eid: str) -> str:
     Facility protocol."""
     return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid)
 
-async def _release_blocks_over_login(
-    app: AppCtx, eid: str, run_login: LoginRunner, *, expect_block: bool = False
-) -> tuple[bool, str]:
+async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunner) -> tuple[bool, str]:
     """Cancel this endpoint's scheduler block(s) by running the scheduler's cancel (scancel/qdel)
     on the **login shape (AMQP)** — never SSH. That's the whole point of the login-node endpoint:
     talk to the cluster over Compute, not a fresh SSH. Matches blocks precisely by the UEP StdOut
@@ -79,14 +77,13 @@ async def _release_blocks_over_login(
     cancel was NOT verified — the caller must report that honestly (never "down"; see #24). An
     unconfirmed cancel is still backstopped by idle-release (`min_blocks=0` + `max_idletime`), and
     re-calling stop (channel now warming) confirms it. Retry budget: HPC_BRIDGE_RELEASE_ATTEMPTS
-    (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s)."""
+    (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s).
+
+    A confirmed release says only what the scheduler holds NOW: a block still to land (the stop-during-provisioning
+    race) or one the endpoint starts after the cancel, for a check of ours still queued, is what the stop's own wait
+    on that check covers (server._release_until_settled) — this no longer polls for a pilot to appear."""
     cmd = _release_cmd_for(app, eid)
-    # `expect_block`: a block was requested but never confirmed running (stop-during-provisioning). Its sbatch may not
-    # be in the scheduler yet, so a scancel that finds nothing ("released none") has NOT confirmed the block gone — the
-    # pilot can land a moment later and burn (the spend_revoked race). Keep polling for it to appear (a longer budget),
-    # and only count a run that actually CANCELLED a job as confirmed. Without a block expected, "released none" is a
-    # genuine confirm (nothing was ever there).
-    attempts = config.provisioning_release_attempts() if expect_block else config.release_attempts()
+    attempts = config.release_attempts()
     backoff = config.release_backoff_s()
     detail = "unconfirmed"
     for i in range(attempts):
@@ -94,22 +91,14 @@ async def _release_blocks_over_login(
         if out.phase == "complete" and out.exit_code == 0:
             lines = (out.stdout or "").strip().splitlines()
             last = (lines[-1] if lines else "").strip()
-            if not last.startswith("released "):
-                # a scheduler command failed (the line says which), or nothing came back: not a confirm
-                detail = last or "the release printed nothing"
-            elif last != "released none" or not expect_block:
-                return True, last  # cancelled a job, or none was expected — the cancel is confirmed
-            else:
-                detail = f"{_NO_PILOT_YET} (block still being submitted)"  # expect_block: keep polling for it
+            if last.startswith("released "):
+                return True, last  # cancelled what was there, or nothing was: the scheduler holds none of ours now
+            detail = last or "the release printed nothing"  # a scheduler command failed (the line says which)
         else:
             detail = out.notice or out.phase or "unconfirmed"
         if i + 1 < attempts and backoff > 0:
             await asyncio.sleep(backoff)  # let the woken login worker register / the sbatch land, then re-confirm
     return False, f"cancel not confirmed ({detail}); idle-release will reclaim it"
-
-# The unconfirmed release's detail when its last look DID read the scheduler (no pilot of ours in it), not a cold
-# channel: a stop tells the two apart by it (server._stop_endpoint).
-_NO_PILOT_YET = "no pilot in the scheduler yet"
 
 
 def _released_jobs(detail: str) -> list[str]:
@@ -330,7 +319,7 @@ def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float, *, own
 class PilotProbe(NamedTuple):
     """One read of THIS endpoint's pilots (`_pilot_status_cmd`): the summary a provisioning notice carries, every pilot
     job listed (live or finished), each that FINISHED with an exit status of its own as (job, exit status) in the
-    listing's order, the live ones, and the scheduler queries that FAILED (`HPCB_FAIL`) — so the server can record the
+    listing's order, and the scheduler queries that FAILED (`HPCB_FAIL`) — so the server can record the
     pilot a FINISHED verdict names, and a stop can tell a pilot the endpoint submitted since from one it already knew
     (server._stop_endpoint). A failed live listing reads `unknown`: it says nothing about the pilot."""
 
@@ -338,7 +327,6 @@ class PilotProbe(NamedTuple):
     suffix: str
     jobs: frozenset[str]
     died: tuple[tuple[str, str], ...]
-    live: frozenset[str] = frozenset()
     failed: frozenset[str] = frozenset()
 
     @property
@@ -387,13 +375,12 @@ async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_
     kept = "\n".join(ln for ln in stdout.splitlines()
                      if not ((r := ln.split(None, 3)) and len(r) > 1 and r[1] in old
                              and r[0][:1].upper() in _DONE_STATES and not ln.startswith("HPCB_")))
-    live = frozenset(r[1] for r in rows if len(r) > 1 and r[0][:1].upper() not in _DONE_STATES)
     if failed & {"squeue", "qstat"}:  # the live listing failed: no verdict, never "no pilot"
         category, suffix = "unknown", ""
     else:
         category, suffix = _summarize_pilot(kept, elapsed_s, own_config=own)
     return PilotProbe(category, suffix, frozenset(r[1] for r in rows if len(r) > 1),
-                      tuple((r[1], r[2]) for r in _died(_pilot_rows(kept))), live=live, failed=failed)
+                      tuple((r[1], r[2]) for r in _died(_pilot_rows(kept))), failed=failed)
 
 async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
     """(category, notice-suffix) of THIS endpoint's pilot (`_probe_pilots_over_login`); None when it can't tell, so the

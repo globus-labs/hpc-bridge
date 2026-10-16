@@ -263,20 +263,25 @@ async def test_a_partition_switch_does_not_hide_a_reap_or_inherit_the_old_block_
 
 
 async def test_stop_after_a_reap_check_waits_for_the_pilot_that_check_may_have_requested(monkeypatch):
+    # the check that found the reap timed out: it is still queued on the endpoint, which can start a block to run it —
+    # so the stop that follows is not `down` on "released none" (#24's evidence: the check, not a clock)
     app, rt, runner = await _warm_app()
     app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, runner=runner)
     rt.warm_confirmed_at -= 100
     runner._canary = _TIMEOUT
     assert (await _run_shell(app, "true")).phase == "needs_confirmation"
-    seen = {}
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
-        return True, "released"
+    async def release(a, eid, run_login, **_kw):
+        return True, "released none"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is True
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and res.spend_stopped is not True
+    assert "(task check-1) is still queued on the endpoint" in res.notice
+    # the endpoint gives it up (its pilot cancelled): the next stop is `down`
+    runner.checks[0].fail(RuntimeError("bad state"))
+    res = await _stop_endpoint(app)
+    assert res.status == "down" and res.spend_stopped is True
 
 
 async def test_on_a_facility_endpoint_the_reap_notice_does_not_promise_a_cancel():
