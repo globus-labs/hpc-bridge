@@ -118,3 +118,18 @@ def test_a_timed_out_cli_turn_keeps_what_it_printed(tmp_path):
     rc, out, err = asyncio.run(cli_runner.run_turn_process(argv, cwd=str(tmp_path), env=dict(os.environ), timeout_s=1))
     assert rc == 124 and '"tool_execution_start"' in out
     assert err.splitlines() == ["warn", "timed out after 1 s"]
+
+
+def test_kill_group_takes_eperm_from_an_all_exited_group_as_gone(monkeypatch):
+    # macOS answers the liveness probe with EPERM once every member of the group has exited but is not reaped yet: that
+    # escaped kill_group and failed a timed-out turn (about 1 run in 25 of the test above, 2026-10-16)
+    sent = []
+
+    def killpg(pid, sig):
+        sent.append(sig)
+        if sig == 0:
+            raise PermissionError(1, "Operation not permitted")
+
+    monkeypatch.setattr(proctree.os, "killpg", killpg)
+    proctree.kill_group(12345, grace_s=5)
+    assert sent == [proctree.signal.SIGTERM, 0, proctree.signal.SIGKILL]

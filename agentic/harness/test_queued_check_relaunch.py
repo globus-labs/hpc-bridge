@@ -592,6 +592,67 @@ def test_world_checks_run_before_the_postchecks_and_the_teardown_and_their_rows_
     sys.modules.pop("scen_watch", None)
 
 
+def test_a_sigterm_during_the_pilot_wait_still_tears_down_and_writes_the_bundle(harness_run, monkeypatch, tmp_path):
+    # The universal pilot check may wait for minutes on a pilot that is ending; a `docker stop` (SIGTERM -> the run task
+    # cancelled, --stop-timeout 120) must not wait with it: the run takes its INTERRUPTED path at once — teardown, the
+    # bundle with what was graded — and the wait never reads as a pass.
+    run_mod = harness_run
+    (tmp_path / "scen_wait.py").write_text(
+        "from invariants import Result\n"
+        "async def watch(ctx):\n"
+        "    return [Result('world:watched', True, 'x')]\n"
+        "async def SCRIPT(ops):\n"
+        "    return 'done'\n"
+        'PROMPT = "x"\nOPERATORS = ("script",)\nWORLD_CHECKS = [watch]\nEXPECT_OK = ["agent_engaged"]\n'
+        'TEARDOWN = "delete"\nTRUST_HOST_KEY = False\nPOSTCHECK_DELAY_S = 0\n')
+    monkeypatch.setattr(run_mod, "SCENARIOS_DIR", tmp_path)
+    monkeypatch.setenv("HPCB_TARGET_CAPS", json.dumps({"scheduler": "slurm", "pilot_end_wait_s": 3600}))
+    real_sleep = asyncio.sleep
+
+    async def quick(s, *a, **k):   # the 10 s settle is not what this test waits on; the 5 s poll is
+        await real_sleep(s if s == run_mod.PILOT_ENDING_POLL_S else 0)
+
+    monkeypatch.setattr(run_mod.asyncio, "sleep", quick)
+    recorded: dict = {}
+    listed: list[str] = []
+    torn: list[str] = []
+
+    async def fake_script_run(prompt, **kw):
+        t = Trace([_call("connect_facility", {"facility": "f"}, {"phase": "needs_account"})])
+        return run_mod.RunResult(trace=t, final=types.SimpleNamespace(is_error=False, total_cost_usd=None),
+                                 messages=[{"harness": "script", "rc": 0}])
+
+    import script_runner
+    monkeypatch.setattr(script_runner, "run_scenario", fake_script_run)
+
+    def fake_ssh(cmd, *, timeout=60, host=None):
+        if cmd.startswith("squeue") and "%j" in cmd:   # the universal pilot check: a pilot that keeps completing
+            listed.append(cmd)
+            return 0, "7 CG parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792166459.1\n"
+        return 0, ""
+
+    monkeypatch.setattr(run_mod, "_ssh_run", fake_ssh)
+    monkeypatch.setattr(run_mod, "_stop_operator", lambda *a, **k: [])
+    monkeypatch.setattr(run_mod, "_teardown", lambda scen, res=None, **kw: (torn.append(str(kw.get("budget_s"))), ("", None))[1])
+    monkeypatch.setattr(run_mod, "write_run_record", lambda runs_dir, **kw: recorded.update(kw))
+
+    async def go():
+        task = asyncio.create_task(run_mod._run("scen_wait", "m", None, None, False, operator="script"))
+        while not listed:
+            await real_sleep(0.01)
+        await real_sleep(0.05)              # in the wait's 5 s poll sleep now
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await asyncio.wait_for(task, timeout=2.0)
+
+    asyncio.run(go())
+    assert len(listed) == 1 and torn == [str(run_mod.EXIT_TEARDOWN_BUDGET_S)]   # the bounded exit-path teardown
+    assert recorded["result"] == "INTERRUPTED" and recorded["rc"] == 130
+    names = {r.name for r in recorded["grading"]}
+    assert "world:watched" in names and "world:stop_honesty_no_pilot_left" not in names   # graded rows kept, no pass
+    sys.modules.pop("scen_wait", None)
+
+
 # ---- phase `second`: a user endpoint that already ran a block -------------------------------------------------------
 
 UEP = f"uep.{EID}.34aaadd8-3a58-d9ea-c9b0-49257afec4d2"

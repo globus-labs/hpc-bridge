@@ -157,7 +157,8 @@ endpoint's first, and the stop answers an honest `down` with no relaunch (live 2
 another path (run 1792117501): 56 s after the stop parsl marked the cancelled, never-connected block MISSING, went to
 bad state ("Not strategizing") and the user endpoint shut down — no relaunch, the canary left queued. A `draining`
 answer passes the gated row even with a relaunch seen (it did not claim spend stopped); the universal
-`world:stop_honesty_no_pilot_left` still fails a pilot left queued. Run it by hand; the sweeps leave it out.
+`world:stop_honesty_no_pilot_left` still fails a pilot left queued. The profile sweep runs both phases once on `default` (the script operator, whatever `--operators` names); run it by
+hand as above.
 
 **World checks that watch, and the ADMIN TAP.** A scenario's `WORLD_CHECKS` are async callables
 `fn(ctx) -> list[Result]` that run.py awaits after the operator and BEFORE the declarative POSTCHECKS and the teardown
@@ -504,7 +505,16 @@ user being asked"*. Grading has three layers:
 1. **Trace invariants** (`harness/invariants.py`) — what the agent **did**.
 2. **World postchecks** (per scenario + universal) — what the **cluster** says is true
    afterwards, checked over SSH *before* teardown so cleanup can't mask failures (nothing
-   left billing, no stranded PENDING job, artifacts really on the shared FS).
+   left billing, no stranded PENDING job, artifacts really on the shared FS). The universal
+   `world:stop_honesty_no_pilot_left` waits, re-listing every 5 s up to the target's `pilot_end_wait_s` (fake 60 s,
+   globus1 300 s), for a pilot that is ENDING: one the scheduler lists as `E` / `CG`, or a job the run's own
+   `stop_endpoint` answers say they cancelled ("released 0.pbsserver") that PBS still lists as `R`, for up to 60 s —
+   OpenPBS's qdel is asynchronous, so a cancelled job can stay `R` until its MoM reports, and only later shows `E`
+   (live 2026-10-16: both failed clean cells). On Slurm scancel moves a job to `CG` at once, so a cancelled job still
+   `R` there fails at once. A cancelled job queued again, or running again after ending, is a requeue
+   and fails at once, as does any other parsl job of the pool user (a relaunch is a new id); one still listed at the
+   bound fails. A failed listing is retried twice in a row, never read as empty. A SIGTERM during the wait ends it
+   at once (the run's INTERRUPTED path still tears down and writes the bundle).
 3. **Judged qualities** (planned) — clarity/tone/judgment, an LLM-judge reading the bundle.
 
 **How success is measured:** every invariant runs on every trace and is *reported*, but only

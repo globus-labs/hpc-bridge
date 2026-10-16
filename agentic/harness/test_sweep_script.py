@@ -156,7 +156,8 @@ n_ok = sum(s not in infra | setup | crash for s in scen)
 print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
-printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s"}\n' "$*" "${HPCB_OPERATOR:-}" >> "$STUB_LOG"
+printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s"}\n' "$*" "${HPCB_OPERATOR:-}" \
+  "${HPCB_RELAUNCH_PHASE:-}" >> "$STUB_LOG"
 echo "RESULT: OK"
 '''
 
@@ -203,10 +204,16 @@ def test_operators_boot_each_profile_once_and_run_its_free_cells_per_operator(tm
         assert _arg(c, "--scenarios").split(",") == want
     assert {c["wait"] for c in suites} == {"120"}                    # HPCB_ALCF_WAIT_S reaches every cell's suite
     smokes = [c for c in calls if c["tool"] == "run_smoke"]
-    assert [c["operator"] for c in smokes] == ["pi", "codex", "hermes21"]   # spend_gate_enforced, per operator
+    # spend_gate_enforced per operator, then queued_check_relaunch ONCE (both phases) under the script operator
+    assert [(c["argv"], c["operator"], c["phase"]) for c in smokes] == [
+        ("spend_gate_enforced", op, "") for op in ("pi", "codex", "hermes21")] + [
+        ("queued_check_relaunch", "script", "second"), ("queued_check_relaunch", "script", "first")]
     # every summary row names its operator; INFRA counted apart, per operator
     rows = [ln for ln in summary.splitlines() if "RESULT:" in ln]
-    assert rows and all(ln.lstrip().startswith(("[pi] ", "[codex] ", "[hermes21] ")) for ln in rows)
+    assert rows and all(ln.lstrip().startswith(("[pi] ", "[codex] ", "[hermes21] ", "[script] ")) for ln in rows)
+    assert "## totals [script] — OK 2 · FAILED 0 · INFRA 0 " in summary
+    assert {p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*-default-qcr-*.log")} == {
+        "default-qcr-second.log", "default-qcr-first.log"}
     for op in ("pi", "codex", "hermes21"):
         n_ok = sum(1 for ln in rows if ln.lstrip().startswith(f"[{op}] ") and "RESULT: OK" in ln)
         assert f"## totals [{op}] — OK {n_ok} · FAILED 0 · INFRA 1 " in summary
@@ -225,7 +232,7 @@ def test_paid_only_runs_the_claude_operator_on_paid_cells_and_never_boots_a_prof
     paid = set(_paid_only())
     assert _arg(suites[0], "--scenarios").split(",") == [s for s in _cells()["default"] if s in paid]
     assert _arg(suites[1], "--scenarios") == "gated_provision"
-    assert not [c for c in calls if c["tool"] == "run_smoke"]                    # spend_gate_enforced is not paid-only
+    assert not [c for c in calls if c["tool"] == "run_smoke"]   # spend_gate_enforced / queued_check_relaunch: not paid-only
     assert "## lmod — SKIPPED (--paid-only: no paid_only() cell here; not booted)" in summary
 
 
@@ -251,7 +258,7 @@ def test_without_the_flags_the_sweep_runs_as_before_and_counts_infra_apart(tmp_p
     n_ok = sum("RESULT: OK" in ln for ln in rows)
     assert f"## totals — OK {n_ok} · FAILED 0 · INFRA 1 " in summary
     assert sorted(p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*.log")) == [
-        "default-spend_gate.log", "default.log", "lmod.log"]
+        "default-qcr-first.log", "default-qcr-second.log", "default-spend_gate.log", "default.log", "lmod.log"]
 
 
 def test_the_cells_env_keeps_the_alcf_wait(monkeypatch):
@@ -269,6 +276,6 @@ def test_the_totals_count_setup_failed_and_crashed_rows(tmp_path):
     r, _, summary, _ = _sweep(tmp_path, "--profiles", "default", STUB_INFRA="happy_path",
                               STUB_SETUP="gated_provision,spend_refusal", STUB_CRASH="endpoint_reuse")
     assert r.returncode == 0, r.stdout + r.stderr
-    n = len(_cells()["default"]) + 1   # + spend_gate_enforced (the stub run_smoke.sh says OK)
+    n = len(_cells()["default"]) + 3   # + spend_gate_enforced and queued_check_relaunch's two phases (stub: OK)
     assert (f"## totals — OK {n - 4} · FAILED 0 · INFRA 1 (the model endpoint failed: not graded) · SETUP FAILED 2 · "
             f"CRASHED 1 (no RESULT line) · other 0") in summary
