@@ -166,10 +166,10 @@ def _allowed_targets(scenario: str) -> set[str] | None:
 
 def _needs_admin(scenario: str) -> bool:
     """ADMIN_SETUP/ADMIN_CLEANUP: cluster-admin world changes run_smoke.sh applies through the target's admin channel
-    (fake: docker exec into slurmctld, or pbsserver on PBS). A target without one (a real facility — we are not its
-    admin) skips the cell."""
+    (fake: docker exec into slurmctld, or pbsserver on PBS); ADMIN_TAP: the scheduler sampled through it. A target
+    without one (a real facility — we are not its admin) skips the cell."""
     k = _knobs(scenario)
-    return bool(k.get("HPCB_KNOB_ADMIN_SETUP") or k.get("HPCB_KNOB_ADMIN_CLEANUP"))
+    return bool(k.get("HPCB_KNOB_ADMIN_SETUP") or k.get("HPCB_KNOB_ADMIN_CLEANUP") or k.get("HPCB_KNOB_ADMIN_TAP"))
 
 
 def _warm_block_user(scenario: str) -> str | None:
@@ -479,7 +479,8 @@ async def _main(args) -> int:
             scenarios.remove(s)
             continue
         if _needs_admin(s) and _TARGET.admin_argv is None:
-            print(f"⏭ skip   {s}: declares ADMIN_SETUP/ADMIN_CLEANUP — --target {_TARGET.name} has no admin channel", flush=True)
+            print(f"⏭ skip   {s}: declares ADMIN_SETUP/ADMIN_CLEANUP/ADMIN_TAP — --target {_TARGET.name} has no admin channel",
+                  flush=True)
             scenarios.remove(s)
     if not scenarios:
         print("nothing to run on this target", flush=True)

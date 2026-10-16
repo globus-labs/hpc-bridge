@@ -33,11 +33,16 @@ if [ -f "$ENV_FILE" ]; then
   done < "$ENV_FILE"
 fi
 
-# Which harness drives hpc-bridge: `claude` (default), `hermes` (an ALCF-hosted model, no Anthropic auth), or
-# `claude-acp` (Claude Code over ACP via Zed's adapter — the subscription token, like `claude`).
+# Which harness drives hpc-bridge: `claude` (default), `hermes` (an ALCF-hosted model, no Anthropic auth),
+# `claude-acp` (Claude Code over ACP via Zed's adapter — the subscription token, like `claude`), or `script` (no model:
+# the scenario's own SCRIPT makes the tool calls — harness/script_runner.py).
 OPERATOR="${HPCB_OPERATOR:-claude}"
 AUTH_ARGS=()
-if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "pi" ] || [ "$OPERATOR" = "hermes21" ]; then
+if [ "$OPERATOR" = "script" ]; then
+  # No model anywhere in the cell (a scripted scenario has no persona), so no Anthropic or ALCF credential is needed or
+  # forwarded, and the ALCF probe below does not run.
+  echo "operator: script (the scenario's own tool-call SCRIPT) — no model, no auth needed"
+elif [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "pi" ] || [ "$OPERATOR" = "hermes21" ]; then
   # hermes / codex / pi / hermes21 drive the scenario with an ALCF-hosted model — no Claude/Anthropic auth needed. Mint the ALCF
   # inference token ON THE HOST (a short-lived bearer minted from the maintainer's Globus login — never the
   # Globus creds themselves) and pass only that in. Base URL + model default to Sophia/gpt-oss-120b.
@@ -215,6 +220,15 @@ if [ "$OPERATOR" = "claude-acp" ]; then
   [ -n "${HPCB_CLAUDE_ACP_MODEL:-}" ] && ARGS+=( -e HPCB_CLAUDE_ACP_MODEL )
   [ -n "${HPCB_BENCHMARK_MODE:-}" ] && ARGS+=( -e HPCB_BENCHMARK_MODE )
 fi
+if [ "$OPERATOR" = "script" ]; then
+  ARGS+=( -e HPCB_OPERATOR=script )
+  [ -n "${HPCB_SCRIPT_TIMEOUT_S:-}" ] && ARGS+=( -e HPCB_SCRIPT_TIMEOUT_S )   # the whole script's bound (default 1800 s)
+fi
+# queued_check_relaunch's knobs (read in the jail by the scenario): how long the world check watches the queue after
+# the stop, how long step 3 waits for the pilot, and the `--begin` hold on every pilot (0 = none). Forwarded when set.
+for knob in HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S HPCB_RELAUNCH_HOLD_S; do
+  [ -n "${!knob:-}" ] && ARGS+=( -e "$knob" )
+done
 if [ -n "$HPCB_T_NETWORK" ]; then
   ARGS+=( --network "$HPCB_T_NETWORK" )   # the fake cluster's compose network: the jail reaches `login:22` directly
 fi
@@ -259,6 +273,30 @@ if [ -n "${HPCB_T_CATALOG_CMD:-}" ]; then
   ARGS+=( -v "$CATALOG_FILE":/run/hpcb/catalog.yaml:ro -e HPC_BRIDGE_CATALOG_FILE=/run/hpcb/catalog.yaml )
 fi
 
+# ---- the ADMIN TAP (scenario ADMIN_TAP; harness/admin_tap.py) ----
+# The scheduler as its admin sees it, sampled every few seconds for the whole cell through the target's admin channel
+# (fake: docker exec into the controller, as root) into the runs volume, where the scenario's WORLD_CHECKS read it in
+# the jail (HPCB_ADMIN_TAP) — queued_check_relaunch watches it for a pilot relaunched after the stop. Started before
+# the cell, stopped and its raw file removed by the EXIT trap (the bundle keeps the samples: admin-tap.jsonl).
+TAP_PID=""; TAP_FILE=""
+stop_tap() {
+  [ -z "$TAP_PID" ] || kill "$TAP_PID" 2>/dev/null
+  TAP_PID=""
+  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE"
+}
+if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
+  [ -n "${HPCB_T_ADMIN_ARGV:-}" ] || { echo "ERROR: scenario '$SCENARIO' declares ADMIN_TAP but target '$TARGET' has no admin channel (fake only)"; exit 2; }
+  eval "TAP_ARGV=($HPCB_T_ADMIN_ARGV)"
+  TAP_FILE="$RUNS_HOST/.admin-tap-$RUNID.jsonl"
+  : > "$TAP_FILE"
+  trap 'stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
+  python3 "$REPO_ROOT/agentic/harness/admin_tap.py" --out "$TAP_FILE" --user "$SSH_USER" --knob "$HPCB_KNOB_ADMIN_TAP" \
+    -- "${TAP_ARGV[@]}" &
+  TAP_PID=$!
+  ARGS+=( -e HPCB_ADMIN_TAP="/work/hpc-bridge/agentic/runs/.admin-tap-$RUNID.jsonl" )
+  echo "admin tap: the scheduler as its admin, sampled into $TAP_FILE (pid $TAP_PID)"
+fi
+
 # ---- cluster-ADMIN world changes (scenario ADMIN_SETUP / ADMIN_CLEANUP; `{user}` = this cell's pool user) ----
 # Run through the target's admin channel (targets.py: fake = `docker exec` into slurmctld or pbsserver, as root; a real
 # facility has none — we are not its admin — so such a cell refuses to run here; run_suite skips it earlier).
@@ -284,13 +322,13 @@ if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}${HPCB_KNOB_ADMIN_CLEANUP:-}" ]; then
     [ -z "${HPCB_KNOB_ADMIN_CLEANUP:-}" ] || admin_run cleanup "$HPCB_KNOB_ADMIN_CLEANUP" || echo "WARN: admin cleanup incomplete — check the cluster's accounting for $SSH_USER"
   }
   if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}" ]; then
-    trap 'admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
     admin_run setup "$HPCB_KNOB_ADMIN_SETUP" || { echo "ERROR: admin setup failed — not launching the cell"; exit 1; }
   else
-    trap 'admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
   fi
 else
-  trap '[ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+  trap 'stop_tap; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
 fi
 
 # The cell runs as a CHILD so a SIGTERM/SIGINT to this script reaches it (docker run proxies the signal into the

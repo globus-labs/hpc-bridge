@@ -29,6 +29,10 @@ agentic/
     cli_runner.py        ← drive Codex / Pi / Hermes (latest) headless — `HPCB_OPERATOR=codex|pi|hermes21`, the
                            harness configured as docs/user/other-hosts.md says, the model on ALCF; trace = the
                            harness's own event stream (order + its shell/read calls) + hpc-bridge's tool-call journal
+    script_runner.py     ← the SCRIPTED operator — `HPCB_OPERATOR=script`: no model; the scenario's own SCRIPT makes the
+                           tool calls over the `mcp` stdio client; trace = its steps + hpc-bridge's journal (as above)
+    admin_tap.py         ← the ADMIN TAP: the scheduler sampled as its admin (fake: root on the controller) for a
+                           scenario's WORLD_CHECKS — host half started by run_smoke.sh, jail half read by run.py
     responses_relay.py   ← lets Codex use ALCF: replays an unstreamed Responses answer as SSE, flattens Codex's
                            `namespace` / `custom` tools to plain functions and restores them on the way back
     run.py               ← per-scenario orchestration: SETUP → agent → invariants → WORLD POSTCHECKS → teardown
@@ -44,7 +48,7 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 66 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 67 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -57,7 +61,7 @@ agentic/
                            long work + output + sessions: long_task_via_handle · long_job_30m · long_output · session_persistence ·
                              repl_interaction · repl_baseline_local
                            stop + chaos: stop_while_running · esc_mid_call · draining_restop · orphaned_task ·
-                             teardown_slow_fs
+                             teardown_slow_fs · queued_check_relaunch
                            facility MEP: mep_compute_only · stranger_mep_walk · mep_no_account · fake_mep_compute ·
                              fake_mep_stop_names_block · fake_mep_stop_while_provisioning · fake_mep_no_account ·
                              fake_pbs_mep_compute
@@ -67,7 +71,8 @@ agentic/
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
                            claude-session/ (the CLI's native transcripts, both actors) ·
-                           server-stderr.log (the MCP server's own stderr) · endpoint-logs.txt (the cluster side)
+                           server-stderr.log (the MCP server's own stderr) · endpoint-logs.txt (the cluster side) ·
+                           admin-tap.jsonl (a cell with ADMIN_TAP: the scheduler as its admin saw it)
 ```
 
 ## Quickstart
@@ -103,6 +108,47 @@ start order; `harness:trace_complete` gates on every journal row being accounted
 it (`native`, `text`, `final`, `journal`, `relay`), so `regrade.py` replays it. The server runs from this checkout
 (`uv run`); the users' `uvx --from git+…` path is covered by `agentic/install_check/`, the clean-container check of the
 install recipes.
+
+**The scripted operator (`HPCB_OPERATOR=script`, `harness/script_runner.py`).** No model: the scenario's own
+`async def SCRIPT(ops)` makes the tool calls, so a cell can provoke ONE exact sequence at the moment it matters, which
+no agent's choices would time. It runs in the jail where an agent CLI would, starts hpc-bridge exactly as the CLI
+operators do (this checkout via `uv run`, behind the stderr wrapper, with the env Codex and Hermes pass it, plus
+`HPC_BRIDGE_JOURNAL`) and drives it with the `mcp` stdio client. `ops.call(tool, **args)` returns the tool's result as
+a dict (an error or a closed channel as `{"is_error": True, "text": …}` — never raised), `ops.say(text)` is the
+script's own words (the trace's texts), `ops.abort(reason)` ends the run errored (`run_completed` fails: a premise
+unmet), `ops.facility` / `ops.ssh_host` are the run's. The graded trace is built as the CLI operators' is: the steps fix
+the order, the journal says what each tool got and returned (`harness:trace_complete` gates), and the bundle's
+`messages.jsonl` holds each step (`native`, with its `t_start` / `t_end`), the script's words, its final message and
+the journal, so `regrade.py` replays it. No credential is needed or forwarded and the ALCF probe does not run; a scenario
+with no SCRIPT is refused (`RESULT: SETUP FAILED`, exit 2), and the operator takes no persona, PHASES or mid-run hook
+(SKIPPED). A scripted scenario may set `OPERATORS = ("script",)` so an agent operator skips it.
+
+```bash
+# the queued-check relaunch proof: stop_endpoint says `down` while the canary is queued — does a new pilot follow?
+HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch
+#   knobs: HPCB_RELAUNCH_WATCH_S (default 240: how long the world check watches the queue after the stop),
+#          HPCB_RELAUNCH_HOLD_S (default 1800: the `#SBATCH --begin` hold that keeps every pilot PENDING; 0 = none),
+#          HPCB_RELAUNCH_PILOT_WAIT_S (default 180: how long the script waits for its pilot to be queued)
+```
+`queued_check_relaunch` (fake, Slurm: `default` or `site`) brings the login shape up from the probe's proposal (every
+pilot held PENDING by an `#SBATCH --begin` hold, so the canary cannot run first — on idle fake nodes the worker answers
+it within ~5 s of the sbatch), confirms a compute block, polls `squeue` on the login shape until its pilot is queued,
+and stops at once — no teardown. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
+submitted after the stop's answer (`world:no_relaunch_after_down`, gated), before the harness tears down. Expected on
+main if the review's claim holds: FAILED, a new pilot ~60–65 s after the `down` (the scenario's docstring has the
+mechanism and the evidence). Run it by hand; the sweeps leave it out.
+
+**World checks that watch, and the ADMIN TAP.** A scenario's `WORLD_CHECKS` are async callables
+`fn(ctx) -> list[Result]` that run.py awaits after the operator and BEFORE the declarative POSTCHECKS and the teardown
+(which would end what they watch — e.g. `gce stop` ends parsl's loop). `ctx` carries the graded trace, the run's
+messages (the journal's own clock) and `ctx.tap`, the cell's admin tap. A row gates when it is `world:*` (as every
+postcheck) or in EXPECT_OK; the rest are reported. A scenario that declares `ADMIN_TAP = {"cmd": …, "every_s": 10}`
+gets the tap: run_smoke.sh starts `harness/admin_tap.py` on the HOST before the cell, which runs the command through the
+target's admin channel (fake: `docker exec` into the controller as root; `{user}` = the pool user) every `every_s`
+seconds into `agentic/runs/.admin-tap-<runid>.jsonl`; the jail reads it (`HPCB_ADMIN_TAP`), the bundle keeps the samples
+(`admin-tap.jsonl`), and the EXIT trap stops the tap and removes the raw file. `admin_tap.slurm_sample_cmd()` samples
+the controller's clock, the pool user's queue and its accounting history, with epoch times. A target with no admin
+channel (globus1: we are not its admin) refuses the cell; `run_suite` skips it.
 
 **INFRA: the model endpoint failed, not hpc-bridge.** ALCF's endpoint can be slow or broken for hours (2026-10-14/15:
 its streaming path answered HTTP 200 carrying `StreamingTimeoutError`; Pi then ended with an empty answer and no tool
@@ -241,7 +287,8 @@ A during hook (`on_tool`) needs `claude`: it is timed from the ToolUseBlock's ar
 operators get their hooks from the server's journal (`HPC_BRIDGE_JOURNAL`), which hpc-bridge writes when a call
 **ends** — so a `cmd` fires right after a matching result, but nothing can see a call in flight, and a one-shot CLI
 turn cannot take a user message mid-turn (no `interject`, no `interrupt`). The ACP operators (`hermes`, `claude-acp`)
-take no hooks yet. What an operator cannot serve, `run.py` reports SKIPPED (`midrun_hooks.operator_refusal`) — never
+take no hooks yet, nor does the `script` operator (a script that needs the world changed mid-run does it in its own
+steps). What an operator cannot serve, `run.py` reports SKIPPED (`midrun_hooks.operator_refusal`) — never
 graded vacuously. That made the `cmd`-only chaos cells free: `orphaned_task`, `draining_restop`, `reap_replaced_block`.
 `harness:midrun_hooks` gates every hooked cell: a hook that never fired, failed, or is missing from the record (its
 action raised) fails it. A journal hook's `call_index` is the journal row (hpc-bridge calls only), not the trace
@@ -450,6 +497,13 @@ ADMIN_CLEANUP = ["… MaxSubmitJobs=-1"]  #   run by run_smoke.sh through the ta
                                         #   slurmctld, or pbsserver on a PBS profile; `{user}` = the pool user) before the agent / always after; no channel ⇒ skipped
 LOCAL_SETUP = ["ssh … nobody@login true"]  # optional: commands run INSIDE THE JAIL before the agent (the client side of the
                                         #   world — e.g. burn fail2ban's budget from this address); a failure aborts the run
+SCRIPT = my_script                     # optional: `async def my_script(ops) -> str` — the tool calls the SCRIPTED operator
+                                       #   makes (HPCB_OPERATOR=script; see "The scripted operator")
+OPERATORS = ("script",)                # optional: the only operators that may drive it (others: SKIPPED)
+WORLD_CHECKS = [my_watch]              # optional: `async def my_watch(ctx) -> list[Result]`, after the agent, before the
+                                       #   POSTCHECKS and the teardown (a `world:*` row gates; see "World checks that watch")
+ADMIN_TAP = {"cmd": "…{user}…", "every_s": 10}   # optional: sample the scheduler as its admin for the whole cell (fake
+                                       #   only; run_smoke.sh starts harness/admin_tap.py; WORLD_CHECKS read `ctx.tap`)
 SETUP = [{"cmd": "…", "on": "each_login"}]  # SETUP/CLEANUP entries may be dicts fanning out to every login node
 ```
 Every bundle's `record.json` (schema 2) carries `result` (OK | FAILED | INFRA | RATE_LIMITED | SETUP FAILED | CRASHED |

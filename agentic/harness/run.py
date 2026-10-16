@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import functools
 import importlib
 import json
 import math
@@ -28,10 +29,12 @@ import sys
 import time
 from collections import Counter
 from concurrent.futures import ThreadPoolExecutor
+from dataclasses import dataclass
 from pathlib import Path
 
 import server_stderr
 from acp_trace import capture_crosscheck
+from admin_tap import TAP_ENV, TapReader, read_samples
 from cluster_ops import (
     capture_logs_cmd,
     delete_records,
@@ -430,6 +433,36 @@ def _postchecks(scen) -> list[Result]:
         detail = "ok" if ok else f"{'; '.join(why)} — output: {' | '.join(shown)[:200]!r}"
         results.append(Result(f"world:{pc['name']}", ok, detail))
     return results
+
+
+@dataclass
+class WorldContext:
+    """What a scenario's WORLD_CHECKS are handed: the run's graded trace, its messages (the CLI and script operators'
+    journal rows carry the server's own clock), and the cell's admin tap (admin_tap.TapReader — the scheduler as its
+    admin saw it; reads nothing when the cell has no tap)."""
+    trace: Trace
+    messages: list
+    tap: TapReader
+
+
+async def _world_checks(scen, res) -> list[Result]:
+    """Scenario WORLD_CHECKS: async callables `fn(WorldContext) -> list[Result]` that observe the world for as long as
+    they need — queued_check_relaunch watches the queue for minutes after the stop — run AFTER the agent and BEFORE the
+    POSTCHECKS and the teardown, for the postchecks' reason: the harness' own teardown (`gce stop`, the scoped scancel)
+    would end the very behaviour they watch (parsl's loop relaunching a pilot). A row gates when it is `world:*` (as
+    every postcheck does) or the scenario's EXPECT_OK names it; the rest are reported. A check that raises is a failed
+    `world:<its name>` row, never a crashed run."""
+    ctx = WorldContext(trace=res.trace, messages=list(res.messages or []),
+                       tap=TapReader(os.environ.get(TAP_ENV, "").strip() or None))
+    out: list[Result] = []
+    for fn in getattr(scen, "WORLD_CHECKS", None) or []:
+        name = getattr(fn, "__name__", "world_check")
+        try:
+            got = await fn(ctx)
+            out += [got] if isinstance(got, Result) else list(got or [])
+        except Exception as exc:  # noqa: BLE001 - graded as a failed world check, never a crashed run
+            out.append(Result(f"world:{name}", False, f"the world check raised {type(exc).__name__}: {exc}"))
+    return out
 
 
 _UUID_RE = re.compile(r"[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}")
@@ -903,6 +936,17 @@ def _midrun_hooks_row(declared: list[dict], record: list[dict]) -> Result:
                   + (f"; MISSING from the record: {missing}" if missing else ""))
 
 
+def _side_streams(res) -> dict[str, list] | None:
+    """The bundle's extra JSONL files (provenance.write_run_record `extra_jsonl`), or None."""
+    out: dict[str, list] = {}
+    if res is not None and getattr(res, "acp_events", None):
+        out["acp-updates"] = res.acp_events
+    tap = os.environ.get(TAP_ENV, "").strip()
+    if tap:
+        out["admin-tap"] = read_samples(Path(tap))
+    return out or None
+
+
 def _metrics_tail(metrics: dict[str, float | None]) -> str:
     """What the RESULT line adds after the verdict: the measured numbers, e.g. `  (first result 41 s)`."""
     secs = metrics.get("first_result_s")
@@ -954,11 +998,27 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     if reason:
         print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
         return 2
-    if operator in ("codex", "pi", "hermes21"):
+    # A scenario may name the operators it is for (OPERATORS): queued_check_relaunch is a scripted proof — an agent
+    # driven through its PROMPT would spend a model run on a sequence it is not there to time.
+    only = tuple(getattr(scen, "OPERATORS", ()) or ())
+    if only and operator not in only:
+        print(f"RESULT: SKIPPED — scenario {scenario!r} runs only under the {', '.join(only)} operator "
+              f"(HPCB_OPERATOR={only[0]}), not {operator}")
+        return 2
+    if operator == "script":
+        # No model: the scenario's own SCRIPT makes the tool calls (script_runner) — a scenario without one is refused
+        from script_runner import run_scenario as _script_run
+        from script_runner import script_refusal
+
+        why = script_refusal(scen)
+        if why:
+            print(f"RESULT: SETUP FAILED — {why}")
+            return 2
+        _run_scenario = functools.partial(_script_run, script=scen.SCRIPT, facility=facility, ssh_host=ssh_host)
+        model = "script"
+    elif operator in ("codex", "pi", "hermes21"):
         # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
         # say; graded from hpc-bridge's own tool-call journal (cli_runner). Autonomous scenarios only for now.
-        import functools
-
         from cli_runner import run_scenario as _cli_run
 
         _run_scenario = functools.partial(_cli_run, harness=operator)
@@ -1011,6 +1071,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         "requires": dict(getattr(scen, "REQUIRES", {}) or {}),
         "admin_setup": list(getattr(scen, "ADMIN_SETUP", []) or []),      # applied by run_smoke.sh via the admin channel
         "admin_cleanup": list(getattr(scen, "ADMIN_CLEANUP", []) or []),
+        "admin_tap": dict(getattr(scen, "ADMIN_TAP", None) or {}) or None,   # sampled by run_smoke.sh (admin_tap.py)
+        "world_checks": [getattr(fn, "__name__", "?") for fn in getattr(scen, "WORLD_CHECKS", None) or []],
         "catalog_file": bool(os.environ.get("HPC_BRIDGE_CATALOG_FILE")),   # a per-cluster local catalog stood in for the registry
         "harness_ssh_port": os.environ.get("HPCB_HARNESS_SSH_PORT") or None,  # the world channel's sshd (MFA profiles)
         "scheduler": _scheduler(scen),                                          # squeue/scancel vs qstat/qdel for the world channel
@@ -1152,6 +1214,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # is visible. Non-gating.
         results.append(Result("harness:guidance_fetched", True,
                               "force-fed SKILL.md in the system prompt (Claude-SDK operator)" if operator == "claude"
+                              else "no model reads guidance: the scenario's SCRIPT made the calls" if operator == "script"
                               else ("fetched the MCP guidance resource" if guidance_fetched(res.trace)
                                     else "did NOT fetch the MCP guidance resource (this run ran guidance-lighter)")))
         # The Codex / Pi / Hermes-latest operator merges the harness's own record with hpc-bridge's journal: a journal
@@ -1211,13 +1274,23 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         delay = max(10, int(getattr(scen, "POSTCHECK_DELAY_S", 10)))
         print(f"\n=== WORLD CHECKS (settling {delay}s first) ===")
         await asyncio.sleep(delay)
+        # The scenario's own WORLD_CHECKS first (they may watch for minutes), then the declarative postchecks — both
+        # before the teardown.
+        watched = await _world_checks(scen, res)
+        for r in watched:
+            gate = r.name.startswith("world:") or r.name in critical
+            print(f"  [{'PASS' if r.ok else 'FAIL'}] {r.name}{' *critical*' if gate else ' (report-only)'}: {r.detail}")
+            if gate:
+                gating.add(r.name)
+                if not r.ok:
+                    failed.append(r.name)
         world = _postchecks(scen)
         for r in world:
             print(f"  [{'PASS' if r.ok else 'FAIL'}] {r.name} *critical*: {r.detail}")
             gating.add(r.name)
             if not r.ok:
                 failed.append(r.name)  # all world postchecks gate — they are deliberate
-        all_results = results + world
+        all_results = results + watched + world
 
         # Teardown HERE on the graded path (the `finally` below covers the others), so the world it leaves behind can
         # still decide the verdict: the after-teardown check gates a delete cell.
@@ -1313,8 +1386,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             result=result_label,
             infra_reason=infra,
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
-            # the ACP client's event log (ACP operators only): the live, ordered record next to the graded trace
-            extra_jsonl=({"acp-updates": res.acp_events} if res is not None and getattr(res, "acp_events", None) else None),
+            # side streams, one file each: the ACP client's event log (ACP operators only: the live, ordered record next
+            # to the graded trace) and the admin tap's samples (a scenario with ADMIN_TAP: the scheduler as its admin saw
+            # it, through the teardown — run_smoke.sh removes the raw file once the cell has ended)
+            extra_jsonl=_side_streams(res),
             arrivals=(getattr(res, "arrivals", None) if res else None),
             metrics=metrics,
             server=watch.summary(),
@@ -1351,10 +1426,11 @@ def main() -> None:
     ap.add_argument("--no-skill", action="store_true",
                     help="ablation: withhold SKILL.md from the system prompt (measure the guidance's value)")
     ap.add_argument("--operator", default=os.environ.get("HPCB_OPERATOR") or "claude",
-                    choices=["claude", "hermes", "claude-acp", "codex", "pi", "hermes21"],
+                    choices=["claude", "hermes", "claude-acp", "codex", "pi", "hermes21", "script"],
                     help="which agent harness drives hpc-bridge (default: claude; hermes = an ALCF-hosted model; "
                          "claude-acp = Claude Code over ACP via Zed's adapter; codex / pi / hermes21 = those harnesses "
-                         "at their latest release, headless, on the ALCF model, graded from the server's journal)")
+                         "at their latest release, headless, on the ALCF model, graded from the server's journal; "
+                         "script = no model: the scenario's own SCRIPT makes the tool calls)")
     args = ap.parse_args()
     sys.exit(asyncio.run(_main(args)))
 
