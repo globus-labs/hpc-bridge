@@ -12,8 +12,17 @@ from __future__ import annotations
 import json
 import os
 import re
+import sys
+import time
+from collections.abc import Iterator
+from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
+
+try:
+    import fcntl
+except ImportError:  # Windows: no advisory lock — the read-merge-write alone
+    fcntl = None  # type: ignore[assignment]
 
 
 def _state_dir() -> Path:
@@ -128,14 +137,28 @@ class FacilityStore:
 _SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
 
 
+class _Unreadable(Exception):
+    """The record exists but cannot be used: `corrupt` (not the JSON we write) or not readable at all (an OSError)."""
+
+    def __init__(self, why: str, *, corrupt: bool) -> None:
+        super().__init__(why)
+        self.corrupt = corrupt
+
+
 class SentCheckStore:
     """The tasks of ours an SSH endpoint's compute user endpoints may still hold (#24's evidence: a check no worker has
     answered, or a command whose result the client lost), by task id, so a server that restarts — Claude Code relaunched
     — still sees them: a new process bound to the same endpoint must not answer a stop `down` while one is queued.
-    One small file per endpoint, `~/.hpc-bridge/sent-checks/<endpoint id>.json`, 0600, written atomically (a temp file,
-    then a rename), holding only `{task_id, partition, account, sent_at, what}` rows — never a command's text. The
-    rows still unresolved are rewritten on each change (warmth._persist_checks); a teardown removes the file.
-    Best-effort: an unreadable or unwritable file reads as empty and never fails a tool call."""
+    One small file per endpoint, `~/.hpc-bridge/sent-checks/<endpoint id>.json`, 0600, holding only
+    `{task_id, partition, account, sent_at, what}` rows — never a command's text.
+
+    Several processes can share it (two sessions on one endpoint, a restart): every write re-reads the file and MERGES
+    under an exclusive lock on a sibling `.lock` file (`fcntl.flock`; on a system without it, the merge alone), adding
+    the writer's rows and removing only the ones it has SEEN resolve (`update`) — a row it does not know is kept. The
+    write itself is atomic (a temp file, then a rename). A record that cannot be read fails CLOSED: `read` reports the
+    problem (a check may be queued that nothing here can see), and a corrupt file is kept aside as
+    `<id>.json.corrupt-<time>`, still reported, until the endpoint's teardown removes it (`remove`, with a line on
+    stderr)."""
 
     def __init__(self, root: Path | str | None = None) -> None:
         self.root = Path(root) if root else _state_dir() / "sent-checks"
@@ -143,38 +166,123 @@ class SentCheckStore:
     def _path(self, endpoint_id: str) -> Path | None:
         return self.root / f"{endpoint_id}.json" if _SAFE_ID.fullmatch(endpoint_id or "") else None
 
-    def load(self, endpoint_id: str) -> list[dict]:
-        path = self._path(endpoint_id)
-        if path is None or not path.exists():
+    @contextmanager
+    def _locked(self, path: Path) -> Iterator[None]:
+        self.root.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
+        try:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_EX)
+            yield
+        finally:
+            if fcntl is not None:
+                fcntl.flock(fd, fcntl.LOCK_UN)
+            os.close(fd)
+
+    @staticmethod
+    def _rows(path: Path) -> list[dict]:
+        """The rows on disk ([] when there is no file); raises _Unreadable."""
+        if not path.exists():
             return []
         try:
-            rows = json.loads(path.read_text()).get("tasks", [])
-        except (json.JSONDecodeError, OSError, AttributeError):
-            return []
-        return [r for r in rows if isinstance(r, dict) and isinstance(r.get("task_id"), str)]
+            text = path.read_text()
+        except OSError as exc:
+            raise _Unreadable(f"{type(exc).__name__}: {exc}", corrupt=False) from exc
+        try:
+            data = json.loads(text)
+            rows = data["tasks"]
+            if not isinstance(rows, list) or not all(isinstance(r, dict) and isinstance(r.get("task_id"), str)
+                                                     for r in rows):
+                raise ValueError("unexpected rows")
+        except (ValueError, KeyError, TypeError) as exc:
+            raise _Unreadable("not the record hpc-bridge writes", corrupt=True) from exc
+        return rows
+
+    def _set_aside(self, path: Path) -> Path | None:
+        aside = path.with_name(f"{path.name}.corrupt-{int(time.time())}")
+        try:
+            os.replace(path, aside)
+        except OSError:
+            return None
+        print(f"hpc-bridge: the record of checks sent to an endpoint was unreadable and is kept as {aside}; stops on "
+              "that endpoint say so until teardown_endpoint", file=sys.stderr)
+        return aside
+
+    def _aside(self, path: Path) -> list[Path]:
+        return sorted(path.parent.glob(f"{path.name}.corrupt-*")) if path.parent.exists() else []
+
+    def read(self, endpoint_id: str) -> tuple[list[dict], str | None]:
+        """(rows, problem): `problem` says why the record cannot be trusted to list every task — it could not be read,
+        or an earlier copy was corrupt and is kept aside — else None."""
+        path = self._path(endpoint_id)
+        if path is None:
+            return [], None
+        why: str | None = None
+        try:
+            with self._locked(path):
+                try:
+                    rows = self._rows(path)
+                except _Unreadable as exc:
+                    if exc.corrupt:
+                        self._set_aside(path)
+                    rows, why = [], str(exc)
+                aside = self._aside(path)
+        except OSError as exc:  # the lock itself (the directory is not writable): read without it, fail closed
+            return [], f"it could not be opened ({type(exc).__name__}: {exc})"
+        if why is None and not aside:
+            return rows, None
+        where = f"; kept as {aside[-1].name}" if aside else ""
+        return rows, f"it could not be read ({why or 'an earlier copy was not the record hpc-bridge writes'}{where})"
+
+    def load(self, endpoint_id: str) -> list[dict]:
+        return self.read(endpoint_id)[0]
+
+    def update(self, endpoint_id: str, add: list[dict], drop: set[str] | frozenset[str]) -> bool:
+        """Merge under the lock: the rows on disk, less `drop` (tasks this writer saw resolve), plus `add` (its own).
+        A corrupt record is kept aside first (and keeps being reported). False when nothing could be written."""
+        path = self._path(endpoint_id)
+        if path is None:
+            return True
+        try:
+            with self._locked(path):
+                try:
+                    current = self._rows(path)
+                except _Unreadable as exc:
+                    if not exc.corrupt or self._set_aside(path) is None:
+                        return False
+                    current = []
+                merged = {r["task_id"]: r for r in current if r["task_id"] not in drop}
+                merged.update({r["task_id"]: r for r in add})
+                if not merged:
+                    path.unlink(missing_ok=True)
+                    return True
+                tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+                fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+                with os.fdopen(fd, "w") as fh:
+                    json.dump({"tasks": list(merged.values())}, fh, indent=1, sort_keys=True)
+                os.replace(tmp, path)
+                return True
+        except OSError:
+            return False
 
     def save(self, endpoint_id: str, rows: list[dict]) -> None:
+        """Replace the record with `rows` (a test seam; the server merges, `update`)."""
         path = self._path(endpoint_id)
-        if path is None:
-            return
-        if not rows:
-            self.remove(endpoint_id)
-            return
-        try:
-            path.parent.mkdir(parents=True, exist_ok=True)
-            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
-            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
-            with os.fdopen(fd, "w") as fh:
-                json.dump({"tasks": rows}, fh, indent=1, sort_keys=True)
-            os.replace(tmp, path)
-        except OSError:
-            return
+        if path is not None:
+            current = {r["task_id"] for r in self.load(endpoint_id)}
+            self.update(endpoint_id, rows, current)
 
     def remove(self, endpoint_id: str) -> None:
+        """The endpoint is gone (its teardown): its record goes, a kept-aside corrupt copy too (said on stderr)."""
         path = self._path(endpoint_id)
         if path is None:
             return
         try:
-            path.unlink(missing_ok=True)
+            with self._locked(path):
+                path.unlink(missing_ok=True)
+                for aside in self._aside(path):
+                    aside.unlink(missing_ok=True)
+                    print(f"hpc-bridge: removed {aside} with its endpoint's teardown", file=sys.stderr)
+            path.with_name(f"{path.name}.lock").unlink(missing_ok=True)  # the endpoint is gone: nothing writes it now
         except OSError:
             return

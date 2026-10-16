@@ -304,8 +304,12 @@ class AppCtx:
     # stop drops the ones it found resolved; a teardown drops the endpoint's. Keyed by endpoint, so a reconnect to the
     # same one keeps them.
     sent_checks: dict[str, list[SentCheck]] = field(default_factory=dict)
-    # Per endpoint id: the task ids last written to disk for it (warmth._persist_checks writes only on a change).
-    persisted_checks: dict[str, frozenset[str]] = field(default_factory=dict)
+    # Per endpoint id: the task ids this process last wrote to disk for it, and the ones it last removed there as seen
+    # resolved (warmth._persist_checks writes only on a change, and again after a failed write).
+    persisted_checks: dict[str, tuple[frozenset[str], frozenset[str]]] = field(default_factory=dict)
+    # Task id -> how it resolved ("ok" / "failed"), as seen this session: never asked again, and removed from the record
+    # on disk by this process (warmth._check_states, _persist_checks). Bounded (warmth._trim_resolved).
+    resolved_checks: dict[str, str] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

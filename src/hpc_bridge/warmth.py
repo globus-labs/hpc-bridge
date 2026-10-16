@@ -824,23 +824,42 @@ def _keep_checks(app: AppCtx, eid: str, new: list[SentCheck]) -> None:
         kept[:] = [c for c in kept if id(c) not in gone]
     _persist_checks(app, eid)
 
-def _persist_checks(app: AppCtx, eid: str, extra: list[SentCheck] | None = None) -> None:
-    """Write the endpoint's unresolved tasks with a task id (and `extra`: the current compute runner's) to disk — only
-    when that set changed — so a restarted server still sees them (state.SentCheckStore). Only for an SSH endpoint:
-    a facility endpoint's stop never looks. Callers hold app.lock."""
+def _persist_checks(app: AppCtx, eid: str) -> None:
+    """Write the endpoint's unresolved tasks with a task id — the ones kept, and the current compute runner's — to disk,
+    so a restarted server still sees them (state.SentCheckStore). The store MERGES: it adds these and removes only the
+    tasks this process has seen resolve (the ones it wrote that are no longer unresolved here, and those its lookups
+    resolved), so another process's rows on the same endpoint are kept. Written when that changed, or when the last
+    write failed (said on stderr, and tried again on the next change). Only for an SSH endpoint: a facility endpoint's
+    stop never looks. Callers hold app.lock."""
     if not _has_login_shape(app):
         return
+    rt = app.shapes.get(DEFAULT_SHAPE)
+    current = _current_checks(app, rt) if getattr(getattr(rt, "runner", None), "endpoint_id", None) == eid else []
     rows: dict[str, dict] = {}
-    for c in [*app.sent_checks.get(eid, []), *(extra or [])]:
+    for c in [*app.sent_checks.get(eid, []), *current]:
         tid = c.tid
-        if tid is None or _locally_resolved(c):
+        if tid is None or _locally_resolved(c) or tid in app.resolved_checks:
             continue
         rows[tid] = {"task_id": tid, "partition": c.terms[0], "account": c.terms[1], "sent_at": c.sent_at,
                      "what": c.what}
-    if app.persisted_checks.get(eid) == frozenset(rows):
+    mine = frozenset(rows)
+    wrote, dropped = app.persisted_checks.get(eid, (frozenset(), frozenset()))
+    drop = ((wrote | frozenset(app.resolved_checks)) - mine)
+    if mine == wrote and drop <= dropped:
         return
-    SentCheckStore().save(eid, list(rows.values()))
-    app.persisted_checks[eid] = frozenset(rows)
+    if SentCheckStore().update(eid, list(rows.values()), drop):
+        app.persisted_checks[eid] = (mine, drop)
+    else:
+        print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under "
+              f"{SentCheckStore().root}); tried again on the next change", file=sys.stderr)
+
+# Resolutions seen this session, by task id: never asked again (AppCtx.resolved_checks), bounded — oldest out first.
+_RESOLVED_MAX = 4096
+
+def _trim_resolved(app: AppCtx) -> None:
+    excess = len(app.resolved_checks) - _RESOLVED_MAX
+    for tid in list(app.resolved_checks)[:max(0, excess)]:
+        app.resolved_checks.pop(tid, None)
 
 def _forget_checks(app: AppCtx, eid: str) -> None:
     """The endpoint is gone (a teardown): nothing of it can start a block any more. Callers hold app.lock."""
@@ -861,17 +880,19 @@ def _note_checks_sent(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     restarts before this runner is retired must still see a check it sent. Callers hold app.lock."""
     eid = app.state.endpoint_id
     if eid is not None and shape == DEFAULT_SHAPE and _has_login_shape(app):
-        _persist_checks(app, eid, _current_checks(app, rt))
+        _persist_checks(app, eid)
 
-def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> list[SentCheck]:
+def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> tuple[list[SentCheck], str | None]:
     """Every task of ours a stop must see resolve before `down`: the ones the endpoint kept (from retired runners, lost
-    commands, and — after a restart — read back from disk by task id), and the ones the current compute runner sent.
-    Callers hold app.lock."""
+    commands, and — after a restart or from another process — read back from disk by task id), and the ones the current
+    compute runner sent; and why the record on disk cannot be trusted to list them all, if it cannot (it could not be
+    read: fail closed). Callers hold app.lock."""
     kept = app.sent_checks.setdefault(eid, [])
     current = _current_checks(app, rt)
     known = {_check_key(c) for c in [*kept, *current]}
-    for row in SentCheckStore().load(eid):  # a restart (or another process) left them: adopt what is not known
-        if row["task_id"] not in known:
+    rows, problem = SentCheckStore().read(eid)
+    for row in rows:  # a restart (or another process) left them: adopt what is not known, nor known resolved
+        if row["task_id"] not in known and row["task_id"] not in app.resolved_checks:
             kept.append(SentCheck(future=None, terms=(row.get("partition"), row.get("account")), task_id=row["task_id"],
                                   sent_at=float(row.get("sent_at") or 0.0),
                                   what="command" if row.get("what") == "command" else "check"))
@@ -879,7 +900,7 @@ def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> list[SentChec
     if not kept:
         app.sent_checks.pop(eid, None)
     in_kept = {_check_key(c) for c in kept}
-    return [*kept, *[c for c in current if _check_key(c) not in in_kept]]
+    return [*kept, *[c for c in current if _check_key(c) not in in_kept]], problem
 
 def _unresolved_count(app: AppCtx, eid: str | None) -> int:
     """How many tasks of ours an endpoint may still hold, without asking the service: the ones kept in memory not known
@@ -888,8 +909,9 @@ def _unresolved_count(app: AppCtx, eid: str | None) -> int:
         return 0
     kept = app.sent_checks.get(eid, [])
     known = {_check_key(c) for c in kept}
-    return (sum(1 for c in kept if not _locally_resolved(c))
-            + sum(1 for row in SentCheckStore().load(eid) if row["task_id"] not in known))
+    rows, problem = SentCheckStore().read(eid)
+    return (sum(1 for c in kept if not _locally_resolved(c)) + (1 if problem else 0)
+            + sum(1 for row in rows if row["task_id"] not in known and row["task_id"] not in app.resolved_checks))
 
 def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: Any, client: Any) -> None:
     """A command whose future FAILED on the client's side alone — not the service's verdict (TaskExecutionFailed), on
@@ -914,14 +936,15 @@ CheckState = Literal["ok", "failed", "pending", "unknown", "unsent"]
 # entry with no id can never be looked up. Taken, it reaches its user endpoint within seconds; a fresh user endpoint
 # scales out on its first 5 s pass, and once its first pilot is cancelled or dies parsl gives the task up at its next
 # 60 s status poll (bad state). 300 s covers the user endpoint's start (tens of seconds), that poll and pass, and the
-# failure reaching the service, with margin. (On an endpoint of an earlier plugin, which keeps one user endpoint, no
-# bound is exact: such a task could still start a block after it. A rare case — a submit that failed after the
-# service took it — and named in the notice while it lasts.)
+# failure reaching the service, with margin. Only where that holds — an endpoint that gives each block request its own
+# compute user endpoint (`drop_no_id`): on one of an earlier plugin, which keeps one user endpoint, nothing gives such
+# a task up, so it stays `unknown` (that endpoint's stop names teardown_endpoint as the only way to end it anyway).
 _NO_ID_BOUND_S = 300.0
 _DROPPED_NO_ID: set[int] = set()
 
-def _local_state(c: SentCheck, now: float) -> CheckState | None:
-    """What a task's own future says, or None when the service must be asked (by task id)."""
+def _local_state(c: SentCheck, now: float, *, drop_no_id: bool = True) -> CheckState | None:
+    """What a task's own future says, or None when the service must be asked (by task id). `drop_no_id`: an id-less task
+    whose submit may have been taken is dropped after `_NO_ID_BOUND_S` (a fresh-user-endpoint endpoint only)."""
     f = c.future
     if f is not None and f.done() and not f.cancelled():
         exc = f.exception()
@@ -935,7 +958,7 @@ def _local_state(c: SentCheck, now: float) -> CheckState | None:
         return "unsent"
     if not f.done():
         return "pending"  # still being submitted
-    if now - c.sent_at < _NO_ID_BOUND_S:
+    if not drop_no_id or now - c.sent_at < _NO_ID_BOUND_S:
         return "unknown"  # the submit failed after the service may have taken it
     if id(f) not in _DROPPED_NO_ID:
         _DROPPED_NO_ID.add(id(f))
@@ -967,35 +990,70 @@ def _task_state(client: Any, tid: str) -> CheckState:
         return "unknown"
     return _status_state(task)
 
-def _lookup_states(client: Any, tids: list[str]) -> dict[str, CheckState]:
-    """Several tasks of one client, in one round trip where the SDK can (`get_batch_result`); a task it leaves out (it
-    drops one the service failed with an exception, logging it) is asked alone. Blocking: run it off the loop."""
+# The most tasks one round asks about one by one (after the batch call), per client: the SDK serialises its requests
+# (Client._request_lock), at 0.2-0.5 s each, so 32 fit in a round's time. The rest are asked in the next round — a
+# resolution is never asked again (AppCtx.resolved_checks), so each round makes progress.
+_MAX_SINGLE_LOOKUPS = 32
+
+def _lookup_into(client: Any, tids: list[str], out: dict[str, CheckState], deadline: float,
+                 resolved: dict[str, str] | None = None) -> None:
+    """Several tasks of one client, written into `out` AS THEY ARE READ — so an answer read before the round's deadline
+    is kept whatever happens after: one batch call where the SDK can (`get_batch_result`), then, for a task it leaves
+    out (it drops one the service failed with an exception, logging it), `get_task` alone, at most
+    `_MAX_SINGLE_LOOKUPS` of them and none once `deadline` (monotonic) has passed — so a round outliving its wait
+    leaves at most one request of ours holding the SDK's lock. `resolved`: where each resolution goes too, as it is
+    read — one that arrives after the round's caller stopped waiting is still never asked again. Blocking: run it off
+    the loop."""
     if client is None:
-        return {t: "unknown" for t in tids}
-    out: dict[str, CheckState] = {}
+        return
+
+    def put(t: str, st: CheckState) -> None:
+        out[t] = st
+        if resolved is not None and st in ("ok", "failed"):
+            resolved[t] = st
+
     batch = getattr(client, "get_batch_result", None)
     if callable(batch) and len(tids) > 1:
         try:
             got = batch(list(tids))
-        except Exception:  # noqa: BLE001 - transport / auth: nothing to read for any of them
-            return {t: "unknown" for t in tids}
+        except Exception:  # noqa: BLE001 - transport / auth: nothing to read for any of them this round
+            return
         if isinstance(got, dict):
-            out = {t: _status_state(got[t]) for t in tids if t in got}
-    return {t: out[t] if t in out else _task_state(client, t) for t in tids}
+            for t in tids:
+                if t in got:
+                    put(t, _status_state(got[t]))
+    asked = 0
+    for t in tids:
+        if t in out:
+            continue
+        if asked >= _MAX_SINGLE_LOOKUPS or time.monotonic() >= deadline:
+            return
+        asked += 1
+        put(t, _task_state(client, t))
+
+def _lookup_states(client: Any, tids: list[str]) -> dict[str, CheckState]:
+    """`_lookup_into`, whole: every task's state (`unknown` for one not read)."""
+    out: dict[str, CheckState] = {}
+    _lookup_into(client, tids, out, time.monotonic() + _LOOKUP_TIMEOUT_S)
+    return {t: out.get(t, "unknown") for t in tids}
 
 # The most one round of lookups may take (a web call per client; the SDK's own timeouts are longer).
 _LOOKUP_TIMEOUT_S = 20.0
 
-async def _check_states(checks: list[SentCheck], fallback: Any = None,
-                        timeout: float = _LOOKUP_TIMEOUT_S) -> list[CheckState]:
+async def _check_states(checks: list[SentCheck], fallback: Any = None, timeout: float = _LOOKUP_TIMEOUT_S, *,
+                        known: dict[str, str] | None = None, drop_no_id: bool = True) -> list[CheckState]:
     """Where each task of ours stands: `ok` (it ran), `failed` (the endpoint gave it up: a rejection, a bad state after
     its first pilot died or was cancelled), `pending` (still queued: the endpoint can start a block for it), `unsent`
-    (the service never took it, or an id-less one past `_NO_ID_BOUND_S`), or `unknown` (it could not be read: read as
-    pending). A future that failed on the client's side alone (the result watcher quitting) is asked about by id,
-    batched per client (`fallback`: the client for a task read back from disk), all within `timeout` — past it, every
-    task still to be read is `unknown`."""
+    (the service never took it, or an id-less one past `_NO_ID_BOUND_S` where `drop_no_id`), or `unknown` (it could not
+    be read: read as pending). First each task's own future, then `known` (resolutions seen before: never asked again),
+    then the service by task id — batched per client (`fallback`: the client for a task read back from disk), all
+    within `timeout`; an answer read in that time is kept, one not read is `unknown`. Resolutions found are added to
+    `known`."""
     now = time.time()
-    states: list[CheckState | None] = [_local_state(c, now) for c in checks]
+    states: list[CheckState | None] = [_local_state(c, now, drop_no_id=drop_no_id) for c in checks]
+    if known is not None:
+        states = [st if st is not None or c.tid not in known else known[c.tid]  # type: ignore[misc]
+                  for c, st in zip(checks, states, strict=True)]
     groups: dict[int, tuple[Any, list[str]]] = {}
     for c, st in zip(checks, states, strict=True):
         if st is None and c.tid is not None:
@@ -1003,16 +1061,17 @@ async def _check_states(checks: list[SentCheck], fallback: Any = None,
             groups.setdefault(id(client), (client, []))[1].append(c.tid)
     found: dict[str, CheckState] = {}
     if groups:
-        try:
-            parts = await asyncio.wait_for(
-                asyncio.gather(*(asyncio.to_thread(_lookup_states, cl, list(dict.fromkeys(ts)))
-                                 for cl, ts in groups.values())),
-                timeout=max(timeout, 0.01))
-            for part in parts:
-                found.update(part)
-        except TimeoutError:
-            pass  # what was not read in time stays unknown
-    return [st if st is not None else found.get(c.tid or "", "unknown") for c, st in zip(checks, states, strict=True)]
+        deadline = time.monotonic() + max(timeout, 0.01)
+        tasks = [asyncio.ensure_future(asyncio.to_thread(_lookup_into, cl, list(dict.fromkeys(ts)), found, deadline,
+                                                         known))
+                 for cl, ts in groups.values()]
+        await asyncio.wait(tasks, timeout=max(timeout, 0.01))  # what arrived in time is kept; the rest stay unknown
+    out = [st if st is not None else found.get(c.tid or "", "unknown") for c, st in zip(checks, states, strict=True)]
+    if known is not None:
+        for c, st in zip(checks, out, strict=True):
+            if c.tid is not None and st in ("ok", "failed"):
+                known[c.tid] = st
+    return out
 
 def _settle_checks(app: AppCtx, eid: str, checks: list[SentCheck], states: list[CheckState]) -> None:
     """After a stop looked: the endpoint keeps only the tasks still queued (or unknown), on disk too. Callers hold
@@ -1024,6 +1083,7 @@ def _settle_checks(app: AppCtx, eid: str, checks: list[SentCheck], states: list[
     else:
         app.sent_checks.pop(eid, None)
     _persist_checks(app, eid)
+    _trim_resolved(app)
 
 def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """A confirmation that asks for a NEW block gets its own compute user endpoint: a fresh `hpcb_block` token in the

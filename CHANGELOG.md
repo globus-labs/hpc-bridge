@@ -86,11 +86,18 @@ installed plugin only when that version changes); git tags mark releases.
     stays queued. The stop still sees those tasks after a partition or account switch, a `connect_facility` to the
     same endpoint, a teardown that stopped to ask for a one-time code, and a restart of hpc-bridge itself: it keeps
     their task ids in a small file per endpoint under `~/.hpc-bridge/sent-checks/`, which the endpoint's teardown
-    removes. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
+    removes. Two sessions on one endpoint share that file: each write merges under a lock and removes only the tasks
+    that session saw finish. A file that cannot be read is kept aside (`.corrupt-<time>`) and the stop does not
+    answer `down` while it is there: it says the record cannot be trusted and that `teardown_endpoint` ends every
+    task on that endpoint. An answer read from the service is kept even when the round of lookups runs out of time,
+    and a task seen finished is never asked about again. A command whose result was lost that may still be running
+    makes the stop refuse (as for a command still running), naming its task id: cancelling the block would not end
+    it. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
     that came up after the stop's last cancel. A `connect_facility` to another facility says when a task may still
     be queued on the endpoint it left. When the endpoint is offline, the stop answers `down` as before, but keeps
     the tasks: if the endpoint comes back, the next stop still sees them. One `stop_endpoint` call takes at most
-    three minutes, its cancels and lookups included;
+    three minutes, its cancels, lookups and waits for another operation on the endpoint included (when another
+    operation, such as a bring-up over SSH, holds the endpoint for longer, the stop says so and to call again);
   - an endpoint hpc-bridge sets up now runs each block request in its own compute user endpoint, a small process on
     the login node that exits ten minutes after its last task (`idle_heartbeats_soft` in the endpoint's template;
     `HPC_BRIDGE_UEP_IDLE_HEARTBEATS`, default 20 heartbeats of 30 s). The block it starts is its first, so when a
