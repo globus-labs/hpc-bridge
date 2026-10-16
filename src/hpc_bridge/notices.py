@@ -627,6 +627,18 @@ def _submit_rejected_notice(partition: str | None, account: str | None, error: s
             "retry unchanged.")
 
 
+def _failed_release_notice(failure: str, *, landing: bool) -> str:
+    """A stop whose release met a FAILED scheduler command — the listing could not be read, or the scheduler refused
+    a cancel (a PBS job already exiting): neither a cold channel nor a confirmed release. The command's own words are
+    quoted, with what it did cancel; `landing`: a block was also still being submitted."""
+    more = " A block asked for may also still be landing." if landing else ""
+    return (f"Spend is NOT confirmed stopped: a scheduler command on the login node failed — {failure!r} — so "
+            f"hpc-bridge cannot confirm what is left of this endpoint's blocks.{more} Call stop_endpoint again in a "
+            "little while; if the same command keeps failing, the facility's scheduler may be down or refusing: tell "
+            "the user, who can check and cancel the jobs on the facility (squeue / scancel, qstat / qdel). The login "
+            "endpoint stays online for reuse.")
+
+
 def _rejected_stop_notice() -> str:
     """The `down` of a stop after a REJECTED submission that found nothing in the scheduler: nothing was ever created to
     cancel — the same fact the REJECTED answer gave, never a claim that a block was released."""

@@ -193,11 +193,12 @@ def _single_block(rt: ShapeRuntime) -> bool:
 
 def _terminal_failure(rt: ShapeRuntime) -> bool:
     """The last failed check is a terminal verdict, which the tools report as `down` (or a failed run_shell): the
-    scheduler rejected a block submission — which, with one block, the endpoint makes only once the confirmed block is
-    gone (with more, another block may still be up) — the identity has no account, or the conflict streak hit its
-    limit."""
+    scheduler rejected a block submission, the identity has no account, or the conflict streak hit its limit. A
+    rejection is terminal whatever the block count: it reaches our check only through parsl's block-error handler
+    (`set_bad_state_and_fail_all`), which needs every block that user endpoint ever had to be FAILED or MISSING (its
+    threshold is max(1, init_blocks)) — so no block of it is still up, and none will be started (`_void_rejected`)."""
     error = rt.last_canary.error if rt.last_canary is not None and not rt.last_canary.ok else None
-    return (bool(rt.no_account) or (_submit_rejected(error) and _single_block(rt))
+    return (bool(rt.no_account) or _submit_rejected(error)
             or rt.transient_conflicts >= TRANSIENT_CONFLICT_LIMIT)
 
 def _kicked_release_note(app: AppCtx) -> str:
@@ -699,12 +700,10 @@ async def _provision(
 
 def _rejected_now(rt: ShapeRuntime) -> bool:
     """The check just made (the last one) failed because the scheduler REJECTED the block's submission, on a billed
-    shape of one block whose spend was confirmed: a terminal verdict (`_terminal_failure`) for the block that
-    confirmation covered. With more blocks another may still be up, and the confirmation stands, as
-    `_terminal_failure` has it."""
+    shape whose spend was confirmed: a terminal verdict (`_terminal_failure`) for every block of that user endpoint,
+    whatever its block count — the rejection reaches us only once all of them have failed."""
     c = rt.last_canary
-    return (c is not None and not c.ok and _submit_rejected(c.error) and _billable(rt) and rt.spend_confirmed
-            and _single_block(rt))
+    return c is not None and not c.ok and _submit_rejected(c.error) and _billable(rt) and rt.spend_confirmed
 
 def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     """The scheduler REJECTED the block's submission (`_rejected_now`): no job id was issued, so no block was created
@@ -712,11 +711,11 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     them: that failure is how the rejection reached us), a bad-state executor is never scaled out again, and the user
     endpoint stops itself. The spend confirmation covered that block, so it is dropped as a reap or a switch drops it:
     the next call without confirm_spend asks again (`needs_confirmation`), and the re-ask says why (`rt.rejected`,
-    notices._reask_prefix) — the same terms are refused again. A block confirmed earlier is gone too (with one block the
-    endpoint submits only once it has gone): `_provision` stopped its clock at its latest end above, and its identity
-    goes here, so the block a new confirmation starts is not taken for an unasked replacement of it (a kicked reap).
-    No pilot dies before our check any more: the check failed with the rest (`_check_resolved`). Callers hold
-    app.lock."""
+    notices._reask_prefix) — the same terms are refused again. A block confirmed earlier is gone too (the handler
+    fires only once every block of that user endpoint has failed): `_provision` stopped its clock at its latest end
+    above, and its identity goes here, so the block a new confirmation starts is not taken for an unasked replacement
+    of it (a kicked reap). No pilot dies before our check any more: the check failed with the rest
+    (`_check_resolved`). Callers hold app.lock."""
     uec = rt.user_endpoint_config
     error = rt.last_canary.error if rt.last_canary is not None else None
     rt.rejected = (_submit_rejection_cause(error), uec.get("partition"), uec.get("account"))
@@ -764,6 +763,8 @@ def _stop_watch(app: AppCtx, eid: str, rt: ShapeRuntime | None, now: float) -> P
     """The pilot watch an SSH stop works with: the endpoint's (an earlier stop's or a switch's), merged with a dead
     pilot the shape carries — whose window starts at this stop: its first stop answers `draining` whatever it finds.
     Stored by the stop once it has looked, not here."""
+    # watches of an endpoint the session has left (a bind elsewhere) go: only the bound endpoint's is this stop's
+    app.pilot_watch = {k: w for k, w in app.pilot_watch.items() if k == eid}
     watch = app.pilot_watch.get(eid)
     if rt is not None and rt.dead_pilot is not None:
         watch = _merge_watch(watch, PilotWatch(since=now, terms=_terms_of(rt), dead=rt.dead_pilot))
@@ -780,20 +781,32 @@ def _hand_dead_pilot_to_watch(app: AppCtx, rt: ShapeRuntime | None) -> None:
                                             PilotWatch(since=time.monotonic(), terms=_terms_of(rt), dead=rt.dead_pilot))
 
 def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
-                       terms: tuple[str | None, str | None], job: str, exit_status: str, jobs: frozenset[str]) -> None:
+                       terms: tuple[str | None, str | None], answered: float | None, job: str, exit_status: str,
+                       jobs: frozenset[str]) -> None:
     """The provisioning probe — run off the lock — found pilot `job` dead: record it where it belongs. On the runtime
-    and terms the probe was for (the same shape, `block_epoch` unchanged), unless a worker has answered since (our
-    check ran). If a switch or a drop came while the probe ran, the pilot is the OLD terms': the endpoint's watch keeps
-    it under the probe's terms — never the new terms' shape, and never discarded. Callers hold app.lock."""
+    and terms the probe was for (the same shape, `block_epoch` unchanged) — whether or not the shape kept a block's
+    identity (a check that failed with an error keeps it, and the endpoint may already be submitting pilots that die:
+    review r2, S2) — unless a worker answered DURING the probe (`warm_confirmed_at` moved past `answered`, read before
+    it): our check ran, so those pilots are history (`_check_resolved` dropped them). If a switch or a drop came while
+    the probe ran, the pilot is the OLD terms': the endpoint's watch keeps it under the probe's terms — never the new
+    terms' shape. A verdict is never dropped otherwise. Callers hold app.lock."""
     if app.state.endpoint_id != eid:
         return  # a re-bind elsewhere: that endpoint's pilots are not this binding's to watch
     if app.shapes.get(shape) is rt and rt.block_epoch == epoch:
-        if rt.block_since is None and rt.warm_confirmed_at is None:
+        if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
             _note_dead_pilot(rt, job, exit_status, jobs)
         return
     dead = DeadPilot(job=job, exit_status=exit_status, known=jobs | {job})
     app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid), PilotWatch(since=time.monotonic(), terms=terms,
                                                                               dead=dead))
+
+# A dead-pilot watch nobody has looked at for this many windows is stale: a stop then takes the pilots listed meanwhile
+# as known (a reconnect hours later must not count that day's pilots as a sign of now) and restarts the watch — still
+# `draining` once, since a check queued all along may still be submitting pilots.
+_WATCH_STALE_WINDOWS = 10
+
+def _watch_stale(watch: PilotWatch, now: float) -> bool:
+    return watch.dead is not None and now - watch.since > _WATCH_STALE_WINDOWS * pilot_watch_s()
 
 def _watch_expired(watch: PilotWatch, now: float) -> bool:
     """No sign of a pilot for the whole window (`config.pilot_watch_s`): one would have been in the scheduler by now."""
@@ -1122,6 +1135,8 @@ def _drop_compute_shape_locked(app: AppCtx) -> float:
     _hand_dead_pilot_to_watch(app, compute)  # a stop decides what to keep of it; a teardown's release step keeps it
     if compute is None:
         return 0.0
+    # (the runner closes below, and with it our reference to a canary still queued on the endpoint — a future fix that
+    # watches that check takes it here first: see PilotWatch)
     # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago
     _bank_warm_interval(compute, app, until=until)
     if compute.runner is not None:

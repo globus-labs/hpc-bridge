@@ -103,7 +103,19 @@ installed plugin only when that version changes); git tags mark releases.
     released. Now each says which command failed, and the stop does not count it as confirmed. The pilot check says
     so too, and a stop that could not read the pilot history stays `draining`;
   - a pilot that died in an earlier session, still in the scheduler's history (Slurm's accounting keeps six hours
-    here, PBS's job history about two weeks), is no longer reported as this block's FINISHED pilot.
+    here, PBS's job history about two weeks), is no longer reported as this block's FINISHED pilot. A check that
+    waits a long time for the login node can no longer make this block's own dead pilot look like an earlier one;
+  - a pilot that died after the block's own check failed with an error (the block kept its identity) is now
+    recorded, so the stop answers `draining` for it, as it did for a pilot of a block never seen up;
+  - a failed scheduler command in the stop (`squeue` or `qstat` unreachable) is said as one, with its own words,
+    not as "the login release channel was cold". The release cancels one job at a time: when PBS refuses to delete a
+    job that is already exiting, the stop names that job and the ones it did cancel, and still does not answer
+    `down`;
+  - a rejected submission now stops the spend clock and asks for spend again whatever the block count. parsl lets
+    the rejection reach hpc-bridge only once every block of that endpoint has failed, so no block of it is still up;
+  - when a stop comes long after the last one (ten windows), the pilots the endpoint submitted meanwhile are taken
+    as history, not as new pilots: that stop answers `draining` once and the next one can answer `down`. A pilot
+    that is running now still counts.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";

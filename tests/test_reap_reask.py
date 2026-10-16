@@ -959,14 +959,25 @@ async def test_an_error_while_checking_stops_the_clock_and_reports_the_spend(pat
     assert (await _ensure_endpoint_up(app)).status == "up" and rt.warm_since == stopped
 
 
-async def test_with_several_blocks_a_rejected_submission_does_not_stop_the_confirmed_blocks_clock():
-    # with max_blocks > 1 a rejected submission is a NEW block refused; the confirmed one may still be up and billing
+async def test_with_several_blocks_a_rejected_submission_is_terminal_too():
+    # This used to keep the confirmed block's clock running "with max_blocks > 1: the confirmed one may still be up".
+    # It cannot be: a rejection reaches our check only through parsl's block-error handler (set_bad_state_and_fail_all),
+    # which needs EVERY block that user endpoint ever had to be FAILED or MISSING (threshold max(1, init_blocks)) —
+    # whatever max_blocks is. So it is terminal for the confirmed block too: the clock stops, the confirmation and the
+    # block's identity go (review r2, R4: dropping the single-block rule from the void alone left `warm_since` running
+    # for an unconfirmed block with no identity).
     app, rt, runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
     rt.user_endpoint_config["max_blocks"] = 2
     rt.warm_confirmed_at -= 55
     runner._canary = CanaryResult(ok=False, error=_REJECTED)
     res = await _ensure_endpoint_up(app)
-    assert res.status == "down" and rt.warm_since is not None and rt.block_job == "112"
+    assert res.status == "down" and "REJECTED" in res.notice
+    assert rt.warm_since is None and rt.spend_confirmed is False and rt.block_since is None and rt.block_job is None
+    spent = _total_session_spend(app)
+    again = await _ensure_endpoint_up(app)
+    assert again.status == "needs_confirmation" and "REJECTED the last block submission" in again.notice
+    assert _total_session_spend(app) == spent
 
 
 async def test_an_orphaned_task_stops_its_blocks_clock():

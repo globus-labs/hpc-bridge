@@ -1302,6 +1302,171 @@ async def test_a_pilot_found_dead_while_the_stops_release_ran_still_gets_its_dra
     assert "still being submitted" not in res.notice and app.pilot_watch[app.state.endpoint_id].dead.job == "12"
 
 
+def _ssh_app(pbs):
+    f = _PbsFacility() if pbs else FakeFacility()
+    f.workers = 1
+    return AppCtx(facility=f, profile=Profile())
+
+
+@pytest.mark.parametrize("pbs,query", [(False, "squeue"), (True, "qstat")])
+async def test_a_failed_scheduler_command_is_said_as_one_not_a_cold_channel(monkeypatch, pbs, query):
+    # Review r2, S1: "release failed: squeue could not be read" was answered as "the login release channel was cold …
+    # (the channel is warming)"
+    from hpc_bridge.server import ShapeRuntime, _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app(pbs)
+    app.state = EndpointState(endpoint_id="eid-1")
+    now = time.monotonic()
+    app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True}, runner=_FakeRunner("eid-1", _Res(0, "", "")),
+                                         spend_confirmed=True, warm_confirmed_at=now, block_since=now, block_job="112")
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, warm_confirmed_at=1.0)
+    _scripted_login(monkeypatch, releases=[f"release failed: {query} could not be read\n"] * 3)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and res.spend_stopped is not True
+    assert f"a scheduler command on the login node failed — 'release failed: {query} could not be read'" in res.notice
+    assert "cold" not in res.notice and "warming" not in res.notice
+
+
+async def test_a_pbs_release_that_could_not_cancel_an_exiting_job_keeps_what_it_cancelled(monkeypatch):
+    # PBS lists a job already EXITING (E) in qstat -f and refuses its qdel: the release used to read as a whole failure
+    # (losing the ids it did delete); now it names both, and is not a `down` while one of ours is left
+    from hpc_bridge.server import ShapeRuntime, _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app(True)
+    app.state = EndpointState(endpoint_id="eid-1")
+    now = time.monotonic()
+    app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True}, runner=_FakeRunner("eid-1", _Res(0, "", "")),
+                                         spend_confirmed=True, warm_confirmed_at=now, block_since=now, block_job="43.pbs")
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, warm_confirmed_at=1.0)
+    _scripted_login(monkeypatch, releases=["release failed: qdel refused 41.pbs; cancelled: 43.pbs\n"] * 3)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "'release failed: qdel refused 41.pbs; cancelled: 43.pbs'" in res.notice
+    from hpc_bridge import scheduler_ops
+    assert scheduler_ops._released_jobs("cancel not confirmed (release failed: qdel refused 41.pbs; cancelled: "
+                                        "43.pbs); idle-release will reclaim it") == ["43.pbs"]
+
+
+@pytest.mark.parametrize("pbs", [False, True])
+async def test_a_dead_pilot_after_a_check_failed_with_an_error_is_still_recorded(monkeypatch, pbs):
+    # Review r2, S2: block 112 up; a check fails with an ERROR (ManagerLost: the block keeps its identity) and the call
+    # answers `provisioning`; the probe finds pilot 113 dead. The guard dropped it (block_since was set), and the stop
+    # made one look and answered `down`.
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app(pbs)
+    j112, j113 = ("112.pbs", "113.pbs") if pbs else ("112", "113")
+    r = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer(j112))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: r
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.warm_confirmed_at -= 100   # past the TTL
+    r._canary = CanaryResult(ok=False, error="ManagerLost: the worker's manager was lost")
+    _scripted_login(monkeypatch, probes=[f"F {j112} 1 x\nF {j113} 42 Job failed\n"])
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "provisioning" and f"pilot {j113} already FINISHED (exit status 42)" in res.notice
+    log = _scripted_login(monkeypatch, probes=[f"F {j112} 1 x\nF {j113} 42 Job failed\n"])
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and f"pilot {j113} already FINISHED (exit status 42)" in stop.notice
+    assert "probe" in _kinds(log)
+
+
+@pytest.mark.parametrize("pbs", [False, True])
+async def test_a_slow_probe_never_reads_this_blocks_dead_pilot_as_an_earlier_sessions(monkeypatch, pbs):
+    # Review r2, S3: the confirmation's age was read BEFORE the probe, the login clock while it ran — a probe that
+    # waited ~100 s for the login worker moved the cutoff past a pilot submitted 20 s after the confirmation
+    from hpc_bridge import server
+    from hpc_bridge.models import ShellOutcome
+
+    skew = _skew(monkeypatch)
+    app = _ssh_app(pbs)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    t0, base = {}, 1_000_000
+
+    async def run(a, command, session_id="default", shape="compute"):
+        if "HPCB_ERR" not in command:
+            return ShellOutcome(phase="complete", exit_code=0, stdout="released none\n", block_state="warm")
+        if "late" in t0:
+            skew[0] += 100.0   # queued behind other login-node work
+        login_now = base + int(time.monotonic() - t0["t"])
+        rows = f"F 12 42 FAILED\nHPCB_SUB 12 {base + 20}\n" if "late" in t0 else ""
+        return ShellOutcome(phase="complete", exit_code=0, stdout=f"HPCB_NOW {login_now}\n{rows}", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", run)
+    t0["t"] = time.monotonic()
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    skew[0] += 30.0
+    t0["late"] = True
+    res = await _ensure_endpoint_up(app)
+    assert "pilot 12 already FINISHED (exit status 42)" in res.notice and app.shapes["compute"].dead_pilot.job == "12"
+
+
+@pytest.mark.parametrize("pbs", [False, True])
+async def test_with_several_blocks_a_rejection_stops_the_clock_and_the_stop_is_down(monkeypatch, pbs):
+    # Review R4 with its pair: the single-block rule left both the stop's contradiction ("still being submitted" after
+    # REJECTED) and, dropped from the void alone, a clock running for an unconfirmed block with no identity
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app(pbs)
+    r = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: r
+    _shape_runtime(app, "compute").user_endpoint_config["max_blocks"] = 2
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.warm_confirmed_at -= 100
+    r._canary = CanaryResult(ok=False, error=_SBATCH_REFUSED)
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and rt.warm_since is None and not rt.spend_confirmed and rt.block_since is None
+    log = _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and "nothing to cancel" in stop.notice and _kinds(log) == ["release"]
+
+
+async def test_a_dead_pilot_watch_left_for_hours_is_rebaselined_not_read_as_more(monkeypatch):
+    # a reconnect hours later: the pilots the endpoint submitted that day are history, not a sign of now — this stop
+    # is the watch's first again (`draining` once), and a later one past the window answers `down`. A pilot live NOW
+    # still counts, whatever the watch's age.
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_PILOT_WATCH_S", "60")   # ten windows: 600 s
+    app = await _dead_pilot_app(monkeypatch)
+    eid = app.state.endpoint_id
+    skew = _skew(monkeypatch)
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    await _stop_endpoint(app)
+    skew[0] += 601
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\nF 13 42 FAILED\nF 14 42 FAILED\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "submitted" not in res.notice and "No new pilot" in res.notice
+    assert {"13", "14"} <= app.pilot_watch[eid].dead.known
+    skew[0] += 61
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\nF 13 42 FAILED\nF 14 42 FAILED\n"])
+    assert (await _stop_endpoint(app)).status == "down"
+    # a live pilot in an old watch is a sign of now
+    app2 = await _dead_pilot_app(monkeypatch)
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    await _stop_endpoint(app2)
+    skew[0] += 601
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\nR 15 - None\n"])
+    live = await _stop_endpoint(app2)
+    assert live.status == "draining" and "submitted pilot 15" in live.notice
+
+
+async def test_a_stop_forgets_the_watches_of_an_endpoint_the_session_left(monkeypatch):
+    from hpc_bridge.context import DeadPilot, PilotWatch
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    app.pilot_watch["old-eid"] = PilotWatch(since=time.monotonic(), terms=(None, None), dead=DeadPilot("7", "1"))
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    await _stop_endpoint(app)
+    assert set(app.pilot_watch) == {app.state.endpoint_id}
+
+
 def test_the_pilot_watch_window_is_configurable(monkeypatch):
     from hpc_bridge import config
 
@@ -1379,11 +1544,19 @@ def test_the_release_says_a_failed_scheduler_command_never_released_none(tmp_pat
     assert _bash(cmd, _stub_scheduler(tmp_path / "a", **{query: ("", 1)})).strip() == \
         f"release failed: {query} could not be read"
     assert _bash(cmd, _stub_scheduler(tmp_path / "b", **{query: (two, 0), cancel: ("", 1)})).strip() == \
-        f"release failed: {cancel} {jobs} exited 1"
+        f"release failed: {cancel} refused {jobs}; cancelled: none"
     assert _bash(cmd, _stub_scheduler(tmp_path / "c", **{query: ("", 0)})).strip() == "released none"
     assert _bash(cmd, _stub_scheduler(tmp_path / "d", **{query: (two, 0), cancel: ("", 0)})).strip() == \
         f"released {jobs}"                                   # every id on the one line, never another endpoint's
-    assert f"{cancel} {jobs}" in (tmp_path / "d" / "calls").read_text()
+    calls = (tmp_path / "d" / "calls").read_text()
+    assert all(f"{cancel} {j}\n" in calls for j in jobs.split())               # one cancel per job
+    # the scheduler refuses ONE (PBS: a job already exiting, still listed): the line says which, and keeps the other
+    env = _stub_scheduler(tmp_path / "e", **{query: (two, 0)})
+    first, second = jobs.split()
+    stub = tmp_path / "e" / "bin" / cancel
+    stub.write_text(f"#!/bin/sh\n[ \"$1\" = {first} ] && exit 35\nexit 0\n")
+    stub.chmod(0o755)
+    assert _bash(cmd, env).strip() == f"release failed: {cancel} refused {first}; cancelled: {second}"
 
 
 @pytest.mark.parametrize("scheduler", ["slurm", "pbs"])
@@ -1428,13 +1601,13 @@ async def test_the_probe_reads_a_failed_listing_as_no_verdict_and_leaves_out_an_
     assert notice == "allocating nodes…" and probe.failed == {"squeue"} and probe.dead is None
     # a pilot that died 2 h before this block's spend was confirmed is an earlier session's: not this block's verdict
     old = "HPCB_NOW 1000000\nF 1108 42 FAILED\nHPCB_SUB 1108 992000\n"
-    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(old), since_s=600)
+    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(old), confirmed_at=time.monotonic() - 600)
     assert probe.category != "finished" and probe.dead is None and "1108" in probe.jobs
     fresh = "HPCB_NOW 1000000\nF 1108 42 FAILED\nHPCB_SUB 1108 999700\n"
-    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(fresh), since_s=600)
+    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(fresh), confirmed_at=time.monotonic() - 600)
     assert probe.dead == ("1108", "42")
     unknown = "HPCB_NOW 1000000\nF 1108 42 FAILED\n"            # no submit time: it counts (the safe side)
-    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(unknown), since_s=600)
+    probe = await scheduler_ops._probe_pilots_over_login(app, "eid-1", 999, runner(unknown), confirmed_at=time.monotonic() - 600)
     assert probe.dead == ("1108", "42")
 
 

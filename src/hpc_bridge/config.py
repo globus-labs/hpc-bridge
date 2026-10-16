@@ -101,9 +101,10 @@ def provisioning_release_attempts() -> int:
 # follows, and the window simply runs out — the next stop answers `down`. On PBS a dead pilot reads COMPLETED, and the
 # pilots keep coming: the window never runs out while they do.
 # What it does NOT cover: the time a user endpoint takes to SPAWN (the manager starting it for our first task, its
-# imports, its first scaling pass) — a block "still being submitted" whose user endpoint is slower to start than the
-# first stop's poll plus this window can land after a `down`. That pilot is healthy (it runs our check, then idles out:
-# min_blocks=0), so idle-release bounds it; one window serves both markers rather than a guessed spawn time.
+# imports, its first scaling pass). For a block "still being submitted", the `down` at the window's end is a CLOCK, not
+# evidence: our check may still be queued, and a pilot can land after it. That is the queued-check hazard (a cancelled
+# or late pilot is resubmitted while our check waits), to be revisited when hpc-bridge can see or end that check — the
+# seam is the canary future the runner holds (PilotWatch, warmth._drop_compute_shape_locked).
 PILOT_WATCH_S = 120.0
 
 

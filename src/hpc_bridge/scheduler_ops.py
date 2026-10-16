@@ -15,6 +15,7 @@ import asyncio
 import itertools
 import re
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from typing import NamedTuple
 
@@ -45,12 +46,15 @@ def _release_cmd(scheduler: str, eid: str) -> str:
         pick = f"awk -v m={m} 'index($0,m){{print $1}}'"
     # A scheduler command that FAILS (slurmctld / pbs_server unreachable, a refused cancel) says so in its own line —
     # never the "released none" an empty listing piped through `2>/dev/null` used to print, which read as a confirmed
-    # release (and now also feeds the `down` after a rejected submission and a pilot watch's end). Every id goes on
-    # the one line (`$(echo $ids)`), so a release that cancels several says all of them.
+    # release (and now also feeds the `down` after a rejected submission and a pilot watch's end). One cancel per job:
+    # one call for all of them fails as a whole when one is refused — PBS refuses a job already EXITING (`E`, still in
+    # `qstat -f`) while it deletes the rest — and its exit code cannot say which. So the line names both: what was
+    # cancelled and what was not (`_released_jobs`, `_release_failure`).
     return (f'if q=$({query} 2>/dev/null); then ids=$(printf \'%s\\n\' "$q" | {pick}); '
-            'if [ -z "$ids" ]; then echo "released none"; '
-            f'elif {cancel} $ids; then echo "released $(echo $ids)"; '
-            f'else rc=$?; echo "release failed: {cancel} $(echo $ids) exited $rc"; fi; '
+            'if [ -z "$ids" ]; then echo "released none"; else ok=""; bad=""; '
+            f'for j in $ids; do if {cancel} "$j"; then ok="$ok $j"; else bad="$bad $j"; fi; done; '
+            'if [ -z "$bad" ]; then echo "released$ok"; '
+            f'else echo "release failed: {cancel} refused$bad; cancelled:${{ok:- none}}"; fi; fi; '
             f'else echo "release failed: {query.split()[0]} could not be read"; fi')
 
 def _release_cmd_for(app: AppCtx, eid: str) -> str:
@@ -109,11 +113,23 @@ _NO_PILOT_YET = "no pilot in the scheduler yet"
 
 
 def _released_jobs(detail: str) -> list[str]:
-    """The jobs a CONFIRMED release cancelled, from its detail (`released <ids>`); [] for `released none`."""
-    words = detail.split()
-    if words[:1] == ["released"]:
+    """The jobs a release cancelled, from its detail: `released <ids>` (confirmed), or the `cancelled: <ids>` of one
+    where the scheduler refused some (unconfirmed — what WAS cancelled is not lost); [] for none."""
+    if "release failed:" in detail:
+        words = detail.split("cancelled:", 1)[1].split(")", 1)[0].split() if "cancelled:" in detail else []
+    else:
+        words = detail.split()
+        if words[:1] != ["released"]:
+            return []  # a cold channel, or a look that found nothing to cancel yet
         words = words[1:]
     return [] if words == ["none"] else words
+
+
+def _release_failure(detail: str) -> str | None:
+    """The scheduler command a release says FAILED, quoted from its detail (`release failed: …`), or None — a cold
+    login channel, or a release that read the scheduler, is not one."""
+    i = detail.find("release failed:")
+    return detail[i:].split("); idle-release", 1)[0] if i >= 0 else None
 
 # A finished pilot's own job may say why it died: hpc-bridge's env_setup line prints one `hpc-bridge: endpoint venv …`
 # line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each
@@ -332,21 +348,28 @@ class PilotProbe(NamedTuple):
         return self.died[-1] if self.category == "finished" and self.died else None
 
 
-# A finished pilot submitted this long before the confirmation it is read against still counts as this block's: the
-# confirmation is measured here and the submit time on the login node, so the slack absorbs the probe's round trip.
-# A pilot of an earlier session (sacct keeps 6 h, PBS's history about two weeks) is minutes to days older.
+# A finished pilot submitted this long before the confirmation it is read against still counts as this block's. The
+# confirmation's age is read after the probe returns, so the probe's own latency only moves the cutoff earlier (toward
+# counting); the slack covers what is left — whole-second timestamps, and the login node's clock slewing against this
+# one's during the age. A pilot of an earlier session (sacct keeps 6 h, PBS's history about two weeks) is far older.
 _SUBMIT_SLACK_S = 60.0
 
 
 async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner, *,
-                                   since_s: float | None = None) -> PilotProbe | None:
+                                   confirmed_at: float | None = None) -> PilotProbe | None:
     """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilots are in. Best-effort:
     None when it can't tell (login worker cold, scheduler unreachable). `elapsed_s` is how long the block has been
-    provisioning — it gates the rejection hint past the cold-start grace. `since_s`: how long ago the block's spend was
-    confirmed; a pilot that FINISHED and was submitted before that (an earlier session's, still in the scheduler's
-    history) is not this block's and is left out of the verdict. A pilot whose submit time is unknown counts."""
+    provisioning — it gates the rejection hint past the cold-start grace. `confirmed_at`: when the block's spend was
+    confirmed (time.monotonic()); a pilot that FINISHED and was submitted before that (an earlier session's, still in
+    the scheduler's history) is not this block's and is left out of the verdict. A pilot whose submit time is unknown
+    counts."""
     scheduler = getattr(getattr(app.facility, "profile", None), "scheduler", "slurm")
     out = await run_login(_pilot_status_cmd(scheduler, eid))
+    # The confirmation's age, read once the probe is BACK: its login-node clock (HPCB_NOW) was read while it ran, at
+    # or before now, so any wait for the login worker (a sync-wait of up to two minutes) makes the age longer and the
+    # cutoff earlier — a pilot is only ever counted when unsure, never dropped (read before the dispatch, a slow probe
+    # moved the cutoff past this block's own pilot: review r2, S3).
+    since_s = time.monotonic() - confirmed_at if confirmed_at is not None else None
     if out.phase != "complete" or out.exit_code != 0:
         return None
     machine = getattr(app, "machine", None)  # bring-your-own (a session facility): its config is the user's to change
@@ -379,14 +402,14 @@ async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_
     return (probe.category, probe.suffix) if probe is not None and probe.category != "unknown" else None
 
 async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner, *,
-                                since_s: float | None = None) -> tuple[str, PilotProbe | None]:
+                                confirmed_at: float | None = None) -> tuple[str, PilotProbe | None]:
     """Enrich a still-cold BILLED block's 'allocating nodes…' with the pilot's ACTUAL scheduler state,
     so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]), and hand back the probe
-    (None: it could not tell) for the server to record a pilot that ran and died (`since_s`: since the confirmation,
-    `_probe_pilots_over_login`). A diagnostic must never break the result it annotates, so any failure — or an empty
-    suffix (the normal cold-start window) — leaves the notice as-is."""
+    (None: it could not tell) for the server to record a pilot that ran and died (`confirmed_at`: the block's
+    confirmation, `_probe_pilots_over_login`). A diagnostic must never break the result it annotates, so any failure —
+    or an empty suffix (the normal cold-start window) — leaves the notice as-is."""
     try:
-        probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login, since_s=since_s)
+        probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login, confirmed_at=confirmed_at)
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
         return notice, None
     suffix = probe.suffix if probe else ""

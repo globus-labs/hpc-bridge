@@ -206,6 +206,9 @@ class PilotWatch:
     since: float                                  # the last sign of a pilot: when a stop looked, or found one
     terms: tuple[str | None, str | None]          # the partition and account of the block it is for
     dead: DeadPilot | None = None                 # None: a block still being submitted
+    # Not built — the seam for the queued-check fix: the watch only infers from the scheduler that our check may still
+    # be queued. The check's own future (GlobusRunner's pending canary, which the SDK's result watcher keeps resolving
+    # after the runner closes) would SAY so; it would be carried here, taken before the drop closes the runner.
 
 
 @dataclass

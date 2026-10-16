@@ -102,7 +102,8 @@ def test_harness_cancel_matches_the_products_marker_scoping():
         for cmd in (prod, harn):
             assert f"uep.{eid}" in cmd
             assert not re.search(r"(scancel|qdel)\s+-u\b", cmd)   # never user-wide
-            assert ("scancel $ids" in cmd) if scheduler == "slurm" else ("qdel $ids" in cmd)
+            # the harness cancels all at once; the product one job at a time, so a refused one is named (review r2)
+            assert re.search(r'(scancel|qdel) (\$ids|"\$j")', cmd) and ("scancel" in cmd) == (scheduler == "slurm")
 
 
 MEP = "6ec15113-4ed0-4076-85f9-e8ccc549840e"   # a facility endpoint's uuid: its pilot belongs to the MAPPED account
