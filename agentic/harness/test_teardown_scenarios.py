@@ -288,13 +288,17 @@ def _product_noops(proposed=None):
 
 @pytest.mark.parametrize("proposed", [None, "fake-1"])
 def test_acted_on_nothing_reads_the_servers_own_no_op_answers(proposed, monkeypatch):
-    from invariants import acted_on_nothing
+    from invariants import acted_on_nothing, no_op_answer
     for tool, res in _product_noops(proposed).items():   # before _product_teardown stubs the server's _run_shell
-        assert acted_on_nothing(ToolCall.of(f"mcp__endpoint__{tool}", {}, res)), (tool, res.get("notice"))
+        call = ToolCall.of(f"mcp__endpoint__{tool}", {}, res)
+        assert no_op_answer(call) and acted_on_nothing(Trace([call]), 0), (tool, res.get("notice"))
     # every answer of a real teardown names its endpoint — not one is a no-op, the down that beat the wait included
     waiting, down, after = _product_teardown(monkeypatch)
-    assert not acted_on_nothing(_td(waiting)) and not acted_on_nothing(_td(down))
-    assert acted_on_nothing(_td(after))   # the call AFTER a finished teardown: nothing left, nothing done
+    assert not no_op_answer(_td(waiting)) and not no_op_answer(_td(down))
+    # the call AFTER a finished teardown answers the same words, but an endpoint existed before it: graded, not skipped
+    # (review of e126f41 — "no endpoint was up" also follows a detach, a teardown or a server restart)
+    t = Trace([_td(waiting), _td(down), _td(after)])
+    assert no_op_answer(_td(after)) and not any(acted_on_nothing(t, i) for i in range(3))
 
 
 def _batch():

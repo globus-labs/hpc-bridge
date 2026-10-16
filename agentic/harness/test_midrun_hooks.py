@@ -157,6 +157,14 @@ def test_a_hooks_actions_and_needs():
     ({"after_tool": "a", "cmd": "c", "after_hook": "missing"}, "after_hook names no other hook"),
     ({"on_tool": "a", "after_s": 1, "action": "interrupt", "when_phase": "running"}, "an after_tool hook only"),
     ({"on_tool": "a", "after_s": 1, "action": "interrupt", "when_endpoint": True}, "an after_tool hook only"),
+    # conditions that could never fire (review of e126f41)
+    *[({"after_tool": t, "cmd": "c", "when_endpoint": True}, "names no endpoint_id")
+      for t in ("run_shell", "poll_task", "reset_session", "connect_facility")],
+    *[({"after_tool": t, "cmd": "c", "when_phase": "down"}, "carries a status, not a phase")
+      for t in ("ensure_endpoint_up", "stop_endpoint", "teardown_endpoint")],
+    ({"after_tool": "poll_task", "cmd": "c", "when_phase": "runing"}, "is no phase poll_task answers"),
+    ({"after_tool": "run_shell", "cmd": "c", "when_phase": "draining"}, "is no phase run_shell answers"),
+    ({"after_tool": "list_facilities", "cmd": "c", "when_phase": "complete"}, "whose answer has no phase"),
 ])
 def test_a_malformed_hook_is_named(hook, problem):
     probs = hooks.hook_problems([hook])
@@ -356,15 +364,24 @@ def test_when_endpoint_counts_only_a_call_that_acted_on_an_endpoint():
 def test_after_hook_counts_only_calls_that_end_after_the_named_hook_fired():
     import draining_restop as sc
     run = ("run_shell", {"shape": "compute", "command": "hostname"})
-    # hermes21, live 2026-10-15 (1792092595): a run, a stop BEFORE the runs were done, a refused run, the second run
-    # that ran, then a stop — the freeze after the second run that RAN, the thaw at the first stop after the freeze
-    seq = [(*run, {"phase": "complete"}),
-           ("stop_endpoint", {}, {"status": "down", "endpoint_id": "e1"}),
-           (*run, {"phase": "needs_confirmation"}),
-           (*run, {"phase": "complete"}),
-           ("stop_endpoint", {}, {"status": "draining", "endpoint_id": "e1"})]
+    e1 = {"endpoint_id": "e1"}
+    # hermes21, live 2026-10-15 (1792092595), its hpc-bridge calls as the journal holds them: a run, a stop BEFORE the
+    # runs were done, a refused run, a re-provision, the second run that RAN — and the trace ends there (no stop after)
+    stored = [("list_facilities", {}, {}), ("connect_facility", {}, {"phase": "proposed_facility_details"}),
+              ("connect_facility", {"details": {}}, {"phase": "provisioning"}),
+              ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "provisioning", **e1}),
+              ("ensure_endpoint_up", {}, {"status": "up", **e1}),
+              (*run, {"phase": "complete"}),
+              ("stop_endpoint", {}, {"status": "down", **e1}),
+              (*run, {"phase": "needs_confirmation"}),
+              *[("ensure_endpoint_up", {"confirm_spend": True}, {"status": st, **e1})
+                for st in ("provisioning", "provisioning", "up", "up")],
+              (*run, {"phase": "complete"})]
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
-    assert _feed(w, seq) == [("freeze_login_worker", 3), ("thaw_login_worker", 4)] and w.unfired == []
+    assert _feed(w, stored) == [("freeze_login_worker", 12)]      # the old hooks: thaw at 6, freeze at 7 (needs_confirm.)
+    assert [h["name"] for h in w.unfired] == ["thaw_login_worker"]   # no stop after the freeze in that run
+    # SYNTHETIC continuation (not in the bundle): the stop that would have followed — the first after the freeze — thaws
+    assert _feed(w, [("stop_endpoint", {}, {"status": "draining", **e1})]) == [("thaw_login_worker", 13)]
     # ...and a stop after the freeze that answered `down` anyway still thaws (CLEANUP then has nothing left to do)
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
     assert _feed(w, [(*run, {"phase": "complete"}), (*run, {"phase": "complete"}),
@@ -374,3 +391,112 @@ def test_after_hook_counts_only_calls_that_end_after_the_named_hook_fired():
                             {"name": "b", "after_tool": "run_shell", "after_hook": "a", "cmd": "y"}])
     one = ("run_shell", {}, {"phase": "complete"})
     assert _feed(w2, [one]) == [("a", 0)] and _feed(w2, [one]) == [("b", 1)]
+
+
+# -- the answer tables against the product, and every hook fires on a good run ---------------------------------------------
+
+def test_the_answer_tables_are_the_products():
+    # hook_problems refuses a condition that could never fire from these tables: they must be what the tools answer
+    import typing
+
+    from hpc_bridge import models, server
+    phases = {m: typing.get_args(m.model_fields["phase"].annotation)
+              for m in (models.ShellOutcome, models.ConnectFacilityResult, models.LoginStatus, models.PreauthStatus)}
+    for tool, values in hooks.ANSWER_PHASES.items():
+        ret = typing.get_type_hints(getattr(server, tool))["return"]
+        assert "phase" in ret.model_fields and "endpoint_id" not in ret.model_fields, tool
+        assert set(values) == set(phases[ret]), tool
+    for tool in hooks.ENDPOINT_ANSWERS:
+        ret = typing.get_type_hints(getattr(server, tool))["return"]
+        assert ret is models.EndpointStatus and "phase" not in ret.model_fields and "endpoint_id" in ret.model_fields
+
+
+# A good run of each hooked scenario, abridged from its newest OK bundle's hpc-bridge calls (repeated connects / polls
+# and login runs no hook reads dropped; only the fields a hook reads; endpoint ids shortened). Every after-hook must
+# fire, on the same call it fired on live (its index here is the abridged one).
+_E = {"endpoint_id": "e1"}
+_GOOD = {
+    "block_reaped_resume": ("1791901834 (claude)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("run_shell", {"shape": "login", "command": "sinfo"}, {"phase": "complete"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "mkdir -p ~/hpcb_reap && cd ~/hpcb_reap && echo HPCB_REAP_7c1d > marker"},
+         {"phase": "complete"}),
+        ("ensure_endpoint_up", {"shape": "compute"}, {"status": "needs_confirmation", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "cat marker && hostname && pwd"}, {"phase": "complete"}),
+        ("stop_endpoint", {}, {"status": "down", **_E})], {"reap_block": 5, "user_returns": 5}),
+    "draining_restop": ("1792089638 (pi)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "hostname"}, {"phase": "complete"}),
+        ("run_shell", {"shape": "compute", "command": "hostname"}, {"phase": "complete"}),
+        ("stop_endpoint", {}, {"status": "draining", **_E}), ("stop_endpoint", {}, {"status": "down", **_E})],
+        {"freeze_login_worker": 5, "thaw_login_worker": 6}),
+    "fake_mep_stop_names_block": ("1792101787 (hermes21)", [
+        ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID; hostname; whoami"}, {"phase": "complete"}),
+        ("stop_endpoint", {}, {"status": "draining", **_E})], {"block_listed_at_stop": 4}),
+    "fake_mep_stop_while_provisioning": ("1792103060 (hermes21)", [
+        ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("stop_endpoint", {}, {"status": "draining", **_E})], {"queue_at_stop": 2}),
+    "fake_pbs_mep_compute": ("1792104316 (hermes21)", [
+        ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "echo JOB=$PBS_JOBID QUEUE=$PBS_QUEUE; whoami"}, {"phase": "complete"}),
+        ("stop_endpoint", {}, {"status": "draining", **_E})], {"block_listed_at_stop": 4}),
+    "orphaned_task": ("1792104913 (codex)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "provisioning"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "compute", "command": "python3 -c …"}, {"phase": "running", "task_id": "compute-1"}),
+        ("poll_task", {"task_id": "compute-1", "wait": 30}, {"phase": "running", "task_id": "compute-1"}),
+        ("poll_task", {"task_id": "compute-1", "wait": 30}, {"phase": "failed"}),
+        ("stop_endpoint", {}, {"status": "down", **_E})], {"kill_manager": 5}),
+    "reap_replaced_block": ("1792093389 (hermes21)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
+        ("run_shell", {"shape": "login", "command": "hostname"}, {"phase": "complete"}),
+        ("run_shell", {"shape": "compute", "command": "mkdir -p ~/hpcb_rr && cd ~/hpcb_rr && echo HPCB_RR_9f3e > marker"},
+         {"phase": "complete"}),
+        ("run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID"}, {"phase": "failed"}),
+        ("stop_endpoint", {}, {"status": "down", **_E})], {"cancel_block": 4}),
+    "spend_revoked": ("1788654391 (claude)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("run_shell", {"shape": "login", "command": "sinfo"}, {"phase": "complete"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
+        ("stop_endpoint", {}, {"status": "down", **_E})], {"user_revokes_spend": 3}),
+}
+
+
+def test_every_hooked_scenario_has_a_good_run_that_fires_its_hooks():
+    during = {n for n in HOOKED if any(hooks.is_during(h) for h in importlib.import_module(n).MIDRUN_HOOKS)}
+    assert set(_GOOD) | during == set(HOOKED), "a hooked scenario with no good run here"
+    assert during == {"esc_mid_call"}
+
+
+@pytest.mark.parametrize("name", sorted(_GOOD))
+def test_a_good_run_fires_every_hook_on_the_call_it_fired_on_live(name):
+    mod = importlib.import_module(name)
+    _bundle, seq, want = _GOOD[name]
+    w = hooks.HookWatcher(mod.MIDRUN_HOOKS)
+    assert dict(_feed(w, seq)) == want and w.unfired == [], name
+
+
+def test_esc_mid_call_presses_esc_during_its_marker_run():
+    # a during hook: the stored run (1791918619, claude) pressed Esc 10 s into the marker command, still in flight
+    import esc_mid_call as sc
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    _start(w, "u0", "run_shell", {"shape": "compute", "command": "hostname"})
+    _end(w, "u0", {"phase": "complete"})
+    assert w.take_armed() == []
+    _start(w, "u1", "run_shell", {"shape": "compute", "command": sc._CMD})
+    (armed,) = w.take_armed()
+    hook = w.due_during(armed)
+    assert hook is not None and hook["name"] == "esc" and hook["call_index"] == 1 and w.unfired == []

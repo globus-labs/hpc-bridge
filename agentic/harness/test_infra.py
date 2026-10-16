@@ -570,19 +570,20 @@ def test_run_suite_counts_exit_2_apart_as_setup_failed_or_skipped(monkeypatch):
     assert mod._graded(results) == [{"ok": True}, {"ok": False}]   # neither is in the pass rate
 
 
-# ---- a tool call the model server returned as text (live 2026-10-15, Codex on ALCF gpt-oss) ------------------------------
+# ---- a final answer that is a tool call never made (live 2026-10-15, Codex on ALCF gpt-oss) -----------------------------
 
+_JSON = "codex: the model answered with a tool call written as JSON instead of calling it: {!r} (0 tool calls)"
+_HARMONY = "codex: the model server returned raw harmony tool-call tokens (unparsed): {!r} (0 tool calls)"
 # The final agent message of each Codex cell, exactly as its bundle stores it (submit_policy_rejected, ssh_account_floor,
 # polaris_filesystems / internal_hostnames / canary_login_discovery, fake_pbs_mep_compute). The first is not even JSON.
 PRINTED_CALLS = [
     ('{"cmd":["mcp__hpc_bridge__connect_facility","{"facility":"fake-1792106891-96340-27905","ssh_host":"login"}"]}',
-     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
-    ('{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}',
-     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
+     ("json", "mcp__hpc_bridge__connect_facility")),
+    ('{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}', ("json", "mcp__hpc_bridge__connect_facility")),
     ('{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-1792107551-28277-58062","ssh_host":"login"}',
-     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
+     ("json", "mcp__hpc_bridge__connect_facility")),
     ("<|start|>assistant<|channel|>commentary to=functions.mcp__hpc_bridge__ensure_endpoint_up<|call|>",
-     "'functions.mcp__hpc_bridge__ensure_endpoint_up' in raw harmony tokens"),
+     ("harmony", "functions.mcp__hpc_bridge__ensure_endpoint_up")),
 ]
 
 
@@ -599,27 +600,33 @@ def _codex_printed(final: str) -> str:
     ])
 
 
-@pytest.mark.parametrize("final,what", PRINTED_CALLS)
-def test_a_tool_call_the_model_server_returned_as_text_is_infra(final, what):
-    assert printed_tool_call(final) == what
+@pytest.mark.parametrize("final,found", PRINTED_CALLS)
+def test_a_final_answer_that_is_a_tool_call_never_made_is_infra_and_says_which_form(final, found):
+    # the harmony form is a parser leak; the JSON form may be the model writing the call on its final channel — both
+    # INFRA (the maintainer's decision), each with its own reason, so a sweep summary and regrade say which it was
+    assert printed_tool_call(final) == found
     t, msgs = _cli("codex", rc=0, stdout=_codex_printed(final), stderr="Reading additional input from stdin...",
                    final=final)
-    assert _reason("codex", t, msgs, failed=["agent_engaged", "ssh_floor_answered"]) == (
-        f"codex: the model server returned the tool call as text, unparsed: {what} (0 tool calls)")
-    # every operator that talks to such a server reads the same; hermes keeps its final answer in the trace
-    for op in ("pi", "hermes21"):
+    want = (_HARMONY if found[0] == "harmony" else _JSON).format(found[1])
+    assert _reason("codex", t, msgs, failed=["agent_engaged", "ssh_floor_answered"]) == want
+    for op in ("pi", "hermes21"):   # every operator that talks to such a server reads the same
         t, msgs = _cli(op, final=final)
-        assert _reason(op, t, msgs) and "returned the tool call as text, unparsed" in _reason(op, t, msgs), op
-    assert "unparsed" in infra_reason(outcome_of("hermes", _tr([], [final]), [], {"is_error": False}), ["agent_engaged"])
+        assert _reason(op, t, msgs) == want.replace("codex:", f"{op}:"), op
+    assert infra_reason(outcome_of("hermes", _tr([], [final]), [], {"is_error": False}), ["agent_engaged"]) == (
+        want.replace("codex:", "hermes:"))
 
 
 @pytest.mark.parametrize("final", [
     "I'll call mcp__hpc_bridge__connect_facility with facility fake-ssh-site next.",           # prose naming a tool
     'Next: {"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}',             # a call quoted in prose
     '```json\n{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}\n```',     # ...or in a code fence
-    '{"status": "done", "tool": "mcp__hpc_bridge__run_shell", "stdout": "c1"}',                 # a report, not a call
+    '{"next_step":"mcp__hpc_bridge__connect_facility","reason":"Which facility?"}',             # not a call-ish key
+    '{"status": "done", "tool": "mcp__hpc_bridge__run_shell", "stdout": "c1"}',                 # a call-ish key, not first
+    '{"type": "function", "name": "mcp__hpc_bridge__run_shell"}',                               # ditto
     '{"cmd": "connect_facility", "facility": "fake-ssh-site"}',                                  # no mcp__ / functions.
     '{"cmd":"mcp__hpc_bridge__connect_facility"',                                                # cut off: no closing }
+    '{"command": "squeue"}<|call|>',                                                             # <|call|>, no recipient
+    "<|start|>assistant to=functions.run_shell<|message|>{}",                                    # recipient, no call/channel
     "<|channel|>final<|message|>The endpoint is down.",                                          # a leaked FINAL answer
     "The model would send to=functions.run_shell next.",                                         # a recipient, no tokens
     "",
@@ -628,6 +635,22 @@ def test_an_answer_that_only_mentions_a_tool_is_not_a_printed_call(final):
     assert printed_tool_call(final) is None
     t, msgs = _cli("codex", rc=0, stdout=_codex_printed(final), final=final)
     assert _reason("codex", t, msgs) is None
+
+
+def test_a_printed_call_never_excuses_a_terminal_error_or_a_bad_exit():
+    # review of e126f41: the 4xx rule (an invalid tool schema can be hpc-bridge's own fault) is not overridden by what
+    # the answer looks like — only a run that otherwise ended cleanly can be INFRA on a printed call
+    final, schema = PRINTED_CALLS[1][0], "400 Bad Request: invalid schema for function mcp__hpc_bridge__connect_facility"
+    assert infra_reason(Outcome("codex", 0, 0, final, rc=1, is_error=True, terminal_error=schema), ["agent_engaged"]) is None
+    for o in (Outcome("codex", 0, 0, final, rc=0, terminal_error=schema),     # each condition alone
+              Outcome("codex", 0, 0, final, rc=1, is_error=True),
+              Outcome("hermes", 0, 0, final, is_error=True)):
+        assert infra_reason(o, ["agent_engaged"]) is None, o
+    failed = json.dumps({"type": "turn.failed", "error": {"message": schema}})
+    t, msgs = _cli("codex", rc=1, stdout=failed, final=final)
+    assert _reason("codex", t, msgs) is None
+    for final, _ in PRINTED_CALLS:   # the clean ending of the same answers: INFRA
+        assert infra_reason(Outcome("codex", 0, 0, final, rc=0, is_error=False), ["agent_engaged"])
 
 
 def test_a_printed_call_after_a_real_one_is_graded_not_infra():
@@ -681,7 +704,7 @@ def test_regrade_derives_infra_from_a_codex_bundle_whose_answer_was_a_printed_ca
     regrade(tmp_path)
     out = capsys.readouterr().out
     assert "[INFRA] 1792106893-96340-31113-happy_path" in out and "stored FAILED -> now INFRA" in out
-    assert "the model server returned the tool call as text, unparsed" in out
+    assert "a tool call written as JSON instead of calling it" in out
     # the same bundle with the agent's one real call in its journal: graded
     rows.insert(3, {"journal": {"tool": "connect_facility", "args": {"facility": "fake-ssh-site"},
                                 "result": {"phase": "needs_account"}, "ts": 1.0, "ms": 5, "seq": 1}})

@@ -123,12 +123,14 @@ call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … l
     evidence and is graded — a raw-SSH workaround before an endpoint death still fails `no_ssh_workaround`;
   - and one of: the error the operator's own record says its run ENDED on is an outage (Pi's last `message_end` /
     `auto_retry_end`, Codex's `turn.failed`: an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); the final
-    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the final answer
-    IS a tool call the model server returned as text, unparsed (Codex on ALCF's gpt-oss, 2026-10-15: the whole answer
-    a call's JSON headed by an `mcp__…` / `functions.…` tool, or raw harmony tokens `<|channel|>commentary
-    to=functions.…<|call|>`; a sentence that names a tool is not one); or the run ended badly (non-zero exit, an
-    error, an empty answer) AND the last line of the operator's stderr names an outage (an earlier line may be a retry
-    it recovered from).
+    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or, in a run that
+    otherwise ended cleanly, the final answer IS a tool call never made (Codex on ALCF's gpt-oss, 2026-10-15), with its
+    own reason for each form: raw harmony tokens the server failed to parse (`<|channel|>commentary
+    to=functions.…<|call|>`), or the call written as JSON (the whole answer one object whose first key is `cmd` /
+    `name` / `tool` / `function` / `recipient`, holding an `mcp__…` tool) — which may be the model writing it on its
+    final channel rather than a parser leak; a sentence that names a tool is neither; or the run ended badly (non-zero
+    exit, an error, an empty answer) AND the last line of the operator's stderr names an outage (an earlier line may be
+    a retry it recovered from).
 
   Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those), even one
   that quotes a 5xx later in its message; a turn
@@ -232,8 +234,10 @@ anything is connected (hermes21 on gpt-oss, 2026-10-15): `poll_task(task_id="PLA
 "no endpoint was up". `orphaned_task`'s "after poll_task #1" fired on that poll. Hence `when_phase: "running"` there
 (the poll found the task running), `"complete"` on a compute run that must have RUN, `when_endpoint` on a stop whose
 moment matters whatever it answered, and `after_hook` on a hook that undoes another (`draining_restop`'s thaw: the first
-stop after the freeze). These read a call's result, so they apply to an `after_tool` hook only.
-`test_midrun_hooks.py` replays such a batch against every scenario's hooks: none may fire on it. And one or more
+stop after the freeze). These read a call's result, so they apply to an `after_tool` hook only, and `hook_problems`
+refuses one that could never fire (`when_endpoint` on a tool whose answer has no `endpoint_id`, `when_phase` on one
+that answers a `status`, a phase the tool never answers). `test_midrun_hooks.py` replays such a batch against every
+scenario's hooks (none may fire on it) and a good run of each (every hook must). And one or more
 actions — what the hook carries:
 
 | action | what it does | `claude` (SDK) | `codex` · `pi` · `hermes21` | `hermes` · `claude-acp` |

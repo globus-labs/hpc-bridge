@@ -24,13 +24,18 @@ the cell never met its orphan. Each answer is a no-op the result itself shows, a
   refused for spend `needs_confirmation`). For a hook whose premise IS that answer;
 - `when_endpoint: True` — an ensure_endpoint_up / stop_endpoint / teardown_endpoint answer that names the endpoint it
   acted on (`endpoint_id`). Made while nothing was connected, they answer `endpoint_id: null` ("no endpoint was up",
-  "No facility connected yet"); every real one names it, under every operator (the stored corpus, 2026-10-15). For a
-  hook that must see the real call whatever it answered (evidence at a stop, a lying `down` included);
+  "No facility connected yet"). A real answer names it whenever the server held one — not always: a confirm whose
+  endpoint configure failed ("hpc-bridge error: … configure failed") carries none, and such a call simply does not
+  count (the next one may). For a hook that must see the real call whatever it answered (evidence at a stop, a lying
+  `down` included);
 - `after_hook: "<name>"` — only calls that END after the named hook of the same scenario fired: a hook that undoes
   another. draining_restop's thaw, "after stop_endpoint #1", fired on a stop hermes21 made before its compute runs
   were done, before the freeze; the freeze then stayed, and the real stops met a frozen worker (`draining` three
   times, the cell failed — live 2026-10-15).
-They read the call's RESULT (or the hooks fired before it), so they apply to an `after_tool` hook only.
+They read the call's RESULT (or the hooks fired before it), so they apply to an `after_tool` hook only — and only to
+a tool whose answer carries the field: `when_phase` on the tools that answer a `phase` (with one of its values),
+`when_endpoint` on the three that answer `status` + `endpoint_id` (`ANSWER_PHASES`, `ENDPOINT_ANSWERS`; a hook that
+could never fire is refused by `hook_problems`, review of e126f41).
 
 And one or more ACTIONS — what the hook carries:
 - `cmd` — a shell command run on the cluster as the pool user (run.py `_run_hook`; `"on": "each_login"` fans it out).
@@ -70,6 +75,19 @@ from invariants import ToolCall, logical_name
 from trace_adapter import _result_to_dict
 
 ACTIONS = ("cmd", "interrupt", "interject")
+# What each hpc-bridge tool's answer carries (server.py's return types; test_midrun_hooks pins both to the product's
+# models): a `phase` with these values (ShellOutcome, ConnectResult, LoginStatus, PreauthStatus) — or, for the
+# EndpointStatus tools, a `status` and an `endpoint_id` and no phase.
+_SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running")
+_LOGIN_PHASES = ("logged_in", "needs_login", "failed")
+ANSWER_PHASES: dict[str, tuple[str, ...]] = {
+    "run_shell": _SHELL_PHASES, "poll_task": _SHELL_PHASES, "reset_session": _SHELL_PHASES,
+    "connect_facility": ("needs_account", "provisioning", "needs_facility_details", "proposed_facility_details",
+                         "needs_preauth", "needs_login", "unsupported", "failed"),
+    "authenticate": _LOGIN_PHASES, "complete_login": _LOGIN_PHASES,
+    "complete_preauth": ("opened", "failed", "needs_terminal"),
+}
+ENDPOINT_ANSWERS = ("ensure_endpoint_up", "stop_endpoint", "teardown_endpoint")
 WORLD_ACTIONS = ("stop_manager",)   # `world` hooks: the harness builds the command (run.py _run_hook); they count as cmd
 DURING_TOOL = "during_tool"   # a need, beside the actions: a trigger only a live view of call STARTS can serve
 
@@ -163,6 +181,16 @@ def hook_problems(hooks: Iterable[dict] | None) -> list[str]:
             out.append(f"{who}: when_phase / when_endpoint / after_hook decide at a call's END — an after_tool hook only")
         if "when_endpoint" in h and h["when_endpoint"] is not True:
             out.append(f"{who}: when_endpoint is True or absent")
+        tool = trigger_tool(h)
+        if "when_endpoint" in h and tool not in ENDPOINT_ANSWERS:
+            out.append(f"{who}: when_endpoint on {tool!r}, whose answer names no endpoint_id — it could never fire")
+        if "when_phase" in h:
+            if tool in ENDPOINT_ANSWERS:
+                out.append(f"{who}: when_phase on {tool!r}, whose answer carries a status, not a phase — it could never fire")
+            elif tool in ANSWER_PHASES and h["when_phase"] not in ANSWER_PHASES[tool]:
+                out.append(f"{who}: when_phase {h['when_phase']!r} is no phase {tool} answers {ANSWER_PHASES[tool]}")
+            elif tool not in ANSWER_PHASES:
+                out.append(f"{who}: when_phase on {tool!r}, whose answer has no phase")
         if "after_hook" in h and (h["after_hook"] == hook_label(h)
                                   or h["after_hook"] not in [hook_label(o) for o in hooks if o is not h]):
             out.append(f"{who}: after_hook names no other hook of this scenario ({h['after_hook']!r})")

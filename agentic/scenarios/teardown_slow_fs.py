@@ -91,8 +91,8 @@ def teardown_handed_back(t: Trace) -> Result:
     every = t.named("teardown_endpoint")
     if not every:
         return Result("teardown_handed_back", False, "no teardown_endpoint call")
-    tds = [(i, c) for i, c in every if not acted_on_nothing(c)]
-    skipped = [i for i, c in every if acted_on_nothing(c)]
+    tds = [(i, c) for i, c in every if not acted_on_nothing(t, i)]
+    skipped = [i for i, _ in every if acted_on_nothing(t, i)]
     if not tds:
         return Result("teardown_handed_back", False,
                       f"every teardown_endpoint (calls {skipped}) answered 'no endpoint was up' — none found an "

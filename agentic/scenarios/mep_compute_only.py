@@ -117,7 +117,7 @@ def mep_stop_is_draining_only(t: Trace) -> Result:
     every = t.named("stop_endpoint")
     if not every:
         return Result("mep_stop_is_draining_only", False, "no stop_endpoint call")
-    stops = [(i, c) for i, c in every if not acted_on_nothing(c)]
+    stops = [(i, c) for i, c in every if not acted_on_nothing(t, i)]
     if not stops:
         return Result("mep_stop_is_draining_only", False,
                       f"every stop_endpoint (calls {[i for i, _ in every]}) answered 'no endpoint was up'")

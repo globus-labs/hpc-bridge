@@ -780,3 +780,22 @@ def test_the_mep_stop_graders_skip_a_stop_sent_before_the_attach():
     assert not nb.no_cancel_claimed(Trace([*_BATCH, _connect("needs_account")])).ok
     r = nb.mep_stop_is_draining_only(Trace([*_BATCH, _connect("needs_account")]))
     assert not r.ok and "no endpoint was up" in r.detail
+
+
+def test_a_bare_no_endpoint_down_after_the_attach_is_graded_not_skipped():
+    # review of e126f41: "no endpoint was up" also follows a detach (or a teardown, a server restart). On a facility
+    # endpoint #178 requires a stop after a detach to name the block it left; a regression answering a bare `down` there
+    # must still fail mep_stop_is_draining_only — only the same words BEFORE anything existed are skipped.
+    import fake_mep_stop_names_block as nb
+    run = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID; hostname"},
+                      {"phase": "complete", "stdout": "JOB=1226\nc2\nhpcbmep\n"})
+    detach = ToolCall.of("mcp__endpoint__teardown_endpoint", {}, {"status": "down", "endpoint_id": "eid-mep",
+                                                                   "notice": "detached from the facility's endpoint …"})
+    up = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+                     {"status": "up", "endpoint_id": "eid-mep"})
+    t = Trace([_connect("needs_account"), up, run, detach, _NOOP_STOP])
+    r = nb.mep_stop_is_draining_only(t)
+    assert not r.ok and "'down'" in r.detail
+    assert nb._first_stop(t) == (4, _NOOP_STOP.result)                       # THE stop, not skipped
+    assert not nb.no_cancel_claimed(t).ok
+    assert nb.mep_stop_is_draining_only(Trace([_NOOP_STOP, _connect("needs_account"), up, run, _stop_result()])).ok

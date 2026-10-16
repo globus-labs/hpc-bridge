@@ -83,7 +83,7 @@ def stopped_while_provisioning(t: Trace) -> Result:
     # a confirm sent before the attach ("No facility connected", invariants.acted_on_nothing) confirmed nothing: taken as
     # THE confirming call, its `down` hid a real `up` after it and the detail blamed the agent for calling again
     starts = [(i, c) for i, c in t.named("ensure_endpoint_up")
-              if i < s and _confirms_spend(c) and _shape(c) == "compute" and not acted_on_nothing(c)]
+              if i < s and _confirms_spend(c) and _shape(c) == "compute" and not acted_on_nothing(t, i)]
     if not starts:
         return Result("stopped_while_provisioning", False, f"no confirmed compute start before the stop (call {s})")
     k, first = starts[0][0], str(_res(starts[0][1]).get("status"))

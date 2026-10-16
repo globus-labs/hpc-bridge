@@ -79,7 +79,7 @@ def _first_stop(t: Trace, after: int = -1) -> tuple[int, dict] | None:
     up", invariants.acted_on_nothing — a model's blind opening batch, hermes21 live 2026-10-15) let nothing go either,
     and read as THE stop it failed no_cancel_claimed and counted every later call as a probe after it."""
     for i, c in t.named("stop_endpoint"):
-        if i > after and str(_res(c).get("status")) != "up" and not acted_on_nothing(c):
+        if i > after and str(_res(c).get("status")) != "up" and not acted_on_nothing(t, i):
             return i, _res(c)
     return None
 
