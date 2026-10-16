@@ -259,7 +259,9 @@ def _smoke(tmp_path, scenario, **extra):
     (stub / "docker").write_text(
         '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/docker.calls"\n'
         'case "$1 $2" in "image inspect") echo sha256:stub ;; esac\n'
-        'case "$1" in run) sleep 2 ;; exec) echo "HPCB_NOW 1792105000" ;; esac\nexit 0\n')
+        # `run` stands for the jail: it asks the tap for a job by id, as the world check does
+        'case "$1" in run) echo 1 > "$STUB_DIR/repo/agentic/runs/.admin-tap-r1.jsonl.ids"; sleep 2 ;; '
+        'exec) echo "HPCB_NOW 1792105000" ;; esac\nexit 0\n')
     (stub / "uv").write_text('#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/uv.calls"\nexit 0\n')
     for f in ("docker", "uv"):
         (stub / f).chmod(0o755)
@@ -289,7 +291,9 @@ def test_run_smoke_runs_the_script_operator_without_any_credential_or_probe(tmp_
     execs = [ln for ln in calls.splitlines() if ln.startswith("exec ")]
     assert execs and "hpcb-fake-slurmctld-1 bash -lc" in execs[0] and "squeue -u hpcbridge-test" in execs[0]
     assert "admin tap: the scheduler as its admin" in r.stdout
-    assert not (root / "agentic" / "runs" / ".admin-tap-r1.jsonl").exists()
+    runs = root / "agentic" / "runs"
+    assert not (runs / ".admin-tap-r1.jsonl").exists() and not (runs / ".admin-tap-r1.jsonl.ids").exists()
+    assert any("sacct -j 1 -X" in ln for ln in execs)   # the id request reached the host tap within the cell
 
 
 def test_run_smoke_refuses_the_cell_off_the_fake_cluster_before_any_tap_or_launch(tmp_path):

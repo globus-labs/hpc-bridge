@@ -12,6 +12,10 @@ host is `/work/hpc-bridge/agentic/runs` in the jail):
   (`{user}` = the cell's pool user, as ADMIN_SETUP's) and appends one JSON line: {"t": host epoch, "rc", "out"}.
 - JAIL — run.py hands the file (HPCB_ADMIN_TAP) to the scenario's WORLD_CHECKS as a `TapReader`; they wait for the
   samples they need and parse them (`parse_slurm_sample`). The bundle keeps every sample (`admin-tap.jsonl`).
+- ASKING FOR JOBS BY ID — a world check that knows job ids (the cell's own pilot) writes them to `<tap file>.ids`
+  (`TapReader.request_ids`); the host tap then adds the scenario's `ids_cmd` (`{ids}` = those ids) to every sample and
+  takes one at once. Why: the first live run (2026-10-15) watched BLIND — its pilot lived 4.6 s between two samples,
+  and `sacct -S <window>` never lists a job that was never ELIGIBLE (held by `--begin`), while `sacct -j <id>` does.
 
 Why the admin channel and not the harness' world channel (ssh as the pool user, what POSTCHECKS use): nothing on the
 admin path is the product's — not the login node the endpoint runs on, not the pool user's sshd that hpc-bridge's own
@@ -27,6 +31,8 @@ from __future__ import annotations
 import argparse
 import asyncio
 import json
+import math
+import re
 import signal
 import subprocess
 import sys
@@ -51,11 +57,32 @@ def _stop(_signum, _frame) -> None:
     raise SystemExit(0)
 
 
-def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float = MAX_RUN_S,
+_JOB_ID = re.compile(r"^[0-9]{1,12}(?:_[0-9]{1,8})?$")
+MAX_IDS = 32
+
+
+def ids_path(out: Path | str) -> Path:
+    """Where the jail asks the host tap for jobs by id: beside the tap file."""
+    out = Path(out)
+    return out.with_name(out.name + ".ids")
+
+
+def read_ids(path: Path) -> list[str]:
+    """The job ids asked for — only scheduler job ids (digits, an array's `_n`), at most MAX_IDS, sorted: the file
+    comes from the jail and the ids go into a root shell on the controller."""
+    try:
+        words = path.read_text().split()
+    except OSError:
+        return []
+    return sorted({w for w in words if _JOB_ID.match(w)}, key=lambda w: (len(w), w))[:MAX_IDS]
+
+
+def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float = MAX_RUN_S, ids_cmd: str = "",
         run: Callable[[list[str]], tuple[int, str]] | None = None, sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic) -> int:
     """Run `admin + [cmd]` every `every_s` seconds (the first at once) and append one sample per run to `out`, until
-    signalled or `max_s` has passed. Returns the number of samples written."""
+    signalled or `max_s` has passed. With ids asked for (`ids_path`) and an `ids_cmd`, each sample runs it too, and a
+    new request is answered at once rather than at the next tick. Returns the number of samples written."""
     def _run(argv: list[str]) -> tuple[int, str]:
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=SAMPLE_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -68,13 +95,22 @@ def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float =
     run = run or _run
     n = 0
     t0 = clock()
+    asked = ids_path(out)
     with out.open("a") as fh:   # held open: a write after run_smoke.sh removed the file never re-creates it
         while clock() - t0 < max_s:
-            rc, text = run([*admin, cmd])
-            fh.write(json.dumps({"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}) + "\n")
+            ids = read_ids(asked) if ids_cmd else []
+            full = f"{cmd}; {ids_cmd.replace('{ids}', ','.join(ids))}" if ids else cmd
+            rc, text = run([*admin, full])
+            sample = {"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}
+            if ids:
+                sample["ids"] = ids
+            fh.write(json.dumps(sample) + "\n")
             fh.flush()
             n += 1
-            sleep(every_s)
+            for _ in range(max(1, math.ceil(every_s))):   # a second at a time: a new request is answered at once
+                sleep(min(1.0, every_s))
+                if ids_cmd and read_ids(asked) != ids:
+                    break
     return n
 
 
@@ -94,7 +130,8 @@ def main(argv: list[str]) -> int:
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _stop)
     tap(args.out, admin, str(knob["cmd"]).replace("{user}", args.user),
-        every_s=float(knob.get("every_s") or DEFAULT_EVERY_S), max_s=args.max_s)
+        every_s=float(knob.get("every_s") or DEFAULT_EVERY_S), max_s=args.max_s,
+        ids_cmd=str(knob.get("ids_cmd") or "").replace("{user}", args.user))
     return 0
 
 
@@ -119,17 +156,32 @@ def read_samples(path: Path | None) -> list[dict]:
     return out
 
 
+# Every state sacct 23.11 takes (`sacct -s`). With an explicit list sacct selects the jobs that were IN one of them
+# during the window; without one it selects the jobs that were ELIGIBLE in it — and a pilot held by `--begin` never is,
+# so `-S now-2hours` alone listed nothing for the first live run's cancelled pilot (2026-10-15, slurm-wlm 23.11.4).
+SACCT_STATES = "PD,R,CA,CD,F,TO,NF,PR,OOM,BF,DL,RQ,RS,RV,S"
+_SACCT_FIELDS = "JobID,JobName,State,Submit,Start,End,SubmitLine"
+_TIMES = "TZ=UTC SLURM_TIME_FORMAT=%s"
+
+
 def slurm_sample_cmd(*, history: str = "now-2hours") -> str:
     """One Slurm sample through the admin channel, as tagged lines (`parse_slurm_sample`): the controller's clock, the
-    pool user's queue (`squeue %o` is the batch script — a parsl pilot's sits under `uep.<eid>.<…>/submit_scripts/`, so
-    it carries the endpoint's marker, as the StdOut path does for scheduler_ops._release_cmd), and its finished jobs
-    since `history` (sacct's SubmitLine names the same script). Times in epoch seconds (SLURM_TIME_FORMAT=%s, glibc's
-    strftime); TZ=UTC so a Slurm that ignores the format prints ISO times in UTC, which the parser reads as such."""
-    env = "TZ=UTC SLURM_TIME_FORMAT=%s"
+    pool user's jobs in the controller (`squeue -t all`: queued and running, AND those finished within MinJobAge — 300 s
+    on the fake profiles — so a pilot cancelled between two samples is still seen; `%o` is the batch script — a parsl
+    pilot's sits under `uep.<eid>.<…>/submit_scripts/`, so it carries the endpoint's marker, as the StdOut path does for
+    scheduler_ops._release_cmd), and its accounting since `history` in any state (SACCT_STATES; SubmitLine names the
+    same script). Times in epoch seconds (SLURM_TIME_FORMAT=%s, glibc's strftime); TZ=UTC so a Slurm that ignores the
+    format prints ISO times in UTC, which the parser reads as such."""
     return ("echo HPCB_NOW $(date +%s); "
-            f"{env} squeue -u {{user}} -h -o '%i|%T|%V|%r|%o' 2>&1 | sed 's/^/HPCB_Q /'; "
-            f"{env} sacct -u {{user}} -X -n -P -S {history} -o JobID,JobName,State,Submit,Start,End,SubmitLine 2>&1 "
+            f"{_TIMES} squeue -u {{user}} -h -t all -o '%i|%T|%V|%r|%o' 2>&1 | sed 's/^/HPCB_Q /'; "
+            f"{_TIMES} sacct -u {{user}} -X -n -P -S {history} -s {SACCT_STATES} -o {_SACCT_FIELDS} 2>&1 "
             "| sed 's/^/HPCB_A /'")
+
+
+def slurm_ids_cmd() -> str:
+    """The tap's `ids_cmd` for Slurm: the jobs asked for by id (`{ids}`), from accounting — `sacct -j` finds a job
+    whatever its eligibility or age (it found the first live run's held, cancelled pilot when the window did not)."""
+    return f"{_TIMES} sacct -j {{ids}} -X -n -P -o {_SACCT_FIELDS} 2>&1 | sed 's/^/HPCB_A /'"
 
 
 def slurm_time(raw: str) -> float | None:
@@ -207,6 +259,18 @@ class TapReader:
 
     def samples(self) -> list[SlurmSample]:
         return [parse_slurm_sample(s) for s in read_samples(self.path)]
+
+    def request_ids(self, ids: list[str]) -> bool:
+        """Ask the host tap to look these jobs up by id from now on (its `ids_cmd`). False without a tap, with no valid
+        id, or when the file cannot be written."""
+        ok = [i for i in ids if _JOB_ID.match(str(i))]
+        if self.path is None or not ok:
+            return False
+        try:
+            ids_path(self.path).write_text(" ".join(ok) + "\n")
+        except OSError:
+            return False
+        return True
 
     async def wait_until(self, now: float, *, deadline_s: float, poll_s: float = 5.0,
                          sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,

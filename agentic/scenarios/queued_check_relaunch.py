@@ -24,9 +24,16 @@ THE CLAIM (main at 7ae46c2):
 
 EXPECTED on main if the claim holds: FAILED — `world:no_relaunch_after_down` names a new pilot of this endpoint submitted
 about 60–65 s after the `down`, and the universal `world:stop_honesty_no_pilot_left` finds it still queued. This is a
-regression check that should pass only once the product fixes the hazard. An OK on main means the claim did not
-reproduce here; the report rows say what the stop answered, the pilot's state at the stop and whether the canary was
-still queued.
+regression check that should pass only once the product fixes the hazard.
+
+WHAT THE FIRST LIVE RUN SHOWED (bundle 1792117501-3824-56199, fake/default, 2026-10-15): no relaunch — but not for the
+claim's reason, and its watch was blind (below). The pilot (job 1, held) was cancelled by the stop's `down`; 56 s later,
+at parsl's next job-status poll, the user endpoint's own log says: "Job is marked as MISSING since the workers failed
+to register to the executor" → TooManyJobFailuresError → "Setting bad state" → "Not strategizing for executor because
+bad state", and the user endpoint shut down — consistent with parsl's HTEX rewriting a finished block that never
+connected to MISSING, and its error handler's threshold being max(1, init_blocks) = 1 here (batch mode: init_blocks 0),
+so ONE cancelled, never-connected block puts the executor in bad state. The canary is then left queued at the service for a user endpoint that has exited.
+`strategy_after_stop` now records those lines from the endpoint log in every run, so the outcome is read, not inferred.
 
 THE SCRIPT (SCRIPT below; the `{facility}`/`{ssh_host}` of every BYO scenario):
 1. connect_facility(fid, ssh_host) → the proposal; connect_facility(fid, ssh_host, details=<the proposal>, env_setup
@@ -47,32 +54,46 @@ login-shape round trip (1–2 s), so the worker could run the canary first and l
 `scheduler_options: "#SBATCH --begin=now+<hold>"` to the confirmed details: Slurm holds every pilot of this endpoint
 PENDING (reason BeginTime), no worker starts, the canary stays queued BY CONSTRUCTION, and the relaunched pilot (same
 template) is held too, so the cell occupies no node. A pending pilot is what a busy facility gives anyway, and parsl
-reads a cancelled PENDING block exactly as a cancelled RUNNING one. HPCB_RELAUNCH_HOLD_S sets the hold (default 1800 s,
+reads a cancelled PENDING block as it reads a cancelled RUNNING one whose workers have not connected yet — and while the
+canary is queued none has (a connected, idle worker takes it at once), so the hold does not change which path parsl
+takes. HPCB_RELAUNCH_HOLD_S sets the hold (default 1800 s,
 at least the watch + 900 s); 0 drops it — the script then stops the moment the job id appears (most likely RUNNING), and
 `canary_before_stop` says whether the canary could have run first (a premise that cannot be shown fails the cell).
 
 THE OBSERVATION (world checks, after the script, BEFORE the harness' teardown — run.py runs WORLD_CHECKS ahead of the
-POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop): the ADMIN TAP (harness/admin_tap.py) samples the
-scheduler as root on slurmctld every 10 s for the whole cell — the harness' admin channel, never hpc-bridge — and
-`relaunch_watch` waits until it has covered HPCB_RELAUNCH_WATCH_S (default 240 s) after the stop's answer. Every job of
-this endpoint (matched by its `uep.<eid>` marker in squeue's batch script or sacct's SubmitLine) is recorded with its
-submit time, state and id. Then the teardown runs as usual (it cancels a relaunched pilot by the same marker), so nothing
-is left on the shared fake cluster.
+POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop):
+- the ADMIN TAP (harness/admin_tap.py) samples the scheduler as root on slurmctld every 10 s for the whole cell — the
+  harness' admin channel, never hpc-bridge: `squeue -t all` (queued and running jobs, and those finished within
+  MinJobAge, 300 s here), `sacct` over the last 2 h in EVERY state (`-s …`: without it sacct lists only jobs that were
+  eligible in the window, and a held pilot never is — the first run's sacct saw nothing), and — once `relaunch_watch`
+  asks for the cell's own pilot by id — `sacct -j <id>`, which finds a job whatever its eligibility or age;
+- `relaunch_watch` waits until the tap has covered HPCB_RELAUNCH_WATCH_S (default 420 s: several 60 s job-status polls)
+  after the stop's answer. Every job of this endpoint (its `uep.<eid>` marker in squeue's batch script or sacct's
+  SubmitLine) is recorded with its submit time, state and id;
+- then it reads the endpoint's own logs over the world channel (cluster_ops.capture_logs_cmd: the manager's, each user
+  endpoint's, the blocks' output) — before the teardown deletes them — for parsl's decisions after the stop.
+Then the teardown runs as usual (it cancels a relaunched pilot by the same marker), so nothing is left on the fake cluster.
 
 GRADED: `world:no_relaunch_after_down` (gates, as every world row): FAIL when the stop answered `down` (or
 spend_stopped=True) and a new pilot of this endpoint was submitted after it — naming the job, its submit time relative to
 the stop's answer and its state. A stop that answered `draining` (or refused) is a different premise: report-only,
-PASS, said so. A `down` with no relaunch passes only when the watch covered its window and the canary was demonstrably
-still queued at the stop. REPORTED: `stop_answer`, `pilot_state_at_stop`, `canary_before_stop`, `relaunch_watch`.
+PASS, said so. A `down` with no relaunch passes only when the watch could have seen one: the tap saw this cell's OWN
+pilot by its marker (else "watch blind" — the first run passed blind: its pilot lived 4.6 s between two samples), the
+endpoint's log shows no scale-out the tap missed, the window was covered, and the canary was demonstrably still queued at
+the stop. REPORTED: `stop_answer`, `pilot_state_at_stop`, `canary_before_stop`, `relaunch_watch`, `strategy_after_stop`
+(the endpoint log's scale-outs, error-handler and user-endpoint lines after the stop).
 """
+import asyncio
 import json
 import os
 import re
 import shlex
 import time
 from dataclasses import dataclass, field
+from datetime import datetime, timezone
 
-from admin_tap import SlurmJob, slurm_sample_cmd
+from admin_tap import SlurmJob, slurm_ids_cmd, slurm_sample_cmd
+from cluster_ops import capture_logs_cmd
 from invariants import Result, ToolCall, Trace
 
 OPERATORS = ("script",)        # a scripted proof cell: an agent operator is refused (run.py: SKIPPED)
@@ -96,7 +117,9 @@ def _env_s(name: str, default: float) -> float:
         return default
 
 
-WATCH_S = _env_s("HPCB_RELAUNCH_WATCH_S", 240.0)
+# 420 s: several of parsl's 60 s job-status polls plus its 5 s strategy period after the stop (the first live run's
+# executor acted 56 s after it)
+WATCH_S = _env_s("HPCB_RELAUNCH_WATCH_S", 420.0)
 PILOT_WAIT_S = _env_s("HPCB_RELAUNCH_PILOT_WAIT_S", 180.0)   # how long step 3 waits for a pilot to be in the queue
 LOGIN_UP_WAIT_S = 300.0                                       # how long step 1 waits for the login shape
 
@@ -116,7 +139,7 @@ def _hold_s() -> int:
 NEEDS_COMPUTE_NODE = _hold_s() == 0
 # The admin tap (run_smoke.sh starts it before the cell; harness/admin_tap.py): the pool user's queue and history as
 # root on slurmctld, every 10 s, with the controller's clock.
-ADMIN_TAP = {"every_s": 10, "cmd": slurm_sample_cmd()}
+ADMIN_TAP = {"every_s": 10, "cmd": slurm_sample_cmd(), "ids_cmd": slurm_ids_cmd()}
 
 PROMPT = (
     "(Scripted — no agent reads this.) On the HPC facility with login host `{ssh_host}` — facility id `{facility}` — "
@@ -292,15 +315,27 @@ NO_RELAUNCH = "world:no_relaunch_after_down"
 
 
 @dataclass
+class LogLine:
+    at: float          # epoch seconds (the login node's clock; its logs are UTC)
+    where: str         # "manager", "uep 9f7c4349", …
+    text: str          # the line, with its continuation lines (a traceback's message) folded in
+
+
+@dataclass
 class Watch:
-    """What the admin tap saw of this endpoint around the stop. Times are the controller's clock (the jail's too)."""
+    """What the admin tap saw of this endpoint around the stop, and what the endpoint's own log says. Times are the
+    controller's clock (the jail's and the login node's too: one Docker VM kernel)."""
     called_at: float | None = None      # the stop call started
     answered_at: float | None = None    # it answered
     window_s: float = WATCH_S
     covered_until: float | None = None  # the controller clock of the latest sample read
     samples: int = 0
-    jobs: list[SlurmJob] = field(default_factory=list)   # this endpoint's jobs, queue and history merged, by id
+    jobs: list[SlurmJob] = field(default_factory=list)   # this endpoint's jobs (by its marker), queue and history merged
     unverifiable: str | None = None
+    own_ids: set[str] = field(default_factory=set)       # the cell's own pilot(s): the script's poll + the stop's release
+    seen_unmarked: set[str] = field(default_factory=set)  # own ids the tap saw WITHOUT this endpoint's marker
+    log_lines: list[LogLine] | None = None                # strategy lines after the stop (None: the log was not read)
+    log_error: str = ""
 
 
 def _stop_times(messages: list) -> tuple[float | None, float | None]:
@@ -315,6 +350,14 @@ def _stop_times(messages: list) -> tuple[float | None, float | None]:
         if isinstance(n, dict) and n.get("name") == "stop_endpoint" and n.get("t_end") is not None:
             return n.get("t_start"), float(n["t_end"])
     return None, None
+
+
+def own_pilots(t: Trace) -> set[str]:
+    """The cell's own pilot job ids: what the script's squeue polls saw before the stop, and what the stop released."""
+    stop = _stop(t)
+    if stop is None:
+        return set()
+    return _released(stop[1]) | _seen_before(t, stop[0])
 
 
 def endpoint_jobs(samples: list, eids: list[str]) -> list[SlurmJob]:
@@ -350,7 +393,7 @@ def relaunches(t: Trace, w: Watch) -> list[SlurmJob]:
     stop = _stop(t)
     if stop is None or w.answered_at is None:
         return []
-    known = _released(stop[1]) | _seen_before(t, stop[0])
+    known = own_pilots(t)
     since = (w.called_at if w.called_at is not None else w.answered_at) - 1.0
     return [j for j in w.jobs if j.job_id not in known and (
         (j.submit is not None and j.submit >= since) or (j.submit is None and (j.seen_at or 0) >= w.answered_at))]
@@ -363,11 +406,90 @@ def _describe(j: SlurmJob, w: Watch) -> str:
     return f"job {j.job_id} {at}, {j.state}{why}"
 
 
+# ---- the endpoint's own log: parsl's strategy decisions after the stop -------------------------------------------------
+
+# A parsl / Globus Compute log line: `2026-10-16 02:27:55,056648 ERROR MainProcess-443 …` (UTC on the fake login node:
+# run 2's scale-out at 02:26:54 sits 8 s after its ensure_endpoint_up call in the journal's epoch).
+_LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{1,6}) ")
+_LOG_FILE = re.compile(r"^=== (\S+)")
+# What decides a relaunch, as GCE 4.18 / parsl 2026.10 log it at INFO: the strategy's scale-out (`Scaling out by N
+# blocks`, `Allocated block ID n`), its scale-in, the error handler (a cancelled block that never connected is rewritten
+# to MISSING and, with init_blocks 0, puts the executor in bad state: `Not strategizing … because bad state`), the
+# interchange's outstanding work, and the manager (re)starting or losing a user endpoint.
+_STRATEGY = re.compile(
+    r"Scaling (?:out|in) by \d+|Allocated block ID|[Ss]trategy case|Requesting \d+ more blocks?|[Ii]dle time|"
+    r"[Ss]caling in|bad state|TooManyJobFailures|marked as MISSING|Not strategizing|[Oo]utstanding|"
+    r"Creating new user endpoint|Command stopped|Endpoint shutdown|[Ss]ubmitted job|[Ll]aunched block")
+_SCALE_OUT = re.compile(r"Scaling out by [1-9]\d* blocks?|Allocated block ID|Requesting [1-9]\d* more blocks?")
+
+
+def _where(path: str) -> str:
+    m = re.search(r"uep\.[0-9a-f-]{36}\.([0-9a-f]{8})", path)
+    if "/submit_scripts/" in path:
+        return "block " + path.rsplit("/", 1)[-1][:60]
+    return f"uep {m.group(1)}" if m else "manager"
+
+
+def strategy_lines(logs: str, since: float) -> list[LogLine]:
+    """The strategy-relevant lines (`_STRATEGY`) of the endpoint logs (cluster_ops.capture_logs_cmd's `=== path`
+    sections) stamped at or after `since` (epoch), in time order across the files, each with its untimestamped
+    continuation lines folded in — a traceback's message says why the executor went to bad state."""
+    out: list[LogLine] = []
+    where, cur = "manager", None
+
+    def keep(rec: LogLine | None) -> None:
+        if rec is not None and rec.at >= since and _STRATEGY.search(rec.text):
+            out.append(rec)
+
+    for raw in logs.splitlines():
+        if (f := _LOG_FILE.match(raw)) is not None:
+            keep(cur)
+            where, cur = _where(f.group(1)), None
+            continue
+        if (m := _LOG_TS.match(raw)) is not None:
+            keep(cur)
+            try:
+                # timezone.utc, not datetime.UTC: scenario_knobs.py imports this module on the host's python3
+                at = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S").replace(tzinfo=timezone.utc).timestamp()  # noqa: UP017
+            except ValueError:
+                cur = None
+                continue
+            cur = LogLine(at + int(m.group(2).ljust(6, "0")) / 1e6, where, raw[m.end():].strip())
+        elif cur is not None and raw.strip() and cur.text.count(" ⏎ ") < 3:
+            cur.text += " ⏎ " + raw.strip()
+    keep(cur)
+    return sorted(out, key=lambda x: x.at)   # the manager's log and each user endpoint's, interleaved in time
+
+
+def _short_log(x: LogLine, w: Watch) -> str:
+    # drop the logger's process / thread / module columns: `INFO MainProcess-443 JobStatusPoller-… parsl.x:207 fn msg`
+    text = re.sub(r"^(\w+) MainProcess-\d+ \S+ \S+ \S+ ", r"\1 ", x.text)
+    return f"{x.at - (w.answered_at or x.at):+.0f} s [{x.where}] {text[:220]}"
+
+
+def strategy_after_stop(w: Watch) -> Result:
+    """REPORTED: what the endpoint itself decided after the stop — parsl's scale-outs, the error handler, the user
+    endpoint stopping or restarting — the direct evidence of a relaunch, or of why there was none."""
+    if w.log_lines is None:
+        return Result("strategy_after_stop", False, f"UNVERIFIABLE — the endpoint's logs were not read: "
+                                                    f"{w.log_error or 'no stop to read them against'}")
+    scale = [x for x in w.log_lines if _SCALE_OUT.search(x.text)]
+    lead = ("SCALE-OUT after the stop" if scale else "no scale-out after the stop") + (
+        f" ({len(w.log_lines)} strategy line(s)): " if w.log_lines else
+        " — no strategy line at all after it (GCE logs a scale-out at INFO as 'Scaling out by N blocks')")
+    return Result("strategy_after_stop", not scale, lead + " · ".join(_short_log(x, w) for x in w.log_lines[:14])
+                  + (f" · … {len(w.log_lines) - 14} more" if len(w.log_lines) > 14 else ""))
+
+
+# ---- the gated grader ---------------------------------------------------------------------------------------------------
+
 def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
     """GATED (a world row): a stop that answered `down` (or spend_stopped=True) must not be followed by a new pilot of
     this endpoint. A stop that did not claim spend stopped (`draining`, a refusal) is another premise: report-only, PASS,
-    said so. A `down` with no relaunch passes only on a covered watch and a check demonstrably queued at the stop —
-    anything less proves nothing."""
+    said so. A `down` with no relaunch passes only when the watch could have seen one — the tap saw this cell's OWN
+    pilot by its marker (the first live run watched blind and passed: its pilot lived 4.6 s between two samples), the
+    endpoint's log shows no scale-out the tap missed, and it covered the window — and the check was demonstrably still
+    queued at the stop. Anything less proves nothing."""
     stop = _stop(t)
     if stop is None:
         return Result(NO_RELAUNCH, False, "premise not met: no stop_endpoint in the trace — the script never reached the "
@@ -385,8 +507,23 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
         return Result(NO_RELAUNCH, False, f"{said}, and the endpoint submitted a NEW pilot after it: "
                       + "; ".join(_describe(j, w) for j in new)
                       + f" — billing that hpc-bridge said had stopped ({canary_state(t)[1]})")
+    scale = [x for x in (w.log_lines or []) if _SCALE_OUT.search(x.text)]
+    if scale:
+        return Result(NO_RELAUNCH, False, f"watch blind: {said}, and the endpoint's own log shows a scale-out after it "
+                                          f"({_short_log(scale[0], w)}) that the admin tap never saw as a new pilot")
     if w.unverifiable:
         return Result(NO_RELAUNCH, False, f"UNVERIFIABLE — {w.unverifiable}")
+    seen = {j.job_id: j for j in w.jobs if j.job_id in w.own_ids}
+    if not w.own_ids:
+        return Result(NO_RELAUNCH, False, "watch blind: no pilot id of this cell is known (no squeue poll saw one and the "
+                                          "stop released none), so nothing shows the tap can see this endpoint's jobs")
+    if not seen:
+        unmarked = sorted(w.own_ids & w.seen_unmarked)
+        return Result(NO_RELAUNCH, False, f"watch blind: the tap never saw this endpoint's own pilot (job "
+                      f"{', '.join(sorted(w.own_ids))}) in {w.samples} sample(s), by squeue or sacct"
+                      + (f" — it saw job {', '.join(unmarked)} but without the uep.<eid> marker in its script / "
+                         "SubmitLine, so a relaunch would have gone unmatched too" if unmarked else "")
+                      + " — so its silence after the stop proves nothing")
     covered = (w.covered_until or 0.0) - (w.answered_at or 0.0)
     if covered < w.window_s - 15:
         return Result(NO_RELAUNCH, False, f"UNVERIFIABLE — the admin tap covered only {covered:.0f} s of the "
@@ -398,8 +535,9 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
     if state != "queued":
         return Result(NO_RELAUNCH, False, f"premise unverified: {why} — 'no relaunch' proves nothing unless the check "
                                           "was still queued (keep the hold: HPCB_RELAUNCH_HOLD_S)")
+    own = ", ".join(f"job {j.job_id} {j.state} [{j.source}]" for j in seen.values())
     return Result(NO_RELAUNCH, True, f"ok: {said}; no new pilot of this endpoint was submitted in the {covered:.0f} s "
-                                     f"after it ({why})")
+                                     f"after it — the tap saw its own pilot ({own}), so it could have seen one ({why})")
 
 
 def relaunch_report(w: Watch) -> Result:
@@ -409,8 +547,9 @@ def relaunch_report(w: Watch) -> Result:
                         "submit time unknown") + f" [{j.source}]" for j in w.jobs) or "none"
     cover = (f"{(w.covered_until or 0) - (w.answered_at or 0):.0f} s after the stop answered"
              if w.covered_until is not None and w.answered_at is not None else "no sample")
-    return Result("relaunch_watch", True, f"{w.samples} admin sample(s), covering {cover}; this endpoint's jobs: {jobs}"
-                  + (f"; {w.unverifiable}" if w.unverifiable else ""))
+    own = ", ".join(sorted(w.own_ids)) or "none known"
+    return Result("relaunch_watch", True, f"{w.samples} admin sample(s), covering {cover}; the cell's own pilot(s): {own}; "
+                  f"this endpoint's jobs: {jobs}" + (f"; {w.unverifiable}" if w.unverifiable else ""))
 
 
 def _endpoint_ids(t: Trace) -> list[str]:
@@ -422,31 +561,52 @@ def _endpoint_ids(t: Trace) -> list[str]:
     return out
 
 
+async def _read_logs(ctx, eids: list[str], w: Watch) -> None:
+    """The endpoint's own logs (manager + user endpoints + blocks), read over the world channel at the END of the watch
+    and BEFORE the harness' teardown deletes them; their strategy lines after the stop go into `w`."""
+    ssh = getattr(ctx, "ssh", None)
+    name = str(getattr(ctx, "endpoint_name", "") or "")
+    if ssh is None or not name or w.called_at is None:
+        w.log_error = "no world channel, endpoint name or stop time"
+        return
+    rc, logs = await asyncio.to_thread(ssh, capture_logs_cmd(name, eids), 120)
+    if rc != 0 or "=== " not in logs:
+        w.log_error = f"rc={rc}: {logs.strip()[-160:]!r}"
+        return
+    w.log_lines = strategy_lines(logs, w.called_at - 1.0)
+
+
 async def relaunch_watch(ctx) -> list[Result]:
-    """WORLD CHECK: wait until the admin tap has covered WATCH_S after the stop's answer, then grade what it saw.
-    `ctx`: run.py's WorldContext (trace, messages, tap)."""
+    """WORLD CHECK: ask the tap for the cell's own pilot by id, wait until it has covered WATCH_S after the stop's
+    answer, read the endpoint's own log, then grade. `ctx`: run.py's WorldContext."""
     t: Trace = ctx.trace
     called, answered = _stop_times(ctx.messages)
-    w = Watch(called_at=called, answered_at=answered)
+    w = Watch(called_at=called, answered_at=answered, own_ids=own_pilots(t))
+    eids = _endpoint_ids(t)
     if _stop(t) is None or answered is None:
         w.unverifiable = "nothing to watch: no stop_endpoint answer in the run"
     elif ctx.tap.path is None:
         w.unverifiable = ("no admin tap: HPCB_ADMIN_TAP is unset — run the cell through run_smoke.sh on the fake target, "
                           "which samples the scheduler through its admin channel")
     else:
+        # by id as well (sacct -j): the window and squeue's MinJobAge may both miss a job that lived seconds
+        asked = ctx.tap.request_ids(sorted(w.own_ids))
         left = answered + w.window_s - time.time()
         print(f"  relaunch watch: reading the admin tap until {w.window_s:.0f} s after the stop answered "
-              f"(~{max(0.0, left):.0f} s more)", flush=True)
+              f"(~{max(0.0, left):.0f} s more){'; asked for job ' + ', '.join(sorted(w.own_ids)) + ' by id' if asked else ''}",
+              flush=True)
         samples = await ctx.tap.wait_until(answered + w.window_s, deadline_s=max(0.0, left) + 90.0)
         good = [s for s in samples if s.now is not None]
         w.samples = len(samples)
         w.covered_until = max((s.now for s in good), default=None)
-        w.jobs = endpoint_jobs(good, _endpoint_ids(t))
+        w.jobs = endpoint_jobs(good, eids)
+        w.seen_unmarked = {j.job_id for s in good for j in [*s.queue, *s.history] if j.job_id in w.own_ids}
         if not any(s.now >= answered for s in good if s.now is not None):
             errors = [s.error for s in samples if s.error][-2:]
             w.unverifiable = (f"the admin tap has no sample after the stop answered ({len(samples)} sample(s)"
                               + (f"; {' | '.join(errors)}" if errors else "") + ")")
-    return [no_relaunch_after_down(t, w), relaunch_report(w)]
+    await _read_logs(ctx, eids, w)
+    return [no_relaunch_after_down(t, w), relaunch_report(w), strategy_after_stop(w)]
 
 
 WORLD_CHECKS = [relaunch_watch]

@@ -65,9 +65,17 @@ def _job(job_id: str, submit: float | None, state: str = "PENDING", reason: str 
                               command=SCRIPT_OF.format(eid=eid, ts=int(submit or 0)), seen_at=seen_at)
 
 
-def _watch(*jobs: admin_tap.SlurmJob, covered: float = 250.0, unverifiable: str | None = None) -> qcr.Watch:
+OWN = None   # sentinel: the cell's own pilot (job 7, cancelled by the stop) as the tap saw it
+
+
+def _watch(*jobs: admin_tap.SlurmJob, covered: float = 250.0, unverifiable: str | None = None,
+           own: set[str] | None = None, log_lines: list | None = None) -> qcr.Watch:
+    """A watch that saw the cell's own pilot (job 7) unless told otherwise — the PASS path needs that proof."""
+    if not any(j.job_id == "7" for j in jobs) and own is None:
+        jobs = (_job("7", T_STOP - 9, state="CANCELLED", reason=""), *jobs)
     return qcr.Watch(called_at=T_STOP - 0.6, answered_at=T_STOP, window_s=240.0, covered_until=T_STOP + covered,
-                     samples=26, jobs=list(jobs), unverifiable=unverifiable)
+                     samples=26, jobs=list(jobs), unverifiable=unverifiable, own_ids={"7"} if own is None else own,
+                     log_lines=log_lines)
 
 
 # ---- the grader -------------------------------------------------------------------------------------------------------
@@ -86,6 +94,7 @@ def test_a_down_with_no_relaunch_passes_on_a_covered_watch_with_the_check_queued
     w = _watch(_job("7", T_STOP - 9, state="CANCELLED", reason=""))
     r = qcr.no_relaunch_after_down(_trace(DOWN), w)
     assert r.ok and r.detail.startswith("ok:") and "250 s" in r.detail and "job 7 PENDING (BeginTime)" in r.detail
+    assert "the tap saw its own pilot (job 7 CANCELLED [squeue])" in r.detail
 
 
 def test_a_draining_stop_is_another_premise_report_only_and_passes_saying_so():
@@ -179,8 +188,11 @@ def test_the_latest_view_of_a_job_wins_and_the_queue_beats_the_history_within_a_
 def test_the_sample_command_asks_for_epoch_times_the_marker_and_the_clock(tmp_path):
     cmd = admin_tap.slurm_sample_cmd()
     assert "SLURM_TIME_FORMAT=%s" in cmd and "TZ=UTC" in cmd and "echo HPCB_NOW $(date +%s)" in cmd
-    assert "squeue -u {user} -h -o '%i|%T|%V|%r|%o'" in cmd and "SubmitLine" in cmd and "-S now-2hours" in cmd
+    # -t all: a job finished within MinJobAge is still listed; -s <every state>: a never-eligible (held) job is too
+    assert "squeue -u {user} -h -t all -o '%i|%T|%V|%r|%o'" in cmd and "SubmitLine" in cmd and "-S now-2hours" in cmd
+    assert f"-s {admin_tap.SACCT_STATES}" in cmd and admin_tap.SACCT_STATES.split(",")[:3] == ["PD", "R", "CA"]
     assert qcr.ADMIN_TAP["cmd"] == cmd and qcr.ADMIN_TAP["every_s"] == 10
+    assert qcr.ADMIN_TAP["ids_cmd"] == admin_tap.slurm_ids_cmd() and "sacct -j {ids} -X -n -P" in qcr.ADMIN_TAP["ids_cmd"]
     # the login-shape poll matches the same marker the product's release does, and prints nothing on no match
     poll = qcr.pilot_poll_cmd(EID)
     assert f"m=uep.{EID}" in poll and "index($4,m)" in poll and poll.endswith("; true")
@@ -212,7 +224,8 @@ def test_the_tap_cli_substitutes_the_pool_user_and_stops_on_sigterm(tmp_path):
     stub = tmp_path / "admin.sh"
     stub.write_text('#!/usr/bin/env bash\necho "HPCB_NOW $(date +%s) $*"\n')
     stub.chmod(0o755)
-    knob = json.dumps({"cmd": "squeue -u {user}", "every_s": 0.2})
+    knob = json.dumps({"cmd": "squeue -u {user}", "every_s": 0.2, "ids_cmd": "sacct -j {ids}"})
+    admin_tap.ids_path(out).write_text("4 5\n")   # the jail asked for jobs 4 and 5
     p = subprocess.Popen([sys.executable, str(HERE / "admin_tap.py"), "--out", str(out), "--user", "hpcbridge-test-05",
                           "--knob", knob, "--", str(stub)])
     try:
@@ -224,7 +237,7 @@ def test_the_tap_cli_substitutes_the_pool_user_and_stops_on_sigterm(tmp_path):
         p.terminate()
         assert p.wait(timeout=10) == 0
     rows = admin_tap.read_samples(out)
-    assert len(rows) >= 2 and rows[0]["rc"] == 0 and "squeue -u hpcbridge-test-05" in rows[0]["out"]
+    assert len(rows) >= 2 and rows[0]["rc"] == 0 and "squeue -u hpcbridge-test-05; sacct -j 4,5" in rows[0]["out"]
 
 
 # ---- the world check: waits on the tap, then grades -----------------------------------------------------------------
@@ -246,20 +259,22 @@ def test_the_world_check_reads_the_tap_and_fails_a_relaunch(tmp_path):
                     f"HPCB_NOW {T_STOP - 5:.0f}\nHPCB_Q 7|PENDING|{T_STOP - 9:.0f}|BeginTime|{run}",
                     f"HPCB_NOW {T_STOP + 70:.0f}\nHPCB_Q 8|PENDING|{T_STOP + 63:.0f}|BeginTime|{run}\n"
                     f"HPCB_A 7|parsl.x|CANCELLED by 0|{T_STOP - 9:.0f}|Unknown|{T_STOP:.0f}|sbatch {run}",
-                    f"HPCB_NOW {T_STOP + 245:.0f}\nHPCB_Q 8|PENDING|{T_STOP + 63:.0f}|BeginTime|{run}")
+                    f"HPCB_NOW {T_STOP + 425:.0f}\nHPCB_Q 8|PENDING|{T_STOP + 63:.0f}|BeginTime|{run}")
     ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap))
-    gated, report = asyncio.run(qcr.relaunch_watch(ctx))
+    gated, report, strategy = asyncio.run(qcr.relaunch_watch(ctx))
     assert not gated.ok and "job 8 submitted +63 s after the stop answered, PENDING (BeginTime)" in gated.detail
-    assert report.name == "relaunch_watch" and "3 admin sample(s), covering 245 s" in report.detail
-    assert "job 7 CANCELLED" in report.detail
+    assert report.name == "relaunch_watch" and "3 admin sample(s), covering 425 s" in report.detail
+    assert "job 7 CANCELLED" in report.detail and "the cell's own pilot(s): 7" in report.detail
+    assert strategy.name == "strategy_after_stop" and strategy.detail.startswith("UNVERIFIABLE")   # no world channel
+    assert (tap.parent / (tap.name + ".ids")).read_text().split() == ["7"]   # the tap was asked for job 7 by id
 
 
 def test_the_world_check_passes_a_quiet_covered_queue_and_is_unverifiable_without_a_tap(tmp_path):
     run = SCRIPT_OF.format(eid=EID, ts=1)
     tap = _tap_file(tmp_path, f"HPCB_NOW {T_STOP - 5:.0f}\nHPCB_Q 7|PENDING|{T_STOP - 9:.0f}|BeginTime|{run}",
-                    f"HPCB_NOW {T_STOP + 241:.0f}\n")
+                    f"HPCB_NOW {T_STOP + 421:.0f}\n")
     ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap))
-    assert asyncio.run(qcr.relaunch_watch(ctx))[0].ok
+    assert asyncio.run(qcr.relaunch_watch(ctx))[0].ok   # the default watch: 420 s
     blind = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(None))
     gated = asyncio.run(qcr.relaunch_watch(blind))[0]
     assert not gated.ok and "HPCB_ADMIN_TAP is unset" in gated.detail
@@ -267,6 +282,131 @@ def test_the_world_check_passes_a_quiet_covered_queue_and_is_unverifiable_withou
                                   tap=admin_tap.TapReader(_tap_file(tmp_path, f"HPCB_NOW {T_STOP - 5:.0f}\n")))
     stale.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=stale.tap.samples())   # no waiting in a test
     assert "no sample after the stop answered" in asyncio.run(qcr.relaunch_watch(stale))[0].detail
+
+
+# ---- a blind watch never passes (the first live run passed blind, 2026-10-15) ------------------------------------------
+
+def test_a_watch_that_never_saw_the_cells_own_pilot_fails_blind():
+    blind = qcr.no_relaunch_after_down(_trace(DOWN), _watch(own={"7"}))   # 37 samples, none of them job 7
+    assert not blind.ok and blind.detail.startswith("watch blind: the tap never saw this endpoint's own pilot (job 7)")
+    # seen by id but without the marker: a relaunch would go unmatched too
+    w = _watch(own={"7"})
+    w.seen_unmarked = {"7"}
+    assert "without the uep.<eid> marker" in qcr.no_relaunch_after_down(_trace(DOWN), w).detail
+    # no own pilot id at all (the stop released none, no poll saw one): nothing proves the tap can see this endpoint
+    stop = {**DOWN, "notice": "compute block released over AMQP (released none)"}
+    nothing = qcr.no_relaunch_after_down(_trace(stop, pilot=""), _watch(own=set()))
+    assert not nothing.ok and "no pilot id of this cell is known" in nothing.detail
+    assert qcr.own_pilots(_trace(DOWN)) == {"7"}
+
+
+def test_a_scale_out_in_the_endpoint_log_that_the_tap_missed_fails_blind():
+    line = qcr.LogLine(T_STOP + 61, "uep 9f7c4349", "INFO MainProcess-443 JobStatusPoller-x parsl.executors."
+                       "status_handling:207 scale_out_facade [Scaling executor X] Scaling out by 1 blocks")
+    r = qcr.no_relaunch_after_down(_trace(DOWN), _watch(log_lines=[line]))
+    assert not r.ok and r.detail.startswith("watch blind:")
+    assert "+61 s [uep 9f7c4349] INFO [Scaling executor X] Scaling out by 1 blocks" in r.detail
+    row = qcr.strategy_after_stop(_watch(log_lines=[line]))
+    assert not row.ok and row.detail.startswith("SCALE-OUT after the stop (1 strategy line(s))")
+
+
+# The first live run's endpoint log (bundle 1792117501-3824-56199-queued_check_relaunch, endpoint-logs.txt), cut to the
+# lines that matter: the compute user endpoint scaled out (job 1) BEFORE the stop, then went to bad state after it.
+RUN2_EID = "da39df5f-29d2-43fb-949d-d5c574b709f3"
+RUN2_LOG = f"""=== /home/hpcbridge-test-00/.globus_compute/hpc-bridge-fake-1792117501-3824-56199/endpoint.log (12 lines; last 2000)
+2026-10-16 02:26:48,059473 INFO MainProcess-345 MainThread-281473343582240 globus_compute_endpoint.endpoint.core_endpoint:1079 cmd_start_endpoint Creating new user endpoint (pid: 443) [(hpcbridge-test-00, uep.{RUN2_EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0) globus-compute-endpoint _start-user-endpoint uep.{RUN2_EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0]
+2026-10-16 02:27:56,235656 INFO MainProcess-345 MainThread-281473343582240 globus_compute_endpoint.endpoint.core_endpoint:330 wait_for_children Command stopped normally (443) [(hpcbridge-test-00, uep.{RUN2_EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0)]
+=== /home/hpcbridge-test-00/.globus_compute/uep.{RUN2_EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0/endpoint.log (43 lines; last 2000)
+2026-10-16 02:26:54,868916 INFO MainProcess-443 JobStatusPoller-Timer-Thread-281473486913616-281473198059936 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 1 blocks
+2026-10-16 02:26:54,868967 INFO MainProcess-443 JobStatusPoller-Timer-Thread-281473486913616-281473198059936 parsl.executors.status_handling:210 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Allocated block ID 0
+2026-10-16 02:27:55,056648 ERROR MainProcess-443 JobStatusPoller-Timer-Thread-281473486913616-281473198059936 parsl.executors.status_handling:145 set_bad_state_and_fail_all Setting bad state due to exception
+parsl.jobs.errors.TooManyJobFailuresError: Error 1:
+\tJob is marked as MISSING since the workers failed to register to the executor. Check the stdout/stderr logs in the submit_scripts directory for more debug information
+
+2026-10-16 02:27:55,059102 INFO MainProcess-443 JobStatusPoller-Timer-Thread-281473486913616-281473198059936 parsl.jobs.strategy:195 _general_strategy [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Not strategizing for executor because bad state
+2026-10-16 02:27:55,346706 WARNING MainProcess-443 MainThread-281473622724640 parsl.jobs.job_status_poller:66 close Not scaling in executor GlobusComputeEngine-HighThroughputExecutor because it is in bad state
+2026-10-16 02:27:55,367169 INFO MainProcess-443 MainThread-281473622724640 globus_compute_endpoint.endpoint.endpoint:626 start_interchange 
+---------- Endpoint shutdown: 9f7c4349-a8a6-c03a-5267-6989ae992de0
+"""
+# its stop_endpoint, from the run's journal: called 02:26:58.520 UTC, 990 ms
+RUN2_STOP = 1792117618.52
+
+
+def test_the_endpoint_log_after_the_stop_reads_as_the_first_run_went_bad_state_no_scale_out():
+    lines = qcr.strategy_lines(RUN2_LOG, RUN2_STOP - 1.0)
+    # 56–58 s after the stop: the job-status poll after the cancel (parsl reads Slurm every 60 s), in time order
+    assert [(round(x.at - RUN2_STOP), x.where) for x in lines] == [
+        (57, "uep 9f7c4349"), (57, "uep 9f7c4349"), (57, "uep 9f7c4349"), (57, "uep 9f7c4349"), (58, "manager")]
+    assert "marked as MISSING" in lines[0].text and "TooManyJobFailuresError" in lines[0].text   # folded continuation
+    assert "Not strategizing for executor because bad state" in lines[1].text
+    assert "Endpoint shutdown: 9f7c4349" in lines[3].text and "Command stopped normally (443)" in lines[4].text
+    # the scale-out of the cell's own pilot came BEFORE the stop, so it is not one after it
+    before = qcr.strategy_lines(RUN2_LOG, 0.0)
+    assert any("Scaling out by 1 blocks" in x.text for x in before) and len(before) == 8
+    w = qcr.Watch(called_at=RUN2_STOP, answered_at=RUN2_STOP + 0.99, log_lines=lines)
+    row = qcr.strategy_after_stop(w)
+    assert row.ok and row.detail.startswith("no scale-out after the stop (5 strategy line(s)): +56 s [uep 9f7c4349] "
+                                            "ERROR Setting bad state due to exception ⏎ parsl.jobs.errors."
+                                            "TooManyJobFailuresError")
+    assert qcr.no_relaunch_after_down(_trace(DOWN), _watch(log_lines=lines)).ok   # no contradiction: it never scaled out
+
+
+def test_the_real_sacct_and_squeue_lines_of_a_held_cancelled_pilot_are_this_endpoints_own(tmp_path):
+    # the first live run's job 1, as the controller lists it (sacct -j 1 -X -n -P: `CANCELLED by 2000`, SubmitLine =
+    # parsl's `sbatch <script>` under uep.<eid>.<uep>/submit_scripts/) and as `squeue -t all` lists it within MinJobAge
+    script = (f"/home/hpcbridge-test-00/.globus_compute/uep.{RUN2_EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0/"
+              "submit_scripts/parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792117614.8689604.submit")
+    s = admin_tap.parse_slurm_sample({"t": 1.0, "rc": 0, "out": "\n".join([
+        "HPCB_NOW 1792117624",
+        f"HPCB_Q 1|CANCELLED|1792117614|None|{script}",
+        "HPCB_A 1|parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792117614.8689604|CANCELLED by 2000|"
+        f"2026-10-16T02:26:54|Unknown|2026-10-16T02:26:59|sbatch {script}",
+    ])})
+    (job,) = qcr.endpoint_jobs([s], [RUN2_EID])
+    assert (job.job_id, job.state, job.submit, job.end, job.source) == ("1", "CANCELLED", 1792117614.0, 1792117619.0,
+                                                                       "sacct+squeue")
+
+
+def test_the_world_check_asks_the_tap_for_its_own_pilot_and_the_host_tap_looks_it_up_by_id(tmp_path):
+    out = tmp_path / ".admin-tap-r1.jsonl"
+    reader = admin_tap.TapReader(out)
+    assert reader.request_ids(["1", "12_3", "1; rm -rf /", "x"]) and admin_tap.read_ids(admin_tap.ids_path(out)) == \
+        ["1", "12_3"]
+    assert not admin_tap.TapReader(None).request_ids(["1"]) and not reader.request_ids(["$(id)"])
+    seen: list[str] = []
+
+    def run(argv):
+        seen.append(argv[-1])
+        return 0, "HPCB_NOW 5\n"
+
+    clock = iter(range(0, 100, 10))
+    admin_tap.tap(out, ["docker", "exec", "c", "bash", "-lc"], "squeue", every_s=10, max_s=15, run=run,
+                  ids_cmd="sacct -j {ids} -X", sleep=lambda s: None, clock=lambda: float(next(clock)))
+    assert seen == ["squeue; sacct -j 1,12_3 -X"] and admin_tap.read_samples(out)[0]["ids"] == ["1", "12_3"]
+
+
+def test_the_world_check_reads_the_endpoint_log_over_the_world_channel_before_the_teardown(tmp_path):
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    tap = _tap_file(tmp_path, f"HPCB_NOW {T_STOP + 5:.0f}\nHPCB_Q 7|CANCELLED|{T_STOP - 9:.0f}|None|{run}",
+                    f"HPCB_NOW {T_STOP + 421:.0f}\n")
+    asked: list[tuple[str, int]] = []
+    log = RUN2_LOG.replace(RUN2_EID, EID)
+
+    def ssh(cmd, timeout):
+        asked.append((cmd, timeout))
+        return 0, log
+
+    ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(answered=RUN2_STOP + 0.99),
+                                tap=admin_tap.TapReader(tap), ssh=ssh, endpoint_name="hpc-bridge-fake-1")
+    ctx.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=ctx.tap.samples())
+    gated, _report, strategy = asyncio.run(qcr.relaunch_watch(ctx))
+    (cmd, timeout), = asked
+    assert "hpc-bridge-fake-1/endpoint.log" in cmd and f'uep."{EID}.*/endpoint.log' in cmd and timeout == 120
+    assert strategy.ok and "Not strategizing for executor because bad state" in strategy.detail
+    assert gated.name == qcr.NO_RELAUNCH
+    failed = types.SimpleNamespace(**{**vars(ctx), "ssh": lambda cmd, timeout: (255, "ssh: connect to host login")})
+    failed.tap.wait_until = ctx.tap.wait_until
+    assert "UNVERIFIABLE — the endpoint's logs were not read: rc=255" in asyncio.run(qcr.relaunch_watch(failed))[2].detail
 
 
 # ---- the script, against a stand-in server ----------------------------------------------------------------------------

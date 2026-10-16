@@ -282,7 +282,7 @@ TAP_PID=""; TAP_FILE=""
 stop_tap() {
   [ -z "$TAP_PID" ] || kill "$TAP_PID" 2>/dev/null
   TAP_PID=""
-  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE"
+  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE" "$TAP_FILE.ids"   # .ids: the jobs the jail asked the tap to look up by id
 }
 if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   [ -n "${HPCB_T_ADMIN_ARGV:-}" ] || { echo "ERROR: scenario '$SCENARIO' declares ADMIN_TAP but target '$TARGET' has no admin channel (fake only)"; exit 2; }

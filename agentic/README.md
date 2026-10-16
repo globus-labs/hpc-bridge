@@ -126,7 +126,7 @@ with no SCRIPT is refused (`RESULT: SETUP FAILED`, exit 2), and the operator tak
 ```bash
 # the queued-check relaunch proof: stop_endpoint says `down` while the canary is queued — does a new pilot follow?
 HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch
-#   knobs: HPCB_RELAUNCH_WATCH_S (default 240: how long the world check watches the queue after the stop),
+#   knobs: HPCB_RELAUNCH_WATCH_S (default 420: how long the world check watches the queue after the stop),
 #          HPCB_RELAUNCH_HOLD_S (default 1800: the `#SBATCH --begin` hold that keeps every pilot PENDING; 0 = none),
 #          HPCB_RELAUNCH_PILOT_WAIT_S (default 180: how long the script waits for its pilot to be queued)
 ```
@@ -134,9 +134,13 @@ HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_sm
 pilot held PENDING by an `#SBATCH --begin` hold, so the canary cannot run first — on idle fake nodes the worker answers
 it within ~5 s of the sbatch), confirms a compute block, polls `squeue` on the login shape until its pilot is queued,
 and stops at once — no teardown. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
-submitted after the stop's answer (`world:no_relaunch_after_down`, gated), before the harness tears down. Expected on
-main if the review's claim holds: FAILED, a new pilot ~60–65 s after the `down` (the scenario's docstring has the
-mechanism and the evidence). Run it by hand; the sweeps leave it out.
+submitted after the stop's answer (`world:no_relaunch_after_down`, gated), and the world check reads the endpoint's own
+log for parsl's decisions after the stop (`strategy_after_stop`, reported), before the harness tears down. A watch that
+never saw the cell's OWN pilot fails as blind — the first live run (2026-10-15) passed blind: its pilot lived 4.6 s
+between two samples, and `sacct -S <window>` lists no job that was never eligible. Expected on main if the review's
+claim holds: FAILED, a new pilot ~60–65 s after the `down`. That first run's endpoint log showed none: 56 s after the
+stop parsl marked the cancelled, never-connected block MISSING, went to bad state ("Not strategizing") and the user
+endpoint shut down (the scenario's docstring has the detail). Run it by hand; the sweeps leave it out.
 
 **World checks that watch, and the ADMIN TAP.** A scenario's `WORLD_CHECKS` are async callables
 `fn(ctx) -> list[Result]` that run.py awaits after the operator and BEFORE the declarative POSTCHECKS and the teardown
@@ -147,8 +151,13 @@ gets the tap: run_smoke.sh starts `harness/admin_tap.py` on the HOST before the 
 target's admin channel (fake: `docker exec` into the controller as root; `{user}` = the pool user) every `every_s`
 seconds into `agentic/runs/.admin-tap-<runid>.jsonl`; the jail reads it (`HPCB_ADMIN_TAP`), the bundle keeps the samples
 (`admin-tap.jsonl`), and the EXIT trap stops the tap and removes the raw file. `admin_tap.slurm_sample_cmd()` samples
-the controller's clock, the pool user's queue and its accounting history, with epoch times. A target with no admin
-channel (globus1: we are not its admin) refuses the cell; `run_suite` skips it.
+the controller's clock, the pool user's jobs (`squeue -t all`: also those finished within MinJobAge) and its accounting
+in every state (`sacct -s …`: without a state list sacct shows only jobs that were eligible in the window, and a held job
+never is), with epoch times. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
+the tap's); the host tap then adds the scenario's `ids_cmd` (`sacct -j {ids}`) to every sample and takes one at once.
+`ctx.ssh(cmd, timeout)` is the harness' world channel (the endpoint's own logs, read before the teardown deletes them)
+and `ctx.endpoint_name` this run's endpoint. A target with no admin channel (globus1: we are not its admin) refuses the
+cell; `run_suite` skips it.
 
 **INFRA: the model endpoint failed, not hpc-bridge.** ALCF's endpoint can be slow or broken for hours (2026-10-14/15:
 its streaming path answered HTTP 200 carrying `StreamingTimeoutError`; Pi then ended with an empty answer and no tool
@@ -502,7 +511,7 @@ SCRIPT = my_script                     # optional: `async def my_script(ops) -> 
 OPERATORS = ("script",)                # optional: the only operators that may drive it (others: SKIPPED)
 WORLD_CHECKS = [my_watch]              # optional: `async def my_watch(ctx) -> list[Result]`, after the agent, before the
                                        #   POSTCHECKS and the teardown (a `world:*` row gates; see "World checks that watch")
-ADMIN_TAP = {"cmd": "…{user}…", "every_s": 10}   # optional: sample the scheduler as its admin for the whole cell (fake
+ADMIN_TAP = {"cmd": "…{user}…", "every_s": 10, "ids_cmd": "…{ids}…"}   # optional: sample the scheduler as its admin (fake
                                        #   only; run_smoke.sh starts harness/admin_tap.py; WORLD_CHECKS read `ctx.tap`)
 SETUP = [{"cmd": "…", "on": "each_login"}]  # SETUP/CLEANUP entries may be dicts fanning out to every login node
 ```

@@ -28,6 +28,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
+from collections.abc import Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -438,11 +439,15 @@ def _postchecks(scen) -> list[Result]:
 @dataclass
 class WorldContext:
     """What a scenario's WORLD_CHECKS are handed: the run's graded trace, its messages (the CLI and script operators'
-    journal rows carry the server's own clock), and the cell's admin tap (admin_tap.TapReader — the scheduler as its
-    admin saw it; reads nothing when the cell has no tap)."""
+    journal rows carry the server's own clock), the cell's admin tap (admin_tap.TapReader — the scheduler as its admin
+    saw it; reads nothing when the cell has no tap), the harness' world channel (`ssh(cmd, timeout)`: one command on the
+    login node as the pool user — e.g. the endpoint's own logs, read before the teardown deletes them) and this run's
+    endpoint name."""
     trace: Trace
     messages: list
     tap: TapReader
+    ssh: Callable[[str, int], tuple[int, str]]
+    endpoint_name: str
 
 
 async def _world_checks(scen, res) -> list[Result]:
@@ -453,7 +458,9 @@ async def _world_checks(scen, res) -> list[Result]:
     every postcheck does) or the scenario's EXPECT_OK names it; the rest are reported. A check that raises is a failed
     `world:<its name>` row, never a crashed run."""
     ctx = WorldContext(trace=res.trace, messages=list(res.messages or []),
-                       tap=TapReader(os.environ.get(TAP_ENV, "").strip() or None))
+                       tap=TapReader(os.environ.get(TAP_ENV, "").strip() or None),
+                       ssh=lambda cmd, timeout=120: _ssh_run(cmd, timeout=timeout),
+                       endpoint_name=os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip())
     out: list[Result] = []
     for fn in getattr(scen, "WORLD_CHECKS", None) or []:
         name = getattr(fn, "__name__", "world_check")
