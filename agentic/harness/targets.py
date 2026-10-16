@@ -28,12 +28,17 @@ PROFILES_DIR = REPO_ROOT / "agentic" / "fakecluster" / "profiles"
 # What the lab cluster offers, in the same vocabulary as a fake-cluster profile's [capabilities]. Four compute nodes
 # since the 2026-10 Spark rebuild (spark1-4 on main/backfill; spark5-6 sit in a `service` partition no cell may use).
 # `catalog`: where `list_facilities` / a catalogued connect read the facilities from — the public registry here.
+# `pilot_end_wait_s`: how long the universal pilot check (run._no_pilot_left) waits for a cancelled or exiting pilot to
+# leave the queue — a real cluster's epilogue can hold a job in CG / E for minutes; the fake cluster's default is
+# FAKE_PILOT_END_WAIT_S (a profile may set its own).
 GLOBUS1_CAPABILITIES = {
     "scheduler": "slurm", "nodes": 4, "login_nodes": 1, "login_hosts": ["globus1.cs.uchicago.edu"],
     "partitions": ["main", "backfill"], "default_partition": "main", "accounting": "none", "accounts": ["lab"],
     "balance_tool": "none", "nics": 1, "qos": [], "gres": "none", "module_system": "none", "mfa": "none",
-    "catalog": "registry",
+    "catalog": "registry", "pilot_end_wait_s": 300,
 }
+# The fake cluster: KillWait=30 (Slurm, no epilog) and a qdel'd PBS job listed R/E for ~19 s (live 2026-10-16).
+FAKE_PILOT_END_WAIT_S = 60
 
 
 @dataclass(frozen=True)
@@ -136,6 +141,7 @@ def get(name: str | None = None) -> Target:
         profile = os.environ.get("HPCB_FAKE_PROFILE", "default")
         man = load_profile(profile)
         caps = dict(man.get("capabilities", {}))
+        caps.setdefault("pilot_end_wait_s", FAKE_PILOT_END_WAIT_S)
         port = os.environ.get("HPCB_FAKE_SSH_PORT", "2222")
         key = os.environ.get("HPCB_FAKE_KEY", f"{home}/.ssh/hpcb-fake")
         nohostkey = ("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR")

@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Callable
+from collections.abc import Awaitable, Callable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -367,13 +367,207 @@ def _local_setup(scen, runner=None) -> bool:
 # billed pilot blocks, ignoring legitimate survivors — an sbatch'd long job SHOULD outlive the
 # agent, and saturation sleepers are the harness', not the agent's. Scheduler-specific: Slurm's
 # `squeue` vs PBS's `qstat` (a scenario declares `SCHEDULER = "pbs"`; default slurm).
+# Each listing carries the job's id and STATE, not only its name, so `_no_pilot_left` can wait out a pilot that is only
+# ending. PBS: -w (wide) keeps 15 columns of the name (`parsl.GlobusCo*`); no `2>/dev/null || true` any more — that read
+# a qstat that failed as an empty queue. An empty queue is rc 0 with no output (every fake-PBS bundle's
+# `qstat -u $USER` with no job, e.g. 1788627910), so a nonzero rc is an unreadable queue and fails. Slurm's `%t` is the
+# compact state (`CG`, never `COMPLETING`). NB, unchanged: on a facility-MEP profile the pilots run as the MAPPED account
+# (`hpcbmep`, `glabs-gc`), so `-u "$(whoami)"` (the pool user) lists none of them — those scenarios check the mapped
+# account themselves (mep_compute_only, fake_pbs_mep_compute).
 def _universal_postchecks(scheduler: str) -> list[dict]:
     if scheduler == "pbs":  # noqa: SIM108
-        # -w (wide) so the pilot job name isn't truncated; `|| true` -> empty output reads as "no leak".
-        cmd = 'qstat -u "$(whoami)" -w 2>/dev/null || true'
+        cmd = 'qstat -u "$(whoami)" -w'
     else:
-        cmd = 'squeue -u "$(whoami)" -h -o %j'
-    return [{"name": "stop_honesty_no_pilot_left", "cmd": cmd, "expect_absent": "parsl"}]
+        cmd = 'squeue -u "$(whoami)" -h -o "%i %t %j"'
+    return [{"name": "stop_honesty_no_pilot_left", "cmd": cmd, "pilots": scheduler}]
+
+
+# A pilot the scheduler itself lists as on its way OUT: PBS `E` (exiting, still listed until the MoM's obit) and Slurm
+# `CG` (completing: its epilog running, its processes being killed — KillWait=30 on the fake cluster). And the state a
+# job a stop cancelled may still be listed in before that, on PBS ONLY: R — OpenPBS's qdel is asynchronous (below), and
+# only for PBS_CANCEL_GRACE_S (kill_delay plus the MoM's report; the live case cleared in 18 s), not the whole bound. On
+# Slurm scancel moves a running job to CG at once: a job a stop cancelled still listed R there is evidence the stop's
+# claim was false, and the check never excuses it on the word of the product under test.
+_ENDING_STATES = {"pbs": frozenset({"E"}), "slurm": frozenset({"CG"})}
+_RUNNING_STATES = {"pbs": frozenset({"R"}), "slurm": frozenset()}
+PBS_CANCEL_GRACE_S = 60.0
+# How long `_no_pilot_left` waits for ending pilots to leave the queue (the TARGET's `pilot_end_wait_s` capability —
+# targets.py: 60 s on the fake cluster, longer on a real one, whose epilogues can hold a job in E / CG for minutes; with
+# no target known, a run against a real facility from the operator's machine, the long value), and how often it looks.
+# Live 2026-10-16, fake PBS, twice: happy_path run 1792140540 — the stop answered `down` after `qdel 0.pbsserver` at
+# 08:49:52, PBS listed the job as E until 08:50:11 (its obittime) and the check, run inside those 19 s, failed a clean
+# cell; then Pi's happy_path run 1792166459 on the first version of this wait — "released 0.pbsserver" at 16:01:51, and
+# PBS kept listing the job as R (not E) until it ended at 16:02:09: the server signals the MoM and the state changes only
+# when the MoM reports, so a confirmed cancel is not visible as E at once. Neither was a relaunch. Each look is its own
+# ssh call (in a thread, so a SIGTERM's cancel lands at once: the run's INTERRUPTED path still tears down and writes the
+# bundle — `docker stop --stop-timeout 120`), its timeout capped by what is left of the bound; the postchecks run on the
+# graded path only, and only a pilot that is ending is waited for. A listing that fails is retried up to
+# PILOT_LIST_RETRIES times in a row within the bound (a busy PBS server, errno 15010; a slurmctld timeout), never read
+# as empty.
+PILOT_END_WAIT_UNKNOWN_S = 300.0
+PILOT_ENDING_POLL_S = 5.0
+PILOT_LIST_RETRIES = 2
+
+# The jobs a stop_endpoint answer says it cancelled — its release's own detail, quoted in the notice
+# (scheduler_ops._release_cmd / server._release_until_settled): `compute block released over AMQP (released 4 5)` (a
+# `down`, or a `draining` that names what it did cancel), `released 4. Spend is NOT confirmed…` (a stop that leads with
+# the detail), and a release the scheduler partly refused, `'release failed: qdel refused 3; cancelled: 4'` — the
+# refused ids are NOT cancelled and are never read. Only these anchors, and only job-id-shaped words after them
+# (Slurm `12`, `12_3`; PBS `0.pbsserver`, `12[3].host.domain`): `released none`, `released over AMQP` and anything else
+# yield nothing, and a stop whose ids cannot be read leaves the check on the job states alone. Nor is a count ever read
+# as ids: a run of numbers followed by `block(s)` / `job(s)` / `pilot(s)` (`released 1 block`) yields nothing — the
+# run is possessive, so it cannot give back its last number to dodge that. The notice is read where the result holds
+# it: its `notice` field, or — a CLI operator's native shape, `{"text": "<the tool's JSON>"}` — the JSON's `notice`
+# once decoded, as cli_runner._journal_call decodes a journal row's string result (else the text as it is).
+_JOB_ID = r"\d+(?:_\d+)?(?:\[\d*\])?(?:\.[A-Za-z0-9-]+)*(?=[\s).,;'\"]|$)"
+_IDS = rf"((?: +{_JOB_ID})++)(?! +(?:block|job|pilot)s?\b)"
+_CANCELLED_RE = re.compile(rf"(?:^|\()released{_IDS}|cancelled:{_IDS}")
+
+
+def _stop_notice(result: dict | None) -> str:
+    r = result or {}
+    if r.get("notice") is not None or not isinstance(r.get("text"), str):
+        return str(r.get("notice") or "")
+    try:
+        obj = json.loads(r["text"])
+    except ValueError:
+        return r["text"]
+    return str(obj.get("notice") or "") if isinstance(obj, dict) else r["text"]
+
+
+def _stop_cancelled_jobs(trace: Trace | None) -> list[str]:
+    """Every job id the run's stop_endpoint answers (any status, every phase) say they cancelled, in order, once each."""
+    out: list[str] = []
+    for _i, c in (trace.named("stop_endpoint") if trace is not None else []):
+        for m in _CANCELLED_RE.finditer(_stop_notice(c.result)):
+            out += [j for j in (m.group(1) or m.group(2)).split() if j not in out]
+    return out
+
+
+def _pilot_end_wait_s() -> float:
+    """The bound for this target (its `pilot_end_wait_s` capability), else PILOT_END_WAIT_UNKNOWN_S."""
+    try:
+        return float(_capabilities().get("pilot_end_wait_s") or PILOT_END_WAIT_UNKNOWN_S)
+    except (TypeError, ValueError):
+        return PILOT_END_WAIT_UNKNOWN_S
+
+
+def _job_key(scheduler: str, job: str) -> str:
+    """What makes two spellings of one job equal: PBS's sequence number — `qstat -w` cuts a Job ID to 30 columns
+    (`123456.polaris-pbs-01.hsn.cm.p*`) while the stop's `qstat -f` names it whole, and the check lists one server's
+    jobs; Slurm's id as it is."""
+    return job.split(".", 1)[0] if scheduler == "pbs" else job
+
+
+def _listed_pilots(scheduler: str, out: str) -> list[tuple[str, str]]:
+    """Every line of the queue listing that names a parsl pilot, as (job, state). PBS: the `qstat -w` row's first column
+    and its `S` column (the one before Elap Time — 11 columns in all); Slurm: the `%i %t %j` line's first two words. A
+    line that names `parsl` but does not parse is (its text, "?"): never an ending state nor a cancelled job's id, so it
+    fails the check."""
+    pilots = []
+    for line in out.splitlines():
+        if "parsl" not in line:
+            continue
+        tok = line.split()
+        if len(tok) < (11 if scheduler == "pbs" else 3):
+            pilots.append((line.strip(), "?"))
+        else:
+            pilots.append((tok[0], tok[-2] if scheduler == "pbs" else tok[1]))
+    return pilots
+
+
+def _jobs(pilots: list[tuple[str, str]], notes: dict[str, str] | None = None) -> str:
+    return ", ".join(f"{job} ({state}{(notes or {}).get(job, '')})" for job, state in pilots)
+
+
+def _rc_why(rc: int) -> str:
+    # rc=255 is ssh itself failing (host down, sshd refused): the world could not be checked at
+    # all — still a FAIL (conservative), but labelled so a sweep can separate an outage from a leak.
+    return f"UNVERIFIABLE — ssh rc={rc}" if rc == 255 else f"rc={rc}"
+
+
+async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list[str] | None = None,
+                         wait_s: float = PILOT_END_WAIT_UNKNOWN_S, timeout: int = 60,
+                         sleep: Callable[[float], Awaitable[object]] | None = None,
+                         clock: Callable[[], float] | None = None) -> Result:
+    """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue. A pilot that is ENDING is
+    waited for — re-listed every PILOT_ENDING_POLL_S, up to `wait_s` — and passes once it is gone:
+      - a job the run's own stops said they cancelled (`cancelled`, from `_stop_cancelled_jobs`), while it is listed as
+        ending, or — PBS only, for PBS_CANCEL_GRACE_S — as R (PBS lists a qdel'd job as R until its MoM reports — run
+        1792166459). Once seen ending it may only stay ending, and it is never queued: a cancelled job back in R or in
+        PD / Q / H is a requeue — Slurm and PBS keep the id — and fails at once, as does one still R past the grace
+        (PBS) or R at all (Slurm);
+      - a job the scheduler lists as E / CG though no stop named it: one whose cancel the notice did not spell out, one
+        parsl's idle-release cancelled, one that hit its walltime — the scheduler's own word that it is exiting. A
+        relaunch never enters as one: it is a NEW id, queued.
+    Any other pilot — queued, held, running, unparseable — fails AT ONCE, ending ones beside it or not (a relaunch seen
+    mid-wait too); one still listed at the bound fails, naming it; so does a listing that keeps failing (more than
+    PILOT_LIST_RETRIES in a row, or at the bound) — an unreadable queue is never an empty one. With no id readable from
+    the stops, the states alone decide. A cancel (SIGTERM) during the wait propagates: the run's INTERRUPTED path."""
+    sleep = sleep or asyncio.sleep
+    clock = clock or time.monotonic
+    ending = _ENDING_STATES.get(scheduler, frozenset())
+    running = _RUNNING_STATES.get(scheduler, frozenset())
+    named = {_job_key(scheduler, j) for j in (cancelled or [])}
+    ended: set[str] = set()          # named jobs seen ending: from then on they may only stay ending
+    seen: dict[str, str] = {}
+    notes: dict[str, str] = {}
+    start = clock()
+    fails = 0
+    try:
+        while True:
+            left = wait_s - (clock() - start)
+            rc, out = await asyncio.to_thread(_ssh_run, cmd, timeout=int(max(15.0, min(timeout, left))))
+            waited = clock() - start
+            if rc != 0:
+                fails += 1
+                if fails > PILOT_LIST_RETRIES or waited >= wait_s:
+                    return Result(f"world:{name}", False,
+                                  f"{_rc_why(rc)}: the queue could not be read ({fails} tr{'y' if fails == 1 else 'ies'} "
+                                  f"in a row, {waited:.0f} s of {wait_s:.0f}"
+                                  + (f"; waiting on {_jobs(list(seen.items()), notes)}" if seen else "")
+                                  + f") — output: {out.strip()[:200]!r}")
+                await sleep(max(0.0, min(PILOT_ENDING_POLL_S, wait_s - waited)))
+                continue
+            fails = 0
+            pilots = _listed_pilots(scheduler, out)
+            waiting, live = [], []
+            for job, state in pilots:
+                key = _job_key(scheduler, job)
+                mine = state != "?" and key in named
+                if mine:
+                    notes[job] = "; a stop cancelled it"
+                if state != "?" and state in ending:
+                    ended.add(key)
+                    waiting.append((job, state))
+                elif mine and state in running and key not in ended and waited <= PBS_CANCEL_GRACE_S:
+                    waiting.append((job, state))
+                else:
+                    if mine and key in ended:
+                        notes[job] = "; a stop cancelled it, and it left the ending state — requeued"
+                    elif mine and state in running:
+                        notes[job] = (f"; a stop cancelled it, yet it still runs {waited:.0f} s on — past the "
+                                      f"{PBS_CANCEL_GRACE_S:.0f} s a qdel takes to reach it")
+                    elif mine and state == "R":
+                        notes[job] = "; a stop cancelled it, yet it still runs — scancel moves a job to CG at once"
+                    elif mine:
+                        notes[job] = "; a stop cancelled it, yet it is queued — requeued?"
+                    live.append((job, state))
+            if live:
+                return Result(f"world:{name}", False, f"found a pilot that is not ending: {_jobs(live, notes)}"
+                              + (f"; ending: {_jobs(waiting, notes)}" if waiting else ""))
+            if not pilots:
+                gone = f"ok: {_jobs(list(seen.items()), notes)} ended and left the queue within {waited:.0f} s"
+                return Result(f"world:{name}", True, gone if seen else "ok")
+            seen.update(pilots)
+            if waited >= wait_s:
+                return Result(f"world:{name}", False, f"a pilot still listed after {waited:.0f} s "
+                              f"(the bound is {wait_s:.0f} s): {_jobs(pilots, notes)}")
+            await sleep(max(0.0, min(PILOT_ENDING_POLL_S, wait_s - waited)))
+    except asyncio.CancelledError:
+        print(f"world:{name}: interrupted while waiting for {_jobs(list(seen.items()), notes) or 'the queue'} to end",
+              file=sys.stderr, flush=True)
+        raise
 
 
 def _scheduler(scen) -> str:
@@ -392,16 +586,22 @@ def _local_run(cmd: str, *, timeout: int = 60) -> tuple[int, str]:
         return 255, f"{type(exc).__name__}: {exc}"
 
 
-def _postchecks(scen) -> list[Result]:
+async def _postchecks(scen, res=None) -> list[Result]:
     """World-state assertions, run AFTER the agent but BEFORE teardown — the ordering is the
     grading integrity: harness cleanup (scancel/delete) must never mask what the agent left
     behind. Declarative: run cmd over SSH, then substring expectations on the output.
     `"on": "each_login"` runs it on every login node; `"on": "local"` runs it in the jail itself (what the MCP
-    server, on this host, created — #177's implicit local endpoint appeared there, not on the cluster)."""
+    server, on this host, created — #177's implicit local endpoint appeared there, not on the cluster). `res`: the run's
+    result, whose stop_endpoint answers name the jobs they cancelled (the universal pilot check waits those out)."""
     results = []
     universal = _universal_postchecks(_scheduler(scen))
     login_hosts = _login_hosts() or [os.environ.get("HPC_BRIDGE_SSH_HOST", "")]
     for pc in list(getattr(scen, "POSTCHECKS", [])) + universal:
+        if "pilots" in pc:   # the universal pilot check: job states + the stops' cancels; waits out an ending pilot
+            cancelled = _stop_cancelled_jobs(getattr(res, "trace", None))
+            results.append(await _no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], cancelled=cancelled,
+                                                wait_s=_pilot_end_wait_s(), timeout=pc.get("timeout", 60)))
+            continue
         # "on": "each_login" runs the check on EVERY login node (a round-robin pool: a manager process left on the
         # node the alias did not pick is exactly the leak a pin bug produces) and joins the outputs
         hosts = login_hosts if pc.get("on") == "each_login" else [None]
@@ -419,9 +619,7 @@ def _postchecks(scen) -> list[Result]:
         out = "\n".join(raw)
         ok, why = True, []
         if not pc.get("allow_nonzero_rc") and rc != 0:
-            # rc=255 is ssh itself failing (host down, sshd refused): the world could not be checked at
-            # all — still a FAIL (conservative), but labelled so a sweep can separate an outage from a leak.
-            ok, why = False, [f"UNVERIFIABLE — ssh rc={rc}" if rc == 255 else f"rc={rc}"]
+            ok, why = False, [_rc_why(rc)]
         if "expect_present" in pc and pc["expect_present"] not in out:
             ok = False
             why.append(f"missing {pc['expect_present']!r}")
@@ -1291,7 +1489,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
                 gating.add(r.name)
                 if not r.ok:
                     failed.append(r.name)
-        world = _postchecks(scen)
+        all_results = results + watched   # an interrupt during the pilot wait keeps what was graded
+        world = await _postchecks(scen, res)
         for r in world:
             print(f"  [{'PASS' if r.ok else 'FAIL'}] {r.name} *critical*: {r.detail}")
             gating.add(r.name)
