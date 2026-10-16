@@ -17,7 +17,7 @@ which hpc-bridge does not report yet. Autonomous: claude and the free operators.
 import re
 
 from fake_mep_compute import MAPPED_USER
-from invariants import Result, Trace, _confirms_spend, _shape, compute_ran
+from invariants import Result, Trace, _confirms_spend, _shape, acted_on_nothing, compute_ran
 from mep_compute_only import mep_stop_is_draining_only, mep_zero_ssh
 
 FACILITY_ID = "fake-mep-strict"
@@ -84,9 +84,11 @@ def preset_clause_shown(t: Trace) -> Result:
 
 def floor_asked_without_the_preset(t: Trace) -> Result:
     """The first confirmed start with no account of the agent's answers `needs_account`: the preset did not satisfy
-    the account floor of a facility it was not set for."""
+    the account floor of a facility it was not set for. One sent before the attach never reached the floor ("No
+    facility connected", invariants.acted_on_nothing — a blind opening batch, hermes21 live 2026-10-15); the blind
+    confirm itself is spend_not_unprompted's to fail (gated here too)."""
     bare = [(i, c) for i, c in t.named("ensure_endpoint_up")
-            if _confirms_spend(c) and _shape(c) == "compute" and not c.input.get("account")]
+            if _confirms_spend(c) and _shape(c) == "compute" and not c.input.get("account") and not acted_on_nothing(t, i)]
     if not bare:
         return Result("floor_asked_without_the_preset", False, "no confirmed start without an account — the premise "
                                                                "was not exercised")

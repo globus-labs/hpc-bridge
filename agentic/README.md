@@ -123,9 +123,14 @@ call). Such a cell used to grade FAILED on `agent_engaged`, `compute_ran`, … l
     evidence and is graded — a raw-SSH workaround before an endpoint death still fails `no_ssh_workaround`;
   - and one of: the error the operator's own record says its run ENDED on is an outage (Pi's last `message_end` /
     `auto_retry_end`, Codex's `turn.failed`: an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); the final
-    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
-    badly (non-zero exit, an error, an empty answer) AND the last line of the operator's stderr names an outage (an
-    earlier line may be a retry it recovered from).
+    answer is itself a dead stream (`StreamingTimeoutError`, `Stream ended without finish_reason`); or, in a run that
+    otherwise ended cleanly, the final answer IS a tool call never made (Codex on ALCF's gpt-oss, 2026-10-15), with its
+    own reason for each form: raw harmony tokens the server failed to parse (`<|channel|>commentary
+    to=functions.…<|call|>`), or the call written as JSON (the whole answer one object whose first key is `cmd` /
+    `name` / `tool` / `function` / `recipient`, holding an `mcp__…` tool) — which may be the model writing it on its
+    final channel rather than a parser leak; a sentence that names a tool is neither; or the run ended badly (non-zero
+    exit, an error, an empty answer) AND the last line of the operator's stderr names an outage (an earlier line may be
+    a retry it recovered from).
 
   Never INFRA: a 4xx (a context overflow or an invalid tool schema — hpc-bridge's own tools can cause those), even one
   that quotes a 5xx later in its message; a turn
@@ -217,12 +222,23 @@ of those at once; use `run_suite` for parallelism.
 A scenario's hooks act on the world, or on the agent's session, at a chosen point of the run. Each has ONE trigger:
 
 - `after_tool` — after the Nth result of that tool (`nth`, default 1), optionally only when the call's input matches
-  (`when_input`) or the result's phase does (`when_phase`).
+  (`when_input`), the result's phase does (`when_phase`), the result names the endpoint it acted on
+  (`when_endpoint: True`), or another hook of the scenario has fired (`after_hook: "<name>"`).
 - `on_tool` — a **during** hook: `after_s` seconds after a matching call STARTED, if that call is still in flight
   (`nth` counts the matching calls that were). This is how a scenario presses Esc in the middle of a call.
 
 `when_input` is a dict (each key equal to the call's argument; `True` and `"true"` alike) or a string (a regex searched
-in the call's argument values, e.g. a marker in the command). And one or more actions — what the hook carries:
+in the call's argument values, e.g. a marker in the command). A call that does not match is not counted, so `nth`
+counts only the calls a hook is about. That matters because a model may open with a blind parallel batch before
+anything is connected (hermes21 on gpt-oss, 2026-10-15): `poll_task(task_id="PLACEHOLDER")` → failed, `stop_endpoint` →
+"no endpoint was up". `orphaned_task`'s "after poll_task #1" fired on that poll. Hence `when_phase: "running"` there
+(the poll found the task running), `"complete"` on a compute run that must have RUN, `when_endpoint` on a stop whose
+moment matters whatever it answered, and `after_hook` on a hook that undoes another (`draining_restop`'s thaw: the first
+stop after the freeze). These read a call's result, so they apply to an `after_tool` hook only, and `hook_problems`
+refuses one that could never fire (`when_endpoint` on a tool whose answer has no `endpoint_id`, `when_phase` on one
+that answers a `status`, a phase the tool never answers). `test_midrun_hooks.py` replays such a batch against every
+scenario's hooks (none may fire on it) and a good run of each (every hook must). And one or more
+actions — what the hook carries:
 
 | action | what it does | `claude` (SDK) | `codex` · `pi` · `hermes21` | `hermes` · `claude-acp` |
 |---|---|---|---|---|

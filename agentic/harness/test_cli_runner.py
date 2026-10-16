@@ -535,3 +535,47 @@ def test_a_journal_hook_whose_runner_raises_is_recorded_failed_not_lost(tmp_path
                                                           {"name": "after", "after_tool": "stop_endpoint", "cmd": "y"}]))
     assert [(h["name"], h["rc"]) for h in r.hooks_fired] == [("kill_manager", 1), ("after", 1)]
     assert "ssh exploded" in r.hooks_fired[0]["out"]
+
+
+def test_a_journal_hook_skips_the_blind_opening_batch_and_fires_on_the_call_it_is_about(tmp_path, monkeypatch):
+    # hermes21 on orphaned_task (live 2026-10-15): ensure_endpoint_up, run_shell, poll_task("PLACEHOLDER") and
+    # stop_endpoint in one batch before any facility; kill_manager fired on the placeholder poll (rc 1: no manager
+    # anywhere) and the cell never met its orphan. Through the real follower, with the scenario's own hooks.
+    import asyncio
+    monkeypatch.syspath_prepend(str(HERE.parent / "scenarios"))
+    import draining_restop
+    import orphaned_task
+    _cli_jail(tmp_path, monkeypatch)
+    no_facility = "No facility connected yet: connect_facility('f') only PROPOSED a config"
+    rows = [("ensure_endpoint_up", {"confirm_spend": True}, {"status": "down", "endpoint_id": None, "notice": no_facility}),
+            ("run_shell", {"shape": "compute", "command": "sleep 300"}, {"phase": "failed", "notice": no_facility}),
+            ("poll_task", {"task_id": "PLACEHOLDER"}, {"phase": "failed", "notice": "no task 'PLACEHOLDER'"}),
+            ("stop_endpoint", {}, {"status": "down", "endpoint_id": None, "notice": "no endpoint was up"}),
+            ("connect_facility", {"facility": "f", "details": {}}, {"phase": "provisioning"}),
+            ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", "endpoint_id": "e1"}),
+            ("run_shell", {"shape": "compute", "command": "sleep 300"}, {"phase": "running", "task_id": "compute-1"}),
+            ("poll_task", {"task_id": "compute-1"}, {"phase": "running", "task_id": "compute-1"}),
+            ("stop_endpoint", {}, {"status": "draining", "endpoint_id": "e1"})]
+
+    async def fake_turn(argv, *, cwd, env, timeout_s):
+        with Path(env["HPC_BRIDGE_JOURNAL"]).open("a") as fh:
+            for k, (tool, args, result) in enumerate(rows):
+                fh.write(json.dumps({"tool": tool, "args": args, "result": result, "ts": float(k), "ms": 5}) + "\n")
+        return 0, "", ""
+
+    ran: list[tuple[str, int]] = []
+
+    async def fake_hook(hook):
+        ran.append((hook["name"], hook["call_index"]))
+        return {"rc": 0, "out": "ok"}
+
+    monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,
+                                            midrun_hooks=orphaned_task.MIDRUN_HOOKS))
+    assert ran == [("kill_manager", 7)] and [h["call_index"] for h in r.hooks_fired] == [7]   # the RUNNING poll
+    # draining_restop's thaw is not due at the batch's stop (no freeze yet), nor its freeze at a failed compute run
+    ran.clear()
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,
+                                            midrun_hooks=draining_restop.MIDRUN_HOOKS))
+    assert ran == [] and sorted(h["out"] for h in r.hooks_fired) == ["NEVER FIRED", "NEVER FIRED"]

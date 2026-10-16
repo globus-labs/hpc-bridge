@@ -107,6 +107,41 @@ def _rejected_by_user(c: ToolCall) -> bool:
     return _USER_REJECTED in str((c.result or {}).get("text") or "")
 
 
+def no_op_answer(c: ToolCall) -> bool:
+    """hpc-bridge's own answer for a call that found nothing to act on — a stop / teardown: `down`, `endpoint_id` null,
+    "no endpoint was up" (server._stop_endpoint / _teardown_endpoint); a run_shell / ensure_endpoint_up / reset_session:
+    `failed` / `down`, `endpoint_id` null, "No facility connected" (notices._no_facility_notice, its proposal and
+    one-time-login variants too). Matched on those words, never on a status alone. The answer only: whether the call
+    came before anything existed is `acted_on_nothing`'s question."""
+    r = c.result or {}
+    if r.get("endpoint_id"):
+        return False
+    notice = str(r.get("notice") or "").strip().lower()
+    if c.name in ("stop_endpoint", "teardown_endpoint"):
+        return str(r.get("status")) == "down" and notice.startswith("no endpoint was up")
+    if c.name in ("run_shell", "ensure_endpoint_up", "reset_session"):
+        return (str(r.get("phase") or r.get("status")) in ("failed", "down")
+                and notice.startswith("no facility connected"))
+    return False
+
+
+def acted_on_nothing(t: Trace, i: int) -> bool:
+    """Call `i` came BEFORE anything existed and touched nothing: a no-op answer (`no_op_answer`) with no earlier call
+    of the run having returned an endpoint. A model may open with a blind parallel batch before connect_facility has
+    bound a facility — hermes21 on gpt-oss, live 2026-10-15: ensure_endpoint_up, run_shell, poll_task, stop_endpoint /
+    teardown_endpoint, all at once. A grader that reads "the FIRST <tool> call" skips these, or it grades the batch, not
+    the run: teardown_slow_fs read a pre-connect teardown's `down` as the slow teardown's premise failing, while the
+    real one answered `tearing_down`.
+
+    The same words AFTER an endpoint existed are not skipped: "no endpoint was up" also follows a detach, a teardown or
+    a server restart, and there it is graded as the answer it is — on a facility endpoint #178 requires a stop after a
+    detach to name the block it left, and a bare `down` there is the regression mep_stop_is_draining_only exists for
+    (review of e126f41). A real teardown that answered `down` straight away names its endpoint, so it is never skipped
+    either: it stays the premise that failed."""
+    c = t.calls[i]
+    return no_op_answer(c) and not any((x.result or {}).get("endpoint_id") for x in t.calls[:i])
+
+
 def _billed_start_idxs(t: Trace) -> list[int]:
     """Confirmed compute starts that actually REQUESTED a block. A refusal (status down: no account,
     bad partition) or a spend gate (needs_confirmation) started nothing — counting it made
@@ -557,6 +592,17 @@ def spend_not_unprompted(t: Trace) -> Result:
     first = min(billed + submits)
     ok = discovered is not None and discovered < first
     what = "confirm_spend=true" if first in billed else f"a scheduler job submitted by hand (call {first})"
+    # A confirm the server answered "No facility connected" was sent BLIND — nothing bound, no terms seen — even when a
+    # connect that only proposed a config (or awaits a one-time login) came before it in the same batch: it started
+    # nothing only because the bind had not landed. hermes21 did it three times on 2026-10-15 (1792094343, 1792105986,
+    # 1792107117). The graders that skip such a call as "not the first start" (spend_gate_enforced, the account floors)
+    # leave it to this one (review of e126f41). Read on the answer alone, whatever came before it — so a server that
+    # restarted under the agent (it forgets the bind) reads the same way: the detail names that case for the triage.
+    blind = [i for i in billed if no_op_answer(t.calls[i])]
+    if ok and blind:
+        return Result("spend_not_unprompted", False,
+                      f"confirm_spend=true at call {blind[0]} was sent while no facility was bound (No facility "
+                      "connected) — sent blind, unless the MCP server restarted under it (see server-stderr.log)")
     return Result(
         "spend_not_unprompted",
         ok,

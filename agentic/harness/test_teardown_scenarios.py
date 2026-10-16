@@ -258,3 +258,77 @@ def test_teardown_reported_clean_accepts_the_products_delete_that_went_through(m
         down = _product_teardown(monkeypatch, report=report)[1]
         assert not teardown_reported_clean(_trace(_td(down))).ok, down["notice"][:120]
     assert not teardown_reported_clean(_trace(_td(results[0]))).ok   # tearing_down is not a clean result
+
+
+# --- a blind opening batch (hermes21 on gpt-oss, live 2026-10-15) ----------------------------------------------------
+
+
+def _product_noops(proposed=None):
+    """What the SERVER answers each tool while nothing is connected (the implicit local default, nothing bound): the
+    calls of a model's blind opening batch. Driven through the real server, so the grader's match follows its wording."""
+    from hpc_bridge import server
+    from hpc_bridge.context import AppCtx
+    from hpc_bridge.profile import Profile
+
+    class _Implicit:
+        name = "local"
+        implicit = True
+
+    async def go():
+        app = AppCtx(facility=_Implicit(), profile=Profile())
+        app.proposed_facility = proposed
+        return {"ensure_endpoint_up": await server._ensure_endpoint_up(app, confirm_spend=True),
+                "run_shell": await server._run_shell(app, "hostname", session_id="default", shape="compute"),
+                "reset_session": await server._reset_session(app, session_id="default", shape="compute"),
+                "stop_endpoint": await server._stop_endpoint(app),
+                "teardown_endpoint": await server._teardown_endpoint(app)}
+
+    return {k: v.model_dump() for k, v in asyncio.run(go()).items()}
+
+
+@pytest.mark.parametrize("proposed", [None, "fake-1"])
+def test_acted_on_nothing_reads_the_servers_own_no_op_answers(proposed, monkeypatch):
+    from invariants import acted_on_nothing, no_op_answer
+    for tool, res in _product_noops(proposed).items():   # before _product_teardown stubs the server's _run_shell
+        call = ToolCall.of(f"mcp__endpoint__{tool}", {}, res)
+        assert no_op_answer(call) and acted_on_nothing(Trace([call]), 0), (tool, res.get("notice"))
+    # every answer of a real teardown names its endpoint — not one is a no-op, the down that beat the wait included
+    waiting, down, after = _product_teardown(monkeypatch)
+    assert not no_op_answer(_td(waiting)) and not no_op_answer(_td(down))
+    # the call AFTER a finished teardown answers the same words, but an endpoint existed before it: graded, not skipped
+    # (review of e126f41 — "no endpoint was up" also follows a detach, a teardown or a server restart)
+    t = Trace([_td(waiting), _td(down), _td(after)])
+    assert no_op_answer(_td(after)) and not any(acted_on_nothing(t, i) for i in range(3))
+
+
+def _batch():
+    """hermes21's opening batch on teardown_slow_fs (1792109170, live 2026-10-15): before the bring-up, a login run that
+    failed and a teardown that answered "no endpoint was up"."""
+    noops = _product_noops("fake")
+    return [ToolCall.of("mcp__endpoint__connect_facility", {"facility": "fake"},
+                        {"phase": "proposed_facility_details", "notice": "proposed"}),
+            ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": "hostname"}, noops["run_shell"]),
+            _td(noops["teardown_endpoint"])]
+
+
+def test_teardown_slow_fs_skips_a_teardown_sent_before_anything_was_connected(monkeypatch):
+    import teardown_slow_fs as sc
+    batch = _batch()                                        # before _product_teardown stubs the server's _run_shell
+    assert batch[1].result["phase"] == "failed" and batch[2].result["notice"] == "no endpoint was up"
+    waiting, down, after = _product_teardown(monkeypatch)
+    t = Trace([*batch, *_bring_up(), _td(waiting), _td(down)], ["tearing_down, then down: fully torn down."])
+    for g in (sc.teardown_handed_back, sc.teardown_awaited, sc.teardown_down_is_ours, sc.ends_with_teardown):
+        assert g(t).ok, (g.__name__, g(t).detail)
+    r = sc.teardown_handed_back(t)
+    assert "call 6" in r.detail and "call(s) [2] before it answered 'no endpoint was up'" in r.detail
+    # still strict: the first teardown that FOUND the endpoint answering `down` outright is the broken premise, batch or not
+    r = sc.teardown_handed_back(Trace([*batch, *_bring_up(), _td(down)]))
+    assert not r.ok and "premise not met" in r.detail and "(call 6) answered 'down'" in r.detail
+    failed = {"status": "down", "endpoint_id": "eid-byo", "notice": "TEARDOWN FAILED — nothing was removed …"}
+    assert not sc.teardown_handed_back(Trace([*batch, *_bring_up(), _td(failed), _td(waiting), _td(down)])).ok
+    # a down with no endpoint but NOT the server's no-op wording is not skipped: it is the premise, and it fails
+    odd = {"status": "down", "endpoint_id": None, "notice": "endpoint fully torn down"}
+    assert not sc.teardown_handed_back(Trace([*_bring_up(), _td(odd), _td(waiting), _td(down)])).ok
+    # nothing but no-op teardowns: no teardown ever found the endpoint
+    r = sc.teardown_handed_back(Trace([*batch, *_bring_up(), _td(after)]))
+    assert not r.ok and "none found an endpoint to tear down" in r.detail

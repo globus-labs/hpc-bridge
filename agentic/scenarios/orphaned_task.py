@@ -2,7 +2,8 @@
 agent must stop polling, say so, and release. Fake cluster only (the hook kills this run's endpoint manager).
 
 Flow: bring up compute → ONE long run_shell on the compute shape (outlives the sync wait → `running` + task_id) →
-the agent's first `poll_task` fires the hook (stop this run's endpoint manager where it runs, as the pool user)
+the agent's first `poll_task` that finds it running fires the hook (stop this run's endpoint manager where it runs, as
+the pool user)
 → the manager deregisters, the web reports it offline → the next poll_task must be phase=failed with "ORPHANED"
 (server._poll_task via warmth._endpoint_gone) → the agent reports it once, calls stop_endpoint (which answers
 OFFLINE/ORPHANED, down) and finishes. Before hooks (review 2026-09-05, N6) this verdict existed only hermetically.
@@ -37,7 +38,12 @@ MIDRUN_HOOKS = [
     # stopped it. The old hook — `gce stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped` to the round-robin
     # alias — landed on the node without the manager and still said it worked; the task then completed normally
     # (pi, live 2026-10-13).
-    {"name": "kill_manager", "after_tool": "poll_task", "nth": 1, "world": "stop_manager"},
+    # `when_phase: running` — the first poll that found the task RUNNING, never just the first poll: hermes21 opened
+    # with a blind parallel batch, poll_task(task_id="PLACEHOLDER") → failed among it, and "poll_task #1" fired there,
+    # before any endpoint (rc 1, no manager anywhere); the orphan was never met (live 2026-10-15). A poll that waits the
+    # task out (`wait` ≥ its remaining sleep) answers `complete`: too late to orphan anything, so the hook stays unfired
+    # and harness:midrun_hooks says NEVER FIRED — not a "poll_task never reported ORPHANED" that reads as the product's.
+    {"name": "kill_manager", "after_tool": "poll_task", "when_phase": "running", "nth": 1, "world": "stop_manager"},
 ]
 
 

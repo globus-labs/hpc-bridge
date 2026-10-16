@@ -6,12 +6,36 @@ purpose (review 2026-09-05, N6–N8; itinerary 2026-10-13, §2.1).
 
 A hook has ONE trigger:
 - `after_tool` — fires after the Nth result of that tool (`nth`, default 1), optionally only when the call's input
-  matches (`when_input`) or the result's phase does (`when_phase`).
+  matches (`when_input`), the result's phase does (`when_phase`), the result names an endpoint (`when_endpoint`), or
+  another hook has already fired (`after_hook`).
 - `on_tool` — a DURING hook: fires `after_s` seconds after a matching call STARTED, if that call is still in flight
   then (`nth` counts the matching calls that were). This is how a scenario presses Esc in the middle of a call.
 
 `when_input` is a dict (each key equal to the call's argument, case-insensitively: True and "true" alike) or a string
 (a regex searched in the call's argument values, e.g. a marker in the command).
+
+A call that does not match is not counted, so `nth` counts only the calls a hook is about. That matters because a
+model may open with a blind parallel batch before anything is connected — hermes21 on gpt-oss, live 2026-10-15:
+`ensure_endpoint_up` → down, `run_shell` → failed, `poll_task(task_id="PLACEHOLDER")` → failed, `stop_endpoint` → "no
+endpoint was up". `orphaned_task`'s "after poll_task #1" fired on that placeholder poll, with no manager to stop, and
+the cell never met its orphan. Each answer is a no-op the result itself shows, and both feeds below see the result:
+- `when_phase` — a run_shell / poll_task / reset_session answer's `phase`: `"running"` is a task that really runs (a
+  placeholder poll answers `failed`), `"complete"` a command that ran (one before any facility answers `failed`, one
+  refused for spend `needs_confirmation`). For a hook whose premise IS that answer;
+- `when_endpoint: True` — an ensure_endpoint_up / stop_endpoint / teardown_endpoint answer that names the endpoint it
+  acted on (`endpoint_id`). Made while nothing was connected, they answer `endpoint_id: null` ("no endpoint was up",
+  "No facility connected yet"). A real answer names it whenever the server held one — not always: a confirm whose
+  endpoint configure failed ("hpc-bridge error: … configure failed") carries none, and such a call simply does not
+  count (the next one may). For a hook that must see the real call whatever it answered (evidence at a stop, a lying
+  `down` included);
+- `after_hook: "<name>"` — only calls that END after the named hook of the same scenario fired: a hook that undoes
+  another. draining_restop's thaw, "after stop_endpoint #1", fired on a stop hermes21 made before its compute runs
+  were done, before the freeze; the freeze then stayed, and the real stops met a frozen worker (`draining` three
+  times, the cell failed — live 2026-10-15).
+They read the call's RESULT (or the hooks fired before it), so they apply to an `after_tool` hook only — and only to
+a tool whose answer carries the field: `when_phase` on the tools that answer a `phase` (with one of its values),
+`when_endpoint` on the three that answer `status` + `endpoint_id` (`ANSWER_PHASES`, `ENDPOINT_ANSWERS`; a hook that
+could never fire is refused by `hook_problems`, review of e126f41).
 
 And one or more ACTIONS — what the hook carries:
 - `cmd` — a shell command run on the cluster as the pool user (run.py `_run_hook`; `"on": "each_login"` fans it out).
@@ -51,6 +75,19 @@ from invariants import ToolCall, logical_name
 from trace_adapter import _result_to_dict
 
 ACTIONS = ("cmd", "interrupt", "interject")
+# What each hpc-bridge tool's answer carries (server.py's return types; test_midrun_hooks pins both to the product's
+# models): a `phase` with these values (ShellOutcome, ConnectResult, LoginStatus, PreauthStatus) — or, for the
+# EndpointStatus tools, a `status` and an `endpoint_id` and no phase.
+_SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running")
+_LOGIN_PHASES = ("logged_in", "needs_login", "failed")
+ANSWER_PHASES: dict[str, tuple[str, ...]] = {
+    "run_shell": _SHELL_PHASES, "poll_task": _SHELL_PHASES, "reset_session": _SHELL_PHASES,
+    "connect_facility": ("needs_account", "provisioning", "needs_facility_details", "proposed_facility_details",
+                         "needs_preauth", "needs_login", "unsupported", "failed"),
+    "authenticate": _LOGIN_PHASES, "complete_login": _LOGIN_PHASES,
+    "complete_preauth": ("opened", "failed", "needs_terminal"),
+}
+ENDPOINT_ANSWERS = ("ensure_endpoint_up", "stop_endpoint", "teardown_endpoint")
 WORLD_ACTIONS = ("stop_manager",)   # `world` hooks: the harness builds the command (run.py _run_hook); they count as cmd
 DURING_TOOL = "during_tool"   # a need, beside the actions: a trigger only a live view of call STARTS can serve
 
@@ -113,7 +150,8 @@ def hook_needs(hooks: Iterable[dict] | None) -> set[str]:
 def hook_problems(hooks: Iterable[dict] | None) -> list[str]:
     """What is wrong with a scenario's hooks (empty: nothing) — test_chaos_scenarios checks every scenario with it."""
     out: list[str] = []
-    for k, h in enumerate(hooks or []):
+    hooks = list(hooks or [])
+    for k, h in enumerate(hooks):
         who = f"hook {k} ({hook_label(h)})"
         if ("after_tool" in h) == ("on_tool" in h):
             out.append(f"{who}: needs exactly one trigger, after_tool or on_tool")
@@ -139,6 +177,23 @@ def hook_problems(hooks: Iterable[dict] | None) -> list[str]:
                 out.append(f"{who}: a during hook needs after_s >= 0")
         elif "after_s" in h:
             out.append(f"{who}: after_s applies to a during hook (on_tool) only")
+        if is_during(h) and any(key in h for key in ("when_phase", "when_endpoint", "after_hook")):
+            out.append(f"{who}: when_phase / when_endpoint / after_hook decide at a call's END — an after_tool hook only")
+        if "when_endpoint" in h and h["when_endpoint"] is not True:
+            out.append(f"{who}: when_endpoint is True or absent")
+        tool = trigger_tool(h)
+        if "when_endpoint" in h and tool not in ENDPOINT_ANSWERS:
+            out.append(f"{who}: when_endpoint on {tool!r}, whose answer names no endpoint_id — it could never fire")
+        if "when_phase" in h:
+            if tool in ENDPOINT_ANSWERS:
+                out.append(f"{who}: when_phase on {tool!r}, whose answer carries a status, not a phase — it could never fire")
+            elif tool in ANSWER_PHASES and h["when_phase"] not in ANSWER_PHASES[tool]:
+                out.append(f"{who}: when_phase {h['when_phase']!r} is no phase {tool} answers {ANSWER_PHASES[tool]}")
+            elif tool not in ANSWER_PHASES:
+                out.append(f"{who}: when_phase on {tool!r}, whose answer has no phase")
+        if "after_hook" in h and (h["after_hook"] == hook_label(h)
+                                  or h["after_hook"] not in [hook_label(o) for o in hooks if o is not h]):
+            out.append(f"{who}: after_hook names no other hook of this scenario ({h['after_hook']!r})")
         want = h.get("when_input")
         if isinstance(want, str):
             try:
@@ -230,13 +285,18 @@ class HookWatcher:
         if eid and eid not in self.endpoint_ids:
             self.endpoint_ids.append(eid)
         due: list[dict] = []
+        fired_before = {hook_label(self.hooks[j]) for j in self._fired}   # a hook due on THIS call is not "before" it
         for k, h in enumerate(self.hooks):
             if k in self._fired or is_during(h) or h.get("after_tool") != name:
                 continue
             if not _input_matches(h.get("when_input"), inp):
                 continue
+            if h.get("after_hook") and h["after_hook"] not in fired_before:
+                continue
             if h.get("when_phase") and str(result.get("phase")) != str(h["when_phase"]):
                 continue
+            if h.get("when_endpoint") and not result.get("endpoint_id"):
+                continue   # a no-op answer: nothing was connected, nothing was acted on (see the module docstring)
             self._counts[k] = self._counts.get(k, 0) + 1
             if self._counts[k] == int(h.get("nth", 1)):
                 self._fired.add(k)
