@@ -716,6 +716,312 @@ async def test_stop_retries_cold_channel_then_confirms(monkeypatch):
     assert calls["n"] == 2 and "online for reuse" in (res.notice or "")
 
 
+# --- a stop after a block that failed before it ever ran (live 2026-10-15: submit_policy_rejected, slurm_worker_died) -
+# Both cells: ensure_endpoint_up said REJECTED / pilot FINISHED, then stop_endpoint said "still being submitted … one
+# may land shortly", and the agents believed the earlier answer and did not retry.
+
+_SBATCH_REFUSED = ("Failed to start block 1: Cannot launch job parsl.slurm.1: Could not read job ID from submit command "
+             "standard output; recode=1, stderr='sbatch: error: Batch job submission failed: Invalid account or "
+             "account/partition combination specified'")
+
+
+def _scripted_login(monkeypatch, releases=(), probes=()):
+    """Script the login channel the release and the pilot probe ride (server._run_shell): each release attempt answers
+    the next of `releases` (its stdout; None: a cold channel; when they run out, `released none`), each pilot probe the
+    next of `probes` (its stdout; None: unreadable; when they run out, nothing listed). Returns the log of calls."""
+    from hpc_bridge import server
+    from hpc_bridge.models import ShellOutcome
+
+    releases, probes, log = list(releases), list(probes), []
+
+    async def run(a, command, session_id="default", shape="compute"):
+        kind = "probe" if "HPCB_ERR" in command else "release"
+        log.append((kind, command))
+        queue = probes if kind == "probe" else releases
+        out = queue.pop(0) if queue else ("released none\n" if kind == "release" else "")
+        if out is None:
+            return ShellOutcome(phase="cold_start", block_state="cold", notice="allocating nodes…")
+        return ShellOutcome(phase="complete", exit_code=0, stdout=out, block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", run)
+    return log
+
+
+def _kinds(log):
+    return [k for k, _ in log]
+
+
+class _PbsFacility(FakeFacility):
+    def __init__(self):
+        from types import SimpleNamespace
+
+        super().__init__()
+        self.profile = SimpleNamespace(scheduler="pbs")
+
+
+async def _dead_pilot_app(monkeypatch, *, pbs=False):
+    """A billed block, spend confirmed and still cold, whose provisioning probe reported its pilot FINISHED — the
+    slurm_worker_died cell's state: pilot 12, exit status 42."""
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")  # no real sleeps in the release poll
+    f = _PbsFacility() if pbs else FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    rows = "F 12.pbsserver 42 Job failed\n" if pbs else "F 12 42 FAILED\n"
+    _scripted_login(monkeypatch, probes=[rows])
+    res = await _ensure_endpoint_up(app, confirm_spend=True)
+    assert res.status == "provisioning" and "already FINISHED (exit status 42)" in res.notice
+    return app
+
+
+async def test_stop_after_a_rejected_submission_is_down_and_says_nothing_was_created(monkeypatch):
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error=_SBATCH_REFUSED))
+    res = await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)
+    assert res.status == "down" and "REJECTED" in res.notice and "The new block was not created" in res.notice
+    log = _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app)
+    # no pilot was expected from a refused submission: one look, "released none" is the confirm — and the words agree
+    # with the REJECTED answer instead of saying a block was released or may still land
+    assert stop.status == "down" and stop.spend_stopped is True and _kinds(log) == ["release"]
+    assert "nothing to cancel" in stop.notice and "REJECTED" in stop.notice and "no block was created" in stop.notice
+    assert "released over AMQP" not in stop.notice and "may land" not in stop.notice
+    assert "compute" not in app.shapes
+
+
+async def test_a_rejection_after_a_switch_away_from_a_pilot_still_landing_keeps_the_stop_polling(monkeypatch):
+    # switch_unseen still overrides: the old terms' pilot belongs to another user endpoint, which the rejection says
+    # nothing about — even when the switch and its confirmation came in one call (which used to clear switch_unseen)
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(
+        eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error=_SBATCH_REFUSED))
+    res = await _ensure_endpoint_up(app, partition="compute", confirm_spend=True)
+    rt = app.shapes["compute"]
+    assert res.status == "down" and "REJECTED" in res.notice
+    log = _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app)
+    assert _kinds(log).count("release") == config.provisioning_release_attempts()   # it polled for the old pilot
+    assert stop.status == "draining" and "nothing to cancel: the scheduler REJECTED" not in stop.notice
+    # the shape is gone, but a second stop still looks for that pilot rather than reading "released none" as done
+    log.clear()
+    assert (await _stop_endpoint(app)).status == "draining"
+    assert _kinds(log).count("release") == config.provisioning_release_attempts()
+    assert rt.rejected and rt.switch_unseen   # what it rests on: the rejection voided spend, the old pilot still counts
+
+
+async def test_a_second_stop_after_a_block_still_being_submitted_polls_again(monkeypatch):
+    # The first stop said "call stop_endpoint again in a few seconds to cancel it once it lands"; the shape it dropped
+    # used to leave the second stop nothing to expect, so it read "released none" as done.
+    from hpc_bridge.server import ShapeRuntime, _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = AppCtx(facility=FakeFacility(), profile=Profile(), state=EndpointState(endpoint_id="eid-1"))
+    app.facility.manager_up = True
+    app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True},
+                                         runner=_FakeRunner("eid-1", _Res(0, "", "")), spend_confirmed=True)
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, warm_confirmed_at=1.0)
+    _scripted_login(monkeypatch)
+    first = await _stop_endpoint(app)
+    assert first.status == "draining" and "still being submitted" in first.notice
+    _scripted_login(monkeypatch, releases=["released none\n", "released 777\n"])   # it lands during the second look
+    second = await _stop_endpoint(app)
+    assert second.status == "down" and "released 777" in second.notice
+    assert "eid-1" not in app.pilot_watch                                        # found and cancelled: nothing waits
+
+
+async def test_stop_after_a_dead_pilot_is_draining_naming_it(monkeypatch):
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    log = _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and res.spend_stopped is not True
+    n = res.notice
+    assert "pilot 12 already FINISHED (exit status 42)" in n                     # as the provisioning answer named it
+    assert "No new pilot of this endpoint appeared during this stop's check" in n
+    assert "NOT confirmed stopped" in n and "may still be queued on the endpoint" in n and "dying the same way" in n
+    assert "about a minute" in n
+    assert "still being submitted" not in n and "idle-release" not in n          # neither is true of a dead pilot
+    assert _kinds(log).count("release") == config.provisioning_release_attempts() and _kinds(log)[-1] == "probe"
+    assert "compute" not in app.shapes and app.pilot_watch[app.state.endpoint_id].dead.job == "12"
+
+
+async def test_a_second_stop_inside_the_window_looks_again_and_stays_draining(monkeypatch):
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    assert (await _stop_endpoint(app)).status == "draining"
+    log = _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    res = await _stop_endpoint(app)                                              # the shape is gone; the watch is not
+    assert res.status == "draining" and "pilot 12 already FINISHED (exit status 42)" in res.notice
+    assert "No new pilot of this endpoint appeared during this stop's check" in res.notice
+    assert _kinds(log).count("release") == config.provisioning_release_attempts() and "probe" in _kinds(log)
+
+
+def _skew(monkeypatch):
+    """time.monotonic, shifted by skew[0] seconds — to let a window pass between calls."""
+    real, skew = time.monotonic, [0.0]
+    monkeypatch.setattr(time, "monotonic", lambda: real() + skew[0])
+    return skew
+
+
+async def test_a_second_stop_after_the_window_with_no_new_pilot_is_down(monkeypatch):
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_PILOT_WATCH_S", "90")
+    app = await _dead_pilot_app(monkeypatch)
+    skew = _skew(monkeypatch)
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    assert (await _stop_endpoint(app)).status == "draining"
+    skew[0] += 91
+    log = _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    res = await _stop_endpoint(app)
+    # one look (the window is over), and the pilot history says the endpoint has stopped submitting for our check
+    assert res.status == "down" and res.spend_stopped is True and _kinds(log) == ["release", "probe"]
+    assert "no new pilot of this endpoint appeared within 90 s" in res.notice and config.pilot_watch_s() == 90
+    assert "pilot 12 FINISHED, exit status 42" in res.notice and "not confirmed" not in res.notice.lower()
+    assert app.state.endpoint_id not in app.pilot_watch
+
+
+async def test_a_pilot_that_came_and_died_between_two_looks_keeps_the_stop_draining(monkeypatch):
+    # The release lists live jobs only: a replacement that lands and dies between two stops is invisible to it. The
+    # pilot history (sacct / qstat -x) still shows it, so a stop past the window does not read the silence as done.
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_PILOT_WATCH_S", "90")
+    app = await _dead_pilot_app(monkeypatch)
+    skew = _skew(monkeypatch)
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    await _stop_endpoint(app)
+    skew[0] += 91
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\nF 13 42 FAILED\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "submitted pilot 13" in res.notice
+    assert "pilot 13 also FINISHED (exit status 42)" in res.notice and "teardown_endpoint" in res.notice
+    watch = app.pilot_watch[app.state.endpoint_id]
+    assert "13" in watch.dead.known and not _expired_now(watch)                     # a fresh sign: the window restarts
+
+
+def _expired_now(watch):
+    from hpc_bridge import warmth
+
+    return warmth._watch_expired(watch, time.monotonic())
+
+
+async def test_a_replacement_pilot_cancelled_during_the_stop_keeps_it_draining(monkeypatch):
+    # The hazard: while our check is still queued, a cancelled pilot is CANCELLED (Slurm) / COMPLETED (PBS) to parsl —
+    # neither trips its block-error handler — and with a task outstanding and no block it submits another on its next
+    # scaling pass. A confirmed cancel of a replacement is therefore not `down`.
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    _scripted_login(monkeypatch, releases=["released none\n", "released 13\n"],
+                    probes=["F 12 42 FAILED\nF 13 - CANCELLED\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and res.spend_stopped is not True
+    assert "this stop cancelled 13" in res.notice and "cancelling a pilot does not end the check" in res.notice
+    assert "still being submitted" not in res.notice and "idle-release" not in res.notice
+    assert "13" in app.pilot_watch[app.state.endpoint_id].dead.known
+
+
+async def test_ensure_records_a_dead_pilot_and_a_worker_answering_clears_it(monkeypatch):
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    rt = app.shapes["compute"]
+    eid = app.state.endpoint_id
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and "pilot 12 already FINISHED (exit status 42)" in stop.notice   # it was recorded
+    assert (rt.dead_pilot.job, rt.dead_pilot.exit_status) == ("12", "42") and "12" in rt.dead_pilot.known
+    assert eid in app.pilot_watch
+    # the user confirms again and a block comes up on the same terms: a worker ran our check, so nothing waits
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "", ""))
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    assert app.shapes["compute"].dead_pilot is None and eid not in app.pilot_watch
+    log = _scripted_login(monkeypatch, releases=["released 14\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "down" and _kinds(log) == ["release"]                    # an ordinary stop again
+
+
+async def test_a_switch_hands_a_dead_pilot_to_the_endpoint_watch(monkeypatch):
+    # the shape forgets it (other terms are a different block); the old terms' user endpoint keeps submitting for its
+    # queued check, so the stop still looks for those pilots and names the dead one
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch)
+    res = await _ensure_endpoint_up(app, partition="other")
+    assert res.status == "needs_confirmation"
+    rt = app.shapes["compute"]
+    _scripted_login(monkeypatch, probes=["F 12 42 FAILED\n"])
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and "pilot 12 already FINISHED (exit status 42)" in stop.notice
+    assert rt.dead_pilot is None and app.pilot_watch[app.state.endpoint_id].dead.job == "12"
+
+
+async def test_a_rejected_submission_voids_the_spend_confirmation(monkeypatch):
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=CanaryResult(ok=False, error=_SBATCH_REFUSED))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "down"
+    canaries = runner.canaries
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "needs_confirmation" and runner.canaries == canaries     # asked again; nothing resubmitted
+    assert "REJECTED the last block submission, on partition 'debug'" in res.notice
+    assert "repeats a request the scheduler refuses" in res.notice
+    res2 = await _ensure_endpoint_up(app, confirm_spend=True)                    # the user confirms: a resubmit
+    assert runner.canaries == canaries + 1 and res2.status == "down" and "REJECTED" in res2.notice
+
+
+async def test_run_shell_surfaces_a_rejection_and_voids_the_confirmation_too(monkeypatch):
+    # run_shell's own provisioning can meet the rejection first: it answers REJECTED (failed), and then asks again too
+    f = FakeFacility()
+    f.workers = 1
+    app = AppCtx(facility=f, profile=Profile())
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    runner._canary = CanaryResult(ok=False, error=_SBATCH_REFUSED)
+    out = await _run_shell(app, "hostname")
+    assert out.phase == "failed" and "REJECTED" in out.notice and runner.commands == []
+    canaries = runner.canaries
+    again = await _run_shell(app, "hostname")
+    assert again.phase == "needs_confirmation" and "REJECTED the last block submission" in again.notice
+    assert runner.canaries == canaries and runner.commands == []
+
+
+def test_the_pilot_watch_window_is_configurable(monkeypatch):
+    from hpc_bridge import config
+
+    assert config.pilot_watch_s() == config.PILOT_WATCH_S == 120.0
+    monkeypatch.setenv("HPC_BRIDGE_PILOT_WATCH_S", "300")
+    assert config.pilot_watch_s() == 300.0
+    monkeypatch.setenv("HPC_BRIDGE_PILOT_WATCH_S", "-5")
+    assert config.pilot_watch_s() == 0.0
+
+
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------
 
 
@@ -784,6 +1090,24 @@ async def test_stop_dispatches_pbs_release_cmd_when_facility_scheduler_is_pbs(mo
     assert "qstat -f" in seen["cmd"] and "qdel" in seen["cmd"]
     assert "scancel" not in seen["cmd"] and "squeue" not in seen["cmd"]
     assert "uep.eid-1" in seen["cmd"]
+
+
+async def test_stop_after_a_dead_pbs_pilot_is_draining_naming_it(monkeypatch):
+    # the PBS twin: a finished pilot reads COMPLETED to parsl (torque/pbspro translate_table maps F/E/C so), which
+    # never trips its block-error handler, so the endpoint resubmits for the queued check for as long as it waits
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    app = await _dead_pilot_app(monkeypatch, pbs=True)
+    log = _scripted_login(monkeypatch, probes=["F 12.pbsserver 42 Job failed\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "pilot 12.pbsserver already FINISHED (exit status 42)" in res.notice
+    assert "No new pilot of this endpoint appeared during this stop's check" in res.notice
+    assert "still being submitted" not in res.notice and "idle-release" not in res.notice
+    releases = [c for k, c in log if k == "release"]
+    probes = [c for k, c in log if k == "probe"]
+    assert len(releases) == config.provisioning_release_attempts() and all("qdel" in c for c in releases)
+    assert len(probes) == 1 and "qstat -x -f" in probes[0]           # the history: finished jobs are listed too
 
 
 async def test_teardown_endpoint_stops_manager_and_clears_state(monkeypatch):

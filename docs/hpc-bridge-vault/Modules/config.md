@@ -1,7 +1,7 @@
 # config
 
 > [!abstract] Role
-> Every environment variable hpc-bridge reads, behind typed accessors with ONE idiom (`env(name)` → stripped value or `None`), plus the runtime tunables (`CANARY_TTL_S`, `CANARY_TIMEOUT_S` (read through `canary_timeout_s()`, which honours the test seam `HPC_BRIDGE_CANARY_TIMEOUT_S`), `TEARDOWN_WAIT_S` (read through `teardown_wait_s()`, which honours the test seam `HPC_BRIDGE_TEARDOWN_WAIT_S`), `SYNC_WAIT_S`, `TASK_CEILING_MARGIN_S`, `TRANSIENT_CONFLICT_LIMIT`, `PROVISION_GRACE_S`) and the SSH ControlMaster settings (`_control_settings`, `_short_control_dir`).
+> Every environment variable hpc-bridge reads, behind typed accessors with ONE idiom (`env(name)` → stripped value or `None`), plus the runtime tunables (`CANARY_TTL_S`, `CANARY_TIMEOUT_S` (read through `canary_timeout_s()`, which honours the test seam `HPC_BRIDGE_CANARY_TIMEOUT_S`), `TEARDOWN_WAIT_S` (read through `teardown_wait_s()`, which honours the test seam `HPC_BRIDGE_TEARDOWN_WAIT_S`), `SYNC_WAIT_S`, `TASK_CEILING_MARGIN_S`, `TRANSIENT_CONFLICT_LIMIT`, `PROVISION_GRACE_S`, `PILOT_WATCH_S` (read through `pilot_watch_s()`, which honours `HPC_BRIDGE_PILOT_WATCH_S`: how long after the last sign of a pilot a stop still expects one, 120 s from parsl's own cadence — its 60 s status poll, a strategy pass of up to 30 s, and the submit — justified at the constant)) and the SSH ControlMaster settings (`_control_settings`, `_short_control_dir`).
 
 `names_machine(*names)` is the one rule for the env presets: `HPC_BRIDGE_ACCOUNT` and `HPC_BRIDGE_PARTITION` apply only to the facility `HPC_BRIDGE_MACHINE` names ([[binding]], [[connect]]).
 

@@ -88,12 +88,25 @@ async def _release_blocks_over_login(
             last = (line[-1] if line else "released none").strip()
             if last != "released none" or not expect_block:
                 return True, last  # cancelled a job, or none was expected — the cancel is confirmed
-            detail = "no pilot in the scheduler yet (block still being submitted)"  # expect_block: keep polling for it
+            detail = f"{_NO_PILOT_YET} (block still being submitted)"  # expect_block: keep polling for it
         else:
             detail = out.notice or out.phase or "unconfirmed"
         if i + 1 < attempts and backoff > 0:
             await asyncio.sleep(backoff)  # let the woken login worker register / the sbatch land, then re-confirm
     return False, f"cancel not confirmed ({detail}); idle-release will reclaim it"
+
+# The unconfirmed release's detail when its last look DID read the scheduler (no pilot of ours in it), not a cold
+# channel: a stop tells the two apart by it (server._stop_endpoint).
+_NO_PILOT_YET = "no pilot in the scheduler yet"
+
+
+def _released_jobs(detail: str) -> list[str]:
+    """The jobs a CONFIRMED release cancelled, from its detail: `released <ids>` (or only the last of several ids,
+    which the release's last-line read keeps); [] for `released none`."""
+    words = detail.split()
+    if words[:1] == ["released"]:
+        words = words[1:]
+    return [] if words == ["none"] else words
 
 # A finished pilot's own job may say why it died: hpc-bridge's env_setup line prints one `hpc-bridge: endpoint venv …`
 # line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each
@@ -167,6 +180,23 @@ _NEVER_PENDING = re.compile(
     r"PartitionTimeLimit|PartitionNodeLimit|PartitionConfig|QOS\w*Limit|Assoc\w*Limit|JobHeld|BadConstraints|"
     r"InvalidAccount|InvalidQOS|ReqNodeNotAvail|DependencyNeverSatisfied|AccountNotAllowed|PartitionDown", re.I)
 
+# A finished row's state: PBS's F/E/X (with -x), and the `F` the Slurm rows command prints for sacct's finished pilots.
+_DONE_STATES = frozenset("FEX")
+
+
+def _pilot_rows(stdout: str) -> list[list[str]]:
+    """`_pilot_status_cmd`'s pilot rows, split (its HPCB_ lines left out). Slurm rows are `STATE JOBID - REASON` (live)
+    or `F JOBID EXIT STATE` (finished); PBS rows are `STATE JOBID EXIT [comment…]` (EXIT = Exit_status, or `-` when the
+    job never ran)."""
+    return [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip() and not ln.startswith("HPCB_")]
+
+
+def _died(rows: list[list[str]]) -> list[list[str]]:
+    """The pilots that FINISHED with an exit status of their own: the worker died there. Finished rows are read by WHY
+    they finished: `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our
+    own release, or the walltime) is a leftover of an earlier block, not a diagnosis, and is left out."""
+    return [r for r in rows if r and r[0][:1].upper() in _DONE_STATES and len(r) > 2 and r[2] not in ("-", "271", "?")]
+
 
 def _summarize_pilot(stdout: str, provisioning_elapsed_s: float, *, own_config: bool = True) -> tuple[str, str]:
     """(category, notice-suffix) from `_pilot_status_cmd` output. category ∈ {starting, queued, held,
@@ -175,20 +205,14 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float, *, own_config: 
     cold-start gap (empty suffix ⇒ the caller leaves 'allocating nodes…' unchanged). `own_config`: the facility's
     configuration is the user's own (a bring-your-own facility, changed with connect_facility(details=…)); a registry
     entry's scheduler directives and walltime cannot be changed per session."""
-    # Slurm rows are `STATE JOBID`; PBS rows are `STATE JOBID EXIT [comment…]` (EXIT = Exit_status, or `-` when the
-    # job never ran). Finished rows are read by WHY they finished: an exit status of its own means the worker died
-    # there; `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our own
-    # release, or the walltime) is a leftover of an earlier block, not a diagnosis, and is ignored.
     said: dict[str, str] = {}
     for ln in stdout.splitlines():
         if ln.startswith("HPCB_SAID "):
             _tag, jid, line = (ln.split(None, 2) + ["", ""])[:3]
             said[jid] = line.strip()
-    rows = [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip() and not ln.startswith("HPCB_")]
-    done_states = {"F", "E", "X"}
-    live = [r for r in rows if r and r[0][:1].upper() not in done_states]
-    died = [r for r in rows
-            if r and r[0][:1].upper() in done_states and len(r) > 2 and r[2] not in ("-", "271", "?")]
+    rows = _pilot_rows(stdout)
+    live = [r for r in rows if r and r[0][:1].upper() not in _DONE_STATES]
+    died = _died(rows)
     if not live:
         if died:  # every pilot this endpoint submitted has FINISHED with an exit status of its own: it ran and died
             r = died[-1]
@@ -267,35 +291,68 @@ def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float, *, own
     tail = f" (reason {reason})" if reason and reason.lower() != "none" else ""
     return "queued", f"— pilot {pjid} is queued (PENDING{tail}); waiting on the scheduler."
 
-async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
-    """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilot is in.
-    Best-effort: returns None when it can't tell (login worker cold, scheduler unreachable) so the
-    caller leaves its notice unchanged. `elapsed_s` is how long the block has been provisioning — it
-    gates the rejection hint past the cold-start grace."""
+class PilotProbe(NamedTuple):
+    """One read of THIS endpoint's pilots (`_pilot_status_cmd`): the summary a provisioning notice carries, every pilot
+    job listed (live or finished), and each that FINISHED with an exit status of its own as (job, exit status), in the
+    listing's order — so the server can record the pilot a FINISHED verdict names, and a stop can tell a pilot the
+    endpoint submitted since from one it already knew (server._stop_endpoint)."""
+
+    category: str
+    suffix: str
+    jobs: frozenset[str]
+    died: tuple[tuple[str, str], ...]
+
+    @property
+    def dead(self) -> tuple[str, str] | None:
+        """(job, exit status) of the pilot a FINISHED verdict names — the newest that died, as `_summarize_pilot` names
+        it; None for any other verdict."""
+        return self.died[-1] if self.category == "finished" and self.died else None
+
+
+async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> PilotProbe | None:  # noqa: E501
+    """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilots are in. Best-effort:
+    None when it can't tell (login worker cold, scheduler unreachable). `elapsed_s` is how long the block has been
+    provisioning — it gates the rejection hint past the cold-start grace."""
     scheduler = getattr(getattr(app.facility, "profile", None), "scheduler", "slurm")
     out = await run_login(_pilot_status_cmd(scheduler, eid))
     if out.phase != "complete" or out.exit_code != 0:
         return None
     machine = getattr(app, "machine", None)  # bring-your-own (a session facility): its config is the user's to change
     own = machine is not None and machine in getattr(app, "session_facilities", {})
-    return _summarize_pilot(out.stdout or "", elapsed_s, own_config=own)
+    stdout = out.stdout or ""
+    category, suffix = _summarize_pilot(stdout, elapsed_s, own_config=own)
+    rows = _pilot_rows(stdout)
+    return PilotProbe(category, suffix, frozenset(r[1] for r in rows if len(r) > 1),
+                      tuple((r[1], r[2]) for r in _died(rows)))
 
-async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
+async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
+    """(category, notice-suffix) of THIS endpoint's pilot (`_probe_pilots_over_login`); None when it can't tell, so the
+    caller leaves its notice unchanged."""
+    probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login)
+    return (probe.category, probe.suffix) if probe is not None else None
+
+async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: float,
+                                run_login: LoginRunner) -> tuple[str, PilotProbe | None]:
     """Enrich a still-cold BILLED block's 'allocating nodes…' with the pilot's ACTUAL scheduler state,
-    so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]). A
-    diagnostic must never break the result it annotates, so any failure — or an empty suffix (the
-    normal cold-start window) — leaves the notice as-is."""
+    so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]), and hand back the probe
+    (None: it could not tell) for the server to record a pilot that ran and died. A diagnostic must never break the
+    result it annotates, so any failure — or an empty suffix (the normal cold-start window) — leaves the notice
+    as-is."""
     try:
-        status = await _pilot_status_over_login(app, eid, elapsed_s, run_login)
+        probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login)
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
-        return notice
-    suffix = status[1] if status else ""
+        return notice, None
+    suffix = probe.suffix if probe else ""
     note = getattr(app.facility, "worker_init_note", "")
-    if status and status[0] == "finished" and isinstance(note, str) and note:
+    if probe and probe.category == "finished" and isinstance(note, str) and note:
         # a worker that died on a REUSED endpoint whose env_setup was edited: its blocks run the endpoint's own one, so
         # editing it again changes nothing — say so (only for a pilot that ran and died, not for a queue wait)
         suffix += " " + note.rstrip()
-    return f"{notice} {suffix}" if suffix else notice
+    return (f"{notice} {suffix}" if suffix else notice), probe
+
+async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
+    """`_augment_provisioning`'s notice alone."""
+    return (await _augment_provisioning(app, eid, notice, elapsed_s, run_login))[0]
 
 
 # --- a scheduler SUBMISSION in the agent's own command ------------------------------------------------------------

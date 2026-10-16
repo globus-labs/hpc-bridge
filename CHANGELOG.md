@@ -62,6 +62,33 @@ installed plugin only when that version changes); git tags mark releases.
   code, its notice says the same: if it was the user's password, tell them to change it, and never repeat it.
 
 ### Fixed
+- **`stop_endpoint` no longer contradicts what it just said about a block that failed before it ran.** Seen live
+  (2026-10-15, the fake `site` cluster under Pi and Hermes): `ensure_endpoint_up` answered that the scheduler REJECTED
+  the block's submission ("the new block was not created: nothing is queued"), or that its pilot job had already
+  FINISHED with exit status 42, and the `stop_endpoint` that followed answered `draining`: "the compute block was
+  still being submitted … one may land shortly … idle-release is the backstop". The agents believed the earlier answer
+  and did not call again. Now:
+  - after a rejected submission the stop answers `down` (`spend_stopped` true), saying there was nothing to cancel
+    because the scheduler rejected the submission and no block was created. It still looks once, and it still waits
+    for a pilot of the terms the session switched away from, which may still land;
+  - a rejected submission also drops the spend confirmation, as a reaped block does: the next `ensure_endpoint_up` or
+    `run_shell` without `confirm_spend` asks again, saying the last submission was rejected and that the same terms
+    would be refused again. Before, the next call submitted the same request again. On a facility's own endpoint the
+    stop no longer names a block confirmed before the rejection as still billing: with one block, the endpoint
+    submits a new one only once that one is gone;
+  - after a pilot that ran and died, the stop answers `draining` and names that pilot and its exit status: no new
+    pilot appeared during its check, but hpc-bridge's last check may still be queued on the endpoint, which can
+    submit another pilot for it, likely dying the same way; call `stop_endpoint` again in about a minute. It no
+    longer says "still being submitted", and no longer offers idle-release as a backstop: an endpoint is not idle
+    while a check waits. On PBS a dead pilot reads as completed to the endpoint, which then submits another for as
+    long as the check waits;
+  - a second stop looks again. Before, the first stop let go of the compute block's state, so the second one found
+    nothing to wait for and answered `down`; this also covered the stop that said a block was still being submitted.
+    Now the endpoint remembers that a pilot may still land, and the next stop polls for it again and reads the
+    endpoint's pilot history, so a pilot that came and died between two stops is still seen. It answers `down` once
+    no new pilot has appeared for two minutes (`HPC_BRIDGE_PILOT_WATCH_S`). A stop that cancels a new pilot for that
+    check stays `draining`: cancelling a pilot does not end the check, so the endpoint submits another. Its notice
+    says that only removing the endpoint ends the check.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";

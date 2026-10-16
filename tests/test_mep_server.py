@@ -644,13 +644,36 @@ async def test_rejected_submission_is_a_terminal_down_naming_the_cause(monkeypat
     assert "REJECTED" in res.notice and "'hpcbmep'" in res.notice and "'compute'" in res.notice
     assert "Could not read job ID" in res.notice and "Traceback" not in res.notice
     assert "allocating" not in res.notice and "Do not retry unchanged" in res.notice
-    # the run_shell cold path says the same thing
+    # the rejection voided the confirmation (it covered a block that was never created): a run_shell after it asks
+    # again, naming the rejection, and submits nothing — no doomed resubmit
+    runner = server._shape_runtime(app, "compute").runner
+    canaries = runner.canaries
     out = await _run_shell(app, "hostname", shape="compute")
-    assert out.phase == "failed" and "REJECTED" in out.notice
+    assert out.phase == "needs_confirmation" and "REJECTED" in out.notice and "'hpcbmep'" in out.notice
+    assert runner.canaries == canaries and runner.commands == []
     # a corrected account re-provisions (a fresh runner whose canary answers)
     app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: _FakeRunner(eid, _Res(0, "c1\n", ""))
     res2 = await _ensure_endpoint_up(app, shape="compute", account="hpcb", confirm_spend=True)
     assert res2.status == "up" and res2.account == "hpcb"
+
+
+async def test_stop_after_a_rejected_submission_names_no_block_left_billing(monkeypatch):
+    """A block confirmed warm (job 112), then a check whose submission the scheduler REJECTED: with one block the
+    endpoint submits only once the confirmed block is gone (its clock already stopped there), and the refused
+    submission created nothing. So the stop — no cancel issued, as on every facility endpoint — has no block to name;
+    it used to name job 112 as still billing. Nothing else in the MEP flow leans on the voided confirmation."""
+    app = _app()
+    await _connect(app, monkeypatch)
+    runner = _FakeRunner(MEP_UUID, _Res(0, "ok", ""), canary_result=CanaryResult(ok=True, worker_job="112"))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    runner._canary = CanaryResult(ok=False, error=_PARSL_SUBMIT_FAILED)
+    res = await _ensure_endpoint_up(app)
+    assert res.status == "down" and "REJECTED" in res.notice
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and "NO CANCEL WAS ISSUED" in stop.notice
+    assert "No block of ours is known to be running there" in stop.notice
+    assert stop.block_job_id is None and "112" not in stop.notice
 
 
 def test_submit_rejection_classifier_and_cause():

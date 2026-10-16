@@ -32,11 +32,14 @@ from .config import (
     _parse_hhmmss,
     _task_ceiling_s,
     canary_timeout_s,
+    pilot_watch_s,
 )
 from .context import (
     DEFAULT_SHAPE,
     AppCtx,
+    DeadPilot,
     LeftBlock,
+    PilotWatch,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
@@ -61,6 +64,7 @@ from .notices import (
     _queue_word,
     _spend_floor_guidance,
     _submit_rejected,
+    _submit_rejection_cause,
     _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
@@ -235,6 +239,7 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         app.worker_user = result.worker_user
     if result.ok:  # its job is up: the first proof dates it (for its walltime), on whatever terms it is met again
         _saw_job(app, result.worker_job, min(now, result.answered_at) if result.answered_at else now)
+        _check_resolved(app, rt)  # a worker ran our check: no pilot is dying before it any more, none waits to land
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
@@ -610,9 +615,12 @@ async def _provision(
         # facility's configured default (the startup pin's), both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
-        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, or its terms switched)
+        rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
-        rt.switched_terms, rt.switch_left, rt.switch_unseen, rt.reap_terms = None, None, False, None
+        # (`switch_unseen` is not cleared here but once a block is up: until then the old terms' pilot may still land,
+        # and a rejected submission on the new terms must not end the stop's look for it — server._stop_endpoint)
+        rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
+        rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -678,10 +686,89 @@ async def _provision(
         rt.block_since, rt.block_job = since, job
     if block == "warm":
         _forget_presumed(rt)
+        rt.switch_unseen = False  # a block is up: the stop it meets cancels every live pilot of the endpoint, as before
+    if checked and block != "warm" and _rejected_now(rt):  # this call's check: the scheduler refused the submission
+        _void_rejected(app, rt)
     if rt.reaped is not None and not rt.reap_told:  # the check just found the block gone (_confirm_worker)
         rt.reap_told = True
         return "needs_confirmation"
     return block
+
+def _rejected_now(rt: ShapeRuntime) -> bool:
+    """The check just made (the last one) failed because the scheduler REJECTED the block's submission, on a billed
+    shape of one block whose spend was confirmed: a terminal verdict (`_terminal_failure`) for the block that
+    confirmation covered. With more blocks another may still be up, and the confirmation stands, as
+    `_terminal_failure` has it."""
+    c = rt.last_canary
+    return (c is not None and not c.ok and _submit_rejected(c.error) and _billable(rt) and rt.spend_confirmed
+            and _single_block(rt))
+
+def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
+    """The scheduler REJECTED the block's submission (`_rejected_now`): no job id was issued, so no block was created
+    and none will be from it — parsl's block-error handler failed every task of that user endpoint (our check among
+    them: that failure is how the rejection reached us), a bad-state executor is never scaled out again, and the user
+    endpoint stops itself. The spend confirmation covered that block, so it is dropped as a reap or a switch drops it:
+    the next call without confirm_spend asks again (`needs_confirmation`), and the re-ask says why (`rt.rejected`,
+    notices._reask_prefix) — the same terms are refused again. A block confirmed earlier is gone too (with one block the
+    endpoint submits only once it has gone): `_provision` stopped its clock at its latest end above, and its identity
+    goes here, so the block a new confirmation starts is not taken for an unasked replacement of it (a kicked reap).
+    No pilot dies before our check any more: the check failed with the rest (`_check_resolved`). Callers hold
+    app.lock."""
+    uec = rt.user_endpoint_config
+    error = rt.last_canary.error if rt.last_canary is not None else None
+    rt.rejected = (_submit_rejection_cause(error), uec.get("partition"), uec.get("account"))
+    rt.spend_confirmed = False
+    rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
+    rt.block_since = rt.block_job = None
+    rt.provisioning_since = None
+    _forget_presumed(rt)
+    _check_resolved(app, rt)
+
+# -- pilots that may still land after a stop (AppCtx.pilot_watch) ------------------------------------------------------
+
+def _terms_of(rt: ShapeRuntime) -> tuple[str | None, str | None]:
+    uec = rt.user_endpoint_config
+    return uec.get("partition"), uec.get("account")
+
+def _check_resolved(app: AppCtx, rt: ShapeRuntime) -> None:
+    """Our check is no longer waiting for a pilot: a worker answered it, or the endpoint failed it with a rejected
+    submission. The pilots that died before it are history (`rt.dead_pilot`), and so is a watch for a pilot of these
+    terms on this endpoint — one on other terms (left by a switch) is another user endpoint's, and stays."""
+    rt.dead_pilot = None
+    eid = app.state.endpoint_id
+    watch = app.pilot_watch.get(eid) if eid is not None else None
+    if eid is not None and watch is not None and watch.terms == _terms_of(rt):
+        app.pilot_watch.pop(eid, None)
+
+def _note_dead_pilot(rt: ShapeRuntime, job: str, exit_status: str, jobs: frozenset[str]) -> None:
+    """The pilot probe reported pilot `job` FINISHED (exit status `exit_status`) before any worker answered: record it
+    on the shape (the newest named; every pilot job listed so far is known). Callers hold app.lock, on the runtime the
+    probe was made for."""
+    known = jobs | (rt.dead_pilot.known if rt.dead_pilot is not None else frozenset())
+    rt.dead_pilot = DeadPilot(job=job, exit_status=exit_status, known=known | {job})
+
+def _merge_watch(old: PilotWatch | None, new: PilotWatch) -> PilotWatch:
+    """One watch per endpoint: the later sign of a pilot, the newer terms, and the newer dead pilot with every job known
+    to either."""
+    if old is None:
+        return new
+    dead = new.dead or old.dead
+    if new.dead is not None and old.dead is not None:
+        dead = replace(new.dead, known=new.dead.known | old.dead.known)
+    return PilotWatch(since=max(old.since, new.since), terms=new.terms, dead=dead)
+
+def _stop_watch(app: AppCtx, eid: str, rt: ShapeRuntime | None, now: float) -> PilotWatch | None:
+    """The pilot watch an SSH stop works with: the endpoint's (an earlier stop's or a switch's), merged with a dead
+    pilot the shape carries — whose window starts at this stop: its first stop answers `draining` whatever it finds.
+    Stored by the stop once it has looked, not here."""
+    watch = app.pilot_watch.get(eid)
+    if rt is not None and rt.dead_pilot is not None:
+        watch = _merge_watch(watch, PilotWatch(since=now, terms=_terms_of(rt), dead=rt.dead_pilot))
+    return watch
+
+def _watch_expired(watch: PilotWatch, now: float) -> bool:
+    """No sign of a pilot for the whole window (`config.pilot_watch_s`): one would have been in the scheduler by now."""
+    return now - watch.since > pilot_watch_s()
 
 # Partition names come from the discovery gate (agent/user-supplied), then flow into a Jinja
 # template rendered on the login node — so validate the token at the boundary (no shell/YAML
@@ -770,6 +857,14 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
         rt.switched_terms, rt.switch_unseen = terms, unseen
     elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
         rt.reap_terms = terms
+    eid = app.state.endpoint_id
+    if rt.dead_pilot is not None and eid is not None:
+        # The new terms are a different block, so the shape forgets the pilot that died. The old terms' user endpoint
+        # does not: its check is still queued there and it keeps submitting pilots for it, which a stop must still look
+        # for (its window starts now) — `switch_unseen`'s twin for a pilot that keeps dying.
+        app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid),
+                                            PilotWatch(since=time.monotonic(), terms=terms, dead=rt.dead_pilot))
+        rt.dead_pilot = None
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
     uec[key] = value
     app.compute_choice[key] = value

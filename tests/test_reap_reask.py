@@ -855,7 +855,9 @@ async def test_a_down_never_leaves_a_clock_running(verdict, facility, monkeypatc
     assert spent >= 60 / 3600 * _block_nodes(rt, app)              # billed up to the verdict, not short of it
     skew["s"] += 300
     res = await _ensure_endpoint_up(app)
-    assert res.status == "down" and _total_session_spend(app) == spent and rt.warm_since is None
+    # a rejection voided the confirmation (warmth._void_rejected): the next call is the re-ask, not another `down`
+    assert res.status == ("needs_confirmation" if verdict == "rejected" else "down")
+    assert _total_session_spend(app) == spent and rt.warm_since is None
 
 
 async def test_with_no_idle_window_known_a_failed_check_stops_the_clock():

@@ -81,7 +81,8 @@ class ShapeRuntime:
     # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
     # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
     # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
-    # (server._stop_endpoint's expect_block). A confirmation clears them.
+    # (server._stop_endpoint's expect_block). A confirmation clears them — `switch_unseen` only once a block is up (a
+    # submission on the new terms that the scheduler rejects leaves the old terms' pilot still to look for).
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
     switch_unseen: bool = False
@@ -102,6 +103,17 @@ class ShapeRuntime:
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0
+    # The scheduler REJECTED this shape's block submission (one block): (the cause, the partition and account it was
+    # on). Set with the confirmation it voids (warmth._void_rejected), cleared by the next confirmation. The re-ask says
+    # why (notices._reask_prefix), and a stop expects no pilot from it (server._stop_endpoint).
+    rejected: tuple[str, str | None, str | None] | None = None
+    # A pilot of this shape that ran and died before any worker answered: the pilot probe reported it FINISHED with an
+    # exit status of its own (scheduler_ops.PilotProbe.dead; recorded by server._ensure_endpoint_up). Cleared when a
+    # worker answers a check (warmth._check_resolved) or the scheduler rejects a submission; a switch hands it to the
+    # endpoint's pilot watch (warmth._repoint). NOT cleared by a fresh confirm_spend: a confirmation is the user's
+    # assent, not news about the endpoint — the check those pilots were started for is still queued (the runner waits
+    # on it again rather than sending another), so the next pilot is for the same check and likely dies the same way.
+    dead_pilot: DeadPilot | None = None
 
 
 @dataclass
@@ -160,6 +172,34 @@ class LeftBlock:
     partition: str | None = None  # the block's partition and account: the same pair is the same facility user
     account: str | None = None    # endpoint process, whose next block supersedes this one (with one block at most)
     multi: bool = False          # the shape could run more than one block (max_blocks > 1): "at least" this one
+
+
+@dataclass(frozen=True)
+class DeadPilot:
+    """A pilot that ran and died before it ran hpc-bridge's check: the block started and its worker exited (a failed
+    worker_init, an environment the compute node lacks). The check is still queued on the endpoint, and parsl submits
+    another pilot for it on its next scaling pass — on PBS forever (a finished job reads COMPLETED, which never trips
+    parsl's block-error handler), on Slurm until every block that user endpoint ever had has FAILED. Idle-release never
+    ends that: the endpoint is not idle while the check waits."""
+
+    job: str                     # the pilot's scheduler job, as the FINISHED notice named it
+    exit_status: str             # its exit status, as reported
+    # every pilot job of this endpoint the probe listed with it (live or finished): a stop tells a pilot the endpoint
+    # submitted since from these
+    known: frozenset[str] = frozenset()
+
+
+@dataclass(frozen=True)
+class PilotWatch:
+    """A pilot of ours that may still land on an SSH endpoint after a stop let the compute shape go (or a switch moved
+    it to other terms), kept per endpoint in `AppCtx.pilot_watch` so a later stop looks again instead of reading
+    "released none" as done (#24): a block still being submitted when a stop ended `draining`, or a dead pilot whose
+    check is still queued (`dead`). A stop that finds nothing within `config.pilot_watch_s()` of `since` answers `down`;
+    one that finds a pilot refreshes it. Times: time.monotonic()."""
+
+    since: float                                  # the last sign of a pilot: when a stop looked, or found one
+    terms: tuple[str | None, str | None]          # the partition and account of the block it is for
+    dead: DeadPilot | None = None                 # None: a block still being submitted
 
 
 @dataclass
@@ -249,6 +289,12 @@ class AppCtx:
     # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
     # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
     job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
+    # Per SSH endpoint id: a pilot of ours that may still land there though the compute shape is gone (PilotWatch). It
+    # outlives the stop's drop of the shape, so a second stop polls and checks again (server._stop_endpoint). Set by a
+    # stop that answered `draining` waiting for a pilot, and by a switch away from a dead pilot (warmth._repoint);
+    # dropped by a stop that answers `down`, a worker answering a check on its terms or a rejected submission there
+    # (warmth._check_resolved), and the teardown of that endpoint. Keyed by endpoint, so a reconnect to it keeps it.
+    pilot_watch: dict[str, PilotWatch] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

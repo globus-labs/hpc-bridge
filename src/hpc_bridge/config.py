@@ -86,6 +86,24 @@ def provisioning_release_attempts() -> int:
     return max(release_attempts(), int(env("HPC_BRIDGE_PROVISIONING_RELEASE_ATTEMPTS") or "6"))
 
 
+# How long after the last sign of a pilot of ours a later stop still expects one to land (AppCtx.pilot_watch): until it
+# passes, a stop that finds nothing answers `draining`; after it, a check that finds nothing new is a confirmed `down`.
+# It is the longest an endpoint takes to put the next pilot in the scheduler once the last one ended, from parsl's own
+# cadence (parsl 2026.4.20 to 2026.10.12, globus-compute-endpoint 4.15 / 4.18 — the code is the same): it learns a
+# pilot ended only from its provider's status poll, at most every 60 s (`status_polling_interval` of SlurmProvider,
+# PBSProProvider and TorqueProvider), run on the JobStatusPoller's tick (`strategy_period`: 5 s on the endpoints
+# hpc-bridge configures, 30 s on ones configured before that, which reuse never rewrites); on that same tick it submits
+# the next pilot while a task of ours is outstanding (strategy cases 2b/4a); sbatch / qsub return in about a second and
+# the job is listed at once (parsl waits up to its cmd_timeout, 10 s on Slurm, 120 s on PBS: a bound, not the norm).
+# 60 + 30 + 30 s of submit-and-listing slack.
+PILOT_WATCH_S = 120.0
+
+
+def pilot_watch_s() -> float:
+    """The pilot watch window: PILOT_WATCH_S, unless HPC_BRIDGE_PILOT_WATCH_S overrides it (never negative)."""
+    return max(0.0, _env_float("HPC_BRIDGE_PILOT_WATCH_S", PILOT_WATCH_S))
+
+
 def charge_factor() -> float:
     return _env_float("HPC_BRIDGE_CHARGE_FACTOR", 0.0)
 
