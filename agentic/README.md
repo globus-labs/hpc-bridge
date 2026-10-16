@@ -144,9 +144,9 @@ pilot of the endpoint, a second confirm with the same terms (the same user endpo
 dir), the poll, the stop at once. No teardown either way. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
 submitted after the stop's answer (`world:no_relaunch_after_down`, gated), and the world check reads the endpoint's own
 log for parsl's decisions after the stop (`strategy_after_stop`, reported), before the harness tears down. A watch that
-never saw the stop's OWN pilot in a CLEAN sample's squeue or window sacct fails as blind (a sample with an error line,
-a failed query or a missing exit status covers no time; `sacct -j <known id>` never counts), and so does one whose
-endpoint log was not read — the first live run passed blind: its pilot lived 4.6 s between two samples.
+never saw the stop's OWN pilot in a CLEAN sample's squeue (or, once that pilot has ended, the window sacct) fails as
+blind (a sample whose squeue or window sacct failed or reported no exit status covers no time; `sacct -j <known id>`
+never counts), and so does one whose endpoint log was not read — the first live run passed blind: its pilot lived 4.6 s between two samples.
 
 **The result on main (fake/default, 2026-10-15) — phase `second` FAILS by design: the bug is real.** Run 1792120434:
 phase B's stop answered `down` ("released 4", spend_stopped True) with its check queued; 53 s later the user endpoint
@@ -166,10 +166,13 @@ gets the tap: run_smoke.sh starts `harness/admin_tap.py` on the HOST before the 
 target's admin channel (fake: `docker exec` into the controller as root; `{user}` = the pool user) every `every_s`
 seconds into `agentic/runs/.admin-tap-<runid>.jsonl`; the jail reads it (`HPCB_ADMIN_TAP`), the bundle keeps the samples
 (`admin-tap.jsonl`), and the EXIT trap stops the tap and removes the raw file. `admin_tap.slurm_sample_cmd()` samples
-the controller's clock, the pool user's jobs (`squeue -t all`: also those finished within MinJobAge) and its accounting
-from the window's start to now (`sacct -S … -E now -s CA,CD,F,PD,R,TO`: without a state list sacct shows only jobs that
-were eligible in the window, and a held job never is; with one but no `-E` it shows nothing — slurm 23.11.4), with
-epoch times, each query ending with its own exit status (`HPCB_RC`) so a Slurm error is never read as an empty queue. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
+the controller's clock, the pool user's jobs (`squeue -t all`: queued, running, and finished within MinJobAge — the
+query that sees a PENDING relaunch) and its accounting from the tap's own start to now (`sacct -S {since} -E now -s
+CA,CD,F,PD,R,TO`: the jobs that ENDED in the window — not a held job still PENDING, which in both phase-`second` bundles
+was in squeue in 38 samples and in sacct once, after its cancel; without a state list sacct shows only jobs that were
+eligible, with one but no `-E` nothing — slurm 23.11.4), with epoch times, each query ending with its own exit status
+(`HPCB_RC`): a query that failed is never read as an empty queue, while lines of one that ended 0 that are not job rows
+(a multi-line SubmitLine) are skipped; array and het job ids (`42_[1-3]`, `43+0`) read as jobs, never ours. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
 the tap's); the host tap then adds the scenario's `ids_cmd` (`sacct -j {ids}`, its own tag `HPCB_J`) to every sample
 and takes one at once. The tap watches run_smoke.sh's pid and, if it is killed outright, exits and removes its files;
 run_suite's emergency cleanup stops an abandoned cell's tap by its `.pid` file.

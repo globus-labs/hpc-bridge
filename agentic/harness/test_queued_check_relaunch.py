@@ -206,10 +206,11 @@ def test_the_sample_command_asks_for_epoch_times_the_marker_and_the_clock(tmp_pa
     assert "SLURM_TIME_FORMAT=%s" in cmd and "TZ=UTC" in cmd and "echo HPCB_NOW $(date +%s)" in cmd
     assert cmd.count('echo "HPCB_RC $?"; } 2>&1 | sed') == 2   # each query reports its own exit status
     # -t all: a job finished within MinJobAge is still listed; -s <every state>: a never-eligible (held) job is too
-    assert "squeue -u {user} -h -t all -o '%i|%T|%V|%r|%o'" in cmd and "SubmitLine" in cmd and "-S now-2hours" in cmd
+    # the window opens at the tap's own start (`{since}`, which the tap fills), not two hours of another cell's past
+    assert "squeue -u {user} -h -t all -o '%i|%T|%V|%r|%o'" in cmd and "SubmitLine" in cmd and "-S {since} " in cmd
     # -E now with -s: without an end time sacct 23.11.4 listed nothing (verified on the fake controller); the six states
     # are the ones verified there
-    assert f"-S now-2hours -E now -s {admin_tap.SACCT_STATES} " in cmd and admin_tap.SACCT_STATES == "CA,CD,F,PD,R,TO"
+    assert f"-S {{since}} -E now -s {admin_tap.SACCT_STATES} " in cmd and admin_tap.SACCT_STATES == "CA,CD,F,PD,R,TO"
     assert qcr.ADMIN_TAP["cmd"] == cmd and qcr.ADMIN_TAP["every_s"] == 10
     assert qcr.ADMIN_TAP["ids_cmd"] == admin_tap.slurm_ids_cmd() and "sacct -j {ids} -X -n -P" in qcr.ADMIN_TAP["ids_cmd"]
     assert qcr.ADMIN_TAP["ids_cmd"].endswith("sed 's/^/HPCB_J /'")   # its own tag: never read as the window's rows
@@ -861,8 +862,9 @@ def test_a_sample_with_error_lines_a_failed_query_or_no_exit_status_is_not_clean
     assert ok.clean and ok.queue == ok.history == []          # an empty queue that SAID so
     errs = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0\n"
                                                          "HPCB_A sacct: error: Problem talking to the database\n"
-                                                         "HPCB_A HPCB_RC 0"})
-    assert not errs.clean and errs.history == [] and "the window sacct said 'sacct: error: Problem" in errs.error
+                                                         "HPCB_A HPCB_RC 1"})
+    assert not errs.clean and errs.history == [] and "the window sacct exited 1" in errs.error
+    assert "sacct: error: Problem talking to the database" in errs.error   # the failed query's own words, quoted
     failed = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 1\nHPCB_A HPCB_RC 0"})
     assert not failed.clean and "squeue exited 1" in failed.error
     silent = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0"})
@@ -997,7 +999,84 @@ def test_the_proving_runs_own_sample_reads_as_the_relaunch_it_was():
     w = qcr.Watch(called_at=1792120537.0, answered_at=1792120538.0, own_ids=qcr.own_pilots(t), phase="second",
                   log_lines=[])
     qcr.fold_samples(w, [sample], [eid])
-    assert w.own_seen == {"4": "CANCELLED [sacct+squeue]"} and w.held == {"5"}
+    assert w.own_seen == {"4": "CANCELLED [squeue]"} and w.held == {"5"}   # squeue first
     r = qcr.no_relaunch_after_down(t, w)
     assert not r.ok and "job 5 submitted +53 s after the stop answered, PENDING (JobHeldAdmin)" in r.detail
     assert qcr.same_user_endpoint(t) == (True, f"phase A and phase B both ran in {uep}")
+
+
+
+# ---- review round 2: a healthy sample stays clean ---------------------------------------------------------------------
+
+RC0 = "HPCB_Q HPCB_RC 0\nHPCB_A HPCB_RC 0"
+
+
+def test_a_query_that_ended_0_may_print_lines_that_are_not_rows_and_the_sample_stays_clean():
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    # another cell's `sbatch --wrap` with a newline in it: sacct -P prints its SubmitLine over two lines
+    wrapped = admin_tap.parse_slurm_sample({"rc": 0, "out": (
+        f"HPCB_NOW 5\nHPCB_A 41|wrap|COMPLETED|1|2|3|sbatch --wrap 'echo a\nHPCB_A echo b'\n"
+        f"HPCB_A 7|parsl.x|CANCELLED by 0|1|None|4|sbatch {run}\n{RC0}")})
+    assert wrapped.clean and wrapped.skipped == 1 and [j.job_id for j in wrapped.history] == ["41", "7"]
+    # a pending array and a het job component read as jobs (never ours: our pilots are plain ids)
+    odd = admin_tap.parse_slurm_sample({"rc": 0, "out": (
+        "HPCB_NOW 5\nHPCB_Q 42_[1-3]|PENDING|1|Resources|/x/a.sh\nHPCB_Q 42_7|RUNNING|1|None|/x/a.sh\n"
+        f"HPCB_Q 43+0|RUNNING|1|None|/x/h.sh\nHPCB_A 43+1|het|COMPLETED|1|2|3|sbatch h.sh\n{RC0}")})
+    assert odd.clean and [j.job_id for j in odd.queue] == ["42_[1-3]", "42_7", "43+0"] and odd.history[0].job_id == "43+1"
+    assert qcr.endpoint_jobs([odd], [EID]) == []   # no marker of ours
+    # the same lines under a query that FAILED: the sample is not clean, and the error quotes them
+    bad = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q squeue: error: Invalid user\n"
+                                                        "HPCB_Q HPCB_RC 1\nHPCB_A HPCB_RC 0"})
+    assert not bad.clean and "squeue exited 1 ('squeue: error: Invalid user')" in bad.error
+
+
+def test_a_failed_lookup_by_id_is_reported_never_an_unclean_sample():
+    s = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\n" + RC0 +
+                                                      "\nHPCB_J sacct: error: Invalid job id\nHPCB_J HPCB_RC 1"})
+    assert s.clean and s.by_id == [] and s.by_id_error == "sacct -j exited 1 ('sacct: error: Invalid job id')"
+
+
+def test_the_tap_opens_the_window_sacct_at_its_own_start(tmp_path):
+    seen: list[str] = []
+    clock = iter([0.0, 0.0, 10.0, 40.0])
+    admin_tap.tap(tmp_path / "t.jsonl", ["x"], "sacct -S {since} -E now", every_s=10, max_s=35,
+                  run=lambda argv: (seen.append(argv[-1]), (0, "HPCB_NOW 1\n"))[1], sleep=lambda s: None,
+                  clock=lambda: next(clock))
+    assert seen == [f"sacct -S now-{admin_tap.SINCE_MARGIN_S} -E now", f"sacct -S now-{admin_tap.SINCE_MARGIN_S + 10} -E now"]
+
+
+def test_the_wait_goes_on_past_an_unclean_sample(tmp_path):
+    tap = tmp_path / "t.jsonl"
+    tap.write_text(json.dumps({"t": 1, "rc": 0, "out": "HPCB_NOW 500\nHPCB_Q HPCB_RC 1\nHPCB_A HPCB_RC 0"}) + "\n")
+    reader = admin_tap.TapReader(tap)
+    t = {"now": 0.0}
+
+    async def sleep(s):   # the next tick: a clean sample arrives
+        t["now"] += s
+        with tap.open("a") as fh:
+            fh.write(json.dumps({"t": 2, "rc": 0, "out": f"HPCB_NOW 510\n{RC0}"}) + "\n")
+
+    got = asyncio.run(reader.wait_until(400.0, deadline_s=60, sleep=sleep, clock=lambda: t["now"]))
+    assert [s.clean for s in got] == [False, True] and t["now"] > 0   # did not stop at the unclean one
+
+
+def test_a_sacct_row_of_a_live_pilot_is_not_a_sighting_squeue_comes_first():
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    live = admin_tap.parse_slurm_sample({"rc": 0, "out": f"HPCB_NOW 5\nHPCB_A 7|p|PENDING|1|None|None|sbatch {run}\n{RC0}"})
+    assert qcr.own_sightings([live], [EID], {"7"}) == {}            # the window sacct never lists a held PENDING job
+    ended = admin_tap.parse_slurm_sample({"rc": 0, "out": f"HPCB_NOW 6\nHPCB_A 7|p|CANCELLED by 0|1|None|3|sbatch {run}\n{RC0}"})
+    assert qcr.own_sightings([live, ended], [EID], {"7"}) == {"7": "CANCELLED [sacct]"}
+    queued = admin_tap.parse_slurm_sample({"rc": 0, "out": f"HPCB_NOW 4\nHPCB_Q 7|PENDING|1|Dependency|{run}\n{RC0}"})
+    assert qcr.own_sightings([queued, ended], [EID], {"7"}) == {"7": "PENDING [squeue]"}
+
+
+def test_no_hold_tick_without_a_whole_endpoint_marker():
+    for marker in ("uep.", "uep. ", "", "uep.not-a-uuid"):
+        assert "scontrol hold" not in qcr.end_sentinel_cmd("12", marker, "13"), marker
+    assert "scontrol hold" in qcr.end_sentinel_cmd("12", f"uep.{EID}", "13")
+    assert admin_tap.is_marker(f"uep.{EID}") and not admin_tap.is_marker("uep.")
+    sent: list[str] = []
+    no_eid = Trace([c for c in _second().calls if not (c.result or {}).get("endpoint_id")])   # no endpoint id known
+    asyncio.run(qcr._end_sentinel(types.SimpleNamespace(ssh=lambda c, timeout: (sent.append(c), (0, ""))[1]), no_eid,
+                                  qcr.Watch()))
+    assert sent and "scontrol hold" not in sent[0] and "scancel 12" in sent[0]

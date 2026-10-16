@@ -94,10 +94,11 @@ THE OBSERVATION (world checks, after the script, BEFORE the harness' teardown �
 POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop; the watch starts at the JUDGED stop):
 - the ADMIN TAP (harness/admin_tap.py) samples the scheduler as root on slurmctld every 10 s for the whole cell — the
   harness' admin channel, never hpc-bridge: `squeue -t all` (queued and running jobs, and those finished within
-  MinJobAge, 300 s here) and `sacct` over the last 2 h to now (`-S now-2hours -E now -s CA,CD,F,PD,R,TO`: without the
-  state list sacct lists only jobs that were eligible in the window, and a held pilot never is; with it but no `-E` it
-  lists nothing — both verified on the controller, slurm 23.11.4; the first run's sacct saw nothing), each query ending
-  with its own exit status; and — once `relaunch_watch` asks for the stop's own pilot by id — `sacct -j <id>`, under
+  MinJobAge, 300 s here) — what sees a PENDING relaunch — and `sacct` from the tap's own start to now (`-S … -E now
+  -s CA,CD,F,PD,R,TO`: without the state list sacct lists only jobs that were eligible in the window, and a held pilot
+  never is; with it but no `-E` it lists nothing — slurm 23.11.4), which lists the jobs that have ENDED (a held pilot
+  only once cancelled: in both phase-`second` bundles the held relaunch was in squeue in 38 samples, in sacct once),
+  each query ending with its own exit status; and — once `relaunch_watch` asks for the stop's own pilot by id — `sacct -j <id>`, under
   its own tag: it says what became of that job, but a lookup by a known id could never see a relaunch, so it is never
   the sighting that makes a watch not blind;
 - `relaunch_watch` waits until the tap has covered HPCB_RELAUNCH_WATCH_S (default 420 s: several 60 s job-status polls)
@@ -116,7 +117,7 @@ GRADED: `world:no_relaunch_after_down` (gates, as every world row) judges the JU
 when it answered `down` (or spend_stopped=True) and a new pilot of this endpoint was submitted after it — naming the
 job, its submit time relative to the stop's answer and its state. A stop that answered `draining` (or refused) is a
 different premise: report-only, PASS, said so. A `down` with no relaunch passes only when the watch could have seen one:
-a CLEAN sample's squeue or window sacct listed the stop's OWN pilot by its marker (else "watch blind" — the first run
+a CLEAN sample's squeue (or, for a pilot that has ended, its window sacct) listed the stop's OWN pilot by its marker (else "watch blind" — the first run
 passed blind: its pilot lived 4.6 s between two samples; a sample with an error line, a failed query, a missing exit
 status or no clock covers no time), the endpoint's log was read, the endpoint's log shows no scale-out the tap missed, the window was covered, and the premise held
 — the canary was still queued at the stop, and in `second` phase A's block had answered in the SAME user endpoint.
@@ -135,7 +136,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from admin_tap import TAP_ENV, SlurmJob, TapReader, slurm_hold_cmd, slurm_ids_cmd, slurm_sample_cmd
+from admin_tap import TAP_ENV, SlurmJob, TapReader, is_marker, slurm_hold_cmd, slurm_ids_cmd, slurm_sample_cmd
 from cluster_ops import capture_logs_cmd
 from invariants import Result, ToolCall, Trace
 
@@ -576,9 +577,10 @@ class Watch:
     log_error: str = ""
     phase: str = "first"                                  # HPCB_RELAUNCH_PHASE as the run was made
     held: set[str] = field(default_factory=set)           # jobs the tap held (phase B's hold request)
-    # The own pilot as a CLEAN sample's squeue or window sacct listed it (by its marker) — the proof the sampling could
+    # The own pilot as a CLEAN sample's squeue (else, once ended, its window sacct) listed it by its marker — the proof the
+    # sampling could
     # see a relaunch. `sacct -j <own id>` (`by_id`) never counts: a lookup by a known id cannot see an unknown one.
-    own_seen: dict[str, str] = field(default_factory=dict)   # job id -> "STATE [squeue|sacct]"
+    own_seen: dict[str, str] = field(default_factory=dict)   # job id -> "STATE [squeue]" (or "[sacct]": ended)
     by_id: dict[str, str] = field(default_factory=dict)      # job id -> "STATE" from sacct -j (reported only)
     unclean: list[str] = field(default_factory=list)         # the errors of the samples that were not clean
     sentinel: str = ""                                        # phase B's sentinel at the end: "gone" | "STILL …" | ""
@@ -891,7 +893,7 @@ def end_sentinel_cmd(sid: str | None, marker: str, from_job: str | None) -> str:
     postcheck reads job names: a sentinel still COMPLETING reads as a pilot left behind). Prints `HPCB_HELD <id>` for
     each pilot it held and `HPCB_SENTINEL gone|STILL <state>`."""
     hold = ""
-    if from_job and from_job.isdigit():
+    if from_job and from_job.isdigit() and is_marker(marker):   # never a bare `uep.`: it would match every pilot
         hold = (slurm_hold_cmd().replace("{user}", '"$(whoami)"').replace("{marker}", shlex.quote(marker))
                 .replace("{from}", from_job).replace('$2 != "JobHeldAdmin"', '$2 !~ /^JobHeld/') + "; ")
     target = sid if sid and sid.isdigit() else ""
@@ -913,11 +915,35 @@ async def _end_sentinel(ctx, t: Trace, w: Watch) -> None:
         return
     sid = _sentinel_job(t)
     eid = next(iter(_endpoint_ids(t)), "")
-    from_job = str(int(sid) + 1) if sid else None
+    # no endpoint id, no hold tick: an empty one would make the bare marker `uep.`, which every pilot carries
+    from_job = str(int(sid) + 1) if sid and eid else None
     _rc, out = await asyncio.to_thread(ssh, end_sentinel_cmd(sid, f"uep.{eid}", from_job), int(SENTINEL_GONE_S) + 60)
     w.held |= {ln.split()[1] for ln in out.splitlines() if ln.startswith("HPCB_HELD ") and len(ln.split()) == 2}
     w.sentinel = next((ln[len("HPCB_SENTINEL "):] for ln in out.splitlines() if ln.startswith("HPCB_SENTINEL ")),
                       f"unknown: {out.strip()[-120:]!r}")
+
+
+# A pilot that has ended, as sacct says it: only then is the window sacct's row a sighting — it lists ENDED jobs, never
+# a held PENDING one, so a sacct row of a live pilot would not show the sampling could see a pending relaunch.
+_ENDED = frozenset({"CANCELLED", "COMPLETED", "FAILED", "TIMEOUT", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY",
+                    "BOOT_FAIL", "DEADLINE"})
+
+
+def own_sightings(clean: list, eids: list[str], own: set[str]) -> dict[str, str]:
+    """The stop's own pilot(s) as CLEAN samples listed them, by this endpoint's marker: squeue first — it is what sees a
+    pending relaunch, so its sighting is the proof the watch could see one — else the window sacct, for a pilot that
+    has already ended."""
+    marks = [f"uep.{e}" for e in eids if e]
+    seen: dict[str, str] = {}
+    for s in clean:
+        for j in s.queue:
+            if j.job_id in own and any(m in j.command for m in marks):
+                seen[j.job_id] = f"{j.state} [squeue]"
+    for s in clean:
+        for j in s.history:
+            if j.job_id in own and j.job_id not in seen and j.state in _ENDED and any(m in j.command for m in marks):
+                seen[j.job_id] = f"{j.state} [sacct]"
+    return seen
 
 
 def fold_samples(w: Watch, samples: list, eids: list[str]) -> None:
@@ -930,7 +956,7 @@ def fold_samples(w: Watch, samples: list, eids: list[str]) -> None:
     w.covered_until = max((s.now for s in clean), default=None)
     w.jobs = endpoint_jobs(samples, eids)
     w.held = {j for s in samples for j in getattr(s, "held", [])}
-    w.own_seen = {j.job_id: f"{j.state} [{j.source}]" for j in endpoint_jobs(clean, eids) if j.job_id in w.own_ids}
+    w.own_seen = own_sightings(clean, eids, w.own_ids)
     w.by_id = {j.job_id: j.state for s in samples for j in getattr(s, "by_id", []) if j.job_id in w.own_ids}
     w.seen_unmarked = {j.job_id for s in clean for j in [*s.queue, *s.history] if j.job_id in w.own_ids}
     if w.answered_at is not None and not any(s.now >= w.answered_at for s in clean):

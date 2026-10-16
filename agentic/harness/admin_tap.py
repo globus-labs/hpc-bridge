@@ -64,6 +64,7 @@ DEFAULT_EVERY_S = 10.0
 SAMPLE_TIMEOUT_S = 30               # one admin command; a wedged `docker exec` must not stall the tap
 OUT_CAP = 64 * 1024                 # a sample keeps at most this much output (its tail)
 MAX_RUN_S = 4 * 3600.0              # a tap orphaned by a killed run_smoke.sh still ends
+SINCE_MARGIN_S = 300                # `{since}`: the window sacct starts this long before the tap did (clock skew)
 
 
 # ---- the host half: sample the admin channel into the tap file ---------------------------------------------------
@@ -95,6 +96,11 @@ def read_ids(path: Path) -> list[str]:
 
 
 _MARKER = re.compile(r"^uep\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.[0-9a-f-]{36})?$")
+
+
+def is_marker(marker: str) -> bool:
+    """A whole endpoint marker, `uep.<eid>` (or `uep.<eid>.<uep id>`) — never a bare `uep.`, which every pilot matches."""
+    return bool(_MARKER.match(marker or ""))
 
 
 def hold_path(out: Path | str) -> Path:
@@ -166,9 +172,11 @@ def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float =
     def requests() -> tuple[list[str], tuple[str, str] | None]:
         return (read_ids(asked) if ids_cmd else []), (read_hold(held) if hold_cmd else None)
 
-    def sample_once(fh) -> tuple[list[str], tuple[str, str] | None]:
+    def sample_once(fh, elapsed: float) -> tuple[list[str], tuple[str, str] | None]:
         ids, hold = requests()
-        parts = [cmd]
+        # `{since}`: the window opens at the tap's own start — the cell's jobs, not another cell's two hours of history
+        # (a multi-line `sbatch --wrap` SubmitLine, an array or a het job of the pool user's past is not this cell's)
+        parts = [cmd.replace("{since}", f"now-{int(elapsed) + SINCE_MARGIN_S}")]
         if hold:   # first: a pilot it holds is then in this very sample, as held
             parts.insert(0, hold_cmd.replace("{marker}", hold[0]).replace("{from}", hold[1]))
         if ids:
@@ -188,8 +196,8 @@ def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float =
         pid_path(out).write_text(f"{os.getpid()}\n")
     try:
         with out.open("a") as fh:   # held open: a write after run_smoke.sh removed the file never re-creates it
-            while clock() - t0 < max_s and not orphaned:
-                asked_now = sample_once(fh)
+            while not orphaned and (elapsed := clock() - t0) < max_s:
+                asked_now = sample_once(fh, elapsed)
                 n += 1
                 for _ in range(max(1, math.ceil(every_s))):   # a second at a time: a new request is answered at once
                     sleep(min(1.0, every_s))
@@ -253,7 +261,10 @@ def read_samples(path: Path | None) -> list[dict]:
 # The window sacct (slurm-wlm 23.11.4 on the fake controller, verified by hand 2026-10-15): without `-s` it lists the
 # jobs that were ELIGIBLE in the window, and a pilot held by `--begin` never is — `-S now-2hours` alone listed nothing
 # for the first live run's cancelled pilot; with `-s` but no END time (`-E now`) it lists nothing at all; with both it
-# listed every job, the held and cancelled ones included. These six states are the ones verified there.
+# lists the jobs that have ENDED in the window, held ones included once cancelled. It does NOT list a held job that is
+# still PENDING: in both live phase-`second` bundles the held relaunch was in squeue in 38 samples and in sacct once,
+# after its cancel. `squeue -t all` is what sees a pending relaunch; the window sacct sees the finished ones. These six
+# states are the ones verified there.
 SACCT_STATES = "CA,CD,F,PD,R,TO"
 _SACCT_FIELDS = "JobID,JobName,State,Submit,Start,End,SubmitLine"
 _TIMES = "TZ=UTC SLURM_TIME_FORMAT=%s"
@@ -264,13 +275,14 @@ def _tagged(query: str, tag: str) -> str:
     return f"{{ {query}; echo \"HPCB_RC $?\"; }} 2>&1 | sed 's/^/{tag} /'"
 
 
-def slurm_sample_cmd(*, history: str = "now-2hours") -> str:
+def slurm_sample_cmd(*, history: str = "{since}") -> str:
     """One Slurm sample through the admin channel, as tagged lines (`parse_slurm_sample`): the controller's clock, the
     pool user's jobs in the controller (`HPCB_Q`: `squeue -t all` — queued and running, AND those finished within
     MinJobAge, 300 s on the fake profiles, so a pilot cancelled between two samples is still seen; `%o` is the batch
     script — a parsl pilot's sits under `uep.<eid>.<…>/submit_scripts/`, so it carries the endpoint's marker, as the
-    StdOut path does for scheduler_ops._release_cmd), and its accounting from `history` to now in SACCT_STATES
-    (`HPCB_A`; SubmitLine names the same script). Each query ends with its own exit status. Times in epoch seconds
+    StdOut path does for scheduler_ops._release_cmd), and its accounting from `history` (default `{since}`, which the
+    tap fills with its own start) to now, the jobs that ENDED in SACCT_STATES (`HPCB_A`; SubmitLine names the same
+    script). Each query ends with its own exit status. Times in epoch seconds
     (SLURM_TIME_FORMAT=%s, glibc's strftime); TZ=UTC so a Slurm that ignores the format prints ISO times in UTC, which
     the parser reads as such."""
     return ("echo HPCB_NOW $(date +%s); "
@@ -326,9 +338,11 @@ class SlurmSample:
     now: float | None             # the controller's clock: what a sample's times compare against
     queue: list[SlurmJob] = field(default_factory=list)     # HPCB_Q: squeue -t all
     history: list[SlurmJob] = field(default_factory=list)   # HPCB_A: the window sacct
-    error: str = ""               # why this sample is not CLEAN (an error line, a query's failure, no clock); "" if it is
+    error: str = ""               # why this sample is not CLEAN (a query that failed or did not end, no clock); "" if it is
     held: list[str] = field(default_factory=list)   # jobs the tap's hold_cmd held in this sample (`HPCB_HELD <id>`)
     by_id: list[SlurmJob] = field(default_factory=list)     # HPCB_J: sacct -j <known ids> — never evidence of sight
+    by_id_error: str = ""         # the by-id lookup failed (report-only: it never makes the sample unclean)
+    skipped: int = 0              # lines of a query that ended 0 that are not job rows (a multi-line SubmitLine)
 
     @property
     def clean(self) -> bool:
@@ -339,17 +353,20 @@ class SlurmSample:
 
 _STREAMS = {"HPCB_Q": "squeue", "HPCB_A": "the window sacct", "HPCB_J": "sacct -j"}
 _REQUIRED = ("HPCB_Q", "HPCB_A")   # the sampling's own queries: each must report how it ended
+# A row's job id as Slurm prints it: plain (every pilot of ours), an array task or a pending array (`42_7`,
+# `42_[1-3]`), a het job component (`43+0`). Read leniently: such a row is a job (not an error), never ours.
+_ROW_ID = re.compile(r"^[0-9]+(?:_(?:[0-9]+|\[[0-9,%\-]+\])|\+[0-9]+)?$")
 
 
 def _job_row(tag: str, rest: str, now: float | None) -> SlurmJob | None:
     if tag == "HPCB_Q":
         f = rest.split("|", 4)
-        if len(f) == 5 and _JOB_ID.match(f[0].strip()):
+        if len(f) == 5 and _ROW_ID.match(f[0].strip()):
             return SlurmJob(job_id=f[0].strip(), state=(f[1].split() or ["?"])[0], submit=slurm_time(f[2]),
                             reason=f[3].strip(), command=f[4].strip(), source="squeue", seen_at=now)
         return None
     f = rest.split("|", 6)
-    if len(f) == 7 and _JOB_ID.match(f[0].strip()):
+    if len(f) == 7 and _ROW_ID.match(f[0].strip()):
         return SlurmJob(job_id=f[0].strip(), name=f[1].strip(), state=(f[2].split() or ["?"])[0],
                         submit=slurm_time(f[3]), start=slurm_time(f[4]), end=slurm_time(f[5]),
                         command=f[6].strip(), source="sacct" if tag == "HPCB_A" else "sacct-j", seen_at=now)
@@ -358,13 +375,16 @@ def _job_row(tag: str, rest: str, now: float | None) -> SlurmJob | None:
 
 def parse_slurm_sample(sample: dict) -> SlurmSample:
     """One tap sample from `slurm_sample_cmd` (+ `ids_cmd`, `hold_cmd`) → its clock, queue, history and by-id rows.
-    Anything under a query's tag that is not a job row or its `HPCB_RC` is an ERROR of the sample (a Slurm error the
-    pipeline's sed would otherwise swallow), as is a query that failed, one that reported no exit status, a failed
-    admin command, or no clock: such a sample is not `clean`. Its job rows are kept (a relaunch it lists is still one)."""
+    The sample is not `clean` when one of the sampling's own queries (squeue, the window sacct) failed — its exit status
+    not 0, its lines (the Slurm error the pipeline's sed would otherwise swallow) quoted — or reported no exit status,
+    when the admin command failed, or when there is no clock. A query that ended 0 may print lines that are not job rows
+    (a multi-line SubmitLine): skipped, not errors. The by-id lookup is report-only: its failure is `by_id_error`, never
+    an unclean sample. Job rows are kept either way (a relaunch an unclean sample lists is still one)."""
     out = str(sample.get("out") or "")
     now: float | None = None
     rows: dict[str, list[SlurmJob]] = {t: [] for t in _STREAMS}
     rcs: dict[str, str] = {}
+    noise: dict[str, list[str]] = {t: [] for t in _STREAMS}
     errors: list[str] = []
     held: list[str] = []
     lines = out.splitlines()
@@ -382,20 +402,28 @@ def parse_slurm_sample(sample: dict) -> SlurmSample:
             elif (job := _job_row(tag, rest, now)) is not None:
                 rows[tag].append(job)
             elif rest.strip():
-                errors.append(f"{_STREAMS[tag]} said {rest.strip()[:160]!r}")
-    for tag, rc in rcs.items():
-        if rc != "0":
-            errors.append(f"{_STREAMS[tag]} exited {rc}")
+                noise[tag].append(rest.strip())
+
+    def said(tag: str) -> str:
+        return f" ({' | '.join(noise[tag])[:200]!r})" if noise[tag] else ""
+
     for tag in _REQUIRED:
         if tag not in rcs:
-            errors.append(f"{_STREAMS[tag]} reported no exit status (it did not run to its end)")
+            errors.append(f"{_STREAMS[tag]} reported no exit status (it did not run to its end){said(tag)}")
+        elif rcs[tag] != "0":
+            errors.append(f"{_STREAMS[tag]} exited {rcs[tag]}{said(tag)}")
+    j_rc = rcs.get("HPCB_J")
+    by_id_error = (f"sacct -j exited {j_rc}{said('HPCB_J')}" if j_rc not in (None, "0") else
+                   f"sacct -j reported no exit status{said('HPCB_J')}" if j_rc is None and noise["HPCB_J"] else "")
+    skipped = sum(len(noise[t]) for t in _REQUIRED if rcs.get(t) == "0")
     rc = sample.get("rc")
     if rc not in (0, None):
         errors.insert(0, f"admin command rc={rc}: {out.strip()[-200:]!r}")
     if now is None:
         errors.insert(0, f"no controller clock in the sample: {out.strip()[-160:]!r}")
     return SlurmSample(t=sample.get("t"), now=now, queue=rows["HPCB_Q"], history=rows["HPCB_A"],
-                       error="; ".join(errors), held=held, by_id=rows["HPCB_J"])
+                       error="; ".join(errors), held=held, by_id=rows["HPCB_J"], by_id_error=by_id_error,
+                       skipped=skipped)
 
 
 class TapReader:
@@ -434,14 +462,14 @@ class TapReader:
     async def wait_until(self, now: float, *, deadline_s: float, poll_s: float = 5.0,
                          sleep: Callable[[float], Awaitable[None]] = asyncio.sleep,
                          clock: Callable[[], float] = time.monotonic) -> list[SlurmSample]:
-        """Wait until a sample's controller clock reaches `now` — or `deadline_s` seconds pass — and return every
-        sample. Returns at once without a tap (`path` None)."""
+        """Wait until a CLEAN sample's controller clock reaches `now` — or `deadline_s` seconds pass — and return every
+        sample: an unclean one covers nothing, so the wait goes on past it. Returns at once without a tap."""
         if self.path is None:
             return []
         t_end = clock() + max(0.0, deadline_s)
         while True:
             got = self.samples()
-            if any(s.now is not None and s.now >= now for s in got) or clock() >= t_end:
+            if any(s.clean and s.now is not None and s.now >= now for s in got) or clock() >= t_end:
                 return got
             await sleep(min(poll_s, max(0.0, t_end - clock())))
 
