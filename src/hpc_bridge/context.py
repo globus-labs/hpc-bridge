@@ -324,6 +324,8 @@ class AppCtx:
     # restarted server still sees one still running (warmth._note_command_sent); and the task that writes a check's or
     # command's task id to the record as soon as the SDK has it (warmth._watch_ids).
     commands_sent: dict[str, list[SentCheck]] = field(default_factory=dict)
+    # Per endpoint id: how many writes of its record failed in a row (warmth._done_job retries with a backoff).
+    record_retries: dict[str, int] = field(default_factory=dict)
     id_watchers: dict[str, asyncio.Task] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)

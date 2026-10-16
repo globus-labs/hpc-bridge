@@ -936,15 +936,42 @@ def _write_job(eid: str, job: _RecordJob, drop: frozenset[str]) -> bool:
         return True
     return store.update(eid, job.rows, drop)
 
+# A failed write is tried again by itself — 1 s, 2 s, 4 s … at most 60 s apart, 20 times — unless a newer one is
+# pending by then (which replaces it): a change skipped while it was in flight must not wait for another change.
+_RETRY_BASE_S = 1.0
+_RETRY_MAX_S = 60.0
+_RETRY_LIMIT = 20
+
 def _done_job(app: AppCtx, eid: str, job: _RecordJob, drop: frozenset[str], ok: bool,
               before: tuple[frozenset[str], frozenset[str]] | None) -> None:
-    if job.rows is not None and not ok:  # not written: back to what is on the record, so the next change retries
-        if before is None:
-            app.persisted_checks.pop(eid, None)
-        else:
-            app.persisted_checks[eid] = before
+    if job.rows is None:
+        return
+    if ok:
+        app.record_retries.pop(eid, None)
+        return
+    if before is None:  # not written: back to what is on the record
+        app.persisted_checks.pop(eid, None)
+    else:
+        app.persisted_checks[eid] = before
+    n = app.record_retries.get(eid, 0) + 1
+    app.record_retries[eid] = n
+    delay = min(_RETRY_MAX_S, _RETRY_BASE_S * 2 ** (n - 1))
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        loop = None
+    if loop is None or n > _RETRY_LIMIT:
         print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under {job.root}); tried "
               "again on the next change", file=sys.stderr)
+        return
+    print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under {job.root}); trying "
+          f"again in {delay:g} s", file=sys.stderr)
+    loop.call_later(delay, _retry_job, app, eid, job)
+
+def _retry_job(app: AppCtx, eid: str, job: _RecordJob) -> None:
+    if eid not in app.checks_pending:  # a newer write pending replaces this one
+        app.checks_pending[eid] = job
+    _schedule_flush(app, eid)
 
 def _take_job(app: AppCtx, eid: str) -> tuple[_RecordJob, frozenset[str], tuple[frozenset[str], frozenset[str]] | None]:
     """The next write, and its removals computed NOW — against what the writes before it put on the record — so a row

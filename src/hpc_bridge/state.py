@@ -30,9 +30,11 @@ def _state_dir() -> Path:
     sockets). Defaults to ~/.hpc-bridge; `HPC_BRIDGE_STATE_DIR` relocates it — tests point it at a
     tmp dir so they never read stale entries or WRITE into the developer's real state."""
     configured = os.environ.get("HPC_BRIDGE_STATE_DIR")
-    if not configured and os.environ.get("PYTEST_CURRENT_TEST"):
-        # a test that reached the real ~/.hpc-bridge (a test file outside tests/, which tests/conftest.py does not
-        # isolate — found 2026-10-16: an empty ~/.hpc-bridge/sent-checks/ appeared in the maintainer's state dir)
+    if not configured and os.environ.get("HPC_BRIDGE_TEST_GUARD") == "1":
+        # hpc-bridge's own unit tier sets the flag (tests/conftest.py) with a tmp state dir: reaching the default here
+        # means a test escaped that isolation (found 2026-10-16: an empty ~/.hpc-bridge/sent-checks/ appeared in the
+        # maintainer's state dir). An explicit flag, never "running under pytest": a third party's pytest-driven agent
+        # eval launches hpc-bridge too, and must keep its normal state dir.
         raise RuntimeError("hpc-bridge: a test reached the real ~/.hpc-bridge — set HPC_BRIDGE_STATE_DIR "
                            "(tests/conftest.py does, for tests under tests/)")
     return Path(configured or (Path.home() / ".hpc-bridge"))
@@ -198,7 +200,8 @@ class SentCheckStore:
         return self.root / f"{endpoint_id}.json" if _SAFE_ID.fullmatch(endpoint_id or "") else None
 
     @contextmanager
-    def _locked(self, path: Path) -> Iterator[None]:
+    def _locked(self, path: Path) -> Iterator[None]:  # (creates the directory: reached only once there is one, or
+        # by a write with rows — a read, a removal or an empty write never creates it)
         """An exclusive lock on the sibling `.lock` file — never blocking: tried without waiting (flock LOCK_NB, or
         msvcrt's non-blocking lock on Windows) for up to `LOCK_WAIT_S`, then OSError, which every caller reads as the
         record being unusable (fail closed). A lock service that hangs (an NFS home) cannot freeze the caller; an
@@ -258,7 +261,7 @@ class SentCheckStore:
         """(rows, problem): `problem` says why the record cannot be trusted to list every task — it could not be read,
         or an earlier copy was corrupt and is kept aside — else None."""
         path = self._path(endpoint_id)
-        if path is None:
+        if path is None or not self.root.is_dir():  # nothing was ever written here: read nothing, create nothing
             return [], None
         why: str | None = None
         try:
@@ -284,7 +287,7 @@ class SentCheckStore:
         """Merge under the lock: the rows on disk, less `drop` (tasks this writer saw resolve), plus `add` (its own).
         A corrupt record is kept aside first (and keeps being reported). False when nothing could be written."""
         path = self._path(endpoint_id)
-        if path is None:
+        if path is None or (not add and not self.root.is_dir()):  # nothing to write, nothing there: create nothing
             return True
         try:
             with self._locked(path):
@@ -318,7 +321,7 @@ class SentCheckStore:
     def remove(self, endpoint_id: str) -> None:
         """The endpoint is gone (its teardown): its record goes, a kept-aside corrupt copy too (said on stderr)."""
         path = self._path(endpoint_id)
-        if path is None:
+        if path is None or not self.root.is_dir():
             return
         try:
             with self._locked(path):

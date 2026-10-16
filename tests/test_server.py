@@ -2607,6 +2607,59 @@ def test_a_test_never_reaches_the_real_state_dir(monkeypatch):
         state._state_dir()
 
 
+def test_reading_or_removing_a_record_never_creates_its_directory(tmp_path):
+    # found 2026-10-16: agentic/harness's teardown scenarios drove the real teardown with the default state dir, and the
+    # record's removal (and a read) created an empty ~/.hpc-bridge/sent-checks/ — only a write with rows may create it
+    from hpc_bridge.state import SentCheckStore
+
+    store = SentCheckStore(tmp_path / "sent-checks")
+    assert store.read("fake-eid") == ([], None)
+    store.remove("fake-eid")
+    assert store.update("fake-eid", [], {"x"}) is True
+    assert not (tmp_path / "sent-checks").exists()
+    assert store.update("fake-eid", [{"task_id": "t", "what": "check"}], set())
+    assert (tmp_path / "sent-checks" / "fake-eid.json").exists()
+
+
+def test_the_guard_is_hpc_bridges_own_flag_not_running_under_pytest(monkeypatch):
+    # Review (final): PYTEST_CURRENT_TEST is inherited by child processes — a third party's pytest-driven agent eval
+    # that launches hpc-bridge would have had every state access refused
+    from pathlib import Path
+
+    from hpc_bridge import state
+
+    monkeypatch.delenv("HPC_BRIDGE_STATE_DIR", raising=False)
+    monkeypatch.delenv("HPC_BRIDGE_TEST_GUARD", raising=False)
+    assert "PYTEST_CURRENT_TEST" in __import__("os").environ
+    assert state._state_dir() == Path.home() / ".hpc-bridge"                # read, never created here
+
+
+async def test_a_failed_record_write_is_tried_again_by_itself(monkeypatch):
+    # Review (final, LOW): a failed write waited for another change — a restart before one lost its rows
+    import asyncio
+
+    from hpc_bridge import warmth
+    from hpc_bridge.state import SentCheckStore
+
+    monkeypatch.setattr(warmth, "_RETRY_BASE_S", 0.05, raising=False)
+    real = SentCheckStore.update
+    calls = {"n": 0}
+
+    def flaky(self, eid, add, drop):
+        calls["n"] += 1
+        return False if calls["n"] <= 2 else real(self, eid, add, drop)   # (a second try fails too)
+
+    monkeypatch.setattr(SentCheckStore, "update", flaky)
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    for _ in range(60):                                                     # no further change of ours
+        await asyncio.sleep(0.05)
+        await warmth._flush_all(app)
+        if SentCheckStore().load("fake-eid"):
+            break
+    assert calls["n"] >= 3 and [r["task_id"] for r in SentCheckStore().load("fake-eid")] == ["check-1"]
+
+
 async def test_a_command_in_its_sync_wait_refuses_the_stop_whatever_the_record_thread_is_doing(monkeypatch):
     # Review r5, the flake (test_a_rebind_under_a_waiting_call[True]): the stop flushed and read the record BEFORE its
     # busy check, on the one record thread — a job left on it (an earlier test's, or a slow home directory) let the
