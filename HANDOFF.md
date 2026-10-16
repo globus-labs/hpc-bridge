@@ -28,8 +28,9 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
   executor in bad state and the user endpoint shuts down instead.
 - **The decided fix:** a fresh compute user endpoint per confirmation; compute user endpoints that exit when idle; a
   stop that answers `down` only on evidence that no check of ours is left queued.
-- **In progress** on `fix/stop-after-failed-block`. `queued_check_relaunch` (phase `second`) is its regression check:
-  FAILED on main by design, it must pass once the fix lands.
+- **Fixed by #204** (`fix/stop-after-failed-block`). `queued_check_relaunch` (phase `second`) is its regression check:
+  it failed on main before the fix (4/4 runs) and passes with it (live 2026-10-16). It is still excluded from the
+  default sweep (`sweep_profiles.sh`); adding it is the maintainer's call.
 
 ## Where it stands (2026-10-14) — the spend question names the block
 

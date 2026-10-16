@@ -149,10 +149,11 @@ never saw the stop's OWN pilot in a CLEAN sample's squeue (or, once that pilot h
 blind (a sample whose squeue or window sacct failed or reported no exit status covers no time; `sacct -j <known id>`
 never counts), and so does one whose endpoint log was not read — the first live run passed blind: its pilot lived 4.6 s between two samples.
 
-**The result on main (fake/default, 2026-10-15) — phase `second` FAILS by design: the bug is real.** Run 1792120434:
+**The result before the fix (main at 7ae46c2, fake/default, 2026-10-15) — phase `second` FAILED: the bug was real.** Run 1792120434:
 phase B's stop answered `down` ("released 4", spend_stopped True) with its check queued; 53 s later the user endpoint
 logged "Scaling out by 1 blocks" and submitted job 5, a new pilot (held by the tap, so it never ran). The cell is the
-regression check for the fix (branch `fix/stop-after-failed-block`; HANDOFF.md). Phase `first` passes on main by
+regression check for the fix (#204): with it, phase B runs in a fresh compute user endpoint, its pilot is that
+endpoint's first, and the stop answers an honest `down` with no relaunch (live 2026-10-16, run 1792142078). Phase `first` passes on main by
 another path (run 1792117501): 56 s after the stop parsl marked the cancelled, never-connected block MISSING, went to
 bad state ("Not strategizing") and the user endpoint shut down — no relaunch, the canary left queued. A `draining`
 answer passes the gated row even with a relaunch seen (it did not claim spend stopped); the universal
