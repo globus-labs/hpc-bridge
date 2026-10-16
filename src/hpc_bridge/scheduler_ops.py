@@ -446,7 +446,9 @@ async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elaps
 #   `_EVIDENCE_SETTLED_S` before the look, so the start request the service sent with it has been acted on by now (a
 #   start or a cache, both in the manager's log) or has expired with the 30 s grace. Nothing of ours sends to that block
 #   request after a stop has dropped its shape (a new confirmation draws a new number).
-# Anything less is no evidence.
+# Anything less is no evidence. Taken on trust from the service, still: a wrong verdict would need it both to deliver a
+# task to the queue more than about a second after returning its id, and its start request to reach the manager more
+# than 35 s late — and the stop reads this only where a new life starts no block without a task (`init_blocks` 0).
 
 _UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
 _DIGITS = re.compile(r"[0-9]+")  # never str.isdigit: it takes '²', which int() refuses
@@ -495,8 +497,11 @@ def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None 
     """Login-shape one-liner that samples, twice `gap_s` apart, each block request's compute user endpoint and its
     manager. Per sample (`<S>` = 1 or 2):
     - `HPCB_NOW <S> <epoch> <nanoseconds|N>` (one `date` call);
-    - `HPCB_FAIL <S> ps|read <id>|manager <count>`: the process list, a user endpoint's log, or the manager's own log
-      (the one endpoint.log outside the user endpoints' directories naming `Core Endpoint begins: <eid>`) not read;
+    - `HPCB_FAIL <S> ps|read <id>|grep|manager <count>`: the process list, a user endpoint's log (with that one's
+      `HPCB_PS`/`HPCB_PID`/`HPCB_MGR` rows, to tell a stopped one from a live twin), a read error grep met, or the
+      manager's own directory (the one outside the user endpoints' whose endpoint.json names `<eid>`, or whose
+      endpoint.log or its rotated `endpoint.log.1` names `Core Endpoint begins: <eid>`) not read — its log is read
+      through the rotation, the copy first;
     - `HPCB_UEP <S> <n> <id> <starts> <start> <request> <subscribed> <bad> <shutdown> <lines> <pid> <epoch> <dst>
       <microseconds>` for each user endpoint whose log names block request `n` (a `grep -lF` over this endpoint's user
       endpoint logs, confirmed exactly by awk, `_UEP_AWK`): the bad state's time turned into epoch seconds ON the login
@@ -522,6 +527,7 @@ def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None 
     grep = " ".join(f"-e {shlex.quote(BLOCK_REQUEST_LOG + str(n))}" for n in nums)
     begins, shut = shlex.quote("========== Endpoint begins: "), shlex.quote("---------- Endpoint shutdown: ")
     core = shlex.quote(f"========== Core Endpoint begins: {eid}")
+    json = shlex.quote(f'"endpoint_id": "{eid}"')
     uep = f"uep.{eid}."
     return (
         # (its names stay clear of the session wrapper's `__hb_*`, around which this runs)
@@ -532,27 +538,38 @@ def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None 
         'for _hpcb_o in -3600 3600; do _hpcb_t=$(date -d "@$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || '
         'date -r "$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null) || _hpcb_a=1; '
         '[ "$_hpcb_t" = "$1" ] && _hpcb_a=1; done; echo "$_hpcb_e $_hpcb_a"; }; '
+        # one user endpoint's process count, pid file and manager-log facts (matched, or with a log that cannot be read)
+        f'_hpcb_facts() {{ if [ "$pok" = 1 ]; then c=$(printf "%s\\n" "$pl" | awk -v m="{uep}$1" '
+        "'index($0,m){c++} END{print c+0}'); echo \"HPCB_PS $S $1 $c\"; fi; "
+        'k="$2/daemon.pid"; if [ ! -e "$k" ]; then echo "HPCB_PID $S $1 none"; '
+        'elif q=$(find "$k" -mmin -2 2>/dev/null); then if [ -n "$q" ]; then echo "HPCB_PID $S $1 fresh"; '
+        'else echo "HPCB_PID $S $1 old"; fi; else echo "HPCB_PID $S $1 unknown"; fi; '
+        f'if [ -n "$m" ]; then if g=$(awk -v m="{uep}$1" {shlex.quote(_MGR_AWK)} ${{m1:+"$m1"}} "$m/endpoint.log"); '
+        'then echo "HPCB_MGR $S $1 $g"; else echo "HPCB_FAIL $S manager read"; fi; fi; }; '
         '_hpcb_sample() { S=$1; echo "HPCB_NOW $S $(date "+%s %N")"; '
         'if pl=$(ps -ww -U "$(id -u)" -o args= 2>/dev/null); then pok=1; else pok=0; echo "HPCB_FAIL $S ps"; fi; '
-        'm=""; nm=0; for f in "$r"/*/endpoint.log; do [ -e "$f" ] || continue; '
-        f'case "$f" in "$r"/uep.*) continue;; esac; if grep -qxF {core} "$f" 2>/dev/null; then m=$f; nm=$((nm + 1)); '
-        'fi; done; [ "$nm" -eq 1 ] || { echo "HPCB_FAIL $S manager $nm"; m=""; }; '
-        f'for f in "$r"/{uep}*/endpoint.log; do [ -e "$f" ] || continue; [ -r "$f" ] && continue; '
-        f'd=${{f%/endpoint.log}}; echo "HPCB_FAIL $S read ${{d##*/{uep}}}"; done; '
-        f'grep -lF {grep} -- "$r"/{uep}*/endpoint.log 2>/dev/null | while IFS= read -r f; do '
+        # the manager's own directory: the one outside the user endpoints' that its endpoint.json, or its log (or the
+        # log's one rotated copy), names as this endpoint's — read through the rotation, older part first
+        'm=""; m1=""; nm=0; for d in "$r"/*/; do d=${d%/}; case "$d" in "$r"/uep.*) continue;; esac; '
+        f'if grep -qF {json} "$d/endpoint.json" 2>/dev/null || grep -qxF {core} "$d/endpoint.log" 2>/dev/null || '
+        f'grep -qxF {core} "$d/endpoint.log.1" 2>/dev/null; then m=$d; nm=$((nm + 1)); fi; done; '
+        '[ "$nm" -eq 1 ] && [ -e "$m/endpoint.log" ] || { echo "HPCB_FAIL $S manager $nm"; m=""; }; '
+        '[ -n "$m" ] && [ -e "$m/endpoint.log.1" ] && m1="$m/endpoint.log.1"; '
+        # the readable user endpoint logs; one that cannot be read is named, with its process, pid file, manager facts
+        f'set --; for f in "$r"/{uep}*/endpoint.log; do [ -e "$f" ] || continue; d=${{f%/endpoint.log}}; '
+        f'u=${{d##*/{uep}}}; case "$u" in *[!0-9a-fA-F-]*|"") continue;; esac; [ ${{#u}} -eq 36 ] || continue; '
+        'if [ -r "$f" ]; then set -- "$@" "$f"; else echo "HPCB_FAIL $S read $u"; _hpcb_facts "$u" "$d"; fi; done; '
+        # a read error grep meets (EIO, a stale NFS handle) is said, never an empty match
+        f'h=""; if [ $# -gt 0 ]; then h=$(grep -lF {grep} -- "$@" 2>/dev/null); [ $? -le 1 ] || '
+        'echo "HPCB_FAIL $S grep"; fi; '
+        'printf "%s\\n" "$h" | while IFS= read -r f; do [ -n "$f" ] || continue; '
         f'd=${{f%/endpoint.log}}; u=${{d##*/{uep}}}; '
         'case "$u" in *[!0-9a-fA-F-]*|"") continue;; esac; [ ${#u} -eq 36 ] || continue; '
         f'if ! o=$(awk -v u="$u" -v w={want} -v p={pre} -v b={begins} -v s={shut} {shlex.quote(_UEP_AWK)} "$f"); '
         'then echo "HPCB_FAIL $S read $u"; continue; fi; [ -n "$o" ] || continue; '
         'printf "%s\\n" "$o" | while read -r n x nb lb lt la lx ls nl pw xd xt xf; do '
         'echo "HPCB_UEP $S $n $x $nb $lb $lt $la $lx $ls $nl $pw $xd $xt $(_hpcb_ep "$xd $xt") $xf"; done; '
-        f'if [ "$pok" = 1 ]; then c=$(printf "%s\\n" "$pl" | awk -v m="{uep}$u" '
-        "'index($0,m){c++} END{print c+0}'); echo \"HPCB_PS $S $u $c\"; fi; "
-        'k="$d/daemon.pid"; if [ ! -e "$k" ]; then echo "HPCB_PID $S $u none"; '
-        'elif q=$(find "$k" -mmin -2 2>/dev/null); then if [ -n "$q" ]; then echo "HPCB_PID $S $u fresh"; '
-        'else echo "HPCB_PID $S $u old"; fi; else echo "HPCB_PID $S $u unknown"; fi; '
-        f'if [ -n "$m" ]; then if g=$(awk -v m="{uep}$u" {shlex.quote(_MGR_AWK)} "$m"); then '
-        'echo "HPCB_MGR $S $u $g"; else echo "HPCB_FAIL $S manager read"; fi; fi; done; }; '
+        '_hpcb_facts "$u" "$d"; done; }; '
         f'_hpcb_sample 1; sleep {gap:g}; _hpcb_sample 2; true'
     )
 
@@ -626,6 +643,17 @@ def _read_uep_evidence(stdout: str, eid: str, wanted: Collection[tuple[str, int,
     return {key: _uep_verdict(eid, samples, block, age) for key, block, age in wanted}
 
 
+def _stopped_for_good(sample: _Sample, uuid: str) -> bool:
+    """A user endpoint whose log could not be read: no process names it, its pid file is gone or stale, and the
+    manager's log never names it, or names its exit after its last start and nothing after that."""
+    mgr = sample.mgr.get(uuid)
+    if sample.ps.get(uuid) != "0" or sample.pid.get(uuid) not in ("none", "old") or mgr is None:
+        return False
+    start, pid, exit_, exit_pid, last = mgr
+    return int(last) == 0 or (int(start) > 0 and int(exit_) > int(start) and pid == exit_pid
+                              and int(last) == int(exit_))
+
+
 def _uep_verdict(eid: str, samples: dict[str, _Sample], block: int, age: float) -> UepEvidence:
     first, second = samples.get("1"), samples.get("2")
     if first is None or second is None:
@@ -634,6 +662,8 @@ def _uep_verdict(eid: str, samples: dict[str, _Sample], block: int, age: float) 
         return UepEvidence(False, "its process list could not be read")
     if "manager" in first.failed or "manager" in second.failed:
         return UepEvidence(False, "the endpoint's own log on the login node could not be found or read")
+    if "grep" in first.failed or "grep" in second.failed:  # a read error, not a missing match
+        return UepEvidence(False, "a user endpoint's log there could not be read")
     found = first.ueps.get(block, [])
     if not found:
         why = ("a user endpoint's log there could not be read" if first.unreadable or second.unreadable
@@ -647,6 +677,14 @@ def _uep_verdict(eid: str, samples: dict[str, _Sample], block: int, age: float) 
     facts = lambda s: (s.ueps.get(block), s.ps.get(uuid), s.pid.get(uuid), s.mgr.get(uuid))  # noqa: E731
     if facts(first) != facts(second):
         return UepEvidence(False, "its user endpoint changed while hpc-bridge looked", uep)
+    # A user endpoint whose log could not be read may be a twin naming the same block request: it must be provably
+    # stopped too — nothing of it runs, and its manager either never started it or logged its exit with nothing after.
+    for other in sorted((first.unreadable | second.unreadable) - {uuid}):
+        if not (_stopped_for_good(first, other) and _stopped_for_good(second, other)
+                and (first.ps.get(other), first.pid.get(other), first.mgr.get(other))
+                == (second.ps.get(other), second.pid.get(other), second.mgr.get(other))):
+            return UepEvidence(False, "a user endpoint there whose log could not be read is still running, or may "
+                                      "start again", uep)
     starts, start, request, subscribed, bad_line, shut, _lines = (int(x) for x in row[1:8])
     life_pid, bad_local, bad_epoch, dst, micro = row[8], f"{row[9]} {row[10]}", row[11], row[12], row[13]
     if starts == 0:

@@ -464,7 +464,13 @@ def test_the_reader_takes_only_rows_of_the_commands_shape():
         (_rows(mgr="8 886 20 886 24"), "started again"),
         (_rows(mgr="8 886 0 - 8"), "does not show"),
         (_rows(now="1792136200 000000000"), "ahead of the login node's clock"),
-        (good + f"HPCB_FAIL 1 read {d}\n", None),                       # an unrelated unreadable log: still settled
+        # an unreadable log beside the match: settled only if that user endpoint is provably stopped too
+        (good + "".join(f"HPCB_FAIL {k} read {d}\nHPCB_PS {k} {d} 0\nHPCB_PID {k} {d} none\nHPCB_MGR {k} {d} 0 - 0 - 0\n"
+                        for k in "12"), None),
+        (good + "".join(f"HPCB_FAIL {k} read {d}\nHPCB_PS {k} {d} 1\nHPCB_PID {k} {d} none\nHPCB_MGR {k} {d} 0 - 0 - 0\n"
+                        for k in "12"), "whose log could not be read"),
+        (good + f"HPCB_FAIL 1 read {d}\n", "whose log could not be read"),     # and nothing known of it
+        (good + "HPCB_FAIL 1 grep\n", "could not be read"),
     ]:
         ev = read(text)
         assert (ev.lost if why is None else not ev.lost and why in ev.why), (text, ev)
@@ -491,12 +497,14 @@ class _UuidFacility(FakeFacility):
     """An SSH endpoint of this plugin's (its user endpoints exit when idle and name their block request), whose
     endpoint id is a UUID, as the web service gives it."""
 
-    def __init__(self, eid: str = REJECTED.eid, *, fresh: bool = True, named: bool = True) -> None:
+    def __init__(self, eid: str = REJECTED.eid, *, fresh: bool = True, named: bool = True,
+                 init_blocks: int | None = 0) -> None:
         super().__init__()
         self.workers = 1
         self.eid = eid
         self.fresh_ueps = fresh
         self.logs_block_requests = named
+        self.compute_init_blocks = init_blocks          # 0: batch mode (the default), 1: interactive
 
     async def provision(self, profile):
         from hpc_bridge.facility.base import EndpointHandle
@@ -533,11 +541,12 @@ class _BlockRunner(_FakeRunner):
         return self.taken.get(id(fut))
 
 
-async def _lost_check_app(monkeypatch, *, eid=REJECTED.eid, pbs=False, fresh=True, named=True, taken_ago=120.0):
+async def _lost_check_app(monkeypatch, *, eid=REJECTED.eid, pbs=False, fresh=True, named=True, taken_ago=120.0,
+                          init_blocks=0):
     """The cells' state: spend confirmed on a fresh user endpoint, its check (canary) timed out and the service lists it
     as pending for good (its failure never left the user endpoint)."""
     monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
-    fac = (_PbsUuidFacility if pbs else _UuidFacility)(eid, fresh=fresh, named=named)
+    fac = (_PbsUuidFacility if pbs else _UuidFacility)(eid, fresh=fresh, named=named, init_blocks=init_blocks)
     app = AppCtx(facility=fac, profile=Profile())
     built = {}
 
@@ -828,10 +837,11 @@ async def test_a_restarted_server_reads_the_block_request_back_and_settles_the_c
     await warmth._flush_all(app)
     [row] = SentCheckStore().load(REJECTED.eid)
     assert row["task_id"] == "check-1" and row["block"] == block and abs(row["taken_at"] - (time.time() - 120)) < 5
-    fac = _UuidFacility(fresh=False, named=False)              # not known yet: the release's provision adopts it
+    fac = _UuidFacility(fresh=False, named=False, init_blocks=None)   # not known yet: the release's provision adopts it
 
     async def adopt(eid):
         fac.fresh_ueps = fac.logs_block_requests = True
+        fac.compute_init_blocks = 0
 
     fac.adopt_endpoint = adopt
     restarted = AppCtx(facility=fac, profile=Profile(), state=EndpointState(endpoint_id=REJECTED.eid))
@@ -886,3 +896,180 @@ async def test_a_check_is_dated_by_when_its_task_id_was_first_seen_not_by_its_su
     assert seen is not None and seen > sent_at and r.taken_at(fut) == seen   # stamped once, when first seen
     r.user_endpoint_config["hpcb_block"] = 78                           # (the shape's config can be the same dict)
     assert r.sent_block(fut) == 77
+
+
+# --- round 2 of the reviews ------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("init_blocks", [1, None], ids=["interactive", "unknown"])
+async def test_an_endpoint_whose_new_user_endpoints_start_a_block_by_themselves_is_not_looked_at(
+        monkeypatch, tmp_path, init_blocks):
+    # interactive mode renders `init_blocks: 1`: ANY new life of that user endpoint submits a block, task or not, so a
+    # `lost` there would rest on the service never restarting a user endpoint it thinks still holds a pending task
+    from hpc_bridge.server import _stop_endpoint
+
+    skew = _skew(monkeypatch)
+    _settle_clock(monkeypatch, skew)
+    app, _runner, block = await _lost_check_app(monkeypatch, init_blocks=init_blocks)
+    _put_cell(tmp_path, REJECTED, block, started=_two_minutes_ago())
+    log = _login_node(monkeypatch, tmp_path)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "evidence" not in _kinds(log) and "looked on the login node" not in res.notice
+
+
+def test_the_templates_compute_init_blocks_is_read_from_it():
+    from hpc_bridge.facility import remote
+    from tests.test_remote_facility import _pbs_profile, _profile
+
+    for prof in (_profile, _pbs_profile):
+        f = remote.SlurmFacility(prof(), cli=None)
+        assert remote.compute_init_blocks(f.config_template(Profile(mode="batch"))[0]) == 0
+        assert remote.compute_init_blocks(f.config_template(Profile(mode="interactive"))[0]) == 1
+    tmpl = remote.SlurmFacility(_profile(), cli=None).config_template(Profile())[0]
+    assert remote.compute_init_blocks("\n".join(ln for ln in tmpl.splitlines() if "init_blocks |" not in ln)) is None
+    assert remote.compute_init_blocks(tmpl + "\n" + tmpl) is None and remote.compute_init_blocks(None) is None
+
+
+async def test_provision_and_adopt_know_the_compute_init_blocks():
+    from hpc_bridge.facility import remote
+    from tests.test_env_setup import _Client, _facility
+    from tests.test_remote_facility import _FakeRemoteCLI, _profile
+
+    for mode, want in (("batch", 0), ("interactive", 1)):
+        fac = remote.SlurmFacility(_profile(), cli=_FakeRemoteCLI(status=None))
+        assert fac.compute_init_blocks is None
+        await fac.provision(Profile(mode=mode))
+        assert fac.compute_init_blocks == want
+    import hpc_bridge.facility.endpoint_venv as ev
+
+    wi = ev.short_env_setup("/home/u/hpc-bridge/gce-venv")
+    for mode, want in (("batch", 0), ("interactive", 1)):
+        ours = _facility(wi).config_template(Profile(mode=mode))[0]
+        fac = _facility(wi, client=lambda t=ours: _Client(t))
+        await fac.adopt_endpoint("eid-1")
+        assert fac.compute_init_blocks == want
+    fac = _facility(wi, client=lambda: _Client(exc=RuntimeError("503")))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.compute_init_blocks is None
+
+
+@needs_posix_shell
+def test_a_rotated_manager_log_is_read_through_its_rotation(tmp_path):
+    # globus-compute-endpoint rotates its log at 100 MB, keeping one copy: the current file then lacks `Core Endpoint
+    # begins`, and a life's start may be in the copy while its exit is in the current file
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    md, _ud, _ = _put_cell(tmp_path, cell, 42, started=started)
+    lines = (md / "endpoint.log").read_text().splitlines()
+    cut = next(i for i, ln in enumerate(lines) if f"(pid: 886) [(hpcbridge-test-00, uep.{cell.eid}.{cell.uuid})" in ln)
+    (md / "endpoint.log.1").write_text("\n".join(lines[:cut + 1]) + "\n")       # its start, in the rotated copy
+    (md / "endpoint.log").write_text("\n".join(lines[cut + 1:]) + "\n")         # its exit, in the current file
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path)
+    assert _verdict(out, cell, 42, taken).lost
+    # rotated twice over (the begin line gone from both): found by its endpoint.json, still read whole
+    (md / "endpoint.log.1").write_text("\n".join(ln for ln in lines[:cut + 1] if "Core Endpoint begins" not in ln) + "\n")
+    assert "could not be found" in _verdict(_run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path), cell, 42,
+                                            taken).why
+    (md / "endpoint.json").write_text(f'{{"endpoint_id": "{cell.eid}"}}')
+    assert _verdict(_run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path), cell, 42, taken).lost
+    # the start rotated out entirely: no evidence
+    (md / "endpoint.log.1").unlink()
+    assert "does not show that user endpoint's stop" in _verdict(
+        _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path), cell, 42, taken).why
+
+
+@needs_posix_shell
+def test_an_unreadable_twin_naming_the_same_block_request_and_alive_is_no_evidence(tmp_path):
+    # the reviewer's probe P2: a second user endpoint naming the same block request, its log unreadable, a process of
+    # it alive — beside the readable, dead one
+    from hpc_bridge import scheduler_ops
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file")
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    _put_cell(tmp_path, cell, 42, started=started)
+    twin_id = "0b1c2d3e-0000-4000-8000-000000000001"
+    twin = tmp_path / f"uep.{cell.eid}.{twin_id}"
+    twin.mkdir()
+    (twin / "endpoint.log").write_text((tmp_path / f"uep.{cell.eid}.{cell.uuid}" / "endpoint.log").read_text())
+    (twin / "endpoint.log").chmod(0)
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(30)", f"uep.{cell.eid}.{twin_id}"])
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()
+        (twin / "endpoint.log").chmod(0o600)
+    ev = _verdict(out, cell, 42, taken)
+    assert not ev.lost and "whose log could not be read is still running" in ev.why
+    assert f"HPCB_PS 1 {twin_id} 1" in out
+    # the same twin, not running and never started by the manager: it cannot start a block — settled
+    (twin / "endpoint.log").chmod(0)
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path)
+    finally:
+        (twin / "endpoint.log").chmod(0o600)
+    assert _verdict(out, cell, 42, taken).lost
+    # …but one its manager started and has not seen exit: not
+    md = tmp_path / "hpc-bridge-fake-cell"
+    with (md / "endpoint.log").open("a") as fh:
+        fh.write(f"{datetime.now():%Y-%m-%d %H:%M:%S,%f} INFO MainProcess-239 MainThread-1 globus_compute_endpoint"
+                 f".endpoint.core_endpoint:1079 cmd_start_endpoint Creating new user endpoint (pid: 5150) [(u, uep."
+                 f"{cell.eid}.{twin_id}) globus-compute-endpoint _start-user-endpoint uep.{cell.eid}.{twin_id}]\n")
+    (twin / "endpoint.log").chmod(0)
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path)
+    finally:
+        (twin / "endpoint.log").chmod(0o600)
+    assert "may start again" in _verdict(out, cell, 42, taken).why
+
+
+@needs_posix_shell
+def test_a_read_error_grep_meets_is_said_never_an_empty_match(tmp_path):
+    # `[ -r ]` checks permissions only: an EIO or a stale NFS handle shows up as grep's own error (exit 2), which must
+    # read as "could not be read", never as "no user endpoint names it"
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    _put_cell(tmp_path / "gc", cell, 42, started=started)
+    shim = tmp_path / "bin"
+    shim.mkdir()
+    real = subprocess.run(["sh", "-c", "command -v grep"], capture_output=True, text=True).stdout.strip()
+    (shim / "grep").write_text(f'#!/bin/sh\ncase " $* " in *" -lF "*) "{real}" "$@"; echo "grep: x: Input/output error" >&2; '
+                               f'exit 2;; esac\nexec "{real}" "$@"\n')
+    (shim / "grep").chmod(0o755)
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path / "gc",
+               env={"PATH": f"{shim}:{os.environ['PATH']}"})
+    assert "HPCB_FAIL 1 grep" in out
+    assert "could not be read" in _verdict(out, cell, 42, taken).why
+
+
+async def test_an_age_is_measured_on_the_monotonic_clock_so_a_wall_clock_step_cannot_stretch_it(monkeypatch, tmp_path):
+    # the check was truly taken AFTER its user endpoint's bad state; then this machine's wall clock stepped forward an
+    # hour. Measured on the wall clock its age would place it an hour earlier, before the bad state — a false `lost`.
+    from hpc_bridge import server
+    from hpc_bridge.context import SentCheck
+
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    _put_cell(tmp_path, REJECTED, 42, started=started)
+    app = AppCtx(facility=_UuidFacility(), profile=Profile(), state=EndpointState(endpoint_id=REJECTED.eid))
+    _login_node(monkeypatch, tmp_path)
+    taken_wall, taken_mono = time.time() - 60, time.monotonic() - 60       # a minute ago: after the bad state
+    real = time.time
+    monkeypatch.setattr(time, "time", lambda: real() + 3600)               # the wall clock steps an hour forward
+    check = SentCheck(future=None, task_id="check-1", block=42, sent_at=taken_wall, taken_at=taken_wall,
+                      taken_mono=taken_mono)
+    states, _found, why = await server._settle_by_evidence(app, REJECTED.eid, [check], ["pending"],
+                                                          time.monotonic() + 120)
+    assert states == ["pending"] and why is not None and "before the check had reached it" in why
+    # read back from disk there is only the wall time: that is what the record carries
+    check = SentCheck(future=None, task_id="check-1", block=42, sent_at=taken_wall, taken_at=taken_wall)
+    states, _found, _why = await server._settle_by_evidence(app, REJECTED.eid, [check], ["pending"],
+                                                            time.monotonic() + 120)
+    assert states == ["lost"]          # (the stepped wall clock fools it: why the in-process age is monotonic)

@@ -232,10 +232,10 @@ class GlobusRunner:
         # id): a stop matches a check to its own compute user endpoint by it (server._settle_by_evidence). Read at the
         # send, never later — the shape's config can be the same dict and gets a new request's number after it.
         self._sent_blocks: dict[int, Any] = {}
-        # When this process first SAW each one's task id (wall clock, by future id): the service took the task before
-        # that — an upper bound on when it did. `Executor.submit` only queues a task; the SDK sends it later (batched,
-        # rate-limited, retried), so the submit's time says nothing of when the service had it.
-        self._taken: dict[int, float] = {}
+        # When this process first SAW each one's task id (wall clock and monotonic, by future id): the service took the
+        # task before that — an upper bound on when it did. `Executor.submit` only queues a task; the SDK sends it later
+        # (batched, rate-limited, retried), so the submit's time says nothing of when the service had it.
+        self._taken: dict[int, tuple[float, float]] = {}
         self._client: Any = None
         # Called right after a canary is submitted, before its wait (warmth._confirm_worker records it on disk).
         self.on_sent: Any = None
@@ -368,14 +368,25 @@ class GlobusRunner:
         client = self.task_client()
         return [(f, client, at) for f, at in self._sent if _may_be_queued(f)]
 
-    def taken_at(self, fut: Any) -> float | None:
-        """When this process first saw the task id of a canary in `sent_checks` (wall clock): the service had taken it
-        by then. Stamped by the first caller that sees the id — the server's id watcher looks every 50 ms to 2 s after
-        a send (warmth._watch_ids) —, so it is never earlier than the service took it. None while it has no id."""
+    def _seen(self, fut: Any) -> tuple[float, float] | None:
         key = id(fut)
         if key not in self._taken and getattr(fut, "task_id", None) and any(f is fut for f, _ in self._sent):
-            self._taken[key] = time.time()
+            self._taken[key] = (time.time(), time.monotonic())
         return self._taken.get(key)
+
+    def taken_at(self, fut: Any) -> float | None:
+        """When this process first saw the task id of a canary in `sent_checks` (wall clock, for the record): the
+        service had taken it by then. Stamped by the first caller that sees the id — the server's id watcher looks every
+        50 ms to 2 s after a send (warmth._watch_ids) —, so it is never earlier than the service took it. None while it
+        has no id."""
+        seen = self._seen(fut)
+        return seen[0] if seen is not None else None
+
+    def taken_mono(self, fut: Any) -> float | None:
+        """`taken_at` on this process's monotonic clock: what an age is measured from here, so a step of the wall clock
+        cannot make a check look older than it is."""
+        seen = self._seen(fut)
+        return seen[1] if seen is not None else None
 
     def sent_block(self, fut: Any) -> Any:
         """The block request (`hpcb_block`) a canary in `sent_checks` was sent for, as this runner's config read at its

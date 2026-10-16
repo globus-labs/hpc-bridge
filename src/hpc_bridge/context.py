@@ -217,6 +217,9 @@ class SentCheck:
     # when this process first saw its task id (wall clock): the service had taken it by then — never earlier than it did
     # (runner.GlobusRunner.taken_at). What the stop's evidence dates a check by; None: not seen (or an older record).
     taken_at: float | None = None
+    # the same moment on this process's monotonic clock (never written to disk): an age measured from it cannot be
+    # stretched by a step of the wall clock. None: read back from disk (the wall time is all there is), or not seen.
+    taken_mono: float | None = None
 
     @property
     def tid(self) -> str | None:

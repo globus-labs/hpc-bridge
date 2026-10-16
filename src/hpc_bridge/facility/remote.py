@@ -1045,6 +1045,18 @@ _BLOCK_REQUEST_LINE = re.compile(
 BLOCK_REQUEST_LOG = "running endpoint_setup command: true hpcb_block="
 
 
+# The compute branch's `init_blocks` default, as `config_template` writes it (`@@EAGER@@`: 1 in interactive mode, 0 in
+# batch); the login branch's literal `init_blocks: 1` is not this line.
+_INIT_BLOCKS_LINE = re.compile(r"^\s*init_blocks: \{\{ init_blocks \| default\((\d+)\) \}\}\s*$", re.M)
+
+
+def compute_init_blocks(template: object) -> int | None:
+    """The `init_blocks` an endpoint's published UEP template gives a compute user endpoint by default — how many blocks
+    each new life of one submits at once, task or not — or None when that is not read exactly once."""
+    found = _INIT_BLOCKS_LINE.findall(str(template or ""))
+    return int(found[0]) if len(found) == 1 else None
+
+
 def logs_block_requests(template: object) -> bool:
     """Whether an endpoint's published UEP template writes each block request's number into its compute user endpoint's
     own log (the `endpoint_setup` line above): only then can a stop tell which user endpoint a check of ours went to."""
@@ -1132,6 +1144,10 @@ class SlurmFacility:
         # Whether that template also names each block request in its compute user endpoint's own log (this plugin's:
         # the `endpoint_setup` line), so a stop can find the user endpoint a check went to. Known with `fresh_ueps`.
         self.logs_block_requests = False
+        # The `init_blocks` a compute user endpoint starts with by default (0 in batch mode, 1 in interactive), read
+        # with the rest; None: unknown. With 1, ANY new life of a user endpoint submits a block, task or not, so a stop
+        # does not settle a check by its user endpoint's fate there (server._settle_by_evidence).
+        self.compute_init_blocks: int | None = None
 
     @property
     def scratch_root(self) -> str | None:
@@ -1151,7 +1167,7 @@ class SlurmFacility:
         if endpoint_id == self._adopted:
             return
         self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, "", False
-        self.logs_block_requests = False
+        self.logs_block_requests, self.compute_init_blocks = False, None
         try:
             md = await endpoint_metadata(self._client_factory, endpoint_id)
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
@@ -1159,6 +1175,7 @@ class SlurmFacility:
         self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
         self.fresh_ueps = gives_fresh_ueps(md.get("user_config_template"))
         self.logs_block_requests = logs_block_requests(md.get("user_config_template"))
+        self.compute_init_blocks = compute_init_blocks(md.get("user_config_template"))
         own = configured_worker_init(md.get("user_config_template"), prefer=self.profile.worker_init)
         if own is None:
             return
@@ -1375,7 +1392,7 @@ class SlurmFacility:
         # the template on disk is this profile's now: forget what an earlier read learned, also if `start` fails below
         # (the daemon may register anyway, and a retry's reuse must read it again)
         self._adopted, self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, None, "", False
-        self.logs_block_requests = False
+        self.logs_block_requests, self.compute_init_blocks = False, None
         eid, host, addr = await self.cli.start(name)
         # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
         # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so
@@ -1384,6 +1401,7 @@ class SlurmFacility:
         self._adopted, self.endpoint_worker_init, self.worker_init_note = eid, self.profile.worker_init, ""
         self.fresh_ueps = hpc.uep_idle_heartbeats > 0  # the template just written is this plugin's
         self.logs_block_requests = True  # …and it names each block request in its compute user endpoint's log
+        self.compute_init_blocks = compute_init_blocks(uep)  # …and starts this many blocks per new life
         # the node's FQDN when routable from here, else the address this connection reached, else the alias
         host = await asyncio.to_thread(_routable_pin, host, addr)
         if host:

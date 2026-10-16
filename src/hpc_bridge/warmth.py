@@ -818,7 +818,8 @@ def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
         if sent:
             _keep_checks(app, eid, [SentCheck(future=f, client=client, terms=_runner_terms(runner, rt),
                                               dead=rt.dead_pilot, task_id=getattr(f, "task_id", None), sent_at=at,
-                                              block=_sent_block(runner, f), taken_at=_taken_at(runner, f))
+                                              block=_sent_block(runner, f), taken_at=_taken_at(runner, f),
+                                              taken_mono=_taken_at(runner, f, mono=True))
                                     for f, client, at in sent])
     runner.close()
 
@@ -1036,7 +1037,7 @@ def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
         return []
     return [SentCheck(future=f, client=client, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot,
                       task_id=getattr(f, "task_id", None), sent_at=at, block=_sent_block(rt.runner, f),
-                      taken_at=_taken_at(rt.runner, f))
+                      taken_at=_taken_at(rt.runner, f), taken_mono=_taken_at(rt.runner, f, mono=True))
             for f, client, at in getattr(rt.runner, "sent_checks", list)()]
 
 # The block-request numbers `_fresh_block` draws (and a record may carry back): a positive whole number below 2**48, so
@@ -1055,9 +1056,10 @@ def _sent_block(runner: object, fut: Any) -> int | None:
     get = getattr(runner, "sent_block", None)
     return _block_number(get(fut)) if callable(get) else None
 
-def _taken_at(runner: object, fut: Any) -> float | None:
-    """When this process first saw a runner's check's task id (GlobusRunner.taken_at), if it has."""
-    get = getattr(runner, "taken_at", None)
+def _taken_at(runner: object, fut: Any, *, mono: bool = False) -> float | None:
+    """When this process first saw a runner's check's task id (GlobusRunner.taken_at, or `taken_mono` on the monotonic
+    clock), if it has."""
+    get = getattr(runner, "taken_mono" if mono else "taken_at", None)
     at = get(fut) if callable(get) else None
     return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
 

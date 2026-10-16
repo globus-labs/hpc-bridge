@@ -1055,7 +1055,11 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     fresh = fresh or getattr(app.facility, "fresh_ueps", False) is True
     evidence: dict[str, scheduler_ops.UepEvidence] = {}
     looked: str | None = None
-    if confirmed and fresh and not store_problem and getattr(app.facility, "logs_block_requests", False) is True:
+    # Only where a new life of a user endpoint starts no block by itself (`init_blocks` 0: batch mode, the default):
+    # with 1 (interactive) any restart bills, task or not, and that the Globus Compute service never restarts a user
+    # endpoint it thinks still holds a pending task cannot be shown from here. Unknown: not either.
+    if (confirmed and fresh and not store_problem and getattr(app.facility, "logs_block_requests", False) is True
+            and getattr(app.facility, "compute_init_blocks", None) == 0):
         states, evidence, looked = await _settle_by_evidence(app, eid, checks, states, call_deadline)
     if not await _acquire_within(app, call_deadline):
         return _lock_busy_status(app, eid, released=detail if confirmed else None)
@@ -1365,8 +1369,15 @@ async def _settle_by_evidence(app: AppCtx, eid: str, checks: list[SentCheck], st
     first seen (`SentCheck.taken_at`), never by the submit, which only queues them in the SDK. One command for all of
     them over the free login shape (AMQP, no SSH), bounded by what is left of the call's budget; a stop's wait need not
     have run first — the command itself asks that each check be old enough (`scheduler_ops._EVIDENCE_SETTLED_S`), so a
-    short `HPC_BRIDGE_STOP_CHECK_WAIT_S` does not loosen it. Returns the states, each check's evidence by its key, and
-    why the evidence settled nothing (None: not looked, or all settled)."""
+    short `HPC_BRIDGE_STOP_CHECK_WAIT_S` does not loosen it. An age is measured on this process's monotonic clock from
+    when the task id was seen here (`SentCheck.taken_mono`), else — read back from disk — on the wall clock.
+
+    What it still takes on trust, from the Globus Compute service: a wrong `down` would need BOTH the service
+    delivering the task to that user endpoint's queue more than about a second after returning its task id (so it could
+    arrive while that endpoint quiesced, and not be acked) AND its start request reaching the manager more than 35 s
+    late (so the restart it causes comes after this look). The caller looks only where a new life starts no block by
+    itself (`init_blocks` 0), so a restart without our task bills nothing. Returns the states, each check's evidence by
+    its key, and why the evidence settled nothing (None: not looked, or all settled)."""
     waiting = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")]
     if not waiting or any(c.what != "check" or c.block is None or c.tid is None or c.taken_at is None
                           for c in waiting):
@@ -1376,9 +1387,9 @@ async def _settle_by_evidence(app: AppCtx, eid: str, checks: list[SentCheck], st
         return states, {}, "this stop had no time left to look"
     # each check's age, read BEFORE the command is sent: the login node's clock is read after it, so the check is
     # never placed earlier on it than the service took it
-    now = time.time()
-    wanted = [(warmth._check_key(c), c.block, now - c.taken_at) for c in waiting
-              if c.block is not None and c.taken_at is not None]
+    now, mono = time.time(), time.monotonic()
+    wanted = [(warmth._check_key(c), c.block, (mono - c.taken_mono) if c.taken_mono is not None else (now - c.taken_at))
+              for c in waiting if c.block is not None and c.taken_at is not None]
     try:
         cmd = scheduler_ops._uep_evidence_cmd(eid, [b for _, b, _ in wanted])
     except ValueError:  # an endpoint id that is not a UUID: no command is built from it

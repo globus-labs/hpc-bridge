@@ -42,7 +42,10 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
   (`slurm_worker_died` 1792168070, 1792168863), `world:stop_honesty_no_pilot_left` everywhere. Two reviews then found
   a one-instant reading could miss the manager reviving the user endpoint (a start request cached within its 30 s
   grace, revived at the ~1 s reap); the second round reads twice 3 s apart, wants the manager's log to show the exit
-  and nothing after, and a check at least 35 s old taken before the bad state — not yet run live. Live checks: the
+  and nothing after, and a check at least 35 s old taken before the bad state. Round 3: only in batch mode (the
+  default; interactive templates start a block per new user endpoint life), the manager log read through its
+  rotation, an unreadable twin must be provably stopped, grep read errors fail closed, ages on the monotonic clock
+  — rounds 2 and 3 not yet run live. Live checks: the
   same cells repeatedly, plus `queued_check_relaunch`; in a `down` naming a lost check, the bundle's manager log must
   show `Command stopped normally (<pid>)` for that user endpoint and no `Creating new user endpoint` /
   `User EP stopped within grace period` for it after, and `world:stop_honesty_no_pilot_left` must pass.

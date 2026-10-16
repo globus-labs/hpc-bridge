@@ -87,7 +87,14 @@ installed plugin only when that version changes); git tags mark releases.
   - the check was taken at least 35 s before the look (that 30 s grace, plus margin), so the start request sent with
     it has been acted on by now — whatever `HPC_BRIDGE_STOP_CHECK_WAIT_S` says.
   Then the check cannot run, and no block can start for it; the notice says so, and that the endpoint's report of the
-  failure was lost on its own side. Anything less keeps `draining`, and the notice says what was missing. Times on the
+  failure was lost on its own side. Anything less keeps `draining`, and the notice says what was missing. The stop
+  looks only on an endpoint in batch mode (the default), whose user endpoints start no block until they hold a task:
+  in interactive mode every new run of one starts a block by itself, so there it stays `draining` as before. What it
+  still takes on trust from the Globus Compute service: a wrong `down` would need both the service handing the check
+  to its user endpoint more than about a second after returning its task id, and the start request sent with it
+  reaching the endpoint more than 35 s late. A user endpoint beside it whose log cannot be read must be provably
+  stopped too; a read error is never taken for "nothing there"; the endpoint's log is read through its rotation; a
+  check's age is measured on a clock the wall clock's steps cannot move. Times on the
   login node are read in its own zone; an hour a clock change repeats is never used. To find the right user endpoint,
   each block request's number now reaches that user endpoint's own log: the template runs `true hpcb_block=<number>`
   as the user endpoint's `endpoint_setup` when it starts (globus-compute-endpoint logs that command), and the number
