@@ -841,17 +841,65 @@ def _persist_checks(app: AppCtx, eid: str) -> None:
         if tid is None or _locally_resolved(c) or tid in app.resolved_checks:
             continue
         rows[tid] = {"task_id": tid, "partition": c.terms[0], "account": c.terms[1], "sent_at": c.sent_at,
-                     "what": c.what}
+                     "what": c.what, "ceiling_at": c.ceiling_at}
     mine = frozenset(rows)
     wrote, dropped = app.persisted_checks.get(eid, (frozenset(), frozenset()))
     drop = ((wrote | frozenset(app.resolved_checks)) - mine)
-    if mine == wrote and drop <= dropped:
+    if mine == wrote and drop <= dropped and eid not in app.checks_pending:
         return
-    if SentCheckStore().update(eid, list(rows.values()), drop):
-        app.persisted_checks[eid] = (mine, drop)
-    else:
+    app.checks_pending[eid] = (list(rows.values()), mine, drop)
+    _schedule_flush(app, eid)
+
+def _schedule_flush(app: AppCtx, eid: str) -> None:
+    """The file is written OFF the event loop (a thread), by one flusher per endpoint, latest state first: a lock
+    service or a home directory that hangs (NFS) must never freeze the server. With no running loop (a synchronous
+    caller), it is written here."""
+    try:
+        loop = asyncio.get_running_loop()
+    except RuntimeError:
+        _write_pending(app, eid)
+        return
+    task = app.check_flushers.get(eid)
+    if task is None or task.done():
+        app.check_flushers[eid] = loop.create_task(_flush_checks(app, eid))
+
+def _write_job(eid: str, job: tuple[list[dict], frozenset[str], frozenset[str]] | None) -> bool:
+    """One pending write (None: the endpoint is gone — remove its record). Blocking."""
+    store = SentCheckStore()
+    if job is None:
+        store.remove(eid)
+        return True
+    return store.update(eid, job[0], job[2])
+
+def _done_job(app: AppCtx, eid: str, job: tuple[list[dict], frozenset[str], frozenset[str]] | None, ok: bool) -> None:
+    if job is not None and ok:
+        app.persisted_checks[eid] = (job[1], job[2])
+    elif job is not None:
         print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under "
               f"{SentCheckStore().root}); tried again on the next change", file=sys.stderr)
+
+def _write_pending(app: AppCtx, eid: str) -> None:
+    while eid in app.checks_pending:
+        job = app.checks_pending.pop(eid)
+        _done_job(app, eid, job, _write_job(eid, job))
+
+async def _flush_checks(app: AppCtx, eid: str) -> None:
+    """Write the endpoint's pending record state, in a thread, until none is left (a newer one replaces an older)."""
+    while eid in app.checks_pending:
+        job = app.checks_pending.pop(eid)
+        _done_job(app, eid, job, await asyncio.to_thread(_write_job, eid, job))
+
+async def _flush_all(app: AppCtx) -> None:
+    """Wait for every pending write of the record (a test seam, and a teardown's last step)."""
+    for task in list(app.check_flushers.values()):
+        await task
+
+async def _read_checks(eid: str, timeout: float = 5.0) -> tuple[list[dict], str | None]:
+    """The record on disk, read in a thread, within `timeout`: out of time, nothing is known — fail closed."""
+    try:
+        return await asyncio.wait_for(asyncio.to_thread(SentCheckStore().read, eid), timeout=max(timeout, 0.1))
+    except TimeoutError:
+        return [], "it could not be read in time"
 
 # Resolutions seen this session, by task id: never asked again (AppCtx.resolved_checks), bounded — oldest out first.
 _RESOLVED_MAX = 4096
@@ -862,10 +910,12 @@ def _trim_resolved(app: AppCtx) -> None:
         app.resolved_checks.pop(tid, None)
 
 def _forget_checks(app: AppCtx, eid: str) -> None:
-    """The endpoint is gone (a teardown): nothing of it can start a block any more. Callers hold app.lock."""
+    """The endpoint is gone (a teardown): nothing of it can start a block any more — its record goes too (written off
+    the loop, like every write). Callers hold app.lock."""
     app.sent_checks.pop(eid, None)
     app.persisted_checks.pop(eid, None)
-    SentCheckStore().remove(eid)
+    app.checks_pending[eid] = None
+    _schedule_flush(app, eid)
 
 def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
     """The current compute runner's sent, unanswered checks, as evidence items."""
@@ -882,38 +932,43 @@ def _note_checks_sent(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     if eid is not None and shape == DEFAULT_SHAPE and _has_login_shape(app):
         _persist_checks(app, eid)
 
-def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> tuple[list[SentCheck], str | None]:
+def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None,
+                disk: tuple[list[dict], str | None]) -> tuple[list[SentCheck], str | None]:
     """Every task of ours a stop must see resolve before `down`: the ones the endpoint kept (from retired runners, lost
     commands, and — after a restart or from another process — read back from disk by task id), and the ones the current
     compute runner sent; and why the record on disk cannot be trusted to list them all, if it cannot (it could not be
-    read: fail closed). Callers hold app.lock."""
+    read: fail closed). `disk`: the record as `_read_checks` read it (off the loop). Callers hold app.lock."""
     kept = app.sent_checks.setdefault(eid, [])
     current = _current_checks(app, rt)
     known = {_check_key(c) for c in [*kept, *current]}
-    rows, problem = SentCheckStore().read(eid)
+    rows, problem = disk
     for row in rows:  # a restart (or another process) left them: adopt what is not known, nor known resolved
         if row["task_id"] not in known and row["task_id"] not in app.resolved_checks:
+            ceiling = row.get("ceiling_at")
             kept.append(SentCheck(future=None, terms=(row.get("partition"), row.get("account")), task_id=row["task_id"],
                                   sent_at=float(row.get("sent_at") or 0.0),
-                                  what="command" if row.get("what") == "command" else "check"))
+                                  what="command" if row.get("what") == "command" else "check",
+                                  ceiling_at=float(ceiling) if isinstance(ceiling, (int, float)) else None))
             known.add(row["task_id"])
     if not kept:
         app.sent_checks.pop(eid, None)
     in_kept = {_check_key(c) for c in kept}
     return [*kept, *[c for c in current if _check_key(c) not in in_kept]], problem
 
-def _unresolved_count(app: AppCtx, eid: str | None) -> int:
+def _unresolved_count(app: AppCtx, eid: str | None, disk: tuple[list[dict], str | None]) -> int:
     """How many tasks of ours an endpoint may still hold, without asking the service: the ones kept in memory not known
-    resolved, plus those on disk not among them. Callers hold app.lock."""
+    resolved, plus those on disk (`disk`, as `_read_checks` read it) not among them — and one more when the record
+    cannot be trusted. Callers hold app.lock."""
     if eid is None:
         return 0
     kept = app.sent_checks.get(eid, [])
     known = {_check_key(c) for c in kept}
-    rows, problem = SentCheckStore().read(eid)
+    rows, problem = disk
     return (sum(1 for c in kept if not _locally_resolved(c)) + (1 if problem else 0)
             + sum(1 for row in rows if row["task_id"] not in known and row["task_id"] not in app.resolved_checks))
 
-def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: Any, client: Any) -> None:
+def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: Any, client: Any, *,
+                       ceiling_s: float | None = None, sent_at: float | None = None) -> None:
     """A command whose future FAILED on the client's side alone — not the service's verdict (TaskExecutionFailed), on
     a task the web service registered (a task id): e.g. "SDK thread quit unexpectedly.", which fails every open future
     while the tasks live on. Its handle is gone, but the endpoint may still run it — or start a block for it after a
@@ -926,8 +981,12 @@ def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: An
     exc = fut.exception()
     if exc is None or isinstance(exc, TaskExecutionFailed):
         return
+    at = sent_at if sent_at is not None else time.time()
+    # past its ceiling (it is killed at its walltime once running) plus the grace a queued one gets, it can no longer
+    # make a stop refuse: it still counts as evidence while the service says it is queued
+    ceiling = at + ceiling_s + _LOST_TASK_GRACE_S if ceiling_s is not None else None
     _keep_checks(app, eid, [SentCheck(future=fut, client=client, terms=_terms_of(rt), task_id=str(fut.task_id),
-                                      sent_at=time.time(), what="command")])
+                                      sent_at=at, what="command", ceiling_at=ceiling)])
 
 CheckState = Literal["ok", "failed", "pending", "unknown", "unsent"]
 
@@ -1506,7 +1565,8 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
     out = _finished_outcome(handle)
     # its future failed on the client's side alone (not the service's verdict): the task may live on — evidence
     runner = getattr(handle.runtime, "runner", None)
-    _keep_lost_command(app, handle.shape, handle.runtime, fut, getattr(runner, "task_client", lambda: None)())
+    _keep_lost_command(app, handle.shape, handle.runtime, fut, getattr(runner, "task_client", lambda: None)(),
+                       ceiling_s=handle.ceiling_s, sent_at=time.time() - (time.monotonic() - handle.submitted_at))
     if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
         return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,

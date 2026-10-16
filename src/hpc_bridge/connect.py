@@ -311,7 +311,8 @@ async def _connect_facility(
         sched = getattr(app.facility, "scheduler", None)
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's blocks/handles are gone
         # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
-        queued_left = 0 if old_mep else warmth._unresolved_count(app, old_eid)
+        queued_left = 0 if old_mep or old_eid is None else warmth._unresolved_count(
+            app, old_eid, await warmth._read_checks(old_eid, 2.0))
         # Blocks a facility stop, detach or switch left belong to THAT endpoint: a reconnect to it keeps them (the next
         # stop still names them); a bind to any other endpoint drops them, and the account its identity was mapped to.
         here = None if "login" in _facility_shapes(fac) else getattr(fac, "endpoint_id", None)

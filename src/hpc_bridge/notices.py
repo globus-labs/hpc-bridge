@@ -666,6 +666,8 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
     what, plural = _check_words(pending, _queue_word(app))
     it, is_, its, stays = ("them", "are", "their", "stay") if plural else ("it", "is", "its", "stays")
     where = "still queued or running" if any(c.what == "command" for c in pending) else "still queued"
+    if unknown:  # not read: what the service would say is not known
+        where, is_ = f"may {where.replace('still', 'still be')}", ""
     dead = next((c.dead for c in pending if c.dead is not None), None)
     died = (f" Pilot {dead.job} FINISHED (exit status {dead.exit_status}) before it ran {it}." if dead else "")
     head = f"compute block released over AMQP ({released}). " if released else ""
@@ -679,7 +681,8 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
                 f"another block for a queued task after every cancel: stopping does not end {it}, only "
                 f"teardown_endpoint does (the user's call). Short of that, the block it starts runs {it} and then "
                 "idles out (~10 min after its last task).")
-    return (f"{head}Spend is NOT confirmed stopped: {reason}{what} {is_} {where} on the endpoint{read}, which can "
+    return (f"{head}Spend is NOT confirmed stopped: {reason}{what} {is_ + ' ' if is_ else ''}{where} on the "
+            f"endpoint{read}, which can "
             f"start a block to run {it}.{died}{waited}{then} The login endpoint stays online for reuse.")
 
 

@@ -19,10 +19,10 @@ from contextlib import contextmanager
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
-try:
+if sys.platform == "win32":
+    import msvcrt
+else:
     import fcntl
-except ImportError:  # Windows: no advisory lock — the read-merge-write alone
-    fcntl = None  # type: ignore[assignment]
 
 
 def _state_dir() -> Path:
@@ -145,6 +145,30 @@ class _Unreadable(Exception):
         self.corrupt = corrupt
 
 
+# How long a store operation waits for the record's lock (tried without blocking, every 50 ms) before failing closed.
+LOCK_WAIT_S = 2.0
+
+
+def _try_lock(fd: int) -> None:
+    """Take the lock without waiting; BlockingIOError when another process holds it."""
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        try:
+            msvcrt.locking(fd, msvcrt.LK_NBLCK, 1)
+        except OSError as exc:  # held elsewhere: msvcrt raises a plain OSError (EACCES / EDEADLOCK)
+            raise BlockingIOError(str(exc)) from exc
+    else:
+        fcntl.flock(fd, fcntl.LOCK_EX | fcntl.LOCK_NB)
+
+
+def _unlock(fd: int) -> None:
+    if sys.platform == "win32":
+        os.lseek(fd, 0, os.SEEK_SET)
+        msvcrt.locking(fd, msvcrt.LK_UNLCK, 1)
+    else:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+
+
 class SentCheckStore:
     """The tasks of ours an SSH endpoint's compute user endpoints may still hold (#24's evidence: a check no worker has
     answered, or a command whose result the client lost), by task id, so a server that restarts — Claude Code relaunched
@@ -153,7 +177,8 @@ class SentCheckStore:
     `{task_id, partition, account, sent_at, what}` rows — never a command's text.
 
     Several processes can share it (two sessions on one endpoint, a restart): every write re-reads the file and MERGES
-    under an exclusive lock on a sibling `.lock` file (`fcntl.flock`; on a system without it, the merge alone), adding
+    under an exclusive lock on a sibling `.lock` file (`fcntl.flock`; `msvcrt.locking` on Windows), never blocking for
+    it (`_locked`: a lock not had within LOCK_WAIT_S fails the operation closed), adding
     the writer's rows and removing only the ones it has SEEN resolve (`update`) — a row it does not know is kept. The
     write itself is atomic (a temp file, then a rename). A record that cannot be read fails CLOSED: `read` reports the
     problem (a check may be queued that nothing here can see), and a corrupt file is kept aside as
@@ -168,15 +193,27 @@ class SentCheckStore:
 
     @contextmanager
     def _locked(self, path: Path) -> Iterator[None]:
+        """An exclusive lock on the sibling `.lock` file — never blocking: tried without waiting (flock LOCK_NB, or
+        msvcrt's non-blocking lock on Windows) for up to `LOCK_WAIT_S`, then OSError, which every caller reads as the
+        record being unusable (fail closed). A lock service that hangs (an NFS home) cannot freeze the caller; an
+        ENOLCK (no locking there at all) fails the same way."""
         self.root.mkdir(parents=True, exist_ok=True)
         fd = os.open(path.with_name(f"{path.name}.lock"), os.O_RDWR | os.O_CREAT, 0o600)
         try:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_EX)
-            yield
+            give_up = time.monotonic() + LOCK_WAIT_S
+            while True:
+                try:
+                    _try_lock(fd)
+                    break
+                except BlockingIOError:
+                    if time.monotonic() >= give_up:
+                        raise OSError("the record's lock is held by another process") from None
+                    time.sleep(0.05)
+            try:
+                yield
+            finally:
+                _unlock(fd)
         finally:
-            if fcntl is not None:
-                fcntl.flock(fd, fcntl.LOCK_UN)
             os.close(fd)
 
     @staticmethod

@@ -1744,11 +1744,12 @@ async def test_the_cap_drops_only_what_is_known_resolved_and_the_ids_listed_are_
     _scripted_login(monkeypatch)
     res = await _stop_endpoint(app)
     assert res.status == "draining" and "(task q10, q11, q12 +58 more)" in res.notice
-    assert "are still queued on the endpoint" in res.notice and "If them" not in res.notice
+    assert "may still be queued on the endpoint" in res.notice and "If them" not in res.notice  # 32 asked a round
 
 
 async def test_a_restarted_server_still_sees_the_check_its_predecessor_sent(monkeypatch):
     # Review M2: AppCtx.sent_checks was memory only — a new process bound to the same endpoint answered `down`
+    from hpc_bridge import warmth
     from hpc_bridge.context import ShapeRuntime
     from hpc_bridge.server import _stop_endpoint
     from hpc_bridge.state import SentCheckStore
@@ -1756,6 +1757,7 @@ async def test_a_restarted_server_still_sees_the_check_its_predecessor_sent(monk
     app, runner = _queued_app(monkeypatch)
     assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
     eid = app.state.endpoint_id
+    await warmth._flush_all(app)                                                  # written off the loop
     assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["check-1"]      # written when it was sent
     # the MCP server restarts (Claude Code relaunched): a new AppCtx, the same endpoint bound again (zero-SSH reuse);
     # its login runner's client can look the task up by id
@@ -1768,14 +1770,18 @@ async def test_a_restarted_server_still_sees_the_check_its_predecessor_sent(monk
     assert stop.status == "draining" and "check for the block on partition 'debug' (task check-1)" in stop.notice
     runner.checks[0].fail(TaskExecutionFailed("BadStateException", "1"))           # the endpoint gives it up
     _scripted_login(monkeypatch)
-    assert (await _stop_endpoint(app2)).status == "down" and SentCheckStore().load(eid) == []
+    assert (await _stop_endpoint(app2)).status == "down"
+    await warmth._flush_all(app2)
+    assert SentCheckStore().load(eid) == []
 
 
 async def test_a_restart_with_no_client_to_ask_is_draining_not_down(monkeypatch):
+    from hpc_bridge import warmth
     from hpc_bridge.server import _stop_endpoint
 
     app, _runner = _queued_app(monkeypatch)
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    await warmth._flush_all(app)
     app2 = AppCtx(facility=app.facility, profile=Profile(), state=EndpointState(endpoint_id=app.state.endpoint_id))
     _scripted_login(monkeypatch)
     stop = await _stop_endpoint(app2)
@@ -1783,17 +1789,19 @@ async def test_a_restart_with_no_client_to_ask_is_draining_not_down(monkeypatch)
 
 
 async def test_a_teardown_removes_the_endpoints_file(monkeypatch):
-    from hpc_bridge import server
+    from hpc_bridge import server, warmth
     from hpc_bridge.server import _teardown_endpoint
     from hpc_bridge.state import SentCheckStore
 
     app, _runner = _queued_app(monkeypatch)
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
     eid = app.state.endpoint_id
+    await warmth._flush_all(app)
     assert SentCheckStore().load(eid)
     monkeypatch.setattr(server, "_teardown_preauth_gate", lambda *a, **k: _none())
     _scripted_login(monkeypatch)
     assert (await _teardown_endpoint(app)).status == "down"
+    await warmth._flush_all(app)
     assert SentCheckStore().load(eid) == [] and eid not in app.sent_checks
 
 
@@ -2057,6 +2065,7 @@ async def test_a_lookup_round_that_runs_out_of_time_keeps_what_it_read_and_never
     _scripted_login(monkeypatch)
     second = await _stop_endpoint(app)
     assert len(asked) == len(set(asked)) == 20                   # each asked once, never again
+    await warmth._flush_all(app)
     assert second.status == "down" and SentCheckStore().load("fake-eid") == []
 
 
@@ -2080,6 +2089,7 @@ def test_one_round_asks_at_most_so_many_one_by_one(monkeypatch):
 async def test_two_processes_on_one_endpoint_keep_each_others_rows(monkeypatch):
     # Review r2, R2: B rewrote the record with only its own rows (none, once its check was answered) and removed A's
     # still-queued a-1; A restarted and its stop answered `down`, spend_stopped, with a-1 queued
+    from hpc_bridge import warmth
     from hpc_bridge.server import _stop_endpoint
     from hpc_bridge.state import SentCheckStore
 
@@ -2092,9 +2102,12 @@ async def test_two_processes_on_one_endpoint_keep_each_others_rows(monkeypatch):
     runner_b.check_prefix = "b"
     app_b.runner_factory = lambda e, user_endpoint_config=None, **_kw: runner_b
     assert (await _ensure_endpoint_up(app_b, confirm_spend=True)).status == "provisioning"
+    await warmth._flush_all(app_a)
+    await warmth._flush_all(app_b)
     assert sorted(r["task_id"] for r in SentCheckStore().load(eid)) == ["a-1", "b-1"]     # merged, not overwritten
     runner_b._canary = _job_answer("9")
     assert (await _ensure_endpoint_up(app_b)).status == "up"
+    await warmth._flush_all(app_b)
     assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["a-1"]   # B removed only what it saw resolve
     app_c = _restarted_app(monkeypatch, eid, runner_a.task_client())       # A restarted
     _scripted_login(monkeypatch)
@@ -2103,7 +2116,9 @@ async def test_two_processes_on_one_endpoint_keep_each_others_rows(monkeypatch):
     # and a process that adopts another's row and sees it resolve removes it
     runner_a.checks[0].fail(TaskExecutionFailed("BadStateException", "1"))
     _scripted_login(monkeypatch)
-    assert (await _stop_endpoint(app_c)).status == "down" and SentCheckStore().load(eid) == []
+    assert (await _stop_endpoint(app_c)).status == "down"
+    await warmth._flush_all(app_c)
+    assert SentCheckStore().load(eid) == []
 
 
 def test_the_record_is_written_under_a_lock_merging_what_is_there(tmp_path):
@@ -2126,17 +2141,20 @@ async def test_adding_a_task_writes_the_current_runners_checks_too(monkeypatch):
     app, _runner = _queued_app(monkeypatch)
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
     eid = app.state.endpoint_id
+    await warmth._flush_all(app)
     SentCheckStore().remove(eid)                                           # as if that write had not happened
     app.persisted_checks.clear()
     lost = _PendingFuture()
     lost.task_id = "cmd-9"
     warmth._keep_checks(app, eid, [SentCheck(future=lost, task_id="cmd-9", what="command")])
+    await warmth._flush_all(app)
     assert sorted(r["task_id"] for r in SentCheckStore().load(eid)) == ["check-1", "cmd-9"]
 
 
 async def test_a_failed_write_is_said_and_tried_again(monkeypatch, capsys):
     import os
 
+    from hpc_bridge import warmth
     from hpc_bridge.state import SentCheckStore
 
     app, runner = _queued_app(monkeypatch)
@@ -2145,6 +2163,7 @@ async def test_a_failed_write_is_said_and_tried_again(monkeypatch, capsys):
     os.chmod(root, 0o500)                                                  # the record cannot be written
     try:
         assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+        await warmth._flush_all(app)
         assert "could not write the record of checks" in capsys.readouterr().err
     finally:
         os.chmod(root, 0o700)
@@ -2152,12 +2171,13 @@ async def test_a_failed_write_is_said_and_tried_again(monkeypatch, capsys):
     assert SentCheckStore().load(eid) == []
     runner._canary = CanaryResult(ok=False, error="timeout")
     await _ensure_endpoint_up(app, confirm_spend=True)                    # the next check: written now
+    await warmth._flush_all(app)
     assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["check-1"]
 
 
 async def test_an_unreadable_record_fails_closed_and_is_kept_aside(monkeypatch):
     # Review r2: a corrupt record read as empty, so a check an earlier session sent went unseen and the stop said `down`
-    from hpc_bridge import server
+    from hpc_bridge import server, warmth
     from hpc_bridge.server import _stop_endpoint, _teardown_endpoint
     from hpc_bridge.state import SentCheckStore
 
@@ -2176,7 +2196,9 @@ async def test_an_unreadable_record_fails_closed_and_is_kept_aside(monkeypatch):
     assert (await _stop_endpoint(app)).status == "draining"                    # still said, call after call
     monkeypatch.setattr(server, "_teardown_preauth_gate", lambda *a, **k: _none())
     _scripted_login(monkeypatch)
-    assert (await _teardown_endpoint(app)).status == "down" and not list(root.glob("fake-eid.json*"))
+    assert (await _teardown_endpoint(app)).status == "down"
+    await warmth._flush_all(app)
+    assert not list(root.glob("fake-eid.json*"))
 
 
 async def test_an_id_less_check_is_never_dropped_on_an_endpoint_of_an_earlier_plugin(monkeypatch):
@@ -2241,6 +2263,153 @@ async def test_the_budget_covers_the_liveness_check(monkeypatch):
     t0 = time.monotonic()
     res = await asyncio.wait_for(_stop_endpoint(app), 5)
     assert time.monotonic() - t0 < 2 and res.status == "draining"
+
+
+# --- review round 3 of 5482bb2: a lost command never makes a block unstoppable; the record never freezes the loop ----
+
+def _row(tid, what="check", **extra):
+    return {"task_id": tid, "partition": None, "account": None, "sent_at": time.time(), "what": what, **extra}
+
+
+async def test_a_lost_command_with_no_client_to_ask_never_stops_the_release(monkeypatch):
+    # Review r3, LC1: after a restart bound from env (no runner, so no SDK client yet), a command row read `unknown`
+    # and the refusal came BEFORE the release — so no login runner was ever built and every stop answered `up`
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    SentCheckStore().save("fake-eid", [_row("cmd-1", "command")])
+    app = _restarted_app(monkeypatch, "fake-eid", None)
+    for _ in range(2):
+        log = _scripted_login(monkeypatch)
+        res = await _stop_endpoint(app)
+        assert _kinds(log) == ["release"] and res.status == "draining" and res.spend_stopped is not True
+        assert ("hpc-bridge's command whose result the client lost (task cmd-1) may still be queued or running on "
+                "the endpoint (its state could not be read from the service)") in res.notice
+
+
+async def test_a_finished_command_the_service_no_longer_answers_for_never_blocks_a_stop(monkeypatch):
+    # Review r3, LC2: a 404 for a command that finished long ago read `unknown` forever, and every stop refused — job
+    # 77, a new block for later work, was never cancelled
+    from types import SimpleNamespace
+
+    from hpc_bridge.context import ShapeRuntime
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    class _NotFound(Exception):
+        http_status = 404
+
+    def get_task(tid):
+        raise _NotFound("Task not found")
+
+    SentCheckStore().save("fake-eid", [_row("cmd-old", "command")])
+    app = _restarted_app(monkeypatch, "fake-eid", SimpleNamespace(get_batch_result=lambda ids: {}, get_task=get_task))
+    app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True}, spend_confirmed=True,
+                                         block_since=time.monotonic(), block_job="77",
+                                         runner=_FakeRunner("fake-eid", _Res(0, "", "")))
+    log = _scripted_login(monkeypatch, releases=["released 77\n"])
+    res = await _stop_endpoint(app)
+    assert _kinds(log) == ["release"] and res.notice.startswith("compute block released over AMQP (released 77).")
+    assert res.status == "draining" and "(task cmd-old) may still be queued or running" in res.notice
+
+
+async def test_a_lost_command_past_its_ceiling_cannot_hold_the_stop(monkeypatch):
+    from types import SimpleNamespace
+
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    pending = SimpleNamespace(get_task=lambda tid: {"pending": True, "status": "running"})
+    SentCheckStore().save("fake-eid", [_row("cmd-2", "command", ceiling_at=time.time() - 1)])
+    app = _restarted_app(monkeypatch, "fake-eid", pending)
+    log = _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app)
+    assert _kinds(log) == ["release"] and res.status == "draining" and "can't stop yet" not in res.notice
+    # within its ceiling, the service's `pending` is the one answer that refuses
+    SentCheckStore().save("fake-eid", [_row("cmd-3", "command", ceiling_at=time.time() + 600)])
+    app2 = _restarted_app(monkeypatch, "fake-eid", pending)
+    log = _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app2)
+    assert log == [] and res.status == "up" and "(task cmd-3) may still be running" in res.notice
+
+
+async def test_a_lost_commands_ceiling_is_written_with_it(monkeypatch):
+    from hpc_bridge import warmth
+    from hpc_bridge.server import _poll_task, _run_shell
+    from hpc_bridge.state import SentCheckStore
+
+    app = _ssh_app()
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"), pending=True)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    out = await _run_shell(app, "sleep 3000", agent_call=True)
+    fut = runner.futures[-1]
+    fut.task_id = "cmd-4"
+    fut.fail(RuntimeError("SDK thread quit unexpectedly."))
+    await _poll_task(app, out.task_id)
+    await warmth._flush_all(app)
+    [row] = [r for r in SentCheckStore().load("fake-eid") if r["task_id"] == "cmd-4"]
+    expected = row["sent_at"] + runner.walltime + warmth._LOST_TASK_GRACE_S
+    assert row["what"] == "command" and abs(row["ceiling_at"] - expected) < 5
+
+
+async def test_a_record_lock_held_elsewhere_fails_closed_and_the_stop_still_releases(monkeypatch):
+    # Review r3: a blocking flock on the event loop could freeze the server (an NFS home); now it is tried without
+    # blocking for a bounded time, and a lock not had fails closed
+    import fcntl
+    import os
+
+    from hpc_bridge import state
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    monkeypatch.setattr(state, "LOCK_WAIT_S", 0.2)
+    store = SentCheckStore()
+    store.save("fake-eid", [])
+    store.root.mkdir(parents=True, exist_ok=True)
+    fd = os.open(store.root / "fake-eid.json.lock", os.O_RDWR | os.O_CREAT, 0o600)
+    fcntl.flock(fd, fcntl.LOCK_EX)                                          # another process holds it
+    try:
+        t0 = time.monotonic()
+        rows, problem = store.read("fake-eid")
+        assert time.monotonic() - t0 < 1 and rows == [] and "lock is held by another process" in problem
+        app = _restarted_app(monkeypatch, "fake-eid", None)
+        log = _scripted_login(monkeypatch)
+        res = await _stop_endpoint(app)
+        assert _kinds(log) == ["release"] and res.status == "draining"
+        assert "hpc-bridge's record of the checks it sent to this endpoint cannot be trusted" in res.notice
+    finally:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+        os.close(fd)
+
+
+async def test_the_records_io_runs_off_the_event_loop(monkeypatch):
+    # a record on a home directory that hangs must not freeze the server (its heartbeats included)
+    import asyncio
+
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    def slow_read(self, eid):
+        time.sleep(0.5)
+        return [], None
+
+    monkeypatch.setattr(SentCheckStore, "read", slow_read)
+    app = _restarted_app(monkeypatch, "fake-eid", None)
+    _scripted_login(monkeypatch)
+    ticks = []
+
+    async def ticker():
+        while True:
+            ticks.append(time.monotonic())
+            await asyncio.sleep(0.05)
+
+    t = asyncio.ensure_future(ticker())
+    try:
+        await _stop_endpoint(app)
+    finally:
+        t.cancel()
+    assert len(ticks) >= 5                                                   # the loop kept running meanwhile
 
 
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------

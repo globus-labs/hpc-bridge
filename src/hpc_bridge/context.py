@@ -203,6 +203,9 @@ class SentCheck:
     task_id: str | None = None   # as registered (the future's, or the one read back from disk)
     sent_at: float = 0.0         # when it was sent (wall clock, time.time())
     what: Literal["check", "command"] = "check"
+    # a command's: past this (wall clock: its ceiling — it is killed at its walltime once running — plus the grace a
+    # queued one gets) it can no longer make a stop refuse; None: unknown, or a check
+    ceiling_at: float | None = None
 
     @property
     def tid(self) -> str | None:
@@ -310,6 +313,10 @@ class AppCtx:
     # Task id -> how it resolved ("ok" / "failed"), as seen this session: never asked again, and removed from the record
     # on disk by this process (warmth._check_states, _persist_checks). Bounded (warmth._trim_resolved).
     resolved_checks: dict[str, str] = field(default_factory=dict)
+    # The record writes still to do per endpoint (rows, task ids written, ids removed; None: remove the record) and the
+    # task writing them off the event loop (warmth._schedule_flush).
+    checks_pending: dict[str, tuple[list[dict], frozenset[str], frozenset[str]] | None] = field(default_factory=dict)
+    check_flushers: dict[str, asyncio.Task] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

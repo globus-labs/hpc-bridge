@@ -90,9 +90,14 @@ installed plugin only when that version changes); git tags mark releases.
     that session saw finish. A file that cannot be read is kept aside (`.corrupt-<time>`) and the stop does not
     answer `down` while it is there: it says the record cannot be trusted and that `teardown_endpoint` ends every
     task on that endpoint. An answer read from the service is kept even when the round of lookups runs out of time,
-    and a task seen finished is never asked about again. A command whose result was lost that may still be running
-    makes the stop refuse (as for a command still running), naming its task id: cancelling the block would not end
-    it. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
+    and a task seen finished is never asked about again. A command whose result was lost that the service says is
+    still queued or running makes the stop refuse (as for a command still running), naming its task id: cancelling
+    the block would not end it. Only that answer refuses: a command whose state cannot be read (no client yet after
+    a restart, or a record the service no longer returns), or one past its time limit plus a grace, never keeps a
+    stop from cancelling — the stop cancels and says the command may still be queued or running. The file is read
+    and written in a background thread, and its lock is never waited on for more than two seconds (on Windows too):
+    a home directory that hangs cannot freeze hpc-bridge, and a lock not had reads as a record that cannot be
+    trusted. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
     that came up after the stop's last cancel. A `connect_facility` to another facility says when a task may still
     be queued on the endpoint it left. When the endpoint is offline, the stop answers `down` as before, but keeps
     the tasks: if the endpoint comes back, the next stop still sees them. One `stop_endpoint` call takes at most

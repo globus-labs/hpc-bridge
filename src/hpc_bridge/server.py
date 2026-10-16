@@ -988,6 +988,8 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     # The whole call is bounded (config.STOP_CALL_BUDGET_S): under the tool timeouts of the clients that drive it —
     # the waits for the lock, the releases, the lookups and the liveness check included.
     call_deadline = time.monotonic() + config.STOP_CALL_BUDGET_S
+    # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server)
+    disk = await warmth._read_checks(eid, min(5.0, call_deadline - time.monotonic()))
     if not await _acquire_within(app, call_deadline):
         return _lock_busy_status(app, eid, released=None)
     try:  # under the lock: a run_shell provisioning right now has counted its dispatch before we look
@@ -1002,7 +1004,7 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # outstanding (live 2026-10-16, `queued_check_relaunch`: "released 4", `down`, job 5 submitted 53 s later). So
         # `down` needs the release confirmed AND every one resolved (or never sent), whatever the shape's own state
         # says. (Our own commands with a live handle are the busy refusal's: a stop never releases under them.)
-        checks, store_problem = warmth._our_checks(app, eid, rt_pre)
+        checks, store_problem = warmth._our_checks(app, eid, rt_pre, disk)
         # On a fresh compute user endpoint (warmth._fresh_block) a cancelled or dead first pilot makes parsl give our
         # check up (bad state) within one scheduler status poll: worth waiting for, so one call usually ends `down`. An
         # endpoint of an earlier plugin keeps one user endpoint, where a cancel is followed by another block instead.
@@ -1184,21 +1186,25 @@ async def _gone_within(app: AppCtx, deadline: float) -> bool:
 
 async def _lost_command_refusal(app: AppCtx, eid: str, checks: list[SentCheck], fresh: bool,
                                 deadline: float) -> EndpointStatus | None:
-    """A command of ours whose result the client lost (its future failed on the client's side alone) may still be
-    running on the block: like a live task, releasing the block would not end it — the endpoint starts another block to
-    run it, and spend continues after a false `down` — so the stop refuses, naming it. One the service says finished
-    (or gave up) does not hold the stop. None: no such command is still running."""
-    cmds = [c for c in checks if c.what == "command"]
+    """A command of ours whose result the client lost (its future failed on the client's side alone) that the SERVICE
+    says is still queued or running: like a live task, releasing the block would not end it — the endpoint starts
+    another block to run it, and spend continues after a false `down` — so the stop refuses, naming it. Only on that
+    answer: one whose state cannot be read (no client yet after a restart — the release builds the login runner that
+    looks it up —, or a record the service no longer returns) never blocks a stop: the stop releases, and names it in
+    its `draining` while it cannot be read. Nor does one past its ceiling (`SentCheck.ceiling_at`: killed at its
+    walltime once running, plus the grace a queued one gets). None: nothing holds the stop."""
+    now = time.time()
+    cmds = [c for c in checks if c.what == "command" and (c.ceiling_at is None or now < c.ceiling_at)]
     if not cmds:
         return None
     states = await warmth._check_states(cmds, _lookup_client(app),
                                         min(warmth._LOOKUP_TIMEOUT_S, deadline - time.monotonic()),
                                         known=app.resolved_checks, drop_no_id=fresh)
-    live = [c for c, st in zip(cmds, states, strict=True) if st in ("pending", "unknown")]
+    live = [c for c, st in zip(cmds, states, strict=True) if st == "pending"]
     if not live:
         return None
     ids = ", ".join(t for c in live if (t := c.tid)) or "unknown id"
-    read = " (its state could not be read from the service)" if "unknown" in states else ""
+    read = ""
     rt = app.shapes.get(DEFAULT_SHAPE)
     return EndpointStatus(
         status="up", block_state="warm" if rt is not None else "cold", endpoint_id=eid,
@@ -1764,7 +1770,8 @@ async def _dispatch_counted(
             rt.inflight -= 1
             counted = None
             if fut is not None:  # a future that failed on the client's side alone: the task may live on — evidence
-                warmth._keep_lost_command(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)())
+                warmth._keep_lost_command(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)(),
+                                          ceiling_s=runner.walltime)
             if guard is not None and (refused := warmth._guard_refusal(out, guard)) is not None:
                 # refused on a replacement block: nothing ran, so no submission and no proof of life — the reap
                 return warmth._wrong_block_outcome(app, shape, rt, guard, refused, reset=reset)
