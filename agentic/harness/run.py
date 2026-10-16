@@ -384,9 +384,13 @@ def _universal_postchecks(scheduler: str) -> list[dict]:
 
 # A pilot the scheduler itself lists as on its way OUT: PBS `E` (exiting, still listed until the MoM's obit) and Slurm
 # `CG` (completing: its epilog running, its processes being killed — KillWait=30 on the fake cluster). And the state a
-# job a stop cancelled may still be listed in before that: R — OpenPBS's qdel is asynchronous (below).
+# job a stop cancelled may still be listed in before that, on PBS ONLY: R — OpenPBS's qdel is asynchronous (below), and
+# only for PBS_CANCEL_GRACE_S (kill_delay plus the MoM's report; the live case cleared in 18 s), not the whole bound. On
+# Slurm scancel moves a running job to CG at once: a job a stop cancelled still listed R there is evidence the stop's
+# claim was false, and the check never excuses it on the word of the product under test.
 _ENDING_STATES = {"pbs": frozenset({"E"}), "slurm": frozenset({"CG"})}
-_RUNNING_STATES = {"pbs": frozenset({"R"}), "slurm": frozenset({"R"})}
+_RUNNING_STATES = {"pbs": frozenset({"R"}), "slurm": frozenset()}
+PBS_CANCEL_GRACE_S = 60.0
 # How long `_no_pilot_left` waits for ending pilots to leave the queue (the TARGET's `pilot_end_wait_s` capability —
 # targets.py: 60 s on the fake cluster, longer on a real one, whose epilogues can hold a job in E / CG for minutes; with
 # no target known, a run against a real facility from the operator's machine, the long value), and how often it looks.
@@ -410,17 +414,32 @@ PILOT_LIST_RETRIES = 2
 # the detail), and a release the scheduler partly refused, `'release failed: qdel refused 3; cancelled: 4'` — the
 # refused ids are NOT cancelled and are never read. Only these anchors, and only job-id-shaped words after them
 # (Slurm `12`, `12_3`; PBS `0.pbsserver`, `12[3].host.domain`): `released none`, `released over AMQP` and anything else
-# yield nothing, and a stop whose ids cannot be read leaves the check on the job states alone.
+# yield nothing, and a stop whose ids cannot be read leaves the check on the job states alone. Nor is a count ever read
+# as ids: a run of numbers followed by `block(s)` / `job(s)` / `pilot(s)` (`released 1 block`) yields nothing — the
+# run is possessive, so it cannot give back its last number to dodge that. The notice is read where the result holds
+# it: its `notice` field, or — a CLI operator's native shape, `{"text": "<the tool's JSON>"}` — the JSON's `notice`
+# once decoded, as cli_runner._journal_call decodes a journal row's string result (else the text as it is).
 _JOB_ID = r"\d+(?:_\d+)?(?:\[\d*\])?(?:\.[A-Za-z0-9-]+)*(?=[\s).,;'\"]|$)"
-_CANCELLED_RE = re.compile(rf"(?:^|\()released((?: +{_JOB_ID})+)|cancelled:((?: +{_JOB_ID})+)")
+_IDS = rf"((?: +{_JOB_ID})++)(?! +(?:block|job|pilot)s?\b)"
+_CANCELLED_RE = re.compile(rf"(?:^|\()released{_IDS}|cancelled:{_IDS}")
+
+
+def _stop_notice(result: dict | None) -> str:
+    r = result or {}
+    if r.get("notice") is not None or not isinstance(r.get("text"), str):
+        return str(r.get("notice") or "")
+    try:
+        obj = json.loads(r["text"])
+    except ValueError:
+        return r["text"]
+    return str(obj.get("notice") or "") if isinstance(obj, dict) else r["text"]
 
 
 def _stop_cancelled_jobs(trace: Trace | None) -> list[str]:
     """Every job id the run's stop_endpoint answers (any status, every phase) say they cancelled, in order, once each."""
     out: list[str] = []
     for _i, c in (trace.named("stop_endpoint") if trace is not None else []):
-        r = c.result or {}
-        for m in _CANCELLED_RE.finditer(str(r.get("notice") or r.get("text") or "")):
+        for m in _CANCELLED_RE.finditer(_stop_notice(c.result)):
             out += [j for j in (m.group(1) or m.group(2)).split() if j not in out]
     return out
 
@@ -474,9 +493,10 @@ async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list
     """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue. A pilot that is ENDING is
     waited for — re-listed every PILOT_ENDING_POLL_S, up to `wait_s` — and passes once it is gone:
       - a job the run's own stops said they cancelled (`cancelled`, from `_stop_cancelled_jobs`), while it is listed as
-        running (PBS lists a qdel'd job as R until its MoM reports — run 1792166459) or ending. Once seen ending it may
-        only stay ending, and it is never queued: a cancelled job back in R or in PD / Q / H is a requeue — Slurm and
-        PBS keep the id — and fails at once;
+        ending, or — PBS only, for PBS_CANCEL_GRACE_S — as R (PBS lists a qdel'd job as R until its MoM reports — run
+        1792166459). Once seen ending it may only stay ending, and it is never queued: a cancelled job back in R or in
+        PD / Q / H is a requeue — Slurm and PBS keep the id — and fails at once, as does one still R past the grace
+        (PBS) or R at all (Slurm);
       - a job the scheduler lists as E / CG though no stop named it: one whose cancel the notice did not spell out, one
         parsl's idle-release cancelled, one that hit its walltime — the scheduler's own word that it is exiting. A
         relaunch never enters as one: it is a NEW id, queued.
@@ -520,12 +540,18 @@ async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list
                 if state != "?" and state in ending:
                     ended.add(key)
                     waiting.append((job, state))
-                elif mine and state in running and key not in ended:
+                elif mine and state in running and key not in ended and waited <= PBS_CANCEL_GRACE_S:
                     waiting.append((job, state))
                 else:
-                    if mine:
-                        notes[job] = ("; a stop cancelled it, and it ran again after ending — requeued"
-                                      if key in ended else "; a stop cancelled it, yet it is not ending — requeued?")
+                    if mine and key in ended:
+                        notes[job] = "; a stop cancelled it, and it left the ending state — requeued"
+                    elif mine and state in running:
+                        notes[job] = (f"; a stop cancelled it, yet it still runs {waited:.0f} s on — past the "
+                                      f"{PBS_CANCEL_GRACE_S:.0f} s a qdel takes to reach it")
+                    elif mine and state == "R":
+                        notes[job] = "; a stop cancelled it, yet it still runs — scancel moves a job to CG at once"
+                    elif mine:
+                        notes[job] = "; a stop cancelled it, yet it is queued — requeued?"
                     live.append((job, state))
             if live:
                 return Result(f"world:{name}", False, f"found a pilot that is not ending: {_jobs(live, notes)}"
