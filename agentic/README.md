@@ -144,11 +144,18 @@ pilot of the endpoint, a second confirm with the same terms (the same user endpo
 dir), the poll, the stop at once. No teardown either way. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
 submitted after the stop's answer (`world:no_relaunch_after_down`, gated), and the world check reads the endpoint's own
 log for parsl's decisions after the stop (`strategy_after_stop`, reported), before the harness tears down. A watch that
-never saw the cell's OWN pilot fails as blind — the first live run (2026-10-15) passed blind: its pilot lived 4.6 s
-between two samples, and `sacct -S <window>` lists no job that was never eligible. Expected on main if the review's
-claim holds: FAILED, a new pilot ~60–65 s after the `down`. That first run's endpoint log showed none: 56 s after the
-stop parsl marked the cancelled, never-connected block MISSING, went to bad state ("Not strategizing") and the user
-endpoint shut down (the scenario's docstring has the detail). Run it by hand; the sweeps leave it out.
+never saw the stop's OWN pilot in a CLEAN sample's squeue or window sacct fails as blind (a sample with an error line,
+a failed query or a missing exit status covers no time; `sacct -j <known id>` never counts), and so does one whose
+endpoint log was not read — the first live run passed blind: its pilot lived 4.6 s between two samples.
+
+**The result on main (fake/default, 2026-10-15) — phase `second` FAILS by design: the bug is real.** Run 1792120434:
+phase B's stop answered `down` ("released 4", spend_stopped True) with its check queued; 53 s later the user endpoint
+logged "Scaling out by 1 blocks" and submitted job 5, a new pilot (held by the tap, so it never ran). The cell is the
+regression check for the fix (branch `fix/stop-after-failed-block`; HANDOFF.md). Phase `first` passes on main by
+another path (run 1792117501): 56 s after the stop parsl marked the cancelled, never-connected block MISSING, went to
+bad state ("Not strategizing") and the user endpoint shut down — no relaunch, the canary left queued. A `draining`
+answer passes the gated row even with a relaunch seen (it did not claim spend stopped); the universal
+`world:stop_honesty_no_pilot_left` still fails a pilot left queued. Run it by hand; the sweeps leave it out.
 
 **World checks that watch, and the ADMIN TAP.** A scenario's `WORLD_CHECKS` are async callables
 `fn(ctx) -> list[Result]` that run.py awaits after the operator and BEFORE the declarative POSTCHECKS and the teardown
@@ -160,9 +167,12 @@ target's admin channel (fake: `docker exec` into the controller as root; `{user}
 seconds into `agentic/runs/.admin-tap-<runid>.jsonl`; the jail reads it (`HPCB_ADMIN_TAP`), the bundle keeps the samples
 (`admin-tap.jsonl`), and the EXIT trap stops the tap and removes the raw file. `admin_tap.slurm_sample_cmd()` samples
 the controller's clock, the pool user's jobs (`squeue -t all`: also those finished within MinJobAge) and its accounting
-in every state (`sacct -s …`: without a state list sacct shows only jobs that were eligible in the window, and a held job
-never is), with epoch times. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
-the tap's); the host tap then adds the scenario's `ids_cmd` (`sacct -j {ids}`) to every sample and takes one at once.
+from the window's start to now (`sacct -S … -E now -s CA,CD,F,PD,R,TO`: without a state list sacct shows only jobs that
+were eligible in the window, and a held job never is; with one but no `-E` it shows nothing — slurm 23.11.4), with
+epoch times, each query ending with its own exit status (`HPCB_RC`) so a Slurm error is never read as an empty queue. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
+the tap's); the host tap then adds the scenario's `ids_cmd` (`sacct -j {ids}`, its own tag `HPCB_J`) to every sample
+and takes one at once. The tap watches run_smoke.sh's pid and, if it is killed outright, exits and removes its files;
+run_suite's emergency cleanup stops an abandoned cell's tap by its `.pid` file.
 A script that must keep an endpoint's next pilots from ever starting asks the tap to hold them
 (`TapReader.request_hold(marker, first_job)`, a `.hold` file); the tap then runs the scenario's `hold_cmd` (`scontrol
 hold` as the admin) in every sample. `ctx.ssh(cmd, timeout)` is the harness' world channel (the endpoint's own logs, read before the teardown deletes them)

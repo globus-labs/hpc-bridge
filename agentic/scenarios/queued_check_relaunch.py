@@ -1,6 +1,7 @@
 """queued_check_relaunch — does `stop_endpoint` answer `down` while hpc-bridge's own CHECK is still queued on the endpoint,
 so that the endpoint submits a NEW billed pilot right after hpc-bridge said spend stopped? A suspected spend-honesty bug
-(review, 2026-10-15) to be PROVEN live before any design. Scripted (HPCB_OPERATOR=script, harness/script_runner.py): no
+(review, 2026-10-15) — PROVEN live on 2026-10-15 (below), so phase `second` FAILS on main BY DESIGN until the fix lands
+(branch fix/stop-after-failed-block; HANDOFF.md). Scripted (HPCB_OPERATOR=script, harness/script_runner.py): no
 agent, one exact sequence. Fake cluster, Slurm: the `default` profile, and `site`. Two phases (HPCB_RELAUNCH_PHASE):
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch
@@ -24,9 +25,14 @@ THE CLAIM (main at 7ae46c2):
 - Field evidence: HANDOFF.md, 2026-10-06 — Delta's endpoint kept relaunching A40 blocks for queued canaries (about
   1.7 GPU-h, stopped by hand). Never reproduced on the fake cluster before this cell.
 
-EXPECTED on main if the claim holds: FAILED — `world:no_relaunch_after_down` names a new pilot of this endpoint submitted
-about 60–65 s after the `down`, and the universal `world:stop_honesty_no_pilot_left` finds it still queued. This is a
-regression check that should pass only once the product fixes the hazard.
+THE RESULT ON MAIN (fake/default, 2026-10-15):
+- phase `second` — FAILED, the bug proven (run 1792120434): phase B's stop answered `down` ("released 4", spend_stopped
+  True) while its check was queued; 53 s later the user endpoint logged "Scaling out by 1 blocks" and submitted job 5,
+  a new pilot of the same endpoint (held by the tap, so it never ran). `world:no_relaunch_after_down` fails on it, and
+  the universal `world:stop_honesty_no_pilot_left` finds it queued. This cell is the regression check for the fix: it
+  passes only once a `down` is no longer followed by a relaunch.
+- phase `first` — passes on main, by the bad-state path (run 1792117501, below): no relaunch, because the user endpoint
+  shut down; the canary is left queued at the service.
 
 WHAT THE FIRST LIVE RUN SHOWED (bundle 1792117501-3824-56199, fake/default, 2026-10-15; now phase `first`): no relaunch
 — but not for the claim's reason, and its watch was blind (below). The pilot (job 1, held) was cancelled by the stop's
@@ -58,7 +64,8 @@ A. ensure_endpoint_up(confirm_spend=True), then ensure_endpoint_up polls until `
    so an honest `down` (`phase_a_stop`; re-stopped while `draining`, as an agent would).
 B. THE SENTINEL: every pilot of this endpoint is named `parsl-hpcb-qcr` with `#SBATCH --dependency=singleton` (in the
    confirmed details, so phase A's ran too — nothing else of that name existed); phase B first starts, as the pool user on
-   the login shape, a one-core job of the same name (`sleep 3600`), so the next pilot waits on it (reason Dependency) —
+   the login shape, a one-core job of the same name on the pilots' partition, account and walltime (terms the scheduler
+   already took for them: `site`'s 30-min `debug` cannot refuse it), so the next pilot waits on it (reason Dependency) —
    an idle fake node starts a job within a second of its sbatch, faster than any hold could follow. Then the script asks
    the ADMIN TAP to `scontrol hold` every new PENDING pilot of `uep.<eid>` from the sentinel's id on (`<tap>.hold`), so
    it never runs whatever ends. Then ensure_endpoint_up(confirm_spend=True) with the SAME terms: hpc-bridge dropped the
@@ -87,16 +94,20 @@ THE OBSERVATION (world checks, after the script, BEFORE the harness' teardown �
 POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop; the watch starts at the JUDGED stop):
 - the ADMIN TAP (harness/admin_tap.py) samples the scheduler as root on slurmctld every 10 s for the whole cell — the
   harness' admin channel, never hpc-bridge: `squeue -t all` (queued and running jobs, and those finished within
-  MinJobAge, 300 s here), `sacct` over the last 2 h in EVERY state (`-s …`: without it sacct lists only jobs that were
-  eligible in the window, and a held pilot never is — the first run's sacct saw nothing), and — once `relaunch_watch`
-  asks for the cell's own pilot by id — `sacct -j <id>`, which finds a job whatever its eligibility or age;
+  MinJobAge, 300 s here) and `sacct` over the last 2 h to now (`-S now-2hours -E now -s CA,CD,F,PD,R,TO`: without the
+  state list sacct lists only jobs that were eligible in the window, and a held pilot never is; with it but no `-E` it
+  lists nothing — both verified on the controller, slurm 23.11.4; the first run's sacct saw nothing), each query ending
+  with its own exit status; and — once `relaunch_watch` asks for the stop's own pilot by id — `sacct -j <id>`, under
+  its own tag: it says what became of that job, but a lookup by a known id could never see a relaunch, so it is never
+  the sighting that makes a watch not blind;
 - `relaunch_watch` waits until the tap has covered HPCB_RELAUNCH_WATCH_S (default 420 s: several 60 s job-status polls)
   after the stop's answer. Every job of this endpoint (its `uep.<eid>` marker in squeue's batch script or sacct's
   SubmitLine) is recorded with its submit time, state and id;
 - then it reads the endpoint's own logs over the world channel (cluster_ops.capture_logs_cmd: the manager's, each user
   endpoint's, the blocks' output) — before the teardown deletes them — for parsl's decisions after the stop.
-- phase `second`: the sentinel is cancelled once the watch is over (it would read as a pilot left behind to the
-  universal postcheck); a relaunched pilot stays held.
+- phase `second`: once the watch is over the world check holds any pilot submitted since the tap's last tick (one
+  last tick, as the pool user), cancels the sentinel and waits until it has left the queue (a COMPLETING sentinel would
+  read as a pilot left behind to the universal postcheck); a relaunched pilot stays held.
 Then the teardown runs as usual — its cancel-by-marker (`cluster_ops.scoped_cancel_cmd`: squeue with no state filter, so
 PENDING and held jobs too) cancels a relaunched pilot — and CLEANUP cancels anything of the singleton name, so nothing is
 left on the fake cluster.
@@ -105,15 +116,15 @@ GRADED: `world:no_relaunch_after_down` (gates, as every world row) judges the JU
 when it answered `down` (or spend_stopped=True) and a new pilot of this endpoint was submitted after it — naming the
 job, its submit time relative to the stop's answer and its state. A stop that answered `draining` (or refused) is a
 different premise: report-only, PASS, said so. A `down` with no relaunch passes only when the watch could have seen one:
-the tap saw the stop's OWN pilot by its marker (else "watch blind" — the first run passed blind: its pilot lived 4.6 s
-between two samples), the endpoint's log shows no scale-out the tap missed, the window was covered, and the premise held
+a CLEAN sample's squeue or window sacct listed the stop's OWN pilot by its marker (else "watch blind" — the first run
+passed blind: its pilot lived 4.6 s between two samples; a sample with an error line, a failed query, a missing exit
+status or no clock covers no time), the endpoint's log was read, the endpoint's log shows no scale-out the tap missed, the window was covered, and the premise held
 — the canary was still queued at the stop, and in `second` phase A's block had answered in the SAME user endpoint.
 REPORTED: `stop_answer`, `phase_a_stop`, `pilot_state_at_stop` (with the user endpoint), `canary_before_stop`,
 `relaunch_watch`, `strategy_after_stop` (the endpoint log's scale-outs, error-handler and user-endpoint lines after the
 stop), `uep_job_history` (phase A's job — connected —, the stop's own, any relaunch; held ones; MISSING / bad state).
-EXPECTED in `second` if the hazard is real: the judged stop answers `down`; within ~65 s the user endpoint's strategy
-logs a scale-out and a block-3 job appears (held by the tap) — `world:no_relaunch_after_down` FAILS. If parsl does not
-relaunch, `strategy_after_stop` says why.
+On main `second` FAILS this way (above). A stop that answered `draining` passes this row even with a relaunch seen —
+it did not claim spend stopped; the universal postcheck still fails a pilot left queued (see the grader's docstring).
 """
 import asyncio
 import json
@@ -254,15 +265,22 @@ def _account(r: dict) -> str | None:
     return next((a for a in accounts if "gpu" not in a.lower()), accounts[0] if accounts else None)
 
 
-def sentinel_cmd(partition: str | None, account: str | None) -> str:
-    """Phase B's sentinel, as the pool user on the login shape: one core, the pilots' name, running for an hour (the
-    world check cancels it once the watch is over; CLEANUP again)."""
-    opts = [f"-J {SINGLETON_NAME}", "-N1", "-n1", "-t 01:00:00", "-o /dev/null", "-e /dev/null"]
+_WALLTIME = re.compile(r"^(?:\d+-)?\d{1,2}:\d{2}:\d{2}$")
+SENTINEL_WALLTIME = "00:30:00"   # when the block's terms name none: the fake profiles' shortest partition limit (debug)
+
+
+def sentinel_cmd(partition: str | None, account: str | None, walltime: str | None = None) -> str:
+    """Phase B's sentinel, as the pool user on the login shape: one core, the pilots' name, on the pilots' partition
+    and account, for the pilots' own walltime — the terms the scheduler already accepted for them, so a partition
+    limit (`site`'s debug: 30 min, EnforcePartLimits=ALL) cannot refuse it. The world check cancels it once the watch
+    is over; CLEANUP again."""
+    wt = walltime if walltime and _WALLTIME.match(walltime) else SENTINEL_WALLTIME
+    opts = [f"-J {SINGLETON_NAME}", "-N1", "-n1", f"-t {wt}", "-o /dev/null", "-e /dev/null"]
     if partition:
         opts.append(f"-p {shlex.quote(partition)}")
     if account:
         opts.append(f"-A {shlex.quote(account)}")
-    return f"sbatch --parsable {' '.join(opts)} --wrap 'sleep 3600'"
+    return f"sbatch --parsable {' '.join(opts)} --wrap 'sleep 86400'"   # the walltime ends it, not the sleep
 
 
 def _brief(r: dict) -> str:
@@ -329,6 +347,7 @@ async def _second_pilot(ops, args: dict, account: str | None) -> str:
     if e.get("status") not in ("provisioning", "up") or not eid:
         ops.abort(f"phase A: no block was started: status={e.get('status')!r} {_brief(e)!r}")
     partition = e.get("partition")   # the block's queue: the sentinel must share it to share the pilots' nodes
+    walltime = (e.get("block") or {}).get("walltime")   # the block's walltime (the confirm's receipt): fits the partition
     poll_args = {k: v for k, v in args.items() if k != "confirm_spend"}
     deadline = time.monotonic() + WARM_WAIT_S
     while e.get("status") != "up":
@@ -351,7 +370,7 @@ async def _second_pilot(ops, args: dict, account: str | None) -> str:
             f"{str(h.get('stdout') or '').strip()!r}; stop_endpoint said {a.get('status')!r} "
             f"(spend_stopped={a.get('spend_stopped')!r}): {_brief(a)}")
     # ---- phase B: the sentinel first, so the next pilot cannot start (an idle node starts a job within a second)
-    sub = await ops.call("run_shell", shape="login", command=sentinel_cmd(partition, account))
+    sub = await ops.call("run_shell", shape="login", command=sentinel_cmd(partition, account, walltime))
     sid = str(sub.get("stdout") or "").strip().split(";")[0].strip()
     if not sid.isdigit():
         ops.abort(f"phase B: the sentinel was not submitted: {_brief(sub)!r}")
@@ -557,6 +576,12 @@ class Watch:
     log_error: str = ""
     phase: str = "first"                                  # HPCB_RELAUNCH_PHASE as the run was made
     held: set[str] = field(default_factory=set)           # jobs the tap held (phase B's hold request)
+    # The own pilot as a CLEAN sample's squeue or window sacct listed it (by its marker) — the proof the sampling could
+    # see a relaunch. `sacct -j <own id>` (`by_id`) never counts: a lookup by a known id cannot see an unknown one.
+    own_seen: dict[str, str] = field(default_factory=dict)   # job id -> "STATE [squeue|sacct]"
+    by_id: dict[str, str] = field(default_factory=dict)      # job id -> "STATE" from sacct -j (reported only)
+    unclean: list[str] = field(default_factory=list)         # the errors of the samples that were not clean
+    sentinel: str = ""                                        # phase B's sentinel at the end: "gone" | "STILL …" | ""
 
 
 def _stop_times(messages: list, nth: int = 0) -> tuple[float | None, float | None]:
@@ -737,7 +762,10 @@ def uep_job_history(t: Trace, w: Watch) -> Result:
 def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
     """GATED (a world row): a JUDGED stop that answered `down` (or spend_stopped=True) must not be followed by a new pilot
     of this endpoint. A stop that did not claim spend stopped (`draining`, a refusal) is another premise: report-only,
-    PASS, said so. A `down` with no relaunch passes only when the watch could have seen one — the tap saw the stop's OWN
+    PASS, said so — EVEN WHEN A RELAUNCH WAS SEEN. Why: this row tests one claim, that a `down` is honest; `draining`
+    is hpc-bridge saying spend may continue and to call stop again (#24), which a later pilot does not contradict. A
+    pilot left queued after such a stop is still caught, by the universal `world:stop_honesty_no_pilot_left` (no job
+    named *parsl* left), which gates every cell. The detail names any relaunch either way. A `down` with no relaunch passes only when the watch could have seen one — the tap saw the stop's OWN
     pilot by its marker (the first live run watched blind and passed: its pilot lived 4.6 s between two samples), the
     endpoint's log shows no scale-out the tap missed, and it covered the window — and the premise held: the check was
     still queued at the stop, and in phase `second` phase A's block had connected in the SAME user endpoint."""
@@ -767,14 +795,21 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
                                           f"({_short_log(scale[0], w)}) that the admin tap never saw as a new pilot")
     if w.unverifiable:
         return Result(NO_RELAUNCH, False, f"UNVERIFIABLE — {w.unverifiable}")
-    seen = {j.job_id: j for j in w.jobs if j.job_id in w.own_ids}
+    if w.log_lines is None:   # a PASS needs the endpoint's own account of its strategy, not only the queue's silence
+        return Result(NO_RELAUNCH, False, f"UNVERIFIABLE — the endpoint's logs were not read "
+                                          f"({w.log_error or 'no reason recorded'}), so a scale-out the tap missed "
+                                          "could not be ruled out")
+    seen = dict(w.own_seen)
     if not w.own_ids:
         return Result(NO_RELAUNCH, False, "watch blind: no pilot id of this stop is known (no squeue poll saw one and it "
                                           "released none), so nothing shows the tap can see this endpoint's jobs")
     if not seen:
         unmarked = sorted(w.own_ids & w.seen_unmarked)
-        return Result(NO_RELAUNCH, False, f"watch blind: the tap never saw this endpoint's own pilot (job "
-                      f"{', '.join(sorted(w.own_ids))}) in {w.samples} sample(s), by squeue or sacct"
+        by_id = (f" (sacct -j found {', '.join(f'job {j} {st}' for j, st in sorted(w.by_id.items()))} — a lookup by a "
+                 "known id, which could never see a relaunch)" if w.by_id else "")
+        return Result(NO_RELAUNCH, False, f"watch blind: no clean sample's squeue or window sacct listed this "
+                      f"endpoint's own pilot (job {', '.join(sorted(w.own_ids))}) in {w.samples} sample(s)"
+                      + (f", {len(w.unclean)} of them not clean" if w.unclean else "") + by_id
                       + (f" — it saw job {', '.join(unmarked)} but without the uep.<eid> marker in its script / "
                          "SubmitLine, so a relaunch would have gone unmatched too" if unmarked else "")
                       + " — so its silence after the stop proves nothing")
@@ -798,7 +833,7 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
         if same is not True:
             return Result(NO_RELAUNCH, False, f"premise {'not met' if same is False else 'unverified'}: {how} — the "
                                               "second pilot must be the same user endpoint's")
-    own = ", ".join(f"job {j.job_id} {j.state} [{j.source}]" for j in seen.values())
+    own = ", ".join(f"job {j} {st}" for j, st in sorted(seen.items()))
     return Result(NO_RELAUNCH, True, f"ok: {said}; no new pilot of this endpoint was submitted in the {covered:.0f} s "
                                      f"after it — the tap saw its own pilot ({own}), so it could have seen one ({why})")
 
@@ -811,8 +846,14 @@ def relaunch_report(w: Watch) -> Result:
     cover = (f"{(w.covered_until or 0) - (w.answered_at or 0):.0f} s after the stop answered"
              if w.covered_until is not None and w.answered_at is not None else "no sample")
     own = ", ".join(sorted(w.own_ids)) or "none known"
-    return Result("relaunch_watch", True, f"{w.samples} admin sample(s), covering {cover}; the stop's own pilot(s): {own}; "
-                  f"this endpoint's jobs: {jobs}" + (f"; held by the tap: {', '.join(sorted(w.held))}" if w.held else "")
+    return Result("relaunch_watch", True, f"{w.samples} admin sample(s) ({len(w.unclean)} not clean), covering {cover}; "
+                  f"the stop's own pilot(s): {own}"
+                  + (f" — seen as {', '.join(f'{j} {st}' for j, st in sorted(w.own_seen.items()))}" if w.own_seen else "")
+                  + (f"; by id (sacct -j): {', '.join(f'{j} {st}' for j, st in sorted(w.by_id.items()))}" if w.by_id
+                     else "")
+                  + f"; this endpoint's jobs: {jobs}" + (f"; held: {', '.join(sorted(w.held))}" if w.held else "")
+                  + (f"; sentinel at the end: {w.sentinel}" if w.sentinel else "")
+                  + (f"; first error: {w.unclean[0][:200]}" if w.unclean else "")
                   + (f"; {w.unverifiable}" if w.unverifiable else ""))
 
 
@@ -840,15 +881,62 @@ async def _read_logs(ctx, eids: list[str], w: Watch) -> None:
     w.log_lines = strategy_lines(logs, w.called_at - 1.0)
 
 
-async def _end_sentinel(ctx, t: Trace) -> None:
-    """Phase `second`: the watch is over — cancel the sentinel (it would read as a pilot left behind to the universal
-    postcheck); a relaunched pilot stays held by the tap until the teardown cancels it. CLEANUP does it again."""
+SENTINEL_GONE_S = 60.0   # how long the world check waits for the cancelled sentinel to leave the queue
+
+
+def end_sentinel_cmd(sid: str | None, marker: str, from_job: str | None) -> str:
+    """Phase `second`'s last world step, as the pool user: hold every pending pilot of `marker` from `from_job` on ONE
+    last time (a relaunch submitted after the tap's last tick would otherwise start the moment the sentinel ends — a
+    user's own hold, JobHeldUser), then cancel the sentinel and wait until it has left the queue (the universal
+    postcheck reads job names: a sentinel still COMPLETING reads as a pilot left behind). Prints `HPCB_HELD <id>` for
+    each pilot it held and `HPCB_SENTINEL gone|STILL <state>`."""
+    hold = ""
+    if from_job and from_job.isdigit():
+        hold = (slurm_hold_cmd().replace("{user}", '"$(whoami)"').replace("{marker}", shlex.quote(marker))
+                .replace("{from}", from_job).replace('$2 != "JobHeldAdmin"', '$2 !~ /^JobHeld/') + "; ")
+    target = sid if sid and sid.isdigit() else ""
+    cancel = (f"scancel {target}" if target else
+              f"scancel -u \"$(whoami)\" --name={SINGLETON_NAME} --state=RUNNING")
+    probe = (f"squeue -h -j {target} -o %T 2>/dev/null" if target else
+             f"squeue -u \"$(whoami)\" -h -n {SINGLETON_NAME} -t R,CG -o %T 2>/dev/null")
+    tries = max(1, int(SENTINEL_GONE_S // 2))
+    return (f"{hold}{cancel} 2>&1; s=; for i in $(seq 1 {tries}); do s=$({probe}); [ -z \"$s\" ] && break; sleep 2; "
+            "done; [ -z \"$s\" ] && echo 'HPCB_SENTINEL gone' || echo \"HPCB_SENTINEL STILL $s\"; true")
+
+
+async def _end_sentinel(ctx, t: Trace, w: Watch) -> None:
+    """Phase `second`: the watch is over — a last hold tick, then cancel the sentinel and wait until it is gone; a
+    relaunched pilot stays held until the teardown cancels it (its cancel-by-marker covers held jobs). CLEANUP cancels
+    the singleton name again."""
     ssh = getattr(ctx, "ssh", None)
     if ssh is None or _sentinel_index(t) is None:
         return
     sid = _sentinel_job(t)
-    cmd = (f"scancel {sid}" if sid else f"scancel -u \"$(whoami)\" --name={SINGLETON_NAME} --state=RUNNING") + " 2>&1; true"
-    await asyncio.to_thread(ssh, cmd, 60)
+    eid = next(iter(_endpoint_ids(t)), "")
+    from_job = str(int(sid) + 1) if sid else None
+    _rc, out = await asyncio.to_thread(ssh, end_sentinel_cmd(sid, f"uep.{eid}", from_job), int(SENTINEL_GONE_S) + 60)
+    w.held |= {ln.split()[1] for ln in out.splitlines() if ln.startswith("HPCB_HELD ") and len(ln.split()) == 2}
+    w.sentinel = next((ln[len("HPCB_SENTINEL "):] for ln in out.splitlines() if ln.startswith("HPCB_SENTINEL ")),
+                      f"unknown: {out.strip()[-120:]!r}")
+
+
+def fold_samples(w: Watch, samples: list, eids: list[str]) -> None:
+    """The tap's samples into `w`. A relaunch is positive evidence from ANY sample (`jobs`); coverage and the own-pilot
+    sighting come from CLEAN samples only — a sample with an error line, a failed query, a missing exit status or no
+    clock covers nothing and proves nothing; `sacct -j` rows (`by_id`) are reported, never a sighting."""
+    clean = [s for s in samples if getattr(s, "clean", not s.error) and s.now is not None]
+    w.samples = len(samples)
+    w.unclean = [s.error for s in samples if s.error]
+    w.covered_until = max((s.now for s in clean), default=None)
+    w.jobs = endpoint_jobs(samples, eids)
+    w.held = {j for s in samples for j in getattr(s, "held", [])}
+    w.own_seen = {j.job_id: f"{j.state} [{j.source}]" for j in endpoint_jobs(clean, eids) if j.job_id in w.own_ids}
+    w.by_id = {j.job_id: j.state for s in samples for j in getattr(s, "by_id", []) if j.job_id in w.own_ids}
+    w.seen_unmarked = {j.job_id for s in clean for j in [*s.queue, *s.history] if j.job_id in w.own_ids}
+    if w.answered_at is not None and not any(s.now >= w.answered_at for s in clean):
+        w.unverifiable = (f"the admin tap has no CLEAN sample after the stop answered ({len(samples)} sample(s), "
+                          f"{len(w.unclean)} not clean" + (f": {' | '.join(w.unclean[-2:])[:400]}" if w.unclean else "")
+                          + ")")
 
 
 async def relaunch_watch(ctx) -> list[Result]:
@@ -871,18 +959,9 @@ async def relaunch_watch(ctx) -> list[Result]:
               f"(~{max(0.0, left):.0f} s more){'; asked for job ' + ', '.join(sorted(w.own_ids)) + ' by id' if asked else ''}",
               flush=True)
         samples = await ctx.tap.wait_until(answered + w.window_s, deadline_s=max(0.0, left) + 90.0)
-        good = [s for s in samples if s.now is not None]
-        w.samples = len(samples)
-        w.covered_until = max((s.now for s in good), default=None)
-        w.jobs = endpoint_jobs(good, eids)
-        w.held = {j for s in samples for j in getattr(s, "held", [])}
-        w.seen_unmarked = {j.job_id for s in good for j in [*s.queue, *s.history] if j.job_id in w.own_ids}
-        if not any(s.now >= answered for s in good if s.now is not None):
-            errors = [s.error for s in samples if s.error][-2:]
-            w.unverifiable = (f"the admin tap has no sample after the stop answered ({len(samples)} sample(s)"
-                              + (f"; {' | '.join(errors)}" if errors else "") + ")")
+        fold_samples(w, samples, eids)
     await _read_logs(ctx, eids, w)
-    await _end_sentinel(ctx, t)
+    await _end_sentinel(ctx, t, w)
     return [no_relaunch_after_down(t, w), relaunch_report(w), strategy_after_stop(w), uep_job_history(t, w)]
 
 

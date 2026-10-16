@@ -5,6 +5,7 @@ from __future__ import annotations
 
 import asyncio
 import json
+import os
 import shlex
 import subprocess
 import sys
@@ -76,14 +77,20 @@ def _job(job_id: str, submit: float | None, state: str = "PENDING", reason: str 
 OWN = None   # sentinel: the cell's own pilot (job 7, cancelled by the stop) as the tap saw it
 
 
+def _seen(jobs, own: set[str]) -> dict[str, str]:
+    return {j.job_id: f"{j.state} [{j.source}]" for j in jobs if j.job_id in own}
+
+
 def _watch(*jobs: admin_tap.SlurmJob, covered: float = 250.0, unverifiable: str | None = None,
            own: set[str] | None = None, log_lines: list | None = None) -> qcr.Watch:
-    """A watch that saw the cell's own pilot (job 7) unless told otherwise — the PASS path needs that proof."""
+    """A watch whose clean samples saw the cell's own pilot (job 7) unless told otherwise, and whose endpoint log was
+    read (no strategy line) — the PASS path needs both."""
     if not any(j.job_id == "7" for j in jobs) and own is None:
         jobs = (_job("7", T_STOP - 9, state="CANCELLED", reason=""), *jobs)
+    own_ids = {"7"} if own is None else own
     return qcr.Watch(called_at=T_STOP - 0.6, answered_at=T_STOP, window_s=240.0, covered_until=T_STOP + covered,
-                     samples=26, jobs=list(jobs), unverifiable=unverifiable, own_ids={"7"} if own is None else own,
-                     log_lines=log_lines)
+                     samples=26, jobs=list(jobs), unverifiable=unverifiable, own_ids=own_ids,
+                     own_seen=_seen(jobs, own_ids), log_lines=[] if log_lines is None else log_lines)
 
 
 # ---- the grader -------------------------------------------------------------------------------------------------------
@@ -164,18 +171,19 @@ def test_a_sample_parses_the_queue_and_the_history_in_epoch_or_iso_times():
         # ignores SLURM_TIME_FORMAT prints `2026-10-15T23:01:53`, in UTC under TZ=UTC)
         f"HPCB_Q 8|PENDING|1792105462|BeginTime|{run}",
         f"HPCB_Q 2|RUNNING|2026-10-15T23:01:53|None|{run}",
-        "HPCB_Q squeue: error: Invalid user: nobody",          # a Slurm error under the tag is not a job
+        "HPCB_Q HPCB_RC 0",                                    # squeue's own exit status (its sed's is the sample's rc)
         # sacct -X -n -P -o JobID,JobName,State,Submit,Start,End,SubmitLine — the stored fake bundles' row shape
         # (1788634219-63412-53791-slurm_worker_died: `2|parsl.GlobusComputeEngine-…|CANCELLED by 2000|…`)
         "HPCB_A 7|parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1788629578.5684283|CANCELLED by 2000|"
         f"2026-09-05T17:32:59|Unknown|2026-09-05T17:33:16|sbatch {run}",
+        "HPCB_A HPCB_RC 0",
     ])}
     s = admin_tap.parse_slurm_sample(sample)
-    assert s.now == 1792105400.0 and s.error == ""
+    assert s.now == 1792105400.0 and s.error == "" and s.clean
     assert [(j.job_id, j.state, j.reason, j.submit) for j in s.queue] == [
         ("8", "PENDING", "BeginTime", 1792105462.0), ("2", "RUNNING", "None", 1792105313.0)]
     (a,) = s.history
-    assert (a.job_id, a.state, a.start, a.source) == ("7", "CANCELLED", None, "sacct")
+    assert (a.job_id, a.state, a.start, a.source) == ("7", "CANCELLED", None, "sacct") and s.by_id == []
     assert a.submit == 1788629579.0 and a.end == 1788629596.0 and f"uep.{EID}" in a.command
     failed = admin_tap.parse_slurm_sample({"t": 1.0, "rc": 1, "out": "Error response from daemon: No such container"})
     assert failed.now is None and "rc=1" in failed.error and "No such container" in failed.error
@@ -196,11 +204,15 @@ def test_the_latest_view_of_a_job_wins_and_the_queue_beats_the_history_within_a_
 def test_the_sample_command_asks_for_epoch_times_the_marker_and_the_clock(tmp_path):
     cmd = admin_tap.slurm_sample_cmd()
     assert "SLURM_TIME_FORMAT=%s" in cmd and "TZ=UTC" in cmd and "echo HPCB_NOW $(date +%s)" in cmd
+    assert cmd.count('echo "HPCB_RC $?"; } 2>&1 | sed') == 2   # each query reports its own exit status
     # -t all: a job finished within MinJobAge is still listed; -s <every state>: a never-eligible (held) job is too
     assert "squeue -u {user} -h -t all -o '%i|%T|%V|%r|%o'" in cmd and "SubmitLine" in cmd and "-S now-2hours" in cmd
-    assert f"-s {admin_tap.SACCT_STATES}" in cmd and admin_tap.SACCT_STATES.split(",")[:3] == ["PD", "R", "CA"]
+    # -E now with -s: without an end time sacct 23.11.4 listed nothing (verified on the fake controller); the six states
+    # are the ones verified there
+    assert f"-S now-2hours -E now -s {admin_tap.SACCT_STATES} " in cmd and admin_tap.SACCT_STATES == "CA,CD,F,PD,R,TO"
     assert qcr.ADMIN_TAP["cmd"] == cmd and qcr.ADMIN_TAP["every_s"] == 10
     assert qcr.ADMIN_TAP["ids_cmd"] == admin_tap.slurm_ids_cmd() and "sacct -j {ids} -X -n -P" in qcr.ADMIN_TAP["ids_cmd"]
+    assert qcr.ADMIN_TAP["ids_cmd"].endswith("sed 's/^/HPCB_J /'")   # its own tag: never read as the window's rows
     # the login-shape poll matches the same marker the product's release does, and prints nothing on no match
     poll = qcr.pilot_poll_cmd(EID)
     assert f"m=uep.{EID}" in poll and "index($4,m)" in poll and poll.endswith("; true")
@@ -250,9 +262,13 @@ def test_the_tap_cli_substitutes_the_pool_user_and_stops_on_sigterm(tmp_path):
 
 # ---- the world check: waits on the tap, then grades -----------------------------------------------------------------
 
-def _tap_file(tmp_path, *outs: str) -> Path:
+RC_OK = "\nHPCB_Q HPCB_RC 0\nHPCB_A HPCB_RC 0"   # each query's own exit status, as slurm_sample_cmd prints it
+
+
+def _tap_file(tmp_path, *outs: str, clean: bool = True) -> Path:
+    """Tap samples; `clean`: each ends as a sample whose queries all reported exit 0."""
     p = tmp_path / ".admin-tap-r1.jsonl"
-    p.write_text("".join(json.dumps({"t": 1.0, "rc": 0, "out": o}) + "\n" for o in outs))
+    p.write_text("".join(json.dumps({"t": 1.0, "rc": 0, "out": o + (RC_OK if clean else "")}) + "\n" for o in outs))
     return p
 
 
@@ -271,7 +287,7 @@ def test_the_world_check_reads_the_tap_and_fails_a_relaunch(tmp_path):
     ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap))
     gated, report, strategy, _history = asyncio.run(qcr.relaunch_watch(ctx))
     assert not gated.ok and "job 8 submitted +63 s after the stop answered, PENDING (BeginTime)" in gated.detail
-    assert report.name == "relaunch_watch" and "3 admin sample(s), covering 425 s" in report.detail
+    assert report.name == "relaunch_watch" and "3 admin sample(s) (0 not clean), covering 425 s" in report.detail
     assert "job 7 CANCELLED" in report.detail and "the stop's own pilot(s): 7" in report.detail
     assert strategy.name == "strategy_after_stop" and strategy.detail.startswith("UNVERIFIABLE")   # no world channel
     assert (tap.parent / (tap.name + ".ids")).read_text().split() == ["7"]   # the tap was asked for job 7 by id
@@ -281,22 +297,26 @@ def test_the_world_check_passes_a_quiet_covered_queue_and_is_unverifiable_withou
     run = SCRIPT_OF.format(eid=EID, ts=1)
     tap = _tap_file(tmp_path, f"HPCB_NOW {T_STOP - 5:.0f}\nHPCB_Q 7|PENDING|{T_STOP - 9:.0f}|BeginTime|{run}",
                     f"HPCB_NOW {T_STOP + 421:.0f}\n")
-    ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap))
-    assert asyncio.run(qcr.relaunch_watch(ctx))[0].ok   # the default watch: 420 s
+    ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap),
+                                ssh=lambda cmd, timeout: (0, "=== log\n"), endpoint_name="hpc-bridge-fake-1")
+    assert asyncio.run(qcr.relaunch_watch(ctx))[0].ok   # the default watch: 420 s; the log read, no strategy line
+    unread = types.SimpleNamespace(**{**vars(ctx), "ssh": None})
+    assert "the endpoint's logs were not read" in asyncio.run(qcr.relaunch_watch(unread))[0].detail
     blind = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(None))
     gated = asyncio.run(qcr.relaunch_watch(blind))[0]
     assert not gated.ok and "HPCB_ADMIN_TAP is unset" in gated.detail
     stale = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(),
                                   tap=admin_tap.TapReader(_tap_file(tmp_path, f"HPCB_NOW {T_STOP - 5:.0f}\n")))
     stale.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=stale.tap.samples())   # no waiting in a test
-    assert "no sample after the stop answered" in asyncio.run(qcr.relaunch_watch(stale))[0].detail
+    assert "no CLEAN sample after the stop answered" in asyncio.run(qcr.relaunch_watch(stale))[0].detail
 
 
 # ---- a blind watch never passes (the first live run passed blind, 2026-10-15) ------------------------------------------
 
 def test_a_watch_that_never_saw_the_cells_own_pilot_fails_blind():
     blind = qcr.no_relaunch_after_down(_trace(DOWN), _watch(own={"7"}))   # 37 samples, none of them job 7
-    assert not blind.ok and blind.detail.startswith("watch blind: the tap never saw this endpoint's own pilot (job 7)")
+    assert not blind.ok and blind.detail.startswith("watch blind: no clean sample's squeue or window sacct listed this "
+                                                    "endpoint's own pilot (job 7)")
     # seen by id but without the marker: a relaunch would go unmatched too
     w = _watch(own={"7"})
     w.seen_unmarked = {"7"}
@@ -537,7 +557,7 @@ def test_world_checks_run_before_the_postchecks_and_the_teardown_and_their_rows_
     monkeypatch.setattr(run_mod, "SCENARIOS_DIR", tmp_path)
     real_sleep = asyncio.sleep
     monkeypatch.setattr(run_mod.asyncio, "sleep", lambda s: real_sleep(0))
-    monkeypatch.setenv("HPCB_ADMIN_TAP", str(_tap_file(tmp_path, "HPCB_NOW 5\n")))
+    monkeypatch.setenv("HPCB_ADMIN_TAP", str(_tap_file(tmp_path, "HPCB_NOW 5\n", clean=False)))
     recorded: dict = {}
 
     def order() -> list:
@@ -609,11 +629,13 @@ def _second(*, b_stop: dict | None = None, a_up: bool = True, b_uep: str = UEP, 
     return Trace(calls)
 
 
-def _watch2(*jobs: admin_tap.SlurmJob, covered: float = 425.0) -> qcr.Watch:
+def _watch2(*jobs: admin_tap.SlurmJob, covered: float = 425.0, log_lines: list | None = None) -> qcr.Watch:
     """The phase-B watch: the tap saw job 1 (phase A, CANCELLED) and job 13 (the judged stop's own) by marker."""
     seen = (_job("1", T_STOP - 120, state="CANCELLED", reason=""), _job("13", T_STOP - 6, state="CANCELLED", reason=""))
     return qcr.Watch(called_at=T_STOP - 0.6, answered_at=T_STOP, window_s=420.0, covered_until=T_STOP + covered,
-                     samples=44, jobs=[*seen, *jobs], own_ids={"13"}, phase="second", held={"14"} & {j.job_id for j in jobs})
+                     samples=44, jobs=[*seen, *jobs], own_ids={"13"}, phase="second",
+                     held={"14"} & {j.job_id for j in jobs}, own_seen=_seen(seen, {"13"}),
+                     log_lines=[] if log_lines is None else log_lines)
 
 
 def test_phase_selection_and_the_directives_each_phase_sends(monkeypatch):
@@ -624,8 +646,13 @@ def test_phase_selection_and_the_directives_each_phase_sends(monkeypatch):
     assert second == "#SBATCH --job-name=parsl-hpcb-qcr\n#SBATCH --dependency=singleton"   # no --begin: A must run
     assert qcr._proposal_details(PROPOSAL, 1800, "first")["scheduler_options"] == "#SBATCH --begin=now+1800"
     assert "parsl" in qcr.SINGLETON_NAME   # the universal postcheck (`no job named *parsl* left`) still sees a pilot
-    assert qcr.sentinel_cmd("main", "hpcb") == ("sbatch --parsable -J parsl-hpcb-qcr -N1 -n1 -t 01:00:00 -o /dev/null "
-                                                "-e /dev/null -p main -A hpcb --wrap 'sleep 3600'")
+    # the pilots' own terms: their partition, account and walltime (site's 30-min debug cannot refuse it)
+    assert qcr.sentinel_cmd("main", "hpcb", "00:20:00") == (
+        "sbatch --parsable -J parsl-hpcb-qcr -N1 -n1 -t 00:20:00 -o /dev/null -e /dev/null -p main -A hpcb "
+        "--wrap 'sleep 86400'")
+    assert "-t 1-00:00:00 " in qcr.sentinel_cmd("compute", None, "1-00:00:00")
+    for bad in (None, "", "30", "00:30; rm -rf /"):   # no walltime, or not one: the shortest partition limit
+        assert f"-t {qcr.SENTINEL_WALLTIME} " in qcr.sentinel_cmd("debug", None, bad) and qcr.SENTINEL_WALLTIME == "00:30:00"
     assert qcr.SETUP == qcr.CLEANUP == ['scancel -u "$(whoami)" --name=parsl-hpcb-qcr 2>/dev/null; echo ok']
 
 
@@ -727,7 +754,8 @@ def test_the_phase_second_script_runs_a_then_holds_b_behind_the_sentinel(tmp_pat
     monkeypatch.setenv("HPCB_ADMIN_TAP", str(tap))
     ops = _Ops({
         "connect_facility": [PROPOSAL, {"phase": "provisioning"}, {"phase": "needs_account", "allocations": []}],
-        "ensure_endpoint_up": [{"status": "provisioning", "endpoint_id": EID, "partition": "main"},
+        "ensure_endpoint_up": [{"status": "provisioning", "endpoint_id": EID, "partition": "main",
+                                "block": {"queue": "main", "walltime": "00:20:00"}},
                                {"status": "up", "block_state": "warm", "endpoint_id": EID},
                                {"status": "provisioning", "endpoint_id": EID}],
         "run_shell": [{"phase": "complete", "exit_code": 0, "stdout": "c1\n"},                        # hostname
@@ -746,7 +774,7 @@ def test_the_phase_second_script_runs_a_then_holds_b_behind_the_sentinel(tmp_pat
     confirms = [a for t, a in ops.calls if t == "ensure_endpoint_up" and a.get("confirm_spend")]
     assert confirms == [{"shape": "compute", "confirm_spend": True}] * 2   # the same terms: the same user endpoint
     assert ops.calls[5] == ("run_shell", {"shape": "compute", "command": "hostname"})
-    assert ops.calls[8][1]["command"] == qcr.sentinel_cmd("main", None)
+    assert ops.calls[8][1]["command"] == qcr.sentinel_cmd("main", None, "00:20:00")   # the block's own terms
     assert admin_tap.read_hold(admin_tap.hold_path(tap)) == (f"uep.{EID}", "13")   # held from after the sentinel
     assert "teardown_endpoint" not in tools and "phase B stopped with job 13 PENDING (Dependency)" in final
     assert any("the admin tap holds every new pilot" in x for x in ops.texts)
@@ -781,5 +809,195 @@ def test_the_world_check_ends_the_sentinel_after_the_watch(tmp_path, monkeypatch
     ctx.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=ctx.tap.samples())
     gated, report, _strategy, history = asyncio.run(qcr.relaunch_watch(ctx))
     assert not gated.ok and "job 14 submitted +62 s after the stop answered, PENDING (JobHeldAdmin)" in gated.detail
-    assert "held by the tap: 14" in report.detail and "HELD by the tap — RELAUNCHED after the stop" in history.detail
-    assert sent[-1] == "scancel 12 2>&1; true"   # the sentinel, by its id, once the watch is over
+    assert "held: 14" in report.detail and "HELD by the tap — RELAUNCHED after the stop" in history.detail
+    end = sent[-1]   # once the watch is over: one last hold tick, the sentinel cancelled by its id, then waited out
+    assert end.startswith('for j in $(squeue -u "$(whoami)" -h -t PD') and f"-v m=uep.{EID} -v f=13" in end
+    assert "$2 !~ /^JobHeld/" in end and end.index("scontrol hold") < end.index("scancel 12")
+    assert "squeue -h -j 12 -o %T" in end and "HPCB_SENTINEL gone" in end
+
+
+
+# ---- review 2026-10-15: no blind pass, ever ---------------------------------------------------------------------------
+
+def _ctx(tmp_path, *outs: str, clean: bool = True, ssh=None):
+    """A world-check context over tap samples written as given (`clean`: each query reported exit 0), the endpoint log
+    readable (`=== log`, no strategy line) unless `ssh` says otherwise."""
+    ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(),
+                                tap=admin_tap.TapReader(_tap_file(tmp_path, *outs, clean=clean)),
+                                ssh=ssh or (lambda cmd, timeout: (0, "=== log\n")), endpoint_name="hpc-bridge-fake-1")
+    ctx.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=ctx.tap.samples())
+    return ctx
+
+
+def test_the_reviewers_blind_pass_now_fails(tmp_path):
+    # the review's demo (scratchpad/review-qcr/blind_pass.py): squeue errors in every sample (its sed's rc was the
+    # sample's), the own pilot only in sacct, the log unread — it PASSED; each of those alone must now fail it
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    err = "HPCB_Q squeue: error: Invalid job state specified: all"
+    own = f"HPCB_A 7|parsl.x|CANCELLED by 0|{T_STOP - 9:.0f}|Unknown|{T_STOP:.0f}|sbatch {run}"
+    demo = _ctx(tmp_path, f"HPCB_NOW {T_STOP - 5:.0f}\n{err}", f"HPCB_NOW {T_STOP + 60:.0f}\n{err}\n{own}",
+                f"HPCB_NOW {T_STOP + 425:.0f}\n{err}\n{own}", clean=False)
+    demo.ssh = None
+    gated = asyncio.run(qcr.relaunch_watch(demo))[0]
+    assert not gated.ok and gated.detail.startswith("UNVERIFIABLE — the admin tap has no CLEAN sample after the stop")
+    # the same with exit statuses: squeue failing is reported by its own status, not swallowed
+    failing = _ctx(tmp_path, *(f"HPCB_NOW {T_STOP + d:.0f}\n{err}\nHPCB_Q HPCB_RC 1\n{own}\nHPCB_A HPCB_RC 0"
+                               for d in (-5, 60, 425)), clean=False)
+    assert "no CLEAN sample" in asyncio.run(qcr.relaunch_watch(failing))[0].detail
+
+
+def test_a_lookup_by_a_known_id_is_never_the_sighting(tmp_path):
+    # every query clean, the queue and the window empty — the own pilot only under HPCB_J (sacct -j): blind
+    by_id = f"HPCB_J 7|parsl.x|CANCELLED by 0|{T_STOP - 9:.0f}|Unknown|{T_STOP:.0f}|sbatch {SCRIPT_OF.format(eid=EID, ts=1)}"
+    ctx = _ctx(tmp_path, *(f"HPCB_NOW {T_STOP + d:.0f}\n{by_id}\nHPCB_J HPCB_RC 0" for d in (5, 425)))
+    gated, report, *_ = asyncio.run(qcr.relaunch_watch(ctx))
+    assert not gated.ok and gated.detail.startswith("watch blind: no clean sample's squeue or window sacct listed")
+    assert "sacct -j found job 7 CANCELLED — a lookup by a known id, which could never see a relaunch" in gated.detail
+    assert "by id (sacct -j): 7 CANCELLED" in report.detail
+
+
+def test_a_sample_with_error_lines_a_failed_query_or_no_exit_status_is_not_clean():
+    ok = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0\nHPCB_A HPCB_RC 0"})
+    assert ok.clean and ok.queue == ok.history == []          # an empty queue that SAID so
+    errs = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0\n"
+                                                         "HPCB_A sacct: error: Problem talking to the database\n"
+                                                         "HPCB_A HPCB_RC 0"})
+    assert not errs.clean and errs.history == [] and "the window sacct said 'sacct: error: Problem" in errs.error
+    failed = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 1\nHPCB_A HPCB_RC 0"})
+    assert not failed.clean and "squeue exited 1" in failed.error
+    silent = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0"})
+    assert not silent.clean and "the window sacct reported no exit status" in silent.error
+    j = admin_tap.parse_slurm_sample({"rc": 0, "out": "HPCB_NOW 5\nHPCB_Q HPCB_RC 0\nHPCB_A HPCB_RC 0\n"
+                                                      "HPCB_J 7|n|CANCELLED|1|Unknown|2|sbatch x\nHPCB_J HPCB_RC 0"})
+    assert j.clean and [x.job_id for x in j.by_id] == ["7"] and j.history == [] and j.by_id[0].source == "sacct-j"
+    # samples that are not clean cover nothing; a relaunch they list still counts
+    w = qcr.Watch(answered_at=10.0, own_ids={"7"})
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    qcr.fold_samples(w, [errs, admin_tap.parse_slurm_sample(
+        {"rc": 0, "out": f"HPCB_NOW 90\nHPCB_Q 8|PENDING|60|None|{run}\nHPCB_Q HPCB_RC 0"})], [EID])
+    assert w.covered_until is None and [j.job_id for j in w.jobs] == ["8"] and len(w.unclean) == 2
+    assert w.unverifiable.startswith("the admin tap has no CLEAN sample after the stop answered (2 sample(s), 2 not clean")
+
+
+def test_the_end_of_phase_b_holds_once_more_then_waits_the_sentinel_out():
+    cmd = qcr.end_sentinel_cmd("12", f"uep.{EID}", "13")
+    assert cmd.index("scontrol hold") < cmd.index("scancel 12") < cmd.index("squeue -h -j 12 -o %T")
+    fallback = qcr.end_sentinel_cmd(None, f"uep.{EID}", None)   # no sentinel id: by name, running, no hold tick
+    assert "scontrol hold" not in fallback and "--name=parsl-hpcb-qcr --state=RUNNING" in fallback
+    assert "-n parsl-hpcb-qcr -t R,CG" in fallback   # waited out while it still runs or completes
+
+    out = "HPCB_HELD 15\nHPCB_SENTINEL gone\n"
+    w = qcr.Watch()
+    ctx = types.SimpleNamespace(ssh=lambda c, timeout: (0, out))
+    monkey_t = _second()
+    asyncio.run(qcr._end_sentinel(ctx, monkey_t, w))
+    assert w.held == {"15"} and w.sentinel == "gone"
+    assert "sentinel at the end: gone" in qcr.relaunch_report(w).detail
+
+
+def test_the_tap_ends_itself_and_removes_its_files_when_its_parent_is_gone(tmp_path):
+    out = tmp_path / ".admin-tap-r1.jsonl"
+    admin_tap.ids_path(out).write_text("7\n")
+    alive = iter([True, False])
+    n = admin_tap.tap(out, ["x"], "squeue", every_s=10, run=lambda argv: (0, "HPCB_NOW 1\n"), sleep=lambda s: None,
+                      parent_pid=4242, parent_alive=lambda pid: next(alive, False), ids_cmd="sacct -j {ids}")
+    assert n == 1 and not [f for f in admin_tap.tap_files(out) if f.exists()]   # orphaned: nobody else will clean up
+    out2 = tmp_path / ".admin-tap-r2.jsonl"
+    clock = iter(range(0, 100, 10))
+    admin_tap.tap(out2, ["x"], "squeue", every_s=10, max_s=15, run=lambda argv: (0, "HPCB_NOW 1\n"),
+                  sleep=lambda s: None, clock=lambda: float(next(clock)))
+    assert out2.exists() and not admin_tap.pid_path(out2).exists()   # a normal end: run_smoke.sh's trap removes the rest
+
+
+def test_the_tap_cli_exits_when_the_pid_it_watches_dies(tmp_path):
+    out = tmp_path / ".admin-tap-r3.jsonl"
+    parent = subprocess.Popen(["sleep", "2"])
+    stub = tmp_path / "admin.sh"
+    stub.write_text('#!/usr/bin/env bash\necho "HPCB_NOW $(date +%s)"\n')
+    stub.chmod(0o755)
+    p = subprocess.Popen([sys.executable, str(HERE / "admin_tap.py"), "--out", str(out), "--user", "u",
+                          "--knob", json.dumps({"cmd": "squeue", "every_s": 1}), "--parent-pid", str(parent.pid),
+                          "--", str(stub)])
+    try:
+        parent.wait(timeout=10)          # gone (and reaped: an unreaped zombie still answers kill -0)
+        assert p.wait(timeout=30) == 0   # ended by itself, a second or so after it
+    finally:
+        p.kill()
+    assert not [f for f in admin_tap.tap_files(out) if f.exists()]
+
+
+def test_run_suite_stops_an_abandoned_cells_tap_by_its_pid_file_and_only_that(tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_suite", HERE.parent / "run_suite.py")
+    suite = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(suite)
+    out = tmp_path / ".admin-tap-r9.jsonl"
+    fake = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", "admin_tap.py", "--out", str(out)])
+    try:
+        for f in admin_tap.tap_files(out):
+            f.write_text("x\n")
+        admin_tap.pid_path(out).write_text(f"{fake.pid}\n")
+        assert suite._stop_admin_tap("r9", runs=tmp_path) == f"stopped tap pid {fake.pid}"
+        assert fake.wait(timeout=10) != 0 and not [f for f in admin_tap.tap_files(out) if f.exists()]
+    finally:
+        fake.kill()
+    # a pid that is no longer this cell's tap (reused) is left alone; the files still go
+    admin_tap.pid_path(out).write_text(f"{os.getpid()}\n")
+    assert "is not this cell's tap" in suite._stop_admin_tap("r9", runs=tmp_path, kill=lambda *a: pytest.fail("killed"))
+    assert suite._stop_admin_tap("r10", runs=tmp_path) == "no tap"
+
+
+def test_a_tap_whose_own_parent_dies_is_re_parented_and_ends(tmp_path):
+    # run_smoke.sh passes its own pid, the tap's parent: killed outright it may linger as a zombie its own parent has not
+    # reaped yet — the tap is re-parented all the same, and that is enough
+    out = tmp_path / ".admin-tap-r4.jsonl"
+    stub = tmp_path / "admin.sh"
+    stub.write_text('#!/usr/bin/env bash\necho "HPCB_NOW $(date +%s)"\n')
+    stub.chmod(0o755)
+    knob = json.dumps({"cmd": "squeue", "every_s": 1}).replace("'", "'\\''")
+    shell = (f"{sys.executable} {HERE / 'admin_tap.py'} --out {out} --user u --knob '{knob}' --parent-pid $$ "
+             f"-- {stub} & echo $!; sleep 2; kill -9 $$")
+    r = subprocess.run(["bash", "-c", shell], capture_output=True, text=True, timeout=30)
+    tap_pid = int(r.stdout.split()[0])
+    for _ in range(300):
+        if not admin_tap.alive(tap_pid) or not admin_tap.pid_path(out).exists():
+            break
+        subprocess.run(["sleep", "0.1"], check=False)
+    assert not [f for f in admin_tap.tap_files(out) if f.exists()]
+
+
+def test_the_proving_runs_own_sample_reads_as_the_relaunch_it_was():
+    # run 1792120434 (fake/default, 2026-10-15), its admin-tap.jsonl sample at +54 s, verbatim — plus the exit-status
+    # lines the tap prints since: `squeue -t all` lists the cancelled pilots and the sentinel (`%o` = (null) for a
+    # --wrap job), the relaunched block-2 held by the tap, epoch times; sacct's Start is `None` for a job never started
+    eid = "1fc1a5de-6e93-48f7-9390-e46ac016f2ba"
+    uep = f"uep.{eid}.3aba04bd-a764-cde2-3abe-c5d62f96f339"
+    sub = f"/home/hpcbridge-test-00/.globus_compute/{uep}/submit_scripts/parsl.GlobusComputeEngine-HighThroughputExecutor"
+    out = (f"HPCB_HELD 5\nHPCB_NOW 1792120592\nHPCB_Q 4|CANCELLED|1792120531|Dependency|{sub}.block-1.1792120531.0697782\n"
+           f"HPCB_Q 2|CANCELLED|1792120470|None|{sub}.block-0.1792120470.9103878\n"
+           f"HPCB_Q 5|PENDING|1792120591|JobHeldAdmin|{sub}.block-2.1792120591.2134814\n"
+           "HPCB_Q 3|RUNNING|1792120483|None|(null)\n"
+           f"HPCB_A 4|parsl-hpcb-qcr|CANCELLED by 2000|1792120531|None|1792120537|sbatch {sub}.block-1.1792120531.0697782\n"
+           "HPCB_Q HPCB_RC 0\nHPCB_A HPCB_RC 0")
+    sample = admin_tap.parse_slurm_sample({"t": 1.0, "rc": 0, "out": out})
+    assert sample.clean and sample.held == ["5"] and [j.job_id for j in sample.queue] == ["4", "2", "5", "3"]
+    poll = lambda line: _call("run_shell", {"shape": "login", "command": qcr.pilot_poll_cmd(eid)},  # noqa: E731
+                              {"phase": "complete", "stdout": line})
+    t = Trace([
+        _call("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", "endpoint_id": eid}),
+        _call("run_shell", {"shape": "compute", "command": "hostname"}, {"phase": "complete"}),
+        poll(f"HPCB_PILOT 2 RUNNING {uep} None\n"),
+        _call("stop_endpoint", {}, {"status": "down", "spend_stopped": True, "notice": "released 2"}),
+        _call("run_shell", {"shape": "login", "command": qcr.sentinel_cmd("main", None)}, {"stdout": "3\n"}),
+        _call("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+              {"status": "provisioning", "endpoint_id": eid}),
+        poll(f"HPCB_PILOT 4 PENDING {uep} Dependency\n"),
+        _call("stop_endpoint", {}, {"status": "down", "spend_stopped": True, "notice": "released 4"}),
+    ])
+    w = qcr.Watch(called_at=1792120537.0, answered_at=1792120538.0, own_ids=qcr.own_pilots(t), phase="second",
+                  log_lines=[])
+    qcr.fold_samples(w, [sample], [eid])
+    assert w.own_seen == {"4": "CANCELLED [sacct+squeue]"} and w.held == {"5"}
+    r = qcr.no_relaunch_after_down(t, w)
+    assert not r.ok and "job 5 submitted +53 s after the stop answered, PENDING (JobHeldAdmin)" in r.detail
+    assert qcr.same_user_endpoint(t) == (True, f"phase A and phase B both ran in {uep}")

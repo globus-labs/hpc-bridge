@@ -53,9 +53,15 @@ SCRIPT_TIMEOUT_S = float(os.environ.get("HPCB_SCRIPT_TIMEOUT_S", "1800"))
 def _read_timeout(session: Any) -> float | timedelta:
     """CALL_TIMEOUT_S in the form this `mcp` takes. The jail's newer client types `read_timeout_seconds` as a float and
     adds it to one (a timedelta raised `TypeError: float + timedelta` before the first call left — live 2026-10-15, the
-    first queued_check_relaunch run); the host's older client wants a timedelta."""
+    first queued_check_relaunch run); the host's older client wants a timedelta. The annotation decides, read as text so
+    both a real type (`datetime.timedelta | None`) and a postponed one (`"timedelta | None"`) match; a parameter that is
+    renamed or gone, or a signature that cannot be read, falls back to the float (never a KeyError on every call)."""
     import inspect
-    ann = str(inspect.signature(session.call_tool).parameters["read_timeout_seconds"].annotation)
+    try:
+        param = inspect.signature(session.call_tool).parameters.get("read_timeout_seconds")
+    except (TypeError, ValueError, AttributeError):
+        param = None
+    ann = "" if param is None or param.annotation is inspect.Parameter.empty else str(param.annotation)
     return timedelta(seconds=CALL_TIMEOUT_S) if "timedelta" in ann else CALL_TIMEOUT_S
 
 

@@ -28,6 +28,7 @@ REPO = Path(__file__).resolve().parents[1]
 SMOKE = REPO / "agentic" / "run_smoke.sh"
 sys.path.insert(0, str(REPO / "agentic" / "harness"))
 import targets  # noqa: E402  (the cluster a run targets: globus1 | fake)
+from admin_tap import pid_path, tap_files  # noqa: E402  (a cell's admin tap: stopped with an abandoned cell)
 from cluster_ops import delete_endpoint_cmd, endpoint_uuid_cmd, scoped_cancel_cmd, uep_dirs_cleanup_cmd  # noqa: E402
 from infra import INFRA_RC  # noqa: E402  (a cell whose model endpoint failed: counted apart, never as a pass or a fail)
 from pool import NodeLaunches, PoolClaims  # noqa: E402  (cross-process pool-user + node claims — see pool.py)
@@ -324,6 +325,40 @@ async def _terminate_and_wait(proc, grace_s: float) -> bool:
         return False
 
 
+def _stop_admin_tap(runid: str, runs: Path | None = None, kill=os.kill) -> str:
+    """Stop an abandoned cell's admin tap (a scenario's ADMIN_TAP: run_smoke.sh starts harness/admin_tap.py, whose EXIT
+    trap a killed run_smoke.sh never runs) and remove its files: by the pid it wrote, and only when that pid is still
+    that tap (its command line names this cell's tap file — a reused pid is left alone). The tap also exits by itself
+    once its run_smoke.sh is gone; this is the suite's own, immediate, say. Returns what it did."""
+    import signal
+    out = (runs or REPO / "agentic" / "runs") / f".admin-tap-{runid}.jsonl"
+    did = "no tap"
+    try:
+        pid = int(pid_path(out).read_text().split()[0])
+    except (OSError, ValueError, IndexError):
+        pid = 0
+    if pid:
+        try:
+            args = subprocess.run(["ps", "-p", str(pid), "-o", "command="], capture_output=True, text=True,
+                                  timeout=10).stdout
+        except Exception:  # noqa: BLE001 - cleanup must not raise during shutdown
+            args = ""
+        if "admin_tap.py" in args and out.name in args:
+            try:
+                kill(pid, signal.SIGTERM)
+                did = f"stopped tap pid {pid}"
+            except ProcessLookupError:
+                did = "tap already gone"
+        else:
+            did = f"pid {pid} is not this cell's tap (left alone)"
+    for f in tap_files(out):
+        try:
+            f.unlink()
+        except OSError:
+            pass
+    return did
+
+
 def _emergency_cleanup(inflight: dict[str, tuple[str, str]]) -> None:
     """Best-effort, run-scoped cleanup for cells this suite abandons (SIGINT, a crash): as each cell's pool user,
     stop+delete ITS endpoint by name and cancel ITS `uep.<eid>` blocks — the same commands run.py's teardown
@@ -333,6 +368,7 @@ def _emergency_cleanup(inflight: dict[str, tuple[str, str]]) -> None:
     key = os.environ.get("HPCB_TEST_SSH_KEY", _TARGET.default_key)
     for runid, (user, name) in list(inflight.items()):
         print(f"🧹 cleanup {user}: endpoint {name} + its blocks (abandoned cell {runid})", flush=True)
+        _stop_admin_tap(runid)
         base = _TARGET.cleanup_argv(user, key)
         try:
             eid = subprocess.run(base + [endpoint_uuid_cmd(name)], capture_output=True, text=True, timeout=60).stdout.strip()

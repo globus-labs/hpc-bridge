@@ -9,19 +9,28 @@ host is `/work/hpc-bridge/agentic/runs` in the jail):
 - HOST — run_smoke.sh starts `admin_tap.py --out <runs>/.admin-tap-<runid>.jsonl …` in the background for a scenario
   that declares `ADMIN_TAP = {"cmd": …, "every_s": …}` (scenario_knobs.py prints it), BEFORE the cell, and stops it and
   removes the file on exit. Every `every_s` seconds it runs the scenario's command through the admin channel
-  (`{user}` = the cell's pool user, as ADMIN_SETUP's) and appends one JSON line: {"t": host epoch, "rc", "out"}.
+  (`{user}` = the cell's pool user, as ADMIN_SETUP's) and appends one JSON line: {"t": host epoch, "rc", "out"}. It
+  watches the pid that started it (`--parent-pid`): a run_smoke.sh killed outright (SIGKILL: no EXIT trap) would
+  otherwise leave it sampling — and holding pilots — for MAX_RUN_S; it then exits and removes its files itself. Its
+  pid is in `<tap file>.pid`, which run_suite's emergency cleanup reads to stop the tap of a cell it abandons.
 - JAIL — run.py hands the file (HPCB_ADMIN_TAP) to the scenario's WORLD_CHECKS as a `TapReader`; they wait for the
   samples they need and parse them (`parse_slurm_sample`). The bundle keeps every sample (`admin-tap.jsonl`).
 - ASKING FOR JOBS BY ID — a world check that knows job ids (the cell's own pilot) writes them to `<tap file>.ids`
   (`TapReader.request_ids`); the host tap then adds the scenario's `ids_cmd` (`{ids}` = those ids) to every sample and
-  takes one at once. Why: the first live run (2026-10-15) watched BLIND — its pilot lived 4.6 s between two samples,
-  and `sacct -S <window>` never lists a job that was never ELIGIBLE (held by `--begin`), while `sacct -j <id>` does.
+  takes one at once, its rows under their own tag (`HPCB_J`): a lookup by a KNOWN id can never see a relaunch (its id
+  is unknown), so it says what became of a job, never that the sampling could see one.
 - ASKING FOR A HOLD — a script that must keep an endpoint's NEXT pilots from ever starting writes `<tap file>.hold`
   (`TapReader.request_hold`: the endpoint's `uep.<eid>` marker and the first job id to hold); the host tap then adds the
   scenario's `hold_cmd` (`{marker}`, `{from}`) to every sample — `scontrol hold` as the admin on each PENDING job of that
   marker from that id on — and takes one at once. A hold cannot catch a job an idle node starts within a second of its
   sbatch; the scenario keeps such jobs PENDING first (queued_check_relaunch: a singleton dependency), and the hold then
   keeps them from ever running, whatever else ends.
+
+EVERY QUERY SAYS HOW IT ENDED: each runs as `{ query; echo "HPCB_RC $?"; } 2>&1 | sed 's/^/<tag> /'` — the sample's
+own `rc` is the last sed's — and a tagged line that is not a job row (a Slurm error) is an error of that sample. A
+sample with an error, a missing exit status or no clock is not CLEAN: it covers no time and proves no sighting
+(`SlurmSample.clean`). The first review found a squeue that failed in every sample, swallowed by its sed, graded as a
+watch that had seen nothing.
 
 Why the admin channel and not the harness' world channel (ssh as the pool user, what POSTCHECKS use): nothing on the
 admin path is the product's — not the login node the endpoint runs on, not the pool user's sshd that hpc-bridge's own
@@ -36,8 +45,10 @@ from __future__ import annotations
 
 import argparse
 import asyncio
+import contextlib
 import json
 import math
+import os
 import re
 import signal
 import subprocess
@@ -103,14 +114,42 @@ def read_hold(path: Path) -> tuple[str, str] | None:
     return None
 
 
+def pid_path(out: Path | str) -> Path:
+    """Where the tap writes its pid: beside the tap file (run_suite's emergency cleanup stops it by it)."""
+    out = Path(out)
+    return out.with_name(out.name + ".pid")
+
+
+def tap_files(out: Path | str) -> list[Path]:
+    """Every file of a tap: the samples, the id and hold requests, the pid."""
+    return [Path(out), ids_path(out), hold_path(out), pid_path(out)]
+
+
+_START_PPID = os.getppid()   # the process that started this one (run_smoke.sh, when it passes its own pid)
+
+
+def alive(pid: int | None) -> bool:
+    """Is process `pid` still there (None: nothing to watch)? When `pid` is the tap's own parent, being re-parented says
+    it is gone even while it is an unreaped zombie (which still answers `kill -0`)."""
+    if not pid:
+        return True
+    try:
+        os.kill(pid, 0)
+    except ProcessLookupError:
+        return False
+    except PermissionError:   # there, under another user
+        return True
+    return not (pid == _START_PPID and os.getppid() != pid)
+
+
 def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float = MAX_RUN_S, ids_cmd: str = "",
-        hold_cmd: str = "",
+        hold_cmd: str = "", parent_pid: int | None = None,
         run: Callable[[list[str]], tuple[int, str]] | None = None, sleep: Callable[[float], None] = time.sleep,
-        clock: Callable[[], float] = time.monotonic) -> int:
+        clock: Callable[[], float] = time.monotonic, parent_alive: Callable[[int | None], bool] = alive) -> int:
     """Run `admin + [cmd]` every `every_s` seconds (the first at once) and append one sample per run to `out`, until
-    signalled or `max_s` has passed. With ids asked for (`ids_path`) and an `ids_cmd`, or a hold asked for (`hold_path`)
-    and a `hold_cmd`, each sample runs those too, and a new request is answered at once rather than at the next tick.
-    Returns the number of samples written."""
+    signalled, `max_s` has passed, or `parent_pid` is gone (then it removes its files: nobody else will). With ids asked
+    for (`ids_path`) and an `ids_cmd`, or a hold asked for (`hold_path`) and a `hold_cmd`, each sample runs those too,
+    and a new request is answered at once rather than at the next tick. Returns the number of samples written."""
     def _run(argv: list[str]) -> tuple[int, str]:
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=SAMPLE_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -121,34 +160,49 @@ def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float =
             return 127, f"{type(exc).__name__}: {exc}"
 
     run = run or _run
-    n = 0
     t0 = clock()
     asked, held = ids_path(out), hold_path(out)
 
     def requests() -> tuple[list[str], tuple[str, str] | None]:
         return (read_ids(asked) if ids_cmd else []), (read_hold(held) if hold_cmd else None)
 
-    with out.open("a") as fh:   # held open: a write after run_smoke.sh removed the file never re-creates it
-        while clock() - t0 < max_s:
-            ids, hold = requests()
-            parts = [cmd]
-            if hold:   # first: a pilot it holds is then in this very sample, as held
-                parts.insert(0, hold_cmd.replace("{marker}", hold[0]).replace("{from}", hold[1]))
-            if ids:
-                parts.append(ids_cmd.replace("{ids}", ",".join(ids)))
-            rc, text = run([*admin, "; ".join(parts)])
-            sample: dict = {"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}
-            if ids:
-                sample["ids"] = ids
-            if hold:
-                sample["hold"] = list(hold)
-            fh.write(json.dumps(sample) + "\n")
-            fh.flush()
-            n += 1
-            for _ in range(max(1, math.ceil(every_s))):   # a second at a time: a new request is answered at once
-                sleep(min(1.0, every_s))
-                if requests() != (ids, hold):
-                    break
+    def sample_once(fh) -> tuple[list[str], tuple[str, str] | None]:
+        ids, hold = requests()
+        parts = [cmd]
+        if hold:   # first: a pilot it holds is then in this very sample, as held
+            parts.insert(0, hold_cmd.replace("{marker}", hold[0]).replace("{from}", hold[1]))
+        if ids:
+            parts.append(ids_cmd.replace("{ids}", ",".join(ids)))
+        rc, text = run([*admin, "; ".join(parts)])
+        sample: dict = {"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}
+        if ids:
+            sample["ids"] = ids
+        if hold:
+            sample["hold"] = list(hold)
+        fh.write(json.dumps(sample) + "\n")
+        fh.flush()
+        return ids, hold
+
+    n, orphaned = 0, False
+    with contextlib.suppress(OSError):
+        pid_path(out).write_text(f"{os.getpid()}\n")
+    try:
+        with out.open("a") as fh:   # held open: a write after run_smoke.sh removed the file never re-creates it
+            while clock() - t0 < max_s and not orphaned:
+                asked_now = sample_once(fh)
+                n += 1
+                for _ in range(max(1, math.ceil(every_s))):   # a second at a time: a new request is answered at once
+                    sleep(min(1.0, every_s))
+                    if not parent_alive(parent_pid):
+                        orphaned = True
+                        break
+                    if requests() != asked_now:
+                        break
+    finally:
+        # orphaned: run_smoke.sh died without its EXIT trap — nobody else will remove the tap's files
+        for f in (tap_files(out) if orphaned else [pid_path(out)]):
+            with contextlib.suppress(OSError):
+                f.unlink()
     return n
 
 
@@ -158,6 +212,7 @@ def main(argv: list[str]) -> int:
     ap.add_argument("--user", required=True, help="the cell's pool user: `{user}` in the command")
     ap.add_argument("--knob", required=True, help='the scenario\'s ADMIN_TAP as JSON: {"cmd": …, "every_s": …}')
     ap.add_argument("--max-s", type=float, default=MAX_RUN_S)
+    ap.add_argument("--parent-pid", type=int, default=None, help="exit (and remove the tap's files) once it is gone")
     ap.add_argument("admin", nargs=argparse.REMAINDER, help="-- then the admin channel's argv prefix")
     args = ap.parse_args(argv)
     admin = args.admin[1:] if args.admin[:1] == ["--"] else args.admin
@@ -170,7 +225,7 @@ def main(argv: list[str]) -> int:
     tap(args.out, admin, str(knob["cmd"]).replace("{user}", args.user),
         every_s=float(knob.get("every_s") or DEFAULT_EVERY_S), max_s=args.max_s,
         ids_cmd=str(knob.get("ids_cmd") or "").replace("{user}", args.user),
-        hold_cmd=str(knob.get("hold_cmd") or "").replace("{user}", args.user))
+        hold_cmd=str(knob.get("hold_cmd") or "").replace("{user}", args.user), parent_pid=args.parent_pid)
     return 0
 
 
@@ -195,32 +250,39 @@ def read_samples(path: Path | None) -> list[dict]:
     return out
 
 
-# Every state sacct 23.11 takes (`sacct -s`). With an explicit list sacct selects the jobs that were IN one of them
-# during the window; without one it selects the jobs that were ELIGIBLE in it — and a pilot held by `--begin` never is,
-# so `-S now-2hours` alone listed nothing for the first live run's cancelled pilot (2026-10-15, slurm-wlm 23.11.4).
-SACCT_STATES = "PD,R,CA,CD,F,TO,NF,PR,OOM,BF,DL,RQ,RS,RV,S"
+# The window sacct (slurm-wlm 23.11.4 on the fake controller, verified by hand 2026-10-15): without `-s` it lists the
+# jobs that were ELIGIBLE in the window, and a pilot held by `--begin` never is — `-S now-2hours` alone listed nothing
+# for the first live run's cancelled pilot; with `-s` but no END time (`-E now`) it lists nothing at all; with both it
+# listed every job, the held and cancelled ones included. These six states are the ones verified there.
+SACCT_STATES = "CA,CD,F,PD,R,TO"
 _SACCT_FIELDS = "JobID,JobName,State,Submit,Start,End,SubmitLine"
 _TIMES = "TZ=UTC SLURM_TIME_FORMAT=%s"
 
 
+def _tagged(query: str, tag: str) -> str:
+    """A query whose every line — its errors and, last, its own exit status (`HPCB_RC <n>`) — carries `tag`."""
+    return f"{{ {query}; echo \"HPCB_RC $?\"; }} 2>&1 | sed 's/^/{tag} /'"
+
+
 def slurm_sample_cmd(*, history: str = "now-2hours") -> str:
     """One Slurm sample through the admin channel, as tagged lines (`parse_slurm_sample`): the controller's clock, the
-    pool user's jobs in the controller (`squeue -t all`: queued and running, AND those finished within MinJobAge — 300 s
-    on the fake profiles — so a pilot cancelled between two samples is still seen; `%o` is the batch script — a parsl
-    pilot's sits under `uep.<eid>.<…>/submit_scripts/`, so it carries the endpoint's marker, as the StdOut path does for
-    scheduler_ops._release_cmd), and its accounting since `history` in any state (SACCT_STATES; SubmitLine names the
-    same script). Times in epoch seconds (SLURM_TIME_FORMAT=%s, glibc's strftime); TZ=UTC so a Slurm that ignores the
-    format prints ISO times in UTC, which the parser reads as such."""
+    pool user's jobs in the controller (`HPCB_Q`: `squeue -t all` — queued and running, AND those finished within
+    MinJobAge, 300 s on the fake profiles, so a pilot cancelled between two samples is still seen; `%o` is the batch
+    script — a parsl pilot's sits under `uep.<eid>.<…>/submit_scripts/`, so it carries the endpoint's marker, as the
+    StdOut path does for scheduler_ops._release_cmd), and its accounting from `history` to now in SACCT_STATES
+    (`HPCB_A`; SubmitLine names the same script). Each query ends with its own exit status. Times in epoch seconds
+    (SLURM_TIME_FORMAT=%s, glibc's strftime); TZ=UTC so a Slurm that ignores the format prints ISO times in UTC, which
+    the parser reads as such."""
     return ("echo HPCB_NOW $(date +%s); "
-            f"{_TIMES} squeue -u {{user}} -h -t all -o '%i|%T|%V|%r|%o' 2>&1 | sed 's/^/HPCB_Q /'; "
-            f"{_TIMES} sacct -u {{user}} -X -n -P -S {history} -s {SACCT_STATES} -o {_SACCT_FIELDS} 2>&1 "
-            "| sed 's/^/HPCB_A /'")
+            + _tagged(f"{_TIMES} squeue -u {{user}} -h -t all -o '%i|%T|%V|%r|%o'", "HPCB_Q") + "; "
+            + _tagged(f"{_TIMES} sacct -u {{user}} -X -n -P -S {history} -E now -s {SACCT_STATES} -o {_SACCT_FIELDS}",
+                      "HPCB_A"))
 
 
 def slurm_ids_cmd() -> str:
-    """The tap's `ids_cmd` for Slurm: the jobs asked for by id (`{ids}`), from accounting — `sacct -j` finds a job
-    whatever its eligibility or age (it found the first live run's held, cancelled pilot when the window did not)."""
-    return f"{_TIMES} sacct -j {{ids}} -X -n -P -o {_SACCT_FIELDS} 2>&1 | sed 's/^/HPCB_A /'"
+    """The tap's `ids_cmd` for Slurm: the jobs asked for by id (`{ids}`) from accounting, under their own tag
+    (`HPCB_J`) — `sacct -j` finds a job whatever its eligibility or age, but only a job whose id is already known."""
+    return _tagged(f"{_TIMES} sacct -j {{ids}} -X -n -P -o {_SACCT_FIELDS}", "HPCB_J")
 
 
 def slurm_hold_cmd() -> str:
@@ -262,44 +324,78 @@ class SlurmJob:
 class SlurmSample:
     t: float | None               # the host's clock (orders the samples only)
     now: float | None             # the controller's clock: what a sample's times compare against
-    queue: list[SlurmJob] = field(default_factory=list)
-    history: list[SlurmJob] = field(default_factory=list)
-    error: str = ""               # why this sample says nothing (the admin command failed, or printed no clock)
+    queue: list[SlurmJob] = field(default_factory=list)     # HPCB_Q: squeue -t all
+    history: list[SlurmJob] = field(default_factory=list)   # HPCB_A: the window sacct
+    error: str = ""               # why this sample is not CLEAN (an error line, a query's failure, no clock); "" if it is
     held: list[str] = field(default_factory=list)   # jobs the tap's hold_cmd held in this sample (`HPCB_HELD <id>`)
+    by_id: list[SlurmJob] = field(default_factory=list)     # HPCB_J: sacct -j <known ids> — never evidence of sight
+
+    @property
+    def clean(self) -> bool:
+        """Every query of the sample ran and said nothing but jobs, with the controller's clock: it covers its time and
+        what it does not list was not there."""
+        return not self.error
+
+
+_STREAMS = {"HPCB_Q": "squeue", "HPCB_A": "the window sacct", "HPCB_J": "sacct -j"}
+_REQUIRED = ("HPCB_Q", "HPCB_A")   # the sampling's own queries: each must report how it ended
+
+
+def _job_row(tag: str, rest: str, now: float | None) -> SlurmJob | None:
+    if tag == "HPCB_Q":
+        f = rest.split("|", 4)
+        if len(f) == 5 and _JOB_ID.match(f[0].strip()):
+            return SlurmJob(job_id=f[0].strip(), state=(f[1].split() or ["?"])[0], submit=slurm_time(f[2]),
+                            reason=f[3].strip(), command=f[4].strip(), source="squeue", seen_at=now)
+        return None
+    f = rest.split("|", 6)
+    if len(f) == 7 and _JOB_ID.match(f[0].strip()):
+        return SlurmJob(job_id=f[0].strip(), name=f[1].strip(), state=(f[2].split() or ["?"])[0],
+                        submit=slurm_time(f[3]), start=slurm_time(f[4]), end=slurm_time(f[5]),
+                        command=f[6].strip(), source="sacct" if tag == "HPCB_A" else "sacct-j", seen_at=now)
+    return None
 
 
 def parse_slurm_sample(sample: dict) -> SlurmSample:
-    """One tap sample from `slurm_sample_cmd` → its clock, queue and history. A line that is not a job (a Slurm error
-    message under the tag) is skipped; a sample with a failed command or no clock carries `error`."""
+    """One tap sample from `slurm_sample_cmd` (+ `ids_cmd`, `hold_cmd`) → its clock, queue, history and by-id rows.
+    Anything under a query's tag that is not a job row or its `HPCB_RC` is an ERROR of the sample (a Slurm error the
+    pipeline's sed would otherwise swallow), as is a query that failed, one that reported no exit status, a failed
+    admin command, or no clock: such a sample is not `clean`. Its job rows are kept (a relaunch it lists is still one)."""
     out = str(sample.get("out") or "")
     now: float | None = None
-    queue: list[SlurmJob] = []
-    history: list[SlurmJob] = []
+    rows: dict[str, list[SlurmJob]] = {t: [] for t in _STREAMS}
+    rcs: dict[str, str] = {}
+    errors: list[str] = []
     held: list[str] = []
-    for line in out.splitlines():
+    lines = out.splitlines()
+    for line in lines:   # the clock first: every job row is stamped with it
         tag, _, rest = line.partition(" ")
         if tag == "HPCB_NOW":
             now = slurm_time(rest)
-        elif tag == "HPCB_HELD" and _JOB_ID.match(rest.strip()):
+    for line in lines:
+        tag, _, rest = line.partition(" ")
+        if tag == "HPCB_HELD" and _JOB_ID.match(rest.strip()):
             held.append(rest.strip())
-        elif tag == "HPCB_Q":
-            f = rest.split("|", 4)
-            if len(f) == 5 and f[0].strip().replace("_", "").isdigit():
-                queue.append(SlurmJob(job_id=f[0].strip(), state=(f[1].split() or ["?"])[0], submit=slurm_time(f[2]),
-                                      reason=f[3].strip(), command=f[4].strip(), source="squeue", seen_at=now))
-        elif tag == "HPCB_A":
-            f = rest.split("|", 6)
-            if len(f) == 7 and f[0].strip().replace("_", "").isdigit():
-                history.append(SlurmJob(job_id=f[0].strip(), name=f[1].strip(), state=(f[2].split() or ["?"])[0],
-                                        submit=slurm_time(f[3]), start=slurm_time(f[4]), end=slurm_time(f[5]),
-                                        command=f[6].strip(), source="sacct", seen_at=now))
+        elif tag in _STREAMS:
+            if rest.startswith("HPCB_RC "):
+                rcs[tag] = rest.split(" ", 1)[1].strip()
+            elif (job := _job_row(tag, rest, now)) is not None:
+                rows[tag].append(job)
+            elif rest.strip():
+                errors.append(f"{_STREAMS[tag]} said {rest.strip()[:160]!r}")
+    for tag, rc in rcs.items():
+        if rc != "0":
+            errors.append(f"{_STREAMS[tag]} exited {rc}")
+    for tag in _REQUIRED:
+        if tag not in rcs:
+            errors.append(f"{_STREAMS[tag]} reported no exit status (it did not run to its end)")
     rc = sample.get("rc")
-    error = ""
     if rc not in (0, None):
-        error = f"admin command rc={rc}: {out.strip()[-200:]!r}"
-    elif now is None:
-        error = f"no controller clock in the sample: {out.strip()[-200:]!r}"
-    return SlurmSample(t=sample.get("t"), now=now, queue=queue, history=history, error=error, held=held)
+        errors.insert(0, f"admin command rc={rc}: {out.strip()[-200:]!r}")
+    if now is None:
+        errors.insert(0, f"no controller clock in the sample: {out.strip()[-160:]!r}")
+    return SlurmSample(t=sample.get("t"), now=now, queue=rows["HPCB_Q"], history=rows["HPCB_A"],
+                       error="; ".join(errors), held=held, by_id=rows["HPCB_J"])
 
 
 class TapReader:

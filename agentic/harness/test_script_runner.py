@@ -304,3 +304,30 @@ def test_run_smoke_refuses_the_cell_off_the_fake_cluster_before_any_tap_or_launc
     r, calls, root = _smoke(tmp_path, "queued_check_relaunch", HPCB_OPERATOR="script", HPCB_TARGET="globus1")
     assert r.returncode == 1 and "runs only on target(s) fake" in r.stdout
     assert "run " not in calls and "exec " not in calls and not list((root / "agentic" / "runs").iterdir())
+
+
+def test_the_call_timeout_takes_the_form_the_clients_annotation_names():
+    # this module postpones its own annotations, so each client's signature is built explicitly: a REAL annotation
+    # object (the host's older mcp), the same as TEXT (a module with `from __future__ import annotations`), a float
+    # (the jail's newer mcp), none, and a parameter that is renamed — which must fall back to the float, not KeyError
+    import datetime as dt
+    import inspect
+
+    def client(name: str | None, annotation=inspect.Parameter.empty):
+        params = [inspect.Parameter("name", inspect.Parameter.POSITIONAL_OR_KEYWORD)]
+        if name:
+            params.append(inspect.Parameter(name, inspect.Parameter.KEYWORD_ONLY, default=None, annotation=annotation))
+
+        async def call_tool(*a, **k): ...
+
+        call_tool.__signature__ = inspect.Signature(params)
+        return types.SimpleNamespace(call_tool=call_tool)
+
+    want = dt.timedelta(seconds=script_runner.CALL_TIMEOUT_S)
+    real = client("read_timeout_seconds", dt.timedelta | None)
+    assert "timedelta" in str(inspect.signature(real.call_tool).parameters["read_timeout_seconds"].annotation)
+    assert script_runner._read_timeout(real) == want
+    assert script_runner._read_timeout(client("read_timeout_seconds", "timedelta | None")) == want
+    for c in (client("read_timeout_seconds", float | None), client("read_timeout_seconds", "float | None"),
+              client("read_timeout_seconds"), client("timeout", float | None), client(None), object()):
+        assert script_runner._read_timeout(c) == script_runner.CALL_TIMEOUT_S

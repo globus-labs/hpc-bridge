@@ -283,8 +283,8 @@ TAP_PID=""; TAP_FILE=""
 stop_tap() {
   [ -z "$TAP_PID" ] || kill "$TAP_PID" 2>/dev/null
   TAP_PID=""
-  # .ids / .hold: the jobs the jail asked the tap to look up by id, and the endpoint whose next pilots it holds
-  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE" "$TAP_FILE.ids" "$TAP_FILE.hold"
+  # .ids / .hold: the jobs the jail asked the tap to look up by id, and the endpoint whose next pilots it holds; .pid: its pid
+  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE" "$TAP_FILE.ids" "$TAP_FILE.hold" "$TAP_FILE.pid"
 }
 if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   [ -n "${HPCB_T_ADMIN_ARGV:-}" ] || { echo "ERROR: scenario '$SCENARIO' declares ADMIN_TAP but target '$TARGET' has no admin channel (fake only)"; exit 2; }
@@ -292,8 +292,9 @@ if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   TAP_FILE="$RUNS_HOST/.admin-tap-$RUNID.jsonl"
   : > "$TAP_FILE"
   trap 'stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
+  # --parent-pid: a run_smoke.sh killed outright never runs its EXIT trap; the tap then ends itself and removes its files
   python3 "$REPO_ROOT/agentic/harness/admin_tap.py" --out "$TAP_FILE" --user "$SSH_USER" --knob "$HPCB_KNOB_ADMIN_TAP" \
-    -- "${TAP_ARGV[@]}" &
+    --parent-pid "$$" -- "${TAP_ARGV[@]}" &
   TAP_PID=$!
   ARGS+=( -e HPCB_ADMIN_TAP="/work/hpc-bridge/agentic/runs/.admin-tap-$RUNID.jsonl" )
   echo "admin tap: the scheduler as its admin, sampled into $TAP_FILE (pid $TAP_PID)"

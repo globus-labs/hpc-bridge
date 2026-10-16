@@ -15,9 +15,21 @@ endpoint (MEP) is attached with zero SSH ever, a billed block is spend-gated (an
 facility requires an allocation), and stop is honest (`down` confirmed / `draining` — terminal on a MEP). Twelve MCP
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
-Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1040 passed** (the CI list: 1016). The live tier has
+Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1050 passed** (the CI list: 1026). The live tier has
 **67 scenarios** and a local **fake cluster with 12 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep`) that is now the main regression backbone; the lab cluster is the real-hardware check.
+
+## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
+
+- **The bug** (`queued_check_relaunch`, phase `second`, fake/default, run 1792120434): on a user endpoint that already
+  ran a block, `stop_endpoint` answers `down` / `spend_stopped=True` while hpc-bridge's own canary is still queued on
+  the endpoint; parsl's strategy then submits a new pilot ~53 s later ("Scaling out by 1 blocks", job 5) — billing after
+  a `down`. A first pilot does not show it (run 1792117501): a cancelled, never-connected first block puts the
+  executor in bad state and the user endpoint shuts down instead.
+- **The decided fix:** a fresh compute user endpoint per confirmation; compute user endpoints that exit when idle; a
+  stop that answers `down` only on evidence that no check of ours is left queued.
+- **In progress** on `fix/stop-after-failed-block`. `queued_check_relaunch` (phase `second`) is its regression check:
+  FAILED on main by design, it must pass once the fix lands.
 
 ## Where it stands (2026-10-14) — the spend question names the block
 
