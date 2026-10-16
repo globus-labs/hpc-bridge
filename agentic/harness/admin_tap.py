@@ -16,6 +16,12 @@ host is `/work/hpc-bridge/agentic/runs` in the jail):
   (`TapReader.request_ids`); the host tap then adds the scenario's `ids_cmd` (`{ids}` = those ids) to every sample and
   takes one at once. Why: the first live run (2026-10-15) watched BLIND — its pilot lived 4.6 s between two samples,
   and `sacct -S <window>` never lists a job that was never ELIGIBLE (held by `--begin`), while `sacct -j <id>` does.
+- ASKING FOR A HOLD — a script that must keep an endpoint's NEXT pilots from ever starting writes `<tap file>.hold`
+  (`TapReader.request_hold`: the endpoint's `uep.<eid>` marker and the first job id to hold); the host tap then adds the
+  scenario's `hold_cmd` (`{marker}`, `{from}`) to every sample — `scontrol hold` as the admin on each PENDING job of that
+  marker from that id on — and takes one at once. A hold cannot catch a job an idle node starts within a second of its
+  sbatch; the scenario keeps such jobs PENDING first (queued_check_relaunch: a singleton dependency), and the hold then
+  keeps them from ever running, whatever else ends.
 
 Why the admin channel and not the harness' world channel (ssh as the pool user, what POSTCHECKS use): nothing on the
 admin path is the product's — not the login node the endpoint runs on, not the pool user's sshd that hpc-bridge's own
@@ -77,12 +83,34 @@ def read_ids(path: Path) -> list[str]:
     return sorted({w for w in words if _JOB_ID.match(w)}, key=lambda w: (len(w), w))[:MAX_IDS]
 
 
+_MARKER = re.compile(r"^uep\.[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?:\.[0-9a-f-]{36})?$")
+
+
+def hold_path(out: Path | str) -> Path:
+    """Where a script asks the host tap to hold an endpoint's next pilots: beside the tap file."""
+    out = Path(out)
+    return out.with_name(out.name + ".hold")
+
+
+def read_hold(path: Path) -> tuple[str, str] | None:
+    """(marker, first job id) asked for, or None — only an endpoint marker and a job id pass: they go into a root shell."""
+    try:
+        words = path.read_text().split()
+    except OSError:
+        return None
+    if len(words) == 2 and _MARKER.match(words[0]) and words[1].isdigit() and len(words[1]) <= 12:
+        return words[0], words[1]
+    return None
+
+
 def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float = MAX_RUN_S, ids_cmd: str = "",
+        hold_cmd: str = "",
         run: Callable[[list[str]], tuple[int, str]] | None = None, sleep: Callable[[float], None] = time.sleep,
         clock: Callable[[], float] = time.monotonic) -> int:
     """Run `admin + [cmd]` every `every_s` seconds (the first at once) and append one sample per run to `out`, until
-    signalled or `max_s` has passed. With ids asked for (`ids_path`) and an `ids_cmd`, each sample runs it too, and a
-    new request is answered at once rather than at the next tick. Returns the number of samples written."""
+    signalled or `max_s` has passed. With ids asked for (`ids_path`) and an `ids_cmd`, or a hold asked for (`hold_path`)
+    and a `hold_cmd`, each sample runs those too, and a new request is answered at once rather than at the next tick.
+    Returns the number of samples written."""
     def _run(argv: list[str]) -> tuple[int, str]:
         try:
             r = subprocess.run(argv, capture_output=True, text=True, timeout=SAMPLE_TIMEOUT_S, stdin=subprocess.DEVNULL)
@@ -95,21 +123,31 @@ def tap(out: Path, admin: list[str], cmd: str, *, every_s: float, max_s: float =
     run = run or _run
     n = 0
     t0 = clock()
-    asked = ids_path(out)
+    asked, held = ids_path(out), hold_path(out)
+
+    def requests() -> tuple[list[str], tuple[str, str] | None]:
+        return (read_ids(asked) if ids_cmd else []), (read_hold(held) if hold_cmd else None)
+
     with out.open("a") as fh:   # held open: a write after run_smoke.sh removed the file never re-creates it
         while clock() - t0 < max_s:
-            ids = read_ids(asked) if ids_cmd else []
-            full = f"{cmd}; {ids_cmd.replace('{ids}', ','.join(ids))}" if ids else cmd
-            rc, text = run([*admin, full])
-            sample = {"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}
+            ids, hold = requests()
+            parts = [cmd]
+            if hold:   # first: a pilot it holds is then in this very sample, as held
+                parts.insert(0, hold_cmd.replace("{marker}", hold[0]).replace("{from}", hold[1]))
+            if ids:
+                parts.append(ids_cmd.replace("{ids}", ",".join(ids)))
+            rc, text = run([*admin, "; ".join(parts)])
+            sample: dict = {"t": round(time.time(), 3), "rc": rc, "out": text[-OUT_CAP:]}
             if ids:
                 sample["ids"] = ids
+            if hold:
+                sample["hold"] = list(hold)
             fh.write(json.dumps(sample) + "\n")
             fh.flush()
             n += 1
             for _ in range(max(1, math.ceil(every_s))):   # a second at a time: a new request is answered at once
                 sleep(min(1.0, every_s))
-                if ids_cmd and read_ids(asked) != ids:
+                if requests() != (ids, hold):
                     break
     return n
 
@@ -131,7 +169,8 @@ def main(argv: list[str]) -> int:
         signal.signal(sig, _stop)
     tap(args.out, admin, str(knob["cmd"]).replace("{user}", args.user),
         every_s=float(knob.get("every_s") or DEFAULT_EVERY_S), max_s=args.max_s,
-        ids_cmd=str(knob.get("ids_cmd") or "").replace("{user}", args.user))
+        ids_cmd=str(knob.get("ids_cmd") or "").replace("{user}", args.user),
+        hold_cmd=str(knob.get("hold_cmd") or "").replace("{user}", args.user))
     return 0
 
 
@@ -184,6 +223,14 @@ def slurm_ids_cmd() -> str:
     return f"{_TIMES} sacct -j {{ids}} -X -n -P -o {_SACCT_FIELDS} 2>&1 | sed 's/^/HPCB_A /'"
 
 
+def slurm_hold_cmd() -> str:
+    """The tap's `hold_cmd` for Slurm: `scontrol hold` (as the admin: reason JobHeldAdmin) on every PENDING job of the pool
+    user whose batch script carries `{marker}`, from job id `{from}` on, once each; `HPCB_HELD <id>` says so."""
+    return ("for j in $(squeue -u {user} -h -t PD -o '%i|%r|%o' 2>/dev/null "
+            "| awk -F'|' -v m={marker} -v f={from} 'index($3,m) && $1+0 >= f+0 && $2 != \"JobHeldAdmin\" {print $1}'); "
+            "do scontrol hold \"$j\" && echo \"HPCB_HELD $j\"; done")
+
+
 def slurm_time(raw: str) -> float | None:
     """A Slurm time stamp as epoch seconds: an epoch (SLURM_TIME_FORMAT=%s) or ISO `2026-09-05T17:32:59` (UTC — the
     sample runs under TZ=UTC); None for `Unknown`, `None`, `N/A` or anything else."""
@@ -218,6 +265,7 @@ class SlurmSample:
     queue: list[SlurmJob] = field(default_factory=list)
     history: list[SlurmJob] = field(default_factory=list)
     error: str = ""               # why this sample says nothing (the admin command failed, or printed no clock)
+    held: list[str] = field(default_factory=list)   # jobs the tap's hold_cmd held in this sample (`HPCB_HELD <id>`)
 
 
 def parse_slurm_sample(sample: dict) -> SlurmSample:
@@ -227,10 +275,13 @@ def parse_slurm_sample(sample: dict) -> SlurmSample:
     now: float | None = None
     queue: list[SlurmJob] = []
     history: list[SlurmJob] = []
+    held: list[str] = []
     for line in out.splitlines():
         tag, _, rest = line.partition(" ")
         if tag == "HPCB_NOW":
             now = slurm_time(rest)
+        elif tag == "HPCB_HELD" and _JOB_ID.match(rest.strip()):
+            held.append(rest.strip())
         elif tag == "HPCB_Q":
             f = rest.split("|", 4)
             if len(f) == 5 and f[0].strip().replace("_", "").isdigit():
@@ -248,7 +299,7 @@ def parse_slurm_sample(sample: dict) -> SlurmSample:
         error = f"admin command rc={rc}: {out.strip()[-200:]!r}"
     elif now is None:
         error = f"no controller clock in the sample: {out.strip()[-200:]!r}"
-    return SlurmSample(t=sample.get("t"), now=now, queue=queue, history=history, error=error)
+    return SlurmSample(t=sample.get("t"), now=now, queue=queue, history=history, error=error, held=held)
 
 
 class TapReader:
@@ -259,6 +310,18 @@ class TapReader:
 
     def samples(self) -> list[SlurmSample]:
         return [parse_slurm_sample(s) for s in read_samples(self.path)]
+
+    def request_hold(self, marker: str, from_job: str | int) -> bool:
+        """Ask the host tap to hold every PENDING job of `marker` (an endpoint's `uep.<eid>`) from job id `from_job` on
+        (its `hold_cmd`). False without a tap, for an invalid marker or id, or when the file cannot be written."""
+        line = f"{marker} {from_job}"
+        if self.path is None or not _MARKER.match(marker) or not str(from_job).isdigit():
+            return False
+        try:
+            hold_path(self.path).write_text(line + "\n")
+        except OSError:
+            return False
+        return True
 
     def request_ids(self, ids: list[str]) -> bool:
         """Ask the host tap to look these jobs up by id from now on (its `ids_cmd`). False without a tap, with no valid

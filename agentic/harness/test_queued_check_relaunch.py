@@ -11,6 +11,8 @@ import sys
 import types
 from pathlib import Path
 
+import pytest
+
 HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(HERE))
 sys.path.insert(0, str(HERE.parent / "scenarios"))
@@ -27,6 +29,12 @@ OTHER = "007c300d-4746-4b48-bc8d-ed39d2fbcf28"
 SCRIPT_OF = ("/home/hpcbridge-test-00/.globus_compute/uep.{eid}.34aaadd8-3a58-d9ea-c9b0-49257afec4d2/submit_scripts/"
              "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.{ts}.submit")
 T_STOP = 1792105400.0   # the stop's answer (epoch, the jail's and the controller's clock)
+
+
+@pytest.fixture(autouse=True)
+def _phase_first(monkeypatch):
+    """Most of these tests are the first-pilot sequence (phase `first`); a phase-`second` test sets it itself."""
+    monkeypatch.setenv("HPCB_RELAUNCH_PHASE", "first")
 
 
 def _call(name: str, inp: dict | None = None, res: dict | None = None) -> ToolCall:
@@ -108,7 +116,7 @@ def test_a_draining_stop_is_another_premise_report_only_and_passes_saying_so():
 
 def test_no_pass_without_proof_no_stop_an_unverifiable_or_short_watch_or_an_unqueued_check():
     no_stop = qcr.no_relaunch_after_down(_trace(None), _watch())
-    assert not no_stop.ok and "premise not met: no stop_endpoint" in no_stop.detail
+    assert not no_stop.ok and "premise not met: no judged stop_endpoint" in no_stop.detail
     blind = qcr.no_relaunch_after_down(_trace(DOWN), _watch(unverifiable="the admin tap has no sample after the stop"))
     assert not blind.ok and blind.detail.startswith("UNVERIFIABLE")
     short = qcr.no_relaunch_after_down(_trace(DOWN), _watch(covered=90.0))
@@ -229,7 +237,7 @@ def test_the_tap_cli_substitutes_the_pool_user_and_stops_on_sigterm(tmp_path):
     p = subprocess.Popen([sys.executable, str(HERE / "admin_tap.py"), "--out", str(out), "--user", "hpcbridge-test-05",
                           "--knob", knob, "--", str(stub)])
     try:
-        for _ in range(100):
+        for _ in range(600):   # up to ~30 s on a loaded host; a fraction of a second normally
             if out.exists() and len(admin_tap.read_samples(out)) >= 2:
                 break
             subprocess.run(["sleep", "0.05"], check=False)
@@ -261,10 +269,10 @@ def test_the_world_check_reads_the_tap_and_fails_a_relaunch(tmp_path):
                     f"HPCB_A 7|parsl.x|CANCELLED by 0|{T_STOP - 9:.0f}|Unknown|{T_STOP:.0f}|sbatch {run}",
                     f"HPCB_NOW {T_STOP + 425:.0f}\nHPCB_Q 8|PENDING|{T_STOP + 63:.0f}|BeginTime|{run}")
     ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(), tap=admin_tap.TapReader(tap))
-    gated, report, strategy = asyncio.run(qcr.relaunch_watch(ctx))
+    gated, report, strategy, _history = asyncio.run(qcr.relaunch_watch(ctx))
     assert not gated.ok and "job 8 submitted +63 s after the stop answered, PENDING (BeginTime)" in gated.detail
     assert report.name == "relaunch_watch" and "3 admin sample(s), covering 425 s" in report.detail
-    assert "job 7 CANCELLED" in report.detail and "the cell's own pilot(s): 7" in report.detail
+    assert "job 7 CANCELLED" in report.detail and "the stop's own pilot(s): 7" in report.detail
     assert strategy.name == "strategy_after_stop" and strategy.detail.startswith("UNVERIFIABLE")   # no world channel
     assert (tap.parent / (tap.name + ".ids")).read_text().split() == ["7"]   # the tap was asked for job 7 by id
 
@@ -296,7 +304,7 @@ def test_a_watch_that_never_saw_the_cells_own_pilot_fails_blind():
     # no own pilot id at all (the stop released none, no poll saw one): nothing proves the tap can see this endpoint
     stop = {**DOWN, "notice": "compute block released over AMQP (released none)"}
     nothing = qcr.no_relaunch_after_down(_trace(stop, pilot=""), _watch(own=set()))
-    assert not nothing.ok and "no pilot id of this cell is known" in nothing.detail
+    assert not nothing.ok and "no pilot id of this stop is known" in nothing.detail
     assert qcr.own_pilots(_trace(DOWN)) == {"7"}
 
 
@@ -399,7 +407,7 @@ def test_the_world_check_reads_the_endpoint_log_over_the_world_channel_before_th
     ctx = types.SimpleNamespace(trace=_trace(DOWN), messages=_messages(answered=RUN2_STOP + 0.99),
                                 tap=admin_tap.TapReader(tap), ssh=ssh, endpoint_name="hpc-bridge-fake-1")
     ctx.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=ctx.tap.samples())
-    gated, _report, strategy = asyncio.run(qcr.relaunch_watch(ctx))
+    gated, _report, strategy, _history = asyncio.run(qcr.relaunch_watch(ctx))
     (cmd, timeout), = asked
     assert "hpc-bridge-fake-1/endpoint.log" in cmd and f'uep."{EID}.*/endpoint.log' in cmd and timeout == 120
     assert strategy.ok and "Not strategizing for executor because bad state" in strategy.detail
@@ -462,7 +470,7 @@ def test_the_script_holds_the_pilot_waits_for_it_on_the_login_shape_and_stops_at
     assert ops.calls[2][1] == {"facility": "fake-1", "ssh_host": "login"}           # again, until the login shape is up
     assert ops.calls[4][1] == {"shape": "compute", "confirm_spend": True, "account": "hpcb"}   # not the GPU account
     assert all(a["shape"] == "login" and f"uep.{EID}" in a["command"] for t, a in ops.calls if t == "run_shell")
-    assert "teardown_endpoint" not in tools and "stopped with 7 PENDING (BeginTime) in the queue" in final
+    assert "teardown_endpoint" not in tools and "stopped with job 7 PENDING (BeginTime) in the queue" in final
 
 
 def test_the_script_aborts_when_a_premise_fails_and_drops_the_hold_on_request(monkeypatch):
@@ -475,7 +483,7 @@ def test_the_script_aborts_when_a_premise_fails_and_drops_the_hold_on_request(mo
     ops = _Ops({"connect_facility": [PROPOSAL, {"phase": "needs_account"}],
                 "ensure_endpoint_up": [{"status": "provisioning", "endpoint_id": EID}],
                 "run_shell": [{"phase": "complete", "stdout": ""}]})
-    with pytest.raises(script_runner.ScriptAbort, match=f"no pilot of uep.{EID} entered the queue"):
+    with pytest.raises(script_runner.ScriptAbort, match=f"no new pilot of uep.{EID} entered the queue"):
         asyncio.run(qcr.SCRIPT(ops))
     assert "stop_endpoint" not in [t for t, _ in ops.calls]       # no stop: the harness teardown cleans up
     monkeypatch.setenv("HPCB_RELAUNCH_HOLD_S", "0")
@@ -492,12 +500,18 @@ def test_it_runs_on_the_fake_slurm_profiles_default_and_site_only_and_declares_i
     assert qcr.TARGETS == ("fake",) and qcr.OPERATORS == ("script",) and qcr.TEARDOWN == "delete"
     for prof, ok in (("default", True), ("site", True), ("pbs", False), ("totp", False), ("pbs_mep", False)):
         assert targets.meets(qcr.REQUIRES, targets.load_profile(prof)["capabilities"])[0] is ok, prof
-    assert qcr.NEEDS_COMPUTE_NODE is False      # every pilot is held: no node is ever taken
-    knobs = subprocess.run([sys.executable, str(HERE / "scenario_knobs.py"), "queued_check_relaunch"],
-                           capture_output=True, text=True, timeout=60, check=True).stdout
-    k = dict(ln.split("=", 1) for ln in knobs.splitlines() if "=" in ln)
+    import os
+
+    def knobs(phase: str) -> dict:
+        out = subprocess.run([sys.executable, str(HERE / "scenario_knobs.py"), "queued_check_relaunch"],
+                             capture_output=True, text=True, timeout=60, check=True,
+                             env={**os.environ, "HPCB_RELAUNCH_PHASE": phase}).stdout
+        return dict(ln.split("=", 1) for ln in out.splitlines() if "=" in ln)
+
+    k = knobs("second")   # the default: phase A runs a real block for a minute
     assert json.loads(shlex.split(k["HPCB_KNOB_ADMIN_TAP"])[0]) == qcr.ADMIN_TAP and k["HPCB_KNOB_TARGETS"] == "fake"
-    assert "HPCB_KNOB_NEEDS_NODE" not in k
+    assert k["HPCB_KNOB_NEEDS_NODE"] == "1" and set(qcr.ADMIN_TAP) == {"every_s", "cmd", "ids_cmd", "hold_cmd"}
+    assert "HPCB_KNOB_NEEDS_NODE" not in knobs("first")   # every pilot held: no node is ever taken
     import importlib.util
     spec = importlib.util.spec_from_file_location("run_suite", HERE.parent / "run_suite.py")
     suite = importlib.util.module_from_spec(spec)
@@ -555,3 +569,217 @@ def test_world_checks_run_before_the_postchecks_and_the_teardown_and_their_rows_
     assert recorded["extra_jsonl"]["admin-tap"] == [{"t": 1.0, "rc": 0, "out": "HPCB_NOW 5\n"}]
     assert recorded["config"]["operator"] == "script" and recorded["config"]["world_checks"] == ["watch"]
     sys.modules.pop("scen_watch", None)
+
+
+# ---- phase `second`: a user endpoint that already ran a block -------------------------------------------------------
+
+UEP = f"uep.{EID}.34aaadd8-3a58-d9ea-c9b0-49257afec4d2"
+OTHER_UEP = f"uep.{EID}.9f7c4349-a8a6-c03a-5267-6989ae992de0"
+
+
+def _second(*, b_stop: dict | None = None, a_up: bool = True, b_uep: str = UEP, sentinel: bool = True) -> Trace:
+    """A phase-`second` trace: phase A (a block that answered and ran hostname, job 1, stopped `down`), the sentinel
+    (job 12), phase B's confirm, its pilot (job 13, PENDING on the sentinel) and the judged stop."""
+    poll = lambda line: _call("run_shell", {"shape": "login", "command": qcr.pilot_poll_cmd(EID)},  # noqa: E731
+                              {"phase": "complete", "exit_code": 0, "stdout": line})
+    calls = [
+        _call("connect_facility", {"facility": "fake-1", "ssh_host": "login"}, {"phase": "proposed_facility_details"}),
+        _call("connect_facility", {"facility": "fake-1", "details": {"ssh_host": "login"}}, {"phase": "provisioning"}),
+        _call("connect_facility", {"facility": "fake-1", "ssh_host": "login"}, {"phase": "needs_account"}),
+        _call("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+              {"status": "provisioning", "endpoint_id": EID, "partition": "main"}),
+        _call("ensure_endpoint_up", {"shape": "compute"},
+              {"status": "up" if a_up else "provisioning", "block_state": "warm" if a_up else "provisioning",
+               "endpoint_id": EID}),
+        _call("run_shell", {"shape": "compute", "command": "hostname"},
+              {"phase": "complete" if a_up else "cold_start", "stdout": "c1\n"}),
+        poll(f"HPCB_PILOT 1 RUNNING {UEP} None\n"),
+        _call("stop_endpoint", {}, {**DOWN, "notice": "compute block released over AMQP (released 1); …"}),
+    ]
+    if sentinel:
+        calls += [_call("run_shell", {"shape": "login", "command": qcr.sentinel_cmd("main", None)},
+                        {"phase": "complete", "exit_code": 0, "stdout": "12\n"}),
+                  _call("run_shell", {"shape": "login", "command": "squeue -j 12 -h -o %T 2>/dev/null; true"},
+                        {"phase": "complete", "exit_code": 0, "stdout": "RUNNING\n"}),
+                  _call("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+                        {"status": "provisioning", "endpoint_id": EID,
+                         "notice": "allocating nodes… — pilot 13 is queued (PENDING (reason Dependency))"}),
+                  poll(f"HPCB_PILOT 13 PENDING {b_uep} Dependency\n"),
+                  _call("stop_endpoint", {}, b_stop or {**DOWN, "notice": "compute block released over AMQP (released 13)"})]
+    return Trace(calls)
+
+
+def _watch2(*jobs: admin_tap.SlurmJob, covered: float = 425.0) -> qcr.Watch:
+    """The phase-B watch: the tap saw job 1 (phase A, CANCELLED) and job 13 (the judged stop's own) by marker."""
+    seen = (_job("1", T_STOP - 120, state="CANCELLED", reason=""), _job("13", T_STOP - 6, state="CANCELLED", reason=""))
+    return qcr.Watch(called_at=T_STOP - 0.6, answered_at=T_STOP, window_s=420.0, covered_until=T_STOP + covered,
+                     samples=44, jobs=[*seen, *jobs], own_ids={"13"}, phase="second", held={"14"} & {j.job_id for j in jobs})
+
+
+def test_phase_selection_and_the_directives_each_phase_sends(monkeypatch):
+    for raw, phase in (("", "second"), ("second", "second"), ("first", "first"), ("FIRST ", "first"), ("x", "second")):
+        monkeypatch.setenv("HPCB_RELAUNCH_PHASE", raw)
+        assert qcr._phase() == phase, raw
+    second = qcr._proposal_details(PROPOSAL, 1800, "second")["scheduler_options"]
+    assert second == "#SBATCH --job-name=parsl-hpcb-qcr\n#SBATCH --dependency=singleton"   # no --begin: A must run
+    assert qcr._proposal_details(PROPOSAL, 1800, "first")["scheduler_options"] == "#SBATCH --begin=now+1800"
+    assert "parsl" in qcr.SINGLETON_NAME   # the universal postcheck (`no job named *parsl* left`) still sees a pilot
+    assert qcr.sentinel_cmd("main", "hpcb") == ("sbatch --parsable -J parsl-hpcb-qcr -N1 -n1 -t 01:00:00 -o /dev/null "
+                                                "-e /dev/null -p main -A hpcb --wrap 'sleep 3600'")
+    assert qcr.SETUP == qcr.CLEANUP == ['scancel -u "$(whoami)" --name=parsl-hpcb-qcr 2>/dev/null; echo ok']
+
+
+def test_the_poll_names_the_user_endpoint_and_old_lines_still_read():
+    new, old = qcr._pilots(ToolCall("run_shell", {}, {"stdout": f"HPCB_PILOT 13 PENDING {UEP} Dependency\n"
+                                                                "HPCB_PILOT 7 PENDING BeginTime\nHPCB_PILOT 8 RUNNING - None"}))[:2]
+    assert (new.job, new.state, new.uep, new.reason) == ("13", "PENDING", UEP, "Dependency")
+    assert (old.job, old.uep, old.reason) == ("7", "", "BeginTime")
+    assert "match($4, /uep" in qcr.pilot_poll_cmd(EID) and "RLENGTH-15" in qcr.pilot_poll_cmd(EID)
+
+
+def test_phase_b_with_a_relaunch_fails_and_phase_a_does_not_count_as_its_canary():
+    t = _second()
+    assert qcr._stop(t)[0] == 12 and [i for i, _ in qcr._phase_a_stops(t)] == [7]
+    assert qcr.canary_state(t)[0] == "queued"            # phase A's `up` and hostname are before phase B's window
+    assert qcr.own_pilots(t) == {"13"} and qcr.same_user_endpoint(t) == (True, f"phase A and phase B both ran in {UEP}")
+    r = qcr.no_relaunch_after_down(t, _watch2(_job("14", T_STOP + 62, reason="JobHeldAdmin")))
+    assert not r.ok and "job 14 submitted +62 s after the stop answered, PENDING (JobHeldAdmin)" in r.detail
+    assert "job 1 submitted" not in r.detail and "job 13 submitted" not in r.detail
+    ok = qcr.no_relaunch_after_down(t, _watch2())
+    assert ok.ok and "the tap saw its own pilot (job 13 CANCELLED [squeue])" in ok.detail
+
+
+def test_phase_b_premises_same_user_endpoint_a_connected_phase_a_and_a_started_phase_b():
+    other = qcr.no_relaunch_after_down(_second(b_uep=OTHER_UEP), _watch2())
+    assert not other.ok and other.detail.startswith("premise not met:") and "a NEW user endpoint" in other.detail
+    unknown = qcr.no_relaunch_after_down(_second(b_uep="-"), _watch2())
+    assert not unknown.ok and unknown.detail.startswith("premise unverified:")
+    cold = qcr.no_relaunch_after_down(_second(a_up=False), _watch2())
+    assert not cold.ok and "phase A's block never answered a check" in cold.detail
+    never = qcr.no_relaunch_after_down(_second(sentinel=False), _watch2())
+    assert not never.ok and "phase B never started" in never.detail
+    draining = qcr.no_relaunch_after_down(_second(b_stop=DRAINING), _watch2(_job("14", T_STOP + 62)))
+    assert draining.ok and draining.detail.startswith("report-only:") and "job 14" in draining.detail
+
+
+def test_phase_b_report_rows_phase_a_stop_and_the_user_endpoints_job_history():
+    t = _second()
+    a = qcr.phase_a_stop(t)
+    assert a.ok and a.detail.startswith("call 7: status='down', spend_stopped=True, released ['1']")
+    assert qcr.phase_a_stop(_trace(DOWN)).detail.startswith("no phase A")
+    assert qcr.pilot_state_at_stop(t).detail == (f"call 11: job 13 PENDING (Dependency) in {UEP}; phase A and phase B "
+                                                 f"both ran in {UEP}")
+    bad = qcr.LogLine(T_STOP + 57, "uep 34aaadd8", "INFO MainProcess-1 a b c Job is marked as MISSING since …")
+    w = _watch2(_job("14", T_STOP + 62, reason="JobHeldAdmin"))
+    w.log_lines = [bad]
+    h = qcr.uep_job_history(t, w).detail
+    assert "job 1 CANCELLED — phase A, connected (a worker answered on it)" in h
+    assert "job 13 CANCELLED — the judged stop's own pilot" in h
+    assert "job 14 PENDING (JobHeldAdmin) HELD by the tap — RELAUNCHED after the stop" in h
+    assert "1 MISSING / bad-state line(s)" in h
+
+
+def test_the_judged_stops_times_come_from_its_own_journal_row():
+    msgs = [{"journal": {"tool": "stop_endpoint", "ts": 100.0, "ms": 500}},
+            {"journal": {"tool": "run_shell", "ts": 150.0, "ms": 10}},
+            {"journal": {"tool": "stop_endpoint", "ts": 200.0, "ms": 1000}}]
+    assert qcr._stop_times(msgs, 1) == (200.0, 201.0) and qcr._stop_times(msgs) == (100.0, 100.5)
+    assert qcr._judged_nth(_second()) == 1 and qcr._judged_nth(_trace(DOWN)) == 0
+
+
+def test_the_hold_request_round_trip_and_the_hold_command(tmp_path):
+    out = tmp_path / ".admin-tap-r1.jsonl"
+    reader = admin_tap.TapReader(out)
+    assert reader.request_hold(f"uep.{EID}", 13) and admin_tap.read_hold(admin_tap.hold_path(out)) == (f"uep.{EID}", "13")
+    assert not reader.request_hold("uep.x; rm -rf /", 13) and not reader.request_hold(f"uep.{EID}", "13; id")
+    assert not admin_tap.TapReader(None).request_hold(f"uep.{EID}", 13)
+    admin_tap.hold_path(out).write_text("uep.$(id) 13\n")            # a request that is not a marker and an id is ignored
+    assert admin_tap.read_hold(admin_tap.hold_path(out)) is None
+    reader.request_hold(f"uep.{EID}", 13)
+    seen: list[str] = []
+
+    def run(argv):
+        seen.append(argv[-1])
+        return 0, "HPCB_HELD 13\nHPCB_NOW 5\n"
+
+    clock = iter(range(0, 100, 10))
+    admin_tap.tap(out, ["docker", "exec", "c", "bash", "-lc"], "squeue", every_s=10, max_s=15, run=run,
+                  hold_cmd="hold {marker} from {from}", sleep=lambda s: None, clock=lambda: float(next(clock)))
+    assert seen == [f"hold uep.{EID} from 13; squeue"]   # the hold first: a pilot it holds is then seen held
+    (sample,) = admin_tap.read_samples(out)
+    assert sample["hold"] == [f"uep.{EID}", "13"] and admin_tap.parse_slurm_sample(sample).held == ["13"]
+    cmd = admin_tap.slurm_hold_cmd()
+    assert "squeue -u {user} -h -t PD" in cmd and "scontrol hold" in cmd and 'HPCB_HELD $j' in cmd
+    assert "index($3,m) && $1+0 >= f+0" in cmd and '"JobHeldAdmin"' in cmd
+
+
+def test_the_teardowns_cancel_by_marker_covers_held_pilots():
+    # held jobs are PENDING: the run-scoped cancel lists the pool user's queue with no state filter, so it finds them
+    from cluster_ops import scoped_cancel_cmd
+    cmd = scoped_cancel_cmd("slurm", [EID])
+    listing = cmd[cmd.index("squeue"):cmd.index("| awk")]
+    assert "-u \"$(whoami)\"" in listing and " -t " not in listing and "--states" not in listing and "scancel" in cmd
+
+
+def test_the_phase_second_script_runs_a_then_holds_b_behind_the_sentinel(tmp_path, monkeypatch):
+    monkeypatch.setenv("HPCB_RELAUNCH_PHASE", "second")
+    tap = tmp_path / ".admin-tap-r1.jsonl"
+    monkeypatch.setenv("HPCB_ADMIN_TAP", str(tap))
+    ops = _Ops({
+        "connect_facility": [PROPOSAL, {"phase": "provisioning"}, {"phase": "needs_account", "allocations": []}],
+        "ensure_endpoint_up": [{"status": "provisioning", "endpoint_id": EID, "partition": "main"},
+                               {"status": "up", "block_state": "warm", "endpoint_id": EID},
+                               {"status": "provisioning", "endpoint_id": EID}],
+        "run_shell": [{"phase": "complete", "exit_code": 0, "stdout": "c1\n"},                        # hostname
+                      {"phase": "complete", "stdout": f"HPCB_PILOT 1 RUNNING {UEP} None\n"},           # A's pilot
+                      {"phase": "complete", "exit_code": 0, "stdout": "12\n"},                        # the sentinel
+                      {"phase": "complete", "stdout": "PENDING\n"}, {"phase": "complete", "stdout": "RUNNING\n"},
+                      {"phase": "complete", "stdout": f"HPCB_PILOT 1 CANCELLED {UEP} None\n"},         # B: not yet
+                      {"phase": "complete", "stdout": f"HPCB_PILOT 13 PENDING {UEP} Dependency\n"}],
+        "stop_endpoint": [{**DOWN, "notice": "compute block released over AMQP (released 1)"}, DOWN],
+    })
+    final = asyncio.run(qcr.SCRIPT(ops))
+    tools = [t for t, _ in ops.calls]
+    assert tools == (["connect_facility"] * 3 + ["ensure_endpoint_up"] * 2 + ["run_shell"] * 2 + ["stop_endpoint"]
+                     + ["run_shell"] * 3 + ["ensure_endpoint_up"] + ["run_shell"] * 2 + ["stop_endpoint"])
+    assert ops.calls[1][1]["details"]["scheduler_options"].endswith("#SBATCH --dependency=singleton")
+    confirms = [a for t, a in ops.calls if t == "ensure_endpoint_up" and a.get("confirm_spend")]
+    assert confirms == [{"shape": "compute", "confirm_spend": True}] * 2   # the same terms: the same user endpoint
+    assert ops.calls[5] == ("run_shell", {"shape": "compute", "command": "hostname"})
+    assert ops.calls[8][1]["command"] == qcr.sentinel_cmd("main", None)
+    assert admin_tap.read_hold(admin_tap.hold_path(tap)) == (f"uep.{EID}", "13")   # held from after the sentinel
+    assert "teardown_endpoint" not in tools and "phase B stopped with job 13 PENDING (Dependency)" in final
+    assert any("the admin tap holds every new pilot" in x for x in ops.texts)
+
+
+def test_the_phase_second_script_aborts_when_the_sentinel_never_runs(monkeypatch):
+    import script_runner
+    monkeypatch.setenv("HPCB_RELAUNCH_PHASE", "second")
+    monkeypatch.setattr(qcr, "SENTINEL_WAIT_S", 0.0)
+    ops = _Ops({
+        "connect_facility": [PROPOSAL, {"phase": "needs_account"}],
+        "ensure_endpoint_up": [{"status": "up", "endpoint_id": EID}],
+        "run_shell": [{"phase": "complete", "stdout": "c1"}, {"phase": "complete", "stdout": f"HPCB_PILOT 1 RUNNING {UEP} x"},
+                      {"phase": "complete", "stdout": "12"}, {"phase": "complete", "stdout": "PENDING"}],
+        "stop_endpoint": [DOWN],
+    })
+    with pytest.raises(script_runner.ScriptAbort, match=r"the sentinel \(job 12\) never started running"):
+        asyncio.run(qcr.SCRIPT(ops))
+    assert [t for t, _ in ops.calls].count("ensure_endpoint_up") == 1   # phase B's confirm never went out
+
+
+def test_the_world_check_ends_the_sentinel_after_the_watch(tmp_path, monkeypatch):
+    monkeypatch.setenv("HPCB_RELAUNCH_PHASE", "second")
+    run = SCRIPT_OF.format(eid=EID, ts=1)
+    tap = _tap_file(tmp_path, f"HPCB_NOW {T_STOP + 5:.0f}\nHPCB_Q 13|CANCELLED|{T_STOP - 6:.0f}|None|{run}",
+                    f"HPCB_NOW {T_STOP + 421:.0f}\nHPCB_HELD 14\nHPCB_Q 14|PENDING|{T_STOP + 62:.0f}|JobHeldAdmin|{run}")
+    sent: list[str] = []
+    ctx = types.SimpleNamespace(trace=_second(), messages=[{"journal": {"tool": "stop_endpoint", "ts": 1.0, "ms": 1}},
+                                                          *_messages()[1:]],
+                                tap=admin_tap.TapReader(tap), endpoint_name="hpc-bridge-fake-1",
+                                ssh=lambda cmd, timeout: (sent.append(cmd), (0, "=== x\n"))[1])
+    ctx.tap.wait_until = lambda now, **kw: asyncio.sleep(0, result=ctx.tap.samples())
+    gated, report, _strategy, history = asyncio.run(qcr.relaunch_watch(ctx))
+    assert not gated.ok and "job 14 submitted +62 s after the stop answered, PENDING (JobHeldAdmin)" in gated.detail
+    assert "held by the tap: 14" in report.detail and "HELD by the tap — RELAUNCHED after the stop" in history.detail
+    assert sent[-1] == "scancel 12 2>&1; true"   # the sentinel, by its id, once the watch is over

@@ -125,15 +125,23 @@ with no SCRIPT is refused (`RESULT: SETUP FAILED`, exit 2), and the operator tak
 
 ```bash
 # the queued-check relaunch proof: stop_endpoint says `down` while the canary is queued — does a new pilot follow?
+# phase `second` (default): the stop on the user endpoint's SECOND pilot, after a first block that connected
 HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch
+# phase `first`: the stop on its FIRST pilot (the bad-state path: the first live run, 2026-10-15)
+HPCB_RELAUNCH_PHASE=first HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default \
+    ./agentic/run_smoke.sh queued_check_relaunch
 #   knobs: HPCB_RELAUNCH_WATCH_S (default 420: how long the world check watches the queue after the stop),
-#          HPCB_RELAUNCH_HOLD_S (default 1800: the `#SBATCH --begin` hold that keeps every pilot PENDING; 0 = none),
-#          HPCB_RELAUNCH_PILOT_WAIT_S (default 180: how long the script waits for its pilot to be queued)
+#          HPCB_RELAUNCH_HOLD_S (phase first; default 1800: the `#SBATCH --begin` hold on every pilot; 0 = none),
+#          HPCB_RELAUNCH_PILOT_WAIT_S (default 180: how long a phase waits for its pilot to be queued)
 ```
-`queued_check_relaunch` (fake, Slurm: `default` or `site`) brings the login shape up from the probe's proposal (every
-pilot held PENDING by an `#SBATCH --begin` hold, so the canary cannot run first — on idle fake nodes the worker answers
-it within ~5 s of the sbatch), confirms a compute block, polls `squeue` on the login shape until its pilot is queued,
-and stops at once — no teardown. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
+`queued_check_relaunch` (fake, Slurm: `default` or `site`) brings the login shape up from the probe's proposal. Phase
+`first`: every pilot is held PENDING by an `#SBATCH --begin` hold (on idle fake nodes the worker answers the canary
+within ~5 s of the sbatch), it confirms a compute block, polls `squeue` on the login shape until its pilot is queued,
+and stops at once. Phase `second`: A — a block that runs, answers the canary and `hostname`, then an honest stop; B —
+a one-core "sentinel" job sharing the pilots' name (`--dependency=singleton` in the confirmed details) keeps the next
+pilot PENDING (an idle node starts a job faster than any hold could follow), the admin tap `scontrol hold`s every new
+pilot of the endpoint, a second confirm with the same terms (the same user endpoint, checked by its `uep.<eid>.<id>`
+dir), the poll, the stop at once. No teardown either way. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
 submitted after the stop's answer (`world:no_relaunch_after_down`, gated), and the world check reads the endpoint's own
 log for parsl's decisions after the stop (`strategy_after_stop`, reported), before the harness tears down. A watch that
 never saw the cell's OWN pilot fails as blind — the first live run (2026-10-15) passed blind: its pilot lived 4.6 s
@@ -155,7 +163,9 @@ the controller's clock, the pool user's jobs (`squeue -t all`: also those finish
 in every state (`sacct -s …`: without a state list sacct shows only jobs that were eligible in the window, and a held job
 never is), with epoch times. A world check that knows job ids asks for them (`ctx.tap.request_ids`, a `.ids` file beside
 the tap's); the host tap then adds the scenario's `ids_cmd` (`sacct -j {ids}`) to every sample and takes one at once.
-`ctx.ssh(cmd, timeout)` is the harness' world channel (the endpoint's own logs, read before the teardown deletes them)
+A script that must keep an endpoint's next pilots from ever starting asks the tap to hold them
+(`TapReader.request_hold(marker, first_job)`, a `.hold` file); the tap then runs the scenario's `hold_cmd` (`scontrol
+hold` as the admin) in every sample. `ctx.ssh(cmd, timeout)` is the harness' world channel (the endpoint's own logs, read before the teardown deletes them)
 and `ctx.endpoint_name` this run's endpoint. A target with no admin channel (globus1: we are not its admin) refuses the
 cell; `run_suite` skips it.
 
@@ -511,7 +521,8 @@ SCRIPT = my_script                     # optional: `async def my_script(ops) -> 
 OPERATORS = ("script",)                # optional: the only operators that may drive it (others: SKIPPED)
 WORLD_CHECKS = [my_watch]              # optional: `async def my_watch(ctx) -> list[Result]`, after the agent, before the
                                        #   POSTCHECKS and the teardown (a `world:*` row gates; see "World checks that watch")
-ADMIN_TAP = {"cmd": "…{user}…", "every_s": 10, "ids_cmd": "…{ids}…"}   # optional: sample the scheduler as its admin (fake
+ADMIN_TAP = {"cmd": "…{user}…", "every_s": 10, "ids_cmd": "…{ids}…", "hold_cmd": "…{marker}…{from}…"}   # optional: sample the
+                                       #   scheduler as its admin (fake
                                        #   only; run_smoke.sh starts harness/admin_tap.py; WORLD_CHECKS read `ctx.tap`)
 SETUP = [{"cmd": "…", "on": "each_login"}]  # SETUP/CLEANUP entries may be dicts fanning out to every login node
 ```

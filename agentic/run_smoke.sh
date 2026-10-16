@@ -224,9 +224,10 @@ if [ "$OPERATOR" = "script" ]; then
   ARGS+=( -e HPCB_OPERATOR=script )
   [ -n "${HPCB_SCRIPT_TIMEOUT_S:-}" ] && ARGS+=( -e HPCB_SCRIPT_TIMEOUT_S )   # the whole script's bound (default 1800 s)
 fi
-# queued_check_relaunch's knobs (read in the jail by the scenario): how long the world check watches the queue after
-# the stop, how long step 3 waits for the pilot, and the `--begin` hold on every pilot (0 = none). Forwarded when set.
-for knob in HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S HPCB_RELAUNCH_HOLD_S; do
+# queued_check_relaunch's knobs (read in the jail by the scenario): which stop it judges (`first` | `second` pilot of the
+# user endpoint), how long the world check watches the queue after it, how long a phase waits for its pilot, and phase
+# `first`'s `--begin` hold on every pilot (0 = none). Forwarded when set.
+for knob in HPCB_RELAUNCH_PHASE HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S HPCB_RELAUNCH_HOLD_S; do
   [ -n "${!knob:-}" ] && ARGS+=( -e "$knob" )
 done
 if [ -n "$HPCB_T_NETWORK" ]; then
@@ -282,7 +283,8 @@ TAP_PID=""; TAP_FILE=""
 stop_tap() {
   [ -z "$TAP_PID" ] || kill "$TAP_PID" 2>/dev/null
   TAP_PID=""
-  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE" "$TAP_FILE.ids"   # .ids: the jobs the jail asked the tap to look up by id
+  # .ids / .hold: the jobs the jail asked the tap to look up by id, and the endpoint whose next pilots it holds
+  [ -z "$TAP_FILE" ] || rm -f "$TAP_FILE" "$TAP_FILE.ids" "$TAP_FILE.hold"
 }
 if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   [ -n "${HPCB_T_ADMIN_ARGV:-}" ] || { echo "ERROR: scenario '$SCENARIO' declares ADMIN_TAP but target '$TARGET' has no admin channel (fake only)"; exit 2; }

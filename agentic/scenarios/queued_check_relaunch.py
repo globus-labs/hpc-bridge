@@ -1,9 +1,11 @@
 """queued_check_relaunch — does `stop_endpoint` answer `down` while hpc-bridge's own CHECK is still queued on the endpoint,
 so that the endpoint submits a NEW billed pilot right after hpc-bridge said spend stopped? A suspected spend-honesty bug
 (review, 2026-10-15) to be PROVEN live before any design. Scripted (HPCB_OPERATOR=script, harness/script_runner.py): no
-agent, one exact sequence. Fake cluster, Slurm: the `default` profile, and `site`.
+agent, one exact sequence. Fake cluster, Slurm: the `default` profile, and `site`. Two phases (HPCB_RELAUNCH_PHASE):
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch
+    HPCB_RELAUNCH_PHASE=first HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default \
+        ./agentic/run_smoke.sh queued_check_relaunch
 
 THE CLAIM (main at 7ae46c2):
 - `ensure_endpoint_up(confirm_spend=True)` makes the endpoint start a block by sending it a check: the canary, a real
@@ -26,27 +28,47 @@ EXPECTED on main if the claim holds: FAILED — `world:no_relaunch_after_down` n
 about 60–65 s after the `down`, and the universal `world:stop_honesty_no_pilot_left` finds it still queued. This is a
 regression check that should pass only once the product fixes the hazard.
 
-WHAT THE FIRST LIVE RUN SHOWED (bundle 1792117501-3824-56199, fake/default, 2026-10-15): no relaunch — but not for the
-claim's reason, and its watch was blind (below). The pilot (job 1, held) was cancelled by the stop's `down`; 56 s later,
-at parsl's next job-status poll, the user endpoint's own log says: "Job is marked as MISSING since the workers failed
-to register to the executor" → TooManyJobFailuresError → "Setting bad state" → "Not strategizing for executor because
-bad state", and the user endpoint shut down — consistent with parsl's HTEX rewriting a finished block that never
-connected to MISSING, and its error handler's threshold being max(1, init_blocks) = 1 here (batch mode: init_blocks 0),
-so ONE cancelled, never-connected block puts the executor in bad state. The canary is then left queued at the service for a user endpoint that has exited.
-`strategy_after_stop` now records those lines from the endpoint log in every run, so the outcome is read, not inferred.
+WHAT THE FIRST LIVE RUN SHOWED (bundle 1792117501-3824-56199, fake/default, 2026-10-15; now phase `first`): no relaunch
+— but not for the claim's reason, and its watch was blind (below). The pilot (job 1, held) was cancelled by the stop's
+`down`; 56 s later, at parsl's next job-status poll, the user endpoint's own log says: "Job is marked as MISSING since
+the workers failed to register to the executor" → TooManyJobFailuresError → "Setting bad state" → "Not strategizing for
+executor because bad state", and the user endpoint shut down. The maintainer confirmed why in parsl 2026.04.20
+(HighThroughputExecutor.status(), executor.py ~880–895): any TERMINAL job whose block never connected (and is not
+SCALED_IN) is rewritten to MISSING, and simple_error_handler sets bad state when total ≥ max(1, init_blocks) AND every
+job is FAILED/MISSING. So a cancelled FIRST pilot of a user endpoint trips bad state, fails the canary and ends it.
+
+THE REMAINING CANDIDATE — phase `second` (the default): a user endpoint that ALREADY has a job that is not failed (an
+earlier block that connected and was then cancelled by a stop: CANCELLED, connected, not rewritten) does not go to bad
+state when its next, never-connected pilot is cancelled; with the canary still outstanding its strategy should scale out
+again — which fits Delta's field incident. Phase A gives the user endpoint that job; phase B stops on its second pilot.
 
 THE SCRIPT (SCRIPT below; the `{facility}`/`{ssh_host}` of every BYO scenario):
 1. connect_facility(fid, ssh_host) → the proposal; connect_facility(fid, ssh_host, details=<the proposal>, env_setup
-   left out as the tool asks, plus the HOLD below); then connect_facility(fid, ssh_host) again until `needs_account`:
-   the login shape is up.
+   left out as the tool asks, plus the phase's directives); then connect_facility(fid, ssh_host) again until
+   `needs_account`: the login shape is up.
+`first`:
 2. ensure_endpoint_up(shape="compute", confirm_spend=True) — with the first non-GPU allocation connect listed (`site`'s
-   mybalance; `default` lists none and needs none).
+   mybalance; `default` lists none and needs none). Its canary goes out; the pilot is held (THE HOLD), so it stays queued.
 3. Poll the queue on the free login shape (`squeue`, matched by the `uep.<eid>` marker, as _release_cmd matches) until a
    pilot of this endpoint is in it — never an ensure_endpoint_up poll: one that found the block up would run the canary.
-4. stop_endpoint() at once. Its status, `spend_stopped` and notice are recorded (`stop_answer`).
-5. No teardown: it would end the manager, and parsl's loop with it, hiding the very relaunch this cell watches for.
+4. stop_endpoint() at once (the judged stop).
+`second`:
+A. ensure_endpoint_up(confirm_spend=True), then ensure_endpoint_up polls until `up` (the block runs and its worker
+   answers the canary: the job CONNECTED), run_shell(compute, `hostname`), stop_endpoint() — nothing of ours outstanding,
+   so an honest `down` (`phase_a_stop`; re-stopped while `draining`, as an agent would).
+B. THE SENTINEL: every pilot of this endpoint is named `parsl-hpcb-qcr` with `#SBATCH --dependency=singleton` (in the
+   confirmed details, so phase A's ran too — nothing else of that name existed); phase B first starts, as the pool user on
+   the login shape, a one-core job of the same name (`sleep 3600`), so the next pilot waits on it (reason Dependency) —
+   an idle fake node starts a job within a second of its sbatch, faster than any hold could follow. Then the script asks
+   the ADMIN TAP to `scontrol hold` every new PENDING pilot of `uep.<eid>` from the sentinel's id on (`<tap>.hold`), so
+   it never runs whatever ends. Then ensure_endpoint_up(confirm_spend=True) with the SAME terms: hpc-bridge dropped the
+   compute shape at phase A's stop, so this builds a new runtime seeded from the facility defaults plus the session's
+   partition/account choice (warmth._seed_uec: `compute_choice` outlives a stop) — the same user_endpoint_config, so the
+   manager hands the canary to the same user endpoint (checked, not assumed: the `uep.<eid>.<uep id>` dir of both pilots'
+   batch scripts). Poll until its pilot (block 2) is queued; stop_endpoint() at once (the judged stop).
+Then no teardown: it would end the manager, and parsl's loop with it, hiding the very relaunch this cell watches for.
 
-THE HOLD (why every pilot is held PENDING): on idle fake nodes a pilot never waits. In stop_while_running's codex bundle
+THE HOLD (phase `first`: why every pilot is held PENDING): on idle fake nodes a pilot never waits. In stop_while_running's codex bundle
 (1792105266-23823-81296, fake/default, 2026-10-15) the user endpoint scaled out 6 s after it started; ensure_endpoint_up
 returned 2.7 s after the sbatch already saying "pilot 2 is RUNNING; the worker is starting", and the canary was answered
 within about 5 s of the sbatch (the next ensure_endpoint_up said `up` at once). A squeue poll and a stop are each a
@@ -58,10 +80,11 @@ reads a cancelled PENDING block as it reads a cancelled RUNNING one whose worker
 canary is queued none has (a connected, idle worker takes it at once), so the hold does not change which path parsl
 takes. HPCB_RELAUNCH_HOLD_S sets the hold (default 1800 s,
 at least the watch + 900 s); 0 drops it — the script then stops the moment the job id appears (most likely RUNNING), and
-`canary_before_stop` says whether the canary could have run first (a premise that cannot be shown fails the cell).
+`canary_before_stop` says whether the canary could have run first (a premise that cannot be shown fails the cell). Phase
+`first` only: phase `second` cannot hold every pilot this way — phase A's block must run.
 
 THE OBSERVATION (world checks, after the script, BEFORE the harness' teardown — run.py runs WORLD_CHECKS ahead of the
-POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop):
+POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop; the watch starts at the JUDGED stop):
 - the ADMIN TAP (harness/admin_tap.py) samples the scheduler as root on slurmctld every 10 s for the whole cell — the
   harness' admin channel, never hpc-bridge: `squeue -t all` (queued and running jobs, and those finished within
   MinJobAge, 300 s here), `sacct` over the last 2 h in EVERY state (`-s …`: without it sacct lists only jobs that were
@@ -72,16 +95,25 @@ POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop):
   SubmitLine) is recorded with its submit time, state and id;
 - then it reads the endpoint's own logs over the world channel (cluster_ops.capture_logs_cmd: the manager's, each user
   endpoint's, the blocks' output) — before the teardown deletes them — for parsl's decisions after the stop.
-Then the teardown runs as usual (it cancels a relaunched pilot by the same marker), so nothing is left on the fake cluster.
+- phase `second`: the sentinel is cancelled once the watch is over (it would read as a pilot left behind to the
+  universal postcheck); a relaunched pilot stays held.
+Then the teardown runs as usual — its cancel-by-marker (`cluster_ops.scoped_cancel_cmd`: squeue with no state filter, so
+PENDING and held jobs too) cancels a relaunched pilot — and CLEANUP cancels anything of the singleton name, so nothing is
+left on the fake cluster.
 
-GRADED: `world:no_relaunch_after_down` (gates, as every world row): FAIL when the stop answered `down` (or
-spend_stopped=True) and a new pilot of this endpoint was submitted after it — naming the job, its submit time relative to
-the stop's answer and its state. A stop that answered `draining` (or refused) is a different premise: report-only,
-PASS, said so. A `down` with no relaunch passes only when the watch could have seen one: the tap saw this cell's OWN
-pilot by its marker (else "watch blind" — the first run passed blind: its pilot lived 4.6 s between two samples), the
-endpoint's log shows no scale-out the tap missed, the window was covered, and the canary was demonstrably still queued at
-the stop. REPORTED: `stop_answer`, `pilot_state_at_stop`, `canary_before_stop`, `relaunch_watch`, `strategy_after_stop`
-(the endpoint log's scale-outs, error-handler and user-endpoint lines after the stop).
+GRADED: `world:no_relaunch_after_down` (gates, as every world row) judges the JUDGED stop (phase B's in `second`): FAIL
+when it answered `down` (or spend_stopped=True) and a new pilot of this endpoint was submitted after it — naming the
+job, its submit time relative to the stop's answer and its state. A stop that answered `draining` (or refused) is a
+different premise: report-only, PASS, said so. A `down` with no relaunch passes only when the watch could have seen one:
+the tap saw the stop's OWN pilot by its marker (else "watch blind" — the first run passed blind: its pilot lived 4.6 s
+between two samples), the endpoint's log shows no scale-out the tap missed, the window was covered, and the premise held
+— the canary was still queued at the stop, and in `second` phase A's block had answered in the SAME user endpoint.
+REPORTED: `stop_answer`, `phase_a_stop`, `pilot_state_at_stop` (with the user endpoint), `canary_before_stop`,
+`relaunch_watch`, `strategy_after_stop` (the endpoint log's scale-outs, error-handler and user-endpoint lines after the
+stop), `uep_job_history` (phase A's job — connected —, the stop's own, any relaunch; held ones; MISSING / bad state).
+EXPECTED in `second` if the hazard is real: the judged stop answers `down`; within ~65 s the user endpoint's strategy
+logs a scale-out and a block-3 job appears (held by the tap) — `world:no_relaunch_after_down` FAILS. If parsl does not
+relaunch, `strategy_after_stop` says why.
 """
 import asyncio
 import json
@@ -92,7 +124,7 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 
-from admin_tap import SlurmJob, slurm_ids_cmd, slurm_sample_cmd
+from admin_tap import TAP_ENV, SlurmJob, TapReader, slurm_hold_cmd, slurm_ids_cmd, slurm_sample_cmd
 from cluster_ops import capture_logs_cmd
 from invariants import Result, ToolCall, Trace
 
@@ -101,7 +133,7 @@ TARGETS = ("fake",)            # the admin tap needs the fake cluster's admin ch
 REQUIRES = {"scheduler": "slurm", "mfa": "none"}   # squeue/sacct, and an autonomous BYO bring-up (no one-time code)
 KIND = "regression"
 SUMMARY = ("spend honesty: stop_endpoint answers `down` while the canary is still queued — does the endpoint relaunch a "
-           "pilot after it? (scripted; the admin tap watches the queue)")
+           "pilot after it? (scripted; phase `second`: a user endpoint that already ran a block; the admin tap watches)")
 TAGS = ["fake", "stop", "spend", "canary", "scripted", "admin"]
 PERSONA = None
 USER_GOAL = ""
@@ -117,15 +149,29 @@ def _env_s(name: str, default: float) -> float:
         return default
 
 
+def _phase() -> str:
+    """HPCB_RELAUNCH_PHASE: `second` (default — the stop that matters is the one on the user endpoint's SECOND pilot,
+    after a first that connected) or `first` (the stop on its first pilot: the bad-state path of the first live run)."""
+    p = os.environ.get("HPCB_RELAUNCH_PHASE", "").strip().lower()
+    return p if p in ("first", "second") else "second"
+
+
 # 420 s: several of parsl's 60 s job-status polls plus its 5 s strategy period after the stop (the first live run's
 # executor acted 56 s after it)
 WATCH_S = _env_s("HPCB_RELAUNCH_WATCH_S", 420.0)
-PILOT_WAIT_S = _env_s("HPCB_RELAUNCH_PILOT_WAIT_S", 180.0)   # how long step 3 waits for a pilot to be in the queue
-LOGIN_UP_WAIT_S = 300.0                                       # how long step 1 waits for the login shape
+PILOT_WAIT_S = _env_s("HPCB_RELAUNCH_PILOT_WAIT_S", 180.0)   # how long a phase waits for its pilot to be in the queue
+WARM_WAIT_S = 300.0                                           # phase A: how long the block gets to answer a check
+LOGIN_UP_WAIT_S = 300.0                                       # how long the login shape gets to come up
+SENTINEL_WAIT_S = 120.0                                       # phase B: how long the sentinel gets to start running
+# Phase `second`: every pilot of this endpoint, and the sentinel, carry this name; with `--dependency=singleton` a pilot
+# waits for any job of the same user and name that runs. The name keeps `parsl` in it, so the universal postcheck
+# (`stop_honesty_no_pilot_left`: no job named *parsl* left) still sees a pilot left queued.
+SINGLETON_NAME = "parsl-hpcb-qcr"
 
 
 def _hold_s() -> int:
-    """The `--begin` hold on every pilot (see THE HOLD): HPCB_RELAUNCH_HOLD_S, default max(1800, watch + 900); 0 = none."""
+    """Phase `first`: the `--begin` hold on every pilot (see THE HOLD): HPCB_RELAUNCH_HOLD_S, default max(1800,
+    watch + 900); 0 = none."""
     raw = os.environ.get("HPCB_RELAUNCH_HOLD_S", "").strip()
     if raw:
         try:
@@ -135,43 +181,70 @@ def _hold_s() -> int:
     return int(max(1800.0, WATCH_S + 900.0))
 
 
-# Held, no pilot ever starts (no node); without the hold the pilot and its relaunch run for the whole watch.
-NEEDS_COMPUTE_NODE = _hold_s() == 0
-# The admin tap (run_smoke.sh starts it before the cell; harness/admin_tap.py): the pool user's queue and history as
-# root on slurmctld, every 10 s, with the controller's clock.
-ADMIN_TAP = {"every_s": 10, "cmd": slurm_sample_cmd(), "ids_cmd": slurm_ids_cmd()}
+# Phase `second` runs a real block (phase A) on one node for a minute; `first`, held, never starts one (unless the hold
+# is dropped). The sentinel takes one core.
+NEEDS_COMPUTE_NODE = _phase() == "second" or _hold_s() == 0
+# The admin tap (run_smoke.sh starts it before the cell; harness/admin_tap.py): the pool user's jobs and history as root
+# on slurmctld every 10 s, with the controller's clock; jobs asked for by id; and, once phase B asks, `scontrol hold` on
+# every new PENDING pilot of this endpoint.
+ADMIN_TAP = {"every_s": 10, "cmd": slurm_sample_cmd(), "ids_cmd": slurm_ids_cmd(), "hold_cmd": slurm_hold_cmd()}
+# Before the cell and after it, as the pool user: no job of the singleton name may be left (one from a cell killed before
+# its cleanup would keep this cell's first pilot from ever starting).
+SETUP = [f"scancel -u \"$(whoami)\" --name={SINGLETON_NAME} 2>/dev/null; echo ok"]
+CLEANUP = [f"scancel -u \"$(whoami)\" --name={SINGLETON_NAME} 2>/dev/null; echo ok"]
 
 PROMPT = (
     "(Scripted — no agent reads this.) On the HPC facility with login host `{ssh_host}` — facility id `{facility}` — "
-    "bring up the login shape from the probe's proposal (every pilot held PENDING by an #SBATCH --begin hold), start a "
-    "compute block with confirm_spend=True, wait on the login shape until its pilot is in the queue, and stop the "
-    "endpoint at once. No teardown: the harness watches the scheduler as its admin for a relaunched pilot."
+    "bring up the login shape from the probe's proposal; phase A: start a compute block, let it answer, run `hostname` "
+    "on it, stop the endpoint; phase B: start a block again in the same user endpoint (its pilot kept PENDING), wait on "
+    "the login shape until the pilot is in the queue, and stop the endpoint at once. No teardown: the harness watches "
+    "the scheduler as its admin for a relaunched pilot."
 )
 
-_PILOT = re.compile(r"^HPCB_PILOT (\S+) (\S+)(?: (.*))?$", re.M)
+# `HPCB_PILOT <job> <state> <uep dir or -> <reason…>` (pilot_poll_cmd); the first run's lines had no uep field
+_PILOT = re.compile(r"^HPCB_PILOT (\S+) (\S+)(?: (uep\.\S+|-))?(?: (.*))?$", re.M)
 _RELEASED = re.compile(r"released ([0-9][0-9_ ]*)")
 
 
 def pilot_poll_cmd(eid: str) -> str:
-    """The login-shape poll: this endpoint's pilots as `HPCB_PILOT <job> <state> <reason>` lines (squeue's batch script
-    carries the `uep.<eid>` marker, the one scheduler_ops._release_cmd matches the StdOut path on). Exits 0 on no match."""
+    """The login-shape poll: this endpoint's pilots as `HPCB_PILOT <job> <state> <uep> <reason>` lines (squeue's batch
+    script carries the `uep.<eid>` marker, the one scheduler_ops._release_cmd matches the StdOut path on, and names the
+    user endpoint: `uep.<eid>.<uep id>/submit_scripts/…`). Exits 0 on no match."""
     marker = shlex.quote(f"uep.{eid}")
     return ("squeue -u \"$USER\" -h -o '%i|%T|%r|%o' 2>/dev/null "
-            f"| awk -F'|' -v m={marker} 'index($4,m){{print \"HPCB_PILOT \"$1\" \"$2\" \"$3}}'; true")
+            f"| awk -F'|' -v m={marker} 'index($4,m){{u=\"-\"; "
+            "if (match($4, /uep\\.[0-9a-f.-]+\\/submit_scripts/)) u=substr($4, RSTART, RLENGTH-15); "
+            "print \"HPCB_PILOT \"$1\" \"$2\" \"u\" \"$3}'; true")
 
 
-def _pilots(c: ToolCall) -> list[tuple[str, str, str]]:
-    """(job, state, reason) of each pilot a poll saw."""
-    return [(m.group(1), m.group(2), (m.group(3) or "").strip()) for m in _PILOT.finditer(str((c.result or {}).get("stdout") or ""))]
+@dataclass(frozen=True)
+class Pilot:
+    job: str
+    state: str
+    uep: str       # the user endpoint's dir, `uep.<eid>.<uep id>` ("" when the poll did not say)
+    reason: str
 
 
-def _proposal_details(r: dict, hold_s: int) -> dict:
+def _pilots(c: ToolCall) -> list[Pilot]:
+    """The pilots a poll saw."""
+    return [Pilot(m.group(1), m.group(2), "" if m.group(3) in (None, "-") else m.group(3), (m.group(4) or "").strip())
+            for m in _PILOT.finditer(str((c.result or {}).get("stdout") or ""))]
+
+
+def _desc(ps: list[Pilot]) -> str:
+    return ", ".join(f"job {p.job} {p.state}" + (f" ({p.reason})" if p.reason and p.reason != "None" else "")
+                     for p in ps)
+
+
+def _proposal_details(r: dict, hold_s: int, phase: str = "first") -> dict:
     """The proposal as the confirming details=: env_setup left out (the server keeps the proposed one — the tool's own
-    instruction), unset fields dropped, and the HOLD added."""
+    instruction), unset fields dropped, and the phase's directives after any the proposal carried (one per line, as the
+    field says): `first` — the `--begin` HOLD; `second` — the singleton name and dependency (THE SENTINEL)."""
     details = {k: v for k, v in dict(r.get("proposed_details") or {}).items() if v is not None and k != "env_setup"}
-    if hold_s:   # after any directive the proposal carried (one per line, as the field says)
-        details["scheduler_options"] = "\n".join(x for x in (details.get("scheduler_options"),
-                                                             f"#SBATCH --begin=now+{hold_s}") if x)
+    extra = ([f"#SBATCH --job-name={SINGLETON_NAME}", "#SBATCH --dependency=singleton"] if phase == "second" else
+             [f"#SBATCH --begin=now+{hold_s}"] if hold_s else [])
+    if extra:
+        details["scheduler_options"] = "\n".join(x for x in (details.get("scheduler_options"), *extra) if x)
     return details
 
 
@@ -181,55 +254,166 @@ def _account(r: dict) -> str | None:
     return next((a for a in accounts if "gpu" not in a.lower()), accounts[0] if accounts else None)
 
 
+def sentinel_cmd(partition: str | None, account: str | None) -> str:
+    """Phase B's sentinel, as the pool user on the login shape: one core, the pilots' name, running for an hour (the
+    world check cancels it once the watch is over; CLEANUP again)."""
+    opts = [f"-J {SINGLETON_NAME}", "-N1", "-n1", "-t 01:00:00", "-o /dev/null", "-e /dev/null"]
+    if partition:
+        opts.append(f"-p {shlex.quote(partition)}")
+    if account:
+        opts.append(f"-A {shlex.quote(account)}")
+    return f"sbatch --parsable {' '.join(opts)} --wrap 'sleep 3600'"
+
+
+def _brief(r: dict) -> str:
+    return str(r.get("notice") or r.get("text") or r.get("stdout") or "")[:200]
+
+
+async def _poll_pilots(ops, eid: str, *, exclude: set[str]) -> list[Pilot]:
+    """Poll the queue on the free login shape until a pilot of this endpoint not in `exclude` is in it (or abort)."""
+    deadline = time.monotonic() + PILOT_WAIT_S
+    while True:
+        q = await ops.call("run_shell", shape="login", command=pilot_poll_cmd(eid))
+        pilots = [p for p in _pilots(ToolCall("run_shell", {}, q)) if p.job not in exclude]
+        if pilots:
+            return pilots
+        if time.monotonic() > deadline:
+            ops.abort(f"no new pilot of uep.{eid} entered the queue within {PILOT_WAIT_S:.0f} s (last poll: {_brief(q)!r})")
+        await ops.sleep(1)
+
+
 async def SCRIPT(ops) -> str:   # the script operator runs it (harness/script_runner.py)
+    phase = _phase()
     fid, host, hold = ops.facility, ops.ssh_host, _hold_s()
     # 1. the login shape, from the probe's proposal
     r = await ops.call("connect_facility", facility=fid, ssh_host=host)
     if r.get("phase") != "proposed_facility_details":
-        ops.abort(f"the probe did not propose details: phase={r.get('phase')!r} {str(r.get('notice') or r.get('text'))[:200]!r}")
-    r = await ops.call("connect_facility", facility=fid, ssh_host=host, details=_proposal_details(r, hold))
+        ops.abort(f"the probe did not propose details: phase={r.get('phase')!r} {_brief(r)!r}")
+    r = await ops.call("connect_facility", facility=fid, ssh_host=host, details=_proposal_details(r, hold, phase))
     deadline = time.monotonic() + LOGIN_UP_WAIT_S
     while r.get("phase") != "needs_account":
         if r.get("phase") != "provisioning" or time.monotonic() > deadline:
-            ops.abort(f"the login shape did not come up: phase={r.get('phase')!r} "
-                      f"{str(r.get('notice') or r.get('text'))[:200]!r}")
+            ops.abort(f"the login shape did not come up: phase={r.get('phase')!r} {_brief(r)!r}")
         await ops.sleep(5)
         r = await ops.call("connect_facility", facility=fid, ssh_host=host)
-    ops.say(f"login shape up; every pilot is held: {'#SBATCH --begin=now+' + str(hold) if hold else 'no hold'}")
-    # 2. the billed block, confirmed: its canary goes out and (the block cold) stays queued
-    args: dict = {"shape": "compute", "confirm_spend": True}
-    if (account := _account(r)) is not None:
-        args["account"] = account
+    account = _account(r)
+    args: dict = {"shape": "compute", "confirm_spend": True, **({"account": account} if account else {})}
+    if phase == "first":
+        ops.say(f"phase first; login shape up; every pilot is held: {'#SBATCH --begin=now+' + str(hold) if hold else 'no hold'}")
+        return await _first_pilot(ops, args)
+    ops.say(f"phase second; login shape up; every pilot is named {SINGLETON_NAME} with --dependency=singleton")
+    return await _second_pilot(ops, args, account)
+
+
+async def _first_pilot(ops, args: dict) -> str:
+    """The stop on the user endpoint's FIRST pilot, held PENDING by the `--begin` hold (the first live run's sequence)."""
+    e = await ops.call("ensure_endpoint_up", **args)   # its canary goes out and (the block cold) stays queued
+    eid = str(e.get("endpoint_id") or "")
+    if e.get("status") not in ("provisioning", "up") or not eid:
+        ops.abort(f"no block was started: status={e.get('status')!r} {_brief(e)!r}")
+    pilots = await _poll_pilots(ops, eid, exclude=set())
+    s = await ops.call("stop_endpoint")   # at once
+    ops.say(f"pilot(s) at the stop: {_desc(pilots)}. stop_endpoint answered status={s.get('status')!r}, "
+            f"spend_stopped={s.get('spend_stopped')!r}: {_brief(s)}")
+    return (f"stopped with {_desc(pilots)} in the queue; stop_endpoint said {s.get('status')!r} "
+            f"(spend_stopped={s.get('spend_stopped')!r}). Not torn down: the world check watches for a relaunch.")
+
+
+async def _second_pilot(ops, args: dict, account: str | None) -> str:
+    """Phase A: a block that runs, answers the check and a command, then an honest stop — the user endpoint now has a
+    job that connected. Phase B: the same user endpoint's next pilot, kept PENDING (the sentinel, then the tap's hold),
+    and the stop while its check is queued."""
+    # ---- phase A
     e = await ops.call("ensure_endpoint_up", **args)
     eid = str(e.get("endpoint_id") or "")
     if e.get("status") not in ("provisioning", "up") or not eid:
-        ops.abort(f"no block was started: status={e.get('status')!r} {str(e.get('notice') or e.get('text'))[:200]!r}")
-    # 3. the queue, on the free login shape, until this endpoint's pilot is in it
-    deadline = time.monotonic() + PILOT_WAIT_S
-    while True:
-        q = await ops.call("run_shell", shape="login", command=pilot_poll_cmd(eid))
-        pilots = _pilots(ToolCall("run_shell", {}, q))
-        if pilots or time.monotonic() > deadline:
+        ops.abort(f"phase A: no block was started: status={e.get('status')!r} {_brief(e)!r}")
+    partition = e.get("partition")   # the block's queue: the sentinel must share it to share the pilots' nodes
+    poll_args = {k: v for k, v in args.items() if k != "confirm_spend"}
+    deadline = time.monotonic() + WARM_WAIT_S
+    while e.get("status") != "up":
+        if e.get("status") != "provisioning" or time.monotonic() > deadline:
+            ops.abort(f"phase A: the block never answered a check: status={e.get('status')!r} {_brief(e)!r}")
+        await ops.sleep(5)
+        e = await ops.call("ensure_endpoint_up", **poll_args)
+        partition = e.get("partition") or partition
+    h = await ops.call("run_shell", shape="compute", command="hostname")
+    if h.get("phase") != "complete":
+        ops.abort(f"phase A: hostname did not complete on the block: phase={h.get('phase')!r} {_brief(h)!r}")
+    first = await _poll_pilots(ops, eid, exclude=set())
+    a = await ops.call("stop_endpoint")
+    for _ in range(3):   # nothing of ours is outstanding: an honest stop ends `down` (a cold channel may first drain)
+        if a.get("status") != "draining":
             break
-        await ops.sleep(1)
-    if not pilots:
-        ops.abort(f"no pilot of uep.{eid} entered the queue within {PILOT_WAIT_S:.0f} s (last poll: "
-                  f"{str(q.get('stdout') or q.get('notice') or q.get('text'))[:200]!r})")
-    seen = ", ".join(f"{j} {s}" + (f" ({why})" if why and why != "None" else "") for j, s, why in pilots)
-    # 4. stop at once
-    s = await ops.call("stop_endpoint")
-    ops.say(f"pilot(s) at the stop: {seen}. stop_endpoint answered status={s.get('status')!r}, "
-            f"spend_stopped={s.get('spend_stopped')!r}: {str(s.get('notice') or s.get('text'))[:300]}")
-    # 5. no teardown: the harness watches the queue first, then tears down
-    return (f"stopped with {seen} in the queue; stop_endpoint said {s.get('status')!r} "
-            f"(spend_stopped={s.get('spend_stopped')!r}). Not torn down: the world check watches for a relaunch.")
+        await ops.sleep(5)
+        a = await ops.call("stop_endpoint")
+    ops.say(f"phase A: block {_desc(first)} on {first[0].uep or '?'} answered and ran hostname on "
+            f"{str(h.get('stdout') or '').strip()!r}; stop_endpoint said {a.get('status')!r} "
+            f"(spend_stopped={a.get('spend_stopped')!r}): {_brief(a)}")
+    # ---- phase B: the sentinel first, so the next pilot cannot start (an idle node starts a job within a second)
+    sub = await ops.call("run_shell", shape="login", command=sentinel_cmd(partition, account))
+    sid = str(sub.get("stdout") or "").strip().split(";")[0].strip()
+    if not sid.isdigit():
+        ops.abort(f"phase B: the sentinel was not submitted: {_brief(sub)!r}")
+    deadline = time.monotonic() + SENTINEL_WAIT_S
+    while True:
+        q = await ops.call("run_shell", shape="login", command=f"squeue -j {sid} -h -o %T 2>/dev/null; true")
+        if str(q.get("stdout") or "").strip() == "RUNNING":
+            break
+        if time.monotonic() > deadline:
+            ops.abort(f"phase B: the sentinel (job {sid}) never started running: {_brief(q)!r}")
+        await ops.sleep(2)
+    held = TapReader(os.environ.get(TAP_ENV, "").strip() or None).request_hold(f"uep.{eid}", int(sid) + 1)
+    ops.say(f"phase B: sentinel job {sid} running; " + (f"the admin tap holds every new pilot of uep.{eid} from job "
+            f"{int(sid) + 1}" if held else "NO admin tap to hold the next pilots (only the sentinel keeps them PENDING)"))
+    b = await ops.call("ensure_endpoint_up", **args)   # the same terms: the same user endpoint, a new canary
+    if b.get("status") not in ("provisioning", "up"):
+        ops.abort(f"phase B: no block was started: status={b.get('status')!r} {_brief(b)!r}")
+    second = await _poll_pilots(ops, eid, exclude={p.job for p in first} | _released(ToolCall("stop_endpoint", {}, a)))
+    s = await ops.call("stop_endpoint")   # at once: the check is queued behind a pilot that cannot start
+    ops.say(f"phase B: pilot(s) at the stop: {_desc(second)} on {second[0].uep or '?'}. stop_endpoint answered "
+            f"status={s.get('status')!r}, spend_stopped={s.get('spend_stopped')!r}: {_brief(s)}")
+    return (f"phase A stop said {a.get('status')!r}; phase B stopped with {_desc(second)} in the queue and said "
+            f"{s.get('status')!r} (spend_stopped={s.get('spend_stopped')!r}). Not torn down: the world check watches.")
 
 
 # ---- what the trace says ----------------------------------------------------------------------------------------------
 
+def _is_sentinel(c: ToolCall) -> bool:
+    cmd = str(c.input.get("command") or "")
+    return c.name == "run_shell" and "sbatch" in cmd and f"-J {SINGLETON_NAME}" in cmd and "--wrap" in cmd
+
+
+def _sentinel_index(t: Trace) -> int | None:
+    """Where phase B began (its sentinel's submission); None in phase `first` (or before phase B)."""
+    return next((i for i, c in enumerate(t.calls) if _is_sentinel(c)), None)
+
+
+def _sentinel_job(t: Trace) -> str | None:
+    i = _sentinel_index(t)
+    sid = str((t.calls[i].result or {}).get("stdout") or "").strip().split(";")[0].strip() if i is not None else ""
+    return sid if sid.isdigit() else None
+
+
 def _stop(t: Trace) -> tuple[int, ToolCall] | None:
+    """The JUDGED stop: in phase `second` the first one after the sentinel (phase B's); else the first one."""
     stops = t.named("stop_endpoint")
+    s = _sentinel_index(t)
+    if s is not None:
+        return next(((i, c) for i, c in stops if i > s), None)
     return stops[0] if stops else None
+
+
+def _phase_a_stops(t: Trace) -> list[tuple[int, ToolCall]]:
+    s = _sentinel_index(t)
+    return [(i, c) for i, c in t.named("stop_endpoint") if s is not None and i < s]
+
+
+def _window(t: Trace) -> tuple[int, int]:
+    """(start, end) of the calls that judge the judged stop's premise: from phase B's start (or the run's), to it."""
+    s = _sentinel_index(t)
+    stop = _stop(t)
+    return (s if s is not None else -1), (stop[0] if stop else len(t.calls))
 
 
 def _claims_stopped(c: ToolCall) -> bool:
@@ -243,48 +427,69 @@ def _released(c: ToolCall) -> set[str]:
     return set(m.group(1).split()) if m else set()
 
 
-def _last_poll(t: Trace, before: int) -> tuple[int, list[tuple[str, str, str]]] | None:
-    """The last login-shape squeue poll before call `before` that saw a pilot."""
-    for i, c in reversed(t.named("run_shell")):
-        if i < before and (p := _pilots(c)):
-            return i, p
-    return None
+def _polls(t: Trace, after: int, before: int) -> list[tuple[int, list[Pilot]]]:
+    return [(i, p) for i, c in t.named("run_shell") if after < i < before and (p := _pilots(c))]
+
+
+def _last_poll(t: Trace) -> tuple[int, list[Pilot]] | None:
+    """The last squeue poll in the judged stop's window that saw a pilot."""
+    polls = _polls(t, *_window(t))
+    return polls[-1] if polls else None
 
 
 def _seen_before(t: Trace, before: int) -> set[str]:
-    return {j for i, c in t.named("run_shell") if i < before for j, _, _ in _pilots(c)}
+    return {p.job for _, ps in _polls(t, -1, before) for p in ps}
+
+
+def _answered(t: Trace, after: int, before: int) -> tuple[int, str] | None:
+    """A worker answered between those calls: an ensure_endpoint_up said up/warm, or compute work completed."""
+    for i, c in enumerate(t.calls):
+        if not (after < i < before) or str(c.input.get("shape") or "compute") != "compute":
+            continue
+        r = c.result or {}
+        if c.name == "ensure_endpoint_up" and (str(r.get("status")) == "up" or str(r.get("block_state")) == "warm"):
+            return i, f"ensure_endpoint_up (call {i}) answered status={r.get('status')!r}: a worker answered the check"
+        if c.name == "run_shell" and r.get("phase") == "complete":
+            return i, f"compute work completed (call {i}): a worker was up"
+    return None
 
 
 def canary_state(t: Trace) -> tuple[str, str]:
-    """Was hpc-bridge's check still queued when the stop came? `queued` (every pilot PENDING at the last poll before the
-    stop, and no worker had answered: none could have run it), `ran` (a worker answered before the stop: an
-    ensure_endpoint_up said up/warm, or compute work completed), or `unknown` (a pilot was RUNNING: its worker may have
-    run it first) — with why."""
-    stop = _stop(t)
-    before = stop[0] if stop else len(t.calls)
-    for i, c in t.named("ensure_endpoint_up"):
-        r = c.result or {}
-        if i < before and str(c.input.get("shape") or "compute") == "compute" and (
-                str(r.get("status")) == "up" or str(r.get("block_state")) == "warm"):
-            return "ran", f"ensure_endpoint_up (call {i}) answered status={r.get('status')!r}: a worker answered the check"
-    for i, c in t.named("run_shell"):
-        if i < before and str(c.input.get("shape") or "compute") == "compute" and (c.result or {}).get("phase") == "complete":
-            return "ran", f"compute work completed (call {i}): a worker was up"
-    last = _last_poll(t, before)
+    """Was hpc-bridge's check still queued when the JUDGED stop came? `queued` (every pilot PENDING at the last poll
+    before it, in its window, and no worker had answered there), `ran` (a worker answered in that window), or `unknown`
+    (a pilot was RUNNING: its worker may have run it first) — with why. Phase A's answers are before the window."""
+    start, end = _window(t)
+    if (got := _answered(t, start, end)) is not None:
+        return "ran", got[1]
+    last = _last_poll(t)
     if last is None:
         return "unknown", "no squeue poll before the stop saw a pilot of this endpoint"
     i, pilots = last
-    desc = ", ".join(f"job {j} {s}" + (f" ({w})" if w and w != "None" else "") for j, s, w in pilots)
-    if all(s == "PENDING" for _, s, _ in pilots):
-        return "queued", f"{desc} at the last poll before the stop (call {i}): no worker had started, so the check was queued"
-    return "unknown", f"{desc} at the last poll before the stop (call {i}): its worker may have run the check first"
+    if all(p.state == "PENDING" for p in pilots):
+        return "queued", (f"{_desc(pilots)} at the last poll before the stop (call {i}): no worker had started, so the "
+                          "check was queued")
+    return "unknown", f"{_desc(pilots)} at the last poll before the stop (call {i}): its worker may have run the check first"
+
+
+def same_user_endpoint(t: Trace) -> tuple[bool | None, str]:
+    """Phase `second`: did phase B's pilot come from the SAME user endpoint as phase A's (the `uep.<eid>.<uep id>` dir
+    of their batch scripts)? None when a side is unknown."""
+    s = _sentinel_index(t)
+    if s is None:
+        return None, "no phase B"
+    a = {p.uep for _, ps in _polls(t, -1, s) for p in ps if p.uep}
+    b = {p.uep for _, ps in _polls(t, *_window(t)) for p in ps if p.uep}
+    if not a or not b:
+        return None, f"the user endpoint is unknown (phase A: {sorted(a) or '?'}, phase B: {sorted(b) or '?'})"
+    return a == b, (f"phase A and phase B both ran in {sorted(a)[0]}" if a == b else
+                    f"phase A ran in {sorted(a)}, phase B in {sorted(b)}: a NEW user endpoint")
 
 
 def stop_answer(t: Trace) -> Result:
-    """REPORTED: the stop's full answer."""
+    """REPORTED: the judged stop's full answer."""
     stop = _stop(t)
     if stop is None:
-        return Result("stop_answer", False, "no stop_endpoint call")
+        return Result("stop_answer", False, "no judged stop_endpoint call")
     i, c = stop
     keep = ("status", "spend_stopped", "block_state", "block_job_id", "endpoint_id", "session_spend", "notice", "text",
             "is_error")
@@ -292,24 +497,38 @@ def stop_answer(t: Trace) -> Result:
                                                                     default=str))
 
 
+def phase_a_stop(t: Trace) -> Result:
+    """REPORTED: phase A's stop(s) — nothing of ours outstanding, so an honest `down`."""
+    stops = _phase_a_stops(t)
+    if not stops:
+        return Result("phase_a_stop", True, "no phase A (HPCB_RELAUNCH_PHASE=first, or phase B never started)")
+    last = stops[-1][1].result or {}
+    return Result("phase_a_stop", _claims_stopped(stops[-1][1]),
+                  " · ".join(f"call {i}: status={(c.result or {}).get('status')!r}, spend_stopped="
+                             f"{(c.result or {}).get('spend_stopped')!r}, released {sorted(_released(c)) or 'none'}"
+                             for i, c in stops) + (f" — {str(last.get('notice') or '')[:160]}" if last else ""))
+
+
 def pilot_state_at_stop(t: Trace) -> Result:
-    """REPORTED: what the last squeue poll before the stop saw of this endpoint's pilot(s)."""
-    stop = _stop(t)
-    last = _last_poll(t, stop[0] if stop else len(t.calls))
+    """REPORTED: what the last squeue poll before the judged stop saw of this endpoint's pilot(s), and their user
+    endpoint (phase `second`: whether it is phase A's)."""
+    last = _last_poll(t)
     if last is None:
         return Result("pilot_state_at_stop", False, "no squeue poll saw a pilot of this endpoint before the stop")
     i, pilots = last
-    return Result("pilot_state_at_stop", True, f"call {i}: " + ", ".join(
-        f"job {j} {s}" + (f" ({w})" if w and w != "None" else "") for j, s, w in pilots))
+    same, why = same_user_endpoint(t)
+    return Result("pilot_state_at_stop", same is not False, f"call {i}: {_desc(pilots)}"
+                  + (f" in {pilots[0].uep}" if pilots[0].uep else "") + (f"; {why}" if _sentinel_index(t) is not None
+                                                                          else ""))
 
 
 def canary_before_stop(t: Trace) -> Result:
-    """REPORTED: whether the canary could have run before the stop (canary_state)."""
+    """REPORTED: whether the canary could have run before the judged stop (canary_state)."""
     state, why = canary_state(t)
     return Result("canary_before_stop", state == "queued", f"{state}: {why}")
 
 
-# ---- what the scheduler says (the admin tap) ---------------------------------------------------------------------------
+# ---- what the scheduler says (the admin tap) and what the endpoint says (its log) -------------------------------------
 
 NO_RELAUNCH = "world:no_relaunch_after_down"
 
@@ -323,41 +542,51 @@ class LogLine:
 
 @dataclass
 class Watch:
-    """What the admin tap saw of this endpoint around the stop, and what the endpoint's own log says. Times are the
-    controller's clock (the jail's and the login node's too: one Docker VM kernel)."""
-    called_at: float | None = None      # the stop call started
+    """What the admin tap saw of this endpoint around the judged stop, and what the endpoint's own log says. Times are
+    the controller's clock (the jail's and the login node's too: one Docker VM kernel)."""
+    called_at: float | None = None      # the judged stop call started
     answered_at: float | None = None    # it answered
     window_s: float = WATCH_S
     covered_until: float | None = None  # the controller clock of the latest sample read
     samples: int = 0
     jobs: list[SlurmJob] = field(default_factory=list)   # this endpoint's jobs (by its marker), queue and history merged
     unverifiable: str | None = None
-    own_ids: set[str] = field(default_factory=set)       # the cell's own pilot(s): the script's poll + the stop's release
+    own_ids: set[str] = field(default_factory=set)       # the judged stop's own pilot(s): its window's polls + release
     seen_unmarked: set[str] = field(default_factory=set)  # own ids the tap saw WITHOUT this endpoint's marker
     log_lines: list[LogLine] | None = None                # strategy lines after the stop (None: the log was not read)
     log_error: str = ""
+    phase: str = "first"                                  # HPCB_RELAUNCH_PHASE as the run was made
+    held: set[str] = field(default_factory=set)           # jobs the tap held (phase B's hold request)
 
 
-def _stop_times(messages: list) -> tuple[float | None, float | None]:
-    """(started, answered) of the run's first stop_endpoint, in epoch seconds: the server journal's own stamps (`ts`,
-    `ms`), else the script's step record."""
-    for m in messages or []:
-        row = m.get("journal") if isinstance(m, dict) else None
-        if isinstance(row, dict) and row.get("tool") == "stop_endpoint" and isinstance(row.get("ts"), int | float):
-            return float(row["ts"]), float(row["ts"]) + float(row.get("ms") or 0) / 1000.0
-    for m in messages or []:
-        n = m.get("native") if isinstance(m, dict) else None
-        if isinstance(n, dict) and n.get("name") == "stop_endpoint" and n.get("t_end") is not None:
-            return n.get("t_start"), float(n["t_end"])
+def _stop_times(messages: list, nth: int = 0) -> tuple[float | None, float | None]:
+    """(started, answered) of the run's `nth` stop_endpoint (0-based, in the order the calls started), in epoch seconds:
+    the server journal's own stamps (`ts`, `ms`), else the script's step record."""
+    rows = sorted((m["journal"] for m in messages or [] if isinstance(m, dict) and isinstance(m.get("journal"), dict)
+                   and m["journal"].get("tool") == "stop_endpoint" and isinstance(m["journal"].get("ts"), int | float)),
+                  key=lambda r: r["ts"])
+    if len(rows) > nth:
+        r = rows[nth]
+        return float(r["ts"]), float(r["ts"]) + float(r.get("ms") or 0) / 1000.0
+    steps = [m["native"] for m in messages or [] if isinstance(m, dict) and isinstance(m.get("native"), dict)
+             and m["native"].get("name") == "stop_endpoint" and m["native"].get("t_end") is not None]
+    if len(steps) > nth:
+        return steps[nth].get("t_start"), float(steps[nth]["t_end"])
     return None, None
 
 
+def _judged_nth(t: Trace) -> int:
+    """Which stop_endpoint call (0-based) the judged stop is."""
+    stop = _stop(t)
+    return sum(1 for i, _ in t.named("stop_endpoint") if stop is not None and i < stop[0])
+
+
 def own_pilots(t: Trace) -> set[str]:
-    """The cell's own pilot job ids: what the script's squeue polls saw before the stop, and what the stop released."""
+    """The judged stop's own pilot job ids: what the squeue polls in its window saw, and what it released."""
     stop = _stop(t)
     if stop is None:
         return set()
-    return _released(stop[1]) | _seen_before(t, stop[0])
+    return _released(stop[1]) | {p.job for _, ps in _polls(t, *_window(t)) for p in ps}
 
 
 def endpoint_jobs(samples: list, eids: list[str]) -> list[SlurmJob]:
@@ -387,13 +616,13 @@ def endpoint_jobs(samples: list, eids: list[str]) -> list[SlurmJob]:
 
 
 def relaunches(t: Trace, w: Watch) -> list[SlurmJob]:
-    """Pilots of this endpoint the stop did not account for: not among those it released or the script saw before it,
-    and submitted once the stop had started (a whole-second Slurm stamp, so 1 s of slack) — or, with no submit time, first
-    seen after its answer."""
+    """Pilots of this endpoint no stop accounted for: not among those any stop released or a poll saw before the judged
+    stop, and submitted once it had started (a whole-second Slurm stamp, so 1 s of slack) — or, with no submit time,
+    first seen after its answer."""
     stop = _stop(t)
     if stop is None or w.answered_at is None:
         return []
-    known = own_pilots(t)
+    known = _seen_before(t, stop[0]) | {j for _, c in t.named("stop_endpoint") for j in _released(c)}
     since = (w.called_at if w.called_at is not None else w.answered_at) - 1.0
     return [j for j in w.jobs if j.job_id not in known and (
         (j.submit is not None and j.submit >= since) or (j.submit is None and (j.seen_at or 0) >= w.answered_at))]
@@ -406,16 +635,14 @@ def _describe(j: SlurmJob, w: Watch) -> str:
     return f"job {j.job_id} {at}, {j.state}{why}"
 
 
-# ---- the endpoint's own log: parsl's strategy decisions after the stop -------------------------------------------------
-
 # A parsl / Globus Compute log line: `2026-10-16 02:27:55,056648 ERROR MainProcess-443 …` (UTC on the fake login node:
 # run 2's scale-out at 02:26:54 sits 8 s after its ensure_endpoint_up call in the journal's epoch).
 _LOG_TS = re.compile(r"^(\d{4}-\d{2}-\d{2} \d{2}:\d{2}:\d{2}),(\d{1,6}) ")
 _LOG_FILE = re.compile(r"^=== (\S+)")
 # What decides a relaunch, as GCE 4.18 / parsl 2026.10 log it at INFO: the strategy's scale-out (`Scaling out by N
-# blocks`, `Allocated block ID n`), its scale-in, the error handler (a cancelled block that never connected is rewritten
-# to MISSING and, with init_blocks 0, puts the executor in bad state: `Not strategizing … because bad state`), the
-# interchange's outstanding work, and the manager (re)starting or losing a user endpoint.
+# blocks`, `Allocated block ID n`), its scale-in, the error handler (a finished block that never connected is rewritten
+# to MISSING and, when every job is FAILED/MISSING, puts the executor in bad state: `Not strategizing … because bad
+# state`), the interchange's outstanding work, and the manager (re)starting or losing a user endpoint.
 _STRATEGY = re.compile(
     r"Scaling (?:out|in) by \d+|Allocated block ID|[Ss]trategy case|Requesting \d+ more blocks?|[Ii]dle time|"
     r"[Ss]caling in|bad state|TooManyJobFailures|marked as MISSING|Not strategizing|[Oo]utstanding|"
@@ -468,7 +695,7 @@ def _short_log(x: LogLine, w: Watch) -> str:
 
 
 def strategy_after_stop(w: Watch) -> Result:
-    """REPORTED: what the endpoint itself decided after the stop — parsl's scale-outs, the error handler, the user
+    """REPORTED: what the endpoint itself decided after the judged stop — parsl's scale-outs, the error handler, the user
     endpoint stopping or restarting — the direct evidence of a relaunch, or of why there was none."""
     if w.log_lines is None:
         return Result("strategy_after_stop", False, f"UNVERIFIABLE — the endpoint's logs were not read: "
@@ -481,19 +708,46 @@ def strategy_after_stop(w: Watch) -> Result:
                   + (f" · … {len(w.log_lines) - 14} more" if len(w.log_lines) > 14 else ""))
 
 
+def uep_job_history(t: Trace, w: Watch) -> Result:
+    """REPORTED: the user endpoint's jobs as the scheduler and the trace know them — phase A's (did a worker answer on
+    it: it connected), the judged stop's own, the relaunched — with their states; and the endpoint log's MISSING / bad
+    state lines (parsl rewrites a finished block that never connected to MISSING)."""
+    s = _sentinel_index(t)
+    a_ids = {p.job for _, ps in _polls(t, -1, s) for p in ps} | {j for _, c in _phase_a_stops(t) for j in _released(c)} \
+        if s is not None else set()
+    answered = _answered(t, -1, s) if s is not None else None
+    new = {j.job_id for j in relaunches(t, w)}
+
+    def label(j: SlurmJob) -> str:
+        if j.job_id in a_ids:
+            return "phase A" + (", connected (a worker answered on it)" if answered else ", never answered")
+        if j.job_id in w.own_ids:
+            return "the judged stop's own pilot"
+        return "RELAUNCHED after the stop" if j.job_id in new else "other"
+
+    jobs = "; ".join(f"job {j.job_id} {j.state}{' (' + j.reason + ')' if j.reason and j.reason != 'None' else ''}"
+                     f"{' HELD by the tap' if j.job_id in w.held else ''} — {label(j)}" for j in w.jobs) or "none seen"
+    bad = [x for x in (w.log_lines or []) if re.search(r"MISSING|bad state", x.text)]
+    return Result("uep_job_history", True, jobs + (f"; the endpoint log after the stop: {len(bad)} MISSING / bad-state "
+                                                   f"line(s), first: {_short_log(bad[0], w)}" if bad else ""))
+
+
 # ---- the gated grader ---------------------------------------------------------------------------------------------------
 
 def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
-    """GATED (a world row): a stop that answered `down` (or spend_stopped=True) must not be followed by a new pilot of
-    this endpoint. A stop that did not claim spend stopped (`draining`, a refusal) is another premise: report-only, PASS,
-    said so. A `down` with no relaunch passes only when the watch could have seen one — the tap saw this cell's OWN
+    """GATED (a world row): a JUDGED stop that answered `down` (or spend_stopped=True) must not be followed by a new pilot
+    of this endpoint. A stop that did not claim spend stopped (`draining`, a refusal) is another premise: report-only,
+    PASS, said so. A `down` with no relaunch passes only when the watch could have seen one — the tap saw the stop's OWN
     pilot by its marker (the first live run watched blind and passed: its pilot lived 4.6 s between two samples), the
-    endpoint's log shows no scale-out the tap missed, and it covered the window — and the check was demonstrably still
-    queued at the stop. Anything less proves nothing."""
+    endpoint's log shows no scale-out the tap missed, and it covered the window — and the premise held: the check was
+    still queued at the stop, and in phase `second` phase A's block had connected in the SAME user endpoint."""
+    if w.phase == "second" and _sentinel_index(t) is None:
+        return Result(NO_RELAUNCH, False, "premise not met: phase B never started (no sentinel in the trace) — see the "
+                                          "run's final message")
     stop = _stop(t)
     if stop is None:
-        return Result(NO_RELAUNCH, False, "premise not met: no stop_endpoint in the trace — the script never reached the "
-                                          "stop (see the run's final message)")
+        return Result(NO_RELAUNCH, False, "premise not met: no judged stop_endpoint in the trace — the script never "
+                                          "reached it (see the run's final message)")
     i, c = stop
     r = c.result or {}
     said = f"the stop (call {i}) answered status={r.get('status')!r}, spend_stopped={r.get('spend_stopped')!r}"
@@ -515,8 +769,8 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
         return Result(NO_RELAUNCH, False, f"UNVERIFIABLE — {w.unverifiable}")
     seen = {j.job_id: j for j in w.jobs if j.job_id in w.own_ids}
     if not w.own_ids:
-        return Result(NO_RELAUNCH, False, "watch blind: no pilot id of this cell is known (no squeue poll saw one and the "
-                                          "stop released none), so nothing shows the tap can see this endpoint's jobs")
+        return Result(NO_RELAUNCH, False, "watch blind: no pilot id of this stop is known (no squeue poll saw one and it "
+                                          "released none), so nothing shows the tap can see this endpoint's jobs")
     if not seen:
         unmarked = sorted(w.own_ids & w.seen_unmarked)
         return Result(NO_RELAUNCH, False, f"watch blind: the tap never saw this endpoint's own pilot (job "
@@ -534,7 +788,16 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
                                           "relaunch' proves nothing")
     if state != "queued":
         return Result(NO_RELAUNCH, False, f"premise unverified: {why} — 'no relaunch' proves nothing unless the check "
-                                          "was still queued (keep the hold: HPCB_RELAUNCH_HOLD_S)")
+                                          "was still queued")
+    if _sentinel_index(t) is not None:
+        if _answered(t, -1, _sentinel_index(t)) is None:
+            return Result(NO_RELAUNCH, False, "premise not met: phase A's block never answered a check, so the user "
+                                              "endpoint had no job that connected — that is the first-pilot (bad-state) "
+                                              "path, not the one phase `second` tests")
+        same, how = same_user_endpoint(t)
+        if same is not True:
+            return Result(NO_RELAUNCH, False, f"premise {'not met' if same is False else 'unverified'}: {how} — the "
+                                              "second pilot must be the same user endpoint's")
     own = ", ".join(f"job {j.job_id} {j.state} [{j.source}]" for j in seen.values())
     return Result(NO_RELAUNCH, True, f"ok: {said}; no new pilot of this endpoint was submitted in the {covered:.0f} s "
                                      f"after it — the tap saw its own pilot ({own}), so it could have seen one ({why})")
@@ -548,8 +811,9 @@ def relaunch_report(w: Watch) -> Result:
     cover = (f"{(w.covered_until or 0) - (w.answered_at or 0):.0f} s after the stop answered"
              if w.covered_until is not None and w.answered_at is not None else "no sample")
     own = ", ".join(sorted(w.own_ids)) or "none known"
-    return Result("relaunch_watch", True, f"{w.samples} admin sample(s), covering {cover}; the cell's own pilot(s): {own}; "
-                  f"this endpoint's jobs: {jobs}" + (f"; {w.unverifiable}" if w.unverifiable else ""))
+    return Result("relaunch_watch", True, f"{w.samples} admin sample(s), covering {cover}; the stop's own pilot(s): {own}; "
+                  f"this endpoint's jobs: {jobs}" + (f"; held by the tap: {', '.join(sorted(w.held))}" if w.held else "")
+                  + (f"; {w.unverifiable}" if w.unverifiable else ""))
 
 
 def _endpoint_ids(t: Trace) -> list[str]:
@@ -576,15 +840,26 @@ async def _read_logs(ctx, eids: list[str], w: Watch) -> None:
     w.log_lines = strategy_lines(logs, w.called_at - 1.0)
 
 
+async def _end_sentinel(ctx, t: Trace) -> None:
+    """Phase `second`: the watch is over — cancel the sentinel (it would read as a pilot left behind to the universal
+    postcheck); a relaunched pilot stays held by the tap until the teardown cancels it. CLEANUP does it again."""
+    ssh = getattr(ctx, "ssh", None)
+    if ssh is None or _sentinel_index(t) is None:
+        return
+    sid = _sentinel_job(t)
+    cmd = (f"scancel {sid}" if sid else f"scancel -u \"$(whoami)\" --name={SINGLETON_NAME} --state=RUNNING") + " 2>&1; true"
+    await asyncio.to_thread(ssh, cmd, 60)
+
+
 async def relaunch_watch(ctx) -> list[Result]:
-    """WORLD CHECK: ask the tap for the cell's own pilot by id, wait until it has covered WATCH_S after the stop's
-    answer, read the endpoint's own log, then grade. `ctx`: run.py's WorldContext."""
+    """WORLD CHECK: ask the tap for the judged stop's own pilot by id, wait until it has covered WATCH_S after the stop's
+    answer, read the endpoint's own log, end the sentinel, then grade. `ctx`: run.py's WorldContext."""
     t: Trace = ctx.trace
-    called, answered = _stop_times(ctx.messages)
-    w = Watch(called_at=called, answered_at=answered, own_ids=own_pilots(t))
+    called, answered = _stop_times(ctx.messages, _judged_nth(t))
+    w = Watch(called_at=called, answered_at=answered, own_ids=own_pilots(t), phase=_phase())
     eids = _endpoint_ids(t)
     if _stop(t) is None or answered is None:
-        w.unverifiable = "nothing to watch: no stop_endpoint answer in the run"
+        w.unverifiable = "nothing to watch: no judged stop_endpoint answer in the run"
     elif ctx.tap.path is None:
         w.unverifiable = ("no admin tap: HPCB_ADMIN_TAP is unset — run the cell through run_smoke.sh on the fake target, "
                           "which samples the scheduler through its admin channel")
@@ -600,17 +875,19 @@ async def relaunch_watch(ctx) -> list[Result]:
         w.samples = len(samples)
         w.covered_until = max((s.now for s in good), default=None)
         w.jobs = endpoint_jobs(good, eids)
+        w.held = {j for s in samples for j in getattr(s, "held", [])}
         w.seen_unmarked = {j.job_id for s in good for j in [*s.queue, *s.history] if j.job_id in w.own_ids}
         if not any(s.now >= answered for s in good if s.now is not None):
             errors = [s.error for s in samples if s.error][-2:]
             w.unverifiable = (f"the admin tap has no sample after the stop answered ({len(samples)} sample(s)"
                               + (f"; {' | '.join(errors)}" if errors else "") + ")")
     await _read_logs(ctx, eids, w)
-    return [no_relaunch_after_down(t, w), relaunch_report(w), strategy_after_stop(w)]
+    await _end_sentinel(ctx, t)
+    return [no_relaunch_after_down(t, w), relaunch_report(w), strategy_after_stop(w), uep_job_history(t, w)]
 
 
 WORLD_CHECKS = [relaunch_watch]
-EXTRA_INVARIANTS = [stop_answer, pilot_state_at_stop, canary_before_stop]
+EXTRA_INVARIANTS = [stop_answer, phase_a_stop, pilot_state_at_stop, canary_before_stop]
 # world:no_relaunch_after_down gates as every world row does; agent_engaged, run_completed (the script finished — an
 # abort is a premise unmet) and the safety floor always gate. The rest is the report.
 EXPECT_OK = ["agent_engaged"]

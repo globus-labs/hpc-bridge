@@ -255,12 +255,14 @@ def _smoke(tmp_path, scenario, **extra):
     (root / "agentic" / "scenarios").symlink_to(HERE.parent / "scenarios")
     stub = tmp_path / "bin"
     stub.mkdir()
-    # `docker run` lasts a moment, so the tap (started before it) takes a sample; `docker exec` is the admin channel
+    # `docker run` lasts a few seconds, so the tap (started before it) takes samples; `docker exec` is the admin channel
     (stub / "docker").write_text(
         '#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/docker.calls"\n'
         'case "$1 $2" in "image inspect") echo sha256:stub ;; esac\n'
-        # `run` stands for the jail: it asks the tap for a job by id, as the world check does
-        'case "$1" in run) echo 1 > "$STUB_DIR/repo/agentic/runs/.admin-tap-r1.jsonl.ids"; sleep 2 ;; '
+        # `run` stands for the jail: it asks the tap for a job by id (the world check) and for a hold (phase B)
+        'case "$1" in run) echo 1 > "$STUB_DIR/repo/agentic/runs/.admin-tap-r1.jsonl.ids"; '
+        'echo "uep.54736c9f-06eb-4183-96e3-65a23b75a770 5" > "$STUB_DIR/repo/agentic/runs/.admin-tap-r1.jsonl.hold"; '
+        'sleep 5 ;; '   # time for the tap (a second-by-second wait) to answer both requests, even on a loaded host
         'exec) echo "HPCB_NOW 1792105000" ;; esac\nexit 0\n')
     (stub / "uv").write_text('#!/usr/bin/env bash\necho "$*" >> "$STUB_DIR/uv.calls"\nexit 0\n')
     for f in ("docker", "uv"):
@@ -292,8 +294,9 @@ def test_run_smoke_runs_the_script_operator_without_any_credential_or_probe(tmp_
     assert execs and "hpcb-fake-slurmctld-1 bash -lc" in execs[0] and "squeue -u hpcbridge-test" in execs[0]
     assert "admin tap: the scheduler as its admin" in r.stdout
     runs = root / "agentic" / "runs"
-    assert not (runs / ".admin-tap-r1.jsonl").exists() and not (runs / ".admin-tap-r1.jsonl.ids").exists()
+    assert not [p.name for p in runs.iterdir() if p.name.startswith(".admin-tap-r1")]   # the tap file, .ids, .hold
     assert any("sacct -j 1 -X" in ln for ln in execs)   # the id request reached the host tap within the cell
+    assert any("scontrol hold" in ln and "-v m=uep.54736c9f-06eb-4183-96e3-65a23b75a770 -v f=5" in ln for ln in execs)
 
 
 def test_run_smoke_refuses_the_cell_off_the_fake_cluster_before_any_tap_or_launch(tmp_path):
