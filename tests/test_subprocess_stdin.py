@@ -44,11 +44,9 @@ def test_ssh_exec_never_hands_the_servers_stdin_to_ssh():
     env = {**os.environ, "PYTHONPATH": str(SRC.parent)}
     proc = subprocess.Popen([sys.executable, "-c", _CHILD], stdin=subprocess.PIPE, stdout=subprocess.PIPE,
                             stderr=subprocess.PIPE, text=True, env=env)
-    assert proc.stdin is not None
-    proc.stdin.write('{"jsonrpc":"2.0","id":7,"method":"tools/call"}\n')  # the client's next request
-    proc.stdin.flush()
-    proc.stdin.close()
-    out, err = proc.communicate(timeout=60)
+    # the client's next request; communicate() writes it and closes the pipe (closing it by hand first made py3.11's
+    # communicate() flush a closed file: ValueError, CI 2026-10-15)
+    out, err = proc.communicate('{"jsonrpc":"2.0","id":7,"method":"tools/call"}\n', timeout=60)
     assert proc.returncode == 0, err
     ssh_line = next(ln for ln in out.splitlines() if ln.startswith("SSH:"))
     server_line = next(ln for ln in out.splitlines() if ln.startswith("SERVER:"))
