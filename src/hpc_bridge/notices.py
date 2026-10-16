@@ -679,8 +679,8 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
     read = f" ({its} state could not be read from the service)" if unknown else ""
     waited = f" This stop waited {int(waited_s)} s for the endpoint to give {it} up." if waited_s >= 1 else ""
     if looked:  # the stop read the check's own user endpoint on the login node too: what kept that from settling it
-        waited += (f" hpc-bridge also looked on the login node and cannot rule out that {it} can still start a block: "
-                   f"{looked}.")
+        waited += (f" hpc-bridge also looked on the login node and cannot rule out that {'they' if plural else 'it'} "
+                   f"can still start a block: {looked}.")
     if fresh:
         then = (" Call stop_endpoint again in about a minute: each call cancels what it finds and looks again. "
                 f"If {it} {stays} queued call after call, teardown_endpoint ends {it} (the user's call).")
@@ -696,21 +696,23 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
 
 def _lost_checks_words(app: AppCtx, lost: Collection[tuple[SentCheck, str, str]]) -> str:
     """Why a check the service still lists as queued can never start a block (server._settle_by_evidence): its own user
-    endpoint went into bad state after it was sent and shut down, and nothing of it runs — and why the service does not
+    endpoint received it and went into bad state, which failed it, then stopped for good — and why the service does not
     know: that endpoint's report of the failure was lost on its own side (a globus-compute-endpoint race)."""
     what, plural = _check_words([c for c, _, _ in lost], _queue_word(app))
-    it, was = ("them", "were") if plural else ("it", "was")
+    they, them = ("they", "them") if plural else ("it", "it")
     ueps = list(dict.fromkeys(u for _, u, _ in lost))
     when = ", ".join(dict.fromkeys(b for _, _, b in lost))
-    whose = "their user endpoints" if len(ueps) > 1 else ("their user endpoint" if plural else "its user endpoint")
+    several = len(ueps) > 1
+    whose = "their user endpoints" if several else ("their user endpoint" if plural else "its user endpoint")
     dead = next((c.dead for c, _, _ in lost if c.dead is not None), None)
-    died = (f" (pilot {dead.job} FINISHED, exit status {dead.exit_status}, before it ran {it})" if dead else "")
-    return (f"{what} cannot run{died}: {whose} on the login node ({', '.join(ueps)}) went into bad state after {it} "
-            f"{was} sent (at {when}, the login node's time) and shut down, and no process of "
-            f"{'them' if len(ueps) > 1 else 'it'} is left there, so no block of ours can start for {it}. The report "
-            f"that {it} failed was lost on the endpoint's own side (a known globus-compute-endpoint race: a user "
-            "endpoint in bad state stops before it sends that report), which is why the Globus Compute service still "
-            f"lists {it} as queued")
+    died = f" (pilot {dead.job} FINISHED, exit status {dead.exit_status}, before it ran {them})" if dead else ""
+    return (f"{what} cannot run{died}: {whose} on the login node ({', '.join(ueps)}) received {them} and went into "
+            f"bad state (at {when}, the login node's time), which failed {them}; {'they' if several else 'it'} then "
+            "shut down, nothing of " + ("them" if several else "it") + " runs there, and the endpoint has not started "
+            + ("them" if several else "it") + f" again, so no block of ours can start for {them}. The report that "
+            f"{they} failed was lost on the endpoint's own side (a known globus-compute-endpoint race: a user endpoint "
+            f"in bad state stops before it sends that report), which is why the Globus Compute service still lists "
+            f"{them} as queued")
 
 
 def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool,

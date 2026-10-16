@@ -5,12 +5,16 @@ it hands it to the engine; at bad state its watcher stops the user endpoint ~0.3
 without blocking, so the failed check's result never reaches the service (`set_bad_state_and_fail_all` at 07:38:22, then
 `ResultPublisher<✗; o:1; t:0> Connection closed`). Every stop then answered `draining` for good, and only
 teardown_endpoint reached `down`. A stop now reads that check's OWN compute user endpoint — the one directory whose log
-names the check's block request — and answers `down` only when it went into bad state AFTER the check was sent, logged
-its shutdown, and left no process. Anything less keeps `draining`.
+names the check's block request — and its manager's log, twice, and answers `down` only when that user endpoint
+received the check (taken before its bad state, in a life that had subscribed), went into bad state, logged its
+shutdown, left no process, and its manager logged its stop with no revival or restart after it. Anything less keeps
+`draining`.
 
-The logs under tests/uep_log_fixtures/ are those two bundles' user endpoint logs, verbatim; the tests insert the
-`endpoint_setup` lines globus-compute-endpoint 4.18 writes at a user endpoint's start (endpoint.py:513, :920) and shift
-the timestamps to the test's clock — never the lines themselves.
+The logs under tests/uep_log_fixtures/ are those bundles' logs, verbatim: `rejected.*` (submit_policy_rejected
+1792136208), `worker_died.*` (slurm_worker_died 1792140090) — both from before the template named the block request, so
+the tests insert the `endpoint_setup` lines globus-compute-endpoint 4.18 writes at a user endpoint's start
+(endpoint.py:513, :920) — and `live_*` (slurm_worker_died 1792168070, this branch's template, settled live by this
+evidence), whose block-request line is the real one. Only the timestamps are shifted, all of a cell's logs together.
 """
 import os
 import re
@@ -19,6 +23,7 @@ import sys
 import time
 from datetime import datetime, timedelta
 from pathlib import Path
+from typing import NamedTuple
 
 import pytest
 
@@ -27,182 +32,355 @@ from hpc_bridge.profile import Profile
 from hpc_bridge.runner import CanaryResult
 from hpc_bridge.server import AppCtx, ShapeRuntime, _ensure_endpoint_up
 from tests.fakes import FakeFacility
-from tests.test_server import _FakeRunner, _PbsFacility, _Res, _settle_clock, _skew
+from tests.test_server import _FakeRunner, _PbsFacility, _PendingFuture, _Res, _settle_clock, _skew
 
 _FIXTURES = Path(__file__).parent / "uep_log_fixtures"
-EID = "7a7da153-4643-4b2f-b8a6-ceee6211af97"            # the submit_policy_rejected cell's endpoint
-LOST = "a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32"            # its user endpoint whose failed check never reached the service
-DIED = "cfe285ef-7f41-943f-0e9f-a4ae1d904982"            # slurm_worker_died's (its pilot exited 42 before it connected)
-LOGIN = "59f3b039-27fb-a42d-6aac-0030bfb5cef3"           # the login shape's own user endpoint (long-lived, no block)
 _STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{6})")
 
 needs_posix_shell = pytest.mark.skipif(sys.platform == "win32", reason="the login node's shell: sh, awk, ps, find, date")
 
 
-def _uep_log(name: str, block: int | None, *, first: datetime) -> str:
-    """A fixture log as the user endpoint would write it under this plugin's template: the bundle's lines verbatim, with
-    the `endpoint_setup` lines a 4.18 user endpoint logs at its start (before `Endpoint begins`) naming `block`, and
-    every timestamp shifted so the log's first one is `first` (the login node's local time, as its logger writes)."""
-    lines = (_FIXTURES / name).read_text().splitlines()
-    stamps = [datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f") for ln in lines if (m := _STAMP.match(ln))]
-    shift = first - stamps[0]
+class Cell(NamedTuple):
+    """One live cell's logs: its endpoint, the user endpoint that held our check, and the files."""
 
-    def restamp(ln: str) -> str:
+    eid: str
+    uuid: str
+    manager: str                 # the manager's own endpoint.log
+    compute: str                 # that user endpoint's endpoint.log
+    real_block: int | None       # the block-request number its log carries (None: insert the lines)
+    login: str | None = None     # the login shape's own user endpoint (a long-lived one, no block request)
+    login_uuid: str | None = None
+
+
+REJECTED = Cell("7a7da153-4643-4b2f-b8a6-ceee6211af97", "a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32",
+                "rejected.manager.log", "rejected.endpoint.log", None,
+                "login.endpoint.log", "59f3b039-27fb-a42d-6aac-0030bfb5cef3")
+WORKER_DIED = Cell("28fae94b-1ea2-47fa-8d5b-40ab9c8c2139", "cfe285ef-7f41-943f-0e9f-a4ae1d904982",
+                   "worker_died.manager.log", "worker_died.endpoint.log", None)
+LIVE = Cell("08d247d2-9baa-4e31-a591-2690a0b1b966", "215aec48-a89c-29b6-8e58-fa16a3b3f018",
+            "live_worker_died.manager.log", "live_worker_died.endpoint.log", 209994360702101,
+            "live_login.endpoint.log", "f81aa051-0b5d-d98d-0584-71da4e888bf8")
+CELLS = {"rejected": REJECTED, "worker_died": WORKER_DIED, "live": LIVE}
+
+
+def _stamps(text: str) -> list[datetime]:
+    return [datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f") for ln in text.splitlines() if (m := _STAMP.match(ln))]
+
+
+def _restamp(text: str, shift: timedelta) -> str:
+    def one(ln: str) -> str:
         m = _STAMP.match(ln)
         if m is None:
             return ln
         when = datetime.strptime(m.group(1), "%Y-%m-%d %H:%M:%S,%f") + shift
         return when.strftime("%Y-%m-%d %H:%M:%S,%f") + ln[m.end():]
-
-    out = [restamp(ln) for ln in lines]
-    if block is not None:  # globus_compute_endpoint.endpoint.endpoint:_run_command, at the start, before the interchange
-        pid = re.search(r"MainProcess-\d+ MainThread-\d+", "\n".join(lines)).group(0)
-        at = (stamps[0] + shift - timedelta(milliseconds=5)).strftime("%Y-%m-%d %H:%M:%S,%f")
-        out[2:2] = [f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:920 _run_command running "
-                    f"endpoint_setup command: true hpcb_block={block}",
-                    f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:923 _run_command endpoint_setup stdout: "
-                    "b''",
-                    f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:924 _run_command endpoint_setup stderr: "
-                    "b''"]
-    return "\n".join(out) + "\n"
+    return "\n".join(one(ln) for ln in text.splitlines()) + "\n"
 
 
-def _put(root: Path, uuid: str, text: str, eid: str = EID) -> Path:
-    d = root / f"uep.{eid}.{uuid}"
-    d.mkdir(parents=True, exist_ok=True)
-    (d / "endpoint.log").write_text(text)
-    return d
+def _named(text: str, block: int, real: int | None) -> str:
+    """The compute user endpoint's log naming `block`: its real line renumbered, or the endpoint_setup lines a 4.18 user
+    endpoint logs at its start (globus_compute_endpoint.endpoint.endpoint:_run_command, before the interchange)."""
+    if real is not None:
+        return text.replace(f"hpcb_block={real}\n", f"hpcb_block={block}\n")
+    lines = text.splitlines()
+    at = _STAMP.match(next(ln for ln in lines if _STAMP.match(ln))).group(1)
+    pid = re.search(r"MainProcess-\d+ MainThread-\d+", text).group(0)
+    lines[2:2] = [f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:920 _run_command running endpoint_setup "
+                  f"command: true hpcb_block={block}",
+                  f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:923 _run_command endpoint_setup stdout: b''",
+                  f"{at} INFO {pid} globus_compute_endpoint.endpoint.endpoint:924 _run_command endpoint_setup stderr: b''"]
+    return "\n".join(lines) + "\n"
 
 
-def _run(cmd: str, root: Path, cwd: Path | None = None) -> str:
+def _put_cell(root: Path, cell: Cell, block: int | None, *, started: datetime, manager: str | None = None,
+              compute: str | None = None) -> tuple[Path, Path, timedelta]:
+    """Write a cell's logs under `root` (the login node's Globus Compute directory), every timestamp shifted so the
+    compute user endpoint's first one is `started` (the login node's local time). `manager` / `compute`: replace a log's
+    text (before the shift). Returns the manager's and the user endpoint's directories, and the shift."""
+    raw = compute if compute is not None else (_FIXTURES / cell.compute).read_text()
+    shift = started - _stamps(raw)[0]
+    text = _named(raw, block, cell.real_block) if block is not None else raw
+    ud = root / f"uep.{cell.eid}.{cell.uuid}"
+    ud.mkdir(parents=True, exist_ok=True)
+    (ud / "endpoint.log").write_text(_restamp(text, shift))
+    md = root / "hpc-bridge-fake-cell"
+    md.mkdir(parents=True, exist_ok=True)
+    (md / "endpoint.log").write_text(_restamp(manager if manager is not None else
+                                              (_FIXTURES / cell.manager).read_text(), shift))
+    if cell.login is not None:
+        ld = root / f"uep.{cell.eid}.{cell.login_uuid}"
+        ld.mkdir(parents=True, exist_ok=True)
+        (ld / "endpoint.log").write_text(_restamp((_FIXTURES / cell.login).read_text(), shift))
+    return md, ud, shift
+
+
+def _run(cmd: str, root: Path, cwd: Path | None = None, env: dict | None = None) -> str:
     """The evidence command as the login shape runs it: a POSIX shell, here, against `root` as the Globus Compute
     directory (never the real one: GLOBUS_COMPUTE_USER_DIR is set, so $HOME is not read)."""
-    env = {**os.environ, "GLOBUS_COMPUTE_USER_DIR": str(root)}
-    res = subprocess.run(["sh", "-c", cmd], env=env, capture_output=True, text=True, timeout=30, cwd=cwd or root)
+    full = {**os.environ, "GLOBUS_COMPUTE_USER_DIR": str(root), **(env or {})}
+    res = subprocess.run(["sh", "-c", cmd], env=full, capture_output=True, text=True, timeout=60, cwd=cwd or root)
     assert res.returncode == 0, res.stderr
     return res.stdout
 
 
-def _now_local(out: str) -> datetime:
-    w = next(ln.split() for ln in out.splitlines() if ln.startswith("HPCB_NOW "))
-    return datetime.strptime(f"{w[2]} {w[3]}", "%Y-%m-%d %H:%M:%S")
+@pytest.fixture(autouse=True)
+def _short_gap(monkeypatch, request):
+    """The two samples, 0.3 s apart here (3 s in production); a test marked `real_gap` keeps the real one."""
+    if not request.node.get_closest_marker("real_gap"):
+        from hpc_bridge import scheduler_ops
+
+        monkeypatch.setattr(scheduler_ops, "_EVIDENCE_GAP_S", 0.3, raising=False)
 
 
-# --- the command, run for real on the bundles' log lines --------------------------------------------------------------
-
-@needs_posix_shell
-@pytest.mark.parametrize("fixture, uuid", [("rejected.endpoint.log", LOST), ("worker_died.endpoint.log", DIED)],
-                         ids=["rejected", "worker_died"])
-def test_the_command_finds_the_checks_user_endpoint_in_bad_state_and_gone(tmp_path, fixture, uuid):
+def _verdict(out: str, cell: Cell, block: int, age: float):
     from hpc_bridge import scheduler_ops
 
-    start = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    _put(tmp_path, uuid, _uep_log(fixture, 207612534, first=start))
-    _put(tmp_path, LOGIN, _uep_log("login.endpoint.log", None, first=start - timedelta(minutes=1)))
-    _put(tmp_path, "0b1c2d3e-0000-4000-8000-000000000001", _uep_log("rejected.endpoint.log", 99, first=start))
-    out = _run(scheduler_ops._uep_evidence_cmd(EID, [207612534]), tmp_path)
-    assert f"HPCB_PS {uuid} 0" in out and f"HPCB_PID {uuid} none" in out and LOGIN not in out
-    age = (_now_local(out) - start).total_seconds() + 1          # sent a second before its user endpoint started
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("check-1", 207612534, age)]).values()
-    assert ev.lost and ev.uep == f"uep.{EID}.{uuid}" and ev.bad_at is not None
-    # the bad state in the log is the bundle's own line, as far after the start as it was live
-    bad = datetime.strptime(ev.bad_at, "%Y-%m-%d %H:%M:%S")
-    assert timedelta(seconds=5) < bad - start < timedelta(seconds=70)
-    # bad state logged BEFORE the check was sent: an earlier life's, not this check's
-    late = (_now_local(out) - bad).total_seconds() - 30
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("check-1", 207612534, late)]).values()
-    assert not ev.lost and "before the check was sent" in ev.why
+    return scheduler_ops._read_uep_evidence(out, cell.eid, [("k", block, age)])["k"]
+
+
+# --- the command, run for real on the cells' logs ---------------------------------------------------------------------
+
+@needs_posix_shell
+@pytest.mark.parametrize("name", ["rejected", "worker_died", "live"])
+def test_the_command_finds_the_checks_user_endpoint_stopped_for_good(tmp_path, name):
+    from hpc_bridge import scheduler_ops
+
+    cell = CELLS[name]
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    _put_cell(tmp_path, cell, 207612534, started=started)
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [207612534]), tmp_path)
+    assert f"HPCB_PS 1 {cell.uuid} 0" in out and f"HPCB_PID 2 {cell.uuid} none" in out
+    assert re.search(rf"HPCB_MGR 1 {cell.uuid} \d+ \d+ \d+ \d+ \d+", out)
+    assert cell.login_uuid is None or cell.login_uuid not in out           # the login shape's own: never matched
+    taken = (datetime.now() - started).total_seconds() + 1        # taken a second before its user endpoint started
+    ev = _verdict(out, cell, 207612534, taken)
+    assert ev.lost, ev
+    assert ev.uep == f"uep.{cell.eid}.{cell.uuid}"
+    bad = datetime.strptime(ev.bad_at, "%Y-%m-%d %H:%M:%S")       # the bundle's own line, as far after the start as live
+    assert timedelta(seconds=5) < bad - started < timedelta(seconds=70)
+    # taken AFTER its user endpoint's bad state: it may have arrived as that endpoint quiesced (never acked, back on the
+    # queue for a later life) — not this check's evidence
+    late = (datetime.now() - bad).total_seconds() - 1
+    assert "before the check had reached it" in _verdict(out, cell, 207612534, late).why
+    # too recent: the start request sent with it may not have reached the manager yet (its 30 s grace for a cached one)
+    assert "too recent" in _verdict(out, cell, 207612534, 20.0).why
+
+
+@needs_posix_shell
+@pytest.mark.real_gap
+def test_a_revival_between_the_two_samples_is_no_evidence(tmp_path):
+    # the reviewers' race: the old life has exited (its log ends in shutdown, its pid file is gone); the manager reaps it
+    # within ~1 s and revives it from a start request it cached — the new child names the directory only after its fork
+    # and render. Sample 1 sees nothing alive; the real 3 s gap later, sample 2 sees the revival.
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    md, _ud, _shift = _put_cell(tmp_path, cell, 42, started=started)
+    title = f"Endpoint starting up for u [globus-compute-endpoint _start-user-endpoint uep.{cell.eid}.{cell.uuid}]"
+    now = datetime.now().strftime("%Y-%m-%d %H:%M:%S,%f")
+    revive = (f"{now} INFO MainProcess-239 MainThread-1 globus_compute_endpoint.endpoint.core_endpoint:350 _revive_child "
+              f"User EP stopped within grace period; using cached arguments to start a new instance (name: "
+              f"uep.{cell.eid}.{cell.uuid})\n{now} INFO MainProcess-239 MainThread-1 globus_compute_endpoint.endpoint"
+              f".core_endpoint:1079 cmd_start_endpoint Creating new user endpoint (pid: 4242) [(u, uep.{cell.eid}."
+              f"{cell.uuid}) globus-compute-endpoint _start-user-endpoint uep.{cell.eid}.{cell.uuid}]\n")
+    # (what names the directory travels in the environment, so the helper names it only once it has exec'd)
+    helper = ("import os, sys, time\ntime.sleep(1.0)\nopen(os.environ['LOG'], 'a').write(os.environ['REV'])\n"
+              "os.execv(sys.executable, [sys.executable, '-c', 'import time; time.sleep(20)', os.environ['T']])\n")
+    proc = subprocess.Popen([sys.executable, "-c", helper],
+                            env={**os.environ, "LOG": str(md / "endpoint.log"), "REV": revive, "T": title})
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [42]), tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert f"HPCB_PS 1 {cell.uuid} 0" in out and f"HPCB_PS 2 {cell.uuid} 1" in out   # it really was quiet at first
+    ev = _verdict(out, cell, 42, (datetime.now() - started).total_seconds() + 1)
+    assert not ev.lost and "changed while hpc-bridge looked" in ev.why
+
+
+@needs_posix_shell
+def test_the_managers_own_log_must_show_the_stop_and_nothing_after_it(tmp_path):
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    base = (_FIXTURES / cell.manager).read_text()
+    name = f"uep.{cell.eid}.{cell.uuid}"
+    [stop] = [ln for ln in base.splitlines() if "Command stopped normally" in ln and name in ln]
+    stamp = stop[:26]
+
+    def verdict(manager: str) -> str:
+        _put_cell(tmp_path, cell, 9, started=started, manager=manager)
+        ev = _verdict(_run(scheduler_ops._uep_evidence_cmd(cell.eid, [9]), tmp_path), cell, 9, taken)
+        assert not ev.lost
+        return ev.why
+
+    # not reaped yet (the gap the manager's 1 s poll leaves): no stop logged for that life
+    assert "does not show that user endpoint's stop" in verdict(base.replace(stop + "\n", ""))
+    # revived from a cached start request (`… is already running … caching arguments`, then the exit within 30 s)
+    revived = base.replace(stop + "\n", stop + "\n" + (
+        f"{stamp} INFO MainProcess-239 MainThread-1 globus_compute_endpoint.endpoint.core_endpoint:350 _revive_child "
+        f"User EP stopped within grace period; using cached arguments to start a new instance (name: {name})\n"))
+    assert "started again" in verdict(revived)
+    # started afresh for a start request that came after the stop
+    again = base.replace(stop + "\n", stop + "\n" + (
+        f"{stamp} INFO MainProcess-239 MainThread-1 globus_compute_endpoint.endpoint.core_endpoint:1079 "
+        f"cmd_start_endpoint Creating new user endpoint (pid: 999) [(u, {name}) globus-compute-endpoint "
+        f"_start-user-endpoint {name}]\n"))
+    assert "started again" in verdict(again)
+    # another process's stop than the one its log names
+    assert "different processes" in verdict(base.replace(f"(886) [(hpcbridge-test-00, {name})",
+                                                           f"(887) [(hpcbridge-test-00, {name})")
+                                                  .replace(f"(pid: 886) [(hpcbridge-test-00, {name})",
+                                                           f"(pid: 887) [(hpcbridge-test-00, {name})"))
+    # no manager log naming this endpoint's start — or two of them
+    assert "own log on the login node could not be found" in verdict(base.replace("Core Endpoint begins", "Core begins"))
+    (tmp_path / "another-manager").mkdir()
+    (tmp_path / "another-manager" / "endpoint.log").write_text(base)
+    assert "own log on the login node could not be found" in verdict(base)
 
 
 @needs_posix_shell
 def test_the_command_sees_a_process_of_that_user_endpoint_and_a_pid_file_still_refreshed(tmp_path):
     from hpc_bridge import scheduler_ops
 
-    start = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    d = _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", 5, first=start))
-    age = (datetime.now() - start).total_seconds() + 1
-    cmd = scheduler_ops._uep_evidence_cmd(EID, [5])
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    _md, ud, _ = _put_cell(tmp_path, cell, 5, started=started)
+    taken = (datetime.now() - started).total_seconds() + 1
+    cmd = scheduler_ops._uep_evidence_cmd(cell.eid, [5])
     # a process whose arguments name the user endpoint's directory (its title does: "Globus Compute Endpoint (<id>,
-    # uep.<eid>.<id>) [...]"): still alive, whatever its log says
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{EID}.{LOST}"])
+    # uep.<eid>.<id>) [...]"): still alive, whatever the logs say
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{cell.eid}.{cell.uuid}"])
     try:
         out = _run(cmd, tmp_path)
     finally:
         proc.kill()
         proc.wait()
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 5, age)]).values()
-    assert not ev.lost and "still running" in ev.why
-    # gone: lost — unless its pid file is still being refreshed (every 15 s while it lives, from any login node)
-    (d / "daemon.pid").write_text("4242\n")
+    assert "still running" in _verdict(out, cell, 5, taken).why
+    (ud / "daemon.pid").write_text("4242\n")          # refreshed every 15 s while it lives, from any login node
     out = _run(cmd, tmp_path)
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 5, age)]).values()
-    assert f"HPCB_PS {LOST} 0" in out and not ev.lost and "pid file is still being refreshed" in ev.why
+    assert f"HPCB_PS 1 {cell.uuid} 0" in out and "pid file is still being refreshed" in _verdict(out, cell, 5, taken).why
     old = time.time() - 600
-    os.utime(d / "daemon.pid", (old, old))          # a force-killed one's leftover: stale
+    os.utime(ud / "daemon.pid", (old, old))          # a force-killed one's leftover: stale
     out = _run(cmd, tmp_path)
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 5, age)]).values()
-    assert f"HPCB_PID {LOST} old" in out and ev.lost
+    assert f"HPCB_PID 1 {cell.uuid} old" in out and _verdict(out, cell, 5, taken).lost
 
 
 @needs_posix_shell
 def test_the_command_reads_no_evidence_from_a_log_that_is_not_settled(tmp_path):
     from hpc_bridge import scheduler_ops
 
-    start = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    age = (datetime.now() - start).total_seconds() + 1
-    full = _uep_log("rejected.endpoint.log", 7, first=start).splitlines()
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    shift = started - _stamps((_FIXTURES / cell.compute).read_text())[0]
+    full = _restamp(_named((_FIXTURES / cell.compute).read_text(), 7, None), shift).splitlines()
 
     def verdict(lines: list[str]) -> str:
-        _put(tmp_path, LOST, "\n".join(lines) + "\n")
-        out = _run(scheduler_ops._uep_evidence_cmd(EID, [7]), tmp_path)
-        [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 7, age)]).values()
+        _put_cell(tmp_path, cell, None, started=started, compute="\n".join(lines) + "\n")
+        ev = _verdict(_run(scheduler_ops._uep_evidence_cmd(cell.eid, [7]), tmp_path), cell, 7, taken)
         assert not ev.lost
         return ev.why
 
-    # no bad state: a user endpoint whose block simply had not come up yet
     assert "no bad state" in verdict([ln for ln in full if "Setting bad state" not in ln])
-    # bad state, but no shutdown logged (yet)
+    assert "no bad state" in verdict([ln for ln in full if "Awaiting messages from queue" not in ln])  # never subscribed
     assert "not logged its shutdown" in verdict([ln for ln in full if not ln.startswith("---------- Endpoint shutdown")])
-    # it was started again for the same block request after that shutdown: the new life has no bad state
-    again = _uep_log("rejected.endpoint.log", 7, first=start + timedelta(seconds=40)).splitlines()
+    # started again for the same block request after that shutdown: the new life has no bad state, or is starting
+    again = _restamp(_named((_FIXTURES / cell.compute).read_text(), 7, None), shift + timedelta(seconds=40)).splitlines()
     assert "no bad state since it last started" in verdict(full + again[:8])
     assert "starting again" in verdict(full + again[:3])            # its endpoint_setup ran, its interchange has not
-    # no user endpoint names the block request: not started yet, or this plugin's template is not the endpoint's
+    # no user endpoint names the block request (not started yet) — or names another one (a prefix of ours is not ours)
     assert "names the check's block request yet" in verdict([ln for ln in full if "hpcb_block=" not in ln])
-    # bad state on another block request's user endpoint (a prefix of ours) is not ours
     assert "names the check's block request yet" in verdict([ln.replace("hpcb_block=7", "hpcb_block=77") for ln in full])
 
 
 @needs_posix_shell
-def test_an_unreadable_or_ambiguous_login_node_is_no_evidence(tmp_path):
+def test_a_bad_state_in_an_hour_a_clock_change_repeats_is_no_evidence(tmp_path):
+    # the log has no zone offset: its local time is turned into epoch seconds on the login node, in its own zone — and
+    # the hour a fall-back repeats cannot be placed
     from hpc_bridge import scheduler_ops
 
-    start = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    age = (datetime.now() - start).total_seconds() + 1
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", 8, first=start))
-    other = _put(tmp_path, DIED, _uep_log("worker_died.endpoint.log", 8, first=start))
-    out = _run(scheduler_ops._uep_evidence_cmd(EID, [8]), tmp_path)
-    [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 8, age)]).values()
-    assert not ev.lost and "more than one user endpoint" in ev.why
-    if os.geteuid() != 0:  # (root reads a 0000 file)
-        (other / "endpoint.log").write_text(_uep_log("worker_died.endpoint.log", 9, first=start))
-        (other / "endpoint.log").chmod(0)
-        try:
-            out = _run(scheduler_ops._uep_evidence_cmd(EID, [8]), tmp_path)
-        finally:
-            (other / "endpoint.log").chmod(0o600)
-        [ev] = scheduler_ops._read_uep_evidence(out, EID, [("k", 8, age)]).values()
-        assert f"HPCB_FAIL read {DIED}" in out and not ev.lost and "could not be read" in ev.why
-    # another endpoint's user endpoints are never read
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", 8, first=start), eid="00000000-1111-4222-8333-444444444444")
-    out = _run(scheduler_ops._uep_evidence_cmd("00000000-1111-4222-8333-444444444444", [8]), tmp_path)
-    assert "HPCB_UEP 8" in out and EID not in out
+    cell = REJECTED
+    tz = {"TZ": "America/Chicago"}
+    bad = next(ln for ln in (_FIXTURES / cell.compute).read_text().splitlines() if "Setting bad state" in ln)
+    to_bad = _stamps(bad)[0] - _stamps((_FIXTURES / cell.compute).read_text())[0]
+    started = datetime(2026, 11, 1, 1, 30, 0) - to_bad                    # its bad state at 01:30, the repeated hour
+    _put_cell(tmp_path, cell, 3, started=started)
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [3]), tmp_path, env=tz)
+    row = next(ln.split() for ln in out.splitlines() if ln.startswith("HPCB_UEP 1 "))
+    assert row[12:14] == ["2026-11-01", "01:30:00"] and row[15] == "1"
+    assert "cannot place" in _verdict(out, cell, 3, 10_000).why
+    # an ordinary hour in that zone is placed (and is then judged on the clock as usual)
+    _put_cell(tmp_path, cell, 3, started=datetime(2026, 10, 15, 12, 0, 0))
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [3]), tmp_path, env=tz)
+    assert next(ln.split() for ln in out.splitlines() if ln.startswith("HPCB_UEP 1 "))[15] == "0"
+
+
+@needs_posix_shell
+def test_an_unreadable_log_voids_only_the_check_it_could_belong_to(tmp_path):
+    from hpc_bridge import scheduler_ops
+
+    if os.geteuid() == 0:
+        pytest.skip("root reads a 0000 file")
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    _put_cell(tmp_path, cell, 8, started=started)
+    other = tmp_path / f"uep.{cell.eid}.0b1c2d3e-0000-4000-8000-000000000001"
+    other.mkdir()
+    (other / "endpoint.log").write_text("x\n")
+    (other / "endpoint.log").chmod(0)
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [8, 9]), tmp_path)
+    finally:
+        (other / "endpoint.log").chmod(0o600)
+    assert "HPCB_FAIL 1 read 0b1c2d3e-0000-4000-8000-000000000001" in out
+    assert _verdict(out, cell, 8, taken).lost                                   # its own log was read: settled
+    assert "could not be read" in _verdict(out, cell, 9, taken).why             # nothing read names 9: it may be there
+
+
+@needs_posix_shell
+def test_two_user_endpoints_naming_one_block_request_are_no_evidence(tmp_path):
+    from hpc_bridge import scheduler_ops
+
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    taken = (datetime.now() - started).total_seconds() + 1
+    _put_cell(tmp_path, REJECTED, 8, started=started)
+    twin = tmp_path / f"uep.{REJECTED.eid}.{WORKER_DIED.uuid}"
+    twin.mkdir()
+    (twin / "endpoint.log").write_text((tmp_path / f"uep.{REJECTED.eid}.{REJECTED.uuid}" / "endpoint.log").read_text())
+    out = _run(scheduler_ops._uep_evidence_cmd(REJECTED.eid, [8]), tmp_path)
+    assert "more than one user endpoint" in _verdict(out, REJECTED, 8, taken).why
+
+
+@needs_posix_shell
+def test_the_command_survives_the_real_dispatch_path(tmp_path):
+    # as the login shape runs it: the session wrapper (base64, eval in bash), then the ShellFunction's own brace escape
+    # and `.format` — every awk program and `${…}` must come out whole
+    from hpc_bridge import scheduler_ops, session_shell
+    from hpc_bridge.runner import _escape_for_shellfunction
+
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    _put_cell(tmp_path / "gc", LIVE, 11, started=started)
+    wrapped = session_shell.wrap(scheduler_ops._uep_evidence_cmd(LIVE.eid, [11]),
+                                 session_shell.Session("_hpc-bridge-internal", str(tmp_path / "state")))
+    script = _escape_for_shellfunction(wrapped).format()
+    env = {**os.environ, "GLOBUS_COMPUTE_USER_DIR": str(tmp_path / "gc")}
+    res = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, cwd=tmp_path)
+    assert res.returncode == 0, res.stderr
+    assert _verdict(res.stdout, LIVE, 11, (datetime.now() - started).total_seconds() + 1).lost
 
 
 # --- what the command is built from ----------------------------------------------------------------------------------
 
-@pytest.mark.parametrize("eid", ["fake-eid", "", f"{EID}; rm -rf ~", f"$(touch pwned){EID[11:]}", EID + "\n",
-                                 "../../../etc/passwd" + EID[20:], f"{EID}*", " " + EID])
+_EID = REJECTED.eid
+
+
+@pytest.mark.parametrize("eid", ["fake-eid", "", f"{_EID}; rm -rf ~", f"$(touch pwned){_EID[11:]}", _EID + "\n",
+                                 "../../../etc/passwd" + _EID[20:], f"{_EID}*", " " + _EID])
 def test_the_command_is_never_built_from_an_endpoint_id_that_is_not_a_uuid(eid):
     from hpc_bridge import scheduler_ops
 
@@ -215,7 +393,15 @@ def test_the_command_is_never_built_from_a_block_request_that_is_not_one_of_ours
     from hpc_bridge import scheduler_ops
 
     with pytest.raises(ValueError):
-        scheduler_ops._uep_evidence_cmd(EID, blocks)
+        scheduler_ops._uep_evidence_cmd(_EID, blocks)
+
+
+@pytest.mark.parametrize("gap", [0, -1, 11, "3; rm -rf ~", float("nan")])
+def test_the_command_is_never_built_with_an_odd_gap(gap):
+    from hpc_bridge import scheduler_ops
+
+    with pytest.raises(ValueError):
+        scheduler_ops._uep_evidence_cmd(_EID, [1], gap_s=gap)
 
 
 @needs_posix_shell
@@ -224,41 +410,79 @@ def test_the_command_is_never_built_from_a_block_request_that_is_not_one_of_ours
 def test_a_hostile_directory_name_on_the_login_node_is_skipped_never_run(tmp_path, name):
     from hpc_bridge import scheduler_ops
 
-    start = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
     gc = tmp_path / "gc"
-    _put(gc, name, _uep_log("rejected.endpoint.log", 3, first=start))
-    out = _run(scheduler_ops._uep_evidence_cmd(EID, [3]), gc, cwd=tmp_path)
-    assert "HPCB_UEP" not in out and not (tmp_path / "pwned").exists() and not (gc / "pwned").exists()
+    _put_cell(gc, REJECTED, 3, started=datetime.now() - timedelta(minutes=5))
+    hostile = gc / f"uep.{REJECTED.eid}.{name}"
+    hostile.mkdir()
+    (hostile / "endpoint.log").write_text((gc / f"uep.{REJECTED.eid}.{REJECTED.uuid}" / "endpoint.log").read_text())
+    out = _run(scheduler_ops._uep_evidence_cmd(REJECTED.eid, [3]), gc, cwd=tmp_path)
+    assert [ln.split()[3] for ln in out.splitlines() if ln.startswith("HPCB_UEP ")] == [REJECTED.uuid] * 2
+    assert not (tmp_path / "pwned").exists() and not (gc / "pwned").exists()
+
+
+def _rows(*, s2: dict | None = None, now: str = "1792136400 000000000", uep: str | None = None,
+          mgr: str = "8 886 20 886 20") -> str:
+    """Both samples of a settled user endpoint (rejected cell, block request 5), as the command prints them."""
+    u = REJECTED.uuid
+    one = {"now": now, "uep": uep or f"5 {u} 1 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661",
+           "ps": f"{u} 0", "pid": f"{u} none", "mgr": f"{u} {mgr}"}
+    two = {**one, **(s2 or {})}
+    out = ""
+    for k, s in (("1", one), ("2", two)):
+        out += (f"HPCB_NOW {k} {s['now']}\nHPCB_UEP {k} {s['uep']}\nHPCB_PS {k} {s['ps']}\nHPCB_PID {k} {s['pid']}\n"
+                f"HPCB_MGR {k} {s['mgr']}\n")
+    return out
 
 
 def test_the_reader_takes_only_rows_of_the_commands_shape():
     from hpc_bridge import scheduler_ops
 
-    now = datetime(2026, 10, 16, 7, 40, 0)
-    epoch = 1_792_136_400
-    good = (f"HPCB_NOW {epoch} 2026-10-16 07:40:00\nHPCB_UEP 5 {LOST} 1 6 3 23 50 2026-10-16 07:38:22\n"
-            f"HPCB_PS {LOST} 0\nHPCB_PID {LOST} none\n")
-    sent = (now - datetime(2026, 10, 16, 7, 38, 10)).total_seconds()  # 07:38:10, 12 s before the bad state
-    assert scheduler_ops._read_uep_evidence(good, EID, [("k", 5, sent)])["k"].lost
-    for bad, why in [
-        (good.replace(f"HPCB_PS {LOST} 0", f"HPCB_PS {LOST} 2"), "still running"),
-        (good.replace(f"HPCB_PS {LOST} 0\n", "") + "HPCB_FAIL ps\n", "process list"),
-        (good.replace(f"HPCB_PS {LOST} 0", "HPCB_PS ../x 0"), "still running"),           # not a row: no answer
-        (good.replace(f"HPCB_PID {LOST} none", f"HPCB_PID {LOST} unknown"), "could not be read"),
-        (good.replace("HPCB_NOW", "HPCB_NOPE"), "clock"),
-        (good + f"HPCB_UEP 5 {DIED} 1 6 3 23 50 2026-10-16 07:38:22\n", "more than one"),
-        (good + f"HPCB_UEP 6 {LOST} 1 6 3 23 50 2026-10-16 07:38:22\n", "more than one"),   # it names two requests
-        (good.replace(" 50 2026", " 0 2026"), "shutdown"),
-        (good.replace("1 6 3 23 50 2026-10-16 07:38:22", "1 6 3 0 0 -"), "no bad state"),
-        (good.replace("1 6 3 23", "0 0 3 23"), "no start"),
-        (good + f"HPCB_FAIL read {DIED}\n", "could not be read"),
-        (good.replace(f"HPCB_UEP 5 {LOST}", f"HPCB_UEP 5 {LOST}; rm"), "names the check's block request yet"),
-        (good.replace("07:40:00", "07:30:00"), "ahead of the login node's clock"),
+    u, d = REJECTED.uuid, WORKER_DIED.uuid
+    sent = 1792136400 - 1792136290        # taken 12 s before the bad state, 110 s before the look
+    read = lambda text, age=sent: scheduler_ops._read_uep_evidence(text, _EID, [("k", 5, age)])["k"]  # noqa: E731
+    assert read(_rows()).lost
+    good = _rows()
+    for text, why in [
+        (_rows(s2={"ps": f"{u} 1"}), "changed while"),
+        (_rows(s2={"uep": f"5 {u} 1 6 3 13 23 50 54 886 2026-10-16 07:38:22 1792136302 0 455661"}), "changed while"),
+        (_rows(s2={"mgr": f"{u} 8 886 20 886 21"}), "changed while"),
+        (good.replace(f"HPCB_PS 1 {u} 0", f"HPCB_PS 1 {u} 2").replace(f"HPCB_PS 2 {u} 0", f"HPCB_PS 2 {u} 2"),
+         "still running"),
+        (good + "HPCB_FAIL 2 ps\n", "process list"),
+        (good + "HPCB_FAIL 1 manager 0\n", "own log on the login node"),
+        (good.replace(f"HPCB_PID 1 {u} none", f"HPCB_PID 1 {u} unknown").replace(f"HPCB_PID 2 {u} none",
+                                                                                f"HPCB_PID 2 {u} unknown"), "pid file"),
+        (good.replace("HPCB_NOW 2", "HPCB_NOPE 2"), "clock"),
+        (good + f"HPCB_UEP 1 5 {d} 1 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661\n", "more than one"),
+        (good + f"HPCB_UEP 1 6 {u} 1 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661\n", "more than one"),
+        (_rows(uep=f"5 {u} 1 6 3 13 23 0 53 886 2026-10-16 07:38:22 1792136302 0 455661"), "shutdown"),
+        (_rows(uep=f"5 {u} 1 6 3 13 0 0 53 886 - - - 1 -"), "no bad state"),
+        (_rows(uep=f"5 {u} 1 6 3 0 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661"), "no bad state"),
+        (_rows(uep=f"5 {u} 0 0 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661"), "no start"),
+        (_rows(uep=f"5 {u} 1 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 1 455661"), "cannot place"),
+        (_rows(uep=f"5 {u} 1 6 3 13 23 50 53 887 2026-10-16 07:38:22 1792136302 0 455661"), "different processes"),
+        (_rows(mgr="8 886 20 886 24"), "started again"),
+        (_rows(mgr="8 886 0 - 8"), "does not show"),
+        (_rows(now="1792136200 000000000"), "ahead of the login node's clock"),
+        (good + f"HPCB_FAIL 1 read {d}\n", None),                       # an unrelated unreadable log: still settled
     ]:
-        ev = scheduler_ops._read_uep_evidence(bad, EID, [("k", 5, sent)])["k"]
-        assert not ev.lost and why in ev.why, (bad, ev)
-    # bad state at the very moment of the send (within whole-second clocks), or before it: not this check's
-    assert not scheduler_ops._read_uep_evidence(good, EID, [("k", 5, sent - 11)])["k"].lost
+        ev = read(text)
+        assert (ev.lost if why is None else not ev.lost and why in ev.why), (text, ev)
+    assert "before the check had reached it" in read(good, 1792136400 - 1792136302 + 0.5).why  # taken 0.5 s before
+    assert "too recent" in read(good, 30.0).why
+
+
+@pytest.mark.parametrize("odd", ["²", "١٢", "1.5", "1e3", "-1", "", "0x10"])
+def test_the_reader_never_raises_on_odd_digits(odd):
+    # str.isdigit() takes '²' and '١٢', which int() refuses: a stop must never raise on what a login node prints
+    from hpc_bridge import scheduler_ops
+
+    u = REJECTED.uuid
+    for text in (_rows(uep=f"5 {u} {odd} 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661"),
+                 _rows(now=f"{odd} 000000000"), _rows(mgr=f"{odd} 886 20 886 20"), _rows(s2={"ps": f"{u} {odd}"}),
+                 f"HPCB_UEP 1 {odd} {u} 1 6 3 13 23 50 53 886 2026-10-16 07:38:22 1792136302 0 455661\n"):
+        ev = scheduler_ops._read_uep_evidence(text, _EID, [("k", 5, 110.0)])["k"]
+        assert not ev.lost
 
 
 # --- the stop -------------------------------------------------------------------------------------------------------
@@ -267,9 +491,10 @@ class _UuidFacility(FakeFacility):
     """An SSH endpoint of this plugin's (its user endpoints exit when idle and name their block request), whose
     endpoint id is a UUID, as the web service gives it."""
 
-    def __init__(self, *, fresh: bool = True, named: bool = True) -> None:
+    def __init__(self, eid: str = REJECTED.eid, *, fresh: bool = True, named: bool = True) -> None:
         super().__init__()
         self.workers = 1
+        self.eid = eid
         self.fresh_ueps = fresh
         self.logs_block_requests = named
 
@@ -277,7 +502,7 @@ class _UuidFacility(FakeFacility):
         from hpc_bridge.facility.base import EndpointHandle
 
         self.provisioned = True
-        return EndpointHandle(endpoint_id=EID, name="fake", reused=self.reused)
+        return EndpointHandle(endpoint_id=self.eid, name="fake", reused=self.reused)
 
 
 class _PbsUuidFacility(_UuidFacility, _PbsFacility):
@@ -286,40 +511,40 @@ class _PbsUuidFacility(_UuidFacility, _PbsFacility):
 
 class _BlockRunner(_FakeRunner):
     """A compute runner that records, as GlobusRunner does, the block request each check was sent for (its config's
-    `hpcb_block` at the send) and when it was sent — `sent_ago` seconds before now, as a check the stop has waited on."""
+    `hpcb_block` at the send) and when its task id was first seen — `taken_ago` seconds before now."""
 
-    def __init__(self, eid, uec, *, sent_ago=60.0):
+    def __init__(self, eid, uec, *, taken_ago=120.0):
         super().__init__(eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
         self.user_endpoint_config = uec
-        self.blocks, self.sent, self.sent_ago = {}, {}, sent_ago
+        self.blocks, self.taken, self.taken_ago = {}, {}, taken_ago
 
     async def canary(self, timeout=8.0):
         before = len(self.checks)
         res = await super().canary(timeout)
         for f in self.checks[before:]:
             self.blocks[id(f)] = (self.user_endpoint_config or {}).get("hpcb_block")
-            self.sent[id(f)] = time.time() - self.sent_ago
+            self.taken[id(f)] = time.time() - self.taken_ago
         return res
-
-    def sent_checks(self):
-        return [(f, c, self.sent.get(id(f), 0.0)) for f, c, _ in super().sent_checks()]
 
     def sent_block(self, fut):
         return self.blocks.get(id(fut))
 
+    def taken_at(self, fut):
+        return self.taken.get(id(fut))
 
-async def _lost_check_app(monkeypatch, *, pbs=False, fresh=True, named=True, sent_ago=60.0):
+
+async def _lost_check_app(monkeypatch, *, eid=REJECTED.eid, pbs=False, fresh=True, named=True, taken_ago=120.0):
     """The cells' state: spend confirmed on a fresh user endpoint, its check (canary) timed out and the service lists it
     as pending for good (its failure never left the user endpoint)."""
     monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
-    fac = _PbsUuidFacility(fresh=fresh, named=named) if pbs else _UuidFacility(fresh=fresh, named=named)
+    fac = (_PbsUuidFacility if pbs else _UuidFacility)(eid, fresh=fresh, named=named)
     app = AppCtx(facility=fac, profile=Profile())
     built = {}
 
     def factory(eid, user_endpoint_config=None, **_kw):
         if not (user_endpoint_config or {}).get("compute"):
             return _FakeRunner(eid, _Res(0, "", ""))                       # the login shape: warm
-        built["compute"] = _BlockRunner(eid, user_endpoint_config, sent_ago=sent_ago)
+        built["compute"] = _BlockRunner(eid, user_endpoint_config, taken_ago=taken_ago)
         return built["compute"]
 
     app.runner_factory = factory
@@ -332,9 +557,10 @@ async def _lost_check_app(monkeypatch, *, pbs=False, fresh=True, named=True, sen
 
 
 def _login_node(monkeypatch, root: Path, *, releases=(), evidence=None):
-    """Script the login channel: a release answers the next of `releases` (else `released none`); the evidence command
-    RUNS, against `root` as the login node's Globus Compute directory — or answers `evidence` (a ShellOutcome) instead.
-    Returns the log of (kind, command)."""
+    """Script the login channel: a release answers the next of `releases` (else `released none`) — after the facility
+    reads the endpoint's template, as the login shape's provision does (warmth._provision -> adopt_endpoint); the
+    evidence command RUNS, against `root` as the login node's Globus Compute directory — or answers `evidence` (a
+    ShellOutcome) instead. Returns the log of (kind, command)."""
     from hpc_bridge import server
     from hpc_bridge.models import ShellOutcome
 
@@ -347,6 +573,9 @@ def _login_node(monkeypatch, root: Path, *, releases=(), evidence=None):
             if evidence is not None:
                 return evidence
             return ShellOutcome(phase="complete", exit_code=0, stdout=_run(command, root), block_state="warm")
+        adopt = getattr(a.facility, "adopt_endpoint", None)
+        if adopt is not None and a.state.endpoint_id:
+            await adopt(a.state.endpoint_id)
         out = (releases.pop(0) if releases else "released none\n") if kind == "release" else ""
         return ShellOutcome(phase="complete", exit_code=0, stdout=out, block_state="warm")
 
@@ -358,24 +587,25 @@ def _kinds(log):
     return [k for k, _ in log]
 
 
+def _two_minutes_ago() -> datetime:
+    return datetime.now().replace(microsecond=0) - timedelta(seconds=119)   # a second after the check was taken
+
+
 @needs_posix_shell
-@pytest.mark.parametrize("fixture, uuid", [("rejected.endpoint.log", LOST), ("worker_died.endpoint.log", DIED)],
-                         ids=["rejected", "worker_died"])
+@pytest.mark.parametrize("name", ["rejected", "worker_died", "live"])
 @pytest.mark.parametrize("pbs", [False, True], ids=["slurm", "pbs"])
-async def test_a_check_whose_user_endpoint_went_into_bad_state_and_is_gone_is_down(monkeypatch, tmp_path, fixture,
-                                                                                     uuid, pbs):
+async def test_a_check_whose_user_endpoint_failed_it_and_stopped_for_good_is_down(monkeypatch, tmp_path, name, pbs):
     # RED on b04aff8: the service lists the check as pending for good, so every stop answered `draining` and only
     # teardown_endpoint reached `down`
     from hpc_bridge import warmth
     from hpc_bridge.server import _stop_endpoint
     from hpc_bridge.state import SentCheckStore
 
+    cell = CELLS[name]
     skew = _skew(monkeypatch)
     _settle_clock(monkeypatch, skew)
-    app, _runner, block = await _lost_check_app(monkeypatch, pbs=pbs, sent_ago=120.0)
-    started = datetime.now().replace(microsecond=0) - timedelta(seconds=118)  # 2 s after the check was sent
-    _put(tmp_path, uuid, _uep_log(fixture, block, first=started))
-    _put(tmp_path, LOGIN, _uep_log("login.endpoint.log", None, first=started - timedelta(minutes=2)))
+    app, _runner, block = await _lost_check_app(monkeypatch, eid=cell.eid, pbs=pbs)
+    _put_cell(tmp_path, cell, block, started=_two_minutes_ago())
     log = _login_node(monkeypatch, tmp_path)
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.spend_stopped is True, res.notice
@@ -383,13 +613,14 @@ async def test_a_check_whose_user_endpoint_went_into_bad_state_and_is_gone_is_do
     n = res.notice
     assert n.startswith("compute block released over AMQP (released none). hpc-bridge's check for the block on the "
                         f"default {'queue' if pbs else 'partition'} (task check-1) cannot run")
-    assert (f"its user endpoint on the login node (uep.{EID}.{uuid}) went into bad state after it was sent" in n
-            and "and shut down, and no process of it is left there, so no block of ours can start for it" in n)
+    assert (f"its user endpoint on the login node (uep.{cell.eid}.{cell.uuid}) received it and went into bad state "
+            "(at 20" in n and "which failed it; it then shut down, nothing of it runs there, and the endpoint has not "
+            "started it again, so no block of ours can start for it" in n)
     assert ("The report that it failed was lost on the endpoint's own side (a known globus-compute-endpoint race" in n
             and "the Globus Compute service still lists it as queued" in n)
     # settled for good: off the record, and a later stop does not look again
     await warmth._flush_all(app)
-    assert SentCheckStore().load(EID) == [] and EID not in app.sent_checks
+    assert SentCheckStore().load(cell.eid) == [] and cell.eid not in app.sent_checks
     log = _login_node(monkeypatch, tmp_path)
     again = await _stop_endpoint(app)
     assert again.status == "down" and _kinds(log) == ["release"]
@@ -404,7 +635,7 @@ async def test_a_rejected_submission_whose_check_was_lost_says_nothing_was_creat
     _settle_clock(monkeypatch, skew)
     app, _runner, block = await _lost_check_app(monkeypatch)
     app.shapes["compute"].rejected = ("sbatch: error: AssocMaxSubmitJobLimit", None, None)   # its REJECTED answer
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", block, first=datetime.now() - timedelta(seconds=58)))
+    _put_cell(tmp_path, REJECTED, block, started=_two_minutes_ago())
     _login_node(monkeypatch, tmp_path)
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.notice.startswith(
@@ -415,75 +646,65 @@ async def test_a_rejected_submission_whose_check_was_lost_says_nothing_was_creat
 
 
 @needs_posix_shell
-async def test_a_check_whose_user_endpoint_is_still_alive_or_not_settled_keeps_the_stop_draining(monkeypatch, tmp_path):
+async def test_a_check_whose_user_endpoint_is_alive_or_unsettled_keeps_the_stop_draining(monkeypatch, tmp_path):
     from hpc_bridge.server import _stop_endpoint
 
     skew = _skew(monkeypatch)
     _settle_clock(monkeypatch, skew)
-    started = datetime.now().replace(microsecond=0) - timedelta(seconds=58)
 
-    async def stop(text_for):
+    async def stop(*, other=False, **put):
         app, _runner, block = await _lost_check_app(monkeypatch)
-        for p in tmp_path.glob("uep.*"):
-            for f in p.iterdir():
-                f.unlink()
-            p.rmdir()
-        d = _put(tmp_path, LOST, text_for(block))
+        _put_cell(tmp_path, REJECTED, block + 1 if other else block, started=put.pop("started", _two_minutes_ago()),
+                  **put)
         log = _login_node(monkeypatch, tmp_path)
-        return app, d, log, await _stop_endpoint(app)
+        return app, log, await _stop_endpoint(app)
 
-    # no bad-state line
-    app, _d, log, res = await stop(lambda b: "\n".join(
-        ln for ln in _uep_log("rejected.endpoint.log", b, first=started).splitlines() if "Setting bad state" not in ln))
+    raw = (_FIXTURES / REJECTED.compute).read_text()
+    app, log, res = await stop(compute="\n".join(ln for ln in raw.splitlines() if "Setting bad state" not in ln) + "\n")
     assert res.status == "draining" and res.spend_stopped is not True and "evidence" in _kinds(log)
     assert ("hpc-bridge also looked on the login node and cannot rule out that it can still start a block: its user "
             "endpoint's log shows no bad state since it last started.") in res.notice
     assert "(task check-1) is still queued on the endpoint" in res.notice
-    assert [c.tid for c in app.sent_checks[EID]] == ["check-1"]                # still on the record
-    # the bad state was logged BEFORE the check was sent (another life's): the check was sent 60 s ago
-    app, _d, log, res = await stop(lambda b: _uep_log("rejected.endpoint.log", b,
-                                                      first=started - timedelta(minutes=10)))
-    assert res.status == "draining" and "bad state was logged before the check was sent" in res.notice
+    assert [c.tid for c in app.sent_checks[REJECTED.eid]] == ["check-1"]        # still on the record
+    # the bad state was logged before the check was taken (another life's): the check was taken two minutes ago
+    _app, _log, res = await stop(started=datetime.now() - timedelta(minutes=10))
+    assert res.status == "draining" and "before the check had reached it" in res.notice
     # its process is still alive
-    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{EID}.{LOST}"])
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{REJECTED.eid}.{REJECTED.uuid}"])
     try:
-        app, _d, log, res = await stop(lambda b: _uep_log("rejected.endpoint.log", b, first=started))
+        _app, _log, res = await stop()
     finally:
         proc.kill()
         proc.wait()
     assert res.status == "draining" and "a process of its user endpoint is still running there" in res.notice
+    # its manager has not reaped it yet (no stop logged), or revived it
+    base = (_FIXTURES / REJECTED.manager).read_text()
+    unreaped = "\n".join(ln for ln in base.splitlines() if "Command stopped normally (886)" not in ln) + "\n"
+    _app, _log, res = await stop(manager=unreaped)
+    assert res.status == "draining" and "does not show that user endpoint's stop" in res.notice
     # no user endpoint names the check's block request (not started yet — or its log is another request's)
-    app, _d, log, res = await stop(lambda b: _uep_log("rejected.endpoint.log", b + 1, first=started))
+    _app, _log, res = await stop(other=True)
     assert res.status == "draining" and "no user endpoint there names the check's block request yet" in res.notice
 
 
 @needs_posix_shell
-async def test_an_unreadable_log_keeps_the_stop_draining(monkeypatch, tmp_path):
+async def test_a_check_too_recent_for_its_user_endpoints_fate_keeps_the_stop_draining(monkeypatch, tmp_path):
+    # a short HPC_BRIDGE_STOP_CHECK_WAIT_S does not loosen it: the check's own age is what counts, past the manager's
+    # 30 s grace for a cached start request
     from hpc_bridge.server import _stop_endpoint
 
-    if os.geteuid() == 0:
-        pytest.skip("root reads a 0000 file")
+    monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "0")
     skew = _skew(monkeypatch)
     _settle_clock(monkeypatch, skew)
-    app, _runner, block = await _lost_check_app(monkeypatch)
-    started = datetime.now().replace(microsecond=0) - timedelta(seconds=58)
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", block, first=started))
-    other = _put(tmp_path, DIED, _uep_log("worker_died.endpoint.log", 3, first=started))
-    (other / "endpoint.log").chmod(0)
-    _login_node(monkeypatch, tmp_path)
-    try:
-        res = await _stop_endpoint(app)
-    finally:
-        (other / "endpoint.log").chmod(0o600)
-    assert res.status == "draining" and "a user endpoint's log there could not be read" in res.notice
+    app, _runner, block = await _lost_check_app(monkeypatch, taken_ago=20.0)
+    _put_cell(tmp_path, REJECTED, block, started=datetime.now() - timedelta(seconds=40))
+    log = _login_node(monkeypatch, tmp_path)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "evidence" in _kinds(log) and "too recent" in res.notice
 
 
-@pytest.mark.parametrize("outcome, why", [
-    ("cold", "the login channel was cold or busy"),
-    ("busy", "the login channel was cold or busy"),
-    ("failed", "the login channel was cold or busy"),
-])
-async def test_a_cold_or_busy_login_channel_keeps_the_stop_draining(monkeypatch, tmp_path, outcome, why):
+@pytest.mark.parametrize("outcome", ["cold", "busy", "failed"])
+async def test_a_cold_or_busy_login_channel_keeps_the_stop_draining(monkeypatch, tmp_path, outcome):
     from hpc_bridge.models import ShellOutcome
     from hpc_bridge.server import _stop_endpoint
 
@@ -495,7 +716,8 @@ async def test_a_cold_or_busy_login_channel_keeps_the_stop_draining(monkeypatch,
               "failed": ShellOutcome(phase="complete", exit_code=1, stdout="", block_state="warm")}[outcome]
     log = _login_node(monkeypatch, tmp_path, evidence=answer)
     res = await _stop_endpoint(app)
-    assert res.status == "draining" and why in res.notice and _kinds(log).count("evidence") == 1
+    assert res.status == "draining" and "the login channel was cold or busy" in res.notice
+    assert _kinds(log).count("evidence") == 1
 
 
 async def test_a_login_node_that_does_not_answer_in_time_keeps_the_stop_draining(monkeypatch, tmp_path):
@@ -557,7 +779,7 @@ async def test_an_endpoint_whose_template_does_not_name_block_requests_is_not_lo
     assert res.status == "draining" and "evidence" not in _kinds(log) and "looked on the login node" not in res.notice
 
 
-async def test_a_lost_command_or_a_check_with_no_block_request_is_not_looked_at(monkeypatch, tmp_path):
+async def test_a_lost_command_or_a_check_with_no_block_request_or_no_task_id_is_not_looked_at(monkeypatch, tmp_path):
     # a command runs the user's work: whatever its user endpoint's fate, a stop must not say it ended — and while it
     # waits nothing can make this stop `down`, so nothing is run
     from hpc_bridge import warmth
@@ -567,34 +789,35 @@ async def test_a_lost_command_or_a_check_with_no_block_request_is_not_looked_at(
     skew = _skew(monkeypatch)
     _settle_clock(monkeypatch, skew)
     app, runner, block = await _lost_check_app(monkeypatch)
-    warmth._keep_checks(app, EID, [SentCheck(future=None, client=runner.task_client(), task_id="cmd-1",
-                                             sent_at=time.time() - 60, what="command", block=block,
-                                             ceiling_at=time.time() - 1)])
-    log = _login_node(monkeypatch, tmp_path)
-    res = await _stop_endpoint(app)
-    assert res.status == "draining" and "evidence" not in _kinds(log)
-    # a check read back with no block request (an older record): nothing names its user endpoint
-    app, _runner, _block = await _lost_check_app(monkeypatch)
-    app.shapes["compute"].runner.blocks.clear()
+    warmth._keep_checks(app, REJECTED.eid, [SentCheck(future=None, client=runner.task_client(), task_id="cmd-1",
+                                                      sent_at=time.time() - 60, what="command", block=block,
+                                                      taken_at=time.time() - 60, ceiling_at=time.time() - 1)])
     log = _login_node(monkeypatch, tmp_path)
     assert (await _stop_endpoint(app)).status == "draining" and "evidence" not in _kinds(log)
-    # a check with no task id may still be on its way to the service: taken after its user endpoint shut down, it would
-    # have the manager start that user endpoint afresh — and a new life of it starts a new block. Never settled so.
-    from tests.test_server import _PendingFuture
-
+    # a check read back with no block request (an older record): nothing names its user endpoint
+    app, runner, _block = await _lost_check_app(monkeypatch)
+    runner.blocks.clear()
+    log = _login_node(monkeypatch, tmp_path)
+    assert (await _stop_endpoint(app)).status == "draining" and "evidence" not in _kinds(log)
+    # a check whose task id was never seen: no time the service took it by — and it may still be on its way there,
+    # where it would have the manager start that user endpoint again
     app, runner, block = await _lost_check_app(monkeypatch)
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", block, first=datetime.now() - timedelta(seconds=58)))
+    _put_cell(tmp_path, REJECTED, block, started=_two_minutes_ago())
     unsent = _PendingFuture()                                   # its submit has not come back: no task id yet
     runner.checks.append(unsent)
-    runner.blocks[id(unsent)], runner.sent[id(unsent)] = block, time.time() - 60
+    runner.blocks[id(unsent)] = block
     log = _login_node(monkeypatch, tmp_path)
-    res = await _stop_endpoint(app)
-    assert res.status == "draining" and "evidence" not in _kinds(log)
+    assert (await _stop_endpoint(app)).status == "draining" and "evidence" not in _kinds(log)
+    app, runner, _block = await _lost_check_app(monkeypatch)
+    runner.taken.clear()
+    log = _login_node(monkeypatch, tmp_path)
+    assert (await _stop_endpoint(app)).status == "draining" and "evidence" not in _kinds(log)
 
 
 @needs_posix_shell
 async def test_a_restarted_server_reads_the_block_request_back_and_settles_the_check(monkeypatch, tmp_path):
-    # the record carries each check's block request, so a server restarted after the check was lost still finds it
+    # the record carries each check's block request and when its task id was seen, so a server restarted after the
+    # check was lost still finds it — its first stop's cancel reads the endpoint's template (the login shape's provision)
     from hpc_bridge import warmth
     from hpc_bridge.server import _stop_endpoint
     from hpc_bridge.state import SentCheckStore
@@ -603,24 +826,32 @@ async def test_a_restarted_server_reads_the_block_request_back_and_settles_the_c
     _settle_clock(monkeypatch, skew)
     app, _runner, block = await _lost_check_app(monkeypatch)
     await warmth._flush_all(app)
-    [row] = SentCheckStore().load(EID)
-    assert row["task_id"] == "check-1" and row["block"] == block
-    fresh = AppCtx(facility=_UuidFacility(), profile=Profile(), state=EndpointState(endpoint_id=EID))
-    fresh.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"},
-                                         runner=_FakeRunner(EID, _Res(0, "", "")), warm_confirmed_at=time.monotonic())
-    fresh.shapes["login"].runner.lookup = lambda tid: {"pending": True, "status": "waiting-for-nodes"}
-    _put(tmp_path, LOST, _uep_log("rejected.endpoint.log", block, first=datetime.now() - timedelta(seconds=58)))
+    [row] = SentCheckStore().load(REJECTED.eid)
+    assert row["task_id"] == "check-1" and row["block"] == block and abs(row["taken_at"] - (time.time() - 120)) < 5
+    fac = _UuidFacility(fresh=False, named=False)              # not known yet: the release's provision adopts it
+
+    async def adopt(eid):
+        fac.fresh_ueps = fac.logs_block_requests = True
+
+    fac.adopt_endpoint = adopt
+    restarted = AppCtx(facility=fac, profile=Profile(), state=EndpointState(endpoint_id=REJECTED.eid))
+    restarted.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"},
+                                             runner=_FakeRunner(REJECTED.eid, _Res(0, "", "")),
+                                             warm_confirmed_at=time.monotonic())
+    restarted.shapes["login"].runner.lookup = lambda tid: {"pending": True, "status": "waiting-for-nodes"}
+    _put_cell(tmp_path, REJECTED, block, started=_two_minutes_ago())
     log = _login_node(monkeypatch, tmp_path)
-    res = await _stop_endpoint(fresh)
+    res = await _stop_endpoint(restarted)
     assert res.status == "down" and "cannot run" in res.notice and _kinds(log).count("evidence") == 1
-    await warmth._flush_all(fresh)
-    assert SentCheckStore().load(EID) == []
-    # an older record (no block request on the row) is not looked at
-    SentCheckStore().save(EID, [{**row, "block": None}])
-    again = AppCtx(facility=_UuidFacility(), profile=Profile(), state=EndpointState(endpoint_id=EID))
-    again.shapes["login"] = fresh.shapes["login"]
-    log = _login_node(monkeypatch, tmp_path)
-    assert (await _stop_endpoint(again)).status == "draining" and "evidence" not in _kinds(log)
+    await warmth._flush_all(restarted)
+    assert SentCheckStore().load(REJECTED.eid) == []
+    # an older record (no block request, or no time its task id was seen) is not looked at
+    for old in ({**row, "block": None}, {**row, "taken_at": None}):
+        SentCheckStore().save(REJECTED.eid, [old])
+        again = AppCtx(facility=fac, profile=Profile(), state=EndpointState(endpoint_id=REJECTED.eid))
+        again.shapes["login"] = restarted.shapes["login"]
+        log = _login_node(monkeypatch, tmp_path)
+        assert (await _stop_endpoint(again)).status == "draining" and "evidence" not in _kinds(log)
 
 
 def test_a_block_request_is_a_whole_number_the_template_renders_as_digits():
@@ -634,3 +865,24 @@ def test_a_block_request_is_a_whole_number_the_template_renders_as_digits():
     assert isinstance(n, int) and 0 < n < 2 ** 48 and warmth._block_number(n) == n
     assert warmth._block_number("3f9a0c1e") is None and warmth._block_number(True) is None
     assert warmth._block_number(0) is None and warmth._block_number(2 ** 48) is None
+
+
+async def test_a_check_is_dated_by_when_its_task_id_was_first_seen_not_by_its_submit():
+    # Executor.submit only queues a task: the SDK sends it later (batched, rate-limited, retried), so the submit's time
+    # says nothing of when the service had it. The id is the service's answer.
+    pytest.importorskip("globus_compute_sdk")
+    from hpc_bridge.runner import GlobusRunner
+    from tests.test_runner import _CanaryFuture, _QueueExecutor
+
+    queued = _CanaryFuture(pending=True)
+    r = GlobusRunner("eid", executor_factory=lambda: _QueueExecutor(queued),
+                     user_endpoint_config={"compute": True, "hpcb_block": 77})
+    await r.canary(timeout=0.05)
+    [(fut, _client, sent_at)] = r.sent_checks()
+    assert r.sent_block(fut) == 77 and r.taken_at(fut) is None          # no id yet: no time the service had it
+    time.sleep(0.05)
+    fut.task_id = "t-1"
+    seen = r.taken_at(fut)
+    assert seen is not None and seen > sent_at and r.taken_at(fut) == seen   # stamped once, when first seen
+    r.user_endpoint_config["hpcb_block"] = 78                           # (the shape's config can be the same dict)
+    assert r.sent_block(fut) == 77

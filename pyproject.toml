@@ -50,7 +50,8 @@ cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "s
 asyncio_mode = "auto"
 asyncio_default_fixture_loop_scope = "function"  # unset -> a PytestDeprecationWarning at configure time on every run
 testpaths = ["tests"]
-markers = ["real_catalog: the test may build the real catalog (the hermetic tier forbids the live registry by default)"]
+markers = ["real_catalog: the test may build the real catalog (the hermetic tier forbids the live registry by default)",
+           "real_gap: the stop's login-node evidence keeps its real gap between its two samples (3 s)"]
 
 [tool.ruff]
 line-length = 120

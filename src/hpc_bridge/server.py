@@ -1050,6 +1050,9 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     # reported (the globus-compute-endpoint race, scheduler_ops): read that user endpoint's fate on the login node —
     # once, only where its log names the check's block request, and only for a confirmed release that a `down` could
     # follow. `looked`: why the evidence did not settle it, for the `draining`.
+    # The endpoint's template is known by now even after a restart: the release rode the login shape, whose provision
+    # read it (warmth._provision -> adopt_endpoint).
+    fresh = fresh or getattr(app.facility, "fresh_ueps", False) is True
     evidence: dict[str, scheduler_ops.UepEvidence] = {}
     looked: str | None = None
     if confirmed and fresh and not store_problem and getattr(app.facility, "logs_block_requests", False) is True:
@@ -1336,39 +1339,46 @@ async def _release_until_settled(app: AppCtx, eid: str, checks: list[SentCheck],
 
 
 # One look at the login node for checks the service still lists as queued (`_settle_by_evidence`): at most this long,
-# only with at least `_EVIDENCE_MIN_S` of it to spend, and never into the last `_EVIDENCE_RESERVE_S` of the call's
-# budget (its final locked step and the answer).
+# only with at least `_EVIDENCE_MIN_S` of it to spend (the command takes two samples `scheduler_ops._EVIDENCE_GAP_S`
+# apart), and never into the last `_EVIDENCE_RESERVE_S` of the call's budget (its final locked step and the answer).
 _EVIDENCE_TIMEOUT_S = 25.0
-_EVIDENCE_MIN_S = 5.0
+_EVIDENCE_MIN_S = 10.0
 _EVIDENCE_RESERVE_S = 10.0
 
 
 async def _settle_by_evidence(app: AppCtx, eid: str, checks: list[SentCheck], states: list[warmth.CheckState],
                               deadline: float) -> tuple[list[warmth.CheckState], dict[str, scheduler_ops.UepEvidence],
                                                         str | None]:
-    """The checks a stop's wait left `pending` (or `unknown`), read on the login node: a check whose own compute user
-    endpoint went into bad state after the check was sent, shut down, and left no process is `lost` — the service lists
-    it as queued only because that endpoint's report of its failure never left (globus-compute-endpoint 4.18 stops its
-    result publisher without blocking, right after bad state; scheduler_ops). Nothing else changes a state.
+    """The checks a stop's wait left `pending` (or `unknown`), read on the login node: a check is `lost` when its own
+    compute user endpoint received it and failed it with bad state, and that user endpoint has stopped for good —
+    gone, and its manager neither reviving nor restarting it (scheduler_ops: what the evidence rules out, and how). The
+    service lists such a check as queued only because that endpoint's report of its failure never left
+    (globus-compute-endpoint 4.18 stops its result publisher without blocking, right after bad state). Nothing else
+    changes a state.
 
-    Only when EVERY task still waiting is a check the service registered (a task id) that names its block request.
-    Otherwise nothing can make this stop `down`, so nothing is run: a command whose result the client lost runs the
-    user's work — whatever its user endpoint's fate, a stop must not say it ended (the stop names it, and
-    teardown_endpoint ends it); a check with no block request (an endpoint configured before this change, an older
-    record) has no user endpoint to find; and one with no task id may still be on its way to the service — taken after
-    its user endpoint shut down, it would have the manager start that user endpoint afresh, and a new life of it starts
-    a new block (a registered task reached its user endpoint when it was sent; only a new submit starts one again, and
-    nothing of ours submits to that block request once the stop has dropped its shape). One command for all of them
-    over the free login shape (AMQP, no SSH), bounded by what is left of the call's budget. Returns the states, each
-    check's evidence by its key, and why the evidence settled nothing (None: not looked, or all settled)."""
+    Only when EVERY task still waiting is a check the service registered (a task id first seen here at a known time)
+    that names its block request. Otherwise nothing can make this stop `down`, so nothing is run: a command whose result
+    the client lost runs the user's work — whatever its user endpoint's fate, a stop must not say it ended (the stop
+    names it, and teardown_endpoint ends it); a check with no block request (an endpoint configured before this change,
+    an older record) has no user endpoint to find; and one with no task id may still be on its way to the service,
+    where it would have the manager start that user endpoint again. The checks are dated by when their task id was
+    first seen (`SentCheck.taken_at`), never by the submit, which only queues them in the SDK. One command for all of
+    them over the free login shape (AMQP, no SSH), bounded by what is left of the call's budget; a stop's wait need not
+    have run first — the command itself asks that each check be old enough (`scheduler_ops._EVIDENCE_SETTLED_S`), so a
+    short `HPC_BRIDGE_STOP_CHECK_WAIT_S` does not loosen it. Returns the states, each check's evidence by its key, and
+    why the evidence settled nothing (None: not looked, or all settled)."""
     waiting = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")]
-    if not waiting or any(c.what != "check" or c.block is None or c.tid is None or c.sent_at <= 0 for c in waiting):
+    if not waiting or any(c.what != "check" or c.block is None or c.tid is None or c.taken_at is None
+                          for c in waiting):
         return states, {}, None
     budget = min(_EVIDENCE_TIMEOUT_S, deadline - time.monotonic() - _EVIDENCE_RESERVE_S)
     if budget < _EVIDENCE_MIN_S:
         return states, {}, "this stop had no time left to look"
-    now = time.time()  # each check's age, read BEFORE the command: the send is never placed earlier than it was
-    wanted = [(warmth._check_key(c), c.block, now - c.sent_at) for c in waiting if c.block is not None]
+    # each check's age, read BEFORE the command is sent: the login node's clock is read after it, so the check is
+    # never placed earlier on it than the service took it
+    now = time.time()
+    wanted = [(warmth._check_key(c), c.block, now - c.taken_at) for c in waiting
+              if c.block is not None and c.taken_at is not None]
     try:
         cmd = scheduler_ops._uep_evidence_cmd(eid, [b for _, b, _ in wanted])
     except ValueError:  # an endpoint id that is not a UUID: no command is built from it

@@ -818,7 +818,7 @@ def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
         if sent:
             _keep_checks(app, eid, [SentCheck(future=f, client=client, terms=_runner_terms(runner, rt),
                                               dead=rt.dead_pilot, task_id=getattr(f, "task_id", None), sent_at=at,
-                                              block=_sent_block(runner, f))
+                                              block=_sent_block(runner, f), taken_at=_taken_at(runner, f))
                                     for f, client, at in sent])
     runner.close()
 
@@ -862,7 +862,8 @@ def _persist_checks(app: AppCtx, eid: str) -> None:
         # a task with no id yet (just submitted, or a submit that may have been taken) is written too, under a key of
         # its own: a server that restarts reads it as unknown (fail closed) — replaced by its id once the SDK has one
         rows[key] = {"task_id": key, "no_id": c.tid is None, "partition": c.terms[0], "account": c.terms[1],
-                     "sent_at": c.sent_at, "what": c.what, "ceiling_at": c.ceiling_at, "block": c.block}
+                     "sent_at": c.sent_at, "what": c.what, "ceiling_at": c.ceiling_at, "block": c.block,
+                     "taken_at": c.taken_at}
     mine = frozenset(rows)
     wrote, dropped = app.persisted_checks.get(eid, (frozenset(), frozenset()))
     drop = ((wrote | frozenset(app.resolved_checks)) - mine)
@@ -1034,7 +1035,8 @@ def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
     if rt is None or rt.runner is None or not _billable(rt):
         return []
     return [SentCheck(future=f, client=client, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot,
-                      task_id=getattr(f, "task_id", None), sent_at=at, block=_sent_block(rt.runner, f))
+                      task_id=getattr(f, "task_id", None), sent_at=at, block=_sent_block(rt.runner, f),
+                      taken_at=_taken_at(rt.runner, f))
             for f, client, at in getattr(rt.runner, "sent_checks", list)()]
 
 # The block-request numbers `_fresh_block` draws (and a record may carry back): a positive whole number below 2**48, so
@@ -1052,6 +1054,12 @@ def _sent_block(runner: object, fut: Any) -> int | None:
     """The block request a runner's check was sent for (GlobusRunner.sent_block, read at its send), if it is one."""
     get = getattr(runner, "sent_block", None)
     return _block_number(get(fut)) if callable(get) else None
+
+def _taken_at(runner: object, fut: Any) -> float | None:
+    """When this process first saw a runner's check's task id (GlobusRunner.taken_at), if it has."""
+    get = getattr(runner, "taken_at", None)
+    at = get(fut) if callable(get) else None
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
 
 def _note_checks_sent(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """A check went out (called at its submit, and again once its wait ends — cancelled too): write the endpoint's
@@ -1129,7 +1137,9 @@ def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None,
                                   sent_at=float(row.get("sent_at") or 0.0),
                                   what="command" if row.get("what") == "command" else "check",
                                   ceiling_at=float(ceiling) if isinstance(ceiling, (int, float)) else None,
-                                  block=_block_number(row.get("block"))))
+                                  block=_block_number(row.get("block")),
+                                  taken_at=(float(taken) if isinstance(taken := row.get("taken_at"), (int, float))
+                                            and not isinstance(taken, bool) else None)))
             known.add(row["task_id"])
     if not kept:
         app.sent_checks.pop(eid, None)

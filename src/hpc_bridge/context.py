@@ -214,6 +214,9 @@ class SentCheck:
     # start (the template's endpoint_setup line) — so a stop can read that endpoint's fate when the service cannot say
     # (server._settle_by_evidence). None: not known (a command, an endpoint of an earlier plugin, an older record).
     block: int | None = None
+    # when this process first saw its task id (wall clock): the service had taken it by then — never earlier than it did
+    # (runner.GlobusRunner.taken_at). What the stop's evidence dates a check by; None: not seen (or an older record).
+    taken_at: float | None = None
 
     @property
     def tid(self) -> str | None:
