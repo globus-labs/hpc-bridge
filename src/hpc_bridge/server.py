@@ -10,7 +10,7 @@ import time
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import asynccontextmanager
 from pathlib import Path
-from typing import Any, Literal, TypeVar
+from typing import Any, Literal, NamedTuple, TypeVar
 
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
@@ -57,6 +57,7 @@ from .context import (  # noqa: F401 - re-exported: tools + tests import them fr
     DEFAULT_SHAPE,
     AppCtx,
     LeftBlock,
+    SentCheck,
     ShapeRuntime,
     TaskHandle,
     _has_login_shape,
@@ -98,11 +99,14 @@ from .notices import (  # noqa: F401 - re-exported
     _billed_bounds_note,
     _block_terms,
     _busy_session_outcome,
+    _check_pending_notice,
+    _check_words,
     _cold_outcome,
     _dispatch_error_suffix,
     _dropped_term_notice,
     _error_outcome,
     _explain_provision_error,
+    _failed_release_notice,
     _hpc_bridge_error,
     _identity_from_error,
     _idle_window_text,
@@ -126,12 +130,16 @@ from .notices import (  # noqa: F401 - re-exported
     _no_facility_outcome,
     _orphaned_outcome,
     _past_ceiling_outcome,
+    _queue_word,
+    _rejected_stop_notice,
+    _rejected_switch_note,
     _released_under_outcome,
     _reserved_session_outcome,
     _running_outcome,
     _scheduler_submit_notice,
     _shape_reject_outcome,
     _spend_floor_guidance,
+    _stop_down_notice,
     _submit_rejected,
     _submit_rejected_notice,
     _switch_receipt,
@@ -194,7 +202,7 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
     scratch = binding._resolve_scratch_root(facility)
     app = AppCtx(
         facility=facility,
-        profile=Profile(mode=_env_mode()),  # type: ignore[arg-type]
+        profile=Profile(mode=_env_mode(), uep_idle_heartbeats=config.uep_idle_heartbeats()),  # type: ignore[arg-type]
         state=EndpointState(endpoint_id=endpoint_id),
         scratch_root=scratch,
         charge_factor=config.charge_factor(),
@@ -205,10 +213,20 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
     try:
         yield app
     finally:
-        app.tasks.clear()  # drop any live poll handles — their blocks are going away with the process
-        for rt in app.shapes.values():
-            if rt.runner is not None:
-                rt.runner.close()
+        await _shutdown(app)
+
+
+async def _shutdown(app: AppCtx) -> None:
+    """The server is going away: write what may still be queued on the bound endpoint to the record and wait (bounded)
+    for every pending write — a server that starts again must see it (#24) — then close the runners."""
+    eid = app.state.endpoint_id
+    if eid is not None:
+        warmth._persist_checks(app, eid)
+    await warmth._flush_all(app, timeout=5.0)
+    app.tasks.clear()  # drop any live poll handles — their blocks are going away with the process
+    for rt in app.shapes.values():
+        if rt.runner is not None:
+            rt.runner.close()
 
 
 # --- operational guidance over MCP (cross-harness) --------------------------------------------------------------
@@ -394,9 +412,16 @@ async def _ensure_endpoint_up(
         # A switch confirmed in this same call: no needs_confirmation answer said what became of the old block, so the
         # answer of the call that confirms the new one does, once.
         receipt = _switch_receipt(app, rt) if confirm_spend and rt.block_epoch != epoch else ""
+        switched_from = rt.switched_terms  # the terms that receipt moved from, before a confirmation clears them
 
         def said(notice: str | None) -> str | None:
-            return receipt + (notice or "") if receipt and rt.spend_confirmed else notice
+            if receipt and rt.spend_confirmed:  # the confirmation held: what it is for, and the old block's fate
+                return receipt + (notice or "")
+            if receipt and rt.rejected is not None and notice:
+                # this call's own check met a rejection (warmth._void_rejected): no new block exists, so not the
+                # receipt ("…this new one included") — only what became of the old terms' block, then the rejection
+                return _rejected_switch_note(app, rt, switched_from) + notice[:1].upper() + notice[1:]
+            return notice
 
         was_confirmed = rt.spend_confirmed  # after a switch dropped it: this call's own confirmation is what is new
         try:
@@ -505,6 +530,8 @@ async def _ensure_endpoint_up(
                 # The scheduler refused the submission (bad account/partition/QOS, missing resource request): a
                 # terminal `down` for THIS config, so the agent stops polling and changes it — not "allocating
                 # nodes…" with the cause buried in a suffix (live 2026-09-09: five polls before anyone read it).
+                # With one block, _provision has voided the spend confirmation (warmth._void_rejected): the next
+                # call without confirm_spend asks again, and a stop expects no pilot from it.
                 rt.provisioning_since = None
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
@@ -532,7 +559,17 @@ async def _ensure_endpoint_up(
     # (The query rides the free login shape — a compute-only facility has none, so skip it there; the
     # #37 failure-signal path for a MEP is the dispatch-error suffix already on the notice.)
     if status == "provisioning" and billable and eid and _has_login_shape(app):
-        notice = await scheduler_ops._augment_provisioning_notice(app, eid, notice, provisioning_elapsed, _login_runner(app))  # noqa: E501
+        # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
+        # (and when a worker last answered, so the record can tell one that answered DURING the probe)
+        probe_epoch, answered = rt.block_epoch, rt.warm_confirmed_at
+        notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
+                                                                  _login_runner(app), confirmed_at=rt.confirmed_at)
+        if probe is not None and probe.dead is not None:
+            # A pilot that ran and died before any worker answered: the check it was started for is still queued, and
+            # the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of that check, which
+            # its own state decides) — on the runtime and terms the probe was for (live 2026-10-15, slurm_worker_died).
+            async with app.lock:
+                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
     return EndpointStatus(
         status=status,
         block_state=block,
@@ -960,28 +997,58 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
     if not _has_login_shape(app):  # a facility MEP: no release channel exists — drain honestly
         return await _stop_mep(app, eid)
-    async with app.lock:  # under the lock: a run_shell provisioning right now has counted its dispatch before we look
+    # The whole call is bounded (config.STOP_CALL_BUDGET_S): under the tool timeouts of the clients that drive it —
+    # the waits for the lock, the releases, the lookups and the liveness check included.
+    call_deadline = time.monotonic() + config.STOP_CALL_BUDGET_S
+    # Our own work on the block refuses the stop at once — before any wait on the record below (a slow home directory
+    # must not let a command still in its sync-wait turn into a handle first, nor delay the answer that names it).
+    if not await _acquire_within(app, call_deadline):
+        return _lock_busy_status(app, eid, released=None)
+    try:
+        if busy := _busy_block_refusal(app, eid):
+            return busy
+    finally:
+        app.lock.release()
+    # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server) — after this
+    # process's own pending writes, so it reads what this process knows
+    await warmth._flush_all(app, timeout=min(5.0, call_deadline - time.monotonic()))
+    disk = await warmth._read_checks(eid, min(5.0, call_deadline - time.monotonic()))
+    if not await _acquire_within(app, call_deadline):
+        return _lock_busy_status(app, eid, released=None)
+    try:  # under the lock: a run_shell provisioning right now has counted its dispatch before we look
         if busy := _busy_block_refusal(app, eid):  # releasing would not end our work: the endpoint relaunches for it
             return busy
-        # Was a block REQUESTED but never CONFIRMED running? Then a scheduler submit may still be in flight — a
-        # one-shot scancel that finds nothing has NOT confirmed the block gone: the pilot's sbatch can land a moment
-        # after (the stop-during-provisioning race — a user revoking mid-bring-up, spend_revoked 2026-09-05). The
-        # release then POLLS for the pilot to land and cancels it (expect_block); captured before the shape is dropped.
         rt_pre = app.shapes.get(DEFAULT_SHAPE)
-        # A block asked for and never seen up (no confirmation, no identity): its sbatch may still land. A reap found by
-        # a canary voided the acknowledgement, but that canary may itself have requested the pilot; a partition or
-        # account switch voids it too, while the old terms' pilot may still be landing. A block that was seen up and
-        # only had its confirmation voided (a failed dispatch, a rebuild, a new login) is not one.
-        expect_block = rt_pre is not None and (
-            ((rt_pre.spend_confirmed or rt_pre.reap_kicked) and rt_pre.warm_confirmed_at is None
-             and rt_pre.block_since is None)
-            or rt_pre.switch_unseen)
+        rejected = rt_pre is not None and rt_pre.rejected is not None
+        # The evidence (#24): every task of ours sent to a compute user endpoint that has not been seen to finish — the
+        # current runner's checks, the ones the endpoint kept from runners a stop, switch, rebuild or re-bind retired, a
+        # command whose result the client lost, and those a restarted server reads back from disk. While one is queued
+        # the endpoint can start a block to run it: after a cancel parsl submits another block for a task still
+        # outstanding (live 2026-10-16, `queued_check_relaunch`: "released 4", `down`, job 5 submitted 53 s later). So
+        # `down` needs the release confirmed AND every one resolved (or never sent), whatever the shape's own state
+        # says. (Our own commands with a live handle are the busy refusal's: a stop never releases under them.)
+        checks, store_problem = warmth._our_checks(app, eid, rt_pre, disk)
+        # On a fresh compute user endpoint (warmth._fresh_block) a cancelled or dead first pilot makes parsl give our
+        # check up (bad state) within one scheduler status poll: worth waiting for, so one call usually ends `down`. An
+        # endpoint of an earlier plugin keeps one user endpoint, where a cancel is followed by another block instead.
+        fresh = getattr(app.facility, "fresh_ueps", False) is True
+        wait = config.stop_check_wait_s() if fresh else 0.0
         # an earlier scheduler command of ours already occupying the internal login session (the cancel would wait)
         internal_before = _busy_session(app, "login", _INTERNAL_SESSION)
+    finally:
+        app.lock.release()
+    # A command whose result the client lost (its handle is gone) that may still be running: like a live task, a stop
+    # refuses — releasing the block would not end it (the endpoint starts another block to run it).
+    if refusal := await _lost_command_refusal(app, eid, checks, fresh, call_deadline):
+        return refusal
     # Cancel the scheduler block over the login shape (AMQP) — no SSH. OFF the lock: the release rides run_shell.
-    confirmed, detail = await scheduler_ops._release_blocks_over_login(
-        app, eid, _login_runner(app), expect_block=expect_block)
-    async with app.lock:  # look again and drop in ONE step: a dispatch may have reached the block during the release
+    started = time.monotonic()
+    settled = await _release_until_settled(app, eid, checks, wait, call_deadline, fresh=fresh)
+    confirmed, detail, states, ran = settled.confirmed, settled.detail, settled.states, settled.ran
+    waited = time.monotonic() - started
+    if not await _acquire_within(app, call_deadline):
+        return _lock_busy_status(app, eid, released=detail if confirmed else None)
+    try:  # look again and drop in ONE step: a dispatch may have reached the block during the release
         if work := _block_work(app, then="stop_endpoint again"):
             # Its command was sent to a block being cancelled: the endpoint may relaunch one to run it. Keep the shape
             # (its handle or returning call stays tracked there, and the next stop refuses or releases honestly).
@@ -991,29 +1058,62 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
                 notice=(f"{detail}. Spend is NOT confirmed stopped: {what} — it reached the block while it was being "
                         f"released, so the endpoint may relaunch a block to run it. {action}"),
             )
-        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
-    if confirmed:
+        # A worker answered a check of another call AFTER this stop's last cancel began: that block is up now.
+        up_late = _answered_since(app.shapes.get(DEFAULT_SHAPE), settled.released_at)
+        warmth._drop_compute_shape_locked(app)  # its spend stays in the session total, its checks with the endpoint
+        warmth._settle_checks(app, eid, checks, states)
+        # a check sent while the release ran (a concurrent ensure_endpoint_up) was not looked at: what its own future
+        # says, else queued
+        seen = {warmth._check_key(c) for c in checks}
+        late = [c for c in app.sent_checks.get(eid, []) if warmth._check_key(c) not in seen
+                and warmth._local_state(c, time.time(), drop_no_id=fresh) not in ("ok", "failed", "unsent")]
+    finally:
+        app.lock.release()
+    if up_late and confirmed:
         return EndpointStatus(
-            status="down",  # cancel CONFIRMED: a block was found + cancelled, or none was ever requested
+            status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+            notice=(f"{detail}. Spend is NOT confirmed stopped: a block came up and answered a check of hpc-bridge's "
+                    "after this stop's last cancel began — it is up now. Call stop_endpoint again to cancel it. The "
+                    "login endpoint stays online for reuse."),
+        )
+    pending = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")] + late
+    unknown = "unknown" in states
+    gave_up = [c for c, st in zip(checks, states, strict=True) if st == "failed"]
+    if confirmed and not pending and store_problem:  # fail closed: a task we cannot see may still be queued
+        return EndpointStatus(
+            status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+            notice=_store_problem_notice(detail, store_problem))
+    if confirmed and not pending:
+        return EndpointStatus(
+            status="down",  # the cancel CONFIRMED, and no task of ours is left that could start a block
             block_state="cold",
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
             spend_stopped=True,  # the one result that may say so
-            notice=f"compute block released over AMQP ({detail}); the login endpoint stays online for "
-            "reuse (reconnecting is zero-SSH).",
+            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran),
         )
-    if await _endpoint_gone(app):
-        # The login endpoint is OFFLINE/gone (the #44 liveness check poll_task got, applied here — found
-        # in review): "call again in a few seconds" would loop forever. A block whose manager is gone
-        # exits on its own (workers lose their manager), so nothing spends through hpc-bridge.
+    if confirmed:  # the scheduler holds nothing of ours now, but a task still queued can start a block
+        released = detail if detail != "released none" else None
         return EndpointStatus(
-            status="down", block_state="cold", endpoint_id=eid,
-            session_spend=_total_session_spend(app),
-            notice=("the login endpoint is OFFLINE — the cancel cannot be dispatched through it (ORPHANED). "
-                    "A block without its manager exits on its own; nothing is spending through hpc-bridge. "
-                    "Do not call stop_endpoint again; connect_facility stands the endpoint up afresh."),
+            status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+            notice=_check_pending_notice(app, pending, released=released, unknown=unknown, waited_s=waited,
+                                         fresh=fresh) + _store_problem_note(store_problem),
         )
+    if await _gone_within(app, call_deadline):
+        return await _orphaned_stop(app, eid, queued=bool(pending))
     # HONEST unconfirmed release (#24): NEVER "down" here — the agent must know spend may still be running.
+    # idle-release (min_blocks=0) ends a block ~10 min after its last task ONLY while no task of ours is outstanding
+    # there: never offered as the backstop while one may be queued (it is named instead), nor while the record of our
+    # tasks cannot be trusted
+    if pending:
+        what, plural = _check_words(pending, _queue_word(app))
+        backstop = (f" {what} {'are' if plural else 'is'} also not seen to finish, and the endpoint can start a block "
+                    "to run " + ("them" if plural else "it") + ": idle-release does not end that.")
+    elif store_problem:
+        backstop = _store_problem_note(store_problem)
+    else:
+        backstop = (" No task of hpc-bridge's is queued there, so idle-release (min_blocks=0) ends the block ~10 min "
+                    "after its last task.")
     internal = _busy_session(app, "login", _INTERNAL_SESSION)
     held = app.tasks.get(internal) if internal is not None else None
     if held is not None and internal != internal_before and held.command == scheduler_ops._release_cmd_for(app, eid):
@@ -1021,26 +1121,30 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # scheduler — sent, not confirmed
         notice = (f"Spend is NOT confirmed stopped: the cancel was sent (task_id={internal!r}) but has not finished — "
                   "it is queued behind other work on the login node, or the scheduler is slow. Call stop_endpoint "
-                  "again in a little while to confirm (idle-release, ~10 min, min_blocks=0, is the backstop). The "
-                  "login endpoint stays online for reuse.")
+                  "again in a little while to confirm." + backstop + " The login endpoint stays online for reuse.")
     elif internal is not None:
         # the cancel never left: another scheduler command of ours (an earlier one, or one started meanwhile)
         # occupies the internal login session
         notice = ("Spend is NOT confirmed stopped: the cancel could not be sent — the login release channel is busy, "
                   f"not cold, with another scheduler command of hpc-bridge's own (task_id={internal!r}) that is "
-                  "still running. Call stop_endpoint again in a little while (idle-release, ~10 min, min_blocks=0, is "
-                  "the backstop). The login endpoint stays online for reuse.")
-    elif expect_block:
-        # the block was still being submitted and no pilot appeared in the scheduler within the release window;
-        # one may land shortly (the stop-during-provisioning race, 0.1.14).
-        notice = (f"{detail}. Spend is NOT confirmed stopped — the compute block was still being submitted and no "
-                  "pilot had appeared in the scheduler yet, so there was nothing to cancel; one may land shortly. "
-                  "Call stop_endpoint again in a few seconds to cancel it once it lands (idle-release, ~10 min, "
-                  "min_blocks=0, is the backstop). The login endpoint stays online for reuse.")
+                  "still running. Call stop_endpoint again in a little while." + backstop + " The login endpoint stays "
+                  "online for reuse.")
+    elif detail == _OUT_OF_TIME:
+        # this call's time ran out before the scheduler answered (the login node or the scheduler is slow)
+        notice = ("Spend is NOT confirmed stopped: the cancel did not finish within this call — the login node or the "
+                  "scheduler is slow. Call stop_endpoint again in a little while to confirm." + backstop + " The login "
+                  "endpoint stays online for reuse.")
+    elif (failure := scheduler_ops._release_failure(detail)) is not None:
+        # a scheduler command itself failed (unreachable, or a cancel refused): not a cold channel, quoted as it is
+        notice = _failed_release_notice(failure, queued=bool(pending))
+    elif pending:  # the release could not look (a cold channel), and a task of ours is still queued
+        notice = _check_pending_notice(app, pending, released=None, unknown=unknown, waited_s=0.0, fresh=fresh,
+                                       reason="the login release channel was cold, and ") + _store_problem_note(
+                                           store_problem)
     else:
-        notice = (f"{detail}. Spend is NOT confirmed stopped — the login release channel was cold. "
-                  "idle-release (~10 min, min_blocks=0) is the backstop; call stop_endpoint again in a few "
-                  "seconds (the channel is warming) to confirm the cancel. The login endpoint stays online for reuse.")
+        notice = (f"{detail}. Spend is NOT confirmed stopped — the login release channel was cold. Call stop_endpoint "
+                  "again in a few seconds (the channel is warming) to confirm the cancel." + backstop + " The login "
+                  "endpoint stays online for reuse.")
     return EndpointStatus(
         status="draining",
         block_state="cold",
@@ -1050,12 +1154,205 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     )
 
 
+def _answered_since(rt: ShapeRuntime | None, since: float | None) -> bool:
+    """A worker answered a check on this shape at or after `since` (monotonic; None: no confirmed release): the block it
+    ran on came up after that cancel began, so it may still be up. Read from the shape's last confirmation, and from a
+    check that answered after its caller stopped waiting (`canary_answer`, not read yet)."""
+    if rt is None or since is None:
+        return False
+    if rt.warm_confirmed_at is not None and rt.warm_confirmed_at >= since:
+        return True
+    late = getattr(rt.runner, "canary_answer", lambda: None)() if rt.runner is not None else None
+    return late is not None and late.answered_at is not None and late.answered_at >= since
+
+
+# How often a stop that waits for our checks looks again: each look is a release (cancelling whatever pilot landed) and
+# a lookup of each check.
+_SETTLE_STEP_S = 10.0
+# Kept back from the call's budget while waiting: one more release and one more round of lookups.
+_SETTLE_RESERVE_S = 40.0
+_sleep = asyncio.sleep  # indirection so tests can run the settle loop without waiting
+# The detail of a release that this call's budget cut short.
+_OUT_OF_TIME = "cancel not confirmed (this call ran out of time before the scheduler answered)"
+
+
+class _Settled(NamedTuple):
+    confirmed: bool               # the last release was confirmed
+    detail: str                   # every job cancelled on the way, or the last attempt's words
+    states: list[warmth.CheckState]
+    ran: bool                     # a check ran during the stop (a block came up for it): it was cancelled after
+    released_at: float | None     # when the last confirmed release began (monotonic)
+
+
+async def _acquire_within(app: AppCtx, deadline: float) -> bool:
+    """Take app.lock, waiting no later than `deadline` (monotonic): another operation can hold it for long (a bring-up
+    over SSH, a provisioning call), and the stop must answer within its budget. A free lock is taken at once, even
+    with no time left (its final locked step must still run). True: the caller holds it now."""
+    if not app.lock.locked():
+        await app.lock.acquire()  # free: no suspension, so nothing can take it in between
+        return True
+    try:
+        await asyncio.wait_for(app.lock.acquire(), timeout=max(0.5, deadline - time.monotonic()))
+    except TimeoutError:
+        return False
+    return True
+
+
+def _lock_busy_status(app: AppCtx, eid: str, *, released: str | None) -> EndpointStatus:
+    """The stop could not take the endpoint within its budget: another hpc-bridge operation holds it. Nothing is
+    confirmed — `released`: what this stop's cancel did before that."""
+    head = f"compute block released over AMQP ({released}), but " if released else ""
+    return EndpointStatus(
+        status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+        notice=(f"{head}Spend is NOT confirmed stopped: another hpc-bridge operation holds this endpoint (for example "
+                "a bring-up over SSH, or a long provisioning call), and this stop could not finish within its time. "
+                "Call stop_endpoint again in a little while. The login endpoint stays online for reuse."),
+    )
+
+
+async def _gone_within(app: AppCtx, deadline: float) -> bool:
+    """`_endpoint_gone`, within the stop's budget (out of time: not known gone — the honest `draining` follows)."""
+    try:
+        return await asyncio.wait_for(_endpoint_gone(app), timeout=max(0.01, deadline - time.monotonic()))
+    except TimeoutError:
+        return False
+
+
+async def _lost_command_refusal(app: AppCtx, eid: str, checks: list[SentCheck], fresh: bool,
+                                deadline: float) -> EndpointStatus | None:
+    """A command of ours whose result the client lost (its future failed on the client's side alone) that the SERVICE
+    says is still queued or running: like a live task, releasing the block would not end it — the endpoint starts
+    another block to run it, and spend continues after a false `down` — so the stop refuses, naming it. Only on that
+    answer: one whose state cannot be read (no client yet after a restart — the release builds the login runner that
+    looks it up —, or a record the service no longer returns) never blocks a stop: the stop releases, and names it in
+    its `draining` while it cannot be read. Nor does one past its ceiling (`SentCheck.ceiling_at`: killed at its
+    walltime once running, plus the grace a queued one gets). None: nothing holds the stop."""
+    now = time.time()
+    cmds = [c for c in checks if c.what == "command" and (c.ceiling_at is None or now < c.ceiling_at)]
+    if not cmds:
+        return None
+    states = await warmth._check_states(cmds, _lookup_client(app),
+                                        min(warmth._LOOKUP_TIMEOUT_S, deadline - time.monotonic()),
+                                        known=app.resolved_checks, drop_no_id=fresh)
+    live = [c for c, st in zip(cmds, states, strict=True) if st == "pending"]
+    if not live:
+        return None
+    ids = ", ".join(t for c in live if (t := c.tid)) or "unknown id"
+    read = ""
+    rt = app.shapes.get(DEFAULT_SHAPE)
+    return EndpointStatus(
+        status="up", block_state="warm" if rt is not None else "cold", endpoint_id=eid,
+        session_spend=_total_session_spend(app), block_job_id=rt.block_job if rt is not None else None,
+        spend_stopped=False,
+        notice=(f"can't stop yet: hpc-bridge's command whose result the client lost (task {ids}) may still be "
+                f"running on the block{read}. Releasing the block now would not end it — the endpoint would start "
+                "another block to run it and spend would continue after a false 'down'. Its result cannot be fetched "
+                "(poll_task cannot return it): call stop_endpoint again once it has had time to finish, or "
+                "teardown_endpoint ends it now (the user's call)."),
+    )
+
+
+def _store_problem_note(problem: str | None) -> str:
+    """The sentence a stop adds when the record of our checks on disk cannot be trusted (state.SentCheckStore)."""
+    if not problem:
+        return ""
+    return (f" hpc-bridge's record of the checks it sent to this endpoint cannot be trusted — {problem} — so a check "
+            "still queued there may go unseen; teardown_endpoint ends every one of them (the user's call).")
+
+
+def _store_problem_notice(detail: str, problem: str) -> str:
+    """A confirmed release and no task of ours seen queued — but the record on disk could not be read: fail closed."""
+    return (f"compute block released over AMQP ({detail}). Spend is NOT confirmed stopped: hpc-bridge's record of the "
+            f"checks it sent to this endpoint cannot be trusted — {problem} — so a check of an earlier session may "
+            "still be queued there, which can start a block to run it. teardown_endpoint ends every one of them (the "
+            "user's call). The login endpoint stays online for reuse.")
+
+
+def _lookup_client(app: AppCtx) -> Any:
+    """An SDK Client to look up a task read back from disk (it has none of its own): any runner of this binding's —
+    the login shape's first, which the release itself just used."""
+    for name in ("login", DEFAULT_SHAPE):
+        runner = getattr(app.shapes.get(name), "runner", None)
+        client = getattr(runner, "task_client", lambda: None)() if runner is not None else None
+        if client is not None:
+            return client
+    return None
+
+
+async def _bounded_release(app: AppCtx, eid: str, run_login: Any, deadline: float) -> tuple[bool, str]:
+    """One release, within what is left of the call's budget."""
+    left = deadline - time.monotonic()
+    if left <= 0:
+        return False, _OUT_OF_TIME
+    try:
+        return await asyncio.wait_for(scheduler_ops._release_blocks_over_login(app, eid, run_login), timeout=left)
+    except TimeoutError:
+        return False, _OUT_OF_TIME
+
+
+async def _release_until_settled(app: AppCtx, eid: str, checks: list[SentCheck], wait_s: float,
+                                 deadline: float, *, fresh: bool = False) -> _Settled:
+    """Release this endpoint's blocks, and — for up to `wait_s` while a task of ours is still queued — release again
+    and look again every `_SETTLE_STEP_S`: a pilot that lands is cancelled, and a fresh user endpoint whose first pilot
+    was cancelled (or died) gives our check up. A check that RAN meanwhile ran on a block that came up for it: one more
+    release cancels that block. Everything — releases and lookups — within the call's `deadline`."""
+    run_login = _login_runner(app)
+    wait_until = min(time.monotonic() + wait_s, deadline - _SETTLE_RESERVE_S)
+    cancelled: list[str] = []
+    ran = False
+    released_at: float | None = None
+    while True:
+        began = time.monotonic()
+        confirmed, detail = await _bounded_release(app, eid, run_login, deadline)
+        if confirmed:
+            released_at = began
+        cancelled += [j for j in scheduler_ops._released_jobs(detail) if j not in cancelled]
+        states = await warmth._check_states(checks, _lookup_client(app),
+                                            min(warmth._LOOKUP_TIMEOUT_S, deadline - time.monotonic()),
+                                            known=app.resolved_checks, drop_no_id=fresh)
+        ran = ran or "ok" in states
+        if not confirmed or not any(st in ("pending", "unknown") for st in states) or time.monotonic() >= wait_until:
+            break
+        await _sleep(min(_SETTLE_STEP_S, max(0.0, wait_until - time.monotonic())))
+    if ran and confirmed:  # a block came up for a check during the stop: it ran it, and is cancelled now
+        began = time.monotonic()
+        confirmed, detail = await _bounded_release(app, eid, run_login, deadline)
+        if confirmed:
+            released_at = began
+        cancelled += [j for j in scheduler_ops._released_jobs(detail) if j not in cancelled]
+    if confirmed:
+        detail = f"released {' '.join(cancelled)}" if cancelled else "released none"
+    return _Settled(confirmed, detail, states, ran, released_at)
+
+
+async def _orphaned_stop(app: AppCtx, eid: str, *, queued: bool = False) -> EndpointStatus:
+    """The login endpoint is OFFLINE/gone (the #44 liveness check poll_task got, applied here — found in review): "call
+    again in a few seconds" would loop forever. A block whose manager is gone exits on its own (workers lose their
+    manager), so nothing spends through hpc-bridge now. Our tasks are KEPT (in memory and on disk): an OFFLINE status
+    can be transient, and a task still queued there can start a block once the endpoint is back — a later stop sees it.
+    `queued`: one was not known resolved."""
+    note = (" hpc-bridge's last check (or command) there was not seen to finish: if the endpoint comes back online it "
+            "can start a block for it — a stop_endpoint then cancels it, and teardown_endpoint ends it."
+            if queued else "")
+    return EndpointStatus(
+        status="down", block_state="cold", endpoint_id=eid,
+        session_spend=_total_session_spend(app),
+        notice=("the login endpoint is OFFLINE — the cancel cannot be dispatched through it (ORPHANED). "
+                "A block without its manager exits on its own; nothing is spending through hpc-bridge." + note
+                + " Do not call stop_endpoint again while it is offline; connect_facility stands the endpoint up "
+                "afresh."),
+    )
+
+
 @mcp.tool()
 async def stop_endpoint(ctx: Context) -> EndpointStatus:
     """Stop spending on the HPC compute block. On an endpoint hpc-bridge stood up over SSH it cancels the billed
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
     reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
-    `spend_stopped` true) means the cancel was confirmed, `draining` that it was not yet. On a facility multi-user
+    `spend_stopped` true) means nothing of ours is left to bill there — the cancel was confirmed (or there was nothing
+    to cancel) and no check of hpc-bridge's is still queued on the endpoint — and `draining` that this is not confirmed
+    yet: the cancel was not confirmed, or such a check is still queued and the endpoint can start a block to run it.
+    Call it again when its notice says; a check that stays queued ends with teardown_endpoint. On a facility multi-user
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
     the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
@@ -1223,6 +1520,8 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         # — unless a connect meanwhile bound a NEW endpoint: that state is its, not this teardown's to clear
         ours = app.state.endpoint_id in (eid, None)
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
+        warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
+    await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",
         block_state="cold",
@@ -1472,6 +1771,9 @@ async def _dispatch_counted(
     try:
         try:
             fut = runner.submit(payload())  # submit; wait a bounded time OFF the lock, else hand back a handle
+            # on the record while it runs (#24): a server that restarts mid-command must still see it
+            warmth._note_command_sent(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)(),
+                                      runner.walltime)
             res = await asyncio.to_thread(fut.result, runner.timeout)
         except asyncio.CancelledError:
             me = asyncio.current_task()
@@ -1505,6 +1807,10 @@ async def _dispatch_counted(
         async with app.lock:
             rt.inflight -= 1
             counted = None
+            if fut is not None:  # a future that failed on the client's side alone: the task may live on — evidence
+                warmth._keep_lost_command(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)(),
+                                          ceiling_s=runner.walltime)
+                warmth._note_command_done(app, fut)  # its result is in: off the record
             if guard is not None and (refused := warmth._guard_refusal(out, guard)) is not None:
                 # refused on a replacement block: nothing ran, so no submission and no proof of life — the reap
                 return warmth._wrong_block_outcome(app, shape, rt, guard, refused, reset=reset)

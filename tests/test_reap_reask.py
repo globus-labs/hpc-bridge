@@ -8,6 +8,7 @@ import time
 from concurrent.futures import Future
 
 import pytest
+from globus_compute_sdk.errors import TaskExecutionFailed
 
 from hpc_bridge import scheduler_ops
 from hpc_bridge.context import ShapeRuntime, TaskHandle
@@ -263,20 +264,25 @@ async def test_a_partition_switch_does_not_hide_a_reap_or_inherit_the_old_block_
 
 
 async def test_stop_after_a_reap_check_waits_for_the_pilot_that_check_may_have_requested(monkeypatch):
+    # the check that found the reap timed out: it is still queued on the endpoint, which can start a block to run it —
+    # so the stop that follows is not `down` on "released none" (#24's evidence: the check, not a clock)
     app, rt, runner = await _warm_app()
     app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, runner=runner)
     rt.warm_confirmed_at -= 100
     runner._canary = _TIMEOUT
     assert (await _run_shell(app, "true")).phase == "needs_confirmation"
-    seen = {}
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
-        return True, "released"
+    async def release(a, eid, run_login, **_kw):
+        return True, "released none"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is True
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and res.spend_stopped is not True
+    assert "(task check-1) is still queued on the endpoint" in res.notice
+    # the endpoint gives it up (its pilot cancelled): the next stop is `down`
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException", "0"))
+    res = await _stop_endpoint(app)
+    assert res.status == "down" and res.spend_stopped is True
 
 
 async def test_on_a_facility_endpoint_the_reap_notice_does_not_promise_a_cancel():
@@ -855,7 +861,9 @@ async def test_a_down_never_leaves_a_clock_running(verdict, facility, monkeypatc
     assert spent >= 60 / 3600 * _block_nodes(rt, app)              # billed up to the verdict, not short of it
     skew["s"] += 300
     res = await _ensure_endpoint_up(app)
-    assert res.status == "down" and _total_session_spend(app) == spent and rt.warm_since is None
+    # a rejection voided the confirmation (warmth._void_rejected): the next call is the re-ask, not another `down`
+    assert res.status == ("needs_confirmation" if verdict == "rejected" else "down")
+    assert _total_session_spend(app) == spent and rt.warm_since is None
 
 
 async def test_with_no_idle_window_known_a_failed_check_stops_the_clock():
@@ -957,14 +965,25 @@ async def test_an_error_while_checking_stops_the_clock_and_reports_the_spend(pat
     assert (await _ensure_endpoint_up(app)).status == "up" and rt.warm_since == stopped
 
 
-async def test_with_several_blocks_a_rejected_submission_does_not_stop_the_confirmed_blocks_clock():
-    # with max_blocks > 1 a rejected submission is a NEW block refused; the confirmed one may still be up and billing
+async def test_with_several_blocks_a_rejected_submission_is_terminal_too():
+    # This used to keep the confirmed block's clock running "with max_blocks > 1: the confirmed one may still be up".
+    # It cannot be: a rejection reaches our check only through parsl's block-error handler (set_bad_state_and_fail_all),
+    # which needs EVERY block that user endpoint ever had to be FAILED or MISSING (threshold max(1, init_blocks)) —
+    # whatever max_blocks is. So it is terminal for the confirmed block too: the clock stops, the confirmation and the
+    # block's identity go (review r2, R4: dropping the single-block rule from the void alone left `warm_since` running
+    # for an unconfirmed block with no identity).
     app, rt, runner = await _warm_app(job="112")
+    app.charge_factor = 1.0
     rt.user_endpoint_config["max_blocks"] = 2
     rt.warm_confirmed_at -= 55
     runner._canary = CanaryResult(ok=False, error=_REJECTED)
     res = await _ensure_endpoint_up(app)
-    assert res.status == "down" and rt.warm_since is not None and rt.block_job == "112"
+    assert res.status == "down" and "REJECTED" in res.notice
+    assert rt.warm_since is None and rt.spend_confirmed is False and rt.block_since is None and rt.block_job is None
+    spent = _total_session_spend(app)
+    again = await _ensure_endpoint_up(app)
+    assert again.status == "needs_confirmation" and "REJECTED the last block submission" in again.notice
+    assert _total_session_spend(app) == spent
 
 
 async def test_an_orphaned_task_stops_its_blocks_clock():

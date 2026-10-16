@@ -60,7 +60,11 @@ it to be cancelled (`scancel` or `qdel`) when you no longer want it.
 "Stop" means stop spending, not tear everything down.
 
 - **SSH-bootstrap facility:** the agent cancels the block through the scheduler and confirms it is
-  gone. Your personal endpoint on the login node stays online, costing nothing (it is a
+  gone. The stop also waits for hpc-bridge's own check (the small task it sends to see whether a block
+  is up) to be dropped, since the endpoint could start a block to run it; until then it says spend is
+  not confirmed stopped, and the agent calls stop again. A check that stays queued ends with a teardown.
+  Each block request runs a small worker process for that block on the login node, which exits ten
+  minutes after its last task (`HPC_BRIDGE_UEP_IDLE_HEARTBEATS`). Your personal endpoint on the login node stays online, costing nothing (it is a
   `globus-compute-endpoint` process in your home directory there), so the next session reconnects with
   no SSH. Ask for a teardown only if you want that endpoint removed entirely, for instance because your
   facility forbids persistent processes on login nodes.

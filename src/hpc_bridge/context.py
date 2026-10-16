@@ -79,12 +79,11 @@ class ShapeRuntime:
     reap_kicked: bool = False
     # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
     # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
-    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
-    # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
-    # (server._stop_endpoint's expect_block). A confirmation clears them.
+    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name.
+    # A confirmation clears them. (A block the old terms asked for that may still land is not tracked here: the check
+    # that asked for it is — the old runner's SentCheck, which the endpoint keeps when the switch retires that runner.)
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
-    switch_unseen: bool = False
     # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
     # while they differ from these — back on them, the block the reap found is that confirmation's again.
     reap_terms: tuple[str | None, str | None] | None = None
@@ -102,6 +101,20 @@ class ShapeRuntime:
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0
+    # The scheduler REJECTED this shape's block submission (one block): (the cause, the partition and account it was
+    # on). Set with the confirmation it voids (warmth._void_rejected), cleared by the next confirmation. The re-ask says
+    # why (notices._reask_prefix), and a stop expects no pilot from it (server._stop_endpoint).
+    rejected: tuple[str, str | None, str | None] | None = None
+    # A pilot of this shape that ran and died before any worker answered: the pilot probe reported it FINISHED with an
+    # exit status of its own (scheduler_ops.PilotProbe.dead; recorded by server._ensure_endpoint_up). Cleared when a
+    # worker answers a check (warmth._check_resolved) or the scheduler rejects a submission; a switch hands it to the
+    # endpoint's pilot watch (warmth._repoint). NOT cleared by a fresh confirm_spend: a confirmation is the user's
+    # assent, not news about the endpoint — the check those pilots were started for is still queued (the runner waits
+    # on it again rather than sending another), so the next pilot is for the same check and likely dies the same way.
+    dead_pilot: DeadPilot | None = None
+    # When spend was last confirmed for this shape (time.monotonic()): a pilot that FINISHED and was submitted before it
+    # is an earlier session's, not this block's (scheduler_ops._probe_pilots_over_login's `since_s`).
+    confirmed_at: float | None = None
 
 
 @dataclass
@@ -160,6 +173,48 @@ class LeftBlock:
     partition: str | None = None  # the block's partition and account: the same pair is the same facility user
     account: str | None = None    # endpoint process, whose next block supersedes this one (with one block at most)
     multi: bool = False          # the shape could run more than one block (max_blocks > 1): "at least" this one
+
+
+@dataclass(frozen=True)
+class DeadPilot:
+    """A pilot that ran and died before it ran hpc-bridge's check: the block started and its worker exited (a failed
+    worker_init, an environment the compute node lacks). Kept to NAME it — a stop says what became of the check it was
+    started for; that check's own state (SentCheck) is the evidence."""
+
+    job: str                     # the pilot's scheduler job, as the FINISHED notice named it
+    exit_status: str             # its exit status, as reported
+    known: frozenset[str] = frozenset()  # every pilot job of this endpoint the probe listed with it
+
+
+@dataclass
+class SentCheck:
+    """A task of ours sent to a COMPUTE user endpoint that has not been seen to finish — #24's evidence: a check
+    (canary) no worker has answered, or a command whose result the client lost (its future failed on the client's side
+    alone, e.g. the SDK's result watcher quitting, while the task lives on). While it is queued the endpoint can start a
+    block to run it: after a stop cancelled one, parsl submits another for a task still outstanding (live 2026-10-16,
+    `queued_check_relaunch`). So a stop answers `down` only once every one has resolved (warmth._check_states). Kept
+    past its runner's close and the shape's drop, per endpoint, in `AppCtx.sent_checks`, and on disk by task id
+    (state.SentCheckStore), so a restarted server still sees it."""
+
+    future: Any                  # the SDK's future (`task_id` once registered); None: read back from disk
+    client: Any = None           # the SDK Client that looks it up (get_task / get_batch_result); None: any of ours
+    terms: tuple[str | None, str | None] = (None, None)  # the partition and account of the block it asked for
+    dead: DeadPilot | None = None  # a pilot that died before it ran this check, to name
+    task_id: str | None = None   # as registered (the future's, or the one read back from disk)
+    sent_at: float = 0.0         # when it was sent (wall clock, time.time())
+    what: Literal["check", "command"] = "check"
+    # a command's: past this (wall clock: its ceiling — it is killed at its walltime once running — plus the grace a
+    # queued one gets) it can no longer make a stop refuse; None: unknown, or a check
+    ceiling_at: float | None = None
+    # the key of its row on disk when it has no task id (read back from a record: the submit's row, written before the
+    # service answered with an id)
+    row_key: str | None = None
+
+    @property
+    def tid(self) -> str | None:
+        """Its task id: the one recorded, else the future's once the web service registered it."""
+        got = self.task_id or getattr(self.future, "task_id", None)
+        return str(got) if got else None
 
 
 @dataclass
@@ -249,6 +304,29 @@ class AppCtx:
     # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
     # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
     job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
+    # Per endpoint id: the tasks of ours its compute user endpoints may still hold (SentCheck), taken from each compute
+    # runner as it is retired (a stop, a switch, a rebuild, a re-bind: warmth._retire_runner), from a command whose
+    # result the client lost, and from disk after a restart (warmth._our_checks), so a later stop still sees them. A
+    # stop drops the ones it found resolved; a teardown drops the endpoint's. Keyed by endpoint, so a reconnect to the
+    # same one keeps them.
+    sent_checks: dict[str, list[SentCheck]] = field(default_factory=dict)
+    # Per endpoint id: the task ids this process last wrote to disk for it, and the ones it last removed there as seen
+    # resolved (warmth._persist_checks writes only on a change, and again after a failed write).
+    persisted_checks: dict[str, tuple[frozenset[str], frozenset[str]]] = field(default_factory=dict)
+    # Task id -> how it resolved ("ok" / "failed"), as seen this session: never asked again, and removed from the record
+    # on disk by this process (warmth._check_states, _persist_checks). Bounded (warmth._trim_resolved).
+    resolved_checks: dict[str, str] = field(default_factory=dict)
+    # The record writes still to do per endpoint (the latest only) and the task writing them off the event loop
+    # (warmth._schedule_flush).
+    checks_pending: dict[str, Any] = field(default_factory=dict)  # warmth._RecordJob
+    check_flushers: dict[str, asyncio.Task] = field(default_factory=dict)
+    # Per endpoint id: the commands of ours sent to its compute block and not finished yet, written to the record so a
+    # restarted server still sees one still running (warmth._note_command_sent); and the task that writes a check's or
+    # command's task id to the record as soon as the SDK has it (warmth._watch_ids).
+    commands_sent: dict[str, list[SentCheck]] = field(default_factory=dict)
+    # Per endpoint id: how many writes of its record failed in a row (warmth._done_job retries with a backoff).
+    record_retries: dict[str, int] = field(default_factory=dict)
+    id_watchers: dict[str, asyncio.Task] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

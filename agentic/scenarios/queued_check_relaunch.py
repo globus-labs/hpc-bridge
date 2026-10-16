@@ -1,7 +1,8 @@
 """queued_check_relaunch — does `stop_endpoint` answer `down` while hpc-bridge's own CHECK is still queued on the endpoint,
 so that the endpoint submits a NEW billed pilot right after hpc-bridge said spend stopped? A suspected spend-honesty bug
-(review, 2026-10-15) — PROVEN live on 2026-10-15 (below), so phase `second` FAILS on main BY DESIGN until the fix lands
-(branch fix/stop-after-failed-block; HANDOFF.md). Scripted (HPCB_OPERATOR=script, harness/script_runner.py): no
+(review, 2026-10-15) — PROVEN live on 2026-10-15 (below): before the fix (#204) phase `second` failed on main, every
+run; with it, phase B lands in a fresh compute user endpoint and the cell passes (live 2026-10-16). It is the fix's
+regression check. Scripted (HPCB_OPERATOR=script, harness/script_runner.py): no
 agent, one exact sequence. Fake cluster, Slurm: the `default` profile, and `site`. Two phases (HPCB_RELAUNCH_PHASE):
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh queued_check_relaunch

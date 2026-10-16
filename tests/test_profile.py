@@ -17,6 +17,35 @@ def test_profile_rejects_nonpositive_idletime():
         Profile(max_idletime_s=0)
 
 
+def test_a_compute_user_endpoint_exits_after_ten_idle_minutes_by_default(monkeypatch):
+    # 20 heartbeats of 30 s: the block's own idle window. Configurable (0: never exit), never negative.
+    from hpc_bridge import config
+
+    assert Profile().uep_idle_heartbeats == 20 == config.uep_idle_heartbeats()
+    with pytest.raises(ValueError):
+        Profile(uep_idle_heartbeats=-1)
+    monkeypatch.setenv("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", "40")
+    assert config.uep_idle_heartbeats() == 40
+    monkeypatch.setenv("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", "-3")
+    assert config.uep_idle_heartbeats() == 20
+    monkeypatch.setenv("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", "0")
+    assert config.uep_idle_heartbeats() == 0
+
+
+def test_the_stops_wait_for_our_checks_is_bounded_and_configurable(monkeypatch):
+    # 90 s: parsl's 60 s scheduler status poll + a 5 s scaling pass + slack for the failure to reach the service
+    from hpc_bridge import config
+
+    assert config.stop_check_wait_s() == config.STOP_CHECK_WAIT_S == 90.0
+    monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "0")
+    assert config.stop_check_wait_s() == 0.0
+    monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "10000")
+    assert config.stop_check_wait_s() == 120.0                     # the whole call fits its budget
+    assert config.STOP_CALL_BUDGET_S <= 180.0                      # under a 300 s client tool timeout
+    monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "-5")
+    assert config.stop_check_wait_s() == 0.0
+
+
 def test_profile_carries_scheduler_and_cpus_per_node():
     import datetime
 

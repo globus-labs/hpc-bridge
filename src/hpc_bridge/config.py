@@ -78,12 +78,40 @@ def release_backoff_s() -> float:
     return float(env("HPC_BRIDGE_RELEASE_BACKOFF_S") or "6")
 
 
-def provisioning_release_attempts() -> int:
-    """Release attempts when a block was REQUESTED but never confirmed running (stop-during-provisioning): the pilot's
-    sbatch may not be in the scheduler yet, so a one-shot scancel finds nothing — keep polling for it to land and
-    cancel it (× release_backoff_s ≈ a ~30 s window by default) rather than falsely reporting 'down' (issue: the
-    spend_revoked race, 2026-09-05)."""
-    return max(release_attempts(), int(env("HPC_BRIDGE_PROVISIONING_RELEASE_ATTEMPTS") or "6"))
+# How long a stop waits for our checks still queued on a FRESH compute user endpoint to resolve (server._stop_endpoint):
+# once it has cancelled that endpoint's first pilot (or one died before it connected), parsl reads the job as MISSING
+# at its next scheduler status poll (at most every 60 s for Slurm and PBS — `status_polling_interval`, parsl 2026.4.20
+# to 2026.10.12), on its JobStatusPoller tick (`strategy_period: 5` in hpc-bridge's templates), trips its block-error
+# handler (bad state) and fails every task it holds — our check among them. 60 + 5 s, plus 25 s for the failure to
+# reach the web service and for our task lookups: 90 s, so one stop usually ends `down` instead of a second call. It
+# bounds the call; a check still queued at the end is said as such (`draining`), never presumed gone. Read at each
+# stop; 0 turns the wait off.
+STOP_CHECK_WAIT_S = 90.0
+_STOP_CHECK_WAIT_MAX_S = 120.0
+# The most one stop_endpoint call takes, its releases and task lookups included: under the 300 s a tool call may run in
+# the clients that drive hpc-bridge (Hermes, Pi), with room for the heartbeat and the answer. Past it, a stop says what
+# it could not confirm (`draining`) instead of running on.
+STOP_CALL_BUDGET_S = 180.0
+
+
+def stop_check_wait_s() -> float:
+    """The stop's bounded wait for our queued checks: STOP_CHECK_WAIT_S, unless HPC_BRIDGE_STOP_CHECK_WAIT_S overrides
+    it (within [0, 120] s, so the whole call — a release before it, and one more release and lookups after — fits in
+    STOP_CALL_BUDGET_S)."""
+    return min(max(0.0, _env_float("HPC_BRIDGE_STOP_CHECK_WAIT_S", STOP_CHECK_WAIT_S)), _STOP_CHECK_WAIT_MAX_S)
+
+
+# Heartbeats (30 s each) an idle COMPUTE user endpoint stays up before it exits (Profile.uep_idle_heartbeats), written
+# into the UEP template when hpc-bridge configures an endpoint — so a change applies to endpoints configured after it.
+UEP_IDLE_HEARTBEATS = 20
+
+
+def uep_idle_heartbeats() -> int:
+    """HPC_BRIDGE_UEP_IDLE_HEARTBEATS, else UEP_IDLE_HEARTBEATS: a whole number >= 0, written into the template of an
+    endpoint hpc-bridge configures from now on. 0 there keeps every compute user endpoint running once started, so such
+    an endpoint gets no fresh one per block request. An endpoint configured earlier keeps what its own template says."""
+    raw = _env_float("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", UEP_IDLE_HEARTBEATS)
+    return int(raw) if math.isfinite(raw) and raw >= 0 else UEP_IDLE_HEARTBEATS
 
 
 def charge_factor() -> float:

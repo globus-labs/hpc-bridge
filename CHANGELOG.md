@@ -60,8 +60,95 @@ installed plugin only when that version changes); git tags mark releases.
   refuse it, to say that it is now in the transcript and should be changed (without restating it), and to give the
   `preauth_command` for the user's own terminal. When `complete_preauth` refuses something that is not a one-time
   code, its notice says the same: if it was the user's password, tell them to change it, and never repeat it.
+- **`HPC_BRIDGE_PROVISIONING_RELEASE_ATTEMPTS` is no longer read.** A stop while a block was still being started
+  used to poll the scheduler a fixed number of times for its pilot, then answer `down` once it had cancelled one. It
+  now goes by hpc-bridge's own check instead (see Fixed): it answers `down` only once that check can no longer start
+  a block, and waits for that on an endpoint hpc-bridge set up (`HPC_BRIDGE_STOP_CHECK_WAIT_S`).
 
 ### Fixed
+- **`stop_endpoint` answers from what is left of hpc-bridge's own work, and no longer contradicts the answer
+  before it.** A stop could say spend stopped while the endpoint was about to start another block. Seen live
+  (2026-10-16, `queued_check_relaunch`): hpc-bridge's check (the small task it sends to see whether a block is up)
+  was still queued; the stop cancelled the block being started for it, answered `down` ("released 4"), and 53 s
+  later the endpoint submitted another block for that check. And (2026-10-15, the fake `site` cluster under Pi and
+  Hermes) `ensure_endpoint_up` answered that the scheduler REJECTED the block's submission ("the new block was not
+  created: nothing is queued"), or that its pilot job had already FINISHED with exit status 42, and the
+  `stop_endpoint` that followed answered `draining`: "the compute block was still being submitted … one may land
+  shortly … idle-release is the backstop". The agents believed the earlier answer and did not call again. Now:
+  - the stop answers `down` (`spend_stopped` true) only when its cancel was confirmed and every task hpc-bridge
+    sent to the endpoint has either been run or been dropped by the endpoint. That covers its checks, and a command
+    whose result hpc-bridge lost on its own side (for example when the Globus Compute client's result thread stops):
+    the command may still be running there. The stop asks the Globus Compute service about each one by its task
+    id, several at once, and takes the service's answer that a task failed as the endpoint having dropped it. While
+    one is still waiting, the stop answers `draining`: it names it (its queue and account, at most three task ids
+    and how many more), says the endpoint can start a block to run it, and says to call `stop_endpoint` again in
+    about a minute (each call cancels what it finds and looks again) and that `teardown_endpoint` ends one that
+    stays queued. The stop still sees those tasks after a partition or account switch, a `connect_facility` to the
+    same endpoint, a teardown that stopped to ask for a one-time code, and a restart of hpc-bridge itself: it keeps
+    their task ids in a small file per endpoint under `~/.hpc-bridge/sent-checks/`, which the endpoint's teardown
+    removes. Two sessions on one endpoint share that file: each write merges under a lock and removes only the tasks
+    that session saw finish. A file that cannot be read is kept aside (`.corrupt-<time>`) and the stop does not
+    answer `down` while it is there: it says the record cannot be trusted and that `teardown_endpoint` ends every
+    task on that endpoint. An answer read from the service is kept even when the round of lookups runs out of time,
+    and a task seen finished is never asked about again. A command whose result was lost that the service says is
+    still queued or running makes the stop refuse (as for a command still running), naming its task id: cancelling
+    the block would not end it. Only that answer refuses: a command whose state cannot be read (no client yet after
+    a restart, or a record the service no longer returns), or one past its time limit plus a grace, never keeps a
+    stop from cancelling — the stop cancels and says the command may still be queued or running. The file is read
+    and written in a background thread of its own, and its lock is never waited on for more than two seconds (on
+    Windows too): a home directory that hangs cannot freeze hpc-bridge, and a lock not had reads as a record that
+    cannot be trusted. A check is on the file from the moment it is sent, before its task id is known and before
+    its wait ends (a cancelled wait included); so is a command while it runs. A server that restarts before the task
+    id arrives reads such a row as possibly queued. Shutdown and teardown wait for the file's last write. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
+    that came up after the stop's last cancel. A `connect_facility` to another facility says when a task may still
+    be queued on the endpoint it left. When the endpoint is offline, the stop answers `down` as before, but keeps
+    the tasks: if the endpoint comes back, the next stop still sees them. One `stop_endpoint` call takes at most
+    three minutes, its cancels, lookups and waits for another operation on the endpoint included (when another
+    operation, such as a bring-up over SSH, holds the endpoint for longer, the stop says so and to call again);
+  - an endpoint hpc-bridge sets up now runs each block request in its own compute user endpoint, a small process on
+    the login node that exits ten minutes after its last task (`idle_heartbeats_soft` in the endpoint's template;
+    `HPC_BRIDGE_UEP_IDLE_HEARTBEATS`, default 20 heartbeats of 30 s). The block it starts is its first, so when a
+    stop cancels that block, or the block dies before it connects, the endpoint drops the check instead of starting
+    another block. On such an endpoint the stop waits up to 90 s for that (`HPC_BRIDGE_STOP_CHECK_WAIT_S`),
+    cancelling anything that lands meanwhile, so one call usually ends `down`. Confirming spend again while a block
+    is still up keeps the same user endpoint, and the login endpoint's own process never changes. An endpoint set
+    up by an earlier plugin keeps one compute user endpoint (one per block request would never exit there): its
+    stops do not wait, and answer `draining` until the check is dropped. To get the new behaviour there, remove the
+    endpoint (`teardown_endpoint`) and connect again. On such an endpoint the stop says that only
+    `teardown_endpoint` ends a queued check there. A facility's own endpoint is unchanged. Two limits remain: each
+    block request leaves a directory of logs and scripts on the login node (`~/.globus_compute/uep.<id>.*`) until the
+    endpoint is torn down, and on a PBS server that keeps no job history the endpoint never learns that a cancelled
+    block is gone, so the check stays queued and the stop stays `draining` until `teardown_endpoint`;
+  - a stop whose cancel could not be confirmed (the login release channel cold or busy, or out of time) offers
+    idle-release as the backstop only when no task of hpc-bridge's is queued: idle-release ends a block about
+    ten minutes after its last task, never while a task waits, so otherwise it names the task instead;
+  - after a rejected submission the stop answers `down`, saying there was nothing to cancel because the scheduler
+    rejected the submission and no block was created;
+  - a rejected submission also drops the spend confirmation, as a reaped block does: the next `ensure_endpoint_up` or
+    `run_shell` without `confirm_spend` asks again, saying the last submission was rejected and that the same terms
+    would be refused again. Before, the next call submitted the same request again. On a facility's own endpoint the
+    stop no longer names a block confirmed before the rejection as still billing: with one block, the endpoint
+    submits a new one only once that one is gone;
+  - after a pilot that ran and died, the stop names that pilot and its exit status: `down` once the endpoint has
+    dropped the check it was started for, `draining` while that check is still queued. It no longer says "still
+    being submitted", and no longer offers idle-release as a backstop: an endpoint is not idle while a check waits;
+  - after a switch, the stop names a check still queued for the old terms ("hpc-bridge's check for the block on
+    partition 'debug'"), whatever the new terms did, and nothing of terms the scheduler rejected. The answer that
+    switched, confirmed and met the rejection no longer opens with a receipt for a new block "this new one
+    included"; it says what became of the old block, then the rejection;
+  - the stop's cancel command used to read an unreachable scheduler (`squeue` or `qstat` failing) as an empty
+    listing, so it answered "released none", a confirmed release; a cancel the scheduler refused also read as
+    released. Now each says which command failed, with its own words (not "the login release channel was cold"),
+    and the stop does not count it as confirmed. The release cancels one job at a time: when PBS refuses to delete a
+    job that is already exiting, the stop names that job and the ones it did cancel. The pilot check says when a
+    command failed too;
+  - a pilot that died in an earlier session, still in the scheduler's history (Slurm's accounting keeps six hours
+    here, PBS's job history about two weeks), is no longer reported as this block's FINISHED pilot. A check that
+    waits a long time for the login node can no longer make this block's own dead pilot look like an earlier one;
+  - a pilot that died after the block's own check failed with an error (the block kept its identity) is now
+    recorded, so the stop names it;
+  - a rejected submission now stops the spend clock and asks for spend again whatever the block count. parsl lets
+    the rejection reach hpc-bridge only once every block of that endpoint has failed, so no block of it is still up.
 - **A command hpc-bridge runs over SSH can no longer take the agent's next request.** With nothing to send it, `ssh`
   inherited the MCP server's own stdin, the channel the agent's requests arrive on. Seen live 2026-10-15 when
   `teardown_endpoint` was called again while a background teardown's stop and delete ran on the login node, with two

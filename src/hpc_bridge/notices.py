@@ -16,7 +16,7 @@ from typing import Literal
 
 from . import config
 from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
-from .context import AppCtx, LeftBlock, ShapeRuntime, _has_login_shape, _idle_release_s
+from .context import AppCtx, LeftBlock, SentCheck, ShapeRuntime, _has_login_shape, _idle_release_s
 from .cost import _block_nodes, _with_spend
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
@@ -356,12 +356,21 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     out = ""
     word = _queue_word(app) if app is not None else "partition"
     left = rt.switch_left if app is not None and _still_left(app, rt.switch_left) else None
+    if rt.rejected is not None:  # warmth._void_rejected: the confirmation covered a block that was never created
+        cause, partition, account = rt.rejected
+        uec = rt.user_endpoint_config
+        same = (partition, account) == (uec.get("partition"), uec.get("account"))
+        out = (f"Confirm spend again with the user: the scheduler REJECTED the last block submission, on "
+               f"{_terms(partition, account, word)} ({cause}), so no block was created and the earlier confirmation "
+               "covered nothing that runs. "
+               + ("Confirming the same terms again repeats a request the scheduler refuses. " if same else
+                  f"The {word} or account has changed since. "))
     if rt.reaped is not None:
         # Found by a check (kicked): a replacement may already be running, and billing from when it started.
         bills = ("a replacement bills from the moment it starts, confirmed or not" if rt.reap_kicked else
                  "a new block bills again")
-        out = (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; "
-               f"{bills}. ")
+        out += (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; "
+                f"{bills}. ")
     if rt.switched_terms is not None:
         uec = rt.user_endpoint_config
         if rt.switched_terms == (uec.get("partition"), uec.get("account")):
@@ -414,6 +423,17 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     word = _queue_word(app)
     return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
             + _switch_fate(app, rt.switch_left, confirmed=True))
+
+def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | None, str | None] | None) -> str:
+    """For the call that switched the partition or account, confirmed and met a REJECTED submission at once: no new
+    block exists, so not `_switch_receipt` ("…this new one included") — only what became of the old terms' block, which
+    nothing cancels on a switch. Empty when nothing was switched, or the terms are back to the old ones."""
+    uec = rt.user_endpoint_config
+    if switched is None or switched == (uec.get("partition"), uec.get("account")):
+        return ""
+    word = _queue_word(app)
+    return (f"The {word} or account changed from {_terms(*switched, word)} in this call. "
+            + _switch_fate(app, rt.switch_left, confirmed=False))
 
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -585,6 +605,106 @@ def _submit_rejected_notice(partition: str | None, account: str | None, error: s
             "this facility, or the partition needs a resource request. Ask the user / check the facility's docs, then "
             "change it and confirm again — ensure_endpoint_up(account=…, partition=…, confirm_spend=True). Do not "
             "retry unchanged.")
+
+
+def _failed_release_notice(failure: str, *, queued: bool) -> str:
+    """A stop whose release met a FAILED scheduler command — the listing could not be read, or the scheduler refused
+    a cancel (a PBS job already exiting): neither a cold channel nor a confirmed release. The command's own words are
+    quoted, with what it did cancel; `queued`: a check of ours is also still queued on the endpoint."""
+    more = (" A check of ours is also still queued on the endpoint, which can start a block to run it." if queued
+            else "")
+    return (f"Spend is NOT confirmed stopped: a scheduler command on the login node failed — {failure!r} — so "
+            f"hpc-bridge cannot confirm what is left of this endpoint's blocks.{more} Call stop_endpoint again in a "
+            "little while; if the same command keeps failing, the facility's scheduler may be down or refusing: tell "
+            "the user, who can check and cancel the jobs on the facility (squeue / scancel, qstat / qdel). The login "
+            "endpoint stays online for reuse.")
+
+
+def _rejected_stop_notice() -> str:
+    """The `down` of a stop after a REJECTED submission that found nothing in the scheduler: nothing was ever created to
+    cancel — the same fact the REJECTED answer gave, never a claim that a block was released."""
+    return ("nothing to cancel: the scheduler REJECTED the block's submission, so no block was created and none bills "
+            "(released none). The login endpoint stays online for reuse (reconnecting is zero-SSH).")
+
+
+# A stop names at most this many task ids, then "+N more".
+_MAX_TASK_IDS = 3
+
+
+def _task_ids(items: Collection[SentCheck]) -> str:
+    """" (task a, b, c +N more)" for a notice, or ""."""
+    ids = [t for c in items if (t := c.tid)]
+    if not ids:
+        return ""
+    more = f" +{len(ids) - _MAX_TASK_IDS} more" if len(ids) > _MAX_TASK_IDS else ""
+    return f" (task {', '.join(ids[:_MAX_TASK_IDS])}{more})"
+
+
+def _check_words(items: Collection[SentCheck], word: str) -> tuple[str, bool]:
+    """(what, plural) for a stop's notice: "hpc-bridge's check for the block on partition 'x' (task …)", and/or
+    "hpc-bridge's command whose result the client lost (task …)"."""
+    checks = [c for c in items if c.what == "check"]
+    cmds = [c for c in items if c.what == "command"]
+    parts = []
+    if checks:
+        on = " and ".join(_terms(*t, word) for t in dict.fromkeys(c.terms for c in checks))
+        parts.append(f"hpc-bridge's check{'' if len(checks) == 1 else 's'} for the block on {on}{_task_ids(checks)}")
+    if cmds:
+        parts.append(f"hpc-bridge's command{'' if len(cmds) == 1 else 's'} whose result the client lost"
+                     f"{_task_ids(cmds)}")
+    return " and ".join(parts), len(items) != 1
+
+
+def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, released: str | None, unknown: bool,
+                          waited_s: float, fresh: bool = True, reason: str = "") -> str:
+    """A stop with a task of ours still queued on a compute user endpoint (`warmth._check_states`): the endpoint can
+    start a block to run it — after a stop cancelled one, parsl submits another for a task still outstanding — so spend
+    is NOT confirmed stopped, whatever the release found (#24). `fresh`: the endpoint gives each block request its own
+    compute user endpoint, which gives a check up once its first pilot is cancelled, so calling again is the way; on an
+    endpoint of an earlier plugin (one compute user endpoint) a cancel never ends a queued task, and only
+    teardown_endpoint does. `reason`: why the release itself was not confirmed, when it was not."""
+    what, plural = _check_words(pending, _queue_word(app))
+    it, is_, its, stays = ("them", "are", "their", "stay") if plural else ("it", "is", "its", "stays")
+    where = "still queued or running" if any(c.what == "command" for c in pending) else "still queued"
+    if unknown:  # not read: what the service would say is not known
+        where, is_ = f"may {where.replace('still', 'still be')}", ""
+    dead = next((c.dead for c in pending if c.dead is not None), None)
+    died = (f" Pilot {dead.job} FINISHED (exit status {dead.exit_status}) before it ran {it}." if dead else "")
+    head = f"compute block released over AMQP ({released}). " if released else ""
+    read = f" ({its} state could not be read from the service)" if unknown else ""
+    waited = f" This stop waited {int(waited_s)} s for the endpoint to give {it} up." if waited_s >= 1 else ""
+    if fresh:
+        then = (" Call stop_endpoint again in about a minute: each call cancels what it finds and looks again. "
+                f"If {it} {stays} queued call after call, teardown_endpoint ends {it} (the user's call).")
+    else:
+        then = (f" This endpoint was set up by an earlier hpc-bridge and keeps one compute user endpoint, which starts "
+                f"another block for a queued task after every cancel: stopping does not end {it}, only "
+                f"teardown_endpoint does (the user's call). Short of that, the block it starts runs {it} and then "
+                "idles out (~10 min after its last task).")
+    return (f"{head}Spend is NOT confirmed stopped: {reason}{what} {is_ + ' ' if is_ else ''}{where} on the "
+            f"endpoint{read}, which can "
+            f"start a block to run {it}.{died}{waited}{then} The login endpoint stays online for reuse.")
+
+
+def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool) -> str:
+    """The `down` of an SSH stop: the release confirmed, and no check of ours is still queued. Says what settled it — a
+    rejected submission (nothing was created), a check the endpoint gave up once its pilot was cancelled or died (naming
+    a dead pilot), a block that came up for a check during the stop and was cancelled — never more than happened."""
+    if rejected and detail == "released none" and not ran:  # the check the endpoint gave up IS the rejected one
+        return _rejected_stop_notice()
+    out = f"compute block released over AMQP ({detail})"
+    if gave_up:
+        what, plural = _check_words(gave_up, _queue_word(app))
+        it = "them" if plural else "it"
+        dead = next((c.dead for c in gave_up if c.dead is not None), None)
+        if dead is not None:
+            out += (f". Pilot {dead.job} FINISHED (exit status {dead.exit_status}) before it ran {what}, and the "
+                    f"endpoint has given {it} up, so it starts no block for {it}")
+        else:
+            out += f". The endpoint has given up {what}, so it starts no block for {it}"
+    if ran:
+        out += ". A block that came up during this stop ran hpc-bridge's last check, and was cancelled"
+    return out + ". The login endpoint stays online for reuse (reconnecting is zero-SSH)."
 
 
 def _no_account_failure(error: str | None) -> bool:

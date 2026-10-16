@@ -15,6 +15,7 @@ import asyncio
 import itertools
 import re
 import shlex
+import time
 from collections.abc import Awaitable, Callable
 from typing import NamedTuple
 
@@ -31,23 +32,30 @@ def _release_cmd(scheduler: str, eid: str) -> str:
     precisely by the `uep.<eid>` StdOut marker Parsl writes under the UEP dir. Scheduler-specific:
     Slurm reads squeue/scancel; PBS reads qstat -f (unwrapping its 80-col line continuations so a
     wrapped Output_Path can't split the marker) and qdel."""
-    marker = f"uep.{eid}"
+    m = shlex.quote(f"uep.{eid}")
     if scheduler == "pbs":
         # NB: `qstat -f -u $USER` yields NOTHING on PBS Pro — the -u filter suppresses full-format
         # output entirely (unlike Slurm's `squeue -u`), which silently no-ops the cancel and lets the
         # block burn to walltime (caught in live Polaris validation). Use bare `qstat -f` (all jobs)
         # and let the endpoint-unique `uep.<eid>` marker scope the match to only our jobs.
-        return (
-            'ids=$(qstat -f 2>/dev/null '
-            "| sed ':a;N;$!ba;s/\\n\\t//g' "
-            f"| awk -v m={shlex.quote(marker)} 'BEGIN{{RS=\"Job Id: \"}} index($0,m){{print $1}}'); "
-            '[ -n "$ids" ] && qdel $ids; echo "released ${ids:-none}"'
-        )
-    return (
-        'ids=$(squeue -u "$USER" -h -O "JobID:30,StdOut:1024" 2>/dev/null '
-        f"| grep -F {shlex.quote(marker)} | awk '{{print $1}}'); "
-        '[ -n "$ids" ] && scancel $ids; echo "released ${ids:-none}"'
-    )
+        query, cancel = "qstat -f", "qdel"
+        pick = ("sed ':a;N;$!ba;s/\\n\\t//g' "
+                f"| awk -v m={m} 'BEGIN{{RS=\"Job Id: \"}} index($0,m){{print $1}}'")
+    else:
+        query, cancel = 'squeue -u "$USER" -h -O "JobID:30,StdOut:1024"', "scancel"
+        pick = f"awk -v m={m} 'index($0,m){{print $1}}'"
+    # A scheduler command that FAILS (slurmctld / pbs_server unreachable, a refused cancel) says so in its own line —
+    # never the "released none" an empty listing piped through `2>/dev/null` used to print, which read as a confirmed
+    # release (and now also feeds the `down` after a rejected submission and a pilot watch's end). One cancel per job:
+    # one call for all of them fails as a whole when one is refused — PBS refuses a job already EXITING (`E`, still in
+    # `qstat -f`) while it deletes the rest — and its exit code cannot say which. So the line names both: what was
+    # cancelled and what was not (`_released_jobs`, `_release_failure`).
+    return (f'if q=$({query} 2>/dev/null); then ids=$(printf \'%s\\n\' "$q" | {pick}); '
+            'if [ -z "$ids" ]; then echo "released none"; else ok=""; bad=""; '
+            f'for j in $ids; do if {cancel} "$j"; then ok="$ok $j"; else bad="$bad $j"; fi; done; '
+            'if [ -z "$bad" ]; then echo "released$ok"; '
+            f'else echo "release failed: {cancel} refused$bad; cancelled:${{ok:- none}}"; fi; fi; '
+            f'else echo "release failed: {query.split()[0]} could not be read"; fi')
 
 def _release_cmd_for(app: AppCtx, eid: str) -> str:
     """The release one-liner for the bound facility's scheduler. The scheduler lives on the facility's MachineProfile
@@ -56,9 +64,7 @@ def _release_cmd_for(app: AppCtx, eid: str) -> str:
     Facility protocol."""
     return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid)
 
-async def _release_blocks_over_login(
-    app: AppCtx, eid: str, run_login: LoginRunner, *, expect_block: bool = False
-) -> tuple[bool, str]:
+async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunner) -> tuple[bool, str]:
     """Cancel this endpoint's scheduler block(s) by running the scheduler's cancel (scancel/qdel)
     on the **login shape (AMQP)** — never SSH. That's the whole point of the login-node endpoint:
     talk to the cluster over Compute, not a fresh SSH. Matches blocks precisely by the UEP StdOut
@@ -69,31 +75,53 @@ async def _release_blocks_over_login(
     to *confirm* the cancel instead of walking away while the block keeps burning. Returns
     `(confirmed, detail)`: `confirmed=False` means the channel stayed cold across the retries and the
     cancel was NOT verified — the caller must report that honestly (never "down"; see #24). An
-    unconfirmed cancel is still backstopped by idle-release (`min_blocks=0` + `max_idletime`), and
-    re-calling stop (channel now warming) confirms it. Retry budget: HPC_BRIDGE_RELEASE_ATTEMPTS
-    (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s)."""
+    unconfirmed cancel is backstopped by idle-release (`min_blocks=0` + `max_idletime`) only while no task of ours
+    is outstanding there (the caller says which), and re-calling stop (channel now warming) confirms it. Retry
+    budget: HPC_BRIDGE_RELEASE_ATTEMPTS (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s).
+
+    A confirmed release says only what the scheduler holds NOW: a block still to land (the stop-during-provisioning
+    race) or one the endpoint starts after the cancel, for a check of ours still queued, is what the stop's own wait
+    on that check covers (server._release_until_settled) — this no longer polls for a pilot to appear."""
     cmd = _release_cmd_for(app, eid)
-    # `expect_block`: a block was requested but never confirmed running (stop-during-provisioning). Its sbatch may not
-    # be in the scheduler yet, so a scancel that finds nothing ("released none") has NOT confirmed the block gone — the
-    # pilot can land a moment later and burn (the spend_revoked race). Keep polling for it to appear (a longer budget),
-    # and only count a run that actually CANCELLED a job as confirmed. Without a block expected, "released none" is a
-    # genuine confirm (nothing was ever there).
-    attempts = config.provisioning_release_attempts() if expect_block else config.release_attempts()
+    attempts = config.release_attempts()
     backoff = config.release_backoff_s()
     detail = "unconfirmed"
     for i in range(attempts):
         out = await run_login(cmd)
         if out.phase == "complete" and out.exit_code == 0:
-            line = (out.stdout or "").strip().splitlines()
-            last = (line[-1] if line else "released none").strip()
-            if last != "released none" or not expect_block:
-                return True, last  # cancelled a job, or none was expected — the cancel is confirmed
-            detail = "no pilot in the scheduler yet (block still being submitted)"  # expect_block: keep polling for it
+            lines = (out.stdout or "").strip().splitlines()
+            last = (lines[-1] if lines else "").strip()
+            if last.startswith("released "):
+                return True, last  # cancelled what was there, or nothing was: the scheduler holds none of ours now
+            detail = last or "the release printed nothing"  # a scheduler command failed (the line says which)
         else:
             detail = out.notice or out.phase or "unconfirmed"
         if i + 1 < attempts and backoff > 0:
             await asyncio.sleep(backoff)  # let the woken login worker register / the sbatch land, then re-confirm
-    return False, f"cancel not confirmed ({detail}); idle-release will reclaim it"
+    return False, f"cancel not confirmed ({detail})"  # (idle-release is a backstop only with nothing of ours queued)
+
+
+def _released_jobs(detail: str) -> list[str]:
+    """The jobs a release cancelled, from its detail: `released <ids>` (confirmed), or the `cancelled: <ids>` of one
+    where the scheduler refused some (unconfirmed — what WAS cancelled is not lost); [] for none."""
+    if "release failed:" in detail:
+        words = detail.split("cancelled:", 1)[1].split(")", 1)[0].split() if "cancelled:" in detail else []
+    else:
+        words = detail.split()
+        if words[:1] != ["released"]:
+            return []  # a cold channel, or a look that found nothing to cancel yet
+        words = words[1:]
+    return [] if words == ["none"] else words
+
+
+def _release_failure(detail: str) -> str | None:
+    """The scheduler command a release says FAILED, quoted from its detail (`release failed: …`), or None — a cold
+    login channel, or a release that read the scheduler, is not one."""
+    i = detail.find("release failed:")
+    if i < 0:
+        return None
+    out = detail[i:].split("); idle-release", 1)[0]  # (the wording before 2026-10-16 added that clause)
+    return out[:-1] if out.endswith(")") and detail.startswith("cancel not confirmed (") else out
 
 # A finished pilot's own job may say why it died: hpc-bridge's env_setup line prints one `hpc-bridge: endpoint venv …`
 # line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each
@@ -103,6 +131,8 @@ async def _release_blocks_over_login(
 _SAID_LOOP = (
     "while IFS= read -r l; do case $l in (\"HPCB_ERR \"*) set -- $l; "
     "s=$(sed -n '/^hpc-bridge: /p' \"$3\" 2>/dev/null | tail -n 1); [ -n \"$s\" ] && echo \"HPCB_SAID $2 $s\";; "
+    # a PBS pilot's creation time as qstat prints it, as epoch seconds (GNU date; elsewhere it is left out, unknown)
+    "(\"HPCB_QT \"*) set -- $l; j=$2; shift 2; t=$(date -d \"$*\" +%s 2>/dev/null) && echo \"HPCB_SUB $j $t\";; "
     "(*) echo \"$l\";; esac; done; true"
 )
 
@@ -117,7 +147,11 @@ def _pilot_status_cmd(scheduler: str, eid: str) -> str:
 
 
 def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
-    marker = f"uep.{eid}"
+    # Around the rows: `HPCB_NOW <epoch>` (the login node's clock, so a pilot's submit time can be compared with a
+    # duration measured here — no clock skew), `HPCB_SUB <job> <epoch>` per finished pilot (when it was submitted), and
+    # `HPCB_FAIL <command>` for a scheduler query that FAILED — never an empty listing that reads as "no pilot".
+    m = shlex.quote(f"uep.{eid}")
+    now = 'echo "HPCB_NOW $(date +%s)"; '
     if scheduler == "pbs":
         # Bare `qstat -f` (the -u filter suppresses full-format output on PBS Pro); unwrap the 80-col
         # line continuations, split on records, and for records carrying the marker print the
@@ -125,19 +159,21 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
         return (
             # -x: finished jobs too — a pilot that RAN AND DIED (a broken worker_init, a missing module) is otherwise
             # invisible and read as "never submitted"; the summary prefers a live state when both are present.
-            "qstat -x -f 2>/dev/null | sed ':a;N;$!ba;s/\\n\\t//g' "
+            now + "if q=$(qstat -x -f 2>/dev/null); then printf '%s\\n' \"$q\" | sed ':a;N;$!ba;s/\\n\\t//g' "
             # …plus the scheduler's `comment` for the record: a HELD pilot's comment is the site's own explanation
             # (a Polaris-style hook: "requires -l filesystems=…"), which the agent otherwise has to dig out of qstat -f.
-            f"| awk -v m={shlex.quote(marker)} 'BEGIN{{RS=\"Job Id: \"}} index($0,m){{"
+            f"| awk -v m={m} 'BEGIN{{RS=\"Job Id: \"}} index($0,m){{"
             's="?"; if (match($0,/job_state = [A-Za-z]/)) s=substr($0,RSTART+12,1); '
             'x="-"; if (match($0,/Exit_status = -?[0-9]+/)) x=substr($0,RSTART+14,RLENGTH-14); '
             'c=""; if (match($0,/comment = [^\\n]*/)) c=substr($0,RSTART+10,RLENGTH-10); '
             "print s\" \"$1\" \"x\" \"c; "
+            # a finished pilot's creation time, as qstat prints it (`_SAID_LOOP` turns it into HPCB_SUB)
+            'if (s ~ /^[FEX]$/ && match($0,/ctime = [^\\n]*/)) print "HPCB_QT "$1" "substr($0,RSTART+8,RLENGTH-8); '
             # where a pilot that ran and died wrote its stderr (Error_Path is host:path)
             'if (s ~ /^[FEX]$/ && x != "-" && match($0,/Error_Path = [^\\n]*/)) '
-            '{p=substr($0,RSTART+13,RLENGTH-13); sub(/^[^:]*:/,"",p); print "HPCB_ERR "$1" "p}}\''
+            '{p=substr($0,RSTART+13,RLENGTH-13); sub(/^[^:]*:/,"",p); print "HPCB_ERR "$1" "p}}\'; '
+            'else echo "HPCB_FAIL qstat"; fi; true'
         )
-    m = shlex.quote(marker)
     # Live pilots from squeue — `STATE JOBID - REASON` (the PENDING reason tells a normal queue wait from a job the
     # scheduler will never start: PartitionTimeLimit, AssocMaxJobsLimit, JobHeldUser…) — plus FINISHED pilots from
     # accounting (sacct's SubmitLine carries the script path, hence the marker) as `F JOBID EXIT STATE`, so a pilot
@@ -145,20 +181,25 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
     # diagnosis: CANCELLED (our own release / re-bind), TIMEOUT (the walltime), COMPLETED with 0 (a worker that
     # simply ended). Filter by the marker INSIDE awk (not `grep -F | awk`): grep exits non-zero on no-match, which
     # under a `set -o pipefail` shell would mask an empty result as an error and swallow the "no pilot" signal.
-    # sacct is best-effort (no accounting daemon ⇒ no rows, not an error).
+    # sacct is best-effort (no accounting daemon ⇒ `HPCB_FAIL sacct` and no rows). Submit comes LAST, after SubmitLine,
+    # as epoch seconds (SLURM_TIME_FORMAT is an strftime format).
     return (
-        '{ squeue -u "$USER" -h -O "State:20,JobID:24,Reason:60,StdOut:1024" 2>/dev/null '
-        f"| awk -v m={m} 'index($0,m){{print $1\" \"$2\" - \"$3}}'; "
-        'sacct -X -n -P -u "$USER" -S now-6hours -o State,JobID,ExitCode,SubmitLine 2>/dev/null '
-        f"| awk -F'|' -v m={m} 'index($4,m){{st=$1; sub(/ .*/,\"\",st); "
+        now + 'if q=$(squeue -u "$USER" -h -O "State:20,JobID:24,Reason:60,StdOut:1024" 2>/dev/null); '
+        f"then printf '%s\\n' \"$q\" | awk -v m={m} 'index($0,m){{print $1\" \"$2\" - \"$3}}'; "
+        'else echo "HPCB_FAIL squeue"; fi; '
+        'if a=$(SLURM_TIME_FORMAT=%s sacct -X -n -P -u "$USER" -S now-6hours -o State,JobID,ExitCode,SubmitLine,Submit '
+        "2>/dev/null); "
+        f"then printf '%s\\n' \"$a\" | awk -F'|' -v m={m} 'index($4,m){{st=$1; sub(/ .*/,\"\",st); "
         'if (st ~ /^(PENDING|RUNNING|COMPLETING|CONFIGURING|SUSPENDED)$/) next; '
         'split($3,e,":"); x=e[1]; '
         'if (st ~ /^(CANCELLED|TIMEOUT|PREEMPTED|NODE_FAIL|DEADLINE|REQUEUED|REVOKED)$/) x="-"; '
         'if (st == "COMPLETED" && x == "0") x="-"; '
         "print \"F \"$2\" \"x\" \"st; "
+        'if ($5 ~ /^[0-9]+$/) print "HPCB_SUB "$2" "$5; '
         # where a pilot that ran and died wrote its stderr: parsl's `<script>.stderr`, the script being the last word
         # of SubmitLine
-        'if (x != "-") {n=split($4,w," "); print "HPCB_ERR "$2" "w[n]".stderr"}}\'; } 2>/dev/null; true'
+        'if (x != "-") {n=split($4,w," "); print "HPCB_ERR "$2" "w[n]".stderr"}}\'; '
+        'else echo "HPCB_FAIL sacct"; fi; true'
     )
 
 # Slurm PENDING reasons that mean "never, as submitted" (Slurm leaves such a job PENDING forever unless
@@ -166,6 +207,23 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
 _NEVER_PENDING = re.compile(
     r"PartitionTimeLimit|PartitionNodeLimit|PartitionConfig|QOS\w*Limit|Assoc\w*Limit|JobHeld|BadConstraints|"
     r"InvalidAccount|InvalidQOS|ReqNodeNotAvail|DependencyNeverSatisfied|AccountNotAllowed|PartitionDown", re.I)
+
+# A finished row's state: PBS's F/E/X (with -x), and the `F` the Slurm rows command prints for sacct's finished pilots.
+_DONE_STATES = frozenset("FEX")
+
+
+def _pilot_rows(stdout: str) -> list[list[str]]:
+    """`_pilot_status_cmd`'s pilot rows, split (its HPCB_ lines left out). Slurm rows are `STATE JOBID - REASON` (live)
+    or `F JOBID EXIT STATE` (finished); PBS rows are `STATE JOBID EXIT [comment…]` (EXIT = Exit_status, or `-` when the
+    job never ran)."""
+    return [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip() and not ln.startswith("HPCB_")]
+
+
+def _died(rows: list[list[str]]) -> list[list[str]]:
+    """The pilots that FINISHED with an exit status of their own: the worker died there. Finished rows are read by WHY
+    they finished: `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our
+    own release, or the walltime) is a leftover of an earlier block, not a diagnosis, and is left out."""
+    return [r for r in rows if r and r[0][:1].upper() in _DONE_STATES and len(r) > 2 and r[2] not in ("-", "271", "?")]
 
 
 def _summarize_pilot(stdout: str, provisioning_elapsed_s: float, *, own_config: bool = True) -> tuple[str, str]:
@@ -175,20 +233,14 @@ def _summarize_pilot(stdout: str, provisioning_elapsed_s: float, *, own_config: 
     cold-start gap (empty suffix ⇒ the caller leaves 'allocating nodes…' unchanged). `own_config`: the facility's
     configuration is the user's own (a bring-your-own facility, changed with connect_facility(details=…)); a registry
     entry's scheduler directives and walltime cannot be changed per session."""
-    # Slurm rows are `STATE JOBID`; PBS rows are `STATE JOBID EXIT [comment…]` (EXIT = Exit_status, or `-` when the
-    # job never ran). Finished rows are read by WHY they finished: an exit status of its own means the worker died
-    # there; `-` (deleted before it ever ran — a held pilot cancelled by a re-bind) or 271 (killed/qdel'd: our own
-    # release, or the walltime) is a leftover of an earlier block, not a diagnosis, and is ignored.
     said: dict[str, str] = {}
     for ln in stdout.splitlines():
         if ln.startswith("HPCB_SAID "):
             _tag, jid, line = (ln.split(None, 2) + ["", ""])[:3]
             said[jid] = line.strip()
-    rows = [ln.split(None, 3) for ln in stdout.splitlines() if ln.strip() and not ln.startswith("HPCB_")]
-    done_states = {"F", "E", "X"}
-    live = [r for r in rows if r and r[0][:1].upper() not in done_states]
-    died = [r for r in rows
-            if r and r[0][:1].upper() in done_states and len(r) > 2 and r[2] not in ("-", "271", "?")]
+    rows = _pilot_rows(stdout)
+    live = [r for r in rows if r and r[0][:1].upper() not in _DONE_STATES]
+    died = _died(rows)
     if not live:
         if died:  # every pilot this endpoint submitted has FINISHED with an exit status of its own: it ran and died
             r = died[-1]
@@ -267,35 +319,100 @@ def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float, *, own
     tail = f" (reason {reason})" if reason and reason.lower() != "none" else ""
     return "queued", f"— pilot {pjid} is queued (PENDING{tail}); waiting on the scheduler."
 
-async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
-    """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilot is in.
-    Best-effort: returns None when it can't tell (login worker cold, scheduler unreachable) so the
-    caller leaves its notice unchanged. `elapsed_s` is how long the block has been provisioning — it
-    gates the rejection hint past the cold-start grace."""
+class PilotProbe(NamedTuple):
+    """One read of THIS endpoint's pilots (`_pilot_status_cmd`): the summary a provisioning notice carries, every pilot
+    job listed (live or finished), each that FINISHED with an exit status of its own as (job, exit status) in the
+    listing's order, and the scheduler queries that FAILED (`HPCB_FAIL`) — so the server can record the
+    pilot a FINISHED verdict names, and a stop can tell a pilot the endpoint submitted since from one it already knew
+    (server._stop_endpoint). A failed live listing reads `unknown`: it says nothing about the pilot."""
+
+    category: str
+    suffix: str
+    jobs: frozenset[str]
+    died: tuple[tuple[str, str], ...]
+    failed: frozenset[str] = frozenset()
+
+    @property
+    def dead(self) -> tuple[str, str] | None:
+        """(job, exit status) of the pilot a FINISHED verdict names — the newest that died, as `_summarize_pilot` names
+        it; None for any other verdict."""
+        return self.died[-1] if self.category == "finished" and self.died else None
+
+
+# A finished pilot submitted this long before the confirmation it is read against still counts as this block's. The
+# confirmation's age is read after the probe returns, so the probe's own latency only moves the cutoff earlier (toward
+# counting); the slack covers what is left — whole-second timestamps, and the login node's clock slewing against this
+# one's during the age. A pilot of an earlier session (sacct keeps 6 h, PBS's history about two weeks) is far older.
+_SUBMIT_SLACK_S = 60.0
+
+
+async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner, *,
+                                   confirmed_at: float | None = None) -> PilotProbe | None:
+    """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilots are in. Best-effort:
+    None when it can't tell (login worker cold, scheduler unreachable). `elapsed_s` is how long the block has been
+    provisioning — it gates the rejection hint past the cold-start grace. `confirmed_at`: when the block's spend was
+    confirmed (time.monotonic()); a pilot that FINISHED and was submitted before that (an earlier session's, still in
+    the scheduler's history) is not this block's and is left out of the verdict. A pilot whose submit time is unknown
+    counts."""
     scheduler = getattr(getattr(app.facility, "profile", None), "scheduler", "slurm")
     out = await run_login(_pilot_status_cmd(scheduler, eid))
+    # The confirmation's age, read once the probe is BACK: its login-node clock (HPCB_NOW) was read while it ran, at
+    # or before now, so any wait for the login worker (a sync-wait of up to two minutes) makes the age longer and the
+    # cutoff earlier — a pilot is only ever counted when unsure, never dropped (read before the dispatch, a slow probe
+    # moved the cutoff past this block's own pilot: review r2, S3).
+    since_s = time.monotonic() - confirmed_at if confirmed_at is not None else None
     if out.phase != "complete" or out.exit_code != 0:
         return None
     machine = getattr(app, "machine", None)  # bring-your-own (a session facility): its config is the user's to change
     own = machine is not None and machine in getattr(app, "session_facilities", {})
-    return _summarize_pilot(out.stdout or "", elapsed_s, own_config=own)
+    stdout = out.stdout or ""
+    meta = [ln.split() for ln in stdout.splitlines() if ln.startswith(("HPCB_NOW ", "HPCB_SUB ", "HPCB_FAIL "))]
+    failed = frozenset(w[1] for w in meta if w[0] == "HPCB_FAIL" and len(w) > 1)
+    rows = _pilot_rows(stdout)
+    old: set[str] = set()
+    now = next((float(w[1]) for w in meta if w[0] == "HPCB_NOW" and len(w) > 1 and w[1].isdigit()), None)
+    if since_s is not None and now is not None:
+        cutoff = now - since_s - _SUBMIT_SLACK_S
+        old = {w[1] for w in meta if w[0] == "HPCB_SUB" and len(w) > 2 and w[2].isdigit() and float(w[2]) < cutoff}
+    # this block's finished pilots only; every live row stays (a live pilot is never an earlier session's leftover)
+    kept = "\n".join(ln for ln in stdout.splitlines()
+                     if not ((r := ln.split(None, 3)) and len(r) > 1 and r[1] in old
+                             and r[0][:1].upper() in _DONE_STATES and not ln.startswith("HPCB_")))
+    if failed & {"squeue", "qstat"}:  # the live listing failed: no verdict, never "no pilot"
+        category, suffix = "unknown", ""
+    else:
+        category, suffix = _summarize_pilot(kept, elapsed_s, own_config=own)
+    return PilotProbe(category, suffix, frozenset(r[1] for r in rows if len(r) > 1),
+                      tuple((r[1], r[2]) for r in _died(_pilot_rows(kept))), failed=failed)
 
-async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
+async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
+    """(category, notice-suffix) of THIS endpoint's pilot (`_probe_pilots_over_login`); None when it can't tell, so the
+    caller leaves its notice unchanged."""
+    probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login)
+    return (probe.category, probe.suffix) if probe is not None and probe.category != "unknown" else None
+
+async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner, *,
+                                confirmed_at: float | None = None) -> tuple[str, PilotProbe | None]:
     """Enrich a still-cold BILLED block's 'allocating nodes…' with the pilot's ACTUAL scheduler state,
-    so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]). A
-    diagnostic must never break the result it annotates, so any failure — or an empty suffix (the
-    normal cold-start window) — leaves the notice as-is."""
+    so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]), and hand back the probe
+    (None: it could not tell) for the server to record a pilot that ran and died (`confirmed_at`: the block's
+    confirmation, `_probe_pilots_over_login`). A diagnostic must never break the result it annotates, so any failure —
+    or an empty suffix (the normal cold-start window) — leaves the notice as-is."""
     try:
-        status = await _pilot_status_over_login(app, eid, elapsed_s, run_login)
+        probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login, confirmed_at=confirmed_at)
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
-        return notice
-    suffix = status[1] if status else ""
+        return notice, None
+    suffix = probe.suffix if probe else ""
     note = getattr(app.facility, "worker_init_note", "")
-    if status and status[0] == "finished" and isinstance(note, str) and note:
+    if probe and probe.category == "finished" and isinstance(note, str) and note:
         # a worker that died on a REUSED endpoint whose env_setup was edited: its blocks run the endpoint's own one, so
         # editing it again changes nothing — say so (only for a pilot that ran and died, not for a queue wait)
         suffix += " " + note.rstrip()
-    return f"{notice} {suffix}" if suffix else notice
+    return (f"{notice} {suffix}" if suffix else notice), probe
+
+async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
+    """`_augment_provisioning`'s notice alone."""
+    return (await _augment_provisioning(app, eid, notice, elapsed_s, run_login))[0]
 
 
 # --- a scheduler SUBMISSION in the agent's own command ------------------------------------------------------------

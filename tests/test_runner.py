@@ -436,3 +436,52 @@ async def test_a_canary_answer_carries_the_job_into_the_result():
     ex = _QueueExecutor(_CanaryFuture(result=_ShellRes("HPCB_CANARY\n3.13.12 0.3.9 a000\nHPCB_JOB 4242\n")))
     res = await GlobusRunner("eid", executor_factory=lambda: ex).canary(timeout=0.1)
     assert res.ok and res.worker_job == "4242"
+
+
+async def test_the_checks_a_runner_sent_stay_listed_until_a_worker_answers_them(monkeypatch):
+    # #24's evidence: every canary this runner sent that may still be queued on the endpoint, with the SDK Client that
+    # looks its task up — kept from the send, so it works after the runner's close — and when it was sent
+    pytest.importorskip("globus_compute_sdk")
+    from types import SimpleNamespace
+
+    from hpc_bridge import runner as runner_mod
+
+    lost, later, unsent = _CanaryFuture(pending=True), _CanaryFuture(pending=True), _CanaryFuture(pending=True)
+    lost.task_id, later.task_id = "t-1", "t-2"
+    ex = _QueueExecutor(lost, later, unsent)
+    ex.client = SimpleNamespace(get_task=lambda tid: {"pending": True, "task_id": tid})
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    assert r.sent_checks() == [] and r.task_client() is None
+    await r.canary(timeout=0.1)
+    [(fut, client, at)] = r.sent_checks()
+    assert fut is lost and client.get_task("t-1")["task_id"] == "t-1" and at > 0
+    monkeypatch.setattr(runner_mod, "_CANARY_MAX_WAIT_S", -1.0)
+    await r.canary(timeout=0.1)                                    # abandoned for a fresh one: both may be queued
+    assert [f for f, _, _ in r.sent_checks()] == [lost, later]
+    lost.resolve(_ShellRes("HPCB_CANARY\n"))                       # a worker answered it: it ran, not queued
+    later.resolve(exc=RuntimeError("SDK thread quit unexpectedly."))  # a client-side failure: the task may live on
+    assert [f for f, _, _ in r.sent_checks()] == [later]
+    await r.canary(timeout=0.1)                                    # hands back that failure, once
+    await r.canary(timeout=0.1)                                    # a submit that failed with no id: acceptance unclear
+    unsent.resolve(exc=TimeoutError("read timed out"))
+    r.close()
+    assert [(f, c is not None) for f, c, _ in r.sent_checks()] == [(later, True), (unsent, True)]
+    assert r.task_client() is ex.client                             # kept from the send, after the close
+
+
+def test_a_future_the_service_certainly_never_took_is_not_evidence():
+    from hpc_bridge.runner import never_sent
+
+    refused = _CanaryFuture(exc=_Http(403))
+    assert never_sent(refused)                                      # a 4xx: the service refused the submission
+    assert not never_sent(_CanaryFuture(exc=_Http(503)))            # a 5xx: it may have taken it
+    assert not never_sent(_CanaryFuture(exc=TimeoutError()))        # a timeout: it may have taken it
+    taken = _CanaryFuture(exc=RuntimeError("x"))
+    taken.task_id = "t-9"
+    assert not never_sent(taken) and not never_sent(_CanaryFuture(pending=True))
+
+
+class _Http(Exception):
+    def __init__(self, status):
+        super().__init__(f"HTTP {status}")
+        self.http_status = status

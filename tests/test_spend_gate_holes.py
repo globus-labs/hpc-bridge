@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from globus_compute_sdk.errors import TaskExecutionFailed
 
 from hpc_bridge import binding, connect, notices, scheduler_ops, server, warmth
 from hpc_bridge.context import LeftBlock
@@ -383,22 +384,22 @@ async def test_after_an_ssh_switch_stop_cancels_the_old_block_and_keeps_the_new_
     assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
     seen = {}
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
+    async def release(a, eid, run_login, **_kw):
         seen["cmd"] = scheduler_ops._release_cmd_for(a, eid)
-        seen["expect_block"] = expect_block
         return True, "released 112"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
     stop = await _stop_endpoint(app)
     assert stop.status == "down" and "uep.fake-eid" in seen["cmd"]   # every block of the endpoint, by its marker
-    assert seen["expect_block"] is False                              # the old block was seen up: nothing in flight
+    assert app.sent_checks == {}                                       # the old block answered every check: none queued
     res = await _ensure_endpoint_up(app)
     assert res.status == "needs_confirmation" and res.partition == "compute"
 
 
-async def test_a_switch_away_from_a_block_still_being_requested_keeps_the_stop_looking_for_its_pilot(monkeypatch):
-    # spend confirmed, the block never seen up (its sbatch may not have landed), then an unconfirmed switch: the stop
-    # must still poll for that pilot (the 0.1.14 stop-during-provisioning race), not take "released none" as done
+async def test_a_switch_away_from_a_block_still_being_requested_keeps_the_stop_draining_on_its_check(monkeypatch):
+    # spend confirmed, the block never seen up (our check still queued for it), then an unconfirmed switch: the old
+    # terms' check stays queued on their user endpoint, which can start a block for it — the stop must not take
+    # "released 7" as done (the 0.1.14 stop-during-provisioning race, now read from the check itself)
     f = FakeFacility()
     f.workers = 1
     app = AppCtx(facility=f, profile=Profile())
@@ -406,15 +407,14 @@ async def test_a_switch_away_from_a_block_still_being_requested_keeps_the_stop_l
     app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
     assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
     assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
-    seen = {}
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
+    async def release(a, eid, run_login, **_kw):
         return True, "released 7"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is True
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and stop.notice.startswith("compute block released over AMQP (released 7).")
+    assert "check for the block on partition 'debug' (task check-1) is still queued" in stop.notice
 
 
 async def test_an_ssh_switch_banks_the_old_block_to_the_latest_it_can_bill():
@@ -464,7 +464,7 @@ async def test_a_switch_on_a_facility_endpoint_asks_again_and_names_the_block_it
 
 
 async def _ssh_stop(app, monkeypatch):
-    async def release(a, eid, *rest, expect_block=False, **kw):
+    async def release(a, eid, run_login, **_kw):
         return True, "released 112"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
@@ -601,58 +601,74 @@ async def test_a_new_block_with_no_job_id_on_other_terms_is_not_dated_as_the_one
     assert rt.block_since == t0 + 200
 
 
-async def test_a_switch_from_a_block_seen_up_leaves_no_pilot_in_flight(monkeypatch):
-    # a voided confirmation (a failed dispatch, a rebuild, a new login) is not a block that was never seen up: a stop
-    # must not poll the long budget and say it is "still being submitted"
+async def test_a_switch_from_a_block_seen_up_leaves_no_check_queued(monkeypatch):
+    # a voided confirmation (a failed dispatch, a rebuild, a new login) is not a block that was never seen up: every
+    # check was answered, so a stop's confirmed release is `down` at once — no wait, no "still queued"
     app = await _warm()
     rt = app.shapes["compute"]
     warmth._void_warm(rt)
     await _ensure_endpoint_up(app, partition="compute")
-    assert rt.switch_unseen is False
-    seen = {}
+    slept = []
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
+    async def release(a, eid, run_login, **_kw):
         return True, "released 112"
 
+    async def sleep(s):
+        slept.append(s)
+
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is False
+    monkeypatch.setattr(server, "_sleep", sleep, raising=False)
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and stop.spend_stopped is True and slept == []
 
 
 async def test_a_voided_confirmation_of_a_block_seen_up_does_not_make_the_stop_wait(monkeypatch):
     app = await _warm()
+    app.facility.fresh_ueps = True                                     # even where a stop may wait for a check
     warmth._void_warm(app.shapes["compute"])
-    seen = {}
+    slept = []
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
+    async def release(a, eid, run_login, **_kw):
         return True, "released 112"
 
+    async def sleep(s):
+        slept.append(s)
+
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is False
+    monkeypatch.setattr(server, "_sleep", sleep, raising=False)
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and slept == []
 
 
-async def test_a_confirmation_ends_the_wait_for_a_switched_away_pilot(monkeypatch):
+async def test_a_confirmation_on_new_terms_does_not_end_the_old_terms_queued_check(monkeypatch):
+    # the old terms' check is queued on THEIR user endpoint: a block that comes up on the new terms answers the new
+    # runner's check, not that one — so a stop still sees it (and names its terms) until the endpoint gives it up
     f = FakeFacility()
     f.workers = 1
     app = AppCtx(facility=f, profile=Profile())
-    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
-    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    canary = {"now": CanaryResult(ok=False, error="timeout")}
+    runners = []
+
+    def factory(eid, user_endpoint_config=None, **_kw):   # a runner per build, as the server makes them
+        runners.append(_FakeRunner(eid, _Res(0, "", ""), canary_result=canary["now"]))
+        return runners[-1]
+
+    app.runner_factory = factory
     assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
     assert (await _ensure_endpoint_up(app, partition="compute")).status == "needs_confirmation"
-    runner._canary = _ok("113")
+    canary["now"] = _ok("113")
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"   # the new block is up and confirmed
-    seen = {}
 
-    async def release(a, eid, *rest, expect_block=False, **kw):
-        seen["expect_block"] = expect_block
+    async def release(a, eid, run_login, **_kw):
         return True, "released 113"
 
     monkeypatch.setattr(scheduler_ops, "_release_blocks_over_login", release)
-    await _stop_endpoint(app)
-    assert seen["expect_block"] is False
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and "check for the block on partition 'debug'" in stop.notice
+    assert "partition 'compute'" not in stop.notice
+    runners[0].checks[0].fail(TaskExecutionFailed("BadStateException", "0"))                # the debug endpoint gives it up
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and "has given up hpc-bridge's check for the block on partition 'debug'" in stop.notice
 
 
 async def test_a_facility_switch_after_a_kicked_reap_names_the_replacement_it_leaves():
