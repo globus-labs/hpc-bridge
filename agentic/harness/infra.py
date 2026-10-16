@@ -270,6 +270,8 @@ def infra_reason(o: Outcome, failed: Iterable[str] = ()) -> str | None:
     gating checks that broke."""
     if o.tool_calls > 0 or o.hpcb_calls > 0:
         return None   # it acted: graded, whatever happened to its model afterwards
+    if o.operator == "script":
+        return None   # the scripted operator has no model endpoint to fail: a script that did nothing is graded
     if any(_protected(n) for n in failed):
         return None
     if o.rc == 124:

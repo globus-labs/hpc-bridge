@@ -58,6 +58,8 @@ Which operator can do what (`OPERATOR_HOOK_ACTIONS`; run.py reports a cell SKIPP
   nothing can see a call in flight (no DURING hook), and a one-shot CLI turn cannot take a user message mid-turn (no
   `interject`, no `interrupt`).
 - `hermes`, `claude-acp` (ACP) — none yet.
+- `script` (no model: the scenario's own SCRIPT makes the calls, script_runner) — none, and no persona: a script that
+  needs the world changed mid-run changes it itself.
 
 Pure and SDK-free (cli_runner and the hermetic tests import it; runner.py re-exports HookWatcher).
 """
@@ -99,8 +101,10 @@ OPERATOR_HOOK_ACTIONS: dict[str, frozenset[str]] = {
     "hermes21": frozenset({"cmd"}),
     "hermes": frozenset(),
     "claude-acp": frozenset(),
+    "script": frozenset(),
 }
 CLI_OPERATORS = ("codex", "pi", "hermes21")
+NO_USER_OPERATORS = (*CLI_OPERATORS, "script")   # nobody to answer a persona's questions: one-shot turns, or no model
 
 
 def is_during(h: dict) -> bool:
@@ -212,7 +216,7 @@ def unsupported_hook_needs(operator: str, hooks: Iterable[dict] | None) -> set[s
 def operator_refusal(operator: str, *, persona: str | None, phases: bool, hooks: Iterable[dict] | None) -> str | None:
     """Why `operator` cannot drive a scenario (a SKIPPED cell, not a vacuous grade) — None when it can."""
     hooks = list(hooks or [])
-    if operator in CLI_OPERATORS and persona:
+    if operator in NO_USER_OPERATORS and persona:
         return "an interactive persona"
     if operator != "claude" and phases:
         return "cross-restart chains (PHASES)"
