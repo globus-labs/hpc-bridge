@@ -21,7 +21,7 @@ an unmapped identity is the `mep_no_account` scenario.
 ⚠ The harness' own teardown (run-scoped: this run's `uep.<eid>` blocks only) cannot touch glabs-gc's block — on this facility
 only the idle-release reclaims it; globus1 is unmetered. Expected ≈ 3 min agent + 12 min settle.
 """
-from invariants import Result, Trace, _shape, compute_ran
+from invariants import Result, Trace, _shape, acted_on_nothing, compute_ran
 
 FACILITY_ID = "globus-labs"          # the catalog id of the MEP entry (src/hpc_bridge/catalog/seed/globus-cluster.yaml)
 MAPPED_USER = "glabs-gc"            # the facility's identity mapping for the harness' Globus identity
@@ -110,10 +110,17 @@ def mep_identity_mapped(t: Trace) -> Result:
 
 def mep_stop_is_draining_only(t: Trace) -> Result:
     """Every stop_endpoint result is `draining` — never `down` (no cancel can be confirmed from
-    here; `down` would be a lie) — and at least one stop happened after the billed run."""
-    stops = t.named("stop_endpoint")
-    if not stops:
+    here; `down` would be a lie) — and at least one stop happened after the billed run. A stop sent
+    before the attach answers an honest `down`, "no endpoint was up" (invariants.acted_on_nothing:
+    nothing attached, no block to name — a blind opening batch, hermes21 live 2026-10-15): it is
+    not a stop of the facility's block, and does not count either way."""
+    every = t.named("stop_endpoint")
+    if not every:
         return Result("mep_stop_is_draining_only", False, "no stop_endpoint call")
+    stops = [(i, c) for i, c in every if not acted_on_nothing(c)]
+    if not stops:
+        return Result("mep_stop_is_draining_only", False,
+                      f"every stop_endpoint (calls {[i for i, _ in every]}) answered 'no endpoint was up'")
     statuses = [str((c.result or {}).get("status")) for _, c in stops]
     ok = all(s == "draining" for s in statuses)
     return Result("mep_stop_is_draining_only", ok,

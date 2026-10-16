@@ -815,6 +815,40 @@ def test_spend_gate_enforced_grader():
                ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname"}, {"phase": "complete"})])
     assert inv(t).ok is False
     assert not inv(Trace([])).ok
+    # a compute call sent before any facility never reached the gate (a blind opening batch, hermes21 live 2026-10-15):
+    # it is skipped, not taken as the first compute-shape call — and the first one that DID reach it still decides
+    no_facility = "No facility connected yet: connect_facility('g') only PROPOSED a config (proposed_facility_details)"
+    batch = [ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname", "shape": "compute"},
+                         {"phase": "failed", "notice": no_facility}),
+             ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+                         {"status": "down", "endpoint_id": None, "notice": no_facility})]
+    r = inv(Trace([*batch, *_gate_trace().calls]))
+    assert r.ok and "call 3" in r.detail
+    assert not inv(Trace([*batch, *_gate_trace(refused_first=False).calls])).ok
+
+
+def test_acted_on_nothing_is_the_servers_no_op_answer_and_nothing_else():
+    from invariants import acted_on_nothing
+
+    def c(tool, result):
+        return ToolCall.of(f"mcp__endpoint__{tool}", {}, result)
+
+    nothing_up = {"status": "down", "endpoint_id": None, "notice": "no endpoint was up"}
+    no_facility = "No facility connected. Call connect_facility(facility, ssh_host=…) FIRST"
+    assert acted_on_nothing(c("stop_endpoint", nothing_up)) and acted_on_nothing(c("teardown_endpoint", nothing_up))
+    assert acted_on_nothing(c("run_shell", {"phase": "failed", "notice": no_facility}))
+    assert acted_on_nothing(c("reset_session", {"phase": "failed", "notice": "No facility connected yet: …"}))
+    assert acted_on_nothing(c("ensure_endpoint_up", {"status": "down", "endpoint_id": None, "notice": no_facility}))
+    # a real answer — an endpoint named, another status, other words, another tool — is never one
+    assert not acted_on_nothing(c("stop_endpoint", {**nothing_up, "endpoint_id": "e1"}))
+    assert not acted_on_nothing(c("teardown_endpoint", {"status": "down", "endpoint_id": None,
+                                                        "notice": "endpoint fully torn down"}))
+    assert not acted_on_nothing(c("teardown_endpoint", {**nothing_up, "status": "tearing_down"}))
+    assert not acted_on_nothing(c("run_shell", {"phase": "complete", "notice": no_facility}))
+    assert not acted_on_nothing(c("ensure_endpoint_up", {"status": "down", "endpoint_id": "e1", "notice": no_facility}))
+    assert not acted_on_nothing(c("poll_task", {"phase": "failed", "notice": "no task 'PLACEHOLDER'"}))
+    assert not acted_on_nothing(c("connect_facility", {"phase": "failed", "notice": no_facility}))
+    assert not acted_on_nothing(c("stop_endpoint", None))   # no result captured (a cut stream): not a no-op on record
 
 
 # --- session_persistence.session_state_persists -------------------------------------------------

@@ -33,6 +33,9 @@ def test_orphaned_task_graders():
     # the manager is stopped where it runs, by the harness (stop_here_cmd on every login node) — never a blind
     # `gce stop … ; echo manager-stopped` to the round-robin alias, and no hard-coded endpoint binary here
     assert sc.MIDRUN_HOOKS[0]["world"] == "stop_manager" and "cmd" not in sc.MIDRUN_HOOKS[0]
+    # ...after the first poll that found the task RUNNING — not a placeholder poll of a blind opening batch (hermes21,
+    # live 2026-10-15: "poll_task #1" fired on poll_task("PLACEHOLDER") → failed, before any endpoint)
+    assert sc.MIDRUN_HOOKS[0]["when_phase"] == "running"
 
 
 def test_draining_restop_and_stop_while_running_graders():
@@ -45,6 +48,9 @@ def test_draining_restop_and_stop_while_running_graders():
     assert "-STOP" in dr.MIDRUN_HOOKS[0]["cmd"] and dr.MIDRUN_HOOKS[0]["on"] == "each_login"
     assert dr.MIDRUN_HOOKS[1]["after_tool"] == "stop_endpoint" and "-CONT" in dr.MIDRUN_HOOKS[1]["cmd"] and dr.MIDRUN_HOOKS[1]["on"] == "each_login"
     assert all(h["expect_any_host"] == "pkill-rc=0" for h in dr.MIDRUN_HOOKS)   # fails unless some node froze / thawed
+    # the freeze counts compute runs that RAN; the thaw, the first stop AFTER the freeze (hermes21, live 2026-10-15:
+    # a stop before its runs were done thawed nothing, and the later freeze stayed through every real stop)
+    assert dr.MIDRUN_HOOKS[0]["when_phase"] == "complete" and dr.MIDRUN_HOOKS[1]["after_hook"] == dr.MIDRUN_HOOKS[0]["name"]
     run = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "python3 -c ..."}, {"phase": "running", "task_id": "t"})
     refused = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "up", "notice": "can't stop yet: task(s) compute-1 are still running on the compute block"})
     silent = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down", "notice": "compute block released over AMQP (released 6)"})

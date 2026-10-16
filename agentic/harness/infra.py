@@ -15,10 +15,12 @@ INFRA needs POSITIVE evidence of a model-endpoint outage, and anything the agent
   hpc-bridge boot crash is what `agent_engaged` exists to catch);
 - the evidence: the error the operator's own record says its run ENDED on (Pi's last `message_end` / `auto_retry_end`,
   Codex's `turn.failed`) reads as an outage (an HTTP 5xx or 429, a timeout, a dead stream, "high demand"); or the final
-  answer is itself a stream failure (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the run ended
-  badly (non-zero exit, an error, an empty answer) AND the last line of the operator's stderr names an outage. An error
-  the operator recovered from decides nothing, and a 4xx (context overflow, an invalid tool schema — hpc-bridge's own
-  tools can cause those) is not an outage, even when the message quotes a 5xx after it;
+  answer is itself a stream failure (`StreamingTimeoutError`, `Stream ended without finish_reason`); or the final
+  answer is a tool call the model server returned as TEXT, unparsed (`printed_tool_call`: the whole answer is a call's
+  JSON headed by an `mcp__…` / `functions.…` tool, or gpt-oss's raw harmony tokens); or the run ended badly (non-zero
+  exit, an error, an empty answer) AND the last line of the operator's stderr names an outage. An error the operator
+  recovered from decides nothing, and a 4xx (context overflow, an invalid tool schema — hpc-bridge's own tools can
+  cause those) is not an outage, even when the message quotes a 5xx after it;
 - the Claude operators (`claude`, `claude-acp`) are INFRA only when the API itself ended the run with a server error
   (5xx, overloaded, unreachable). A 429 is RATE_LIMITED's, which run.py decides first.
 
@@ -56,6 +58,22 @@ _OUTAGE = (
     re.compile(r"\b(?:HTTP(?:/[\d.]+)?|status(?:[ _]code)?|error code|code)\W{0,3}(?:5\d\d|429)\b", re.I),
     re.compile(r"\b(?:APITimeoutError|ReadTimeout|Request timed out)\b"),
 )
+# A tool call the model server handed back as the answer's TEXT instead of a call (live 2026-10-15, Codex on ALCF's
+# gpt-oss: six cells ended after one model response, with no call of any kind and this as the final message; the
+# relay's log shows vLLM's own output as `["reasoning", "message"]`, no function_call item — the server, not the relay
+# or Codex, left it unparsed). Two shapes, matched only as the WHOLE answer or by tokens no prose carries:
+# - the call's JSON, headed by the tool: the object's FIRST value (or the first item of its first value) is an
+#   `mcp__…` / `functions.…` name — `{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}`, and once
+#   `{"cmd":["mcp__hpc_bridge__connect_facility","{"facility":…}"]}` with its inner quotes unescaped (not even JSON, so
+#   this is a shape test, not json.loads). A sentence that names a tool, a JSON report whose first field is not a tool,
+#   a call quoted inside prose or a code fence: none starts the answer with `{"key": "mcp__…`;
+# - gpt-oss's harmony format, which the server failed to parse into a call:
+#   `<|start|>assistant<|channel|>commentary to=functions.mcp__hpc_bridge__ensure_endpoint_up<|call|>`. `<|call|>` ends
+#   a tool-call message and nothing else; a recipient `to=functions.…` counts beside another harmony control token. A
+#   leaked FINAL message (`<|channel|>final<|message|>Done.`) is an answer, graded as one.
+_PRINTED_CALL_JSON = re.compile(r'\A\{\s*"[^"\n]{1,64}"\s*:\s*\[?\s*"((?:mcp__|functions\.)[\w.-]+)"')
+_HARMONY_TOKEN = re.compile(r"<\|(?:start|channel|message|constrain|call|end|return)\|>")
+_HARMONY_RECIPIENT = re.compile(r"\bto=(functions\.[\w.-]+)")
 # An MCP server that did not start (Codex with `required = true` exits 1 on it): a product or harness failure, never INFRA.
 _MCP_STARTUP = re.compile(r"MCP servers? failed to (?:initialize|start)|handshaking with MCP server failed|"
                           r"MCP server [\w.-]* (?:failed|exited|closed)|failed to (?:start|connect to) (?:the )?MCP server",
@@ -87,6 +105,18 @@ def _last_line(text: str) -> str:
 def stream_death(text: str) -> str | None:
     """A dead model stream, as an operator reports it — strong enough to read in a final answer."""
     return _first(_STREAM_DEATH, text)
+
+
+def printed_tool_call(text: str) -> str | None:
+    """What a final answer that IS an unparsed tool call names (`'mcp__…' printed as JSON`, `'functions.…' in raw
+    harmony tokens`, or `raw harmony tokens`), or None for anything else."""
+    s = (text or "").strip()
+    if s.endswith("}") and (m := _PRINTED_CALL_JSON.match(s)):
+        return f"{m.group(1)!r} printed as JSON"
+    recipient = _HARMONY_RECIPIENT.search(s)
+    if "<|call|>" in s or (recipient and _HARMONY_TOKEN.search(s)):
+        return f"{recipient.group(1)!r} in raw harmony tokens" if recipient else "raw harmony tokens"
+    return None
 
 
 @dataclass(frozen=True)
@@ -250,6 +280,10 @@ def infra_reason(o: Outcome, failed: Iterable[str] = ()) -> str | None:
         return f"{o.operator}: {_short(o.terminal_error)} ({none})"
     if (sig := stream_death(o.final_text)):
         return f"{o.operator}: its final answer is a dead model stream, {sig!r} ({none})"
+    # The model asked for a call and the server handed it back as text: nothing reached a tool, so there is nothing
+    # of the agent's to grade. Read only here, after `tool_calls == 0`: a printed call after a real one is graded.
+    if (call := printed_tool_call(o.final_text)):
+        return f"{o.operator}: the model server returned the tool call as text, unparsed: {call} ({none})"
     # A bad ending, and the LAST thing the operator wrote to stderr names an outage: an earlier line may be a retry it
     # recovered from ("retrying after HTTP 503 (1/3)" … "request ok"), and a recovered error decides nothing.
     ended_badly = (o.rc not in (None, 0)) or bool(o.is_error) or not o.final_text.strip()

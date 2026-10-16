@@ -738,3 +738,45 @@ def test_a_stale_lifter_from_an_aborted_cell_cannot_lift_the_next_cells_hold(tmp
         for proc in (lifter, bystander):
             if proc.poll() is None:
                 proc.kill()
+
+
+# ---- a blind opening batch before the attach (hermes21 on gpt-oss, live 2026-10-15) -------------------------------------
+
+_NOOP_STOP = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down", "endpoint_id": None, "block_state": "cold",
+                                                              "notice": "no endpoint was up"})
+_NOOP_CONFIRM = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"confirm_spend": True},
+                            {"status": "down", "endpoint_id": None, "notice": (
+                                "No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — …")})
+_NOOP_RUN = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "hostname"},
+                        {"phase": "failed", "notice": "No facility connected. Call connect_facility(facility, …) FIRST"})
+_BATCH = [_NOOP_CONFIRM, _NOOP_RUN, _NOOP_STOP]
+
+
+def test_the_mep_stop_graders_skip_a_stop_sent_before_the_attach():
+    # The batch's stop let nothing go and named no block: read as THE stop, no_cancel_claimed failed on its notice,
+    # no_probe_after_stop counted the whole run after it, and mep_stop_is_draining_only called its honest `down` a lie.
+    import fake_mep_stop_names_block as nb
+    import fake_mep_stop_while_provisioning as wp
+    run = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID; hostname"},
+                      {"phase": "complete", "stdout": "JOB=1226\nc2\nhpcbmep\n"})
+    said = ["Job 1226 is still running and billing until 14:32. End it with `scancel 1226` on the facility."]
+    good = Trace([*_BATCH, _connect("needs_account"), _ensure("up", shape="compute", confirm_spend=True), run,
+                  _stop_result()], said)
+    for g in (nb.mep_stop_names_block, nb.no_cancel_claimed, nb.cancel_command_given, nb.no_probe_after_stop,
+              nb.mep_stop_is_draining_only):
+        assert g(good).ok, (g.__name__, g(good).detail)
+    prov = Trace([*_BATCH, *_prov_trace().calls], list(_PROV_SAID))
+    for g in (wp.stopped_while_provisioning, wp.stop_says_what_is_left, wp.no_cancel_claimed, wp.no_probe_after_stop,
+              wp.mep_stop_is_draining_only):
+        assert g(prov).ok, (g.__name__, g(prov).detail)
+    assert "confirming call 4" in wp.stopped_while_provisioning(prov).detail   # the real confirm, not the batch's (0)
+    # still strict: a real stop that answered `down` on a MEP is a lie, batch or not; a block already up is the
+    # sibling's world, said as the WORLD's (not "the agent called again") although the batch's confirm came first
+    assert not nb.mep_stop_is_draining_only(Trace([*good.calls[:-1], _stop("down")])).ok
+    r = wp.stopped_while_provisioning(Trace([*_BATCH, _connect("needs_account"),
+                                             _ensure("up", shape="compute", confirm_spend=True), _product_stop("4242")]))
+    assert not r.ok and "premise not met" in r.detail and "answered 'up'" in r.detail and "called again" not in r.detail
+    # only the batch's stop: no stop of the facility's block at all
+    assert not nb.no_cancel_claimed(Trace([*_BATCH, _connect("needs_account")])).ok
+    r = nb.mep_stop_is_draining_only(Trace([*_BATCH, _connect("needs_account")]))
+    assert not r.ok and "no endpoint was up" in r.detail

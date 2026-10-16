@@ -16,7 +16,7 @@ premise, not a product failure. Not graded: an `account_source` result field, wh
 """
 from pathlib import Path
 
-from invariants import Result, Trace, _confirms_spend, _shape
+from invariants import Result, Trace, _confirms_spend, _shape, acted_on_nothing
 
 FACILITY_ID = "fake-ssh-site"
 NEEDS_COMPUTE_NODE = False             # no block should start
@@ -58,9 +58,11 @@ def _res(c) -> dict:
 
 
 def _bare(t: Trace) -> list[tuple[int, dict]]:
-    """Confirmed compute starts that carried no account."""
+    """Confirmed compute starts that carried no account — and reached the facility: one sent before any facility was
+    connected answers `down`, "No facility connected" (invariants.acted_on_nothing — a blind opening batch, hermes21
+    live 2026-10-15). Taken as the first, it failed ssh_floor_answered; counted, its `down` read as a block started."""
     return [(i, _res(c)) for i, c in t.named("ensure_endpoint_up")
-            if _confirms_spend(c) and _shape(c) == "compute" and not c.input.get("account")]
+            if _confirms_spend(c) and _shape(c) == "compute" and not c.input.get("account") and not acted_on_nothing(c)]
 
 
 def _bypassed(t: Trace) -> int | None:

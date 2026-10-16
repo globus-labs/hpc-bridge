@@ -348,6 +348,38 @@ def test_hook_watcher_fires_after_the_nth_matching_result_once(runner):
     assert runner.HookWatcher([{"after_tool": "teardown_endpoint"}]).unfired  # never reached -> reported unfired
 
 
+def test_the_sdk_feed_skips_a_blind_opening_batch_for_the_hooks_that_say_so(runner, monkeypatch):
+    # hermes21 opened orphaned_task with a parallel batch before any facility (live 2026-10-15); a Claude model can send
+    # the same as one AssistantMessage. The scenario's kill_manager must wait for the poll that finds the task RUNNING,
+    # and a when_endpoint stop hook for the stop that reached an endpoint — on the SDK stream as on the journal.
+    monkeypatch.syspath_prepend(str(HERE.parent / "scenarios"))
+    import orphaned_task
+    no_facility = "No facility connected yet: connect_facility('f') only PROPOSED a config"
+    w = runner.HookWatcher([*orphaned_task.MIDRUN_HOOKS,
+                            {"name": "at_stop", "after_tool": "stop_endpoint", "when_endpoint": True, "cmd": "squeue"}])
+    batch = [(ToolUseBlock("b1", "mcp__hpc-bridge__ensure_endpoint_up", {"confirm_spend": True}),
+              json.dumps({"status": "down", "endpoint_id": None, "notice": no_facility})),
+             (ToolUseBlock("b2", "mcp__hpc-bridge__run_shell", {"shape": "compute", "command": "sleep 300"}),
+              json.dumps({"phase": "failed", "notice": no_facility})),
+             (ToolUseBlock("b3", "mcp__hpc-bridge__poll_task", {"task_id": "PLACEHOLDER"}),
+              json.dumps({"phase": "failed", "notice": "no task 'PLACEHOLDER'"})),
+             (ToolUseBlock("b4", "mcp__hpc-bridge__stop_endpoint", {}),
+              json.dumps({"status": "down", "endpoint_id": None, "notice": "no endpoint was up"}))]
+    assert w.observe(AssistantMessage([u for u, _ in batch])) == []
+    assert w.observe(UserMessage([ToolResultBlock(u.id, r) for u, r in batch])) == []
+    fired = []
+    for use, res in [
+        (ToolUseBlock("u1", "mcp__hpc-bridge__ensure_endpoint_up", {"confirm_spend": True}), '{"status":"up","endpoint_id":"e1"}'),
+        (ToolUseBlock("u2", "mcp__hpc-bridge__run_shell", {"shape": "compute"}), '{"phase":"running","task_id":"compute-1"}'),
+        (ToolUseBlock("u3", "mcp__hpc-bridge__poll_task", {"task_id": "compute-1"}), '{"phase":"running","task_id":"compute-1"}'),
+        (ToolUseBlock("u4", "mcp__hpc-bridge__stop_endpoint", {}), '{"status":"draining","endpoint_id":"e1"}'),
+    ]:
+        w.observe(AssistantMessage([use]))
+        fired += w.observe(UserMessage([ToolResultBlock(use.id, res)]))
+    assert [(f["name"], f["call_index"]) for f in fired] == [("kill_manager", 6), ("at_stop", 7)]   # trace indices
+    assert w.unfired == []
+
+
 def test_run_scenario_executes_hooks_and_records_them(runner):
     use = ToolUseBlock("u1", "mcp__endpoint__poll_task", {"task_id": "t"})
     _Client.turns = [[AssistantMessage([use]), UserMessage([ToolResultBlock("u1", '{"phase":"running"}')]),

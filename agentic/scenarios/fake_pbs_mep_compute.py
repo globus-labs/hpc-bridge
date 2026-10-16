@@ -235,7 +235,11 @@ _AT_STOP = (
     "else echo \"no block at the stop: job $last finished ${age} s before this check — at the stop\"; fi; fi; fi"
 )
 MIDRUN_HOOKS = [
-    {"name": "block_listed_at_stop", "after_tool": "stop_endpoint", "nth": 1, "cmd": _AT_STOP,
+    # `when_endpoint`: the first stop that reached the facility's endpoint (any answer — a lying `down` too: that is
+    # when the evidence matters most). A stop sent before anything was attached answers "no endpoint was up" with no
+    # endpoint_id; read there, the queue holds no block and the hook fails while the real stop goes unchecked
+    # (a blind opening batch: hermes21, live 2026-10-15).
+    {"name": "block_listed_at_stop", "after_tool": "stop_endpoint", "when_endpoint": True, "nth": 1, "cmd": _AT_STOP,
      "expect_any_host": "BLOCK_AT_STOP:", "timeout": 60},
 ]
 # Only the facility's idle-release (max_idletime 240 s in the template) reclaims the block: wait past it (the idle clock

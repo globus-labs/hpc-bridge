@@ -35,9 +35,17 @@ MIDRUN_HOOKS = [
     # "on": "each_login": the endpoint's manager (and its login worker pool) sits on ONE node of a round-robin pool;
     # a hook sent to the alias may land on the other one (the sweep rerun, 2026-09-06). pkill's own rc is echoed, and
     # `expect_any_host` makes each hook FAIL (harness:midrun_hooks) unless some node actually froze / thawed a worker.
-    {"name": "freeze_login_worker", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "nth": 2, "on": "each_login",
+    # Each counts only the calls it is about (midrun_hooks.py). The freeze: compute runs that RAN (`when_phase`) — not
+    # one refused `needs_confirmation` (the block was gone: hermes21 froze there, live 2026-10-15), nor a `failed` one
+    # sent before any facility. The thaw: the first stop AFTER the freeze (`after_hook`), whatever it answered. hermes21
+    # called stop_endpoint before its compute runs were done (2026-10-15, both cells): "stop_endpoint #1" thawed
+    # nothing there and the freeze came later and stayed; in one cell the real stops then met a frozen worker —
+    # `draining` three times — and the cell gave up.
+    {"name": "freeze_login_worker", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "when_phase": "complete",
+     "nth": 2, "on": "each_login",
      "cmd": "pkill -STOP -u $(whoami) -f 'process_worker_[p]ool'; echo \"frozen pkill-rc=$?\"", "expect_any_host": "pkill-rc=0"},
-    {"name": "thaw_login_worker", "after_tool": "stop_endpoint", "nth": 1, "on": "each_login",
+    {"name": "thaw_login_worker", "after_tool": "stop_endpoint", "after_hook": "freeze_login_worker", "nth": 1,
+     "on": "each_login",
      "cmd": "pkill -CONT -u $(whoami) -f 'process_worker_[p]ool'; echo \"thawed pkill-rc=$?\"", "expect_any_host": "pkill-rc=0"},
 ]
 CLEANUP = [{"on": "each_login", "cmd": "pkill -CONT -u $(whoami) -f 'process_worker_[p]ool' 2>/dev/null; echo thawed"}]   # never leave a frozen worker

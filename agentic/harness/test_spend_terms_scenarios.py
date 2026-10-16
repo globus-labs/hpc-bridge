@@ -624,3 +624,36 @@ def test_a_which_project_answer_never_supersedes_a_spend_decline(later):
     t = Trace([_connect(), decline, _ask_opts(later, ["hpcb", "hpcb-gpu"], "hpcb"),
                _start("provisioning", block=_block(), account="hpcb")], [], [])
     assert not no_spend_after_decline(t).ok
+
+
+# --- a blind opening batch before the connect (hermes21 on gpt-oss, live 2026-10-15) ----------------------------------
+
+_NO_FACILITY = "No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — it's the entry point …"
+
+
+def _noop_confirm(**inp):
+    """hpc-bridge's answer to a confirmed start sent before any facility was connected: nothing reached a floor."""
+    return ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True, **inp},
+                       {"status": "down", "endpoint_id": None, "notice": _NO_FACILITY})
+
+
+def test_the_account_floor_graders_skip_a_confirm_sent_before_the_connect():
+    # taken as "the first confirmed start with no account", its `down` failed ssh_floor_answered and
+    # floor_asked_without_the_preset (not needs_account); counted, it read as a block started without an account
+    import preset_account_scoped as pa
+    import ssh_account_floor as sf
+    good = _preset_trace()
+    t = Trace([_noop_confirm(), *good.calls], good.texts)
+    for g in (pa.preset_clause_shown, pa.floor_asked_without_the_preset, pa.preset_not_charged):
+        assert g(t).ok, (g.__name__, g(t).detail)
+    connect = _connect("login node is up; this facility has no allocation listing …")
+    t = Trace([_noop_confirm(), connect, _ensure("needs_account", _FLOOR, partition="compute", confirm_spend=True),
+               _stop("down", "compute block released over AMQP (released none) …")], ["It needs an account."])
+    for g in (sf.ssh_floor_answered, sf.no_start_without_an_account, sf.no_account_guessed):
+        assert g(t).ok, (g.__name__, g(t).detail)
+    assert "call 2" in sf.ssh_floor_answered(t).detail
+    # still strict: the first start that REACHED the facility going through with no account fails both
+    main = Trace([_noop_confirm(), connect, _ensure("provisioning", "allocating nodes…", partition="compute",
+                                                    confirm_spend=True), _run("JOB=9 ACCOUNT=hpcb\n"), _stop("down")])
+    assert not sf.ssh_floor_answered(main).ok and not sf.no_start_without_an_account(main).ok
+    assert not pa.floor_asked_without_the_preset(Trace([_noop_confirm(), _connect(_CLAUSE)])).ok   # premise: none reached

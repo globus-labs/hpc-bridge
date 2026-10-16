@@ -17,6 +17,7 @@ from infra import (
     infra_reason,
     outcome_of,
     pi_terminal_error,
+    printed_tool_call,
     signature,
     stream_death,
 )
@@ -567,3 +568,124 @@ def test_run_suite_counts_exit_2_apart_as_setup_failed_or_skipped(monkeypatch):
     results = [setup, skipped, {"ok": True}, {"ok": False}]
     assert mod._summary_line(results) == "1/2 passed · 1 setup failed · 1 skipped"
     assert mod._graded(results) == [{"ok": True}, {"ok": False}]   # neither is in the pass rate
+
+
+# ---- a tool call the model server returned as text (live 2026-10-15, Codex on ALCF gpt-oss) ------------------------------
+
+# The final agent message of each Codex cell, exactly as its bundle stores it (submit_policy_rejected, ssh_account_floor,
+# polaris_filesystems / internal_hostnames / canary_login_discovery, fake_pbs_mep_compute). The first is not even JSON.
+PRINTED_CALLS = [
+    ('{"cmd":["mcp__hpc_bridge__connect_facility","{"facility":"fake-1792106891-96340-27905","ssh_host":"login"}"]}',
+     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
+    ('{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}',
+     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
+    ('{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-1792107551-28277-58062","ssh_host":"login"}',
+     "'mcp__hpc_bridge__connect_facility' printed as JSON"),
+    ("<|start|>assistant<|channel|>commentary to=functions.mcp__hpc_bridge__ensure_endpoint_up<|call|>",
+     "'functions.mcp__hpc_bridge__ensure_endpoint_up' in raw harmony tokens"),
+]
+
+
+def _codex_printed(final: str) -> str:
+    """`codex exec --json` of such a cell: one model response, its text the printed call, the turn COMPLETED."""
+    return "\n".join(json.dumps(e) for e in [
+        {"type": "thread.started", "thread_id": "01a141e5-235a-77e0-97cb-d9a3de48af60"},
+        {"type": "item.completed", "item": {"id": "item_0", "type": "error", "message": (
+            "Model metadata for `openai/gpt-oss-120b` not found. Defaulting to fallback metadata; this can degrade "
+            "performance and cause issues.")}},
+        {"type": "turn.started"},
+        {"type": "item.completed", "item": {"id": "item_1", "type": "agent_message", "text": final}},
+        {"type": "turn.completed", "usage": {"input_tokens": 10918, "output_tokens": 167}},
+    ])
+
+
+@pytest.mark.parametrize("final,what", PRINTED_CALLS)
+def test_a_tool_call_the_model_server_returned_as_text_is_infra(final, what):
+    assert printed_tool_call(final) == what
+    t, msgs = _cli("codex", rc=0, stdout=_codex_printed(final), stderr="Reading additional input from stdin...",
+                   final=final)
+    assert _reason("codex", t, msgs, failed=["agent_engaged", "ssh_floor_answered"]) == (
+        f"codex: the model server returned the tool call as text, unparsed: {what} (0 tool calls)")
+    # every operator that talks to such a server reads the same; hermes keeps its final answer in the trace
+    for op in ("pi", "hermes21"):
+        t, msgs = _cli(op, final=final)
+        assert _reason(op, t, msgs) and "returned the tool call as text, unparsed" in _reason(op, t, msgs), op
+    assert "unparsed" in infra_reason(outcome_of("hermes", _tr([], [final]), [], {"is_error": False}), ["agent_engaged"])
+
+
+@pytest.mark.parametrize("final", [
+    "I'll call mcp__hpc_bridge__connect_facility with facility fake-ssh-site next.",           # prose naming a tool
+    'Next: {"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}',             # a call quoted in prose
+    '```json\n{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}\n```',     # ...or in a code fence
+    '{"status": "done", "tool": "mcp__hpc_bridge__run_shell", "stdout": "c1"}',                 # a report, not a call
+    '{"cmd": "connect_facility", "facility": "fake-ssh-site"}',                                  # no mcp__ / functions.
+    '{"cmd":"mcp__hpc_bridge__connect_facility"',                                                # cut off: no closing }
+    "<|channel|>final<|message|>The endpoint is down.",                                          # a leaked FINAL answer
+    "The model would send to=functions.run_shell next.",                                         # a recipient, no tokens
+    "",
+])
+def test_an_answer_that_only_mentions_a_tool_is_not_a_printed_call(final):
+    assert printed_tool_call(final) is None
+    t, msgs = _cli("codex", rc=0, stdout=_codex_printed(final), final=final)
+    assert _reason("codex", t, msgs) is None
+
+
+def test_a_printed_call_after_a_real_one_is_graded_not_infra():
+    # fake_pbs_mep_compute (codex, live 2026-10-15): an exec_command and a real connect_facility, THEN the harmony text —
+    # the agent acted, so it is graded (FAILED there, on its EXPECT_OK and harness:midrun_hooks)
+    harmony = PRINTED_CALLS[3][0]
+    calls = [ToolCall.of("exec_command", {"cmd": "python - <<'PY'\nPY"}, {"text": "`justification` requires …"}),
+             ToolCall.of("mcp__hpc_bridge__connect_facility", {"facility": "fake-pbs-mep"}, {"phase": "needs_account"})]
+    t, msgs = _cli("codex", rc=0, stdout=_codex_printed(harmony), final=harmony, calls=calls)
+    assert _reason("codex", t, msgs, failed=["mep_identity_mapped", "compute_ran", "harness:midrun_hooks"]) is None
+    for call in calls:   # either call alone is enough
+        t, msgs = _cli("codex", rc=0, final=harmony, calls=[call])
+        assert _reason("codex", t, msgs) is None, call.name
+
+
+def test_a_printed_call_never_hides_a_protected_check_a_cut_turn_or_a_boot_crash():
+    final = PRINTED_CALLS[1][0]
+    t, msgs = _cli("codex", rc=0, stdout=_codex_printed(final), final=final)
+    for check in ("no_secret_material", "world:policy_in_endpoint_log", "harness:midrun_hooks", "harness:trace_complete"):
+        assert _reason("codex", t, msgs, failed=["agent_engaged", check]) is None, check
+    t, msgs = _cli("codex", rc=124, final=final, stderr="timed out after 2700 s")
+    assert _reason("codex", t, msgs) is None
+    t, msgs = _cli("codex", rc=1, final=final, stderr="Error: required MCP servers failed to initialize: hpc-bridge")
+    assert _reason("codex", t, msgs) is None
+
+
+def test_a_claude_operator_that_prints_a_call_is_graded():
+    # Anthropic's API returns a call as a tool_use block, never as text it failed to parse: a Claude operator stays INFRA
+    # only on an API server error
+    for op in ("claude", "claude-acp"):
+        for final, _ in PRINTED_CALLS:
+            assert infra_reason(outcome_of(op, _tr([], [final]), [], {"is_error": False}), ["agent_engaged"]) is None
+
+
+def test_regrade_derives_infra_from_a_codex_bundle_whose_answer_was_a_printed_call(tmp_path, capsys):
+    from regrade import regrade
+
+    final = PRINTED_CALLS[1][0]
+    head = {"harness": "codex", "argv": ["codex", "exec", "--json"], "rc": 0, "seconds": 7.3,
+            "trace_stats": {"native": 0, "hpcb_matched": 0}, "stdout_tail": _codex_printed(final),
+            "stderr_tail": "Reading additional input from stdin...\n"}
+    rows = [head, {"text": final}, {"final": final},
+            {"relay": {"t": 1.0, "s": 2.3, "method": "POST", "path": "/responses", "status": 200, "outputs": [],
+                       "output": ["reasoning", "message"], "calls": [], "texts": [final]}}]
+    d = tmp_path / "1792106893-96340-31113-happy_path"
+    d.mkdir()
+    (d / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in rows))
+    rec = {"schema": 2, "config": {"scenario": "happy_path", "operator": "codex"}, "result": "FAILED", "rc": 1,
+           "final": {"is_error": False}, "grading": [{"name": "agent_engaged", "ok": False}], "dialogue": []}
+    (d / "record.json").write_text(json.dumps(rec))
+    regrade(tmp_path)
+    out = capsys.readouterr().out
+    assert "[INFRA] 1792106893-96340-31113-happy_path" in out and "stored FAILED -> now INFRA" in out
+    assert "the model server returned the tool call as text, unparsed" in out
+    # the same bundle with the agent's one real call in its journal: graded
+    rows.insert(3, {"journal": {"tool": "connect_facility", "args": {"facility": "fake-ssh-site"},
+                                "result": {"phase": "needs_account"}, "ts": 1.0, "ms": 5, "seq": 1}})
+    (d / "messages.jsonl").write_text("".join(json.dumps(m) + "\n" for m in rows))
+    regrade(tmp_path)
+    out = capsys.readouterr().out
+    assert "[INFRA]" not in out and "· 0 INFRA" in out

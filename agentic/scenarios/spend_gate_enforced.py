@@ -13,7 +13,7 @@ Deterministic on purpose (the prompt dictates the order). Run with **--no-skill*
 so the agent follows the literal instruction rather than the skill's ensure-first habit — the floor
 is a server property and must hold for an agent that never read SKILL.md. One short billed block.
 """
-from invariants import Result, Trace, _confirms_spend, _shape, compute_ran
+from invariants import Result, Trace, _confirms_spend, _shape, acted_on_nothing, compute_ran
 
 PROMPT = (
     "I'm testing the spend gate on the HPC facility with login host `{ssh_host}` — "
@@ -49,10 +49,12 @@ def spend_gate_enforced(t: Trace) -> Result:
     """The floor held, in order: the FIRST compute-shape call (`run_shell` / `ensure_endpoint_up` /
     `reset_session` with shape=compute — or shape omitted, which the server defaults to compute)
     came back `needs_confirmation`; a confirmed start (`ensure_endpoint_up(confirm_spend=True)` on
-    the compute shape) came AFTER it. Real compute work is `compute_ran`'s job (also gated)."""
+    the compute shape) came AFTER it. Real compute work is `compute_ran`'s job (also gated). A call sent before any
+    facility was connected never reached the gate ("No facility connected", invariants.acted_on_nothing — a model's
+    blind opening batch, hermes21 live 2026-10-15): it is not the first compute-shape call the floor answered."""
     compute_calls = [
         (i, c) for i, c in t.named("run_shell", "ensure_endpoint_up", "reset_session")
-        if _shape(c) == "compute"
+        if _shape(c) == "compute" and not acted_on_nothing(c)
     ]
     if not compute_calls:
         return Result("spend_gate_enforced", False, "no compute-shape call at all — the floor was never tested")

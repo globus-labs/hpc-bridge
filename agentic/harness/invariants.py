@@ -107,6 +107,30 @@ def _rejected_by_user(c: ToolCall) -> bool:
     return _USER_REJECTED in str((c.result or {}).get("text") or "")
 
 
+def acted_on_nothing(c: ToolCall) -> bool:
+    """hpc-bridge's answer to a call made while nothing was connected: it touched no endpoint and started nothing. A
+    model may open with a blind parallel batch before connect_facility has bound a facility — hermes21 on gpt-oss, live
+    2026-10-15: ensure_endpoint_up, run_shell, poll_task, stop_endpoint / teardown_endpoint, all at once. A grader that
+    reads "the FIRST <tool> call" must skip these or it grades the batch, not the run: teardown_slow_fs read a
+    pre-connect teardown's `down` as the slow teardown's premise failing, while the real one answered `tearing_down`.
+
+    Matched on the server's own no-op answers only, never on a status alone (a real teardown that answered `down`
+    straight away still names its endpoint, and stays the premise that failed): a stop / teardown answers `down`,
+    `endpoint_id` null, "no endpoint was up" (server._stop_endpoint / _teardown_endpoint); a run_shell /
+    ensure_endpoint_up / reset_session answers `failed` / `down`, `endpoint_id` null, "No facility connected"
+    (notices._no_facility_notice, its proposal and one-time-login variants too)."""
+    r = c.result or {}
+    if r.get("endpoint_id"):
+        return False
+    notice = str(r.get("notice") or "").strip().lower()
+    if c.name in ("stop_endpoint", "teardown_endpoint"):
+        return str(r.get("status")) == "down" and notice.startswith("no endpoint was up")
+    if c.name in ("run_shell", "ensure_endpoint_up", "reset_session"):
+        return (str(r.get("phase") or r.get("status")) in ("failed", "down")
+                and notice.startswith("no facility connected"))
+    return False
+
+
 def _billed_start_idxs(t: Trace) -> list[int]:
     """Confirmed compute starts that actually REQUESTED a block. A refusal (status down: no account,
     bad partition) or a spend gate (needs_confirmation) started nothing — counting it made
