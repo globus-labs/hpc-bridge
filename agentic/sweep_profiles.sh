@@ -67,7 +67,6 @@ mep_no_account                the registry tier: the real globus-labs MEP + a se
 needs_login_paste             the registry tier: a logged-out connect to the real registry's globus-labs entry
 saturation                    globus1: holds every node for 25 min (re-homing it to fake is a later change)
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
-queued_check_relaunch         the script operator only (HPCB_OPERATOR=script): a scripted proof cell, run by hand
 EXCLUDED
 }
 
@@ -150,11 +149,22 @@ for prof in "${PROFS[@]}"; do
         | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 | sed "s/^/    ${TAGGED:+[$op] }spend_gate_enforced — /" | tee -a "$SUMMARY"
     fi
   done
+  if [ "$prof" = default ] && [ -z "$PAID_ONLY" ]; then
+    # The relaunch regression (#203, fixed by #204): no model, the script operator, so once per sweep whatever
+    # --operators names — both phases (a user endpoint's second pilot, then its first), on the cluster booted above.
+    for ph in second first; do
+      echo "    ${TAGGED:+[script] }queued_check_relaunch phase $ph (script operator):" | tee -a "$SUMMARY"
+      HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default HPCB_SKIP_BUILD=1 HPCB_RELAUNCH_PHASE="$ph" \
+        "$HERE/agentic/run_smoke.sh" queued_check_relaunch 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-default-qcr-$ph.log" \
+        | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
+        | sed "s/^/    ${TAGGED:+[script] }queued_check_relaunch $ph — /" | tee -a "$SUMMARY"
+    done
+  fi
 done
 # INFRA apart from OK and FAILED: the operator's model endpoint failed (or the ALCF probe found it unhealthy and the cell
 # was not run) — nothing about hpc-bridge. Counted off the RESULT the rows above carry, per operator when tagged.
 tally() { grep -cE "$1" "$SUMMARY" || true; }
-for op in "${OPS[@]}"; do
+for op in "${OPS[@]}" ${TAGGED:+script}; do   # with --operators, the script operator's rows get their own totals
   p="${TAGGED:+\[$op\] .*}"
   rows=$(tally "${p}(RESULT: |no RESULT line)"); ok=$(tally "${p}RESULT: OK"); bad=$(tally "${p}RESULT: FAILED")
   infra=$(tally "${p}RESULT: INFRA"); setup=$(tally "${p}RESULT: SETUP FAILED"); crashed=$(tally "${p}no RESULT line")

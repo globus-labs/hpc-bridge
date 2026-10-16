@@ -157,7 +157,8 @@ endpoint's first, and the stop answers an honest `down` with no relaunch (live 2
 another path (run 1792117501): 56 s after the stop parsl marked the cancelled, never-connected block MISSING, went to
 bad state ("Not strategizing") and the user endpoint shut down — no relaunch, the canary left queued. A `draining`
 answer passes the gated row even with a relaunch seen (it did not claim spend stopped); the universal
-`world:stop_honesty_no_pilot_left` still fails a pilot left queued. Run it by hand; the sweeps leave it out.
+`world:stop_honesty_no_pilot_left` still fails a pilot left queued. The profile sweep runs both phases once on `default` (the script operator, whatever `--operators` names); run it by
+hand as above.
 
 **World checks that watch, and the ADMIN TAP.** A scenario's `WORLD_CHECKS` are async callables
 `fn(ctx) -> list[Result]` that run.py awaits after the operator and BEFORE the declarative POSTCHECKS and the teardown
