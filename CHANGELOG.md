@@ -95,9 +95,11 @@ installed plugin only when that version changes); git tags mark releases.
     the block would not end it. Only that answer refuses: a command whose state cannot be read (no client yet after
     a restart, or a record the service no longer returns), or one past its time limit plus a grace, never keeps a
     stop from cancelling — the stop cancels and says the command may still be queued or running. The file is read
-    and written in a background thread, and its lock is never waited on for more than two seconds (on Windows too):
-    a home directory that hangs cannot freeze hpc-bridge, and a lock not had reads as a record that cannot be
-    trusted. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
+    and written in a background thread of its own, and its lock is never waited on for more than two seconds (on
+    Windows too): a home directory that hangs cannot freeze hpc-bridge, and a lock not had reads as a record that
+    cannot be trusted. A check is on the file from the moment it is sent, before its task id is known and before
+    its wait ends (a cancelled wait included); so is a command while it runs. A server that restarts before the task
+    id arrives reads such a row as possibly queued. Shutdown and teardown wait for the file's last write. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
     that came up after the stop's last cancel. A `connect_facility` to another facility says when a task may still
     be queued on the endpoint it left. When the endpoint is offline, the stop answers `down` as before, but keeps
     the tasks: if the endpoint comes back, the next stop still sees them. One `stop_endpoint` call takes at most

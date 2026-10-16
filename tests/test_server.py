@@ -2412,6 +2412,166 @@ async def test_the_records_io_runs_off_the_event_loop(monkeypatch):
     assert len(ticks) >= 5                                                   # the loop kept running meanwhile
 
 
+# --- review round 4 of e4d9937: a sent task is on the record from its submit ----------------------------------------
+
+async def test_a_check_whose_wait_is_cancelled_is_on_the_record(monkeypatch):
+    # Review r4, D1: the row was written only after runner.canary returned — a cancel (Esc, a kill) during the wait left
+    # a check at the service with no row, and a restarted server's stop answered `down` with it queued
+    import asyncio
+
+    from hpc_bridge import warmth
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    app, runner = _queued_app(monkeypatch)
+    gate = asyncio.Event()
+
+    async def canary(timeout=8.0):          # sent (the service took it: a task id) — then waiting on the worker
+        fut = _PendingFuture()
+        fut.task_id = "sent-1"
+        runner.checks.append(fut)
+        await gate.wait()
+
+    runner.canary = canary
+    task = asyncio.ensure_future(_ensure_endpoint_up(app, confirm_spend=True))
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if runner.checks:
+            break
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    await warmth._flush_all(app)
+    eid = app.state.endpoint_id
+    assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["sent-1"]
+    app2 = _restarted_app(monkeypatch, eid, None)                    # restarted
+    _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app2)
+    assert not runner.checks[0].done() and res.status == "draining" and "(task sent-1)" in res.notice
+
+
+async def test_a_check_is_on_the_record_at_its_submit_and_its_late_id_replaces_the_placeholder(monkeypatch):
+    # Review r4: the row waited for the canary's whole wait, and a task id that arrived after it waited for a later save
+    import asyncio
+
+    from hpc_bridge import warmth
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    app, runner = _queued_app(monkeypatch)
+    sent = {}
+
+    async def canary(timeout=8.0):          # as GlobusRunner: the submit, its on_sent hook, then the wait
+        if "fut" not in sent:   # one check, waited on again (the login shape's canary rides this fake runner too)
+            sent["fut"] = _PendingFuture()                        # the SDK has no task id for it yet
+            runner.checks.append(sent["fut"])
+        runner.on_sent()
+        await warmth._flush_all(app)
+        sent["at_submit"] = SentCheckStore().load(app.state.endpoint_id)
+        return CanaryResult(ok=False, error="timeout")
+
+    runner.canary = canary
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    eid = app.state.endpoint_id
+    [row] = sent["at_submit"]
+    assert row["no_id"] is True                                     # on the record before the wait
+    app2 = _restarted_app(monkeypatch, eid, None)                   # a restart now: fail closed, not `down`
+    _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app2)
+    assert res.status == "draining" and "may still be queued" in res.notice
+    sent["fut"].task_id = "late-1"                                  # the SDK's submit thread answers, late
+    for _ in range(40):
+        await asyncio.sleep(0.05)
+        await warmth._flush_all(app)
+        if [r["task_id"] for r in SentCheckStore().load(eid)] == ["late-1"]:
+            break
+    assert [(r["task_id"], r["no_id"]) for r in SentCheckStore().load(eid)] == [("late-1", False)]
+
+
+def test_the_runner_calls_on_sent_right_after_the_submit():
+    pytest.importorskip("globus_compute_sdk")
+    import asyncio
+
+    from hpc_bridge.runner import GlobusRunner
+    from tests.test_runner import _CanaryFuture, _QueueExecutor
+
+    pending = _CanaryFuture(pending=True)
+    ex = _QueueExecutor(pending)
+    r = GlobusRunner("eid", executor_factory=lambda: ex)
+    seen = []
+    r.on_sent = lambda: seen.append([f for f, _, _ in r.sent_checks()])
+    asyncio.run(r.canary(timeout=0.1))
+    assert seen == [[pending]]
+
+
+async def test_a_command_running_when_the_server_restarts_is_on_the_record(monkeypatch):
+    # Review r4: the command's path had the same gap — in flight, it was on no record, so a restart answered `down`
+    import asyncio
+    from types import SimpleNamespace
+
+    from hpc_bridge import warmth
+    from hpc_bridge.server import _poll_task, _run_shell, _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    app = _ssh_app()
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"), pending=True)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    runner.timeout = 0.01
+    out = await _run_shell(app, "sleep 3000", agent_call=True)
+    assert out.phase == "running"
+    runner.futures[-1].task_id = "cmd-7"
+    for _ in range(40):                                              # the id watcher writes it as soon as it is set
+        await asyncio.sleep(0.05)
+        await warmth._flush_all(app)
+        if [r["task_id"] for r in SentCheckStore().load("fake-eid")] == ["cmd-7"]:
+            break
+    assert [r["what"] for r in SentCheckStore().load("fake-eid")] == ["command"]
+    running = SimpleNamespace(get_task=lambda tid: {"pending": True, "status": "running"})
+    app2 = _restarted_app(monkeypatch, "fake-eid", running)          # the server restarts mid-command
+    log = _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app2)
+    assert log == [] and res.status == "up" and "(task cmd-7) may still be running" in res.notice
+    runner.futures[-1].finish(_Res(0, "", ""))                       # it finishes: off the record
+    await _poll_task(app, out.task_id)
+    await warmth._flush_all(app)
+    assert SentCheckStore().load("fake-eid") == []
+
+
+async def test_shutdown_writes_and_flushes_the_record(monkeypatch):
+    from hpc_bridge import server, warmth
+    from hpc_bridge.state import SentCheckStore
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    eid = app.state.endpoint_id
+    await warmth._flush_all(app)
+    SentCheckStore().remove(eid)                                      # as if its write had been lost
+    app.persisted_checks.clear()
+    await server._shutdown(app)
+    assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["check-1"]
+
+
+async def test_the_records_io_has_a_thread_of_its_own(monkeypatch):
+    import threading
+
+    from hpc_bridge import warmth
+    from hpc_bridge.state import SentCheckStore
+
+    names = []
+    real = SentCheckStore.read
+
+    def read(self, eid):
+        names.append(threading.current_thread().name)
+        return real(self, eid)
+
+    monkeypatch.setattr(SentCheckStore, "read", read)
+    await warmth._read_checks("fake-eid")
+    assert names and names[0].startswith("hpc-bridge-record")
+
+
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------
 
 

@@ -229,6 +229,8 @@ class GlobusRunner:
         # queued can make the endpoint start a block for it.
         self._sent: list[tuple[Any, float]] = []
         self._client: Any = None
+        # Called right after a canary is submitted, before its wait (warmth._confirm_worker records it on disk).
+        self.on_sent: Any = None
 
     def _default_factory(self):
         from globus_compute_sdk import Executor
@@ -294,6 +296,11 @@ class GlobusRunner:
             self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
             self._sent = [(f, at) for f, at in self._sent if _may_be_queued(f)] + [(fut, time.time())]
             self._client = _task_client(self._ex) or self._client
+            if self.on_sent is not None:  # the caller records it NOW, before the wait (a restart must still see it)
+                try:
+                    self.on_sent()
+                except Exception:  # noqa: BLE001 - a record that cannot be written never fails the check
+                    pass
 
             def _stamp(f, runner=self):  # runs on the SDK's thread; only for the canary still current
                 if runner._canary_fut is f:

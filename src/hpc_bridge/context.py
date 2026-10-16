@@ -206,6 +206,9 @@ class SentCheck:
     # a command's: past this (wall clock: its ceiling — it is killed at its walltime once running — plus the grace a
     # queued one gets) it can no longer make a stop refuse; None: unknown, or a check
     ceiling_at: float | None = None
+    # the key of its row on disk when it has no task id (read back from a record: the submit's row, written before the
+    # service answered with an id)
+    row_key: str | None = None
 
     @property
     def tid(self) -> str | None:
@@ -317,6 +320,11 @@ class AppCtx:
     # task writing them off the event loop (warmth._schedule_flush).
     checks_pending: dict[str, tuple[list[dict], frozenset[str], frozenset[str]] | None] = field(default_factory=dict)
     check_flushers: dict[str, asyncio.Task] = field(default_factory=dict)
+    # Per endpoint id: the commands of ours sent to its compute block and not finished yet, written to the record so a
+    # restarted server still sees one still running (warmth._note_command_sent); and the task that writes a check's or
+    # command's task id to the record as soon as the SDK has it (warmth._watch_ids).
+    commands_sent: dict[str, list[SentCheck]] = field(default_factory=dict)
+    id_watchers: dict[str, asyncio.Task] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

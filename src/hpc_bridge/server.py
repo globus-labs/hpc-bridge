@@ -211,10 +211,20 @@ async def lifespan(server: FastMCP) -> AsyncIterator[AppCtx]:
     try:
         yield app
     finally:
-        app.tasks.clear()  # drop any live poll handles — their blocks are going away with the process
-        for rt in app.shapes.values():
-            if rt.runner is not None:
-                rt.runner.close()
+        await _shutdown(app)
+
+
+async def _shutdown(app: AppCtx) -> None:
+    """The server is going away: write what may still be queued on the bound endpoint to the record and wait (bounded)
+    for every pending write — a server that starts again must see it (#24) — then close the runners."""
+    eid = app.state.endpoint_id
+    if eid is not None:
+        warmth._persist_checks(app, eid)
+    await warmth._flush_all(app, timeout=5.0)
+    app.tasks.clear()  # drop any live poll handles — their blocks are going away with the process
+    for rt in app.shapes.values():
+        if rt.runner is not None:
+            rt.runner.close()
 
 
 # --- operational guidance over MCP (cross-harness) --------------------------------------------------------------
@@ -988,7 +998,9 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     # The whole call is bounded (config.STOP_CALL_BUDGET_S): under the tool timeouts of the clients that drive it —
     # the waits for the lock, the releases, the lookups and the liveness check included.
     call_deadline = time.monotonic() + config.STOP_CALL_BUDGET_S
-    # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server)
+    # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server) — after this
+    # process's own pending writes, so it reads what this process knows
+    await warmth._flush_all(app, timeout=min(5.0, call_deadline - time.monotonic()))
     disk = await warmth._read_checks(eid, min(5.0, call_deadline - time.monotonic()))
     if not await _acquire_within(app, call_deadline):
         return _lock_busy_status(app, eid, released=None)
@@ -1487,6 +1499,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         ours = app.state.endpoint_id in (eid, None)
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
         warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
+    await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",
         block_state="cold",
@@ -1736,6 +1749,9 @@ async def _dispatch_counted(
     try:
         try:
             fut = runner.submit(payload())  # submit; wait a bounded time OFF the lock, else hand back a handle
+            # on the record while it runs (#24): a server that restarts mid-command must still see it
+            warmth._note_command_sent(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)(),
+                                      runner.walltime)
             res = await asyncio.to_thread(fut.result, runner.timeout)
         except asyncio.CancelledError:
             me = asyncio.current_task()
@@ -1772,6 +1788,7 @@ async def _dispatch_counted(
             if fut is not None:  # a future that failed on the client's side alone: the task may live on — evidence
                 warmth._keep_lost_command(app, shape, rt, fut, getattr(runner, "task_client", lambda: None)(),
                                           ceiling_s=runner.walltime)
+                warmth._note_command_done(app, fut)  # its result is in: off the record
             if guard is not None and (refused := warmth._guard_refusal(out, guard)) is not None:
                 # refused on a replacement block: nothing ran, so no submission and no proof of life — the reap
                 return warmth._wrong_block_outcome(app, shape, rt, guard, refused, reset=reset)
