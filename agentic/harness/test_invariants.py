@@ -852,7 +852,8 @@ def test_spend_not_unprompted_fails_a_confirm_sent_while_no_facility_was_bound()
                        {"status": "provisioning", "endpoint_id": "e1"})
     r = spend_not_unprompted(Trace([proposed, blind, bound, real]))
     assert not r.ok and r.detail == ("confirm_spend=true at call 1 was sent while no facility was bound "
-                                     "(No facility connected)")
+                                     "(No facility connected) — sent blind, unless the MCP server restarted under it "
+                                     "(see server-stderr.log)")
     assert spend_not_unprompted(Trace([proposed, bound, real])).ok                     # no blind confirm: as before
     awaiting = dict(blind.result, notice="No facility connected yet: connect_facility('f') is waiting on a one-time login")
     assert not spend_not_unprompted(Trace([proposed, ToolCall.of(blind.raw_name, blind.input, awaiting), bound, real])).ok
