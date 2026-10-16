@@ -52,7 +52,9 @@ _CELL_ENV_KEEP_PREFIXES = ("HPCB_TEST_", "HPCB_POOL_", "HPCB_NODE_", "HPCB_FAKE_
                            "HPCB_ALCF", "HPCB_HERMES_EAGER",   # HPCB_HERMES_EAGER_TOOLS: expose MCP tools directly
                            "HPCB_HERMES_ACP",   # drive hermes over one persistent ACP session (not -z replay)
                            "HPCB_BENCHMARK",    # HPCB_BENCHMARK_MODE: operator-preference graders → report-only
-                           "HPCB_CLAUDE_ACP")   # the claude-acp operator's model pin (a whole-suite choice, like HPCB_ALCF_*)
+                           "HPCB_CLAUDE_ACP",   # the claude-acp operator's model pin (a whole-suite choice, like HPCB_ALCF_*)
+                           "HPCB_RELAUNCH_")    # queued_check_relaunch's knobs (which phase; the watch): set for that cell
+                                                # only — scrubbed, HPCB_RELAUNCH_PHASE=first ran phase `second` (live)
 
 
 class Stagger:
