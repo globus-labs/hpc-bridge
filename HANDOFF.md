@@ -31,6 +31,24 @@ internal hostile pbs_mep`) that is now the main regression backbone; the lab clu
 - **Fixed by #204** (`fix/stop-after-failed-block`). `queued_check_relaunch` (phase `second`) is its regression check:
   it failed on main before the fix (4/4 runs) and passes with it (live 2026-10-16). The default sweep runs both
   phases once on `default`, under the script operator (`sweep_profiles.sh`).
+- **The lost-result race (#208).** In ~2 of ~12 rejected or dead-pilot cells
+  (fake `site`, 2026-10-16: `submit_policy_rejected` 1792136208, `slurm_worker_died` 1792140090) the user endpoint's
+  report that it failed our check never left it (globus-compute-endpoint 4.18 stops its result publisher without
+  blocking, ~0.3 s after bad state), so the service lists the check as pending for good and every stop said
+  `draining`. The stop now reads that check's own user endpoint and the manager's own log on the login node (evidence,
+  never a clock: vault `Modules/server.md`, "When the service cannot say"). It needs #208's template
+  (`endpoint_setup: "true hpcb_block=<n>"`): an endpoint configured before it never matches and behaves as before.
+  First round live (8264bcb, 3 rounds × Pi/Hermes21 × both cells): 12/12 stops `down`, 2 through the evidence
+  (`slurm_worker_died` 1792168070, 1792168863), `world:stop_honesty_no_pilot_left` everywhere. Two reviews then found
+  a one-instant reading could miss the manager reviving the user endpoint (a start request cached within its 30 s
+  grace, revived at the ~1 s reap); the second round reads twice 3 s apart, wants the manager's log to show the exit
+  and nothing after, and a check at least 35 s old taken before the bad state. Round 3: only in batch mode (the
+  default; interactive templates start a block per new user endpoint life), the manager log read through its
+  rotation, an unreadable twin must be provably stopped, grep read errors fail closed, ages on the monotonic clock
+  — live again on ac91b8a (12/12 `down`, 2 through the evidence) and 358657d (every stop `down`, 1 through
+  the evidence; `queued_check_relaunch` OK), the pilot-left check passing in every cell. Live checks to repeat: in a `down` naming a lost check, the bundle's manager log must
+  show `Command stopped normally (<pid>)` for that user endpoint and no `Creating new user endpoint` /
+  `User EP stopped within grace period` for it after, and `world:stop_honesty_no_pilot_left` must pass.
 
 ## Where it stands (2026-10-14) — the spend question names the block
 

@@ -1,0 +1,53 @@
+> Endpoint directory set to '/home/hpcbridge-test-00/.globus_compute/uep.7a7da153-4643-4b2f-b8a6-ceee6211af97.a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32'
+> GLOBUS_COMPUTE_LOG_PATH has been set to '/home/hpcbridge-test-00/.globus_compute/uep.7a7da153-4643-4b2f-b8a6-ceee6211af97.a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32/endpoint.log'
+2026-10-16 07:38:11,679590 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.endpoint:610 start_interchange 
+
+========== Endpoint begins: a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32
+2026-10-16 07:38:11,679741 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:88 __init__ Initializing EndpointInterchange process with Endpoint ID: a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32
+2026-10-16 07:38:11,680026 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:137 __init__ Platform info: {'parsl_v': '2026.10.12', 'python_v': '3.11.16', 'os': 'Linux', 'hname': 'login02.hpcb.test', 'funcx_sdk_version': '4.18.0', 'funcx_endpoint_version': '4.18.0', 'registration': 'a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32', 'dir': '/home/hpcbridge-test-00'}
+2026-10-16 07:38:11,680474 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:222 start Starting EndpointInterchange
+2026-10-16 07:38:11,680563 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:142 start_engine Starting Engine
+2026-10-16 07:38:12,431123 INFO MainProcess-886 Thread-4-281473340731808 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 07:38:12,431384 INFO MainProcess-886 Thread-5-281473332277664 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 07:38:12,431998 INFO MainProcess-886 TQS-281473323823520 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:147 run <TaskQueueSubscriber(TQS, started 281473323823520)> Opening connection to AMQP service.
+2026-10-16 07:38:12,760867 INFO MainProcess-886 TQS-281473323823520 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:284 _start_consuming <TaskQueueSubscriber(TQS, started 281473323823520)> Awaiting messages from queue: a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32.tasks
+2026-10-16 07:38:12,793779 INFO MainProcess-886 Thread-5-281473332277664 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:1; t:0> Ready to send results to exchange: heartbeats
+2026-10-16 07:38:12,804303 INFO MainProcess-886 Thread-4-281473340731808 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:0; t:0> Ready to send results to exchange: results
+2026-10-16 07:38:17,435593 INFO MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 0 blocks
+2026-10-16 07:38:17,435783 INFO MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 1 blocks
+2026-10-16 07:38:17,435815 INFO MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.executors.status_handling:210 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Allocated block ID 0
+2026-10-16 07:38:17,454362 ERROR MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.providers.slurm.slurm:374 submit Submit command failed
+2026-10-16 07:38:17,454498 ERROR MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.providers.slurm.slurm:375 submit Retcode:1 STDOUT: STDERR:sbatch: error: AssocMaxSubmitJobLimit
+sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)
+2026-10-16 07:38:22,455661 ERROR MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.executors.status_handling:145 set_bad_state_and_fail_all Setting bad state due to exception
+parsl.jobs.errors.TooManyJobFailuresError: Error 1:
+	Failed to start block 0: Cannot launch job parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792136297.4358523: Could not read job ID from submit command standard output; recode=1, stdout=, stderr=sbatch: error: AssocMaxSubmitJobLimit
+sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)
+
+
+2026-10-16 07:38:22,457852 INFO MainProcess-886 JobStatusPoller-Timer-Thread-281473712980048-281473349185952 parsl.jobs.strategy:195 _general_strategy [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Not strategizing for executor because bad state is set
+2026-10-16 07:38:22,466141 INFO MainProcess-886 HTEX-Result-Queue-Thread-281473357640096 parsl.executors.high_throughput.executor:568 _result_queue_worker Closing result ZMQ pipe
+2026-10-16 07:38:22,466434 INFO MainProcess-886 BadStateWatcher-281472753660320 globus_compute_endpoint.endpoint.interchange:158 stop Shutting down EndpointInterchange
+2026-10-16 07:38:22,466960 ERROR MainProcess-886 BadStateWatcher-281472753660320 globus_compute_endpoint.endpoint.interchange:552 engine_bad_state_watcher Error 1:
+	Failed to start block 0: Cannot launch job parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792136297.4358523: Could not read job ID from submit command standard output; recode=1, stdout=, stderr=sbatch: error: AssocMaxSubmitJobLimit
+sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job submit limit, user's size and/or time limits)
+
+NoneType: None
+2026-10-16 07:38:22,467451 INFO MainProcess-886 HTEX-Result-Queue-Thread-281473357640096 parsl.executors.high_throughput.executor:570 _result_queue_worker Result queue worker finished
+2026-10-16 07:38:22,514198 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:176 stop Stopping thread
+2026-10-16 07:38:22,514456 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:153 quiesce Interchange quiesce in progress
+2026-10-16 07:38:22,514803 WARNING MainProcess-886 MainThread-281473847517216 parsl.jobs.job_status_poller:66 close Not scaling in executor GlobusComputeEngine-HighThroughputExecutor because it is in bad state
+2026-10-16 07:38:22,514929 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:926 shutdown Attempting HighThroughputExecutor shutdown
+2026-10-16 07:38:22,514960 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:928 shutdown Terminating interchange and result queue thread
+2026-10-16 07:38:22,524335 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:937 shutdown Closing ZMQ pipes
+2026-10-16 07:38:22,524505 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:947 shutdown Closing outgoing_q
+2026-10-16 07:38:22,525136 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:951 shutdown Closing command client
+2026-10-16 07:38:22,525627 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:954 shutdown Waiting for result queue thread exit
+2026-10-16 07:38:22,525793 INFO MainProcess-886 MainThread-281473847517216 parsl.executors.high_throughput.executor:963 shutdown Finished HighThroughputExecutor shutdown attempt
+2026-10-16 07:38:22,525878 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.interchange:273 start EndpointInterchange shutdown complete.
+2026-10-16 07:38:22,525915 INFO MainProcess-886 MainThread-281473847517216 globus_compute_endpoint.endpoint.endpoint:626 start_interchange 
+---------- Endpoint shutdown: a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32
+
+2026-10-16 07:38:22,774562 INFO MainProcess-886 Thread-4-281473340731808 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:223 _on_connection_closed ResultPublisher<✗; o:1; t:0> Connection closed: (200, 'Normal shutdown')
+2026-10-16 07:38:23,231344 INFO MainProcess-886 Thread-5-281473332277664 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:223 _on_connection_closed ResultPublisher<✗; o:0; t:2> Connection closed: (200, 'Normal shutdown')
+2026-10-16 07:38:23,272009 INFO MainProcess-886 TQS-281473323823520 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:213 _on_connection_closed <TaskQueueSubscriber(TQS, started 281473323823520)> Connection closed: (200, 'Normal shutdown')

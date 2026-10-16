@@ -603,14 +603,19 @@ async def test_a_reused_endpoint_gives_fresh_compute_user_endpoints_only_if_its_
     ours = _facility(wi).config_template(Profile())[0]
     fac = _facility(wi, client=lambda: _Client(ours))
     await fac.adopt_endpoint("eid-1")
-    assert fac.fresh_ueps is True
+    assert fac.fresh_ueps is True and fac.logs_block_requests is True  # …and its log names each block request
     earlier = "\n".join(line for line in ours.splitlines() if "idle_heartbeats_soft" not in line)
     fac = _facility(wi, client=lambda: _Client(earlier))
     await fac.adopt_endpoint("eid-1")
     assert fac.fresh_ueps is False
+    # fresh user endpoints, configured before their logs named the block request: a stop has nothing to match there
+    unnamed = "\n".join(line for line in ours.splitlines() if "endpoint_setup" not in line)
+    fac = _facility(wi, client=lambda: _Client(unnamed))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.fresh_ueps is True and fac.logs_block_requests is False
     fac = _facility(wi, client=lambda: _Client(exc=RuntimeError("503")))
     await fac.adopt_endpoint("eid-1")
-    assert fac.fresh_ueps is False                                     # unreadable: never presumed
+    assert fac.fresh_ueps is False and fac.logs_block_requests is False  # unreadable: never presumed
 
 
 @pytest.mark.parametrize("current", ["", "module load gce && source /x/bin/activate"], ids=["emptied", "hand-written"])

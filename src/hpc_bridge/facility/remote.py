@@ -911,21 +911,28 @@ class RemoteEndpointCLI:
 
 
 # The COMPUTE user endpoint (both templates) exits once idle (`idle_heartbeats_soft`, Profile.uep_idle_heartbeats;
-# its hard idle limit then applies too), and its config carries `hpcb_block`: a token hpc-bridge changes per block
+# its hard idle limit then applies too), and its config carries `hpcb_block`: a number hpc-bridge changes per block
 # request (warmth._fresh_block). The web service keys a user endpoint on its config, so each block request gets a
 # FRESH user endpoint and every pilot is its first: one cancelled, or dead before it connects, reads MISSING to parsl,
 # which then fails our queued check (bad state) instead of starting another block for it — live 2026-10-16,
-# `queued_check_relaunch`. The template need not use the token (an unused key is ignored, and the default schema
-# allows any); it names it in a comment. An endpoint configured before this change has neither line, and is never
-# given fresh user endpoints (`fresh_ueps`): one of its user endpoints would never exit.
+# `queued_check_relaunch`. An endpoint configured before that change has neither line, and is never given fresh user
+# endpoints (`fresh_ueps`): one of its user endpoints would never exit.
+# The number also reaches that user endpoint's OWN log: globus-compute-endpoint 4.18 writes nothing into a user
+# endpoint's directory that names its config (the rendered config goes to the process on stdin and into its log only
+# under `debug: true`; endpoint.json holds only its own id), but it logs its `endpoint_setup` command at its start
+# ("running endpoint_setup command: …"). So the line below — a no-op, `true` with the number as its argument, rendered
+# `| int` so only digits ever reach that shell — names the block request in its log, and a stop can find the user
+# endpoint a check of ours went to (server._settle_by_evidence; `logs_block_requests`). A template without it (an
+# endpoint configured before this change) leaves the stop with nothing to match: it stays `draining` there.
 # `strategy_period: 5` (both templates; 30 on endpoints configured before this change): a new user endpoint scales
 # out only on its first scaling pass, one period after it starts, and a first SSH result pays that wait twice
 # (login shape, then compute). It is not the scheduler query rate (parsl polls Slurm/PBS at most every 60 s).
 # warmth._IDLE_GRACE_S is two of these passes plus 5 s; a test ties them.
 _SLURM_TEMPLATE = """\
 {% if compute | default(true) %}
-# hpc-bridge block request {{ hpcb_block | default("") }}
+# hpc-bridge block request {{ hpcb_block | default(0) | int }}
 idle_heartbeats_soft: @@IDLEHB@@
+endpoint_setup: "true hpcb_block={{ hpcb_block | default(0) | int }}"
 {% endif %}
 engine:
   type: GlobusComputeEngine
@@ -976,8 +983,9 @@ engine:
 # the fake OpenPBS cluster, 2026-09-06: every facility we had met before required an account, so it never showed).
 _PBS_TEMPLATE = """\
 {% if compute | default(true) %}
-# hpc-bridge block request {{ hpcb_block | default("") }}
+# hpc-bridge block request {{ hpcb_block | default(0) | int }}
 idle_heartbeats_soft: @@IDLEHB@@
+endpoint_setup: "true hpcb_block={{ hpcb_block | default(0) | int }}"
 {% endif %}
 engine:
   type: GlobusComputeEngine
@@ -1027,6 +1035,32 @@ engine:
 
 # The compute branch's idle-exit line (this plugin's templates; an endpoint configured earlier has none).
 _IDLE_HEARTBEATS_LINE = re.compile(r"^\s*idle_heartbeats_soft:\s*(\d+)\s*$", re.M)
+
+
+# The compute branch's block-request line (this plugin's templates; one configured before it has none).
+_BLOCK_REQUEST_LINE = re.compile(
+    r'^\s*endpoint_setup: "true hpcb_block=\{\{ hpcb_block \| default\(0\) \| int \}\}"\s*$', re.M)
+# What that line writes into the user endpoint's own log at its start (globus-compute-endpoint's Endpoint._run_command:
+# `running endpoint_setup command: <command>`), the number appended: what a stop's evidence matches (scheduler_ops).
+BLOCK_REQUEST_LOG = "running endpoint_setup command: true hpcb_block="
+
+
+# The compute branch's `init_blocks` default, as `config_template` writes it (`@@EAGER@@`: 1 in interactive mode, 0 in
+# batch); the login branch's literal `init_blocks: 1` is not this line.
+_INIT_BLOCKS_LINE = re.compile(r"^\s*init_blocks: \{\{ init_blocks \| default\((\d+)\) \}\}\s*$", re.M)
+
+
+def compute_init_blocks(template: object) -> int | None:
+    """The `init_blocks` an endpoint's published UEP template gives a compute user endpoint by default — how many blocks
+    each new life of one submits at once, task or not — or None when that is not read exactly once."""
+    found = _INIT_BLOCKS_LINE.findall(str(template or ""))
+    return int(found[0]) if len(found) == 1 else None
+
+
+def logs_block_requests(template: object) -> bool:
+    """Whether an endpoint's published UEP template writes each block request's number into its compute user endpoint's
+    own log (the `endpoint_setup` line above): only then can a stop tell which user endpoint a check of ours went to."""
+    return _BLOCK_REQUEST_LINE.search(str(template or "")) is not None
 
 
 def gives_fresh_ueps(template: object) -> bool:
@@ -1107,6 +1141,13 @@ class SlurmFacility:
         # worker_init (adopt_endpoint), set when provision writes it; False until known — a template of an earlier
         # plugin keeps one compute user endpoint, which never exits (warmth._fresh_block).
         self.fresh_ueps = False
+        # Whether that template also names each block request in its compute user endpoint's own log (this plugin's:
+        # the `endpoint_setup` line), so a stop can find the user endpoint a check went to. Known with `fresh_ueps`.
+        self.logs_block_requests = False
+        # The `init_blocks` a compute user endpoint starts with by default (0 in batch mode, 1 in interactive), read
+        # with the rest; None: unknown. With 1, ANY new life of a user endpoint submits a block, task or not, so a stop
+        # does not settle a check by its user endpoint's fate there (server._settle_by_evidence).
+        self.compute_init_blocks: int | None = None
 
     @property
     def scratch_root(self) -> str | None:
@@ -1126,12 +1167,15 @@ class SlurmFacility:
         if endpoint_id == self._adopted:
             return
         self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, "", False
+        self.logs_block_requests, self.compute_init_blocks = False, None
         try:
             md = await endpoint_metadata(self._client_factory, endpoint_id)
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
             return
         self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
         self.fresh_ueps = gives_fresh_ueps(md.get("user_config_template"))
+        self.logs_block_requests = logs_block_requests(md.get("user_config_template"))
+        self.compute_init_blocks = compute_init_blocks(md.get("user_config_template"))
         own = configured_worker_init(md.get("user_config_template"), prefer=self.profile.worker_init)
         if own is None:
             return
@@ -1348,6 +1392,7 @@ class SlurmFacility:
         # the template on disk is this profile's now: forget what an earlier read learned, also if `start` fails below
         # (the daemon may register anyway, and a retry's reuse must read it again)
         self._adopted, self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, None, "", False
+        self.logs_block_requests, self.compute_init_blocks = False, None
         eid, host, addr = await self.cli.start(name)
         # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
         # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so
@@ -1355,6 +1400,8 @@ class SlurmFacility:
         # line. Recorded as known (a teardown runs the CLI in it, even after a reconnect changed env_setup).
         self._adopted, self.endpoint_worker_init, self.worker_init_note = eid, self.profile.worker_init, ""
         self.fresh_ueps = hpc.uep_idle_heartbeats > 0  # the template just written is this plugin's
+        self.logs_block_requests = True  # …and it names each block request in its compute user endpoint's log
+        self.compute_init_blocks = compute_init_blocks(uep)  # …and starts this many blocks per new life
         # the node's FQDN when routable from here, else the address this connection reached, else the alias
         host = await asyncio.to_thread(_routable_pin, host, addr)
         if host:

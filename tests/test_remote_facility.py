@@ -445,15 +445,17 @@ async def test_provision_knows_its_endpoint_gives_fresh_compute_user_endpoints()
     # it just wrote this plugin's template: no read needed (the web service may still serve the old one for seconds)
     cli = _FakeRemoteCLI(status=None)
     fac = SlurmFacility(_profile(), cli=cli)
-    assert fac.fresh_ueps is False
+    assert fac.fresh_ueps is False and fac.logs_block_requests is False
     await fac.provision(Profile(mode="interactive"))
     assert fac.fresh_ueps is True and "idle_heartbeats_soft: 20" in cli.written["uep"]
+    assert fac.logs_block_requests is True and remote.logs_block_requests(cli.written["uep"])
     never = SlurmFacility(_profile(), cli=_FakeRemoteCLI(status=None))
     await never.provision(Profile(mode="interactive", uep_idle_heartbeats=0))
     assert never.fresh_ueps is False                                    # its user endpoints would never exit
     reused = SlurmFacility(_profile(), cli=_FakeRemoteCLI(status="running"))
     await reused.provision(Profile(mode="interactive"))
     assert reused.fresh_ueps is False                                   # not written here: known once its template is read
+    assert reused.logs_block_requests is False
 
 
 async def test_provision_skips_configure_when_already_configured():
@@ -932,13 +934,27 @@ def test_the_compute_user_endpoint_exits_when_idle_and_carries_its_block_request
     # the block number makes a new one; it must exit once idle, or each would stay on the login node for good
     f = SlurmFacility(profile(), cli=None)
     tmpl, defaults = f.config_template(Profile(mode="batch"))
-    uec = {**defaults, **shape_config("compute"), "hpcb_block": "3f9a0c1e"}
+    uec = {**defaults, **shape_config("compute"), "hpcb_block": 207612534}
     assert _render(tmpl, uec)["idle_heartbeats_soft"] == 20           # 10 min of 30 s heartbeats: the block's idle
-    assert '# hpc-bridge block request "3f9a0c1e"' in _render_text(tmpl, uec)
+    assert "# hpc-bridge block request 207612534" in _render_text(tmpl, uec)
+    # the number reaches the user endpoint's OWN log at its start (globus-compute-endpoint logs its endpoint_setup
+    # command): a no-op, `true` with the number, which is how a stop finds the user endpoint a check went to
+    assert _render(tmpl, uec)["endpoint_setup"] == "true hpcb_block=207612534"
     assert _render(tmpl, {**defaults, **shape_config("compute")})["idle_heartbeats_soft"] == 20   # no number: renders
+    assert _render(tmpl, {**defaults, **shape_config("compute")})["endpoint_setup"] == "true hpcb_block=0"
+    # only digits ever reach that shell, whatever a config carries (`| int`): an earlier plugin's hex string, an injection
+    for odd in ("3f9a0c1e", 'x"; rm -rf ~; echo "', "1; touch /tmp/pwned", "$(id)"):
+        assert _render(tmpl, {**uec, "hpcb_block": odd})["endpoint_setup"] == "true hpcb_block=0"
     # the login user endpoint is unchanged: it never exits on idle, and has no block number
     login = {**defaults, **shape_config("login")}
     assert "idle_heartbeats_soft" not in _render(tmpl, login) and "block request" not in _render_text(tmpl, login)
+    assert "endpoint_setup" not in _render(tmpl, login)
+    # what adopt_endpoint reads from a published template: ours names each block request in its user endpoint's log; one
+    # written before this change (fresh user endpoints, but no endpoint_setup line), or earlier, does not
+    assert remote.logs_block_requests(tmpl)
+    no_line = "\n".join(line for line in tmpl.splitlines() if "endpoint_setup" not in line)
+    assert remote.gives_fresh_ueps(no_line) and not remote.logs_block_requests(no_line)
+    assert not remote.logs_block_requests(None)
     tmpl40, _ = f.config_template(Profile(mode="batch", uep_idle_heartbeats=40))
     assert _render(tmpl40, uec)["idle_heartbeats_soft"] == 40
     # what the stop's upgrade check reads from a published template: ours does; an earlier plugin's, or 0, does not

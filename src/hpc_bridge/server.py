@@ -1046,6 +1046,21 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     settled = await _release_until_settled(app, eid, checks, wait, call_deadline, fresh=fresh)
     confirmed, detail, states, ran = settled.confirmed, settled.detail, settled.states, settled.ran
     waited = time.monotonic() - started
+    # A check the service still lists as queued after that wait may be one whose failure its own user endpoint never
+    # reported (the globus-compute-endpoint race, scheduler_ops): read that user endpoint's fate on the login node —
+    # once, only where its log names the check's block request, and only for a confirmed release that a `down` could
+    # follow. `looked`: why the evidence did not settle it, for the `draining`.
+    # The endpoint's template is known by now even after a restart: the release rode the login shape, whose provision
+    # read it (warmth._provision -> adopt_endpoint).
+    fresh = fresh or getattr(app.facility, "fresh_ueps", False) is True
+    evidence: dict[str, scheduler_ops.UepEvidence] = {}
+    looked: str | None = None
+    # Only where a new life of a user endpoint starts no block by itself (`init_blocks` 0: batch mode, the default):
+    # with 1 (interactive) any restart bills, task or not, and that the Globus Compute service never restarts a user
+    # endpoint it thinks still holds a pending task cannot be shown from here. Unknown: not either.
+    if (confirmed and fresh and not store_problem and getattr(app.facility, "logs_block_requests", False) is True
+            and getattr(app.facility, "compute_init_blocks", None) == 0):
+        states, evidence, looked = await _settle_by_evidence(app, eid, checks, states, call_deadline)
     if not await _acquire_within(app, call_deadline):
         return _lock_busy_status(app, eid, released=detail if confirmed else None)
     try:  # look again and drop in ONE step: a dispatch may have reached the block during the release
@@ -1079,6 +1094,8 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     pending = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")] + late
     unknown = "unknown" in states
     gave_up = [c for c, st in zip(checks, states, strict=True) if st == "failed"]
+    lost = [(c, ev.uep or "", ev.bad_at or "") for c, st in zip(checks, states, strict=True)
+            if st == "lost" and (ev := evidence.get(warmth._check_key(c))) is not None]
     if confirmed and not pending and store_problem:  # fail closed: a task we cannot see may still be queued
         return EndpointStatus(
             status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
@@ -1090,14 +1107,14 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
             spend_stopped=True,  # the one result that may say so
-            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran),
+            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran, lost=lost),
         )
     if confirmed:  # the scheduler holds nothing of ours now, but a task still queued can start a block
         released = detail if detail != "released none" else None
         return EndpointStatus(
             status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
             notice=_check_pending_notice(app, pending, released=released, unknown=unknown, waited_s=waited,
-                                         fresh=fresh) + _store_problem_note(store_problem),
+                                         fresh=fresh, looked=looked) + _store_problem_note(store_problem),
         )
     if await _gone_within(app, call_deadline):
         return await _orphaned_stop(app, eid, queued=bool(pending))
@@ -1325,6 +1342,71 @@ async def _release_until_settled(app: AppCtx, eid: str, checks: list[SentCheck],
     return _Settled(confirmed, detail, states, ran, released_at)
 
 
+# One look at the login node for checks the service still lists as queued (`_settle_by_evidence`): at most this long,
+# only with at least `_EVIDENCE_MIN_S` of it to spend (the command takes two samples `scheduler_ops._EVIDENCE_GAP_S`
+# apart), and never into the last `_EVIDENCE_RESERVE_S` of the call's budget (its final locked step and the answer).
+_EVIDENCE_TIMEOUT_S = 25.0
+_EVIDENCE_MIN_S = 10.0
+_EVIDENCE_RESERVE_S = 10.0
+
+
+async def _settle_by_evidence(app: AppCtx, eid: str, checks: list[SentCheck], states: list[warmth.CheckState],
+                              deadline: float) -> tuple[list[warmth.CheckState], dict[str, scheduler_ops.UepEvidence],
+                                                        str | None]:
+    """The checks a stop's wait left `pending` (or `unknown`), read on the login node: a check is `lost` when its own
+    compute user endpoint received it and failed it with bad state, and that user endpoint has stopped for good —
+    gone, and its manager neither reviving nor restarting it (scheduler_ops: what the evidence rules out, and how). The
+    service lists such a check as queued only because that endpoint's report of its failure never left
+    (globus-compute-endpoint 4.18 stops its result publisher without blocking, right after bad state). Nothing else
+    changes a state.
+
+    Only when EVERY task still waiting is a check the service registered (a task id first seen here at a known time)
+    that names its block request. Otherwise nothing can make this stop `down`, so nothing is run: a command whose result
+    the client lost runs the user's work — whatever its user endpoint's fate, a stop must not say it ended (the stop
+    names it, and teardown_endpoint ends it); a check with no block request (an endpoint configured before this change,
+    an older record) has no user endpoint to find; and one with no task id may still be on its way to the service,
+    where it would have the manager start that user endpoint again. The checks are dated by when their task id was
+    first seen (`SentCheck.taken_at`), never by the submit, which only queues them in the SDK. One command for all of
+    them over the free login shape (AMQP, no SSH), bounded by what is left of the call's budget; a stop's wait need not
+    have run first — the command itself asks that each check be old enough (`scheduler_ops._EVIDENCE_SETTLED_S`), so a
+    short `HPC_BRIDGE_STOP_CHECK_WAIT_S` does not loosen it. An age is measured on this process's monotonic clock from
+    when the task id was seen here (`SentCheck.taken_mono`), else — read back from disk — on the wall clock.
+
+    What it still takes on trust, from the Globus Compute service: a wrong `down` would need BOTH the service
+    delivering the task to that user endpoint's queue more than about a second after returning its task id (so it could
+    arrive while that endpoint quiesced, and not be acked) AND its start request reaching the manager more than 35 s
+    late (so the restart it causes comes after this look). The caller looks only where a new life starts no block by
+    itself (`init_blocks` 0), so a restart without our task bills nothing. Returns the states, each check's evidence by
+    its key, and why the evidence settled nothing (None: not looked, or all settled)."""
+    waiting = [c for c, st in zip(checks, states, strict=True) if st in ("pending", "unknown")]
+    if not waiting or any(c.what != "check" or c.block is None or c.tid is None or c.taken_at is None
+                          for c in waiting):
+        return states, {}, None
+    budget = min(_EVIDENCE_TIMEOUT_S, deadline - time.monotonic() - _EVIDENCE_RESERVE_S)
+    if budget < _EVIDENCE_MIN_S:
+        return states, {}, "this stop had no time left to look"
+    # each check's age, read BEFORE the command is sent: the login node's clock is read after it, so the check is
+    # never placed earlier on it than the service took it
+    now, mono = time.time(), time.monotonic()
+    wanted = [(warmth._check_key(c), c.block, (mono - c.taken_mono) if c.taken_mono is not None else (now - c.taken_at))
+              for c in waiting if c.block is not None and c.taken_at is not None]
+    try:
+        cmd = scheduler_ops._uep_evidence_cmd(eid, [b for _, b, _ in wanted])
+    except ValueError:  # an endpoint id that is not a UUID: no command is built from it
+        return states, {}, None
+    try:
+        out = await asyncio.wait_for(_login_runner(app)(cmd), timeout=budget)
+    except TimeoutError:
+        return states, {}, "the login node did not answer in time"
+    if out.phase != "complete" or out.exit_code != 0:
+        return states, {}, "the login channel was cold or busy"
+    found = scheduler_ops._read_uep_evidence(out.stdout or "", eid, wanted)
+    new = [("lost" if st in ("pending", "unknown") and (ev := found.get(warmth._check_key(c))) is not None and ev.lost
+            else st) for c, st in zip(checks, states, strict=True)]
+    why = next((ev.why for ev in found.values() if not ev.lost), None)
+    return new, found, why
+
+
 async def _orphaned_stop(app: AppCtx, eid: str, *, queued: bool = False) -> EndpointStatus:
     """The login endpoint is OFFLINE/gone (the #44 liveness check poll_task got, applied here — found in review): "call
     again in a few seconds" would loop forever. A block whose manager is gone exits on its own (workers lose their
@@ -1350,8 +1432,9 @@ async def stop_endpoint(ctx: Context) -> EndpointStatus:
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
     reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
     `spend_stopped` true) means nothing of ours is left to bill there — the cancel was confirmed (or there was nothing
-    to cancel) and no check of hpc-bridge's is still queued on the endpoint — and `draining` that this is not confirmed
-    yet: the cancel was not confirmed, or such a check is still queued and the endpoint can start a block to run it.
+    to cancel) and no check of hpc-bridge's can still start a block (none is queued; or the service still lists one,
+    but its user endpoint shut down for good, which the notice says) — and `draining` that this is not confirmed yet:
+    the cancel was not confirmed, or such a check is still queued and the endpoint can start a block to run it.
     Call it again when its notice says; a check that stays queued ends with teardown_endpoint. On a facility multi-user
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command

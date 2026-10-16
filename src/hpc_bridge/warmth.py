@@ -817,7 +817,9 @@ def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
         sent: list[tuple[Any, Any, float]] = getattr(runner, "sent_checks", list)()
         if sent:
             _keep_checks(app, eid, [SentCheck(future=f, client=client, terms=_runner_terms(runner, rt),
-                                              dead=rt.dead_pilot, task_id=getattr(f, "task_id", None), sent_at=at)
+                                              dead=rt.dead_pilot, task_id=getattr(f, "task_id", None), sent_at=at,
+                                              block=_sent_block(runner, f), taken_at=_taken_at(runner, f),
+                                              taken_mono=_taken_at(runner, f, mono=True))
                                     for f, client, at in sent])
     runner.close()
 
@@ -861,7 +863,8 @@ def _persist_checks(app: AppCtx, eid: str) -> None:
         # a task with no id yet (just submitted, or a submit that may have been taken) is written too, under a key of
         # its own: a server that restarts reads it as unknown (fail closed) — replaced by its id once the SDK has one
         rows[key] = {"task_id": key, "no_id": c.tid is None, "partition": c.terms[0], "account": c.terms[1],
-                     "sent_at": c.sent_at, "what": c.what, "ceiling_at": c.ceiling_at}
+                     "sent_at": c.sent_at, "what": c.what, "ceiling_at": c.ceiling_at, "block": c.block,
+                     "taken_at": c.taken_at}
     mine = frozenset(rows)
     wrote, dropped = app.persisted_checks.get(eid, (frozenset(), frozenset()))
     drop = ((wrote | frozenset(app.resolved_checks)) - mine)
@@ -1033,8 +1036,32 @@ def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
     if rt is None or rt.runner is None or not _billable(rt):
         return []
     return [SentCheck(future=f, client=client, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot,
-                      task_id=getattr(f, "task_id", None), sent_at=at)
+                      task_id=getattr(f, "task_id", None), sent_at=at, block=_sent_block(rt.runner, f),
+                      taken_at=_taken_at(rt.runner, f), taken_mono=_taken_at(rt.runner, f, mono=True))
             for f, client, at in getattr(rt.runner, "sent_checks", list)()]
+
+# The block-request numbers `_fresh_block` draws (and a record may carry back): a positive whole number below 2**48, so
+# the template renders it as digits only (`| int`) and JSON keeps it exact.
+_BLOCK_MAX = 2 ** 48
+
+def _block_number(value: object) -> int | None:
+    """A block-request number as hpc-bridge draws it, or None — anything else (a string an earlier plugin drew, a bool,
+    a value out of range) names no user endpoint a stop can find."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < _BLOCK_MAX:
+        return value
+    return None
+
+def _sent_block(runner: object, fut: Any) -> int | None:
+    """The block request a runner's check was sent for (GlobusRunner.sent_block, read at its send), if it is one."""
+    get = getattr(runner, "sent_block", None)
+    return _block_number(get(fut)) if callable(get) else None
+
+def _taken_at(runner: object, fut: Any, *, mono: bool = False) -> float | None:
+    """When this process first saw a runner's check's task id (GlobusRunner.taken_at, or `taken_mono` on the monotonic
+    clock), if it has."""
+    get = getattr(runner, "taken_mono" if mono else "taken_at", None)
+    at = get(fut) if callable(get) else None
+    return float(at) if isinstance(at, (int, float)) and not isinstance(at, bool) else None
 
 def _note_checks_sent(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """A check went out (called at its submit, and again once its wait ends — cancelled too): write the endpoint's
@@ -1111,7 +1138,10 @@ def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None,
                                   row_key=row["task_id"] if no_id else None,
                                   sent_at=float(row.get("sent_at") or 0.0),
                                   what="command" if row.get("what") == "command" else "check",
-                                  ceiling_at=float(ceiling) if isinstance(ceiling, (int, float)) else None))
+                                  ceiling_at=float(ceiling) if isinstance(ceiling, (int, float)) else None,
+                                  block=_block_number(row.get("block")),
+                                  taken_at=(float(taken) if isinstance(taken := row.get("taken_at"), (int, float))
+                                            and not isinstance(taken, bool) else None)))
             known.add(row["task_id"])
     if not kept:
         app.sent_checks.pop(eid, None)
@@ -1153,7 +1183,10 @@ def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: An
     _keep_checks(app, eid, [SentCheck(future=fut, client=client, terms=_terms_of(rt), task_id=str(fut.task_id),
                                       sent_at=at, what="command", ceiling_at=ceiling)])
 
-CheckState = Literal["ok", "failed", "pending", "unknown", "unsent"]
+# `lost`: the service still says pending, but the check's own compute user endpoint is gone for good — it went into
+# bad state after the check was sent and shut down, and its report of the failure never reached the service (a
+# globus-compute-endpoint race): it can never run, nor start a block (server._settle_by_evidence). Only a stop sets it.
+CheckState = Literal["ok", "failed", "pending", "unknown", "unsent", "lost"]
 
 # A task whose submit failed in a way that leaves it unclear whether the web service took it (no task id: a timeout, a
 # 5xx, a malformed answer) reads `unknown` for this long after it was sent, then is dropped with a line on stderr — an
@@ -1304,9 +1337,10 @@ async def _check_states(checks: list[SentCheck], fallback: Any = None, timeout: 
 def _settle_checks(app: AppCtx, eid: str, checks: list[SentCheck], states: list[CheckState]) -> None:
     """After a stop looked: the endpoint keeps only the tasks still queued (or unknown), on disk too. Callers hold
     app.lock."""
-    resolved = {_check_key(c) for c, s in zip(checks, states, strict=True) if s in ("ok", "failed", "unsent")}
+    done = ("ok", "failed", "unsent", "lost")
+    resolved = {_check_key(c) for c, s in zip(checks, states, strict=True) if s in done}
     for c, st in zip(checks, states, strict=True):  # removed from the record by this process (it saw them resolve)
-        if st in ("ok", "failed", "unsent") and (c.tid or c.row_key):
+        if st in done and (c.tid or c.row_key):
             app.resolved_checks[_check_key(c)] = st
     kept = [c for c in app.sent_checks.get(eid, []) if _check_key(c) not in resolved]
     if kept:
@@ -1330,7 +1364,9 @@ def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
         return
     if rt.block_since is not None or rt.inflight or _live_task_handles(app, shape):
         return
-    rt.user_endpoint_config["hpcb_block"] = secrets.token_hex(4)
+    # a whole number (digits only once the template renders it `| int`, whatever a config carries): the user endpoint's
+    # own log names it from its start (the template's endpoint_setup line), which is how a stop finds that endpoint
+    rt.user_endpoint_config["hpcb_block"] = secrets.randbelow(_BLOCK_MAX - 1) + 1
     rt.runner_stale = True
 
 # Partition names come from the discovery gate (agent/user-supplied), then flow into a Jinja

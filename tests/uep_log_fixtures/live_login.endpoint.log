@@ -1,0 +1,17 @@
+> Endpoint directory set to '/home/hpcbridge-test-01/.globus_compute/uep.08d247d2-9baa-4e31-a591-2690a0b1b966.f81aa051-0b5d-d98d-0584-71da4e888bf8'
+> GLOBUS_COMPUTE_LOG_PATH has been set to '/home/hpcbridge-test-01/.globus_compute/uep.08d247d2-9baa-4e31-a591-2690a0b1b966.f81aa051-0b5d-d98d-0584-71da4e888bf8/endpoint.log'
+2026-10-16 16:28:33,975831 INFO MainProcess-1043 MainThread-281472834068512 globus_compute_endpoint.endpoint.endpoint:610 start_interchange 
+
+========== Endpoint begins: f81aa051-0b5d-d98d-0584-71da4e888bf8
+2026-10-16 16:28:33,975893 INFO MainProcess-1043 MainThread-281472834068512 globus_compute_endpoint.endpoint.interchange:88 __init__ Initializing EndpointInterchange process with Endpoint ID: f81aa051-0b5d-d98d-0584-71da4e888bf8
+2026-10-16 16:28:33,975971 INFO MainProcess-1043 MainThread-281472834068512 globus_compute_endpoint.endpoint.interchange:137 __init__ Platform info: {'parsl_v': '2026.10.12', 'python_v': '3.11.16', 'os': 'Linux', 'hname': 'login02.hpcb.test', 'funcx_sdk_version': '4.18.0', 'funcx_endpoint_version': '4.18.0', 'registration': 'f81aa051-0b5d-d98d-0584-71da4e888bf8', 'dir': '/home/hpcbridge-test-01'}
+2026-10-16 16:28:33,976142 INFO MainProcess-1043 MainThread-281472834068512 globus_compute_endpoint.endpoint.interchange:222 start Starting EndpointInterchange
+2026-10-16 16:28:33,976174 INFO MainProcess-1043 MainThread-281472834068512 globus_compute_endpoint.endpoint.interchange:142 start_engine Starting Engine
+2026-10-16 16:28:34,513878 INFO MainProcess-1043 Thread-4-281472334098848 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 16:28:34,514116 INFO MainProcess-1043 Thread-5-281472325644704 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 16:28:34,514750 INFO MainProcess-1043 TQS-281472317190560 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:147 run <TaskQueueSubscriber(TQS, started 281472317190560)> Opening connection to AMQP service.
+2026-10-16 16:28:34,688970 INFO MainProcess-1043 TQS-281472317190560 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:284 _start_consuming <TaskQueueSubscriber(TQS, started 281472317190560)> Awaiting messages from queue: f81aa051-0b5d-d98d-0584-71da4e888bf8.tasks
+2026-10-16 16:28:34,732786 INFO MainProcess-1043 Thread-5-281472325644704 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:1; t:0> Ready to send results to exchange: heartbeats
+2026-10-16 16:28:34,734775 INFO MainProcess-1043 Thread-4-281472334098848 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:0; t:0> Ready to send results to exchange: results
+2026-10-16 16:28:39,514925 INFO MainProcess-1043 JobStatusPoller-Timer-Thread-281472698155088-281472342552992 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 1 blocks
+2026-10-16 16:28:39,515043 INFO MainProcess-1043 JobStatusPoller-Timer-Thread-281472698155088-281472342552992 parsl.executors.status_handling:210 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Allocated block ID 0

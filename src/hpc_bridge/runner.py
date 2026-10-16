@@ -228,6 +228,14 @@ class GlobusRunner:
         # looks a task up (`sent_checks`): a stop answers `down` only once each has resolved, since a check still
         # queued can make the endpoint start a block for it.
         self._sent: list[tuple[Any, float]] = []
+        # The block request each of those was sent for (the `hpcb_block` of this runner's config AT ITS SEND, by future
+        # id): a stop matches a check to its own compute user endpoint by it (server._settle_by_evidence). Read at the
+        # send, never later — the shape's config can be the same dict and gets a new request's number after it.
+        self._sent_blocks: dict[int, Any] = {}
+        # When this process first SAW each one's task id (wall clock and monotonic, by future id): the service took the
+        # task before that — an upper bound on when it did. `Executor.submit` only queues a task; the SDK sends it later
+        # (batched, rate-limited, retried), so the submit's time says nothing of when the service had it.
+        self._taken: dict[int, tuple[float, float]] = {}
         self._client: Any = None
         # Called right after a canary is submitted, before its wait (warmth._confirm_worker records it on disk).
         self.on_sent: Any = None
@@ -295,6 +303,9 @@ class GlobusRunner:
                 return _failed_canary(exc)
             self._canary_fut, self._canary_done_at, self._canary_submitted_at = fut, None, now
             self._sent = [(f, at) for f, at in self._sent if _may_be_queued(f)] + [(fut, time.time())]
+            self._sent_blocks = {id(f): self._sent_blocks.get(id(f)) for f, _ in self._sent[:-1]}
+            self._taken = {id(f): self._taken[id(f)] for f, _ in self._sent[:-1] if id(f) in self._taken}
+            self._sent_blocks[id(fut)] = (self.user_endpoint_config or {}).get("hpcb_block")
             self._client = _task_client(self._ex) or self._client
             if self.on_sent is not None:  # the caller records it NOW, before the wait (a restart must still see it)
                 try:
@@ -356,6 +367,31 @@ class GlobusRunner:
         by task id (warmth._check_states)."""
         client = self.task_client()
         return [(f, client, at) for f, at in self._sent if _may_be_queued(f)]
+
+    def _seen(self, fut: Any) -> tuple[float, float] | None:
+        key = id(fut)
+        if key not in self._taken and getattr(fut, "task_id", None) and any(f is fut for f, _ in self._sent):
+            self._taken[key] = (time.time(), time.monotonic())
+        return self._taken.get(key)
+
+    def taken_at(self, fut: Any) -> float | None:
+        """When this process first saw the task id of a canary in `sent_checks` (wall clock, for the record): the
+        service had taken it by then. Stamped by the first caller that sees the id — the server's id watcher looks every
+        50 ms to 2 s after a send (warmth._watch_ids) —, so it is never earlier than the service took it. None while it
+        has no id."""
+        seen = self._seen(fut)
+        return seen[0] if seen is not None else None
+
+    def taken_mono(self, fut: Any) -> float | None:
+        """`taken_at` on this process's monotonic clock: what an age is measured from here, so a step of the wall clock
+        cannot make a check look older than it is."""
+        seen = self._seen(fut)
+        return seen[1] if seen is not None else None
+
+    def sent_block(self, fut: Any) -> Any:
+        """The block request (`hpcb_block`) a canary in `sent_checks` was sent for, as this runner's config read at its
+        send; None when it had none (the login shape, a facility endpoint, an endpoint of an earlier plugin)."""
+        return self._sent_blocks.get(id(fut))
 
     @property
     def canary_pending(self) -> bool:

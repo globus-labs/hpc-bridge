@@ -66,6 +66,46 @@ installed plugin only when that version changes); git tags mark releases.
   a block, and waits for that on an endpoint hpc-bridge set up (`HPC_BRIDGE_STOP_CHECK_WAIT_S`).
 
 ### Fixed
+- **A stop no longer stays `draining` for good when the endpoint loses its report on hpc-bridge's own check.** Seen
+  live twice (2026-10-16, the fake `site` cluster: `submit_policy_rejected`, `slurm_worker_died`): after a rejected
+  submission or a pilot that died, the user endpoint holding hpc-bridge's check went into an error state ("bad
+  state") and shut down within half a second, before its report that the check had failed was sent (a race in
+  globus-compute-endpoint 4.18: it stops sending results without waiting for the last one). The Globus Compute service
+  then listed the check as queued for good, so every `stop_endpoint` answered `draining`, and only `teardown_endpoint`
+  ended it. Now, when the service still lists a check as queued after the stop's wait, the stop looks on the login
+  node (free, over the login endpoint, one command that reads everything twice, three seconds apart) at the user
+  endpoint that check went to, and at the endpoint's own log, and answers `down` only when all of this holds, the same
+  in both readings:
+  - that user endpoint received the check: the service had taken it at least a second before the user endpoint went
+    into bad state, in a run of it that was already reading its queue (a check that arrives while a user endpoint is
+    shutting down is not taken by it and goes back on its queue for a later run);
+  - bad state failed it, and the user endpoint then logged its shutdown;
+  - no process of it is left, and its pid file is gone or stale;
+  - the endpoint's own log shows that run's exit, and nothing after it for that user endpoint: the endpoint restarts a
+    user endpoint that stops within 30 s of a start request it held back while it ran ("User EP stopped within grace
+    period"), and starts one for every new task sent to it, and either would start a block;
+  - the check was taken at least 35 s before the look (that 30 s grace, plus margin), so the start request sent with
+    it has been acted on by now — whatever `HPC_BRIDGE_STOP_CHECK_WAIT_S` says.
+  Then the check cannot run, and no block can start for it; the notice says so, and that the endpoint's report of the
+  failure was lost on its own side. Anything less keeps `draining`, and the notice says what was missing. The stop
+  looks only on an endpoint in batch mode (the default), whose user endpoints start no block until they hold a task:
+  in interactive mode every new run of one starts a block by itself, so there it stays `draining` as before. What it
+  still takes on trust from the Globus Compute service: a wrong `down` would need both the service handing the check
+  to its user endpoint more than about a second after returning its task id, and the start request sent with it
+  reaching the endpoint more than 35 s late. A user endpoint beside it whose log cannot be read must be provably
+  stopped too; a read error is never taken for "nothing there"; the endpoint's log is read through its rotation; a
+  check's age is measured on a clock the wall clock's steps cannot move. Times on the
+  login node are read in its own zone; an hour a clock change repeats is never used. To find the right user endpoint,
+  each block request's number now reaches that user endpoint's own log: the template runs `true hpcb_block=<number>`
+  as the user endpoint's `endpoint_setup` when it starts (globus-compute-endpoint logs that command), and the number
+  is a whole number now, so only digits reach that shell. A check is dated by when hpc-bridge first saw its task id
+  (the SDK sends a task some time after it is submitted). hpc-bridge's record of its checks
+  (`~/.hpc-bridge/sent-checks/`) keeps each check's number and that time, so a restarted server's first stop can look
+  too (its own cancel reads the endpoint's template first). A command whose result was lost is never settled this way:
+  it runs your work, so the stop still names it. Nor is a check with no task id: it may still reach the service. An
+  endpoint configured before this change has no number in its logs, and its stops behave as before until it is torn
+  down and connected again. Should the `endpoint_setup` command itself fail (say, a login node refusing to start one
+  more process), that user endpoint exits before it runs anything: no block starts, and the stop stays `draining`.
 - **`stop_endpoint` answers from what is left of hpc-bridge's own work, and no longer contradicts the answer
   before it.** A stop could say spend stopped while the endpoint was about to start another block. Seen live
   (2026-10-16, `queued_check_relaunch`): hpc-bridge's check (the small task it sends to see whether a block is up)

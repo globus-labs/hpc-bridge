@@ -16,13 +16,14 @@ import itertools
 import re
 import shlex
 import time
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from typing import NamedTuple
 
 from . import config
 from .config import PROVISION_GRACE_S
 from .context import AppCtx
 from .facility.endpoint_venv import WORKER_SAID
+from .facility.remote import BLOCK_REQUEST_LOG
 from .models import ShellOutcome, Submission
 
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
@@ -413,6 +414,317 @@ async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: f
 async def _augment_provisioning_notice(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner) -> str:  # noqa: E501
     """`_augment_provisioning`'s notice alone."""
     return (await _augment_provisioning(app, eid, notice, elapsed_s, run_login))[0]
+
+
+# --- a check's OWN compute user endpoint, read on the login node ------------------------------------------------------
+# globus-compute-endpoint 4.18 acks a task once it hands it to the engine; at bad state its watcher stops the user
+# endpoint about 0.3 s later, and the result publisher stops without blocking (`stop(block=False)`), so the failed
+# check's result can be left unsent (`ResultPublisher<✗; o:1; t:0> Connection closed`; live 2026-10-16,
+# submit_policy_rejected and slurm_worker_died). The service then lists that check as pending for good. So where the
+# service cannot say, a stop reads the evidence itself, over the FREE login shape (the user endpoints run where their
+# manager runs, which is where the login shape's own user endpoint runs: the manager forks every one of them).
+#
+# What the evidence must rule out is any way a block of ours can still start for that check:
+# - the check itself running: it was taken (its task id seen here) at least `_DELIVERY_S` before its user endpoint's
+#   latest life went into bad state, a life that had subscribed to its task queue before that (`Awaiting messages
+#   from queue`). A queue being consumed delivers in milliseconds, and the subscriber stops only after bad state, so
+#   that life (or an earlier one) received the check and acked it, and bad state failed it: an acked task is never sent
+#   again.
+#   (A task that arrives while a user endpoint quiesces is deliberately NOT acked and goes back on its queue — this is
+#   the case the ordering rules out.)
+# - that user endpoint starting again — any new life of it submits a block (an interactive compute config has
+#   `init_blocks: 1`). The manager starts one for a start request the service sends ahead of every task for that config,
+#   and REVIVES one that exits normally within `mu_child_ep_grace_period_s` (30 s) of a start request it cached while
+#   the old life ran (core_endpoint.py:990-998, :329-333). It reaps an exited one only between its 1 s command-queue
+#   polls (:631), and a revived child's title names the directory only after its fork and render (:1266): for about a
+#   second the old life is gone, its pid file too, its log ends in shutdown — and a new one is coming. So: the manager's
+#   OWN log
+#   must show that life's stop (`Command stopped normally (<pid>) [… uep.<eid>.<id> …]`, or another exit) after its
+#   start, and nothing about that user endpoint after the stop (no `User EP stopped within grace period…`, no new
+#   `Creating new user endpoint …`, no `… is already running … caching arguments`); two samples `_EVIDENCE_GAP_S` apart
+#   must agree on all of it; and every check of ours for that block request must have been taken at least
+#   `_EVIDENCE_SETTLED_S` before the look, so the start request the service sent with it has been acted on by now (a
+#   start or a cache, both in the manager's log) or has expired with the 30 s grace. Nothing of ours sends to that block
+#   request after a stop has dropped its shape (a new confirmation draws a new number).
+# Anything less is no evidence. Taken on trust from the service, still: a wrong verdict would need it both to deliver a
+# task to the queue more than about a second after returning its id, and its start request to reach the manager more
+# than 35 s late — and the stop reads this only where a new life starts no block without a task (`init_blocks` 0).
+
+_UUID = re.compile(r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}")
+_DIGITS = re.compile(r"[0-9]+")  # never str.isdigit: it takes '²', which int() refuses
+_LOCAL_TIME = re.compile(r"[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}")
+# Between the two samples: well past the manager's reap (a 1 s command-queue poll) and the revival it logs at once.
+_EVIDENCE_GAP_S = 3.0
+# How long before the look each check of ours must have been taken: the manager's 30 s grace for a cached start request
+# (`mu_child_ep_grace_period_s`), plus margin for its 1 s poll and the request's delivery.
+_EVIDENCE_SETTLED_S = 35.0
+# A task taken this long before its user endpoint's bad state was in that endpoint's queue while it was consumed.
+_DELIVERY_S = 1.0
+# A bad state logged this far ahead of the login node's own clock means the two do not agree: no evidence.
+_AHEAD_S = 2.0
+
+# The user endpoint's own log, one pass: per block request it names (`HPCB_UEP` fields, after the request and the id)
+# the number of starts, the line of the last start, of the last block-request line, of the latest life's first
+# subscription, of its last bad state and of a shutdown after that, the line count, its pid (from that subscription
+# line) and the bad state's local time (date, time, microseconds) — `-` for what is not there.
+_UEP_AWK = (
+    "BEGIN{n=split(w,W,\" \");for(i=1;i<=n;i++)ok[W[i]]=1;nb=0;lb=0;lt=0;la=0;lx=0;ls=0;pw=\"-\";"
+    "xd=\"-\";xt=\"-\";xf=\"-\"} "
+    "index($0,p){t=substr($0,index($0,p)+length(p));if(t in ok){hit[t]=1;lt=NR};next} "
+    "index($0,b)==1{nb++;lb=NR;la=0;lx=0;ls=0;pw=\"-\";xd=\"-\";xt=\"-\";xf=\"-\";next} "
+    "index($0,s)==1{if(lx)ls=NR;next} "
+    "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] [0-9][0-9]:[0-9][0-9]:[0-9][0-9]/{"
+    "if(!la&&index($0,\"Awaiting messages from queue: \")){la=NR;q=$4;sub(/^MainProcess-/,\"\",q);"
+    "if(q~/^[0-9]+$/)pw=q}"
+    "else if(index($0,\"Setting bad state\")){lx=NR;ls=0;xd=$1;xt=substr($2,1,8);xf=substr($2,10,6);"
+    "if(xf!~/^[0-9][0-9][0-9][0-9][0-9][0-9]$/)xf=\"-\"}} "
+    "END{for(t in hit)print t\" \"u\" \"nb\" \"lb\" \"lt\" \"la\" \"lx\" \"ls\" \"NR\" \"pw\" \"xd\" \"xt\" \"xf}"
+)
+# The manager's log, for one user endpoint (its directory name `m`): the line and pid of its last start, of its last
+# exit, and the last line that names it at all.
+_MGR_AWK = (
+    "index($0,m){last=NR;"
+    "if(i=index($0,\"Creating new user endpoint (pid: \")){q=substr($0,i+33);sub(/\\).*/,\"\",q);"
+    "if(q~/^[0-9]+$/){sp=q;sn=NR}}"
+    "else if(index($0,\"Command stopped normally (\")||index($0,\"Command return code: \")||"
+    "index($0,\"Command terminated by signal: \")||index($0,\"Command unknown return code: \")){"
+    "q=substr($0,index($0,\"Command \"));if(match(q,/\\([0-9]+\\)/)){xp=substr(q,RSTART+1,RLENGTH-2);xn=NR}}} "
+    "END{print (sn+0)\" \"(sp==\"\"?\"-\":sp)\" \"(xn+0)\" \"(xp==\"\"?\"-\":xp)\" \"(last+0)}"
+)
+
+
+def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None = None) -> str:
+    """Login-shape one-liner that samples, twice `gap_s` apart, each block request's compute user endpoint and its
+    manager. Per sample (`<S>` = 1 or 2):
+    - `HPCB_NOW <S> <epoch> <nanoseconds|N>` (one `date` call);
+    - `HPCB_FAIL <S> ps|read <id>|grep|manager <count>`: the process list, a user endpoint's log (with that one's
+      `HPCB_PS`/`HPCB_PID`/`HPCB_MGR` rows, to tell a stopped one from a live twin), a read error grep met, or the
+      manager's own directory (the one outside the user endpoints' whose endpoint.json names `<eid>`, or whose
+      endpoint.log or its rotated `endpoint.log.1` names `Core Endpoint begins: <eid>`) not read — its log is read
+      through the rotation, the copy first;
+    - `HPCB_UEP <S> <n> <id> <starts> <start> <request> <subscribed> <bad> <shutdown> <lines> <pid> <epoch> <dst>
+      <microseconds>` for each user endpoint whose log names block request `n` (a `grep -lF` over this endpoint's user
+      endpoint logs, confirmed exactly by awk, `_UEP_AWK`): the bad state's time turned into epoch seconds ON the login
+      node, in its own zone (GNU `date -d`, else BSD `date -j -f`), and `<dst>` 1 when that local time is one a clock
+      change makes ambiguous (the same wall time an hour either side) or it could not be turned at all;
+    - `HPCB_PS <S> <id> <count>` (processes whose arguments name `uep.<eid>.<id>`: a user endpoint's title and command
+      line do; the list is read before anything names an id, and the script itself names none, so it never counts
+      itself), `HPCB_PID <S> <id> none|old|fresh|unknown` (`daemon.pid`, refreshed every 15 s while it lives), and
+      `HPCB_MGR <S> <id> <start line> <start pid> <exit line> <exit pid> <last line naming it>` (`_MGR_AWK`).
+    Read-only. Built from validated values only: `eid` must be a UUID and every block a whole number in range (else a
+    ValueError); a user endpoint's id is read from its directory name and used only when it is a UUID's characters,
+    inside double quotes or as awk data; times reach `date` only as the digits and separators the awk pattern took."""
+    if not _UUID.fullmatch(eid or ""):
+        raise ValueError(f"not an endpoint id: {eid!r}")
+    if not blocks or not all(isinstance(b, int) and not isinstance(b, bool) and 0 < b < 2 ** 48 for b in blocks):
+        raise ValueError("block requests must be whole numbers in range")
+    gap = _EVIDENCE_GAP_S if gap_s is None else gap_s
+    if not (isinstance(gap, (int, float)) and 0 < gap <= 10):
+        raise ValueError("the gap between the samples must be within (0, 10] s")
+    nums = sorted(set(blocks))
+    want = shlex.quote(" ".join(str(n) for n in nums))
+    pre = shlex.quote(BLOCK_REQUEST_LOG)
+    grep = " ".join(f"-e {shlex.quote(BLOCK_REQUEST_LOG + str(n))}" for n in nums)
+    begins, shut = shlex.quote("========== Endpoint begins: "), shlex.quote("---------- Endpoint shutdown: ")
+    core = shlex.quote(f"========== Core Endpoint begins: {eid}")
+    json = shlex.quote(f'"endpoint_id": "{eid}"')
+    uep = f"uep.{eid}."
+    return (
+        # (its names stay clear of the session wrapper's `__hb_*`, around which this runs)
+        'r="${GLOBUS_COMPUTE_USER_DIR:-$HOME/.globus_compute}"; '
+        # a local log time -> "<epoch> <0|1>", 1 when a clock change makes it ambiguous or it cannot be turned at all
+        '_hpcb_ep() { _hpcb_e=$(date -d "$1" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null); '
+        'case "$_hpcb_e" in ""|*[!0-9]*) echo "- 1"; return;; esac; _hpcb_a=0; '
+        'for _hpcb_o in -3600 3600; do _hpcb_t=$(date -d "@$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || '
+        'date -r "$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null) || _hpcb_a=1; '
+        '[ "$_hpcb_t" = "$1" ] && _hpcb_a=1; done; echo "$_hpcb_e $_hpcb_a"; }; '
+        # one user endpoint's process count, pid file and manager-log facts (matched, or with a log that cannot be read)
+        f'_hpcb_facts() {{ if [ "$pok" = 1 ]; then c=$(printf "%s\\n" "$pl" | awk -v m="{uep}$1" '
+        "'index($0,m){c++} END{print c+0}'); echo \"HPCB_PS $S $1 $c\"; fi; "
+        'k="$2/daemon.pid"; if [ ! -e "$k" ]; then echo "HPCB_PID $S $1 none"; '
+        'elif q=$(find "$k" -mmin -2 2>/dev/null); then if [ -n "$q" ]; then echo "HPCB_PID $S $1 fresh"; '
+        'else echo "HPCB_PID $S $1 old"; fi; else echo "HPCB_PID $S $1 unknown"; fi; '
+        f'if [ -n "$m" ]; then if g=$(awk -v m="{uep}$1" {shlex.quote(_MGR_AWK)} ${{m1:+"$m1"}} "$m/endpoint.log"); '
+        'then echo "HPCB_MGR $S $1 $g"; else echo "HPCB_FAIL $S manager read"; fi; fi; }; '
+        '_hpcb_sample() { S=$1; echo "HPCB_NOW $S $(date "+%s %N")"; '
+        'if pl=$(ps -ww -U "$(id -u)" -o args= 2>/dev/null); then pok=1; else pok=0; echo "HPCB_FAIL $S ps"; fi; '
+        # the manager's own directory: the one outside the user endpoints' that its endpoint.json, or its log (or the
+        # log's one rotated copy), names as this endpoint's — read through the rotation, older part first
+        'm=""; m1=""; nm=0; for d in "$r"/*/; do d=${d%/}; case "$d" in "$r"/uep.*) continue;; esac; '
+        f'if grep -qF {json} "$d/endpoint.json" 2>/dev/null || grep -qxF {core} "$d/endpoint.log" 2>/dev/null || '
+        f'grep -qxF {core} "$d/endpoint.log.1" 2>/dev/null; then m=$d; nm=$((nm + 1)); fi; done; '
+        '[ "$nm" -eq 1 ] && [ -e "$m/endpoint.log" ] || { echo "HPCB_FAIL $S manager $nm"; m=""; }; '
+        '[ -n "$m" ] && [ -e "$m/endpoint.log.1" ] && m1="$m/endpoint.log.1"; '
+        # the readable user endpoint logs; one that cannot be read is named, with its process, pid file, manager facts
+        f'set --; for f in "$r"/{uep}*/endpoint.log; do [ -e "$f" ] || continue; d=${{f%/endpoint.log}}; '
+        f'u=${{d##*/{uep}}}; case "$u" in *[!0-9a-fA-F-]*|"") continue;; esac; [ ${{#u}} -eq 36 ] || continue; '
+        'if [ -r "$f" ]; then set -- "$@" "$f"; else echo "HPCB_FAIL $S read $u"; _hpcb_facts "$u" "$d"; fi; done; '
+        # a read error grep meets (EIO, a stale NFS handle) is said, never an empty match
+        f'h=""; if [ $# -gt 0 ]; then h=$(grep -lF {grep} -- "$@" 2>/dev/null); [ $? -le 1 ] || '
+        'echo "HPCB_FAIL $S grep"; fi; '
+        'printf "%s\\n" "$h" | while IFS= read -r f; do [ -n "$f" ] || continue; '
+        f'd=${{f%/endpoint.log}}; u=${{d##*/{uep}}}; '
+        'case "$u" in *[!0-9a-fA-F-]*|"") continue;; esac; [ ${#u} -eq 36 ] || continue; '
+        f'if ! o=$(awk -v u="$u" -v w={want} -v p={pre} -v b={begins} -v s={shut} {shlex.quote(_UEP_AWK)} "$f"); '
+        'then echo "HPCB_FAIL $S read $u"; continue; fi; [ -n "$o" ] || continue; '
+        'printf "%s\\n" "$o" | while read -r n x nb lb lt la lx ls nl pw xd xt xf; do '
+        'echo "HPCB_UEP $S $n $x $nb $lb $lt $la $lx $ls $nl $pw $xd $xt $(_hpcb_ep "$xd $xt") $xf"; done; '
+        '_hpcb_facts "$u" "$d"; done; }; '
+        f'_hpcb_sample 1; sleep {gap:g}; _hpcb_sample 2; true'
+    )
+
+
+class UepEvidence(NamedTuple):
+    """What the login node says of one check's compute user endpoint. `lost`: the check can never run, nor start a block
+    (see above). Otherwise `why` says what was missing (for the stop's `draining`). `uep` (its directory name) and
+    `bad_at` (its bad state's time on the login node, as its log wrote it) name it when matched."""
+
+    lost: bool
+    why: str
+    uep: str | None = None
+    bad_at: str | None = None
+
+
+class _Sample(NamedTuple):
+    now_lo: float                              # the login node's clock when the sample began: at least this…
+    now_hi: float                              # …and at most this (`date +%N` unread: a whole second wide)
+    failed: frozenset[str]                     # "ps", "manager", "read"
+    unreadable: frozenset[str]                 # user endpoints whose log could not be read
+    ueps: dict[int, list[tuple[str, ...]]]     # block request -> (id, the `HPCB_UEP` fields after it)
+    ps: dict[str, str]
+    pid: dict[str, str]
+    mgr: dict[str, tuple[str, ...]]
+
+
+def _read_samples(stdout: str) -> dict[str, _Sample]:
+    """`_uep_evidence_cmd`'s rows, per sample, keeping only rows of exactly the command's shape."""
+    raw: dict[str, dict] = {}
+    for line in stdout.splitlines():
+        w = line.split()
+        if len(w) < 3 or w[1] not in ("1", "2"):
+            continue
+        s = raw.setdefault(w[1], {"now": None, "failed": set(), "unreadable": set(), "ueps": {}, "ps": {}, "pid": {},
+                                  "mgr": {}})
+        tag, rest = w[0], w[2:]
+        if tag == "HPCB_NOW" and len(rest) == 2 and _DIGITS.fullmatch(rest[0]):
+            ns = rest[1] if _DIGITS.fullmatch(rest[1]) and len(rest[1]) == 9 else None
+            lo = int(rest[0]) + (int(ns) / 1e9 if ns else 0.0)
+            s["now"] = (lo, lo if ns else lo + 1.0)
+        elif tag == "HPCB_FAIL":
+            s["failed"].add(rest[0])
+            if rest[0] == "read" and len(rest) == 2 and _UUID.fullmatch(rest[1]):
+                s["unreadable"].add(rest[1])
+        elif (tag == "HPCB_UEP" and len(rest) == 15 and _DIGITS.fullmatch(rest[0]) and _UUID.fullmatch(rest[1])
+              and all(_DIGITS.fullmatch(x) for x in rest[2:9]) and (rest[9] == "-" or _DIGITS.fullmatch(rest[9]))
+              and ((rest[10], rest[11]) == ("-", "-") or _LOCAL_TIME.fullmatch(f"{rest[10]} {rest[11]}"))
+              and (rest[12] == "-" or _DIGITS.fullmatch(rest[12])) and rest[13] in ("0", "1")
+              and (rest[14] == "-" or (_DIGITS.fullmatch(rest[14]) and len(rest[14]) == 6))):
+            s["ueps"].setdefault(int(rest[0]), []).append(tuple(rest[1:]))
+        elif tag == "HPCB_PS" and len(rest) == 2 and _UUID.fullmatch(rest[0]) and _DIGITS.fullmatch(rest[1]):
+            s["ps"][rest[0]] = rest[1]
+        elif tag == "HPCB_PID" and len(rest) == 2 and _UUID.fullmatch(rest[0]):
+            s["pid"][rest[0]] = rest[1]
+        elif (tag == "HPCB_MGR" and len(rest) == 6 and _UUID.fullmatch(rest[0]) and _DIGITS.fullmatch(rest[1])
+              and _DIGITS.fullmatch(rest[3]) and _DIGITS.fullmatch(rest[5])
+              and all(x == "-" or _DIGITS.fullmatch(x) for x in (rest[2], rest[4]))):
+            s["mgr"][rest[0]] = tuple(rest[1:])
+    out: dict[str, _Sample] = {}
+    for k, s in raw.items():
+        if s["now"] is not None:
+            out[k] = _Sample(s["now"][0], s["now"][1], frozenset(s["failed"]), frozenset(s["unreadable"]), s["ueps"],
+                             s["ps"], s["pid"], s["mgr"])
+    return out
+
+
+def _read_uep_evidence(stdout: str, eid: str, wanted: Collection[tuple[str, int, float]]) -> dict[str, UepEvidence]:
+    """`_uep_evidence_cmd`'s two samples, read for each wanted check — (its key, its block request, how long before the
+    command was sent its task id was first seen here) — into a verdict. Strict: every doubt reads as no evidence."""
+    samples = _read_samples(stdout)
+    return {key: _uep_verdict(eid, samples, block, age) for key, block, age in wanted}
+
+
+def _stopped_for_good(sample: _Sample, uuid: str) -> bool:
+    """A user endpoint whose log could not be read: no process names it, its pid file is gone or stale, and the
+    manager's log never names it, or names its exit after its last start and nothing after that."""
+    mgr = sample.mgr.get(uuid)
+    if sample.ps.get(uuid) != "0" or sample.pid.get(uuid) not in ("none", "old") or mgr is None:
+        return False
+    start, pid, exit_, exit_pid, last = mgr
+    return int(last) == 0 or (int(start) > 0 and int(exit_) > int(start) and pid == exit_pid
+                              and int(last) == int(exit_))
+
+
+def _uep_verdict(eid: str, samples: dict[str, _Sample], block: int, age: float) -> UepEvidence:
+    first, second = samples.get("1"), samples.get("2")
+    if first is None or second is None:
+        return UepEvidence(False, "the login node's clock could not be read")
+    if "ps" in first.failed or "ps" in second.failed:
+        return UepEvidence(False, "its process list could not be read")
+    if "manager" in first.failed or "manager" in second.failed:
+        return UepEvidence(False, "the endpoint's own log on the login node could not be found or read")
+    if "grep" in first.failed or "grep" in second.failed:  # a read error, not a missing match
+        return UepEvidence(False, "a user endpoint's log there could not be read")
+    found = first.ueps.get(block, [])
+    if not found:
+        why = ("a user endpoint's log there could not be read" if first.unreadable or second.unreadable
+               else "no user endpoint there names the check's block request yet")
+        return UepEvidence(False, why)
+    if len(found) > 1 or sum(1 for rows in first.ueps.values() for r in rows if r[0] == found[0][0]) > 1:
+        return UepEvidence(False, "more than one user endpoint there names the check's block request")
+    row = found[0]
+    uuid = row[0]
+    uep = f"uep.{eid}.{uuid}"
+    facts = lambda s: (s.ueps.get(block), s.ps.get(uuid), s.pid.get(uuid), s.mgr.get(uuid))  # noqa: E731
+    if facts(first) != facts(second):
+        return UepEvidence(False, "its user endpoint changed while hpc-bridge looked", uep)
+    # A user endpoint whose log could not be read may be a twin naming the same block request: it must be provably
+    # stopped too — nothing of it runs, and its manager either never started it or logged its exit with nothing after.
+    for other in sorted((first.unreadable | second.unreadable) - {uuid}):
+        if not (_stopped_for_good(first, other) and _stopped_for_good(second, other)
+                and (first.ps.get(other), first.pid.get(other), first.mgr.get(other))
+                == (second.ps.get(other), second.pid.get(other), second.mgr.get(other))):
+            return UepEvidence(False, "a user endpoint there whose log could not be read is still running, or may "
+                                      "start again", uep)
+    starts, start, request, subscribed, bad_line, shut, _lines = (int(x) for x in row[1:8])
+    life_pid, bad_local, bad_epoch, dst, micro = row[8], f"{row[9]} {row[10]}", row[11], row[12], row[13]
+    if starts == 0:
+        return UepEvidence(False, "its user endpoint has no start in its log", uep)
+    if request > start:
+        return UepEvidence(False, "its user endpoint is starting again", uep)
+    if not (start < subscribed < bad_line):
+        return UepEvidence(False, "its user endpoint's log shows no bad state since it last started", uep)
+    if shut <= bad_line:
+        return UepEvidence(False, "its user endpoint has not logged its shutdown", uep)
+    if bad_epoch == "-" or dst != "0":
+        return UepEvidence(False, "its user endpoint's bad state is at a time the login node cannot place", uep)
+    bad = int(bad_epoch) + (int(micro) / 1e6 if micro != "-" else 0.0)
+    bad_at = bad_local  # as its log wrote it, the login node's local time
+    if bad > first.now_hi + _AHEAD_S:
+        return UepEvidence(False, "its user endpoint's log is ahead of the login node's clock", uep, bad_at)
+    if age < _EVIDENCE_SETTLED_S:
+        return UepEvidence(False, "the check is too recent for its user endpoint's fate to be settled", uep, bad_at)
+    # the latest the service can have taken it, on the login node's clock: its task id was seen `age` before the
+    # command was SENT, and the clock was read after that
+    if first.now_hi - age + _DELIVERY_S > bad:
+        return UepEvidence(False, "its user endpoint's bad state was logged before the check had reached it", uep,
+                           bad_at)
+    mgr = first.mgr.get(uuid)
+    if mgr is None:
+        return UepEvidence(False, "the endpoint's own log does not show that user endpoint's stop", uep, bad_at)
+    m_start, m_pid, m_exit, x_pid, m_last = mgr
+    if not (int(m_start) > 0 and int(m_exit) > int(m_start) and m_pid == x_pid and int(m_last) == int(m_exit)):
+        why = ("the endpoint's own log shows that user endpoint started again" if int(m_last) > int(m_exit) > 0
+               else "the endpoint's own log does not show that user endpoint's stop")
+        return UepEvidence(False, why, uep, bad_at)
+    if life_pid != m_pid:
+        return UepEvidence(False, "its log and the endpoint's own log name different processes", uep, bad_at)
+    if first.ps.get(uuid) != "0":
+        return UepEvidence(False, "a process of its user endpoint is still running there", uep, bad_at)
+    if first.pid.get(uuid) not in ("none", "old"):
+        why = ("its user endpoint's pid file is still being refreshed" if first.pid.get(uuid) == "fresh"
+               else "its user endpoint's pid file could not be read")
+        return UepEvidence(False, why, uep, bad_at)
+    return UepEvidence(True, "", uep, bad_at)
 
 
 # --- a scheduler SUBMISSION in the agent's own command ------------------------------------------------------------

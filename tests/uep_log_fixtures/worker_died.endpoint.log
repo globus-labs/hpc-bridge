@@ -1,0 +1,43 @@
+> Endpoint directory set to '/home/hpcbridge-test-01/.globus_compute/uep.28fae94b-1ea2-47fa-8d5b-40ab9c8c2139.cfe285ef-7f41-943f-0e9f-a4ae1d904982'
+> GLOBUS_COMPUTE_LOG_PATH has been set to '/home/hpcbridge-test-01/.globus_compute/uep.28fae94b-1ea2-47fa-8d5b-40ab9c8c2139.cfe285ef-7f41-943f-0e9f-a4ae1d904982/endpoint.log'
+2026-10-16 08:42:19,376055 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.endpoint:610 start_interchange 
+
+========== Endpoint begins: cfe285ef-7f41-943f-0e9f-a4ae1d904982
+2026-10-16 08:42:19,376167 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:88 __init__ Initializing EndpointInterchange process with Endpoint ID: cfe285ef-7f41-943f-0e9f-a4ae1d904982
+2026-10-16 08:42:19,376290 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:137 __init__ Platform info: {'parsl_v': '2026.10.12', 'python_v': '3.11.16', 'os': 'Linux', 'hname': 'login02.hpcb.test', 'funcx_sdk_version': '4.18.0', 'funcx_endpoint_version': '4.18.0', 'registration': 'cfe285ef-7f41-943f-0e9f-a4ae1d904982', 'dir': '/home/hpcbridge-test-01'}
+2026-10-16 08:42:19,376528 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:222 start Starting EndpointInterchange
+2026-10-16 08:42:19,376578 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:142 start_engine Starting Engine
+2026-10-16 08:42:19,919513 INFO MainProcess-1073 Thread-4-281472988279200 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 08:42:19,919676 INFO MainProcess-1073 Thread-5-281472979825056 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:147 run ResultPublisher<✗; o:0; t:0> Opening connection to AMQP service.
+2026-10-16 08:42:19,919968 INFO MainProcess-1073 TQS-281472560787872 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:147 run <TaskQueueSubscriber(TQS, started 281472560787872)> Opening connection to AMQP service.
+2026-10-16 08:42:20,198590 INFO MainProcess-1073 TQS-281472560787872 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:284 _start_consuming <TaskQueueSubscriber(TQS, started 281472560787872)> Awaiting messages from queue: cfe285ef-7f41-943f-0e9f-a4ae1d904982.tasks
+2026-10-16 08:42:20,263261 INFO MainProcess-1073 Thread-5-281472979825056 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:1; t:0> Ready to send results to exchange: heartbeats
+2026-10-16 08:42:20,281193 INFO MainProcess-1073 Thread-4-281472988279200 globus_compute_endpoint.endpoint.rabbit_mq.result_publisher:297 _on_queue_verified ResultPublisher<✓; o:0; t:0> Ready to send results to exchange: results
+2026-10-16 08:42:24,919866 INFO MainProcess-1073 JobStatusPoller-Timer-Thread-281473275297872-281472996733344 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 0 blocks
+2026-10-16 08:42:24,920029 INFO MainProcess-1073 JobStatusPoller-Timer-Thread-281473275297872-281472996733344 parsl.executors.status_handling:207 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Scaling out by 1 blocks
+2026-10-16 08:42:24,920057 INFO MainProcess-1073 JobStatusPoller-Timer-Thread-281473275297872-281472996733344 parsl.executors.status_handling:210 scale_out_facade [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Allocated block ID 0
+2026-10-16 08:43:25,095009 ERROR MainProcess-1073 JobStatusPoller-Timer-Thread-281473275297872-281472996733344 parsl.executors.status_handling:145 set_bad_state_and_fail_all Setting bad state due to exception
+parsl.jobs.errors.TooManyJobFailuresError: Error 1:
+	Job is marked as MISSING since the workers failed to register to the executor. Check the stdout/stderr logs in the submit_scripts directory for more debug information
+
+2026-10-16 08:43:25,097022 INFO MainProcess-1073 JobStatusPoller-Timer-Thread-281473275297872-281472996733344 parsl.jobs.strategy:195 _general_strategy [Scaling executor GlobusComputeEngine-HighThroughputExecutor] Not strategizing for executor because bad state is set
+2026-10-16 08:43:25,097800 INFO MainProcess-1073 HTEX-Result-Queue-Thread-281473005187488 parsl.executors.high_throughput.executor:568 _result_queue_worker Closing result ZMQ pipe
+2026-10-16 08:43:25,098256 INFO MainProcess-1073 HTEX-Result-Queue-Thread-281473005187488 parsl.executors.high_throughput.executor:570 _result_queue_worker Result queue worker finished
+2026-10-16 08:43:25,403400 INFO MainProcess-1073 BadStateWatcher-281472535425440 globus_compute_endpoint.endpoint.interchange:158 stop Shutting down EndpointInterchange
+2026-10-16 08:43:25,403663 ERROR MainProcess-1073 BadStateWatcher-281472535425440 globus_compute_endpoint.endpoint.interchange:552 engine_bad_state_watcher Error 1:
+	Job is marked as MISSING since the workers failed to register to the executor. Check the stdout/stderr logs in the submit_scripts directory for more debug information
+NoneType: None
+2026-10-16 08:43:25,483137 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.rabbit_mq.task_queue_subscriber:176 stop Stopping thread
+2026-10-16 08:43:25,483466 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:153 quiesce Interchange quiesce in progress
+2026-10-16 08:43:25,483873 WARNING MainProcess-1073 MainThread-281473414275104 parsl.jobs.job_status_poller:66 close Not scaling in executor GlobusComputeEngine-HighThroughputExecutor because it is in bad state
+2026-10-16 08:43:25,484104 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:926 shutdown Attempting HighThroughputExecutor shutdown
+2026-10-16 08:43:25,484200 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:928 shutdown Terminating interchange and result queue thread
+2026-10-16 08:43:25,492998 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:937 shutdown Closing ZMQ pipes
+2026-10-16 08:43:25,493111 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:947 shutdown Closing outgoing_q
+2026-10-16 08:43:25,493482 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:951 shutdown Closing command client
+2026-10-16 08:43:25,493834 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:954 shutdown Waiting for result queue thread exit
+2026-10-16 08:43:25,493909 INFO MainProcess-1073 MainThread-281473414275104 parsl.executors.high_throughput.executor:963 shutdown Finished HighThroughputExecutor shutdown attempt
+2026-10-16 08:43:25,493970 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.interchange:273 start EndpointInterchange shutdown complete.
+2026-10-16 08:43:25,494078 INFO MainProcess-1073 MainThread-281473414275104 globus_compute_endpoint.endpoint.endpoint:626 start_interchange 
+---------- Endpoint shutdown: cfe285ef-7f41-943f-0e9f-a4ae1d904982
+

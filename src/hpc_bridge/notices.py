@@ -620,11 +620,15 @@ def _failed_release_notice(failure: str, *, queued: bool) -> str:
             "endpoint stays online for reuse.")
 
 
-def _rejected_stop_notice() -> str:
+_STOP_ONLINE = " The login endpoint stays online for reuse (reconnecting is zero-SSH)."
+
+
+def _rejected_stop_notice(then: str = "") -> str:
     """The `down` of a stop after a REJECTED submission that found nothing in the scheduler: nothing was ever created to
-    cancel — the same fact the REJECTED answer gave, never a claim that a block was released."""
+    cancel — the same fact the REJECTED answer gave, never a claim that a block was released. `then`: what else
+    settled the stop (a sentence, before the closing one)."""
     return ("nothing to cancel: the scheduler REJECTED the block's submission, so no block was created and none bills "
-            "(released none). The login endpoint stays online for reuse (reconnecting is zero-SSH).")
+            f"(released none).{then}{_STOP_ONLINE}")
 
 
 # A stop names at most this many task ids, then "+N more".
@@ -656,13 +660,14 @@ def _check_words(items: Collection[SentCheck], word: str) -> tuple[str, bool]:
 
 
 def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, released: str | None, unknown: bool,
-                          waited_s: float, fresh: bool = True, reason: str = "") -> str:
+                          waited_s: float, fresh: bool = True, reason: str = "", looked: str | None = None) -> str:
     """A stop with a task of ours still queued on a compute user endpoint (`warmth._check_states`): the endpoint can
     start a block to run it — after a stop cancelled one, parsl submits another for a task still outstanding — so spend
     is NOT confirmed stopped, whatever the release found (#24). `fresh`: the endpoint gives each block request its own
     compute user endpoint, which gives a check up once its first pilot is cancelled, so calling again is the way; on an
     endpoint of an earlier plugin (one compute user endpoint) a cancel never ends a queued task, and only
-    teardown_endpoint does. `reason`: why the release itself was not confirmed, when it was not."""
+    teardown_endpoint does. `reason`: why the release itself was not confirmed, when it was not. `looked`: the stop also
+    read the check's own user endpoint on the login node, and this is why that did not settle it."""
     what, plural = _check_words(pending, _queue_word(app))
     it, is_, its, stays = ("them", "are", "their", "stay") if plural else ("it", "is", "its", "stays")
     where = "still queued or running" if any(c.what == "command" for c in pending) else "still queued"
@@ -673,6 +678,9 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
     head = f"compute block released over AMQP ({released}). " if released else ""
     read = f" ({its} state could not be read from the service)" if unknown else ""
     waited = f" This stop waited {int(waited_s)} s for the endpoint to give {it} up." if waited_s >= 1 else ""
+    if looked:  # the stop read the check's own user endpoint on the login node too: what kept that from settling it
+        waited += (f" hpc-bridge also looked on the login node and cannot rule out that {'they' if plural else 'it'} "
+                   f"can still start a block: {looked}.")
     if fresh:
         then = (" Call stop_endpoint again in about a minute: each call cancels what it finds and looks again. "
                 f"If {it} {stays} queued call after call, teardown_endpoint ends {it} (the user's call).")
@@ -686,12 +694,36 @@ def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, releas
             f"start a block to run {it}.{died}{waited}{then} The login endpoint stays online for reuse.")
 
 
-def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool) -> str:
+def _lost_checks_words(app: AppCtx, lost: Collection[tuple[SentCheck, str, str]]) -> str:
+    """Why a check the service still lists as queued can never start a block (server._settle_by_evidence): its own user
+    endpoint received it and went into bad state, which failed it, then stopped for good — and why the service does not
+    know: that endpoint's report of the failure was lost on its own side (a globus-compute-endpoint race)."""
+    what, plural = _check_words([c for c, _, _ in lost], _queue_word(app))
+    they, them = ("they", "them") if plural else ("it", "it")
+    ueps = list(dict.fromkeys(u for _, u, _ in lost))
+    when = ", ".join(dict.fromkeys(b for _, _, b in lost))
+    several = len(ueps) > 1
+    whose = "their user endpoints" if several else ("their user endpoint" if plural else "its user endpoint")
+    dead = next((c.dead for c, _, _ in lost if c.dead is not None), None)
+    died = f" (pilot {dead.job} FINISHED, exit status {dead.exit_status}, before it ran {them})" if dead else ""
+    return (f"{what} cannot run{died}: {whose} on the login node ({', '.join(ueps)}) received {them} and went into "
+            f"bad state (at {when}, the login node's time), which failed {them}; {'they' if several else 'it'} then "
+            "shut down, nothing of " + ("them" if several else "it") + " runs there, and the endpoint has not started "
+            + ("them" if several else "it") + f" again, so no block of ours can start for {them}. The report that "
+            f"{they} failed was lost on the endpoint's own side (a known globus-compute-endpoint race: a user endpoint "
+            f"in bad state stops before it sends that report), which is why the Globus Compute service still lists "
+            f"{them} as queued")
+
+
+def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool,
+                      lost: Collection[tuple[SentCheck, str, str]] = ()) -> str:
     """The `down` of an SSH stop: the release confirmed, and no check of ours is still queued. Says what settled it — a
     rejected submission (nothing was created), a check the endpoint gave up once its pilot was cancelled or died (naming
-    a dead pilot), a block that came up for a check during the stop and was cancelled — never more than happened."""
+    a dead pilot), a check whose user endpoint is gone for good although the service lists it as queued (`lost`:
+    (check, user endpoint, when its bad state was logged); server._settle_by_evidence), a block that came up for a check
+    during the stop and was cancelled — never more than happened."""
     if rejected and detail == "released none" and not ran:  # the check the endpoint gave up IS the rejected one
-        return _rejected_stop_notice()
+        return _rejected_stop_notice(f" {_lost_checks_words(app, lost)}." if lost else "")
     out = f"compute block released over AMQP ({detail})"
     if gave_up:
         what, plural = _check_words(gave_up, _queue_word(app))
@@ -704,7 +736,9 @@ def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Coll
             out += f". The endpoint has given up {what}, so it starts no block for {it}"
     if ran:
         out += ". A block that came up during this stop ran hpc-bridge's last check, and was cancelled"
-    return out + ". The login endpoint stays online for reuse (reconnecting is zero-SSH)."
+    if lost:
+        out += ". " + _lost_checks_words(app, lost)
+    return out + "." + _STOP_ONLINE
 
 
 def _no_account_failure(error: str | None) -> bool:

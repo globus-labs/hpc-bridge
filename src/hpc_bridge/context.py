@@ -209,6 +209,17 @@ class SentCheck:
     # the key of its row on disk when it has no task id (read back from a record: the submit's row, written before the
     # service answered with an id)
     row_key: str | None = None
+    # the block request a check was sent for (`hpcb_block`, warmth._fresh_block), as its runner read it at the send: the
+    # one thing on the login node that names its compute user endpoint — that endpoint's own log carries it from its
+    # start (the template's endpoint_setup line) — so a stop can read that endpoint's fate when the service cannot say
+    # (server._settle_by_evidence). None: not known (a command, an endpoint of an earlier plugin, an older record).
+    block: int | None = None
+    # when this process first saw its task id (wall clock): the service had taken it by then — never earlier than it did
+    # (runner.GlobusRunner.taken_at). What the stop's evidence dates a check by; None: not seen (or an older record).
+    taken_at: float | None = None
+    # the same moment on this process's monotonic clock (never written to disk): an age measured from it cannot be
+    # stretched by a step of the wall clock. None: read back from disk (the wall time is all there is), or not seen.
+    taken_mono: float | None = None
 
     @property
     def tid(self) -> str | None:
@@ -313,8 +324,10 @@ class AppCtx:
     # Per endpoint id: the task ids this process last wrote to disk for it, and the ones it last removed there as seen
     # resolved (warmth._persist_checks writes only on a change, and again after a failed write).
     persisted_checks: dict[str, tuple[frozenset[str], frozenset[str]]] = field(default_factory=dict)
-    # Task id -> how it resolved ("ok" / "failed"), as seen this session: never asked again, and removed from the record
-    # on disk by this process (warmth._check_states, _persist_checks). Bounded (warmth._trim_resolved).
+    # Task id -> how it resolved ("ok" / "failed"; "unsent"; "lost": its user endpoint is gone for good, read on the
+    # login node by a stop, server._settle_by_evidence), as seen this session: never asked again, and removed from the
+    # record on disk by this process (warmth._check_states, _settle_checks, _persist_checks). Bounded
+    # (warmth._trim_resolved).
     resolved_checks: dict[str, str] = field(default_factory=dict)
     # The record writes still to do per endpoint (the latest only) and the task writing them off the event loop
     # (warmth._schedule_flush).
