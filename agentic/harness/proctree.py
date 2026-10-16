@@ -123,6 +123,11 @@ def kill_group(pid: int, *, grace_s: float = 5.0) -> None:
             os.killpg(pid, 0)
         except ProcessLookupError:
             return
+        except PermissionError:
+            # macOS answers EPERM, not ESRCH, for a group whose members have all exited but are not yet reaped
+            # (zombies): nothing is left to signal. It escaped here before, failing a timed-out turn with PermissionError
+            # (test_proctree on macOS, about 1 run in 25; its traceback showed the deadline's CancelledError first).
+            break
         time.sleep(0.1)
     with contextlib.suppress(ProcessLookupError, PermissionError):
         os.killpg(pid, signal.SIGKILL)
