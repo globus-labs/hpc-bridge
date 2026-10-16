@@ -627,34 +627,60 @@ def _rejected_stop_notice() -> str:
             "(released none). The login endpoint stays online for reuse (reconnecting is zero-SSH).")
 
 
-def _check_words(checks: Collection[SentCheck], word: str) -> tuple[str, str]:
-    """(what: "hpc-bridge's check for the block on partition 'x' (task …)", it/them) for a stop's notice."""
-    terms = list(dict.fromkeys(c.terms for c in checks))
-    on = " and ".join(_terms(*t, word) for t in terms)
-    ids = [str(t) for c in checks if (t := getattr(c.future, "task_id", None))]
-    task = f" (task {', '.join(ids)})" if ids else ""
-    one = len(checks) == 1
-    return (f"hpc-bridge's check{'' if one else 's'} for the block on {on}{task}", "it" if one else "them")
+# A stop names at most this many task ids, then "+N more".
+_MAX_TASK_IDS = 3
+
+
+def _task_ids(items: Collection[SentCheck]) -> str:
+    """" (task a, b, c +N more)" for a notice, or ""."""
+    ids = [t for c in items if (t := c.tid)]
+    if not ids:
+        return ""
+    more = f" +{len(ids) - _MAX_TASK_IDS} more" if len(ids) > _MAX_TASK_IDS else ""
+    return f" (task {', '.join(ids[:_MAX_TASK_IDS])}{more})"
+
+
+def _check_words(items: Collection[SentCheck], word: str) -> tuple[str, bool]:
+    """(what, plural) for a stop's notice: "hpc-bridge's check for the block on partition 'x' (task …)", and/or
+    "hpc-bridge's command whose result the client lost (task …)"."""
+    checks = [c for c in items if c.what == "check"]
+    cmds = [c for c in items if c.what == "command"]
+    parts = []
+    if checks:
+        on = " and ".join(_terms(*t, word) for t in dict.fromkeys(c.terms for c in checks))
+        parts.append(f"hpc-bridge's check{'' if len(checks) == 1 else 's'} for the block on {on}{_task_ids(checks)}")
+    if cmds:
+        parts.append(f"hpc-bridge's command{'' if len(cmds) == 1 else 's'} whose result the client lost"
+                     f"{_task_ids(cmds)}")
+    return " and ".join(parts), len(items) != 1
 
 
 def _check_pending_notice(app: AppCtx, pending: Collection[SentCheck], *, released: str | None, unknown: bool,
-                          waited_s: float, reason: str = "") -> str:
-    """A stop with a check of ours still queued on a compute user endpoint (`warmth._check_states`): the endpoint can
+                          waited_s: float, fresh: bool = True, reason: str = "") -> str:
+    """A stop with a task of ours still queued on a compute user endpoint (`warmth._check_states`): the endpoint can
     start a block to run it — after a stop cancelled one, parsl submits another for a task still outstanding — so spend
-    is NOT confirmed stopped, whatever the release found (#24). Each call cancels what it finds and looks again; a
-    check that stays queued ends with the endpoint (teardown_endpoint). `reason`: why the release itself was not
-    confirmed, when it was not."""
-    what, it = _check_words(pending, _queue_word(app))
-    one = it == "it"
+    is NOT confirmed stopped, whatever the release found (#24). `fresh`: the endpoint gives each block request its own
+    compute user endpoint, which gives a check up once its first pilot is cancelled, so calling again is the way; on an
+    endpoint of an earlier plugin (one compute user endpoint) a cancel never ends a queued task, and only
+    teardown_endpoint does. `reason`: why the release itself was not confirmed, when it was not."""
+    what, plural = _check_words(pending, _queue_word(app))
+    it, is_, its, stays = ("them", "are", "their", "stay") if plural else ("it", "is", "its", "stays")
+    where = "still queued or running" if any(c.what == "command" for c in pending) else "still queued"
     dead = next((c.dead for c in pending if c.dead is not None), None)
     died = (f" Pilot {dead.job} FINISHED (exit status {dead.exit_status}) before it ran {it}." if dead else "")
     head = f"compute block released over AMQP ({released}). " if released else ""
-    read = f" ({'its' if one else 'their'} state could not be read from the service)" if unknown else ""
+    read = f" ({its} state could not be read from the service)" if unknown else ""
     waited = f" This stop waited {int(waited_s)} s for the endpoint to give {it} up." if waited_s >= 1 else ""
-    return (f"{head}Spend is NOT confirmed stopped: {reason}{what} {'is' if one else 'are'} still queued on the "
-            f"endpoint{read}, which can start a block to run {it}.{died}{waited} Call stop_endpoint again in about a "
-            f"minute: each call cancels what it finds and looks again. If {it} {'stays' if one else 'stay'} queued, "
-            "teardown_endpoint ends it (the user's call). The login endpoint stays online for reuse.")
+    if fresh:
+        then = (" Call stop_endpoint again in about a minute: each call cancels what it finds and looks again. "
+                f"If {it} {stays} queued call after call, teardown_endpoint ends {it} (the user's call).")
+    else:
+        then = (f" This endpoint was set up by an earlier hpc-bridge and keeps one compute user endpoint, which starts "
+                f"another block for a queued task after every cancel: stopping does not end {it}, only "
+                f"teardown_endpoint does (the user's call). Short of that, the block it starts runs {it} and then "
+                "idles out (~10 min after its last task).")
+    return (f"{head}Spend is NOT confirmed stopped: {reason}{what} {is_} {where} on the endpoint{read}, which can "
+            f"start a block to run {it}.{died}{waited}{then} The login endpoint stays online for reuse.")
 
 
 def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool) -> str:
@@ -665,7 +691,8 @@ def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Coll
         return _rejected_stop_notice()
     out = f"compute block released over AMQP ({detail})"
     if gave_up:
-        what, it = _check_words(gave_up, _queue_word(app))
+        what, plural = _check_words(gave_up, _queue_word(app))
+        it = "them" if plural else "it"
         dead = next((c.dead for c in gave_up if c.dead is not None), None)
         if dead is not None:
             out += (f". Pilot {dead.job} FINISHED (exit status {dead.exit_status}) before it ran {what}, and the "

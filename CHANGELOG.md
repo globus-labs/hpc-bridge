@@ -75,16 +75,22 @@ installed plugin only when that version changes); git tags mark releases.
   created: nothing is queued"), or that its pilot job had already FINISHED with exit status 42, and the
   `stop_endpoint` that followed answered `draining`: "the compute block was still being submitted … one may land
   shortly … idle-release is the backstop". The agents believed the earlier answer and did not call again. Now:
-  - the stop answers `down` (`spend_stopped` true) only when its cancel was confirmed and every check hpc-bridge
-    sent to the endpoint has either been run or been dropped by the endpoint. It asks the Globus Compute service
-    about each one by its task id, so a check that failed only on hpc-bridge's side still counts as waiting. While
-    one is still waiting, the stop answers `draining`: it names the check (its queue and account, its task id), says
-    the endpoint can start a block to run it, and says to call `stop_endpoint` again in about a minute (each call
-    cancels what it finds and looks again) and that `teardown_endpoint` ends a check that stays queued. The stop
-    still sees those checks after a partition or account switch, a `connect_facility` to the same endpoint, and a
-    teardown that stopped to ask for a one-time code. A check sent by another call while the stop was cancelling
-    counts as waiting too. When the endpoint has gone offline, nothing is left to start a block, and the stop
-    answers `down` as before;
+  - the stop answers `down` (`spend_stopped` true) only when its cancel was confirmed and every task hpc-bridge
+    sent to the endpoint has either been run or been dropped by the endpoint. That covers its checks, and a command
+    whose result hpc-bridge lost on its own side (for example when the Globus Compute client's result thread stops):
+    the command may still be running there. The stop asks the Globus Compute service about each one by its task
+    id, several at once, and takes the service's answer that a task failed as the endpoint having dropped it. While
+    one is still waiting, the stop answers `draining`: it names it (its queue and account, at most three task ids
+    and how many more), says the endpoint can start a block to run it, and says to call `stop_endpoint` again in
+    about a minute (each call cancels what it finds and looks again) and that `teardown_endpoint` ends one that
+    stays queued. The stop still sees those tasks after a partition or account switch, a `connect_facility` to the
+    same endpoint, a teardown that stopped to ask for a one-time code, and a restart of hpc-bridge itself: it keeps
+    their task ids in a small file per endpoint under `~/.hpc-bridge/sent-checks/`, which the endpoint's teardown
+    removes. A check sent by another call while the stop was cancelling counts as waiting too, and so does a block
+    that came up after the stop's last cancel. A `connect_facility` to another facility says when a task may still
+    be queued on the endpoint it left. When the endpoint is offline, the stop answers `down` as before, but keeps
+    the tasks: if the endpoint comes back, the next stop still sees them. One `stop_endpoint` call takes at most
+    three minutes, its cancels and lookups included;
   - an endpoint hpc-bridge sets up now runs each block request in its own compute user endpoint, a small process on
     the login node that exits ten minutes after its last task (`idle_heartbeats_soft` in the endpoint's template;
     `HPC_BRIDGE_UEP_IDLE_HEARTBEATS`, default 20 heartbeats of 30 s). The block it starts is its first, so when a
@@ -94,7 +100,11 @@ installed plugin only when that version changes); git tags mark releases.
     is still up keeps the same user endpoint, and the login endpoint's own process never changes. An endpoint set
     up by an earlier plugin keeps one compute user endpoint (one per block request would never exit there): its
     stops do not wait, and answer `draining` until the check is dropped. To get the new behaviour there, remove the
-    endpoint (`teardown_endpoint`) and connect again. A facility's own endpoint is unchanged;
+    endpoint (`teardown_endpoint`) and connect again. On such an endpoint the stop says that only
+    `teardown_endpoint` ends a queued check there. A facility's own endpoint is unchanged. Two limits remain: each
+    block request leaves a directory of logs and scripts on the login node (`~/.globus_compute/uep.<id>.*`) until the
+    endpoint is torn down, and on a PBS server that keeps no job history the endpoint never learns that a cancelled
+    block is gone, so the check stays queued and the stop stays `draining` until `teardown_endpoint`;
   - after a rejected submission the stop answers `down`, saying there was nothing to cancel because the scheduler
     rejected the submission and no block was created;
   - a rejected submission also drops the spend confirmation, as a reaped block does: the next `ensure_endpoint_up` or

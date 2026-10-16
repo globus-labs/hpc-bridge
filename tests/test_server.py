@@ -2,6 +2,7 @@ import time
 from pathlib import Path
 
 import pytest
+from globus_compute_sdk.errors import TaskExecutionFailed
 
 from hpc_bridge import binding
 from hpc_bridge.lifecycle import EndpointState
@@ -111,6 +112,8 @@ class _PendingFuture:
 
 
 class _FakeRunner:
+    check_prefix = "check"  # its checks' task ids: check-1, check-2, … (a test with several runners may set its own)
+
     def __init__(
         self, endpoint_id, res, *, canary_result=None, walltime=1780.0, timeout=120.0, pending=False
     ):
@@ -150,18 +153,38 @@ class _FakeRunner:
         live = self.checks[-1] if self.checks and not self.checks[-1].done() else None
         if not c.ok and live is None:  # a check that does not answer is a task sent: queued (timeout), or failed
             live = _PendingFuture()
-            live.task_id = f"check-{len(self.checks) + 1}"
+            live.task_id = f"{self.check_prefix}-{len(self.checks) + 1}"
             self.checks.append(live)
         if live is not None and c.ok:
             live.finish(_Res(0, "HPCB_CANARY", ""))  # a worker answered the check still queued
         elif live is not None and c.error != "timeout":
-            live.fail(RuntimeError(c.error or "failed"))
+            live.fail(TaskExecutionFailed(c.error or "failed", "0"))  # the endpoint's verdict, as the SDK delivers it
         return c
 
+    def _service(self, tid):
+        """The web service's view of one of this runner's tasks, as SDK 4.18's `Client.get_task` returns it: pending
+        while its future is (or failed on the client's side alone), RAISING TaskExecutionFailed once the endpoint failed
+        it, a success once it ran."""
+        fut = next((f for f in [*self.checks, *self.futures] if getattr(f, "task_id", None) == tid), None)
+        if fut is None or not fut.done() or fut.cancelled():
+            return {"pending": True, "status": "waiting-for-nodes"}
+        exc = fut.exception()
+        if isinstance(exc, TaskExecutionFailed):
+            raise exc
+        if exc is not None:
+            return {"pending": True, "status": "running"}
+        return {"pending": False, "status": "success", "task_id": tid, "result": fut.result()}
+
+    def task_client(self):
+        """The SDK Client stand-in: `get_task` late-bound (a test may change what the service answers after a retire, as
+        with the real client) — `lookup` when a test sets one, else `_service`."""
+        from types import SimpleNamespace
+
+        return SimpleNamespace(get_task=lambda tid: (self.lookup or self._service)(tid))
+
     def sent_checks(self):
-        # late-bound, as the SDK client's get_task is: a test may change what the service answers after a retire
-        look = (lambda tid: self.lookup(tid)) if self.lookup is not None else None
-        return [(f, look) for f in self.checks
+        client = self.task_client()
+        return [(f, client, 0.0) for f in self.checks
                 if not (f.done() and not f.cancelled() and f.exception() is None)]
 
     def close(self):
@@ -700,7 +723,7 @@ async def test_stop_during_provisioning_is_draining_not_down(monkeypatch):
     monkeypatch.setattr(server, "_run_shell", released_nothing)
     res = await _stop_endpoint(app)
     assert res.status == "draining" and res.spend_stopped is not True
-    assert "is still queued on the endpoint" in (res.notice or "") and "stop_endpoint again" in (res.notice or "")
+    assert "is still queued on the endpoint" in (res.notice or "") and "only teardown_endpoint does" in (res.notice or "")
 
     # RECOVERY on a fresh compute user endpoint: the stop looks again while our check is queued — "released none", then
     # the pilot lands and is cancelled, and the endpoint gives the check up: `down` in ONE call
@@ -883,14 +906,14 @@ async def test_a_check_still_queued_keeps_the_stop_draining(monkeypatch):
     assert res.status == "draining" and res.spend_stopped is not True and _kinds(log) == ["release"]
     assert ("hpc-bridge's check for the block on the default partition (task check-1) is still queued on the endpoint, "
             "which can start a block to run it") in res.notice
-    assert "teardown_endpoint ends it" in res.notice and "about a minute" in res.notice
+    assert "only teardown_endpoint does" in res.notice and "about a minute" not in res.notice  # one user endpoint
     assert "still being submitted" not in res.notice and "idle-release" not in res.notice
-    assert [getattr(c.future, "task_id", None) for c in app.sent_checks[app.state.endpoint_id]] == ["check-1"]
+    assert [c.tid for c in app.sent_checks[app.state.endpoint_id]] == ["check-1"]
     # a second stop (the shape is gone) still sees it: the endpoint kept it
     _scripted_login(monkeypatch)
     assert (await _stop_endpoint(app)).status == "draining"
     # it resolves (failed: the endpoint gave it up) — the next stop is `down`, and forgets it
-    runner.checks[0].fail(RuntimeError("bad state"))
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException", "0"))
     _scripted_login(monkeypatch)
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.spend_stopped is True and "has given up hpc-bridge's check" in res.notice
@@ -971,6 +994,7 @@ async def test_the_stops_wait_for_a_check_is_bounded_and_says_what_it_waited(mon
     _scripted_login(monkeypatch)
     res = await _stop_endpoint(app)
     assert res.status == "draining" and f"This stop waited {int(config.stop_check_wait_s())} s" in res.notice
+    assert "Call stop_endpoint again in about a minute" in res.notice and "teardown_endpoint ends it" in res.notice
     assert config.stop_check_wait_s() - 1 < skew[0] <= config.stop_check_wait_s()
     # an endpoint of an earlier plugin (one user endpoint, which relaunches instead) is not waited on
     skew2 = skew[0]
@@ -1006,7 +1030,7 @@ async def test_a_check_sent_while_the_stop_released_is_counted_as_queued(monkeyp
 
     app, runner = _queued_app(monkeypatch)
     assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
-    runner.checks[0].fail(RuntimeError("bad state"))   # the endpoint gave the first check up
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException", "0"))   # the endpoint gave the first check up
     busy = {}
 
     async def run(a, command, session_id="default", shape="compute"):
@@ -1095,7 +1119,7 @@ async def test_a_dead_pilot_whose_check_was_given_up_is_down_naming_it(monkeypat
 
     app, runner = await _dead_pilot_app(monkeypatch, pbs=pbs)
     job = "12.pbsserver" if pbs else "12"
-    runner.checks[0].fail(RuntimeError("TooManyJobFailuresError: Error 1: EXIT CODE: 42"))
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException: Error 1: EXIT CODE: 42", "0"))
     log = _scripted_login(monkeypatch)
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.spend_stopped is True and _kinds(log) == ["release"]
@@ -1270,7 +1294,9 @@ async def test_a_cold_release_with_a_queued_check_stays_draining_and_an_offline_
     app.facility.manager_up = False   # the endpoint went offline: nothing of it can start a block any more
     _scripted_login(monkeypatch, releases=[None] * 3)
     gone = await _stop_endpoint(app)
-    assert gone.status == "down" and "ORPHANED" in gone.notice and eid not in app.sent_checks
+    assert gone.status == "down" and "ORPHANED" in gone.notice and gone.spend_stopped is not True
+    # kept: an OFFLINE status can be transient, and the check can start a block once the endpoint is back
+    assert eid in app.sent_checks and "if the endpoint comes back online it can start a block for it" in gone.notice
 
 
 async def test_a_switch_away_from_a_dead_pilot_then_a_rejection_still_names_the_dead_pilot(monkeypatch):
@@ -1542,6 +1568,448 @@ async def test_a_facility_endpoint_never_gets_a_block_number(monkeypatch):
     assert "hpcb_block" not in app.shapes["compute"].user_endpoint_config
 
 
+# --- review of 4fb0262: the evidence read as the SDK gives it, and kept where it can be lost ---------------------------
+# SDK 4.18's Client.get_task RAISES TaskExecutionFailed for a task the endpoint failed with an exception (a check failed
+# by bad state, by a REJECTED submission, by a dead first pilot); it returns {"pending": False, "status": "success", …}
+# for one that ran, and {"pending": True, "status": <state>} otherwise (sdk/client.py:_update_task_table).
+
+def _sdk_get_task(failed_ids=(), ok_ids=(), always_failed=False):
+    def get_task(tid):
+        if always_failed or tid in failed_ids:
+            raise TaskExecutionFailed("parsl.executors.errors.BadStateException: Executor is in bad state", "1")
+        if tid in ok_ids:
+            return {"pending": False, "status": "success", "task_id": tid, "result": object()}
+        return {"pending": True, "status": "waiting-for-nodes"}
+    return get_task
+
+
+@pytest.mark.parametrize("local", ["the service's verdict", "a client-side failure"])
+async def test_a_rejected_submission_stop_is_down_with_the_sdks_own_get_task(monkeypatch, local):
+    # Review H1: the lookup raised TaskExecutionFailed, which read as "could not be read" — REJECTED, then `draining`
+    # on every stop (the very contradiction of 2026-10-15)
+    from hpc_bridge.server import _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app()
+    runners = []
+
+    def factory(eid, user_endpoint_config=None, **_kw):
+        r = _FakeRunner(eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error=_SBATCH_REFUSED))
+        r.lookup = _sdk_get_task(always_failed=True)
+        runners.append(r)
+        return r
+
+    app.runner_factory = factory
+    res = await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)
+    assert res.status == "down" and "REJECTED" in res.notice
+    if local == "a client-side failure":   # the future failed on the client alone: the service must be asked
+        check = runners[-1].checks[0]
+        check._exc = RuntimeError("SDK thread quit unexpectedly.")
+    _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and stop.spend_stopped is True and "nothing to cancel" in stop.notice
+    assert "could not be read" not in stop.notice
+
+
+async def test_a_fresh_user_endpoints_cancelled_first_pilot_is_down_in_one_stop_with_the_sdks_get_task(monkeypatch):
+    # Review H1, live: the cancelled first pilot read MISSING, parsl failed the check (bad state) at +55 s — and the
+    # stop waited 91 s and answered "could not be read". Now the raise is the verdict: `down`, well inside the wait.
+    from hpc_bridge import config
+    from hpc_bridge.server import _stop_endpoint
+
+    skew = _skew(monkeypatch)
+    _settle_clock(monkeypatch, skew)
+    app, runner = _queued_app(monkeypatch, fresh=True)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+
+    def get_task(tid):
+        if skew[0] < 60:
+            return {"pending": True, "status": "waiting-for-nodes"}
+        raise TaskExecutionFailed("BadStateException", "1")
+
+    runner.lookup = get_task
+    _scripted_login(monkeypatch, releases=["released 4\n"])
+    stop = await _stop_endpoint(app)
+    assert stop.status == "down" and stop.spend_stopped is True and "has given up hpc-bridge's check" in stop.notice
+    assert 60 <= skew[0] < config.stop_check_wait_s()
+
+
+def test_each_status_shape_of_the_sdk_maps_to_one_state():
+    from types import SimpleNamespace
+
+    from globus_compute_sdk.errors import SerializationError
+
+    from hpc_bridge import warmth
+
+    def client(answer):
+        def get_task(tid):
+            if isinstance(answer, BaseException):
+                raise answer
+            return answer
+        return SimpleNamespace(get_task=get_task)
+
+    cases = {
+        "pending": {"pending": True, "status": "waiting-for-nodes"},
+        "pending/unknown": {"pending": True, "status": "unknown"},
+        "ok/result": {"pending": False, "status": "success", "result": 1},
+        "ok/no result": {"pending": False, "status": "success", "reason": "unknown"},
+        "failed/reason": {"pending": False, "status": "failed", "reason": "endpoint shut down"},
+        "failed/raised": TaskExecutionFailed("BadStateException", "1"),
+        "ok/unreadable result": SerializationError("Result Object Deserialization"),
+        "unknown/transport": ConnectionError("reset"),
+        "unknown/mismatch": ValueError("Task t returned invalid response"),
+        "unknown/not a dict": "garbage",
+    }
+    got = {k: warmth._task_state(client(v), "t") for k, v in cases.items()}
+    assert got == {k: k.split("/")[0] for k in cases}
+
+
+def test_lookups_are_batched_and_a_task_the_batch_drops_is_asked_alone():
+    # get_batch_result drops (and logs) a task it cannot unpack — one the endpoint failed with an exception among them
+    from types import SimpleNamespace
+
+    from hpc_bridge import warmth
+
+    calls = []
+
+    def batch(ids):
+        calls.append(("batch", sorted(ids)))
+        return {"a": {"pending": True, "status": "running"}, "b": {"pending": False, "status": "success"}}
+
+    def get_task(tid):
+        calls.append(("one", tid))
+        raise TaskExecutionFailed("BadStateException", "1")
+
+    got = warmth._lookup_states(SimpleNamespace(get_batch_result=batch, get_task=get_task), ["a", "b", "c"])
+    assert got == {"a": "pending", "b": "ok", "c": "failed"} and calls == [("batch", ["a", "b", "c"]), ("one", "c")]
+
+    def broken(ids):
+        raise ConnectionError("down")
+
+    assert warmth._lookup_states(SimpleNamespace(get_batch_result=broken, get_task=get_task), ["a", "b"]) == \
+        {"a": "unknown", "b": "unknown"}
+
+
+async def test_the_64_cap_never_evicts_a_check_still_queued(monkeypatch):
+    # Review M1: `del kept[:-64]` dropped check A (an older user endpoint, which relaunches a block for it); the second
+    # stop then answered `down` while A was still queued
+    from hpc_bridge.server import _stop_endpoint
+
+    app, _runner = _queued_app(monkeypatch)
+    runners = []
+
+    def factory(eid, user_endpoint_config=None, **_kw):
+        r = _FakeRunner(eid, _Res(0, "", ""), canary_result=CanaryResult(ok=False, error="timeout"))
+        r.check_prefix = "A" if not runners else "B"
+        runners.append(r)
+        return r
+
+    app.runner_factory = factory
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
+    a = runners[0].checks[0]
+    assert (await _ensure_endpoint_up(app, partition="compute", confirm_spend=True)).status == "provisioning"
+    new = runners[-1]
+    for i in range(1, 64):                                   # ~5 h of re-asks on a saturated queue
+        _queued_check(new, f"B{i}")
+    _scripted_login(monkeypatch)
+    assert (await _stop_endpoint(app)).status == "draining"
+    eid = app.state.endpoint_id
+    assert "A-1" in [c.tid for c in app.sent_checks[eid]]
+    for c in new.checks:                                     # the compute terms' user endpoint gives its checks up
+        c.fail(TaskExecutionFailed("BadStateException", "1"))
+    _scripted_login(monkeypatch)
+    second = await _stop_endpoint(app)
+    assert not a.done() and second.status == "draining" and second.spend_stopped is not True
+    assert "check for the block on partition 'debug' (task A-1) is still queued" in second.notice
+
+
+async def test_the_cap_drops_only_what_is_known_resolved_and_the_ids_listed_are_bounded(monkeypatch):
+    from hpc_bridge import warmth
+    from hpc_bridge.context import SentCheck
+    from hpc_bridge.server import _stop_endpoint
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    eid = app.state.endpoint_id
+    done = []
+    for i in range(70):
+        f = _PendingFuture()
+        f.task_id = f"q{i}"
+        if i < 10:                                           # the oldest ten: the service failed them
+            f.fail(TaskExecutionFailed("BadStateException", "1"))
+            done.append(f.task_id)
+        warmth._keep_checks(app, eid, [SentCheck(future=f, task_id=f.task_id)])
+    kept = [c.tid for c in app.sent_checks[eid]]
+    assert len(kept) == warmth._SENT_CHECKS_MAX and all(f"q{i}" in kept for i in range(10, 70))
+    _scripted_login(monkeypatch)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "(task q10, q11, q12 +58 more)" in res.notice
+    assert "are still queued on the endpoint" in res.notice and "If them" not in res.notice
+
+
+async def test_a_restarted_server_still_sees_the_check_its_predecessor_sent(monkeypatch):
+    # Review M2: AppCtx.sent_checks was memory only — a new process bound to the same endpoint answered `down`
+    from hpc_bridge.context import ShapeRuntime
+    from hpc_bridge.server import _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    app, runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, partition="debug", confirm_spend=True)).status == "provisioning"
+    eid = app.state.endpoint_id
+    assert [r["task_id"] for r in SentCheckStore().load(eid)] == ["check-1"]      # written when it was sent
+    # the MCP server restarts (Claude Code relaunched): a new AppCtx, the same endpoint bound again (zero-SSH reuse);
+    # its login runner's client can look the task up by id
+    app2 = AppCtx(facility=app.facility, profile=Profile(), state=EndpointState(endpoint_id=eid))
+    app2.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, runner=runner,
+                                        warm_confirmed_at=time.monotonic())
+    _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app2)
+    assert not runner.checks[0].done()
+    assert stop.status == "draining" and "check for the block on partition 'debug' (task check-1)" in stop.notice
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException", "1"))           # the endpoint gives it up
+    _scripted_login(monkeypatch)
+    assert (await _stop_endpoint(app2)).status == "down" and SentCheckStore().load(eid) == []
+
+
+async def test_a_restart_with_no_client_to_ask_is_draining_not_down(monkeypatch):
+    from hpc_bridge.server import _stop_endpoint
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    app2 = AppCtx(facility=app.facility, profile=Profile(), state=EndpointState(endpoint_id=app.state.endpoint_id))
+    _scripted_login(monkeypatch)
+    stop = await _stop_endpoint(app2)
+    assert stop.status == "draining" and "(its state could not be read from the service)" in stop.notice
+
+
+async def test_a_teardown_removes_the_endpoints_file(monkeypatch):
+    from hpc_bridge import server
+    from hpc_bridge.server import _teardown_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    eid = app.state.endpoint_id
+    assert SentCheckStore().load(eid)
+    monkeypatch.setattr(server, "_teardown_preauth_gate", lambda *a, **k: _none())
+    _scripted_login(monkeypatch)
+    assert (await _teardown_endpoint(app)).status == "down"
+    assert SentCheckStore().load(eid) == [] and eid not in app.sent_checks
+
+
+def test_the_store_is_small_private_and_atomic(tmp_path):
+    import os
+    import stat
+
+    from hpc_bridge.state import SentCheckStore
+
+    store = SentCheckStore(tmp_path / "sc")
+    store.save("eid-1", [{"task_id": "t1", "partition": "debug", "account": None, "sent_at": 1.0, "what": "check"}])
+    path = tmp_path / "sc" / "eid-1.json"
+    assert stat.S_IMODE(os.stat(path).st_mode) == 0o600 and store.load("eid-1")[0]["task_id"] == "t1"
+    assert [p.name for p in (tmp_path / "sc").iterdir()] == ["eid-1.json"]       # no temp file left behind
+    store.save("../evil", [{"task_id": "t"}])                                     # never a path outside its dir
+    assert not (tmp_path / "evil.json").exists()
+    path.write_text("{not json")
+    assert store.load("eid-1") == []                                              # unreadable reads as empty
+    store.save("eid-1", [])
+    assert not path.exists()
+
+
+async def test_a_command_whose_future_failed_on_the_client_alone_keeps_the_stop_honest(monkeypatch):
+    # Review M3: the SDK's result watcher quitting fails EVERY open future locally ("SDK thread quit unexpectedly.")
+    # while the tasks live on; the handle was dropped and the stop answered `down` with the command still running
+    from hpc_bridge.server import _poll_task, _run_shell, _stop_endpoint
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app()
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"), pending=True)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    out = await _run_shell(app, "sleep 3000", agent_call=True)
+    assert out.phase == "running"
+    fut = runner.futures[-1]
+    fut.task_id = "cmd-1"
+    fut.fail(RuntimeError("SDK thread quit unexpectedly."))      # local only: the task is still on the endpoint
+    await _poll_task(app, out.task_id)
+    _scripted_login(monkeypatch, releases=["released 112\n"])
+    stop = await _stop_endpoint(app)
+    assert stop.status == "draining" and stop.spend_stopped is not True
+    assert "hpc-bridge's command whose result the client lost (task cmd-1) is still queued or running" in stop.notice
+    runner.lookup = _sdk_get_task(ok_ids=("cmd-1",))            # it finished on the endpoint
+    _scripted_login(monkeypatch)
+    assert (await _stop_endpoint(app)).status == "down"
+
+
+async def test_a_command_the_service_failed_is_not_kept(monkeypatch):
+    from hpc_bridge.server import _poll_task, _run_shell
+
+    app = _ssh_app()
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"), pending=True)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    out = await _run_shell(app, "false", agent_call=True)
+    fut = runner.futures[-1]
+    fut.task_id = "cmd-2"
+    fut.fail(TaskExecutionFailed("WorkerLost", "1"))           # the service's verdict: it is over
+    await _poll_task(app, out.task_id)
+    assert app.state.endpoint_id not in app.sent_checks
+
+
+def test_a_check_with_no_task_id_counts_for_a_bounded_time_then_is_dropped_with_a_line(capsys):
+    # Review item 4: a submit that failed after the service may have taken it has no id to look up; it counts as
+    # unknown for _NO_ID_BOUND_S, then goes (with a line on stderr); one the service certainly never took never counts
+    from hpc_bridge import warmth
+    from hpc_bridge.context import SentCheck
+
+    now = time.time()
+    lost = _PendingFuture()
+    lost.fail(TimeoutError("read timed out"))
+    assert warmth._local_state(SentCheck(future=lost, sent_at=now - 10), now) == "unknown"
+    assert warmth._local_state(SentCheck(future=lost, sent_at=now - warmth._NO_ID_BOUND_S - 1), now) == "unsent"
+    assert "no longer counted by stop_endpoint" in capsys.readouterr().err
+    cancelled = _PendingFuture()
+    cancelled.cancel()
+    assert warmth._local_state(SentCheck(future=cancelled, sent_at=now), now) == "unsent"
+    submitting = _PendingFuture()
+    assert warmth._local_state(SentCheck(future=submitting, sent_at=now), now) == "pending"
+
+
+async def test_the_whole_stop_call_is_bounded(monkeypatch):
+    # Review: the call must end well inside a client's 300 s tool timeout, a slow release and slow lookups included
+    import asyncio
+
+    from hpc_bridge import config, server, warmth
+    from hpc_bridge.models import ShellOutcome
+    from hpc_bridge.server import _stop_endpoint
+
+    app, runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    monkeypatch.setattr(config, "STOP_CALL_BUDGET_S", 0.5)
+
+    async def stuck(a, command, session_id="default", shape="compute"):
+        await asyncio.sleep(30)
+        return ShellOutcome(phase="complete", exit_code=0, stdout="released none\n", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", stuck)
+    t0 = time.monotonic()
+    res = await _stop_endpoint(app)
+    assert time.monotonic() - t0 < 3 and res.status == "draining"
+    assert "the cancel did not finish within this call" in res.notice
+    # a lookup that hangs: unknown at the lookup timeout, never `down`
+    monkeypatch.setattr(config, "STOP_CALL_BUDGET_S", 180.0)
+    monkeypatch.setattr(warmth, "_LOOKUP_TIMEOUT_S", 0.2)
+    runner.lookup = lambda tid: time.sleep(1.0) or {"pending": False, "status": "failed"}
+    _scripted_login(monkeypatch)
+    t0 = time.monotonic()
+    res = await _stop_endpoint(app)
+    assert time.monotonic() - t0 < 1 and res.status == "draining" and "could not be read" in res.notice
+
+
+async def test_a_block_that_answered_a_check_after_the_last_cancel_is_not_down(monkeypatch):
+    # Review: a check (another call's) answered by a block that came up after this stop's last cancel: up now
+    from hpc_bridge import server
+    from hpc_bridge.models import ShellOutcome
+    from hpc_bridge.server import _stop_endpoint
+
+    app, runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    runner.lookup = _sdk_get_task(ok_ids=("check-1",))            # the service: it ran — one more release follows
+    calls = {"release": 0}
+
+    async def run(a, command, session_id="default", shape="compute"):
+        if "HPCB_ERR" in command:
+            return ShellOutcome(phase="complete", exit_code=0, stdout="", block_state="warm")
+        calls["release"] += 1
+        if calls["release"] == 2:   # during the last cancel, another call's check is answered by a block coming up
+            runner._canary = _job_answer("6")
+            assert (await _ensure_endpoint_up(app)).status == "up"
+        return ShellOutcome(phase="complete", exit_code=0, stdout="released none\n", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", run)
+    res = await _stop_endpoint(app)
+    assert calls["release"] == 2 and res.status == "draining" and res.spend_stopped is not True
+    assert "a block came up and answered a check of hpc-bridge's after this stop's last cancel began" in res.notice
+
+
+async def test_a_connect_away_from_an_endpoint_with_a_check_queued_says_so(monkeypatch):
+    from hpc_bridge import connect
+    from hpc_bridge.facility.base import EndpointHandle
+    from tests.fakes import FakeCatalog, fake_entry
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+
+    class _Other(FakeFacility):
+        async def provision(self, profile):
+            return EndpointHandle(endpoint_id="other-eid", name="other", reused=False)
+
+    other = _Other()
+    other.workers = 1
+    monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")]))
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda e, *, account: other)
+
+    async def run_login(cmd):
+        from hpc_bridge.models import ShellOutcome
+        return ShellOutcome(phase="complete", block_state="warm", exit_code=0, stdout="")
+
+    res = await connect._connect_facility(app, "anvil", run_login=run_login)
+    assert app.state.endpoint_id == "other-eid"
+    assert ("On the endpoint this connect left (fake-eid), a check (or command) of hpc-bridge's not seen to finish may "
+            "still be queued") in res.notice and "teardown_endpoint there ends them" in res.notice
+
+
+async def test_a_kick_met_before_a_switch_does_not_keep_the_old_user_endpoint(monkeypatch):
+    # Review: `kicked_up` must ignore a replacement met on the terms switched away from — the new terms' block is a new
+    # request, with its own user endpoint
+    app = _fresh_app()
+    runner = _FakeRunner("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"))
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, partition="A", confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    rt.warm_confirmed_at -= 100
+    runner._canary = _job_answer("113")                             # a kicked reap on A
+    assert (await _ensure_endpoint_up(app)).status == "needs_confirmation" and rt.reap_kicked
+    block = rt.user_endpoint_config["hpcb_block"]
+    assert (await _ensure_endpoint_up(app, partition="B")).status == "needs_confirmation"
+    runner._canary = CanaryResult(ok=False, error="timeout")
+    await _ensure_endpoint_up(app, confirm_spend=True)
+    assert rt.user_endpoint_config["hpcb_block"] != block
+
+
+async def test_a_client_cancel_mid_wait_leaves_the_shape_and_checks_for_the_next_stop(monkeypatch):
+    # (from the review: passes) a client that times out mid-wait cancels the call: nothing dropped, the next stop works
+    import asyncio
+
+    from hpc_bridge import server
+    from hpc_bridge.server import _stop_endpoint
+
+    app, runner = _queued_app(monkeypatch, fresh=True)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    runner.lookup = _sdk_get_task()                                   # still pending
+    entered = asyncio.Event()
+
+    async def sleep(_s):
+        entered.set()
+        await asyncio.sleep(3600)
+
+    monkeypatch.setattr(server, "_sleep", sleep)
+    _scripted_login(monkeypatch)
+    task = asyncio.ensure_future(_stop_endpoint(app))
+    await entered.wait()
+    task.cancel()
+    try:
+        await task
+    except asyncio.CancelledError:
+        pass
+    assert "compute" in app.shapes and not app.lock.locked()
+    monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "0")
+    runner.lookup = _sdk_get_task(ok_ids=("check-1",))
+    _scripted_login(monkeypatch, releases=["released 7\n", "released 7\n"])
+    res = await _stop_endpoint(app)
+    assert res.status == "down" and "ran hpc-bridge's last check" in res.notice
+
+
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------
 
 
@@ -1734,7 +2202,10 @@ async def test_stop_after_a_dead_pbs_pilot_is_draining_naming_it(monkeypatch):
     assert res.status == "draining" and "Pilot 12.pbsserver FINISHED (exit status 42) before it ran it." in res.notice
     assert "check for the block on the default queue (task check-1) is still queued" in res.notice
     assert "still being submitted" not in res.notice and "idle-release" not in res.notice
-    assert "keeps resubmitting" not in res.notice and "only teardown" not in res.notice
+    assert "keeps resubmitting" not in res.notice
+    # an endpoint of an earlier plugin (one compute user endpoint): a cancel never ends the check there
+    assert "set up by an earlier hpc-bridge" in res.notice and "only teardown_endpoint does" in res.notice
+    assert "Call stop_endpoint again in about a minute" not in res.notice
     assert _kinds(log) == ["release"] and all("qdel" in c for _, c in log)
 
 

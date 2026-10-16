@@ -188,16 +188,27 @@ class DeadPilot:
 
 @dataclass
 class SentCheck:
-    """A check (canary) hpc-bridge sent to a COMPUTE user endpoint and has not seen a worker answer — #24's evidence.
-    While it is queued the endpoint can start a block to run it: after a stop cancelled one, parsl submits another for a
-    task still outstanding (live 2026-10-16, `queued_check_relaunch`). So a stop answers `down` only once every such
-    check has resolved (warmth._check_states). Kept past its runner's close and the shape's drop, per endpoint, in
-    `AppCtx.sent_checks`."""
+    """A task of ours sent to a COMPUTE user endpoint that has not been seen to finish — #24's evidence: a check
+    (canary) no worker has answered, or a command whose result the client lost (its future failed on the client's side
+    alone, e.g. the SDK's result watcher quitting, while the task lives on). While it is queued the endpoint can start a
+    block to run it: after a stop cancelled one, parsl submits another for a task still outstanding (live 2026-10-16,
+    `queued_check_relaunch`). So a stop answers `down` only once every one has resolved (warmth._check_states). Kept
+    past its runner's close and the shape's drop, per endpoint, in `AppCtx.sent_checks`, and on disk by task id
+    (state.SentCheckStore), so a restarted server still sees it."""
 
-    future: Any                  # the SDK's future: `task_id` once the web service registered the task
-    lookup: Callable[[str], Any] | None  # the SDK client's `get_task` (task id → {"pending", "status"}), or None
+    future: Any                  # the SDK's future (`task_id` once registered); None: read back from disk
+    client: Any = None           # the SDK Client that looks it up (get_task / get_batch_result); None: any of ours
     terms: tuple[str | None, str | None] = (None, None)  # the partition and account of the block it asked for
     dead: DeadPilot | None = None  # a pilot that died before it ran this check, to name
+    task_id: str | None = None   # as registered (the future's, or the one read back from disk)
+    sent_at: float = 0.0         # when it was sent (wall clock, time.time())
+    what: Literal["check", "command"] = "check"
+
+    @property
+    def tid(self) -> str | None:
+        """Its task id: the one recorded, else the future's once the web service registered it."""
+        got = self.task_id or getattr(self.future, "task_id", None)
+        return str(got) if got else None
 
 
 @dataclass
@@ -287,11 +298,14 @@ class AppCtx:
     # often a switch, a stop or a reconnect let go of it and it answered again (warmth._answering_block_since).
     # Bounded; kept for the endpoint a reconnect binds again, like `billed_to`, and dropped by a bind to another one.
     job_seen_since: dict[tuple[str | None, str], float] = field(default_factory=dict)
-    # Per endpoint id: the checks of ours its compute user endpoints may still hold (SentCheck), taken from each compute
-    # runner as it is retired (a stop, a switch, a rebuild, a re-bind: warmth._retire_runner), so a later stop still
-    # sees them. A stop drops the ones it found resolved; a teardown drops the endpoint's. Keyed by endpoint, so a
-    # reconnect to the same one keeps them.
+    # Per endpoint id: the tasks of ours its compute user endpoints may still hold (SentCheck), taken from each compute
+    # runner as it is retired (a stop, a switch, a rebuild, a re-bind: warmth._retire_runner), from a command whose
+    # result the client lost, and from disk after a restart (warmth._our_checks), so a later stop still sees them. A
+    # stop drops the ones it found resolved; a teardown drops the endpoint's. Keyed by endpoint, so a reconnect to the
+    # same one keeps them.
     sent_checks: dict[str, list[SentCheck]] = field(default_factory=dict)
+    # Per endpoint id: the task ids last written to disk for it (warmth._persist_checks writes only on a change).
+    persisted_checks: dict[str, frozenset[str]] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
 

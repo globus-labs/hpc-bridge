@@ -310,6 +310,8 @@ async def _connect_facility(
             left = warmth._leave_block(app, DEFAULT_SHAPE, compute, how="reconnect")
         sched = getattr(app.facility, "scheduler", None)
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's blocks/handles are gone
+        # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
+        queued_left = 0 if old_mep else warmth._unresolved_count(app, old_eid)
         # Blocks a facility stop, detach or switch left belong to THAT endpoint: a reconnect to it keeps them (the next
         # stop still names them); a bind to any other endpoint drops them, and the account its identity was mapped to.
         here = None if "login" in _facility_shapes(fac) else getattr(fac, "endpoint_id", None)
@@ -329,7 +331,7 @@ async def _connect_facility(
             res = await _connect_mep(app, facility, fac)
             if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
                 res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
-            res.notice = login_note + presets_note + (res.notice or "")
+            res.notice = login_note + presets_note + _left_checks_note(app, old_eid, queued_left) + (res.notice or "")
             return res
         # An MFA facility (curated `auth_method: mfa-otp`) with no shared connection yet: don't burn a failing
         # SSH attempt (and a fail2ban strike) to learn what the entry already says — hand off first. But ONLY
@@ -371,6 +373,7 @@ async def _connect_facility(
     reused = app.state.reused and facility not in app.bootstrapped_facilities
     if prior_spend > 0 or left is not None:  # say what it cost, and name a block left billing, rather than lose them
         reuse_note = _prior_note(prior_spend, left, sched, same=False, old_mep=old_mep) + reuse_note
+    reuse_note = _left_checks_note(app, old_eid, queued_left) + reuse_note
     terms = _next_block_terms(app)
     if block != "warm":  # login node still coming up — nothing to read yet
         return ConnectFacilityResult(
@@ -410,6 +413,17 @@ async def _connect_facility(
                              "login node is up; the allocation listing returned none. ")
         + _connect_terms_note(app, terms, listed=bool(allocations)),
     )
+
+def _left_checks_note(app: AppCtx, old_eid: str | None, queued: int) -> str:
+    """A connect that LEFT an SSH endpoint where tasks of ours were not seen to finish (#24): while one is queued
+    there, that endpoint can start a block for it — nothing of this connect ends it. Silent on a reconnect to it."""
+    if not queued or old_eid is None or app.state.endpoint_id == old_eid:
+        return ""
+    things = "a check (or command) of hpc-bridge's" if queued == 1 else f"{queued} checks (or commands) of hpc-bridge's"
+    return (f"On the endpoint this connect left ({old_eid}), {things} not seen to finish may still be queued: while "
+            "one is, that endpoint can start a billed block to run it. Connecting back to it and calling "
+            "stop_endpoint cancels such a block and says when none is left; teardown_endpoint there ends them. ")
+
 
 def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, same: bool, old_mep: bool) -> str:
     """What a re-bind did to the previous binding's blocks, with the session spend so far. An SSH facility's shapes are

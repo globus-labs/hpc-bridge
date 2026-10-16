@@ -8,6 +8,7 @@ import time
 from concurrent.futures import Future
 
 import pytest
+from globus_compute_sdk.errors import TaskExecutionFailed
 
 from hpc_bridge import scheduler_ops
 from hpc_bridge.context import ShapeRuntime, TaskHandle
@@ -279,7 +280,7 @@ async def test_stop_after_a_reap_check_waits_for_the_pilot_that_check_may_have_r
     assert res.status == "draining" and res.spend_stopped is not True
     assert "(task check-1) is still queued on the endpoint" in res.notice
     # the endpoint gives it up (its pilot cancelled): the next stop is `down`
-    runner.checks[0].fail(RuntimeError("bad state"))
+    runner.checks[0].fail(TaskExecutionFailed("BadStateException", "0"))
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.spend_stopped is True
 

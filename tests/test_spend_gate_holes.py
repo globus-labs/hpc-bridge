@@ -15,6 +15,7 @@ import time
 from pathlib import Path
 
 import pytest
+from globus_compute_sdk.errors import TaskExecutionFailed
 
 from hpc_bridge import binding, connect, notices, scheduler_ops, server, warmth
 from hpc_bridge.context import LeftBlock
@@ -665,7 +666,7 @@ async def test_a_confirmation_on_new_terms_does_not_end_the_old_terms_queued_che
     stop = await _stop_endpoint(app)
     assert stop.status == "draining" and "check for the block on partition 'debug'" in stop.notice
     assert "partition 'compute'" not in stop.notice
-    runners[0].checks[0].fail(RuntimeError("bad state"))                # the debug endpoint gives it up
+    runners[0].checks[0].fail(TaskExecutionFailed("BadStateException", "0"))                # the debug endpoint gives it up
     stop = await _stop_endpoint(app)
     assert stop.status == "down" and "has given up hpc-bridge's check for the block on partition 'debug'" in stop.notice
 

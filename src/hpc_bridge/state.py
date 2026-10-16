@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 from dataclasses import asdict, dataclass
 from pathlib import Path
 
@@ -122,3 +123,58 @@ class FacilityStore:
         data = self._load()
         if data.pop(ssh_host, None) is not None:
             self._save(data)
+
+
+_SAFE_ID = re.compile(r"[A-Za-z0-9][A-Za-z0-9._-]{0,127}")
+
+
+class SentCheckStore:
+    """The tasks of ours an SSH endpoint's compute user endpoints may still hold (#24's evidence: a check no worker has
+    answered, or a command whose result the client lost), by task id, so a server that restarts — Claude Code relaunched
+    — still sees them: a new process bound to the same endpoint must not answer a stop `down` while one is queued.
+    One small file per endpoint, `~/.hpc-bridge/sent-checks/<endpoint id>.json`, 0600, written atomically (a temp file,
+    then a rename), holding only `{task_id, partition, account, sent_at, what}` rows — never a command's text. The
+    rows still unresolved are rewritten on each change (warmth._persist_checks); a teardown removes the file.
+    Best-effort: an unreadable or unwritable file reads as empty and never fails a tool call."""
+
+    def __init__(self, root: Path | str | None = None) -> None:
+        self.root = Path(root) if root else _state_dir() / "sent-checks"
+
+    def _path(self, endpoint_id: str) -> Path | None:
+        return self.root / f"{endpoint_id}.json" if _SAFE_ID.fullmatch(endpoint_id or "") else None
+
+    def load(self, endpoint_id: str) -> list[dict]:
+        path = self._path(endpoint_id)
+        if path is None or not path.exists():
+            return []
+        try:
+            rows = json.loads(path.read_text()).get("tasks", [])
+        except (json.JSONDecodeError, OSError, AttributeError):
+            return []
+        return [r for r in rows if isinstance(r, dict) and isinstance(r.get("task_id"), str)]
+
+    def save(self, endpoint_id: str, rows: list[dict]) -> None:
+        path = self._path(endpoint_id)
+        if path is None:
+            return
+        if not rows:
+            self.remove(endpoint_id)
+            return
+        try:
+            path.parent.mkdir(parents=True, exist_ok=True)
+            tmp = path.with_name(f".{path.name}.{os.getpid()}.tmp")
+            fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+            with os.fdopen(fd, "w") as fh:
+                json.dump({"tasks": rows}, fh, indent=1, sort_keys=True)
+            os.replace(tmp, path)
+        except OSError:
+            return
+
+    def remove(self, endpoint_id: str) -> None:
+        path = self._path(endpoint_id)
+        if path is None:
+            return
+        try:
+            path.unlink(missing_ok=True)
+        except OSError:
+            return

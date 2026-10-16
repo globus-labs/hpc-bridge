@@ -40,7 +40,8 @@ def test_the_stops_wait_for_our_checks_is_bounded_and_configurable(monkeypatch):
     monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "0")
     assert config.stop_check_wait_s() == 0.0
     monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "10000")
-    assert config.stop_check_wait_s() == 300.0                     # a tool call must not outlive a client's window
+    assert config.stop_check_wait_s() == 120.0                     # the whole call fits its budget
+    assert config.STOP_CALL_BUDGET_S <= 180.0                      # under a 300 s client tool timeout
     monkeypatch.setenv("HPC_BRIDGE_STOP_CHECK_WAIT_S", "-5")
     assert config.stop_check_wait_s() == 0.0
 

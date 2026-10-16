@@ -87,12 +87,17 @@ def release_backoff_s() -> float:
 # bounds the call; a check still queued at the end is said as such (`draining`), never presumed gone. Read at each
 # stop; 0 turns the wait off.
 STOP_CHECK_WAIT_S = 90.0
-_STOP_CHECK_WAIT_MAX_S = 300.0
+_STOP_CHECK_WAIT_MAX_S = 120.0
+# The most one stop_endpoint call takes, its releases and task lookups included: under the 300 s a tool call may run in
+# the clients that drive hpc-bridge (Hermes, Pi), with room for the heartbeat and the answer. Past it, a stop says what
+# it could not confirm (`draining`) instead of running on.
+STOP_CALL_BUDGET_S = 180.0
 
 
 def stop_check_wait_s() -> float:
     """The stop's bounded wait for our queued checks: STOP_CHECK_WAIT_S, unless HPC_BRIDGE_STOP_CHECK_WAIT_S overrides
-    it (within [0, 300] s: past that a tool call outlives a client's window)."""
+    it (within [0, 120] s, so the whole call — a release before it, and one more release and lookups after — fits in
+    STOP_CALL_BUDGET_S)."""
     return min(max(0.0, _env_float("HPC_BRIDGE_STOP_CHECK_WAIT_S", STOP_CHECK_WAIT_S)), _STOP_CHECK_WAIT_MAX_S)
 
 
@@ -102,8 +107,9 @@ UEP_IDLE_HEARTBEATS = 20
 
 
 def uep_idle_heartbeats() -> int:
-    """HPC_BRIDGE_UEP_IDLE_HEARTBEATS, else UEP_IDLE_HEARTBEATS: a whole number >= 0. 0 keeps every compute user
-    endpoint running once started — and then hpc-bridge does not start a fresh one per block request."""
+    """HPC_BRIDGE_UEP_IDLE_HEARTBEATS, else UEP_IDLE_HEARTBEATS: a whole number >= 0, written into the template of an
+    endpoint hpc-bridge configures from now on. 0 there keeps every compute user endpoint running once started, so such
+    an endpoint gets no fresh one per block request. An endpoint configured earlier keeps what its own template says."""
     raw = _env_float("HPC_BRIDGE_UEP_IDLE_HEARTBEATS", UEP_IDLE_HEARTBEATS)
     return int(raw) if math.isfinite(raw) and raw >= 0 else UEP_IDLE_HEARTBEATS
 

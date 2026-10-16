@@ -14,7 +14,10 @@ class Profile:
     # Heartbeats (30 s each) a COMPUTE user endpoint stays up once idle — no task outstanding, at least one forwarded —
     # before it exits (globus-compute-endpoint's `idle_heartbeats_soft`; 0 = never, which also leaves its hard idle
     # limit off). 20 = 10 min, the block's own idle window: hpc-bridge starts a fresh compute user endpoint per block
-    # request (warmth._fresh_block), so each must go once its block has. The login user endpoint never exits.
+    # request (warmth._fresh_block), so each must go once its block has. The login user endpoint never exits. It is
+    # WRITTEN into the template when hpc-bridge configures an endpoint, so it governs only endpoints configured under
+    # it: an endpoint is given fresh user endpoints by what its own published template says (`fresh_ueps`), whatever
+    # this value is now.
     uep_idle_heartbeats: int = 20
 
     def __post_init__(self) -> None:

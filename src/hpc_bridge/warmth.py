@@ -21,9 +21,12 @@ import dataclasses
 import inspect
 import re
 import secrets
+import sys
 import time
 from dataclasses import replace
 from typing import Any, Literal
+
+from globus_compute_sdk.errors import SerdeError, TaskExecutionFailed
 
 from . import dispatch, session_shell
 from .config import (
@@ -70,8 +73,9 @@ from .notices import (
     _transient_dispatch_failure,
     _with_submission_notice,
 )
-from .runner import CanaryResult, GlobusRunner
+from .runner import CanaryResult, GlobusRunner, never_sent
 from .shapes import SHAPES, shape_config
+from .state import SentCheckStore
 
 
 def _shape_reject(app: AppCtx, shape: str) -> str | None:
@@ -237,6 +241,7 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     timeout = canary_timeout_s()
     result = await runner.canary(timeout=timeout)
     rt.last_canary = result  # keep failures too: the error text is the diagnosis the caller needs
+    _note_checks_sent(app, shape, rt)  # on disk too: a server that restarts must still see a check still queued
     if result.ok and result.worker_user:  # the account the work runs as (a facility's identity mapping): for squeue -u
         app.worker_user = result.worker_user
     if result.ok:  # its job is up: the first proof dates it (for its walltime), on whatever terms it is met again
@@ -616,7 +621,9 @@ async def _provision(
         # facility's configured default (the startup pin's), both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
-        kicked_up = rt.reap_kicked and rt.last_canary is not None and rt.last_canary.ok  # a replacement already up
+        # a replacement already up — on these terms: a kick met before a switch is the other terms' block
+        kicked_up = (rt.reap_kicked and rt.last_canary is not None and rt.last_canary.ok
+                     and (rt.reap_terms is None or rt.reap_terms == _terms_of(rt)))
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
@@ -766,6 +773,21 @@ def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoc
     if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
         _note_dead_pilot(rt, job, exit_status, jobs)
 
+def _check_key(c: SentCheck) -> object:
+    """One task, however it was found: its task id once registered, else its future."""
+    return c.tid or id(c.future)
+
+def _locally_resolved(c: SentCheck) -> bool:
+    """Known resolved without asking the service: a worker answered it, the service failed it (TaskExecutionFailed is
+    the service's own verdict), or it was certainly never sent."""
+    f = c.future
+    if f is None or not f.done():
+        return False
+    if f.cancelled():
+        return c.tid is None
+    exc = f.exception()
+    return exc is None or isinstance(exc, TaskExecutionFailed) or never_sent(f)
+
 def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
     """Close a shape's runner — and, for a billed shape, first hand the checks it sent that no worker has answered to
     the endpoint (`AppCtx.sent_checks`), with the terms they asked for and the pilot that died there: closing it drops
@@ -776,65 +798,232 @@ def _retire_runner(app: AppCtx, rt: ShapeRuntime) -> None:
         return
     eid = getattr(runner, "endpoint_id", None)
     if _billable(rt) and eid is not None and _has_login_shape(app):  # (a facility endpoint's stop never looks)
-        sent: list[tuple[Any, Any]] = getattr(runner, "sent_checks", list)()
+        sent: list[tuple[Any, Any, float]] = getattr(runner, "sent_checks", list)()
         if sent:
-            kept = app.sent_checks.setdefault(eid, [])
-            known = {id(c.future) for c in kept}
-            kept.extend(SentCheck(future=f, lookup=look, terms=_runner_terms(runner, rt), dead=rt.dead_pilot)
-                        for f, look in sent if id(f) not in known)
-            del kept[:-_SENT_CHECKS_MAX]
+            _keep_checks(app, eid, [SentCheck(future=f, client=client, terms=_runner_terms(runner, rt),
+                                              dead=rt.dead_pilot, task_id=getattr(f, "task_id", None), sent_at=at)
+                                    for f, client, at in sent])
     runner.close()
 
-# More than any session sends while checks stay queued; the oldest go first.
+# Past this many kept per endpoint, the ones KNOWN resolved (answered, failed by the service, never sent) go first,
+# oldest first. One still unresolved is never dropped: a dropped one could make a later stop's `down` a lie.
 _SENT_CHECKS_MAX = 64
 
+def _keep_checks(app: AppCtx, eid: str, new: list[SentCheck]) -> None:
+    """Add tasks to the endpoint's evidence (not twice), bound it without ever dropping an unresolved one, and write
+    it to disk. Callers hold app.lock."""
+    kept = app.sent_checks.setdefault(eid, [])
+    known = {_check_key(c) for c in kept}
+    for c in new:
+        if _check_key(c) not in known:
+            kept.append(c)
+            known.add(_check_key(c))
+    excess = len(kept) - _SENT_CHECKS_MAX
+    if excess > 0:  # oldest first (kept is in arrival order), and only what is known resolved
+        gone = {id(c) for c in [c for c in kept if _locally_resolved(c)][:excess]}
+        kept[:] = [c for c in kept if id(c) not in gone]
+    _persist_checks(app, eid)
+
+def _persist_checks(app: AppCtx, eid: str, extra: list[SentCheck] | None = None) -> None:
+    """Write the endpoint's unresolved tasks with a task id (and `extra`: the current compute runner's) to disk — only
+    when that set changed — so a restarted server still sees them (state.SentCheckStore). Only for an SSH endpoint:
+    a facility endpoint's stop never looks. Callers hold app.lock."""
+    if not _has_login_shape(app):
+        return
+    rows: dict[str, dict] = {}
+    for c in [*app.sent_checks.get(eid, []), *(extra or [])]:
+        tid = c.tid
+        if tid is None or _locally_resolved(c):
+            continue
+        rows[tid] = {"task_id": tid, "partition": c.terms[0], "account": c.terms[1], "sent_at": c.sent_at,
+                     "what": c.what}
+    if app.persisted_checks.get(eid) == frozenset(rows):
+        return
+    SentCheckStore().save(eid, list(rows.values()))
+    app.persisted_checks[eid] = frozenset(rows)
+
+def _forget_checks(app: AppCtx, eid: str) -> None:
+    """The endpoint is gone (a teardown): nothing of it can start a block any more. Callers hold app.lock."""
+    app.sent_checks.pop(eid, None)
+    app.persisted_checks.pop(eid, None)
+    SentCheckStore().remove(eid)
+
+def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
+    """The current compute runner's sent, unanswered checks, as evidence items."""
+    if rt is None or rt.runner is None or not _billable(rt):
+        return []
+    return [SentCheck(future=f, client=client, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot,
+                      task_id=getattr(f, "task_id", None), sent_at=at)
+            for f, client, at in getattr(rt.runner, "sent_checks", list)()]
+
+def _note_checks_sent(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
+    """After a check went out: write the endpoint's evidence, the current runner's included, to disk — a server that
+    restarts before this runner is retired must still see a check it sent. Callers hold app.lock."""
+    eid = app.state.endpoint_id
+    if eid is not None and shape == DEFAULT_SHAPE and _has_login_shape(app):
+        _persist_checks(app, eid, _current_checks(app, rt))
+
 def _our_checks(app: AppCtx, eid: str, rt: ShapeRuntime | None) -> list[SentCheck]:
-    """Every check of ours a stop must see resolve before `down`: the ones the endpoint kept from retired runners, and
-    the ones the current compute runner sent. Callers hold app.lock."""
-    checks = list(app.sent_checks.get(eid, []))
-    known = {id(c.future) for c in checks}
-    if rt is not None and rt.runner is not None and _billable(rt):
-        checks += [SentCheck(future=f, lookup=look, terms=_runner_terms(rt.runner, rt), dead=rt.dead_pilot)
-                   for f, look in getattr(rt.runner, "sent_checks", list)() if id(f) not in known]
-    return checks
+    """Every task of ours a stop must see resolve before `down`: the ones the endpoint kept (from retired runners, lost
+    commands, and — after a restart — read back from disk by task id), and the ones the current compute runner sent.
+    Callers hold app.lock."""
+    kept = app.sent_checks.setdefault(eid, [])
+    current = _current_checks(app, rt)
+    known = {_check_key(c) for c in [*kept, *current]}
+    for row in SentCheckStore().load(eid):  # a restart (or another process) left them: adopt what is not known
+        if row["task_id"] not in known:
+            kept.append(SentCheck(future=None, terms=(row.get("partition"), row.get("account")), task_id=row["task_id"],
+                                  sent_at=float(row.get("sent_at") or 0.0),
+                                  what="command" if row.get("what") == "command" else "check"))
+            known.add(row["task_id"])
+    if not kept:
+        app.sent_checks.pop(eid, None)
+    in_kept = {_check_key(c) for c in kept}
+    return [*kept, *[c for c in current if _check_key(c) not in in_kept]]
+
+def _unresolved_count(app: AppCtx, eid: str | None) -> int:
+    """How many tasks of ours an endpoint may still hold, without asking the service: the ones kept in memory not known
+    resolved, plus those on disk not among them. Callers hold app.lock."""
+    if eid is None:
+        return 0
+    kept = app.sent_checks.get(eid, [])
+    known = {_check_key(c) for c in kept}
+    return (sum(1 for c in kept if not _locally_resolved(c))
+            + sum(1 for row in SentCheckStore().load(eid) if row["task_id"] not in known))
+
+def _keep_lost_command(app: AppCtx, shape: str, rt: ShapeRuntime | None, fut: Any, client: Any) -> None:
+    """A command whose future FAILED on the client's side alone — not the service's verdict (TaskExecutionFailed), on
+    a task the web service registered (a task id): e.g. "SDK thread quit unexpectedly.", which fails every open future
+    while the tasks live on. Its handle is gone, but the endpoint may still run it — or start a block for it after a
+    stop — so it is kept as evidence like a check. Only for a billed shape on an SSH endpoint. Callers hold app.lock."""
+    eid = app.state.endpoint_id
+    if eid is None or rt is None or not _billable(rt) or not _has_login_shape(app) or shape != DEFAULT_SHAPE:
+        return
+    if not fut.done() or fut.cancelled() or getattr(fut, "task_id", None) is None:
+        return
+    exc = fut.exception()
+    if exc is None or isinstance(exc, TaskExecutionFailed):
+        return
+    _keep_checks(app, eid, [SentCheck(future=fut, client=client, terms=_terms_of(rt), task_id=str(fut.task_id),
+                                      sent_at=time.time(), what="command")])
 
 CheckState = Literal["ok", "failed", "pending", "unknown", "unsent"]
 
-def _check_state(c: SentCheck) -> CheckState:
-    """Where one check of ours stands — `ok` (a worker ran it), `failed` (the endpoint gave it up: a rejection, a bad
-    state after its first pilot died or was cancelled), `pending` (still queued: the endpoint can start a block for
-    it), `unsent` (cancelled before the web service took it), or `unknown` (its task could not be looked up: read as
-    pending). A future that FAILED locally may be the client's failure alone (the result watcher quitting, a cancel),
-    so a registered task is asked about by id. Blocking (a web call): run it off the event loop and the lock."""
+# A task whose submit failed in a way that leaves it unclear whether the web service took it (no task id: a timeout, a
+# 5xx, a malformed answer) reads `unknown` for this long after it was sent, then is dropped with a line on stderr — an
+# entry with no id can never be looked up. Taken, it reaches its user endpoint within seconds; a fresh user endpoint
+# scales out on its first 5 s pass, and once its first pilot is cancelled or dies parsl gives the task up at its next
+# 60 s status poll (bad state). 300 s covers the user endpoint's start (tens of seconds), that poll and pass, and the
+# failure reaching the service, with margin. (On an endpoint of an earlier plugin, which keeps one user endpoint, no
+# bound is exact: such a task could still start a block after it. A rare case — a submit that failed after the
+# service took it — and named in the notice while it lasts.)
+_NO_ID_BOUND_S = 300.0
+_DROPPED_NO_ID: set[int] = set()
+
+def _local_state(c: SentCheck, now: float) -> CheckState | None:
+    """What a task's own future says, or None when the service must be asked (by task id)."""
     f = c.future
-    done, cancelled = f.done(), f.cancelled()
-    if done and not cancelled and f.exception() is None:
-        return "ok"
-    task_id = getattr(f, "task_id", None)
-    if task_id is None:  # never registered: the close cancelled it unsent — or the submitter still holds it
-        return "unsent" if done else "pending"
-    if c.lookup is None:
-        return "failed" if done and not cancelled else "pending"
-    try:
-        task = c.lookup(task_id)
-    except Exception:  # noqa: BLE001 - a lookup that fails says nothing: the honest side is "still queued"
+    if f is not None and f.done() and not f.cancelled():
+        exc = f.exception()
+        if exc is None:
+            return "ok"
+        if isinstance(exc, TaskExecutionFailed):
+            return "failed"  # the service's verdict, delivered to the future
+    if c.tid is not None:
+        return None
+    if f is None or never_sent(f):
+        return "unsent"
+    if not f.done():
+        return "pending"  # still being submitted
+    if now - c.sent_at < _NO_ID_BOUND_S:
+        return "unknown"  # the submit failed after the service may have taken it
+    if id(f) not in _DROPPED_NO_ID:
+        _DROPPED_NO_ID.add(id(f))
+        print(f"hpc-bridge: a {c.what} whose submit failed without a task id ({type(f.exception()).__name__}) is no "
+              f"longer counted by stop_endpoint, {int(now - c.sent_at)} s after it was sent", file=sys.stderr)
+    return "unsent"
+
+def _status_state(task: object) -> CheckState:
+    """A task dict as the SDK returns it (`{"pending", "status", …}`): pending while `pending` is not False; then
+    `success` (with a result, or with none: it finished) is `ok`, anything else `failed`."""
+    if not isinstance(task, dict):
         return "unknown"
-    if not isinstance(task, dict) or task.get("pending", True):
+    if task.get("pending", True) is not False:
         return "pending"
     return "ok" if str(task.get("status", "")).lower() == "success" else "failed"
 
-async def _check_states(checks: list[SentCheck]) -> list[CheckState]:
-    """`_check_state` for each, off the event loop (each may be a web call)."""
-    return [await asyncio.to_thread(_check_state, c) for c in checks]
+def _task_state(client: Any, tid: str) -> CheckState:
+    """One task, by id (`Client.get_task`). SDK 4.18 RAISES `TaskExecutionFailed` for a task the endpoint failed with an
+    exception — a check failed by bad state, a REJECTED submission, a dead first pilot: that is the service's verdict,
+    `failed`. A `SerdeError` arises only for a finished task's result this process cannot read: it finished, `ok`.
+    Anything else (transport, auth, an unexpected answer) says nothing: `unknown`, read as still queued."""
+    try:
+        task = client.get_task(tid)
+    except TaskExecutionFailed:
+        return "failed"
+    except SerdeError:
+        return "ok"
+    except Exception:  # noqa: BLE001 - a lookup that fails says nothing: the honest side is "still queued"
+        return "unknown"
+    return _status_state(task)
+
+def _lookup_states(client: Any, tids: list[str]) -> dict[str, CheckState]:
+    """Several tasks of one client, in one round trip where the SDK can (`get_batch_result`); a task it leaves out (it
+    drops one the service failed with an exception, logging it) is asked alone. Blocking: run it off the loop."""
+    if client is None:
+        return {t: "unknown" for t in tids}
+    out: dict[str, CheckState] = {}
+    batch = getattr(client, "get_batch_result", None)
+    if callable(batch) and len(tids) > 1:
+        try:
+            got = batch(list(tids))
+        except Exception:  # noqa: BLE001 - transport / auth: nothing to read for any of them
+            return {t: "unknown" for t in tids}
+        if isinstance(got, dict):
+            out = {t: _status_state(got[t]) for t in tids if t in got}
+    return {t: out[t] if t in out else _task_state(client, t) for t in tids}
+
+# The most one round of lookups may take (a web call per client; the SDK's own timeouts are longer).
+_LOOKUP_TIMEOUT_S = 20.0
+
+async def _check_states(checks: list[SentCheck], fallback: Any = None,
+                        timeout: float = _LOOKUP_TIMEOUT_S) -> list[CheckState]:
+    """Where each task of ours stands: `ok` (it ran), `failed` (the endpoint gave it up: a rejection, a bad state after
+    its first pilot died or was cancelled), `pending` (still queued: the endpoint can start a block for it), `unsent`
+    (the service never took it, or an id-less one past `_NO_ID_BOUND_S`), or `unknown` (it could not be read: read as
+    pending). A future that failed on the client's side alone (the result watcher quitting) is asked about by id,
+    batched per client (`fallback`: the client for a task read back from disk), all within `timeout` — past it, every
+    task still to be read is `unknown`."""
+    now = time.time()
+    states: list[CheckState | None] = [_local_state(c, now) for c in checks]
+    groups: dict[int, tuple[Any, list[str]]] = {}
+    for c, st in zip(checks, states, strict=True):
+        if st is None and c.tid is not None:
+            client = c.client if c.client is not None else fallback
+            groups.setdefault(id(client), (client, []))[1].append(c.tid)
+    found: dict[str, CheckState] = {}
+    if groups:
+        try:
+            parts = await asyncio.wait_for(
+                asyncio.gather(*(asyncio.to_thread(_lookup_states, cl, list(dict.fromkeys(ts)))
+                                 for cl, ts in groups.values())),
+                timeout=max(timeout, 0.01))
+            for part in parts:
+                found.update(part)
+        except TimeoutError:
+            pass  # what was not read in time stays unknown
+    return [st if st is not None else found.get(c.tid or "", "unknown") for c, st in zip(checks, states, strict=True)]
 
 def _settle_checks(app: AppCtx, eid: str, checks: list[SentCheck], states: list[CheckState]) -> None:
-    """After a stop looked: the endpoint keeps only the checks still queued (or unknown). Callers hold app.lock."""
-    resolved = {id(c.future) for c, s in zip(checks, states, strict=True) if s in ("ok", "failed", "unsent")}
-    kept = [c for c in app.sent_checks.get(eid, []) if id(c.future) not in resolved]
+    """After a stop looked: the endpoint keeps only the tasks still queued (or unknown), on disk too. Callers hold
+    app.lock."""
+    resolved = {_check_key(c) for c, s in zip(checks, states, strict=True) if s in ("ok", "failed", "unsent")}
+    kept = [c for c in app.sent_checks.get(eid, []) if _check_key(c) not in resolved]
     if kept:
         app.sent_checks[eid] = kept
     else:
         app.sent_checks.pop(eid, None)
+    _persist_checks(app, eid)
 
 def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     """A confirmation that asks for a NEW block gets its own compute user endpoint: a fresh `hpcb_block` token in the
@@ -1255,6 +1444,9 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         return None  # still running
     app.tasks.pop(task_id, None)  # atomic claim under the lock
     out = _finished_outcome(handle)
+    # its future failed on the client's side alone (not the service's verdict): the task may live on — evidence
+    runner = getattr(handle.runtime, "runner", None)
+    _keep_lost_command(app, handle.shape, handle.runtime, fut, getattr(runner, "task_client", lambda: None)())
     if handle.guard is not None and (refused := _guard_refusal(out, handle.guard)) is not None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
         return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,
