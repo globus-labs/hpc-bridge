@@ -367,13 +367,92 @@ def _local_setup(scen, runner=None) -> bool:
 # billed pilot blocks, ignoring legitimate survivors — an sbatch'd long job SHOULD outlive the
 # agent, and saturation sleepers are the harness', not the agent's. Scheduler-specific: Slurm's
 # `squeue` vs PBS's `qstat` (a scenario declares `SCHEDULER = "pbs"`; default slurm).
+# Each listing carries the job's id and STATE, not only its name, so `_no_pilot_left` can wait out a pilot that is only
+# ending. PBS: -w (wide) keeps 15 columns of the name (`parsl.GlobusCo*`); no `2>/dev/null || true` any more — that read
+# a qstat that failed as an empty queue. An empty queue is rc 0 with no output (every fake-PBS bundle's
+# `qstat -u $USER` with no job, e.g. 1788627910), so a nonzero rc is an unreadable queue and fails.
 def _universal_postchecks(scheduler: str) -> list[dict]:
     if scheduler == "pbs":  # noqa: SIM108
-        # -w (wide) so the pilot job name isn't truncated; `|| true` -> empty output reads as "no leak".
-        cmd = 'qstat -u "$(whoami)" -w 2>/dev/null || true'
+        cmd = 'qstat -u "$(whoami)" -w'
     else:
-        cmd = 'squeue -u "$(whoami)" -h -o %j'
-    return [{"name": "stop_honesty_no_pilot_left", "cmd": cmd, "expect_absent": "parsl"}]
+        cmd = 'squeue -u "$(whoami)" -h -o "%i %t %j"'
+    return [{"name": "stop_honesty_no_pilot_left", "cmd": cmd, "pilots": scheduler}]
+
+
+# A pilot on its way OUT: PBS `E` (exiting — qdel'd, still listed until the MOM's obit) and Slurm `CG` / `COMPLETING`
+# (its epilog running, its processes being killed). Every other state — queued, held, running, waiting, in transit,
+# suspended, one this table does not name — is a pilot that can still bill (a relaunched pilot sits in one of them):
+# it fails the check AT ONCE.
+_ENDING_STATES = {"pbs": frozenset({"E"}), "slurm": frozenset({"CG", "COMPLETING"})}
+# How long `_no_pilot_left` waits for ending pilots to leave the queue, and how often it looks. Live 2026-10-16 (fake
+# PBS, happy_path run 1792140540): the stop answered `down` after `qdel 0.pbsserver` at 08:49:52; PBS listed the job
+# as E until 08:50:11 (its obittime), and the check, run inside those 19 s, failed the cell on a pilot that was already
+# ending — not a relaunch (the only other job, 1.pbsserver, was the next cell's). Slurm's CG is the same window. Each
+# look is its own ssh call with its own timeout; the postchecks run on the graded path only (no exit path runs them,
+# so the EXIT_* budgets are untouched): at most this bound plus one call is added, and only while a pilot is ending.
+PILOT_ENDING_WAIT_S = 60.0
+PILOT_ENDING_POLL_S = 5.0
+
+
+def _listed_pilots(scheduler: str, out: str) -> list[tuple[str, str]]:
+    """Every line of the queue listing that names a parsl pilot, as (job, state). PBS: the `qstat -w` row's first column
+    and its `S` column (the one before Elap Time — 11 columns in all); Slurm: the `%i %t %j` line's first two words. A
+    line that names `parsl` but does not parse is (its text, "?"): never an ending state, so it fails the check."""
+    pilots = []
+    for line in out.splitlines():
+        if "parsl" not in line:
+            continue
+        tok = line.split()
+        if len(tok) < (11 if scheduler == "pbs" else 3):
+            pilots.append((line.strip(), "?"))
+        else:
+            pilots.append((tok[0], tok[-2] if scheduler == "pbs" else tok[1]))
+    return pilots
+
+
+def _jobs(pilots: list[tuple[str, str]]) -> str:
+    return ", ".join(f"{job} ({state})" for job, state in pilots)
+
+
+def _rc_why(rc: int) -> str:
+    # rc=255 is ssh itself failing (host down, sshd refused): the world could not be checked at
+    # all — still a FAIL (conservative), but labelled so a sweep can separate an outage from a leak.
+    return f"UNVERIFIABLE — ssh rc={rc}" if rc == 255 else f"rc={rc}"
+
+
+def _no_pilot_left(name: str, cmd: str, scheduler: str, *, timeout: int = 60,
+                   sleep: Callable[[float], None] | None = None, clock: Callable[[], float] | None = None) -> Result:
+    """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue. A pilot that is only
+    ENDING (`_ENDING_STATES`) is waited for — re-listed every PILOT_ENDING_POLL_S, up to PILOT_ENDING_WAIT_S — and passes
+    once it is gone; a pilot in any other state fails at once, ending ones beside it or not (a relaunch seen mid-wait
+    too); one still ending at the bound fails. A listing that fails (rc != 0) fails at once: an unreadable queue is never
+    an empty one. The detail names each job and its state — the old one cut the qstat table at 200 characters, before
+    its first row (run 1792140540)."""
+    sleep = sleep or time.sleep
+    clock = clock or time.monotonic
+    ending = _ENDING_STATES.get(scheduler, frozenset())
+    start = clock()
+    seen: dict[str, str] = {}
+    while True:
+        rc, out = _ssh_run(cmd, timeout=timeout)
+        if rc != 0:
+            return Result(f"world:{name}", False,
+                          f"{_rc_why(rc)}: the queue could not be read — output: {out.strip()[:200]!r}")
+        pilots = _listed_pilots(scheduler, out)
+        live = [p for p in pilots if p[1] not in ending]
+        if live:
+            also = [p for p in pilots if p[1] in ending]
+            return Result(f"world:{name}", False, f"found a pilot that is not ending: {_jobs(live)}"
+                          + (f"; ending: {_jobs(also)}" if also else ""))
+        waited = clock() - start
+        if not pilots:
+            gone = f"ok: {_jobs(list(seen.items()))} ended and left the queue within {waited:.0f} s"
+            return Result(f"world:{name}", True, gone if seen else "ok")
+        seen.update(pilots)
+        if waited >= PILOT_ENDING_WAIT_S:
+            return Result(f"world:{name}", False, f"a pilot still ending after {waited:.0f} s "
+                          f"(the bound is {PILOT_ENDING_WAIT_S:.0f} s): {_jobs(pilots)}")
+        sleep(max(0.0, min(PILOT_ENDING_POLL_S, PILOT_ENDING_WAIT_S - waited)))
 
 
 def _scheduler(scen) -> str:
@@ -402,6 +481,9 @@ def _postchecks(scen) -> list[Result]:
     universal = _universal_postchecks(_scheduler(scen))
     login_hosts = _login_hosts() or [os.environ.get("HPC_BRIDGE_SSH_HOST", "")]
     for pc in list(getattr(scen, "POSTCHECKS", [])) + universal:
+        if pc.get("pilots"):   # the universal pilot check: it reads job states and waits out a pilot that is ending
+            results.append(_no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], timeout=pc.get("timeout", 60)))
+            continue
         # "on": "each_login" runs the check on EVERY login node (a round-robin pool: a manager process left on the
         # node the alias did not pick is exactly the leak a pin bug produces) and joins the outputs
         hosts = login_hosts if pc.get("on") == "each_login" else [None]
@@ -419,9 +501,7 @@ def _postchecks(scen) -> list[Result]:
         out = "\n".join(raw)
         ok, why = True, []
         if not pc.get("allow_nonzero_rc") and rc != 0:
-            # rc=255 is ssh itself failing (host down, sshd refused): the world could not be checked at
-            # all — still a FAIL (conservative), but labelled so a sweep can separate an outage from a leak.
-            ok, why = False, [f"UNVERIFIABLE — ssh rc={rc}" if rc == 255 else f"rc={rc}"]
+            ok, why = False, [_rc_why(rc)]
         if "expect_present" in pc and pc["expect_present"] not in out:
             ok = False
             why.append(f"missing {pc['expect_present']!r}")

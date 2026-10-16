@@ -504,7 +504,10 @@ user being asked"*. Grading has three layers:
 1. **Trace invariants** (`harness/invariants.py`) — what the agent **did**.
 2. **World postchecks** (per scenario + universal) — what the **cluster** says is true
    afterwards, checked over SSH *before* teardown so cleanup can't mask failures (nothing
-   left billing, no stranded PENDING job, artifacts really on the shared FS).
+   left billing, no stranded PENDING job, artifacts really on the shared FS). The universal
+   `world:stop_honesty_no_pilot_left` reads each parsl pilot's state: one that is only ENDING (PBS `E`, Slurm `CG`)
+   is re-listed every 5 s for up to 60 s and passes once gone (live 2026-10-16: a qdel'd pilot sat in `E` for 19 s
+   and failed a clean cell); any other state fails at once, as does a queue listing that fails.
 3. **Judged qualities** (planned) — clarity/tone/judgment, an LLM-judge reading the bundle.
 
 **How success is measured:** every invariant runs on every trace and is *reported*, but only
