@@ -75,9 +75,9 @@ async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunn
     to *confirm* the cancel instead of walking away while the block keeps burning. Returns
     `(confirmed, detail)`: `confirmed=False` means the channel stayed cold across the retries and the
     cancel was NOT verified — the caller must report that honestly (never "down"; see #24). An
-    unconfirmed cancel is still backstopped by idle-release (`min_blocks=0` + `max_idletime`), and
-    re-calling stop (channel now warming) confirms it. Retry budget: HPC_BRIDGE_RELEASE_ATTEMPTS
-    (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s).
+    unconfirmed cancel is backstopped by idle-release (`min_blocks=0` + `max_idletime`) only while no task of ours
+    is outstanding there (the caller says which), and re-calling stop (channel now warming) confirms it. Retry
+    budget: HPC_BRIDGE_RELEASE_ATTEMPTS (default 3) × HPC_BRIDGE_RELEASE_BACKOFF_S (default 6s).
 
     A confirmed release says only what the scheduler holds NOW: a block still to land (the stop-during-provisioning
     race) or one the endpoint starts after the cancel, for a check of ours still queued, is what the stop's own wait
@@ -98,7 +98,7 @@ async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunn
             detail = out.notice or out.phase or "unconfirmed"
         if i + 1 < attempts and backoff > 0:
             await asyncio.sleep(backoff)  # let the woken login worker register / the sbatch land, then re-confirm
-    return False, f"cancel not confirmed ({detail}); idle-release will reclaim it"
+    return False, f"cancel not confirmed ({detail})"  # (idle-release is a backstop only with nothing of ours queued)
 
 
 def _released_jobs(detail: str) -> list[str]:
@@ -118,7 +118,10 @@ def _release_failure(detail: str) -> str | None:
     """The scheduler command a release says FAILED, quoted from its detail (`release failed: …`), or None — a cold
     login channel, or a release that read the scheduler, is not one."""
     i = detail.find("release failed:")
-    return detail[i:].split("); idle-release", 1)[0] if i >= 0 else None
+    if i < 0:
+        return None
+    out = detail[i:].split("); idle-release", 1)[0]  # (the wording before 2026-10-16 added that clause)
+    return out[:-1] if out.endswith(")") and detail.startswith("cancel not confirmed (") else out
 
 # A finished pilot's own job may say why it died: hpc-bridge's env_setup line prints one `hpc-bridge: endpoint venv …`
 # line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each

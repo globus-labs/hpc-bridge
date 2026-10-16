@@ -119,6 +119,9 @@ installed plugin only when that version changes); git tags mark releases.
     block request leaves a directory of logs and scripts on the login node (`~/.globus_compute/uep.<id>.*`) until the
     endpoint is torn down, and on a PBS server that keeps no job history the endpoint never learns that a cancelled
     block is gone, so the check stays queued and the stop stays `draining` until `teardown_endpoint`;
+  - a stop whose cancel could not be confirmed (the login release channel cold or busy, or out of time) offers
+    idle-release as the backstop only when no task of hpc-bridge's is queued: idle-release ends a block about
+    ten minutes after its last task, never while a task waits, so otherwise it names the task instead;
   - after a rejected submission the stop answers `down`, saying there was nothing to cancel because the scheduler
     rejected the submission and no block was created;
   - a rejected submission also drops the spend confirmation, as a reaped block does: the next `ensure_endpoint_up` or

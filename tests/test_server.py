@@ -1382,7 +1382,9 @@ async def test_a_pbs_release_that_could_not_cancel_an_exiting_job_keeps_what_it_
     assert res.status == "draining" and "'release failed: qdel refused 41.pbs; cancelled: 43.pbs'" in res.notice
     from hpc_bridge import scheduler_ops
     assert scheduler_ops._released_jobs("cancel not confirmed (release failed: qdel refused 41.pbs; cancelled: "
-                                        "43.pbs); idle-release will reclaim it") == ["43.pbs"]
+                                        "43.pbs)") == ["43.pbs"]
+    assert scheduler_ops._release_failure("cancel not confirmed (release failed: squeue could not be read)") == \
+        "release failed: squeue could not be read"
 
 
 @pytest.mark.parametrize("pbs", [False, True])
@@ -2696,6 +2698,53 @@ async def test_a_command_in_its_sync_wait_refuses_the_stop_whatever_the_record_t
         for f in runner.futures:
             if not f.done():
                 f.set_result(_Res(0, "", ""))
+
+
+# --- live run 2026-10-16 (draining_restop): what a cold release channel says about idle-release ---------------------
+
+async def test_a_cold_release_offers_idle_release_only_when_nothing_of_ours_is_queued(monkeypatch):
+    # idle-release (min_blocks=0) ends a block ~10 min after its last task only while no task of ours is outstanding:
+    # the cold-channel answer said "idle-release will reclaim it … is the backstop" whatever was queued
+    from hpc_bridge.server import ShapeRuntime, _stop_endpoint
+    from hpc_bridge.state import SentCheckStore
+
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    app = _ssh_app()
+    app.state = EndpointState(endpoint_id="eid-1")
+    now = time.monotonic()
+    app.shapes["compute"] = ShapeRuntime(user_endpoint_config={"compute": True}, runner=_FakeRunner("eid-1", _Res(0, "", "")),
+                                         spend_confirmed=True, warm_confirmed_at=now, block_since=now, block_job="112")
+    app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"}, warm_confirmed_at=1.0)
+    _scripted_login(monkeypatch, releases=[None] * 3)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "idle-release will reclaim it" not in res.notice
+    assert "No task of hpc-bridge's is queued there, so idle-release (min_blocks=0) ends the block" in res.notice
+    # with the record of our tasks untrusted, no backstop is offered: the store is named
+    root = SentCheckStore().root
+    root.mkdir(parents=True, exist_ok=True)
+    (root / "eid-1.json").write_text("{torn")
+    _scripted_login(monkeypatch, releases=[None] * 3)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "idle-release" not in res.notice and "cannot be trusted" in res.notice
+
+
+async def test_a_busy_release_channel_with_a_check_queued_names_it_not_idle_release(monkeypatch):
+    from hpc_bridge import server
+    from hpc_bridge.models import ShellOutcome
+    from hpc_bridge.server import _stop_endpoint
+
+    app, _runner = _queued_app(monkeypatch)
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"
+    monkeypatch.setattr(server, "_busy_session", lambda a, shape, sid: "login-9" if sid == server._INTERNAL_SESSION
+                        else None)
+
+    async def busy(a, command, session_id="default", shape="compute"):
+        return ShellOutcome(phase="failed", block_state="warm", notice="session busy")
+
+    monkeypatch.setattr(server, "_run_shell", busy)
+    res = await _stop_endpoint(app)
+    assert res.status == "draining" and "could not be sent" in res.notice and "idle-release does not end that" in res.notice
+    assert "is the backstop" not in res.notice
 
 
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------

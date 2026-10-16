@@ -100,6 +100,7 @@ from .notices import (  # noqa: F401 - re-exported
     _block_terms,
     _busy_session_outcome,
     _check_pending_notice,
+    _check_words,
     _cold_outcome,
     _dispatch_error_suffix,
     _dropped_term_notice,
@@ -129,6 +130,7 @@ from .notices import (  # noqa: F401 - re-exported
     _no_facility_outcome,
     _orphaned_outcome,
     _past_ceiling_outcome,
+    _queue_word,
     _rejected_stop_notice,
     _rejected_switch_note,
     _released_under_outcome,
@@ -1100,6 +1102,18 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     if await _gone_within(app, call_deadline):
         return await _orphaned_stop(app, eid, queued=bool(pending))
     # HONEST unconfirmed release (#24): NEVER "down" here — the agent must know spend may still be running.
+    # idle-release (min_blocks=0) ends a block ~10 min after its last task ONLY while no task of ours is outstanding
+    # there: never offered as the backstop while one may be queued (it is named instead), nor while the record of our
+    # tasks cannot be trusted
+    if pending:
+        what, plural = _check_words(pending, _queue_word(app))
+        backstop = (f" {what} {'are' if plural else 'is'} also not seen to finish, and the endpoint can start a block "
+                    "to run " + ("them" if plural else "it") + ": idle-release does not end that.")
+    elif store_problem:
+        backstop = _store_problem_note(store_problem)
+    else:
+        backstop = (" No task of hpc-bridge's is queued there, so idle-release (min_blocks=0) ends the block ~10 min "
+                    "after its last task.")
     internal = _busy_session(app, "login", _INTERNAL_SESSION)
     held = app.tasks.get(internal) if internal is not None else None
     if held is not None and internal != internal_before and held.command == scheduler_ops._release_cmd_for(app, eid):
@@ -1107,20 +1121,19 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # scheduler — sent, not confirmed
         notice = (f"Spend is NOT confirmed stopped: the cancel was sent (task_id={internal!r}) but has not finished — "
                   "it is queued behind other work on the login node, or the scheduler is slow. Call stop_endpoint "
-                  "again in a little while to confirm (idle-release, ~10 min, min_blocks=0, is the backstop). The "
-                  "login endpoint stays online for reuse.")
+                  "again in a little while to confirm." + backstop + " The login endpoint stays online for reuse.")
     elif internal is not None:
         # the cancel never left: another scheduler command of ours (an earlier one, or one started meanwhile)
         # occupies the internal login session
         notice = ("Spend is NOT confirmed stopped: the cancel could not be sent — the login release channel is busy, "
                   f"not cold, with another scheduler command of hpc-bridge's own (task_id={internal!r}) that is "
-                  "still running. Call stop_endpoint again in a little while (idle-release, ~10 min, min_blocks=0, is "
-                  "the backstop). The login endpoint stays online for reuse.")
+                  "still running. Call stop_endpoint again in a little while." + backstop + " The login endpoint stays "
+                  "online for reuse.")
     elif detail == _OUT_OF_TIME:
         # this call's time ran out before the scheduler answered (the login node or the scheduler is slow)
         notice = ("Spend is NOT confirmed stopped: the cancel did not finish within this call — the login node or the "
-                  "scheduler is slow. Call stop_endpoint again in a little while to confirm. The login endpoint stays "
-                  "online for reuse.")
+                  "scheduler is slow. Call stop_endpoint again in a little while to confirm." + backstop + " The login "
+                  "endpoint stays online for reuse.")
     elif (failure := scheduler_ops._release_failure(detail)) is not None:
         # a scheduler command itself failed (unreachable, or a cancel refused): not a cold channel, quoted as it is
         notice = _failed_release_notice(failure, queued=bool(pending))
@@ -1129,9 +1142,9 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
                                        reason="the login release channel was cold, and ") + _store_problem_note(
                                            store_problem)
     else:
-        notice = (f"{detail}. Spend is NOT confirmed stopped — the login release channel was cold. "
-                  "idle-release (~10 min, min_blocks=0) is the backstop; call stop_endpoint again in a few "
-                  "seconds (the channel is warming) to confirm the cancel. The login endpoint stays online for reuse.")
+        notice = (f"{detail}. Spend is NOT confirmed stopped — the login release channel was cold. Call stop_endpoint "
+                  "again in a few seconds (the channel is warming) to confirm the cancel." + backstop + " The login "
+                  "endpoint stays online for reuse.")
     return EndpointStatus(
         status="draining",
         block_state="cold",
