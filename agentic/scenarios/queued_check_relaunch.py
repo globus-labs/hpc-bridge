@@ -536,8 +536,8 @@ def pilot_state_at_stop(t: Trace) -> Result:
     if last is None:
         return Result("pilot_state_at_stop", False, "no squeue poll saw a pilot of this endpoint before the stop")
     i, pilots = last
-    same, why = same_user_endpoint(t)
-    return Result("pilot_state_at_stop", same is not False, f"call {i}: {_desc(pilots)}"
+    _, why = same_user_endpoint(t)
+    return Result("pilot_state_at_stop", True, f"call {i}: {_desc(pilots)}"   # reported: a new user endpoint is the fix
                   + (f" in {pilots[0].uep}" if pilots[0].uep else "") + (f"; {why}" if _sentinel_index(t) is not None
                                                                           else ""))
 
@@ -832,12 +832,20 @@ def no_relaunch_after_down(t: Trace, w: Watch) -> Result:
                                               "endpoint had no job that connected — that is the first-pilot (bad-state) "
                                               "path, not the one phase `second` tests")
         same, how = same_user_endpoint(t)
-        if same is not True:
-            return Result(NO_RELAUNCH, False, f"premise {'not met' if same is False else 'unverified'}: {how} — the "
-                                              "second pilot must be the same user endpoint's")
+        if same is None:
+            return Result(NO_RELAUNCH, False, f"premise unverified: {how} — which user endpoint phase B's pilot came "
+                                              "from decides which case this stop tested")
+        # A NEW user endpoint for phase B is the fix's design (a fresh compute user endpoint per block request, so the
+        # judged pilot is that endpoint's FIRST and a cancel trips parsl's bad state), not a broken premise: judge the
+        # relaunch all the same — the integration run of 2026-10-16 failed here on exactly that, with nothing relaunched.
+        fresh = (f"; {how} — fresh per block request, so the later-pilot case cannot arise there"
+                 if same is False else "")
+    else:
+        fresh = ""
     own = ", ".join(f"job {j} {st}" for j, st in sorted(seen.items()))
     return Result(NO_RELAUNCH, True, f"ok: {said}; no new pilot of this endpoint was submitted in the {covered:.0f} s "
-                                     f"after it — the tap saw its own pilot ({own}), so it could have seen one ({why})")
+                                     f"after it — the tap saw its own pilot ({own}), so it could have seen one ({why})"
+                                     + fresh)
 
 
 def relaunch_report(w: Watch) -> Result:

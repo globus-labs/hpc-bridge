@@ -140,8 +140,9 @@ within ~5 s of the sbatch), it confirms a compute block, polls `squeue` on the l
 and stops at once. Phase `second`: A — a block that runs, answers the canary and `hostname`, then an honest stop; B —
 a one-core "sentinel" job sharing the pilots' name (`--dependency=singleton` in the confirmed details) keeps the next
 pilot PENDING (an idle node starts a job faster than any hold could follow), the admin tap `scontrol hold`s every new
-pilot of the endpoint, a second confirm with the same terms (the same user endpoint, checked by its `uep.<eid>.<id>`
-dir), the poll, the stop at once. No teardown either way. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
+pilot of the endpoint, a second confirm with the same terms (on main the same user endpoint, checked by its `uep.<eid>.<id>`
+dir; with the stop fix a FRESH one per block request, so its pilot is that endpoint's first — the cell judges the
+relaunch either way), the poll, the stop at once. No teardown either way. The ADMIN TAP then watches the queue as root on slurmctld for a pilot of this endpoint
 submitted after the stop's answer (`world:no_relaunch_after_down`, gated), and the world check reads the endpoint's own
 log for parsl's decisions after the stop (`strategy_after_stop`, reported), before the harness tears down. A watch that
 never saw the stop's OWN pilot in a CLEAN sample's squeue (or, once that pilot has ended, the window sacct) fails as

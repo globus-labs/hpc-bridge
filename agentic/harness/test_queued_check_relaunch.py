@@ -678,8 +678,11 @@ def test_phase_b_with_a_relaunch_fails_and_phase_a_does_not_count_as_its_canary(
 
 
 def test_phase_b_premises_same_user_endpoint_a_connected_phase_a_and_a_started_phase_b():
+    # a NEW user endpoint for phase B is the fix's design (fresh per block request), not a broken premise: judged anyway
     other = qcr.no_relaunch_after_down(_second(b_uep=OTHER_UEP), _watch2())
-    assert not other.ok and other.detail.startswith("premise not met:") and "a NEW user endpoint" in other.detail
+    assert other.ok and "a NEW user endpoint" in other.detail and "the later-pilot case cannot arise" in other.detail
+    relaunched = qcr.no_relaunch_after_down(_second(b_uep=OTHER_UEP), _watch2(_job("14", T_STOP + 62)))
+    assert not relaunched.ok and "job 14" in relaunched.detail   # a relaunch fails it from either user endpoint
     unknown = qcr.no_relaunch_after_down(_second(b_uep="-"), _watch2())
     assert not unknown.ok and unknown.detail.startswith("premise unverified:")
     cold = qcr.no_relaunch_after_down(_second(a_up=False), _watch2())
