@@ -81,7 +81,8 @@ def _master_alive(target) -> bool:
     if not getattr(target, "control_dir", None):
         return False
     try:
-        r = subprocess.run(target.control_argv("check"), capture_output=True, text=True, timeout=10, check=False)
+        r = subprocess.run(target.control_argv("check"), stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                           timeout=10, check=False)
     except Exception:  # noqa: BLE001 - no ssh / odd target: treat as no master
         return False
     return r.returncode == 0

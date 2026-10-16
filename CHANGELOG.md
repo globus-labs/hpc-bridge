@@ -62,6 +62,13 @@ installed plugin only when that version changes); git tags mark releases.
   code, its notice says the same: if it was the user's password, tell them to change it, and never repeat it.
 
 ### Fixed
+- **A command hpc-bridge runs over SSH can no longer take the agent's next request.** With nothing to send it, `ssh`
+  inherited the MCP server's own stdin, the channel the agent's requests arrive on. Seen live 2026-10-15 when
+  `teardown_endpoint` was called again while a background teardown's stop and delete ran on the login node, with two
+  symptoms: under Codex ssh read the request itself, so it never reached hpc-bridge and the call timed out after
+  600 s; under Pi OpenSSH set the shared pipe non-blocking, hpc-bridge's next read came back empty, and the server
+  shut down as if the agent had gone ("MCP connection closed"). Every subprocess hpc-bridge's own code starts now
+  gets `/dev/null` for stdin.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";
