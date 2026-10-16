@@ -81,11 +81,14 @@ class ShapeRuntime:
     # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
     # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name;
     # `switch_unseen`: that block was asked for but never seen up, so a stop must still look for its pilot
-    # (server._stop_endpoint's expect_block). A confirmation clears them — `switch_unseen` only once a block is up (a
-    # submission on the new terms that the scheduler rejects leaves the old terms' pilot still to look for).
+    # (server._stop_endpoint's expect_block) — also after a reap a check found (`reap_kicked`), whose check may have
+    # asked the old terms' user endpoint for a block; `unseen_terms` are that block's partition and account, which a
+    # stop names and watches for. A confirmation clears them — `switch_unseen` / `unseen_terms` only once a block is
+    # up (a submission on the new terms that the scheduler rejects leaves the old terms' pilot still to look for).
     switched_terms: tuple[str | None, str | None] | None = None
     switch_left: LeftBlock | None = None
     switch_unseen: bool = False
+    unseen_terms: tuple[str | None, str | None] | None = None
     # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
     # while they differ from these — back on them, the block the reap found is that confirmation's again.
     reap_terms: tuple[str | None, str | None] | None = None
@@ -114,6 +117,9 @@ class ShapeRuntime:
     # assent, not news about the endpoint — the check those pilots were started for is still queued (the runner waits
     # on it again rather than sending another), so the next pilot is for the same check and likely dies the same way.
     dead_pilot: DeadPilot | None = None
+    # When spend was last confirmed for this shape (time.monotonic()): a pilot that FINISHED and was submitted before it
+    # is an earlier session's, not this block's (scheduler_ops._probe_pilots_over_login's `since_s`).
+    confirmed_at: float | None = None
 
 
 @dataclass

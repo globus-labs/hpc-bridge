@@ -95,7 +95,15 @@ def provisioning_release_attempts() -> int:
 # hpc-bridge configures, 30 s on ones configured before that, which reuse never rewrites); on that same tick it submits
 # the next pilot while a task of ours is outstanding (strategy cases 2b/4a); sbatch / qsub return in about a second and
 # the job is listed at once (parsl waits up to its cmd_timeout, 10 s on Slurm, 120 s on PBS: a bound, not the norm).
-# 60 + 30 + 30 s of submit-and-listing slack.
+# 60 + 30 + 30 s of submit-and-listing slack. It counts from when a stop ANSWERS, after its own poll (about 36 s).
+# On Slurm with accounting, a fresh user endpoint's first dead pilot usually trips parsl's block-error handler at once
+# (threshold max(1, init_blocks), every block it ever had FAILED): the check FAILS instead of staying queued, no pilot
+# follows, and the window simply runs out — the next stop answers `down`. On PBS a dead pilot reads COMPLETED, and the
+# pilots keep coming: the window never runs out while they do.
+# What it does NOT cover: the time a user endpoint takes to SPAWN (the manager starting it for our first task, its
+# imports, its first scaling pass) — a block "still being submitted" whose user endpoint is slower to start than the
+# first stop's poll plus this window can land after a `down`. That pilot is healthy (it runs our check, then idles out:
+# min_blocks=0), so idle-release bounds it; one window serves both markers rather than a guessed spawn time.
 PILOT_WATCH_S = 120.0
 
 

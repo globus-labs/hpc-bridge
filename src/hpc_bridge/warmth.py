@@ -314,6 +314,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     warm block's interval (found in review). A block the clock presumes released is banked to that time, not to
     now. Callers hold app.lock."""
     untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
+    _hand_dead_pilot_to_watch(app, app.shapes.get(DEFAULT_SHAPE))  # a re-bind keeps it for this endpoint
     app.tasks.clear()
     _retain_inflight(app, app.shapes.get(DEFAULT_SHAPE))  # counted only if the same endpoint is bound again
     for name, rt in app.shapes.items():
@@ -621,6 +622,7 @@ async def _provision(
         # and a rejected submission on the new terms must not end the stop's look for it — server._stop_endpoint)
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
         rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
+        rt.confirmed_at = time.monotonic()  # a pilot that died before this is an earlier session's, not this block's
     if app.state.endpoint_id is None:
         bootstrap = getattr(app.facility, "bootstrap", None)
         if bootstrap is not None:
@@ -686,7 +688,8 @@ async def _provision(
         rt.block_since, rt.block_job = since, job
     if block == "warm":
         _forget_presumed(rt)
-        rt.switch_unseen = False  # a block is up: the stop it meets cancels every live pilot of the endpoint, as before
+        # a block is up: the stop it meets cancels every live pilot of the endpoint, as before
+        rt.switch_unseen, rt.unseen_terms = False, None
     if checked and block != "warm" and _rejected_now(rt):  # this call's check: the scheduler refused the submission
         _void_rejected(app, rt)
     if rt.reaped is not None and not rt.reap_told:  # the check just found the block gone (_confirm_worker)
@@ -765,6 +768,32 @@ def _stop_watch(app: AppCtx, eid: str, rt: ShapeRuntime | None, now: float) -> P
     if rt is not None and rt.dead_pilot is not None:
         watch = _merge_watch(watch, PilotWatch(since=now, terms=_terms_of(rt), dead=rt.dead_pilot))
     return watch
+
+def _hand_dead_pilot_to_watch(app: AppCtx, rt: ShapeRuntime | None) -> None:
+    """A shape dropped with a dead pilot on it — a stop, a re-bind (connect_facility to the same endpoint, which the
+    FINISHED notice of a facility you brought points at), a teardown's release step: its check is still queued on the
+    endpoint, so the endpoint's watch keeps the pilot, its window from now (a stop then keeps or drops what it learned).
+    Callers hold app.lock, before the endpoint is unbound."""
+    eid = app.state.endpoint_id
+    if rt is not None and rt.dead_pilot is not None and eid is not None:
+        app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid),
+                                            PilotWatch(since=time.monotonic(), terms=_terms_of(rt), dead=rt.dead_pilot))
+
+def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
+                       terms: tuple[str | None, str | None], job: str, exit_status: str, jobs: frozenset[str]) -> None:
+    """The provisioning probe — run off the lock — found pilot `job` dead: record it where it belongs. On the runtime
+    and terms the probe was for (the same shape, `block_epoch` unchanged), unless a worker has answered since (our
+    check ran). If a switch or a drop came while the probe ran, the pilot is the OLD terms': the endpoint's watch keeps
+    it under the probe's terms — never the new terms' shape, and never discarded. Callers hold app.lock."""
+    if app.state.endpoint_id != eid:
+        return  # a re-bind elsewhere: that endpoint's pilots are not this binding's to watch
+    if app.shapes.get(shape) is rt and rt.block_epoch == epoch:
+        if rt.block_since is None and rt.warm_confirmed_at is None:
+            _note_dead_pilot(rt, job, exit_status, jobs)
+        return
+    dead = DeadPilot(job=job, exit_status=exit_status, known=jobs | {job})
+    app.pilot_watch[eid] = _merge_watch(app.pilot_watch.get(eid), PilotWatch(since=time.monotonic(), terms=terms,
+                                                                              dead=dead))
 
 def _watch_expired(watch: PilotWatch, now: float) -> bool:
     """No sign of a pilot for the whole window (`config.pilot_watch_s`): one would have been in the scheduler by now."""
@@ -854,9 +883,17 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
         rt.switch_left = left
     if confirmed:
         rt.spend_confirmed = False
-        rt.switched_terms, rt.switch_unseen = terms, unseen
+        rt.switched_terms = terms
     elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
         rt.reap_terms = terms
+    # A block asked for on the old terms and never seen up may still land: confirmed and unseen (the sbatch may be in
+    # flight), or after a reap a check found (`reap_kicked`), whose check may itself have asked the old terms' user
+    # endpoint for a block — it says so, "stop_endpoint releases it". That check is still queued there whatever the
+    # new terms do: neither the confirmation that clears `reap_kicked` nor a rejection of the new terms ends it.
+    if unseen and (confirmed or rt.reap_kicked):
+        if not rt.switch_unseen:
+            rt.unseen_terms = terms
+        rt.switch_unseen = True
     eid = app.state.endpoint_id
     if rt.dead_pilot is not None and eid is not None:
         # The new terms are a different block, so the shape forgets the pilot that died. The old terms' user endpoint
@@ -1082,6 +1119,7 @@ def _drop_compute_shape_locked(app: AppCtx) -> float:
     _drain_shape_tasks(app, DEFAULT_SHAPE)  # the released block's poll handles are now dead
     compute = app.shapes.pop(DEFAULT_SHAPE, None)
     _retain_inflight(app, compute)
+    _hand_dead_pilot_to_watch(app, compute)  # a stop decides what to keep of it; a teardown's release step keeps it
     if compute is None:
         return 0.0
     # stop the spend clock — at the presumed release if the block idled out or hit its walltime long ago

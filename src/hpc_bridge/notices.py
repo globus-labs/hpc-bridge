@@ -424,6 +424,37 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
             + _switch_fate(app, rt.switch_left, confirmed=True))
 
+def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | None, str | None] | None) -> str:
+    """For the call that switched the partition or account, confirmed and met a REJECTED submission at once: no new
+    block exists, so not `_switch_receipt` ("…this new one included") — only what became of the old terms' block, which
+    nothing cancels on a switch. Empty when nothing was switched, or the terms are back to the old ones."""
+    uec = rt.user_endpoint_config
+    if switched is None or switched == (uec.get("partition"), uec.get("account")):
+        return ""
+    word = _queue_word(app)
+    return (f"The {word} or account changed from {_terms(*switched, word)} in this call. "
+            + _switch_fate(app, rt.switch_left, confirmed=False))
+
+def _landing_notice(app: AppCtx, detail: str, terms: tuple[str | None, str | None] | None, *, switched: bool,
+                    rejected: bool) -> str:
+    """A stop that polled for a block still being submitted and found none (`draining`; a later stop looks again). With
+    `terms`, it names that block: the one asked for on the old terms before a switch (`switched`; `rejected`: the new
+    terms' submission was refused, so nothing of it exists — never "the compute block was still being submitted" after
+    "the new block was not created"), or the one an earlier stop waited for."""
+    backstop = ("Call stop_endpoint again in a few seconds to cancel it once it lands (idle-release, ~10 min, "
+                "min_blocks=0, is the backstop). The login endpoint stays online for reuse.")
+    if terms is None:
+        return (f"{detail}. Spend is NOT confirmed stopped — the compute block was still being submitted and no "
+                "pilot had appeared in the scheduler yet, so there was nothing to cancel; one may land shortly. "
+                + backstop)
+    word = _queue_word(app)
+    block = f"the block asked for on {_terms(*terms, word)}"
+    if switched:
+        block += f" before the {word} or account was switched"
+    lead = ("the scheduler rejected the block on the new terms, so nothing of it was created; but " if rejected else "")
+    return (f"Spend is NOT confirmed stopped — {lead}{block} was still being submitted, and no pilot of it had "
+            f"appeared in the scheduler yet, so there was nothing to cancel; one may land shortly. {backstop}")
+
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
     (they used to drift). Names the free login shape only where one exists: on a compute-only
@@ -608,13 +639,15 @@ _StopOutcome = Literal["waiting", "more", "unlooked", "gone"]
 
 def _dead_pilot_stop_notice(dead: DeadPilot, outcome: _StopOutcome, *, released: str | None = None,
                             new: Collection[str] = (), cancelled: Collection[str] = (),
-                            died: tuple[str, str] | None = None, why: str = "", window_s: float = 0.0) -> str:
+                            died: tuple[str, str] | None = None, uncancelled: Collection[str] = (), why: str = "",
+                            window_s: float = 0.0) -> str:
     """A stop after a pilot that ran and died before it ran hpc-bridge's check (`DeadPilot`), which is still queued on
     the endpoint: the endpoint keeps submitting pilots for it, so the stop's answer is NOT confirmed — never "still
     being submitted" (a pilot was, and died), never idle-release (the endpoint is not idle while the check waits).
     `outcome`: `waiting` — no new pilot in this stop's check, inside the window (or the dead pilot's first stop);
-    `more` — the endpoint submitted another since (`new`; this stop `cancelled` some; `died`: a new one that FINISHED);
-    `unlooked` — this stop could not look (`why`); `gone` — none within `window_s` of the last sign: the `down`.
+    `more` — the endpoint submitted another since (`new`; this stop `cancelled` some; `died`: a new one that FINISHED;
+    `uncancelled`: live ones it did not cancel, and `why`); `unlooked` — this stop could not look (`why`); `gone` — none
+    within `window_s` of the last sign: the `down`.
     `released`: the release detail when it cancelled the shape's own confirmed block."""
     def lead(text: str) -> str:  # after the release's own sentence, when it cancelled the shape's block, a new one
         return f"compute block released over AMQP ({released}). {text[:1].upper()}{text[1:]}" if released else text
@@ -630,16 +663,23 @@ def _dead_pilot_stop_notice(dead: DeadPilot, outcome: _StopOutcome, *, released:
     queued = ("that check may still be queued on the endpoint, which can submit another pilot for it, likely dying the "
               "same way")
     if outcome == "more":
-        jobs = ", ".join(new)
+        def pilots(jobs: Collection[str]) -> str:
+            return f"{'pilot' if len(jobs) == 1 else 'pilots'} {', '.join(jobs)}"
+
         found = [f"this stop cancelled {', '.join(cancelled)}"] if cancelled else []
         if died is not None:
             found.append(f"pilot {died[0]} also FINISHED (exit status {died[1]})")
-        return (f"{head}, and the endpoint has since submitted {'pilot' if len(new) == 1 else 'pilots'} {jobs} for "
-                f"that check, which is still queued there{': ' + '; '.join(found) if found else ''}. Spend is NOT "
-                "confirmed stopped: cancelling a pilot does not end the check, so the endpoint can submit another for "
-                "it, likely dying the same way. Call stop_endpoint again in about a minute; if pilots keep coming, the "
-                "check stays queued until the endpoint itself is removed (teardown_endpoint, if the user agrees). The "
-                "login endpoint stays online for reuse.")
+        if uncancelled:  # seen live, NOT cancelled (a cold channel, a failed cancel, or it came after the last look)
+            one = len(uncancelled) == 1
+            found.append(f"{pilots(uncancelled)} {'is' if one else 'are'} in the scheduler and this stop did not "
+                         f"cancel {'it' if one else 'them'} ({why})")
+        next_one = ("cancelling a pilot does not end the check, so the endpoint can submit another for it" if cancelled
+                    else "the endpoint can submit another pilot for that check")
+        return (f"{head}, and the endpoint has since submitted {pilots(new)} for that check, which is still queued "
+                f"there{': ' + '; '.join(found) if found else ''}. Spend is NOT confirmed stopped: {next_one}, likely "
+                "dying the same way. Call stop_endpoint again in about a minute; if pilots keep coming, the check "
+                "stays queued until the endpoint itself is removed (teardown_endpoint, if the user agrees). The login "
+                "endpoint stays online for reuse.")
     if outcome == "unlooked":
         return (f"{head}. Spend is NOT confirmed stopped: {why}, so this stop could not look for another pilot — "
                 f"{queued}. {again}")

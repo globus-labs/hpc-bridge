@@ -88,7 +88,22 @@ installed plugin only when that version changes); git tags mark releases.
     endpoint's pilot history, so a pilot that came and died between two stops is still seen. It answers `down` once
     no new pilot has appeared for two minutes (`HPC_BRIDGE_PILOT_WATCH_S`). A stop that cancels a new pilot for that
     check stays `draining`: cancelling a pilot does not end the check, so the endpoint submits another. Its notice
-    says that only removing the endpoint ends the check.
+    says that only removing the endpoint ends the check. A stop that could not cancel a new pilot it saw (the release
+    channel was cold) says so instead of implying it did;
+  - after a switch whose new terms the scheduler rejected, the stop still looks for the block asked for on the old
+    terms, and names it: "the block asked for on partition 'debug' before the partition or account was switched was
+    still being submitted", never "the compute block". The same holds after a block that stopped answering a check
+    (whose check may have asked for a new block on the old terms). The answer that switched, confirmed and met the
+    rejection no longer opens with a receipt for a new block "this new one included"; it says what became of the old
+    block, then the rejection;
+  - a pilot that died stays watched when the compute block's state is dropped some other way than a stop: a
+    `connect_facility` to the same endpoint, or a teardown that stopped to ask for a one-time code;
+  - the stop's cancel command used to read an unreachable scheduler (`squeue` or `qstat` failing) as an empty
+    listing, so it answered "released none", a confirmed release; a cancel the scheduler refused also read as
+    released. Now each says which command failed, and the stop does not count it as confirmed. The pilot check says
+    so too, and a stop that could not read the pilot history stays `draining`;
+  - a pilot that died in an earlier session, still in the scheduler's history (Slurm's accounting keeps six hours
+    here, PBS's job history about two weeks), is no longer reported as this block's FINISHED pilot.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";
