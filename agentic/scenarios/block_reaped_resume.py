@@ -70,13 +70,16 @@ MIDRUN_HOOKS = [
     # 1. Reap the pilot block after the marker was written: cancel every job of this run's user on the login node
     #    (the login shape is a LocalProvider there — no Slurm job — so only the compute pilot goes), wait for the queue
     #    to drain, then sit past CANARY_TTL_S (45 s) so the next call must re-canary instead of trusting warmth.
-    {"name": "reap_block", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "nth": 1,
+    #    `when_phase: complete` — the marker write is the first compute run that RAN; a compute run_shell sent before
+    #    any facility (`failed`, a model's blind opening batch — hermes21, live 2026-10-15) or refused for spend
+    #    (`needs_confirmation`) reaps no block and must not count.
+    {"name": "reap_block", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "when_phase": "complete", "nth": 1,
      "cmd": ("scancel -u \"$(whoami)\"; for i in $(seq 1 30); do squeue -u \"$(whoami)\" -h | grep -q . || break; sleep 2; done; "
              "echo \"reaped; queue-left=$(squeue -u \"$(whoami)\" -h | wc -l)\"; sleep 55"),
      "timeout": 180},
     # 2. The user returns. Same trigger; hooks fire in list order, and the cmd above is awaited first.
-    {"name": "user_returns", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "nth": 1,
-     "interject": RETURN},
+    {"name": "user_returns", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "when_phase": "complete",
+     "nth": 1, "interject": RETURN},
 ]
 
 

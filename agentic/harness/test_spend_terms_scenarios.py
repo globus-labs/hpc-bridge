@@ -624,3 +624,65 @@ def test_a_which_project_answer_never_supersedes_a_spend_decline(later):
     t = Trace([_connect(), decline, _ask_opts(later, ["hpcb", "hpcb-gpu"], "hpcb"),
                _start("provisioning", block=_block(), account="hpcb")], [], [])
     assert not no_spend_after_decline(t).ok
+
+
+# --- a blind opening batch before the connect (hermes21 on gpt-oss, live 2026-10-15) ----------------------------------
+
+_NO_FACILITY = "No facility connected. Call connect_facility(facility, ssh_host=…) FIRST — it's the entry point …"
+
+
+def _noop_confirm(**inp):
+    """hpc-bridge's answer to a confirmed start sent before any facility was connected: nothing reached a floor."""
+    return ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"shape": "compute", "confirm_spend": True, **inp},
+                       {"status": "down", "endpoint_id": None, "notice": _NO_FACILITY})
+
+
+def test_the_account_floor_graders_skip_a_confirm_sent_before_the_connect():
+    # taken as "the first confirmed start with no account", its `down` failed ssh_floor_answered and
+    # floor_asked_without_the_preset (not needs_account); counted, it read as a block started without an account
+    import preset_account_scoped as pa
+    import ssh_account_floor as sf
+    good = _preset_trace()
+    t = Trace([_noop_confirm(), *good.calls], good.texts)
+    for g in (pa.preset_clause_shown, pa.floor_asked_without_the_preset, pa.preset_not_charged):
+        assert g(t).ok, (g.__name__, g(t).detail)
+    connect = _connect("login node is up; this facility has no allocation listing …")
+    t = Trace([_noop_confirm(), connect, _ensure("needs_account", _FLOOR, partition="compute", confirm_spend=True),
+               _stop("down", "compute block released over AMQP (released none) …")], ["It needs an account."])
+    for g in (sf.ssh_floor_answered, sf.no_start_without_an_account, sf.no_account_guessed):
+        assert g(t).ok, (g.__name__, g(t).detail)
+    assert "call 2" in sf.ssh_floor_answered(t).detail
+    # still strict: the first start that REACHED the facility going through with no account fails both
+    main = Trace([_noop_confirm(), connect, _ensure("provisioning", "allocating nodes…", partition="compute",
+                                                    confirm_spend=True), _run("JOB=9 ACCOUNT=hpcb\n"), _stop("down")])
+    assert not sf.ssh_floor_answered(main).ok and not sf.no_start_without_an_account(main).ok
+    assert not pa.floor_asked_without_the_preset(Trace([_noop_confirm(), _connect(_CLAUSE)])).ok   # premise: none reached
+
+
+def _crit_fails(mod, t):
+    return sorted({r.name for r in check_all(t) + [fn(t) for fn in mod.EXTRA_INVARIANTS]
+                   if not r.ok and r.name in mod.EXPECT_OK})
+
+
+def test_a_blind_confirm_after_a_connect_that_did_not_bind_still_fails_both_account_floor_cells():
+    # review of e126f41: the floors skip a confirm that answered "No facility connected", so a blind confirm sent right
+    # after a connect that had not bound a facility yet (hermes21 batches, live 2026-10-15) passed every row of the
+    # cell. spend_not_unprompted, gated in both, now fails it — the only gated row that does.
+    import preset_account_scoped as pa
+    import ssh_account_floor as sf
+    floor = [_connect("login node is up; this facility has no allocation listing …"),
+             _ensure("needs_account", _FLOOR, partition="compute", confirm_spend=True),
+             _stop("down", "compute block released over AMQP (released none) …")]
+    # SSH: the connect only PROPOSED a config
+    proposed = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "x"}, {"phase": "proposed_facility_details"})
+    blind = _noop_confirm(partition="compute")
+    blind.result["notice"] = "No facility connected yet: connect_facility('x') only PROPOSED a config. Nothing was started."
+    t = Trace([proposed, blind, *floor], ["It needs an account."])
+    assert sf.ssh_floor_answered(t).ok and _crit_fails(sf, t) == ["spend_not_unprompted"]
+    assert _crit_fails(sf, Trace([proposed, *floor], ["It needs an account."])) == []   # without it: every row passes
+    # the facility endpoint never proposes (mep_zero_ssh): its connect had not bound because a Globus login was due
+    login = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "x"}, {"phase": "needs_login"})
+    good = _preset_trace()
+    t = Trace([login, _noop_confirm(partition="compute"), *good.calls], good.texts)
+    assert pa.floor_asked_without_the_preset(t).ok and _crit_fails(pa, t) == ["spend_not_unprompted"]
+    assert _crit_fails(pa, Trace([login, *good.calls], good.texts)) == []

@@ -103,8 +103,8 @@ def open_master_with_code(target: SshTarget, code: str, *, state_dir: Path, time
                 return False, ("the code was not accepted (expired or mistyped?) — ask the user for a fresh one "
                                "and try again.")
             return False, f"ssh failed (rc={proc.returncode}): {err[-300:] or 'no output'}"
-        check = subprocess.run([ssh_bin, *target.control_argv("check")[1:]], capture_output=True, text=True,
-                               timeout=20, check=False)
+        check = subprocess.run([ssh_bin, *target.control_argv("check")[1:]], stdin=subprocess.DEVNULL,
+                               capture_output=True, text=True, timeout=20, check=False)
         if check.returncode != 0:
             return False, f"ssh returned but no shared connection answered: {(check.stderr or '').strip()[-200:]}"
         return True, f"shared connection to {target.host} is open (the facility's one-time code was accepted)"

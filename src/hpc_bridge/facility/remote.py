@@ -173,7 +173,8 @@ def _resolved_hostname(host: str) -> str:
     import subprocess
 
     try:
-        out = subprocess.run(["ssh", "-G", "--", host], capture_output=True, text=True, timeout=10, check=False).stdout
+        out = subprocess.run(["ssh", "-G", "--", host], stdin=subprocess.DEVNULL, capture_output=True, text=True,
+                             timeout=10, check=False).stdout
     except Exception:  # noqa: BLE001 - no ssh binary / odd host -> the name as given
         return host
     for line in out.splitlines():
@@ -186,10 +187,15 @@ def _resolved_hostname(host: str) -> str:
 async def ssh_exec(
     target: SshTarget, remote_cmd: str, *, stdin: str | None = None, timeout: float = 120.0
 ) -> tuple[int, str, str]:
-    """Run one command on the remote host over SSH; returns (rc, stdout, stderr)."""
+    """Run one command on the remote host over SSH; returns (rc, stdout, stderr).
+
+    With no payload ssh gets /dev/null, never the server's own stdin: that is the MCP channel. An ssh that
+    inherited it (2026-10-15, a teardown_endpoint re-call during a background teardown) either read the agent's
+    next request itself, so the call never arrived, or set the shared pipe non-blocking, so the server's next read
+    came back empty and its stdio loop ended as if the client had gone."""
     proc = await asyncio.create_subprocess_exec(
         *target.argv(remote_cmd),
-        stdin=asyncio.subprocess.PIPE if stdin is not None else None,
+        stdin=asyncio.subprocess.PIPE if stdin is not None else asyncio.subprocess.DEVNULL,
         stdout=asyncio.subprocess.PIPE,
         stderr=asyncio.subprocess.PIPE,
     )
@@ -894,6 +900,7 @@ class RemoteEndpointCLI:
         try:
             proc = await asyncio.create_subprocess_exec(
                 *self.target.control_argv("exit"),
+                stdin=asyncio.subprocess.DEVNULL,
                 stdout=asyncio.subprocess.DEVNULL,
                 stderr=asyncio.subprocess.DEVNULL,
             )

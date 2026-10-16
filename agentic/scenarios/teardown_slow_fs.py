@@ -27,6 +27,7 @@ from invariants import (
     HPC_BRIDGE_TOOL_NAMES,
     Result,
     Trace,
+    acted_on_nothing,
     ends_with_teardown,
     first_contact_noted,
     login_shape_ran,
@@ -81,18 +82,27 @@ def _down_after(t: Trace, k: int) -> tuple[int, dict] | None:
 
 
 def teardown_handed_back(t: Trace) -> Result:
-    """The server-task path showed: the FIRST teardown_endpoint answered `tearing_down`, naming the endpoint, with a
-    notice to call teardown_endpoint again. The premise is checked, never assumed: a first teardown that answered
-    `down` (or anything else) outright means the seam did not reach the server or the ops beat a 1 s wait — the path
-    was not exercised, and the detail says so."""
-    tds = t.named("teardown_endpoint")
-    if not tds:
+    """The server-task path showed: the FIRST teardown_endpoint that found an endpoint answered `tearing_down`, naming
+    the endpoint, with a notice to call teardown_endpoint again. The premise is checked, never assumed: a first such
+    teardown that answered `down` (or anything else) outright means the seam did not reach the server or the ops beat a
+    1 s wait — the path was not exercised, and the detail says so. Skipped: a teardown sent before anything was
+    connected ("no endpoint was up", invariants.acted_on_nothing) — hermes21 opened with one in a blind parallel batch,
+    and its `down` failed this premise while the real teardown answered `tearing_down` then `down` (live 2026-10-15)."""
+    every = t.named("teardown_endpoint")
+    if not every:
         return Result("teardown_handed_back", False, "no teardown_endpoint call")
+    tds = [(i, c) for i, c in every if not acted_on_nothing(t, i)]
+    skipped = [i for i, _ in every if acted_on_nothing(t, i)]
+    if not tds:
+        return Result("teardown_handed_back", False,
+                      f"every teardown_endpoint (calls {skipped}) answered 'no endpoint was up' — none found an "
+                      "endpoint to tear down")
     i, c = tds[0]
     r = _res(c)
     if str(r.get("status")) != "tearing_down":
         return Result("teardown_handed_back", False,
-                      f"premise not met: the first teardown_endpoint (call {i}) answered {r.get('status')!r}, not "
+                      f"premise not met: the first teardown_endpoint on an endpoint (call {i}) answered "
+                      f"{r.get('status')!r}, not "
                       "'tearing_down' — HPC_BRIDGE_TEARDOWN_WAIT_S=1 did not reach the server, or the login-node ops "
                       "beat the 1 s wait; the tearing_down path was not exercised")
     why = []
@@ -100,8 +110,10 @@ def teardown_handed_back(t: Trace) -> Result:
         why.append("it names no endpoint_id")
     if "teardown_endpoint again" not in str(r.get("notice") or "").lower():
         why.append(f"its notice does not say to call teardown_endpoint again: {str(r.get('notice') or '')[:120]!r}")
+    skipped = [k for k in skipped if k < i]
+    before = f" (call(s) {skipped} before it answered 'no endpoint was up': nothing to tear down)" if skipped else ""
     return Result("teardown_handed_back", not why,
-                  f"ok: the first teardown (call {i}) answered tearing_down for {r.get('endpoint_id')}" if not why
+                  f"ok: the first teardown (call {i}) answered tearing_down for {r.get('endpoint_id')}{before}" if not why
                   else "; ".join(why))
 
 

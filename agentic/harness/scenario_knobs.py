@@ -11,6 +11,9 @@
                                                    #   else DERIVED: 1 when `compute_ran` is among EXTRA_INVARIANTS
     HPCB_KNOB_WARM_BLOCK_USER=glabs-gc                # WARM_BLOCK_USER -> a running block of that user satisfies the need
                                                    #   (a facility MEP's warm block is what the cell reuses)
+    HPCB_KNOB_ADMIN_TAP='{"cmd": …, "every_s": 10}'  # ADMIN_TAP -> run_smoke.sh samples the scheduler through the target's
+                                                   #   admin channel for the whole cell (harness/admin_tap.py); the
+                                                   #   scenario's WORLD_CHECKS read the samples in the jail
 
 Everything else a scenario declares (EXTRA_ENV, SEED_FACILITY_CACHE, …) is applied INSIDE the container
 by run.py. Scenario modules import only `invariants` (pure), so this is importable on the host."""
@@ -74,6 +77,12 @@ def main(argv: list[str]) -> int:
         if cmds:
             import json
             print(f"{knob}={shlex.quote(json.dumps(cmds))}")
+    # The ADMIN TAP: the scheduler sampled as its admin for the whole cell (run_smoke.sh starts harness/admin_tap.py
+    # through the same admin channel; `{user}` = the pool user). No admin channel on the target ⇒ the cell is refused.
+    tap = getattr(mod, "ADMIN_TAP", None)
+    if tap:
+        import json
+        print(f"HPCB_KNOB_ADMIN_TAP={shlex.quote(json.dumps(dict(tap), sort_keys=True))}")
     return 0
 
 

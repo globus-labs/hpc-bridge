@@ -45,6 +45,7 @@ class EndpointCLI:
         proc = await asyncio.create_subprocess_exec(
             "globus-compute-endpoint",
             *args,
+            stdin=asyncio.subprocess.DEVNULL,
             stdout=asyncio.subprocess.PIPE,
             stderr=asyncio.subprocess.PIPE,
             env=self._env(),

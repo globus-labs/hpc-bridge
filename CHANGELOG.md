@@ -149,6 +149,13 @@ installed plugin only when that version changes); git tags mark releases.
     recorded, so the stop names it;
   - a rejected submission now stops the spend clock and asks for spend again whatever the block count. parsl lets
     the rejection reach hpc-bridge only once every block of that endpoint has failed, so no block of it is still up.
+- **A command hpc-bridge runs over SSH can no longer take the agent's next request.** With nothing to send it, `ssh`
+  inherited the MCP server's own stdin, the channel the agent's requests arrive on. Seen live 2026-10-15 when
+  `teardown_endpoint` was called again while a background teardown's stop and delete ran on the login node, with two
+  symptoms: under Codex ssh read the request itself, so it never reached hpc-bridge and the call timed out after
+  600 s; under Pi OpenSSH set the shared pipe non-blocking, hpc-bridge's next read came back empty, and the server
+  shut down as if the agent had gone ("MCP connection closed"). Every subprocess hpc-bridge's own code starts now
+  gets `/dev/null` for stdin.
 - **A Globus login that no longer works is named, not mistaken for a config fault.** When Globus refuses to renew
   the stored login (it was revoked, or it expired), every dispatch fails. Seen live (2026-10-14), each one said
   "allocating nodes… — last dispatch failed: AuthAPIError … Not a queue wait: fix the config/partition and retry";
@@ -291,6 +298,53 @@ installed plugin only when that version changes); git tags mark releases.
   `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
+- **INFRA for a final answer that is a tool call never made.** In the free-operator sweep rerun of 2026-10-15, six
+  Codex cells on ALCF's gpt-oss ended after one model response, with no call of any kind: the final message was the
+  call itself. Either it was raw harmony tokens (`<|start|>assistant<|channel|>commentary
+  to=functions.mcp__hpc_bridge__ensure_endpoint_up<|call|>`), a call the server's parser left unparsed, or the call
+  written as JSON (`{"cmd":"mcp__hpc_bridge__connect_facility","facility":"fake-ssh-site"}`, once with unescaped inner
+  quotes). The JSON form may be the model writing the call on its final channel rather than a parser leak; the relay's
+  log shows only that vLLM returned a `message`, with no function call in it. Either way nothing reached a tool, and
+  both are now INFRA, each with its own reason: "the model server returned raw harmony tool-call tokens (unparsed)" or
+  "the model answered with a tool call written as JSON instead of calling it". The harmony form needs
+  `to=functions.…` together with `<|call|>` or `<|channel|>`. The JSON form needs the whole answer to be one object
+  whose first key is `cmd`, `name`, `tool`, `function` or `recipient` and holds an `mcp__…` / `functions.…` name. A
+  sentence naming a tool, a call quoted in prose or a code fence, and `{"next_step": "mcp__…", …}` are not matched.
+  It applies only to a run that otherwise ended cleanly: a terminal error (a 4xx such as an invalid tool schema), a
+  non-zero exit or an error is never excused by what the answer looks like. Every other INFRA rule holds: any tool
+  call before the printed one is graded (`fake_pbs_mep_compute` made two, and stays FAILED), and a failed world check
+  stays FAILED (`submit_policy_rejected`'s `world:policy_in_endpoint_log`). Over the 945 stored bundles: 5 Codex
+  FAILs are now INFRA (4 of the six, and a `stop_while_running` cell from the same server); nothing else moved.
+- **Mid-run hooks and graders skip a blind opening batch.** hermes21 on gpt-oss opened some cells with a parallel batch
+  sent before any facility was connected: `ensure_endpoint_up` (down, "No facility connected"), `run_shell` (failed),
+  `poll_task(task_id="PLACEHOLDER")` (failed) and `stop_endpoint` / `teardown_endpoint` ("no endpoint was up"). A
+  hook or grader keyed on "the first call of tool X" took the batch's call:
+  - `orphaned_task`'s `kill_manager` fired on the placeholder poll, with no manager to stop, and the orphan was never
+    met. Hooks now count only the calls they are about: `when_phase: "running"` there; `when_phase: "complete"` on
+    `draining_restop`'s freeze and `block_reaped_resume`'s reap; the new `when_endpoint: True` (the call's answer
+    names the endpoint it acted on) on the stop hooks of `fake_mep_stop_names_block`, `fake_mep_stop_while_provisioning`
+    and `fake_pbs_mep_compute` and on `spend_revoked`'s revocation; and the new `after_hook` on `draining_restop`'s
+    thaw. That thaw had fired at a stop hermes21 made before its compute runs were done, so the freeze that came later
+    was never undone: the real stops met a frozen worker, `draining` three times. The thaw now waits for the first
+    stop after the freeze. Both feeds see these conditions (the Claude SDK stream and the CLI operators' journal).
+    `hook_problems` refuses them on a during hook, and refuses any that could never fire: `when_endpoint` on a tool
+    whose answer has no `endpoint_id`, `when_phase` on one that answers a `status`, or a phase the tool never answers
+    (the tables are pinned to the product's models). Every hooked scenario has a hermetic good run, abridged from its
+    newest OK bundle, on which each hook fires. Replayed over every stored bundle of the 9 hooked scenarios, only those
+    three hermes21 cells fire differently.
+  - `teardown_slow_fs`'s `teardown_handed_back` read the batch's `down` as the slow teardown's premise failing, while the
+    real teardown answered `tearing_down`, then `down`. It now takes the first teardown that found an endpoint. A real
+    teardown that answers `down` straight away still fails the premise. The same skip, `invariants.acted_on_nothing`,
+    now applies to the MEP stop graders (`_first_stop`, `mep_stop_is_draining_only`, `stopped_while_provisioning`),
+    `spend_gate_enforced`, `ssh_account_floor` and `preset_account_scoped`. It skips only the server's own no-op answer
+    ("no endpoint was up", "No facility connected"; never a status alone), and only before any call returned an
+    endpoint: the same words after a detach, a teardown or a restart are graded, so a facility endpoint's bare `down`
+    after a detach (#178) still fails `mep_stop_is_draining_only`. The stored `teardown_slow_fs` bundle now regrades
+    OK; no other stored verdict moved.
+  - A skipped confirm is still caught: `spend_not_unprompted` now fails a `confirm_spend=True` the server answered "No
+    facility connected", even when a connect that only proposed a config (or awaited a login) came before it in the
+    same batch. hermes21 did that three times on 2026-10-15; those cells were already FAILED. It is gated by
+    `spend_gate_enforced`, `ssh_account_floor` and `preset_account_scoped`, so the cells still fail on it.
 - Every run's bundle now keeps the hpc-bridge MCP server's own stderr, as `server-stderr.log`. On 2026-10-15,
   `teardown_slow_fs` under Pi and Codex lost the server mid-teardown ("MCP connection closed", "Transport closed"),
   and no bundle held a line from the server, so the crash could not be diagnosed. Every operator (Claude SDK,
