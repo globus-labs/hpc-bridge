@@ -108,8 +108,10 @@ POSTCHECKS and the teardown, whose `gce stop` would end parsl's loop; the watch 
 - then it reads the endpoint's own logs over the world channel (cluster_ops.capture_logs_cmd: the manager's, each user
   endpoint's, the blocks' output) — before the teardown deletes them — for parsl's decisions after the stop.
 - phase `second`: once the watch is over the world check holds any pilot submitted since the tap's last tick (one
-  last tick, as the pool user), cancels the sentinel and waits until it has left the queue (a COMPLETING sentinel would
-  read as a pilot left behind to the universal postcheck); a relaunched pilot stays held.
+  last tick, as the pool user), cancels the sentinel and waits until it has left the queue; a relaunched pilot stays
+  held. (A COMPLETING sentinel once read as a pilot left behind to the universal postcheck; that check now waits out a
+  job Slurm lists as CG, up to the target's bound, so this wait is partly redundant — it stays so the world check says
+  itself whether the sentinel went, `HPCB_SENTINEL gone|STILL <state>`.)
 Then the teardown runs as usual — its cancel-by-marker (`cluster_ops.scoped_cancel_cmd`: squeue with no state filter, so
 PENDING and held jobs too) cancels a relaunched pilot — and CLEANUP cancels anything of the singleton name, so nothing is
 left on the fake cluster.
@@ -898,9 +900,11 @@ SENTINEL_GONE_S = 60.0   # how long the world check waits for the cancelled sent
 def end_sentinel_cmd(sid: str | None, marker: str, from_job: str | None) -> str:
     """Phase `second`'s last world step, as the pool user: hold every pending pilot of `marker` from `from_job` on ONE
     last time (a relaunch submitted after the tap's last tick would otherwise start the moment the sentinel ends — a
-    user's own hold, JobHeldUser), then cancel the sentinel and wait until it has left the queue (the universal
-    postcheck reads job names: a sentinel still COMPLETING reads as a pilot left behind). Prints `HPCB_HELD <id>` for
-    each pilot it held and `HPCB_SENTINEL gone|STILL <state>`."""
+    user's own hold, JobHeldUser), then cancel the sentinel and wait until it has left the queue. The universal
+    postcheck (`run._no_pilot_left`) now waits out a sentinel still COMPLETING (CG) itself, so this wait is partly
+    redundant: it stays to say whether the sentinel went, and a sentinel still RUNNING — its cancel refused — is
+    still a pilot left behind to that check. Prints `HPCB_HELD <id>` for each pilot it held and
+    `HPCB_SENTINEL gone|STILL <state>`."""
     hold = ""
     if from_job and from_job.isdigit() and is_marker(marker):   # never a bare `uep.`: it would match every pilot
         hold = (slurm_hold_cmd().replace("{user}", '"$(whoami)"').replace("{marker}", shlex.quote(marker))

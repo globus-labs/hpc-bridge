@@ -505,9 +505,14 @@ user being asked"*. Grading has three layers:
 2. **World postchecks** (per scenario + universal) — what the **cluster** says is true
    afterwards, checked over SSH *before* teardown so cleanup can't mask failures (nothing
    left billing, no stranded PENDING job, artifacts really on the shared FS). The universal
-   `world:stop_honesty_no_pilot_left` reads each parsl pilot's state: one that is only ENDING (PBS `E`, Slurm `CG`)
-   is re-listed every 5 s for up to 60 s and passes once gone (live 2026-10-16: a qdel'd pilot sat in `E` for 19 s
-   and failed a clean cell); any other state fails at once, as does a queue listing that fails.
+   `world:stop_honesty_no_pilot_left` waits, re-listing every 5 s up to the target's `pilot_end_wait_s` (fake 60 s,
+   globus1 300 s), for a pilot that is ENDING: a job the run's own `stop_endpoint` answers say they cancelled
+   ("released 0.pbsserver") while it is still listed as running — OpenPBS's qdel is asynchronous, so a cancelled job
+   can stay `R` until its MoM reports, and only later shows `E` — or one the scheduler lists as `E` / `CG` (live
+   2026-10-16: both failed clean cells). A cancelled job queued again, or running again after ending, is a requeue
+   and fails at once, as does any other parsl job of the pool user (a relaunch is a new id); one still listed at the
+   bound fails. A failed listing is retried twice in a row, never read as empty. A SIGTERM during the wait ends it
+   at once (the run's INTERRUPTED path still tears down and writes the bundle).
 3. **Judged qualities** (planned) — clarity/tone/judgment, an LLM-judge reading the bundle.
 
 **How success is measured:** every invariant runs on every trace and is *reported*, but only

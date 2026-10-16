@@ -11,6 +11,7 @@ import asyncio
 import json
 import os
 import sys
+import time
 import types
 from dataclasses import dataclass, field
 from pathlib import Path
@@ -474,7 +475,7 @@ def test_postchecks_on_each_login_judge_raw_output_per_host(runner, monkeypatch)
     class Scen:
         POSTCHECKS: ClassVar[list] = [{"name": "no_proc", "on": "each_login", "cmd": "pgrep x || true", "expect_empty": True}]
 
-    res = {r.name: r for r in run_mod._postchecks(Scen)}
+    res = {r.name: r for r in asyncio.run(run_mod._postchecks(Scen))}
     assert calls[:2] == ["l1", "l2"] and res["world:no_proc"].ok, res["world:no_proc"].detail
     assert not res["world:stop_honesty_no_pilot_left"].ok  # the universal check ran on the default host and found a pilot
 
@@ -482,7 +483,7 @@ def test_postchecks_on_each_login_judge_raw_output_per_host(runner, monkeypatch)
         return 0, "12345 globus-compute-endpoint\n" if host == "l2" else ""
 
     monkeypatch.setattr(run_mod, "_ssh_run", leaky)
-    r = {r.name: r for r in run_mod._postchecks(Scen)}["world:no_proc"]
+    r = {r.name: r for r in asyncio.run(run_mod._postchecks(Scen))}["world:no_proc"]
     assert not r.ok and "[l2] 12345" in r.detail  # the leaking node is named
 
 
@@ -547,12 +548,14 @@ def test_world_channel_scheduler_comes_from_the_target_then_the_scenario(monkeyp
     assert "qstat" in harness_run._universal_postchecks("pbs")[0]["cmd"] and "squeue" in harness_run._universal_postchecks("slurm")[0]["cmd"]
 
 
-# ---- the universal pilot check waits out a pilot that is only ENDING --------------------------------------------------
-# Live 2026-10-16 (fake PBS, happy_path run 1792140540): the stop qdel'd 0.pbsserver at 08:49:52, PBS listed it as E
-# until 08:50:11, and `world:stop_honesty_no_pilot_left` failed the cell inside that window. The listings below are
-# what the check's OWN command prints: `qstat -u <user> -w` (the header as that bundle stored it, rows in OpenPBS's wide
-# columns — the narrow rows of bundle 1788627910, e.g. `0.pbsserver     hpcbrid* debug    parsl.Glo*    134   1   1
-# --  00:30 R 00:00`, widened) and `squeue -h -o "%i %t %j"`.
+# ---- the universal pilot check waits out a pilot that is ENDING ------------------------------------------------------
+# Live 2026-10-16, fake PBS: happy_path run 1792140540 — the stop qdel'd 0.pbsserver at 08:49:52, PBS listed it as E until
+# 08:50:11, and `world:stop_honesty_no_pilot_left` failed the cell inside that window; then Pi's happy_path run
+# 1792166459 — the stop answered `down`, "released 0.pbsserver", at 16:01:51 and PBS kept listing the job as R until
+# 16:02:09 (OpenPBS's qdel is asynchronous: the MoM reports the end). The listings below are what the check's OWN command
+# prints: `qstat -u <user> -w` (the header as run 1792140540 stored it, rows in OpenPBS's wide columns — the narrow rows
+# of bundle 1788627910, e.g. `0.pbsserver     hpcbrid* debug    parsl.Glo*    134   1   1    --  00:30 R 00:00`,
+# widened) and `squeue -h -o "%i %t %j"`; the stop notices are as stored bundles hold them.
 
 _PILOT = "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.1792140540.5505073"
 _SAT = "hpcb-sat"   # a harness sleeper: never a pilot
@@ -561,11 +564,18 @@ _PBS_HEAD = ("\npbsserver: \n" + " " * 99 + "Req'd  Req'd   Elap\n"
              f"{'Memory':>6} {'Time':>5} S {'Time':>5}\n"
              + " ".join("-" * w for w in (30, 15, 15, 15, 8, 4, 5, 6, 5, 1, 5)) + "\n")
 _SCHED = {
-    "pbs": {"ending": "E", "live": ("Q", "H", "R", "W", "T"),
+    "pbs": {"ending": "E", "live": ("Q", "H", "R", "W", "T"), "queued": ("Q", "H", "W"),
             "down": "Connection refused\nqstat: cannot connect to server pbsserver (errno=15010)\n"},
-    "slurm": {"ending": "CG", "live": ("PD", "R", "S", "CF"),
+    "slurm": {"ending": "CG", "live": ("PD", "R", "S", "CF"), "queued": ("PD",),
               "down": "slurm_load_jobs error: Unable to contact slurm controller (connect failure)\n"},
 }
+_NOTICES = {
+    "pbs": ("compute block released over AMQP (released 0.pbsserver). The login endpoint stays online for reuse "
+            "(reconnecting is zero-SSH)."),                                                   # run 1792166459
+    "slurm": ("compute block released over AMQP (released 0); the login endpoint stays online for reuse (reconnecting "
+              "is zero-SSH)."),                                                               # run 1792130369's form
+}
+WAIT = 60.0   # the fake cluster's bound (targets.FAKE_PILOT_END_WAIT_S)
 
 
 def _job(scheduler: str, n: int) -> str:
@@ -587,38 +597,55 @@ def _listing(scheduler: str, *jobs: tuple[int, str, str]) -> str:
     return _PBS_HEAD + "".join(rows)
 
 
+def _ls(scheduler: str, *jobs: tuple[int, str]) -> tuple[int, str]:
+    """One clean listing of parsl pilots (job number, state)."""
+    return 0, _listing(scheduler, *((n, st, _PILOT) for n, st in jobs))
+
+
 class _Queue:
     """The login node as the check sees it: each `_ssh_run` answers the next (rc, output) — the last one for good — and
     the check's sleeps advance a fake clock."""
 
     def __init__(self, *answers: tuple[int, str]):
-        self.answers, self.cmds, self.sleeps, self.now = list(answers), [], [], 1000.0
+        self.answers, self.cmds, self.timeouts, self.sleeps, self.now = list(answers), [], [], [], 1000.0
 
     def ssh(self, cmd, *, timeout=60, host=None):
         self.cmds.append(cmd)
+        self.timeouts.append(timeout)
         return self.answers.pop(0) if len(self.answers) > 1 else self.answers[0]
 
-    def sleep(self, s):
+    async def sleep(self, s):
         self.sleeps.append(s)
         self.now += s
 
 
-def _check(harness_run, monkeypatch, scheduler, *answers):
+def _stops(*notices, name="stop_endpoint"):
+    from invariants import ToolCall, Trace
+    return Trace([ToolCall("run_shell", {"command": "squeue"}, {"stdout": "released 9\n"})]
+                 + [ToolCall(name, {}, {"status": "down", "notice": n}) for n in notices])
+
+
+def _check(harness_run, monkeypatch, scheduler, *answers, cancelled=None):
     q = _Queue(*answers)
     monkeypatch.setattr(harness_run, "_ssh_run", q.ssh)
     (pc,) = harness_run._universal_postchecks(scheduler)
-    row = harness_run._no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], sleep=q.sleep, clock=lambda: q.now)
+    row = asyncio.run(harness_run._no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], cancelled=cancelled, wait_s=WAIT,
+                                                 sleep=q.sleep, clock=lambda: q.now))
     assert row.name == "world:stop_honesty_no_pilot_left" and set(q.cmds) == {pc["cmd"]}   # the check's own command
     return row, q
 
 
+def _mine(harness_run, scheduler):
+    return harness_run._stop_cancelled_jobs(_stops(_NOTICES[scheduler]))
+
+
 @pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
-def test_pilot_check_waits_out_a_pilot_that_is_only_ending(harness_run, monkeypatch, scheduler):
+def test_pilot_check_waits_out_a_pilot_the_scheduler_lists_as_ending(harness_run, monkeypatch, scheduler):
     e = _SCHED[scheduler]["ending"]
     ending = (0, _listing(scheduler, (0, e, _PILOT), (7, "R", _SAT)))
     row, q = _check(harness_run, monkeypatch, scheduler, ending, ending, (0, _listing(scheduler, (7, "R", _SAT))))
     assert row.ok and len(q.cmds) == 3 and q.sleeps == [5.0, 5.0], row.detail     # the sleeper is not a pilot
-    assert f"{_job(scheduler, 0)} ({e}) ended and left the queue within 10 s" in row.detail
+    assert row.detail == f"ok: {_job(scheduler, 0)} ({e}) ended and left the queue within 10 s"
     row, q = _check(harness_run, monkeypatch, scheduler, ending, (0, ""))           # the queue empties outright
     assert row.ok and len(q.cmds) == 2
     row, q = _check(harness_run, monkeypatch, scheduler, (0, _listing(scheduler, (7, "R", _SAT))))
@@ -626,73 +653,227 @@ def test_pilot_check_waits_out_a_pilot_that_is_only_ending(harness_run, monkeypa
 
 
 @pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
-def test_pilot_check_fails_a_pilot_still_ending_at_the_bound(harness_run, monkeypatch, scheduler):
+def test_pilot_check_fails_a_pilot_still_listed_at_the_bound(harness_run, monkeypatch, scheduler):
     e = _SCHED[scheduler]["ending"]
-    row, q = _check(harness_run, monkeypatch, scheduler, (0, _listing(scheduler, (0, e, _PILOT))))
-    assert not row.ok and q.now - 1000.0 == harness_run.PILOT_ENDING_WAIT_S == 60.0, row.detail
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, e)))
+    assert not row.ok and q.now - 1000.0 == WAIT, row.detail
     assert len(q.cmds) == 13 and max(q.sleeps) == 5.0                               # every 5 s, the last look AT 60 s
-    assert "still ending after 60 s" in row.detail and f"{_job(scheduler, 0)} ({e})" in row.detail
-    if scheduler == "slurm":   # the extended name of the same state (squeue %T) waits the same way
-        row, _ = _check(harness_run, monkeypatch, scheduler, (0, f"3 COMPLETING {_PILOT}\n"), (0, ""))
-        assert row.ok, row.detail
+    assert row.detail == f"a pilot still listed after 60 s (the bound is 60 s): {_job(scheduler, 0)} ({e})"
+    # one a stop cancelled, still R at the bound, is named with its state
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, "R")), cancelled=_mine(harness_run, scheduler))
+    assert not row.ok and len(q.cmds) == 13, row.detail
+    assert row.detail == f"a pilot still listed after 60 s (the bound is 60 s): {_job(scheduler, 0)} (R; a stop cancelled it)"
 
 
 @pytest.mark.parametrize("scheduler, state", [(s, st) for s in _SCHED for st in _SCHED[s]["live"]])
 def test_pilot_check_fails_a_queued_held_or_running_pilot_at_once(harness_run, monkeypatch, scheduler, state):
-    row, q = _check(harness_run, monkeypatch, scheduler, (0, _listing(scheduler, (4, state, _PILOT))), (0, ""))
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (4, state)), (0, ""))
     assert not row.ok and len(q.cmds) == 1 and q.sleeps == [], row.detail   # never waited on: a relaunch sits here
     assert row.detail == f"found a pilot that is not ending: {_job(scheduler, 4)} ({state})"
+    # a stop that cancelled ANOTHER job does not excuse this one
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (4, state)), (0, ""),
+                    cancelled=_mine(harness_run, scheduler))
+    assert not row.ok and len(q.cmds) == 1, row.detail
 
 
 @pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
 def test_pilot_check_fails_an_ending_pilot_beside_a_queued_one(harness_run, monkeypatch, scheduler):
     e, q_state = _SCHED[scheduler]["ending"], _SCHED[scheduler]["live"][0]
-    mix = (0, _listing(scheduler, (0, e, _PILOT), (1, q_state, _PILOT)))
+    mix = _ls(scheduler, (0, e), (1, q_state))
     row, q = _check(harness_run, monkeypatch, scheduler, mix, (0, ""))
     assert not row.ok and len(q.cmds) == 1, row.detail
     assert row.detail == (f"found a pilot that is not ending: {_job(scheduler, 1)} ({q_state}); "
                           f"ending: {_job(scheduler, 0)} ({e})")
     # a pilot relaunched WHILE the check waits on an ending one fails at the look that sees it
-    ending = (0, _listing(scheduler, (0, e, _PILOT)))
-    row, q = _check(harness_run, monkeypatch, scheduler, ending, mix, (0, ""))
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, e)), mix, (0, ""))
     assert not row.ok and len(q.cmds) == 2 and q.sleeps == [5.0] and f"{_job(scheduler, 1)} ({q_state})" in row.detail
 
+
+# ---- a job the run's own stops said they cancelled -------------------------------------------------------------------
+
+def test_the_jobs_a_run_s_stops_cancelled_are_read_from_their_answers(harness_run):
+    from hpc_bridge.notices import _failed_release_notice, _rejected_stop_notice
+    read = harness_run._stop_cancelled_jobs
+    assert read(_stops(_NOTICES["pbs"])) == ["0.pbsserver"] and read(_stops(_NOTICES["slurm"])) == ["0"]
+    # a draining stop that names what it cancelled (run 1792128317), a stop that leads with the detail, two stops and
+    # an id twice (#204: a fresh user endpoint per block request — one stop may cancel several), PBS's long ids
+    assert read(_stops("compute block released over AMQP (released 4). Spend is NOT confirmed stopped: hpc-bridge's "
+                       "check for the block on partition 'main' (task fc8c6745) is still queued on the endpoint",
+                       "released 5. Spend is NOT confirmed stopped: a block came up and answered a check",
+                       "compute block released over AMQP (released 5 6 12_3), but Spend is NOT confirmed stopped")) \
+        == ["4", "5", "6", "12_3"]
+    assert read(_stops("compute block released over AMQP (released 123456.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov)"
+                       ". The login endpoint stays online")) == ["123456.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov"]
+    # a release the scheduler partly refused: what it cancelled counts, what it refused never does
+    assert read(_stops(_failed_release_notice("release failed: qdel refused 3.pbsserver; cancelled: 4.pbsserver "
+                                              "5.pbsserver", queued=False))) == ["4.pbsserver", "5.pbsserver"]
+    assert read(_stops(_failed_release_notice("release failed: scancel refused 3; cancelled: none", queued=True))) == []
+    # nothing to read: none cancelled, a rejected submission, a cold channel, the older wording without `released`
+    # (run 1792096430), another tool's output, no trace at all
+    assert read(_stops("compute block released over AMQP (released none). Pilot 1 FINISHED (exit status 42) before it "
+                       "ran hpc-bridge's check", _rejected_stop_notice(),
+                       "Spend is NOT confirmed stopped: the login release channel is cold",
+                       "compute block released over AMQP (1.pbsserver); the login endpoint stays online")) == []
+    assert read(_stops(_NOTICES["pbs"], name="teardown_endpoint")) == [] and read(None) == []
+    assert read(_stops("compute block released over AMQP (released 12abc) and (released 1 block)")) == ["1"]
+
+
+@pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
+def test_pilot_check_waits_out_a_job_a_stop_cancelled_while_it_still_runs(harness_run, monkeypatch, scheduler):
+    mine, running = _mine(harness_run, scheduler), _ls(scheduler, (0, "R"))
+    # the live sequence (run 1792166459): listed as R after the confirmed cancel, then gone
+    row, q = _check(harness_run, monkeypatch, scheduler, running, running, running, running, (0, ""), cancelled=mine)
+    assert row.ok and len(q.cmds) == 5, row.detail
+    assert row.detail == f"ok: {_job(scheduler, 0)} (R; a stop cancelled it) ended and left the queue within 20 s"
+    # R, then the ending state, then gone
+    row, q = _check(harness_run, monkeypatch, scheduler, running, _ls(scheduler, (0, _SCHED[scheduler]["ending"])),
+                    (0, ""), cancelled=mine)
+    assert row.ok and len(q.cmds) == 3, row.detail
+    # the same listing with no id readable from the stops: the states alone decide — an R pilot fails at once
+    row, q = _check(harness_run, monkeypatch, scheduler, running, (0, ""), cancelled=[])
+    assert not row.ok and len(q.cmds) == 1 and row.detail == f"found a pilot that is not ending: {_job(scheduler, 0)} (R)"
+
+
+@pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
+def test_pilot_check_fails_a_new_job_while_a_cancelled_one_ends(harness_run, monkeypatch, scheduler):
+    mine = _mine(harness_run, scheduler)
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, "R"), (1, "R")), (0, ""), cancelled=mine)
+    assert not row.ok and len(q.cmds) == 1 and q.sleeps == [], row.detail                  # a relaunch is a NEW id
+    assert row.detail == (f"found a pilot that is not ending: {_job(scheduler, 1)} (R); "
+                          f"ending: {_job(scheduler, 0)} (R; a stop cancelled it)")
+    # one that appears queued while the check waits on the cancelled one fails at the look that sees it
+    pd = _SCHED[scheduler]["queued"][0]
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, "R")), _ls(scheduler, (0, "R"), (1, pd)),
+                    (0, ""), cancelled=mine)
+    assert not row.ok and len(q.cmds) == 2 and f"{_job(scheduler, 1)} ({pd})" in row.detail, row.detail
+    # an unnamed job ENDING beside the cancelled one (parsl's idle-release, a walltime) is waited out like it
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, "R"), (1, _SCHED[scheduler]["ending"])),
+                    (0, ""), cancelled=mine)
+    assert row.ok and len(q.cmds) == 2, row.detail
+
+
+@pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
+def test_pilot_check_fails_a_cancelled_job_that_is_requeued(harness_run, monkeypatch, scheduler):
+    # Slurm and PBS requeue a job under its OWN id: a cancelled job queued again, or running again after it was seen
+    # ending, is not ending — it fails at once, never waited out
+    mine, e = _mine(harness_run, scheduler), _SCHED[scheduler]["ending"]
+    for st in _SCHED[scheduler]["queued"]:
+        row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, st)), (0, ""), cancelled=mine)
+        assert not row.ok and len(q.cmds) == 1, row.detail
+        assert row.detail == (f"found a pilot that is not ending: {_job(scheduler, 0)} ({st}; a stop cancelled it, yet "
+                              "it is not ending — requeued?)")
+    pd = _SCHED[scheduler]["queued"][0]
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, "R")), _ls(scheduler, (0, e)),
+                    _ls(scheduler, (0, pd)), (0, ""), cancelled=mine)
+    assert not row.ok and len(q.cmds) == 3 and f"{_job(scheduler, 0)} ({pd}; a stop cancelled it" in row.detail
+    row, q = _check(harness_run, monkeypatch, scheduler, _ls(scheduler, (0, e)), _ls(scheduler, (0, "R")), (0, ""),
+                    cancelled=mine)
+    assert not row.ok and len(q.cmds) == 2, row.detail
+    assert row.detail == (f"found a pilot that is not ending: {_job(scheduler, 0)} (R; a stop cancelled it, and it ran "
+                          "again after ending — requeued)")
+
+
+def test_pilot_check_matches_a_pbs_job_whose_id_qstat_cut_to_30_columns(harness_run, monkeypatch):
+    # Polaris-style ids: the stop's `qstat -f` names the job whole, `qstat -w` cuts its Job ID column at 30
+    long_id = "123456.polaris-pbs-01.hsn.cm.polaris.alcf.anl.gov"
+    mine = harness_run._stop_cancelled_jobs(_stops(f"compute block released over AMQP (released {long_id})."))
+    row_text = _listing("pbs", (0, "R", _PILOT)).replace(f"{'0.pbsserver':<30}", f"{long_id[:29] + '*':<30}")
+    assert long_id[:29] + "*" in row_text
+    row, _ = _check(harness_run, monkeypatch, "pbs", (0, row_text), (0, ""), cancelled=mine)
+    assert row.ok, row.detail
+    row, _ = _check(harness_run, monkeypatch, "pbs", (0, row_text), (0, ""), cancelled=["123457.polaris-pbs-01"])
+    assert not row.ok, row.detail                                                            # another sequence number
+
+
+# ---- a listing that fails ---------------------------------------------------------------------------------------------
 
 @pytest.mark.parametrize("scheduler", ["pbs", "slurm"])
 def test_pilot_check_never_reads_a_failed_listing_as_an_empty_queue(harness_run, monkeypatch, scheduler):
     (pc,) = harness_run._universal_postchecks(scheduler)
     assert "|| true" not in pc["cmd"] and "/dev/null" not in pc["cmd"]   # the PBS command used to mask a failed qstat
     down = (1, _SCHED[scheduler]["down"])
-    row, q = _check(harness_run, monkeypatch, scheduler, down, (0, ""))
-    assert not row.ok and len(q.cmds) == 1 and row.detail.startswith("rc=1: the queue could not be read"), row.detail
+    # three failures in a row (the first and PILOT_LIST_RETRIES more) fail, quoting the scheduler
+    row, q = _check(harness_run, monkeypatch, scheduler, down, down, down, (0, ""))
+    assert not row.ok and len(q.cmds) == 3 and q.sleeps == [5.0, 5.0], row.detail
+    assert row.detail.startswith("rc=1: the queue could not be read (3 tries in a row, 10 s of 60)")
     assert "cannot connect" in row.detail or "Unable to contact" in row.detail
     row, _ = _check(harness_run, monkeypatch, scheduler, (255, "ssh: connect to host login port 22: Connection refused"))
-    assert not row.ok and row.detail.startswith("UNVERIFIABLE — ssh rc=255")
-    ending = (0, _listing(scheduler, (0, _SCHED[scheduler]["ending"], _PILOT)))
-    row, q = _check(harness_run, monkeypatch, scheduler, ending, down, (0, ""))      # it fails while the check waits
-    assert not row.ok and len(q.cmds) == 2 and "could not be read" in row.detail
-    # a line naming a pilot that does not parse is never an ending one
+    assert not row.ok and row.detail.startswith("UNVERIFIABLE — ssh rc=255: the queue could not be read (3 tries")
+    # a failure while waiting on an ending job: retried; a clean listing after it decides
+    ending = _ls(scheduler, (0, _SCHED[scheduler]["ending"]))
+    row, q = _check(harness_run, monkeypatch, scheduler, ending, down, down, (0, ""))
+    assert row.ok and len(q.cmds) == 4, row.detail                                          # 2 in a row, then clean
+    row, q = _check(harness_run, monkeypatch, scheduler, ending, down, down, down, (0, ""))
+    assert not row.ok and len(q.cmds) == 4 and f"waiting on {_job(scheduler, 0)}" in row.detail, row.detail
+    # failures that alternate with an ending listing never pass: the window ends unverified, or the bound fails it
+    row, q = _check(harness_run, monkeypatch, scheduler, *[ending, down] * 20)
+    assert not row.ok and q.now - 1000.0 <= WAIT, row.detail
+    # one look's ssh timeout never outlasts the bound by much (15 s floor)
+    assert max(q.timeouts) <= 60 and min(q.timeouts) >= 15
+    # a line naming a pilot that does not parse is never an ending one, nor a cancelled job's
     cut = _PBS_HEAD + "0.pbsserver   parsl.GlobusCo*\n" if scheduler == "pbs" else _PILOT + "\n"
-    row, q = _check(harness_run, monkeypatch, scheduler, (0, cut), (0, ""))
+    row, q = _check(harness_run, monkeypatch, scheduler, (0, cut), (0, ""), cancelled=_mine(harness_run, scheduler))
     assert not row.ok and len(q.cmds) == 1 and row.detail.endswith("(?)"), row.detail
+
+
+# ---- wired into the run ----------------------------------------------------------------------------------------------
+
+def test_the_bound_is_the_target_s(harness_run, monkeypatch):
+    import targets
+    assert targets.get("fake").capabilities["pilot_end_wait_s"] == targets.FAKE_PILOT_END_WAIT_S == WAIT
+    assert targets.get("globus1").capabilities["pilot_end_wait_s"] > WAIT                  # a real cluster: longer
+    monkeypatch.setenv("HPCB_TARGET_CAPS", json.dumps(targets.get("globus1").capabilities))
+    assert harness_run._pilot_end_wait_s() == 300.0
+    monkeypatch.setenv("HPCB_TARGET_CAPS", "{}")                                             # no target known (aurora)
+    assert harness_run._pilot_end_wait_s() == harness_run.PILOT_END_WAIT_UNKNOWN_S == 300.0
+    monkeypatch.setenv("HPCB_TARGET_CAPS", '{"pilot_end_wait_s": 90}')
+    assert harness_run._pilot_end_wait_s() == 90.0
 
 
 def test_postchecks_run_the_pilot_check_with_its_wait(harness_run, monkeypatch):
     # the universal row in `_postchecks` is this check (job states read, an ending pilot waited out), on the target's
-    # scheduler — a scenario's own POSTCHECKS still run declaratively beside it
-    monkeypatch.setenv("HPCB_TARGET_CAPS", '{"scheduler": "pbs"}')
+    # scheduler with the target's bound — a scenario's own POSTCHECKS still run declaratively beside it
+    monkeypatch.setenv("HPCB_TARGET_CAPS", '{"scheduler": "pbs", "pilot_end_wait_s": 60}')
     monkeypatch.setattr(harness_run, "PILOT_ENDING_POLL_S", 0.0)
-    q = _Queue((0, _listing("pbs", (0, "E", _PILOT))), (0, ""))
+    q = _Queue(_ls("pbs", (0, "E")), (0, ""))
     monkeypatch.setattr(harness_run, "_ssh_run",
                         lambda cmd, *, timeout=60, host=None: (0, "hi\n") if cmd == "echo hi" else q.ssh(cmd))
 
     class Scen:
         POSTCHECKS: ClassVar[list] = [{"name": "mine", "cmd": "echo hi", "expect_present": "hi"}]
 
-    rows = {r.name: r for r in harness_run._postchecks(Scen)}
+    rows = {r.name: r for r in asyncio.run(harness_run._postchecks(Scen))}
     assert rows["world:mine"].ok and rows["world:stop_honesty_no_pilot_left"].ok, rows
     assert "0.pbsserver (E) ended" in rows["world:stop_honesty_no_pilot_left"].detail
     assert q.cmds == ['qstat -u "$(whoami)" -w'] * 2
+    # with the run's result: its stop's cancel lets an R listing be waited out (run 1792166459)
+    q.answers = [_ls("pbs", (0, "R")), (0, "")]
+    res = types.SimpleNamespace(trace=_stops(_NOTICES["pbs"]))
+    row = {r.name: r for r in asyncio.run(harness_run._postchecks(Scen, res))}["world:stop_honesty_no_pilot_left"]
+    assert row.ok and "0.pbsserver (R; a stop cancelled it) ended" in row.detail, row.detail
+    q.answers = [_ls("pbs", (0, "R")), (0, "")]
+    assert not {r.name: r for r in asyncio.run(harness_run._postchecks(Scen))}["world:stop_honesty_no_pilot_left"].ok
+
+
+def test_a_cancel_during_the_wait_ends_it_at_once(harness_run, monkeypatch):
+    # SIGTERM (`docker stop`) cancels the run task through asyncio's signal handling: the wait must not hold it — the
+    # cancel lands at the wait's next await, never as a pass, and the run's INTERRUPTED path writes the bundle
+    q = _Queue(_ls("pbs", (0, "E")))
+    monkeypatch.setattr(harness_run, "_ssh_run", q.ssh)
+    (pc,) = harness_run._universal_postchecks("pbs")
+
+    async def go():
+        task = asyncio.create_task(harness_run._no_pilot_left(pc["name"], pc["cmd"], "pbs", wait_s=3600.0))
+        while not q.cmds:
+            await asyncio.sleep(0.01)
+        await asyncio.sleep(0.05)              # inside the 5 s poll sleep now
+        t0 = time.monotonic()
+        task.cancel()
+        with pytest.raises(asyncio.CancelledError):
+            await task
+        return time.monotonic() - t0
+
+    assert asyncio.run(go()) < 1.0 and len(q.cmds) == 1
 
 
 def test_after_teardown_check_gates_delete_cells_and_reports_keep_cells(runner, monkeypatch):
@@ -752,10 +933,10 @@ def test_a_local_postcheck_runs_in_the_jail_not_over_ssh(runner, monkeypatch, tm
         POSTCHECKS: ClassVar[list] = [{"name": "jail_clean", "on": "local", "expect_empty": True,
                                        "cmd": f"ls -d {tmp_path}/hpc-bridge-* 2>/dev/null; true"}]
 
-    r = {x.name: x for x in run_mod._postchecks(Scen)}["world:jail_clean"]
+    r = {x.name: x for x in asyncio.run(run_mod._postchecks(Scen))}["world:jail_clean"]
     assert not r.ok and "[jail]" in r.detail and "hpc-bridge-dev" in r.detail
     (tmp_path / "hpc-bridge-dev").rmdir()
-    assert {x.name: x for x in run_mod._postchecks(Scen)}["world:jail_clean"].ok
+    assert {x.name: x for x in asyncio.run(run_mod._postchecks(Scen))}["world:jail_clean"].ok
 
 
 def test_a_leaked_manager_after_teardown_fails_a_delete_cell_end_to_end(runner, monkeypatch, tmp_path):
