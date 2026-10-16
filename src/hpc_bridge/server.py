@@ -998,6 +998,15 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     # The whole call is bounded (config.STOP_CALL_BUDGET_S): under the tool timeouts of the clients that drive it —
     # the waits for the lock, the releases, the lookups and the liveness check included.
     call_deadline = time.monotonic() + config.STOP_CALL_BUDGET_S
+    # Our own work on the block refuses the stop at once — before any wait on the record below (a slow home directory
+    # must not let a command still in its sync-wait turn into a handle first, nor delay the answer that names it).
+    if not await _acquire_within(app, call_deadline):
+        return _lock_busy_status(app, eid, released=None)
+    try:
+        if busy := _busy_block_refusal(app, eid):
+            return busy
+    finally:
+        app.lock.release()
     # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server) — after this
     # process's own pending writes, so it reads what this process knows
     await warmth._flush_all(app, timeout=min(5.0, call_deadline - time.monotonic()))

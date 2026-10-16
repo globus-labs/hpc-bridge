@@ -19,12 +19,15 @@ from __future__ import annotations
 import asyncio
 import dataclasses
 import inspect
+import queue
 import re
 import secrets
 import sys
+import threading
 import time
-from concurrent.futures import ThreadPoolExecutor
+from concurrent.futures import Future
 from dataclasses import replace
+from pathlib import Path
 from typing import Any, Literal
 
 from globus_compute_sdk.errors import SerdeError, TaskExecutionFailed
@@ -864,13 +867,53 @@ def _persist_checks(app: AppCtx, eid: str) -> None:
     drop = ((wrote | frozenset(app.resolved_checks)) - mine)
     if mine == wrote and drop <= dropped and eid not in app.checks_pending:
         return
-    app.checks_pending[eid] = (list(rows.values()), mine, drop)
+    app.checks_pending[eid] = _RecordJob(list(rows.values()), mine, SentCheckStore().root)
     _schedule_flush(app, eid)
 
-# The record's I/O runs on ONE thread of its own, never the loop's shared pool: a home directory that hangs (NFS) can
-# hold that thread, but nothing else waits on it — reads are bounded (`_read_checks`), and the rest of hpc-bridge's
-# blocking calls keep their pool.
-_STORE_POOL = ThreadPoolExecutor(max_workers=1, thread_name_prefix="hpc-bridge-record")
+@dataclasses.dataclass(frozen=True)
+class _RecordJob:
+    """A write of an endpoint's record, as decided on the loop: its rows (None: the endpoint is gone — remove the
+    record), their keys, and the record's directory AS IT WAS when the write was decided — never re-read in the worker,
+    where the environment may have changed since (a later test, a later binding)."""
+    rows: list[dict] | None
+    mine: frozenset[str]
+    root: Path
+
+class _RecordThread:
+    """The record's I/O runs on ONE thread of its own, never the loop's shared pool: a home directory that hangs (NFS)
+    can hold that thread, but nothing else waits on it — reads are bounded (`_read_checks`), and the rest of
+    hpc-bridge's blocking calls keep their pool. A DAEMON thread, started on first use: a write hung at exit never keeps
+    the interpreter alive (the shutdown's flush is bounded)."""
+
+    def __init__(self, name: str) -> None:
+        self._name = name
+        self._jobs: queue.SimpleQueue = queue.SimpleQueue()
+        self._thread: threading.Thread | None = None
+        self._guard = threading.Lock()
+
+    def submit(self, fn: Any, *args: Any) -> Future:
+        fut: Future = Future()
+        self._jobs.put((fut, fn, args))
+        with self._guard:
+            if self._thread is None or not self._thread.is_alive():
+                self._thread = threading.Thread(target=self._run, name=self._name, daemon=True)
+                self._thread.start()
+        return fut
+
+    def _run(self) -> None:
+        while True:
+            fut, fn, args = self._jobs.get()
+            if not fut.set_running_or_notify_cancel():
+                continue
+            try:
+                fut.set_result(fn(*args))
+            except BaseException as exc:  # noqa: BLE001 - handed to the waiting coroutine
+                fut.set_exception(exc)
+
+_STORE_POOL = _RecordThread("hpc-bridge-record")
+
+async def _on_record_thread(fn: Any, *args: Any) -> Any:
+    return await asyncio.wrap_future(_STORE_POOL.submit(fn, *args))
 
 def _schedule_flush(app: AppCtx, eid: str) -> None:
     """The file is written OFF the event loop (a thread), by one flusher per endpoint, latest state first: a lock
@@ -885,41 +928,48 @@ def _schedule_flush(app: AppCtx, eid: str) -> None:
     if task is None or task.done():
         app.check_flushers[eid] = loop.create_task(_flush_checks(app, eid))
 
-def _write_job(eid: str, job: tuple[list[dict], frozenset[str], frozenset[str]] | None) -> bool:
-    """One pending write (None: the endpoint is gone — remove its record). Blocking."""
-    store = SentCheckStore()
-    if job is None:
+def _write_job(eid: str, job: _RecordJob, drop: frozenset[str]) -> bool:
+    """One pending write, in the record's own directory as decided (`job.root`). Blocking."""
+    store = SentCheckStore(job.root)
+    if job.rows is None:
         store.remove(eid)
         return True
-    return store.update(eid, job[0], job[2])
+    return store.update(eid, job.rows, drop)
 
-def _done_job(app: AppCtx, eid: str, job: tuple[list[dict], frozenset[str], frozenset[str]] | None, ok: bool) -> None:
-    if job is not None and ok:
-        app.persisted_checks[eid] = (job[1], job[2])
-    elif job is not None:
-        print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under "
-              f"{SentCheckStore().root}); tried again on the next change", file=sys.stderr)
+def _done_job(app: AppCtx, eid: str, job: _RecordJob, drop: frozenset[str], ok: bool,
+              before: tuple[frozenset[str], frozenset[str]] | None) -> None:
+    if job.rows is not None and not ok:  # not written: back to what is on the record, so the next change retries
+        if before is None:
+            app.persisted_checks.pop(eid, None)
+        else:
+            app.persisted_checks[eid] = before
+        print(f"hpc-bridge: could not write the record of checks sent to endpoint {eid} (under {job.root}); tried "
+              "again on the next change", file=sys.stderr)
 
-def _take_job(app: AppCtx, eid: str) -> tuple[list[dict], frozenset[str], frozenset[str]] | None:
-    """The next write, its removals computed NOW — against what the writes before it put on the record — so a row an
-    earlier write added is removed by a later one that no longer has it, however the two were queued."""
+def _take_job(app: AppCtx, eid: str) -> tuple[_RecordJob, frozenset[str], tuple[frozenset[str], frozenset[str]] | None]:
+    """The next write, and its removals computed NOW — against what the writes before it put on the record — so a row
+    an earlier write added is removed by a later one that no longer has it, however the two were queued. What it
+    writes counts as written from now (`persisted_checks`), so a change while it is in flight is not queued twice;
+    a write that fails puts back what was there before (`_done_job`)."""
     job = app.checks_pending.pop(eid)
-    if job is None:
-        return None
-    wrote = app.persisted_checks.get(eid, (frozenset(), frozenset()))[0]
-    return job[0], job[1], (wrote | frozenset(app.resolved_checks)) - job[1]
+    before = app.persisted_checks.get(eid)
+    wrote = before[0] if before is not None else frozenset()
+    drop = (wrote | frozenset(app.resolved_checks)) - job.mine
+    if job.rows is not None:
+        app.persisted_checks[eid] = (job.mine, drop)
+    return job, drop, before
 
 def _write_pending(app: AppCtx, eid: str) -> None:
     while eid in app.checks_pending:
-        job = _take_job(app, eid)
-        _done_job(app, eid, job, _write_job(eid, job))
+        job, drop, before = _take_job(app, eid)
+        _done_job(app, eid, job, drop, _write_job(eid, job, drop), before)
 
 async def _flush_checks(app: AppCtx, eid: str) -> None:
-    """Write the endpoint's pending record state, in a thread, until none is left (a newer one replaces an older)."""
+    """Write the endpoint's pending record state, on the record's thread, until none is left (a newer one replaces an
+    older)."""
     while eid in app.checks_pending:
-        job = _take_job(app, eid)
-        ok = await asyncio.get_running_loop().run_in_executor(_STORE_POOL, _write_job, eid, job)
-        _done_job(app, eid, job, ok)
+        job, drop, before = _take_job(app, eid)
+        _done_job(app, eid, job, drop, await _on_record_thread(_write_job, eid, job, drop), before)
 
 async def _flush_all(app: AppCtx, timeout: float = 10.0) -> None:
     """Wait — at most `timeout` — for every pending write of the record: at a teardown's end and the server's shutdown
@@ -931,8 +981,7 @@ async def _flush_all(app: AppCtx, timeout: float = 10.0) -> None:
 async def _read_checks(eid: str, timeout: float = 5.0) -> tuple[list[dict], str | None]:
     """The record on disk, read in a thread, within `timeout`: out of time, nothing is known — fail closed."""
     try:
-        return await asyncio.wait_for(asyncio.get_running_loop().run_in_executor(_STORE_POOL, SentCheckStore().read,
-                                                                                    eid), timeout=max(timeout, 0.1))
+        return await asyncio.wait_for(_on_record_thread(SentCheckStore().read, eid), timeout=max(timeout, 0.1))
     except TimeoutError:
         return [], "it could not be read in time"
 
@@ -949,7 +998,7 @@ def _forget_checks(app: AppCtx, eid: str) -> None:
     the loop, like every write). Callers hold app.lock."""
     app.sent_checks.pop(eid, None)
     app.persisted_checks.pop(eid, None)
-    app.checks_pending[eid] = None
+    app.checks_pending[eid] = _RecordJob(None, frozenset(), SentCheckStore().root)
     _schedule_flush(app, eid)
 
 def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:

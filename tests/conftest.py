@@ -5,11 +5,30 @@ import pytest
 @pytest.fixture(autouse=True)
 def _isolate_hpc_bridge_state(monkeypatch, tmp_path):
     """Point ALL of hpc-bridge's local state — the whole ~/.hpc-bridge tree: `endpoints.json`
-    (login-node pins), `facilities.json` (the local-discovery cache), and the SSH control-socket
-    dir — at a per-test tmp dir. So no test reads stale entries or WRITES into the developer's real
+    (login-node pins), `facilities.json` (the local-discovery cache), the record of sent checks and the SSH
+    control-socket dir — at a per-test tmp dir. So no test reads stale entries or WRITES into the developer's real
     state (a test once polluted the real facilities.json before this existed). Belt-and-suspenders:
-    the code defaults to ~/.hpc-bridge; this just relocates it via HPC_BRIDGE_STATE_DIR."""
+    the code defaults to ~/.hpc-bridge; this just relocates it via HPC_BRIDGE_STATE_DIR (and state._state_dir refuses
+    the default while a test runs). After the test, the record's own I/O thread is drained, so no write queued by one
+    test lands while the next one runs."""
     monkeypatch.setenv("HPC_BRIDGE_STATE_DIR", str(tmp_path / "hpc-bridge-state"))
+    yield
+    from hpc_bridge import warmth
+
+    warmth._STORE_POOL.submit(lambda: None).result(5)
+
+
+@pytest.fixture(autouse=True, scope="session")
+def _never_the_real_state_dir():
+    """Fail the run if anything appeared under the developer's real ~/.hpc-bridge/sent-checks while it ran (found
+    2026-10-16: an empty one appeared during a review round)."""
+    from pathlib import Path
+
+    real = Path.home() / ".hpc-bridge" / "sent-checks"
+    before = set(real.iterdir()) if real.is_dir() else None
+    yield
+    after = set(real.iterdir()) if real.is_dir() else None
+    assert after == before, f"tests wrote into the real {real}: {sorted(map(str, (after or set()) - (before or set())))}"
 
 
 @pytest.fixture(autouse=True)

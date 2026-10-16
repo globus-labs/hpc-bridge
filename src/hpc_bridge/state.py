@@ -29,7 +29,13 @@ def _state_dir() -> Path:
     """Base dir for hpc-bridge's local state (login-node pins, the facility cache, SSH control
     sockets). Defaults to ~/.hpc-bridge; `HPC_BRIDGE_STATE_DIR` relocates it — tests point it at a
     tmp dir so they never read stale entries or WRITE into the developer's real state."""
-    return Path(os.environ.get("HPC_BRIDGE_STATE_DIR") or (Path.home() / ".hpc-bridge"))
+    configured = os.environ.get("HPC_BRIDGE_STATE_DIR")
+    if not configured and os.environ.get("PYTEST_CURRENT_TEST"):
+        # a test that reached the real ~/.hpc-bridge (a test file outside tests/, which tests/conftest.py does not
+        # isolate — found 2026-10-16: an empty ~/.hpc-bridge/sent-checks/ appeared in the maintainer's state dir)
+        raise RuntimeError("hpc-bridge: a test reached the real ~/.hpc-bridge — set HPC_BRIDGE_STATE_DIR "
+                           "(tests/conftest.py does, for tests under tests/)")
+    return Path(configured or (Path.home() / ".hpc-bridge"))
 
 
 @dataclass(frozen=True)

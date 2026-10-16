@@ -2050,7 +2050,7 @@ async def test_a_lookup_round_that_runs_out_of_time_keeps_what_it_read_and_never
     asked = []
 
     def get_task(tid):
-        time.sleep(0.04)
+        time.sleep(0.05)
         asked.append(tid)
         raise TaskExecutionFailed("BadStateException", "1")
 
@@ -2058,10 +2058,12 @@ async def test_a_lookup_round_that_runs_out_of_time_keeps_what_it_read_and_never
     _scripted_login(monkeypatch)
     first = await _stop_endpoint(app)
     n = len(asked)
-    assert 5 <= n < 20 and first.status == "draining" and "could not be read" in first.notice
+    # 20 x 50 ms do not fit in 0.5 s, however loaded the machine: some read, not all
+    assert 1 <= n < 20 and first.status == "draining" and "could not be read" in first.notice
     time.sleep(0.2)
     assert len(asked) <= n + 1                                   # past its deadline the round asks nothing more
     assert set(app.resolved_checks) >= set(asked[:n])            # what was read is kept
+    monkeypatch.setattr(warmth, "_LOOKUP_TIMEOUT_S", 5.0)          # the next round has the time for the rest
     _scripted_login(monkeypatch)
     second = await _stop_endpoint(app)
     assert len(asked) == len(set(asked)) == 20                   # each asked once, never again
@@ -2570,6 +2572,77 @@ async def test_the_records_io_has_a_thread_of_its_own(monkeypatch):
     monkeypatch.setattr(SentCheckStore, "read", read)
     await warmth._read_checks("fake-eid")
     assert names and names[0].startswith("hpc-bridge-record")
+
+
+# --- review round 5 of f445ae1: no record write crosses into another directory, and the stop's refusal never waits ---
+
+async def test_a_record_write_goes_where_it_was_decided_not_where_the_environment_points_later(monkeypatch, tmp_path):
+    # Review r5: _write_job built SentCheckStore() in the worker thread, so a write queued by one test ran with the
+    # NEXT test's HPC_BRIDGE_STATE_DIR (and, between tests, the real ~/.hpc-bridge)
+    from hpc_bridge import warmth
+    from hpc_bridge.state import SentCheckStore
+
+    app, _runner = _queued_app(monkeypatch)
+    first = tmp_path / "first"
+    monkeypatch.setenv("HPC_BRIDGE_STATE_DIR", str(first))
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "provisioning"   # queues its write
+    monkeypatch.setenv("HPC_BRIDGE_STATE_DIR", str(tmp_path / "later"))                   # changed before it runs
+    await warmth._flush_all(app)
+    assert [r["task_id"] for r in SentCheckStore(first / "sent-checks").load("fake-eid")] == ["check-1"]
+    assert not (tmp_path / "later" / "sent-checks" / "fake-eid.json").exists()
+
+
+def test_the_records_thread_never_keeps_the_interpreter_alive():
+    from hpc_bridge import warmth
+
+    assert warmth._STORE_POOL.submit(lambda: 7).result(5) == 7
+    assert warmth._STORE_POOL._thread is not None and warmth._STORE_POOL._thread.daemon
+
+
+def test_a_test_never_reaches_the_real_state_dir(monkeypatch):
+    from hpc_bridge import state
+
+    monkeypatch.delenv("HPC_BRIDGE_STATE_DIR", raising=False)
+    with pytest.raises(RuntimeError, match=r"real ~/\.hpc-bridge"):
+        state._state_dir()
+
+
+async def test_a_command_in_its_sync_wait_refuses_the_stop_whatever_the_record_thread_is_doing(monkeypatch):
+    # Review r5, the flake (test_a_rebind_under_a_waiting_call[True]): the stop flushed and read the record BEFORE its
+    # busy check, on the one record thread — a job left on it (an earlier test's, or a slow home directory) let the
+    # call's 0.3 s sync-wait run out first, so the refusal named a running task instead of the call in its sync-wait
+    import asyncio
+    from concurrent.futures import Future
+
+    from hpc_bridge import warmth
+    from hpc_bridge.server import _stop_endpoint
+
+    app = _ssh_app()
+
+    class _Blocking(_FakeRunner):
+        def submit(self, command):
+            fut: Future = Future()
+            self.futures.append(fut)
+            return fut
+
+    runner = _Blocking("fake-eid", _Res(0, "", ""), canary_result=_job_answer("112"), timeout=0.3)
+    app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
+    assert (await _ensure_endpoint_up(app, confirm_spend=True)).status == "up"
+    rt = app.shapes["compute"]
+    try:
+        call = asyncio.ensure_future(_run_shell(app, "python train.py", agent_call=True))
+        for _ in range(300):
+            await asyncio.sleep(0.01)
+            if rt.inflight == 1:
+                break
+        warmth._STORE_POOL.submit(time.sleep, 0.6)                 # the record thread is busy for longer
+        st = await _stop_endpoint(app)
+        assert st.status == "up" and "sync-wait" in st.notice
+        await call
+    finally:
+        for f in runner.futures:
+            if not f.done():
+                f.set_result(_Res(0, "", ""))
 
 
 # --- cancel: qdel/qstat on the cost-critical stop path (PBS) --------------------------------

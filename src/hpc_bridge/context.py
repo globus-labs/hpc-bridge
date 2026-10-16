@@ -316,9 +316,9 @@ class AppCtx:
     # Task id -> how it resolved ("ok" / "failed"), as seen this session: never asked again, and removed from the record
     # on disk by this process (warmth._check_states, _persist_checks). Bounded (warmth._trim_resolved).
     resolved_checks: dict[str, str] = field(default_factory=dict)
-    # The record writes still to do per endpoint (rows, task ids written, ids removed; None: remove the record) and the
-    # task writing them off the event loop (warmth._schedule_flush).
-    checks_pending: dict[str, tuple[list[dict], frozenset[str], frozenset[str]] | None] = field(default_factory=dict)
+    # The record writes still to do per endpoint (the latest only) and the task writing them off the event loop
+    # (warmth._schedule_flush).
+    checks_pending: dict[str, Any] = field(default_factory=dict)  # warmth._RecordJob
     check_flushers: dict[str, asyncio.Task] = field(default_factory=dict)
     # Per endpoint id: the commands of ours sent to its compute block and not finished yet, written to the record so a
     # restarted server still sees one still running (warmth._note_command_sent); and the task that writes a check's or
