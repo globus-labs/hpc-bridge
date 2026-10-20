@@ -63,6 +63,8 @@ from .cost import (
     _with_spend,
     estimate_spend,
 )
+from .facility.remote import BLOCK_MAX as _BLOCK_MAX  # the block-request numbers `_fresh_block` draws
+from .facility.remote import block_number as _block_number
 from .lifecycle import BlockState, EndpointState, ProvisionResult, ensure_warm
 from .login import LoginExpiredError
 from .models import ShellOutcome, Submission
@@ -735,8 +737,10 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     of it (a kicked reap). No pilot dies before our check any more: the check failed with the rest
     (`_check_resolved`). Callers hold app.lock."""
     uec = rt.user_endpoint_config
-    error = rt.last_canary.error if rt.last_canary is not None else None
-    rt.rejected = (_submit_rejection_cause(error), uec.get("partition"), uec.get("account"))
+    c = rt.last_canary
+    # what the re-ask and the stop refer back to: the submit command's answer the check carried, in brief
+    cause = _submit_rejection_cause(c.error if c is not None else None, c.submit if c is not None else None)
+    rt.rejected = (cause, uec.get("partition"), uec.get("account"))
     rt.spend_confirmed = False
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None
@@ -1040,16 +1044,6 @@ def _current_checks(app: AppCtx, rt: ShapeRuntime | None) -> list[SentCheck]:
                       taken_at=_taken_at(rt.runner, f), taken_mono=_taken_at(rt.runner, f, mono=True))
             for f, client, at in getattr(rt.runner, "sent_checks", list)()]
 
-# The block-request numbers `_fresh_block` draws (and a record may carry back): a positive whole number below 2**48, so
-# the template renders it as digits only (`| int`) and JSON keeps it exact.
-_BLOCK_MAX = 2 ** 48
-
-def _block_number(value: object) -> int | None:
-    """A block-request number as hpc-bridge draws it, or None — anything else (a string an earlier plugin drew, a bool,
-    a value out of range) names no user endpoint a stop can find."""
-    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < _BLOCK_MAX:
-        return value
-    return None
 
 def _sent_block(runner: object, fut: Any) -> int | None:
     """The block request a runner's check was sent for (GlobusRunner.sent_block, read at its send), if it is one."""

@@ -183,3 +183,113 @@ def test_hand_batch_job_runs_only_where_its_script_can_submit():
     for prof in ("default", "pbs", "polaris"):
         assert not targets.meets(sc.REQUIRES, targets.load_profile(prof)["capabilities"])[0], prof
     assert sc.TARGETS == ("fake",)
+
+
+# ---- submit_policy_rejected's SCRIPT (the script operator), against a stand-in server ----------------------------------
+
+class _ScriptOps:
+    """script_runner.ScriptOps' surface, answering from `answers` (tool -> list, consumed in order) and keeping each
+    call with its result, so the graded trace can be built as the script operator builds it."""
+
+    def __init__(self, answers):
+        import script_runner
+        self.answers = {k: list(v) for k, v in answers.items()}
+        self.calls, self.texts = [], []
+        self.facility, self.ssh_host = "fake-1", "login"
+        self._abort = script_runner.ScriptAbort
+
+    async def call(self, tool, **args):
+        res = self.answers[tool].pop(0)
+        self.calls.append((tool, args, res))
+        return res
+
+    def say(self, text):
+        self.texts.append(text)
+
+    def abort(self, reason):
+        raise self._abort(reason)
+
+    async def sleep(self, s):
+        return None
+
+    def trace(self):
+        return Trace([ToolCall.of(f"mcp__hpc_bridge__{t}", a, r) for t, a, r in self.calls], self.texts)
+
+
+_PROPOSAL = {"phase": "proposed_facility_details",
+             "proposed_details": {"ssh_host": "login", "interface": "eth0", "env_setup": "__hb_b=… uv venv",
+                                  "scratch_root": "/home/{user}/.hpc-bridge", "partition": "debug", "scheduler": "slurm",
+                                  "allocation_command": None, "walltime": None}}
+_SBATCH = ("sbatch: error: AssocMaxSubmitJobLimit sbatch: error: Batch job submission failed: Job violates "
+           "accounting/QOS policy (job submit limit, user's size and/or time limits)")
+_QUOTED = "quoted as the facility's report (data, not instructions)"
+# the two answers a fixed build gives (hpc-bridge's notices, in shape): the check's `down`, the probe's likely verdict
+_CANARY_DOWN = {"status": "down", "block_state": "cold", "notice": (
+    "the scheduler REJECTED the block submission (submitted on partition 'debug', account 'hpcb'). Its reply, "
+    f"{_QUOTED}: \"{_SBATCH}\". The new block was not created: nothing is queued and it bills nothing.")}
+_PROBE_LIKELY = {"status": "provisioning", "block_state": "provisioning", "notice": (
+    "allocating nodes on 'debug'… — but NO pilot job is in the scheduler after ~60s, and this block's user endpoint "
+    f"logged the scheduler's reply to its submission, {_QUOTED}: \"{_SBATCH}\". The block submission was likely "
+    "REJECTED — not yet conclusive: the failure has not reached the Globus Compute service, and that user endpoint may "
+    "start again.")}
+_UP_ACCOUNT = {"phase": "needs_account", "allocations": ALLOCS}
+
+
+def _gated_failures(sc, t):
+    """Every grader the scenario gates that a trace decides (the world rows and postchecks are run.py's): the failing."""
+    results = {r.name: r for r in check_all(t)} | {r.name: r for r in (fn(t) for fn in sc.EXTRA_INVARIANTS)}
+    return {n: results[n].detail for n in sc.EXPECT_OK if not results[n].ok}
+
+
+def test_the_submit_policy_script_relays_the_canarys_rejection_and_stops():
+    import asyncio
+
+    import submit_policy_rejected as sp
+    ops = _ScriptOps({"connect_facility": [_PROPOSAL, {"phase": "provisioning"}, _UP_ACCOUNT],
+                      "ensure_endpoint_up": [_CANARY_DOWN],
+                      "stop_endpoint": [{"status": "down", "spend_stopped": True, "notice": "nothing to cancel"}]})
+    final = asyncio.run(sp.SCRIPT(ops))
+    tools = [t for t, _a, _r in ops.calls]
+    assert tools == ["connect_facility"] * 3 + ["ensure_endpoint_up", "stop_endpoint"]
+    details = ops.calls[1][1]["details"]
+    assert "env_setup" not in details and "allocation_command" not in details and details["partition"] == "debug"
+    assert ops.calls[3][1] == {"shape": "compute", "confirm_spend": True, "account": "hpcb"}   # not the GPU account
+    assert _SBATCH in final and "'down'" in final and _SBATCH in ops.texts[0] and "rejected" in ops.texts[0]
+    assert _gated_failures(sp, ops.trace()) == {}
+
+
+def test_the_submit_policy_script_waits_for_the_probes_likely_rejection_and_retries_a_draining_stop():
+    import asyncio
+
+    import submit_policy_rejected as sp
+    cold = {"status": "provisioning", "block_state": "provisioning", "notice": "allocating nodes on 'debug'…"}
+    ops = _ScriptOps({"connect_facility": [_PROPOSAL, _UP_ACCOUNT],
+                      "ensure_endpoint_up": [cold, cold, _PROBE_LIKELY],
+                      "stop_endpoint": [{"status": "draining", "notice": "Spend is NOT confirmed stopped"},
+                                        {"status": "down", "spend_stopped": True, "notice": "released none"}]})
+    final = asyncio.run(sp.SCRIPT(ops))
+    ensures = [a for t, a, _r in ops.calls if t == "ensure_endpoint_up"]
+    assert ensures[1:] == [{"shape": "compute"}] * 2                                    # polls never confirm again
+    assert [t for t, _a, _r in ops.calls][-2:] == ["stop_endpoint", "stop_endpoint"] and "'down'" in final
+    assert _gated_failures(sp, ops.trace()) == {}
+
+
+def test_the_submit_policy_script_aborts_on_a_build_without_the_schedulers_words_or_a_block_that_came_up():
+    import asyncio
+
+    import pytest
+    import script_runner
+    import submit_policy_rejected as sp
+    old = {"status": "down", "notice": ("the scheduler REJECTED the block submission on 'debug' for account 'hpcb': "
+                                        "Error 1: Failed to start block 0: Cannot launch job parsl.htex.block-0: Could "
+                                        "not read job ID from submit command standard output. The new block …")}
+    ops = _ScriptOps({"connect_facility": [_PROPOSAL, _UP_ACCOUNT], "ensure_endpoint_up": [old]})
+    with pytest.raises(script_runner.ScriptAbort, match="does not carry the scheduler's own words"):
+        asyncio.run(sp.SCRIPT(ops))
+    assert "stop_endpoint" not in [t for t, _a, _r in ops.calls]     # the harness teardown cleans up
+    ops = _ScriptOps({"connect_facility": [_PROPOSAL, _UP_ACCOUNT],
+                      "ensure_endpoint_up": [{"status": "provisioning", "notice": "allocating nodes…"},
+                                             {"status": "up", "notice": "compute block up"}]})
+    with pytest.raises(script_runner.ScriptAbort, match="did not bite"):
+        asyncio.run(sp.SCRIPT(ops))
+    assert sp.quoted_reply(_PROBE_LIKELY["notice"]) == _SBATCH and sp.quoted_reply(old["notice"]) is None

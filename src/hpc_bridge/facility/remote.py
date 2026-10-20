@@ -1071,6 +1071,17 @@ _BLOCK_REQUEST_LINE = re.compile(
 # What that line writes into the user endpoint's own log at its start (globus-compute-endpoint's Endpoint._run_command:
 # `running endpoint_setup command: <command>`), the number appended: what a stop's evidence matches (scheduler_ops).
 BLOCK_REQUEST_LOG = "running endpoint_setup command: true hpcb_block="
+# The block-request numbers warmth._fresh_block draws (and a record may carry back): a positive whole number below
+# 2**48, so the template renders it as digits only (`| int`) and JSON keeps it exact.
+BLOCK_MAX = 2 ** 48
+
+
+def block_number(value: object) -> int | None:
+    """A block-request number as hpc-bridge draws it, or None — anything else (a string an earlier plugin drew, a bool,
+    a value out of range) names no user endpoint a stop or a probe can find. The one rule for every reader."""
+    if isinstance(value, int) and not isinstance(value, bool) and 0 < value < BLOCK_MAX:
+        return value
+    return None
 
 
 # The compute branch's `init_blocks` default, as `config_template` writes it (`@@EAGER@@`: 1 in interactive mode, 0 in

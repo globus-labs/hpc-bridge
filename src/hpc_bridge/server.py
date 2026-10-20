@@ -131,6 +131,7 @@ from .notices import (  # noqa: F401 - re-exported
     _orphaned_outcome,
     _past_ceiling_outcome,
     _queue_word,
+    _rejected_notice,
     _rejected_stop_notice,
     _rejected_switch_note,
     _released_under_outcome,
@@ -536,7 +537,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=said(_submit_rejected_notice(active_partition, active_account, rt.last_canary.error)),
+                    notice=said(_rejected_notice(app, rt, rt.last_canary)),
                 )
             if not _has_login_shape(app) and rt.last_canary is None:
                 # On a MEP a canary runs on EVERY poll whose manager gate passes (and is recorded even
@@ -562,8 +563,11 @@ async def _ensure_endpoint_up(
         # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
         # (and when a worker last answered, so the record can tell one that answered DURING the probe)
         probe_epoch, answered = rt.block_epoch, rt.warm_confirmed_at
+        # the block request names its user endpoint's log, where the probe may read a refusal's own words (quoted only:
+        # a log read is not conclusive, so nothing is voided on it — the block stays `provisioning`)
         notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
-                                                                  _login_runner(app), confirmed_at=rt.confirmed_at)
+                                                                  _login_runner(app), confirmed_at=rt.confirmed_at,
+                                                                  block=rt.user_endpoint_config.get("hpcb_block"))
         if probe is not None and probe.dead is not None:
             # A pilot that ran and died before any worker answered: the check it was started for is still queued, and
             # the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of that check, which
@@ -1019,7 +1023,7 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         if busy := _busy_block_refusal(app, eid):  # releasing would not end our work: the endpoint relaunches for it
             return busy
         rt_pre = app.shapes.get(DEFAULT_SHAPE)
-        rejected = rt_pre is not None and rt_pre.rejected is not None
+        rejected = rt_pre.rejected[0] if rt_pre is not None and rt_pre.rejected is not None else None  # its cause
         # The evidence (#24): every task of ours sent to a compute user endpoint that has not been seen to finish — the
         # current runner's checks, the ones the endpoint kept from runners a stop, switch, rebuild or re-bind retired, a
         # command whose result the client lost, and those a restarted server reads back from disk. While one is queued
@@ -1793,7 +1797,7 @@ async def _ready_session(
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _with_spend(app, _needs_account_outcome(app, rt))
     if not_warm is not None:
-        return _cold_outcome(not_warm, _shape_runtime(app, shape).last_canary)
+        return _cold_outcome(not_warm, rt.last_canary, app=app, rt=rt)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
         return _busy_session_outcome(busy, shape, session_id, client_cancelled=busy_cancelled,
                                      internal=session_id == _INTERNAL_SESSION)

@@ -648,8 +648,9 @@ async def test_a_rejected_submission_whose_check_was_lost_says_nothing_was_creat
     _login_node(monkeypatch, tmp_path)
     res = await _stop_endpoint(app)
     assert res.status == "down" and res.notice.startswith(
-        "nothing to cancel: the scheduler REJECTED the block's submission, so no block was created and none bills "
-        "(released none). hpc-bridge's check for the block on the default partition (task check-1) cannot run")
+        "nothing to cancel: the scheduler REJECTED the block's submission (sbatch: error: AssocMaxSubmitJobLimit), so "
+        "no block was created and none bills (released none). hpc-bridge's check for the block on the default partition "
+        "(task check-1) cannot run")
     assert res.notice.endswith("still lists it as queued. The login endpoint stays online for reuse (reconnecting is "
                                "zero-SSH).")
 
