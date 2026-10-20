@@ -52,6 +52,7 @@ installed plugin only when that version changes); git tags mark releases.
   "likely REJECTED"), and aborts unless that notice quotes sbatch's "Job violates accounting/QOS policy", so a build
   without the scheduler's words fails plainly. It relays the words and stops the endpoint; every grader the scenario
   gates holds for such a run (none needs a question to the user). Agent operators run the cell as before.
+- **CI runs every harness test file.** The hermetic harness step listed its test files by name, so six of them (`test_alcf_inference`, `test_hostile`, `test_internal`, `test_lmod`, `test_polaris`, `test_slurm_probe_scenario`) never ran in CI, and a new file was skipped until someone added it. The step now lets pytest collect `agentic/harness/test_*.py`.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 
