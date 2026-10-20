@@ -1204,7 +1204,7 @@ async def test_a_switch_then_a_rejection_says_what_exists_and_the_stop_names_the
     res = await _ensure_endpoint_up(app, partition="compute", confirm_spend=True)
     assert res.status == "down" and "this new one included" not in res.notice
     assert res.notice.startswith("The partition or account changed from partition 'debug' in this call. Nothing cancels")
-    assert "The scheduler REJECTED the block submission on 'compute'" in res.notice
+    assert "The scheduler REJECTED the block submission (submitted on partition 'compute', no account named)" in res.notice
     _scripted_login(monkeypatch)
     stop = await _stop_endpoint(app)
     assert stop.status == "draining" and "the compute block was still being submitted" not in stop.notice

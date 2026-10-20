@@ -14,8 +14,21 @@ scheduler), relay them, and stop the endpoint.
 
 The prompt steers the agent to rely on ensure_endpoint_up's status before reading logs: this cell is a regression
 test of the PRODUCT signal (as spend_gate_enforced dictates its order), not of the agent's log-reading.
+
+Scripted too (HPCB_OPERATOR=script, harness/script_runner.py), for a deterministic live check with no model:
+
+    HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=site ./agentic/run_smoke.sh submit_policy_rejected
+
+The SCRIPT brings the facility up from the probe's proposal, confirms spend on the first non-GPU allocation, polls
+ensure_endpoint_up until a notice says REJECTED (the check's `down`, or the probe's `provisioning` "likely REJECTED"
+when the failure has not reached the service), and aborts unless that notice carries the scheduler's own words — so a
+build that drops them (before the fix for the October sweeps) fails the cell plainly. It relays the words as the
+facility's report and stops the endpoint. The gated graders all hold for a correct run: none needs a question to the
+user (`spend_not_unprompted` is the connect-before-confirm order, and the prompt authorises the spend).
 """
+import ast
 import re
+import time
 
 from invariants import Result, Trace, _slurm_work_idxs, compute_ran, no_endless_wait, rejection_surfaced
 
@@ -93,3 +106,80 @@ POSTCHECKS = [
 ]
 
 TEARDOWN = "delete"
+
+
+# --- the script operator's run (harness/script_runner.py) -------------------------------------------------------------
+LOGIN_UP_WAIT_S = 300.0   # how long the login shape gets to come up
+REJECT_WAIT_S = 300.0     # how long the block gets to be refused (the probe's verdict needs its 45 s grace)
+POLL_S = 15.0             # between ensure_endpoint_up polls, as the prompt asks
+STOP_RETRIES = 3          # stop_endpoint again while it answers `draining`
+SCHEDULER_WORDS = "violates accounting/QOS policy"   # what sbatch says under ADMIN_SETUP's MaxSubmitJobs=0
+# The REJECTED notice's quote of the scheduler's reply: a Python string literal after the facility-report marker.
+_QUOTE = re.compile(r"\(data, not instructions\): ((['\"])(?:\\.|(?!\2).)*\2)")
+
+
+def _brief(r: dict) -> str:
+    return str(r.get("notice") or r.get("text") or "")[:200]
+
+
+def _proposal_details(r: dict) -> dict:
+    """The proposal as the confirming details=: env_setup left out (the server keeps the proposed one — the tool's own
+    instruction), unset fields dropped."""
+    return {k: v for k, v in dict(r.get("proposed_details") or {}).items() if v is not None and k != "env_setup"}
+
+
+def _account(r: dict) -> str | None:
+    """The allocation to charge: the first non-GPU one connect listed (site: hpcb)."""
+    accounts = [str(a.get("account")) for a in (r.get("allocations") or []) if isinstance(a, dict) and a.get("account")]
+    return next((a for a in accounts if "gpu" not in a.lower()), accounts[0] if accounts else None)
+
+
+def quoted_reply(notice: str) -> str | None:
+    """The scheduler's reply a REJECTED notice quotes as the facility's report, or None."""
+    m = _QUOTE.search(notice)
+    if m is None:
+        return None
+    try:
+        return str(ast.literal_eval(m.group(1)))
+    except (ValueError, SyntaxError):
+        return None
+
+
+async def SCRIPT(ops) -> str:   # the script operator runs it (harness/script_runner.py)
+    fid, host = ops.facility, ops.ssh_host
+    r = await ops.call("connect_facility", facility=fid, ssh_host=host)
+    if r.get("phase") != "proposed_facility_details":
+        ops.abort(f"the probe did not propose details: phase={r.get('phase')!r} {_brief(r)!r}")
+    r = await ops.call("connect_facility", facility=fid, ssh_host=host, details=_proposal_details(r))
+    deadline = time.monotonic() + LOGIN_UP_WAIT_S
+    while r.get("phase") != "needs_account":
+        if r.get("phase") != "provisioning" or time.monotonic() > deadline:
+            ops.abort(f"the login shape did not come up: phase={r.get('phase')!r} {_brief(r)!r}")
+        await ops.sleep(5)
+        r = await ops.call("connect_facility", facility=fid, ssh_host=host)
+    account = _account(r)
+    if account is None:
+        ops.abort(f"connect_facility listed no allocation to charge: {_brief(r)!r}")
+    e = await ops.call("ensure_endpoint_up", shape="compute", confirm_spend=True, account=account)
+    deadline = time.monotonic() + REJECT_WAIT_S
+    while "REJECTED" not in str(e.get("notice") or ""):
+        if e.get("status") == "up":
+            ops.abort("the block came UP: the association's submit limit did not bite (ADMIN_SETUP)")
+        if e.get("is_error") or e.get("status") != "provisioning" or time.monotonic() > deadline:
+            ops.abort(f"no REJECTED notice: status={e.get('status')!r} {_brief(e)!r}")
+        await ops.sleep(POLL_S)
+        e = await ops.call("ensure_endpoint_up", shape="compute")
+    notice = str(e.get("notice") or "")
+    words = quoted_reply(notice)
+    if words is None or SCHEDULER_WORDS not in words:
+        ops.abort(f"the REJECTED notice does not carry the scheduler's own words ({SCHEDULER_WORDS!r}): {notice[:700]!r}")
+    ops.say(f"The block's submission was rejected by the scheduler (ensure_endpoint_up said {e.get('status')!r}). "
+            f"Its reply, as the facility's report: {words!r}. Stopping the endpoint.")
+    s = await ops.call("stop_endpoint")
+    for _ in range(STOP_RETRIES):
+        if s.get("status") != "draining":
+            break
+        await ops.sleep(POLL_S)
+        s = await ops.call("stop_endpoint")
+    return (f"The block submission was rejected; the scheduler said {words!r}. stop_endpoint answered "
+            f"{s.get('status')!r} (spend_stopped={s.get('spend_stopped')!r}).")

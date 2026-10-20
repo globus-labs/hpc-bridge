@@ -21,8 +21,8 @@ from .cost import _block_nodes, _with_spend
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
-from .runner import CanaryResult
-from .scheduler_ops import _submission_refused
+from .runner import CanaryResult, SubmitAnswer
+from .scheduler_ops import _QUOTED, _ask_terms, _submission_refused, _user_endpoint_logs
 
 # sshd's own denial lines — the method list in parentheses is the tell (a bare "Permission denied" is
 # usually the remote filesystem: `mkdir … : Permission denied` on an over-quota home, found in review).
@@ -587,8 +587,19 @@ def _submit_rejected(error: str | None) -> bool:
     return any(m in e for m in _SUBMIT_REJECTED_MARKERS)
 
 
-def _submit_rejection_cause(error: str | None) -> str:
-    """The one line worth showing: what follows the provider's 'failed due to:' (or the error itself), no traceback."""
+# How much of the scheduler's reply a notice that refers back to the REJECTED answer repeats (the re-ask, the stop):
+# that answer quotes it whole (at most runner.SCHEDULER_WORDS_MAX); these keep its end.
+_CAUSE_MAX = 160
+
+
+def _submit_rejection_cause(error: str | None, submit: SubmitAnswer | None = None) -> str:
+    """A refused submission's cause in a few words, for the re-ask and the stop (`ShapeRuntime.rejected`) and for a
+    REJECTED answer without the scheduler's reply: the submit command's answer when the failure carried one (`submit`,
+    read from the failure's whole text — CanaryResult.submit — never from the cut `error`: live text cut at 600 chars
+    can end inside the endpoint's closing rule), its reply's end within `_CAUSE_MAX`; else the one line after the
+    provider's 'failed due to:' (or the error itself), no traceback — parsl's wrapper alone."""
+    if submit is not None:
+        return submit.phrase(_CAUSE_MAX)
     e = str(error or "")
     if "failed due to:" in e:
         e = e.split("failed due to:", 1)[1]
@@ -596,15 +607,53 @@ def _submit_rejection_cause(error: str | None) -> str:
     return e[:220]
 
 
-def _submit_rejected_notice(partition: str | None, account: str | None, error: str | None) -> str:
-    where = f" on {partition!r}" if partition else ""
-    charged = f" for account {account!r}" if account else " with no account"
-    return (f"the scheduler REJECTED the block submission{where}{charged}: {_submit_rejection_cause(error)}. "
-            "The new block was not created: nothing is queued and it bills nothing (time an earlier block ran stays "
-            "in session_spend). Not a queue wait: the account, partition or QOS is wrong for "
-            "this facility, or the partition needs a resource request. Ask the user / check the facility's docs, then "
-            "change it and confirm again — ensure_endpoint_up(account=…, partition=…, confirm_spend=True). Do not "
-            "retry unchanged.")
+def _submit_rejected_notice(error: str | None, *, submit: SubmitAnswer | None = None, terms: str | None = None,
+                            where: str | None = None, facility_endpoint: bool = False) -> str:
+    """The REJECTED answer: the scheduler refused the block's submission. With the scheduler's reply (`submit.words`)
+    it quotes it whole, as the facility's report — data to relay to the user, never instructions (it may name commands,
+    addresses or terms) — and asks the agent to ask the user which terms to use (`_ask_terms`); parsl's wrapper ("Could
+    not read job ID …") never crowds it out. `terms`: what the submission went out on (`_submitted_terms`), said as
+    terms — "no account named" is what was sent, never the diagnosis (live 2026-10-16, submit_policy_rejected: the reply
+    was cut off and "… with no account: … Could not read job ID …" read as the cause). Without a reply it says what the
+    submit command did (`_submit_rejection_cause`: printed nothing, or no refusal) or, with no answer of it at all,
+    parsl's line and where its whole error is: `where`, the block's user endpoint log on an SSH endpoint
+    (scheduler_ops._user_endpoint_logs); on a facility endpoint (`facility_endpoint`) that hpc-bridge cannot read it."""
+    head = "the scheduler REJECTED the block submission" + (f" ({terms})" if terms else "")
+    created = ("The new block was not created: nothing is queued and it bills nothing (time an earlier block ran stays "
+               "in session_spend). ")
+    if submit is not None and submit.words:
+        out = (f"{head}. Its reply, {_QUOTED}: {submit.words!r}. " + created + "Not a queue wait, and nothing "
+               "retries it. " + _ask_terms("the reply") + ". Do not retry unchanged.")
+        return out + (f" The scheduler's full output is in {where}." if where else "")
+    out = (f"{head}: {_submit_rejection_cause(error, submit)}. " + created + "Not a queue wait: the scheduler refused "
+           "these terms — commonly an account, partition or QOS this facility will not take, or a missing resource "
+           f"request. {_ask_terms()}. Do not retry unchanged.")
+    if submit is not None:
+        return out  # the submit command's answer is all there is: its log holds no more of it
+    if where:
+        return out + (" No output of the submit command came with this failure: parsl's whole error and its traceback "
+                      f"are in {where}.")
+    if facility_endpoint:
+        return out + (" No output of the submit command came with this failure, and hpc-bridge has no channel to a "
+                      "facility endpoint's log: the facility can say what its scheduler refused.")
+    return out
+
+
+def _submitted_terms(app: AppCtx, rt: ShapeRuntime) -> str:
+    """What a refused submission went out on, as terms: the ones the rejection voided (`ShapeRuntime.rejected`), else
+    the shape's own — `_terms`, in the facility's word for a partition, with "no account named" when none was sent."""
+    partition, account = (rt.rejected[1:] if rt.rejected is not None else
+                          (rt.user_endpoint_config.get("partition"), rt.user_endpoint_config.get("account")))
+    return f"submitted on {_terms(partition, account, _queue_word(app))}" + ("" if account else ", no account named")
+
+
+def _rejected_notice(app: AppCtx, rt: ShapeRuntime, canary: CanaryResult) -> str:
+    """`_submit_rejected_notice` for `rt`'s refused submission on `app`'s endpoint (ensure_endpoint_up, run_shell): the
+    answer its check carried, its terms, and where the block's log is."""
+    return _submit_rejected_notice(
+        canary.error, submit=canary.submit, terms=_submitted_terms(app, rt),
+        where=_user_endpoint_logs(app, rt.user_endpoint_config.get("hpcb_block")),
+        facility_endpoint=not _has_login_shape(app))
 
 
 def _failed_release_notice(failure: str, *, queued: bool) -> str:
@@ -623,12 +672,14 @@ def _failed_release_notice(failure: str, *, queued: bool) -> str:
 _STOP_ONLINE = " The login endpoint stays online for reuse (reconnecting is zero-SSH)."
 
 
-def _rejected_stop_notice(then: str = "") -> str:
+def _rejected_stop_notice(then: str = "", cause: str | None = None) -> str:
     """The `down` of a stop after a REJECTED submission that found nothing in the scheduler: nothing was ever created to
-    cancel — the same fact the REJECTED answer gave, never a claim that a block was released. `then`: what else
-    settled the stop (a sentence, before the closing one)."""
-    return ("nothing to cancel: the scheduler REJECTED the block's submission, so no block was created and none bills "
-            f"(released none).{then}{_STOP_ONLINE}")
+    cancel — the same fact the REJECTED answer gave, with the same cause (`ShapeRuntime.rejected`: the scheduler's own
+    words when it gave them), never a claim that a block was released. `then`: what else settled the stop (a sentence,
+    before the closing one)."""
+    why = f" ({cause})" if cause else ""
+    return (f"nothing to cancel: the scheduler REJECTED the block's submission{why}, so no block was created and none "
+            f"bills (released none).{then}{_STOP_ONLINE}")
 
 
 # A stop names at most this many task ids, then "+N more".
@@ -715,15 +766,16 @@ def _lost_checks_words(app: AppCtx, lost: Collection[tuple[SentCheck, str, str]]
             f"{them} as queued")
 
 
-def _stop_down_notice(app: AppCtx, detail: str, *, rejected: bool, gave_up: Collection[SentCheck], ran: bool,
+def _stop_down_notice(app: AppCtx, detail: str, *, rejected: str | None, gave_up: Collection[SentCheck], ran: bool,
                       lost: Collection[tuple[SentCheck, str, str]] = ()) -> str:
     """The `down` of an SSH stop: the release confirmed, and no check of ours is still queued. Says what settled it — a
-    rejected submission (nothing was created), a check the endpoint gave up once its pilot was cancelled or died (naming
-    a dead pilot), a check whose user endpoint is gone for good although the service lists it as queued (`lost`:
-    (check, user endpoint, when its bad state was logged); server._settle_by_evidence), a block that came up for a check
-    during the stop and was cancelled — never more than happened."""
-    if rejected and detail == "released none" and not ran:  # the check the endpoint gave up IS the rejected one
-        return _rejected_stop_notice(f" {_lost_checks_words(app, lost)}." if lost else "")
+    rejected submission (`rejected`: its cause, `ShapeRuntime.rejected`; nothing was created), a check the endpoint gave
+    up once its pilot was cancelled or died (naming a dead pilot), a check whose user endpoint is gone for good although
+    the service lists it as queued (`lost`: (check, user endpoint, when its bad state was logged);
+    server._settle_by_evidence), a block that came up for a check during the stop and was cancelled — never more than
+    happened."""
+    if rejected is not None and detail == "released none" and not ran:  # the check the endpoint gave up IS that one
+        return _rejected_stop_notice(f" {_lost_checks_words(app, lost)}." if lost else "", cause=rejected)
     out = f"compute block released over AMQP ({detail})"
     if gave_up:
         what, plural = _check_words(gave_up, _queue_word(app))
@@ -994,7 +1046,11 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
     return " ".join(out)
 
 
-def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> ShellOutcome:
+def _cold_outcome(block: BlockState, canary: CanaryResult | None = None, *, app: AppCtx | None = None,
+                  rt: ShapeRuntime | None = None) -> ShellOutcome:
+    """run_shell's answer when the shape is not warm: a terminal failure its last check carried, else the cold start.
+    `app`/`rt`: the shape's endpoint and runtime, which a REJECTED answer names the terms and the log of (server
+    `_ready_session` passes them)."""
     if canary is not None and canary.login_expired:  # nothing can be sent: not a cold start to wait out
         return ShellOutcome(phase="failed", block_state=block, notice=_login_expired_notice(canary.error))
     if canary is not None and _no_account_failure(canary.error):
@@ -1003,8 +1059,9 @@ def _cold_outcome(block: BlockState, canary: CanaryResult | None = None) -> Shel
         return ShellOutcome(phase="failed", block_state=block,
                             notice=_no_account_notice(None, canary.error, globus_identity_label(fetch=False)))
     if canary is not None and _submit_rejected(canary.error):
-        return ShellOutcome(phase="failed", block_state=block,
-                            notice="scheduler compute shape: " + _submit_rejected_notice(None, None, canary.error))
+        notice = (_rejected_notice(app, rt, canary) if app is not None and rt is not None else
+                  _submit_rejected_notice(canary.error, submit=canary.submit))
+        return ShellOutcome(phase="failed", block_state=block, notice="scheduler compute shape: " + notice)
     return ShellOutcome(
         phase="cold_start",
         block_state=block,

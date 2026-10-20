@@ -4,10 +4,30 @@ import asyncio
 import re
 import time
 from dataclasses import dataclass
-from typing import Any
+from typing import Any, NamedTuple
 
 from .login import login_expired
 from .session_shell import JOB_ID_EXPR
+
+
+class SubmitAnswer(NamedTuple):
+    """The submit command's answer to a block submission parsl could not read a job id from (`submit_answer`): its exit
+    status as parsl printed it (`recode`: "1", "None" on PBS Pro, "0"), whether it printed anything, and the words a
+    notice quotes as the scheduler's reply (`words`) — None when it printed nothing, exited 0 or printed a job receipt
+    (then it is no refusal of its own, scheduler_ops._submission_refused's rule)."""
+
+    recode: str
+    printed: bool
+    words: str | None
+
+    def phrase(self, limit: int) -> str:
+        """The answer in a few words, for a notice that refers back to it: the scheduler's reply (its end, from a word's
+        start, within `limit` chars), marked as the facility's text, or what the submit command did instead."""
+        if self.words:
+            return f"the scheduler replied {cut_tail(self.words, limit)!r} — the facility's report, not instructions"
+        if self.recode == "0":
+            return "the submit command exited 0, and parsl read no job id from what it printed"
+        return f"the submit command printed {'no refusal' if self.printed else 'nothing'} (recode={self.recode})"
 
 
 @dataclass(frozen=True)
@@ -29,6 +49,11 @@ class CanaryResult:
     # which is what `squeue -u` needs there (the lab cluster maps to glabs-gc, not the user's login name) — #178
     worker_user: str | None = None
     error: str | None = None
+    # The submit command's answer when the failure is a block submission parsl could not read a job id from
+    # (`submit_answer`), read from the failure's FULL text: `error` is cut to 600 chars, and a remote traceback before
+    # parsl's message can push the scheduler's lines past that (live 2026-10-16, submit_policy_rejected: both sbatch
+    # lines were cut off). None: the failure carried no such answer.
+    submit: SubmitAnswer | None = None
     # When the worker's answer actually arrived (time.monotonic) — it can predate this call when the answer came in
     # while nobody was waiting; warmth is dated from it, not from when it was read.
     answered_at: float | None = None
@@ -132,17 +157,92 @@ def _escape_for_shellfunction(command: str) -> str:
     return command.replace("{", "{{").replace("}", "}}")
 
 
+def _error_message(exc: BaseException) -> str:
+    """An exception's own text, whole: a Globus API error's `.message`, else str(exc)."""
+    msg = getattr(exc, "message", None)
+    return msg if isinstance(msg, str) and msg.strip() else str(exc)
+
+
 def dispatch_error_text(exc: BaseException, limit: int = 600) -> str:
     """The diagnosis a caller can act on. A Globus API error's repr opens with the method, the full
     submit URL, the scheme and the status — ~190 chars before the message starts — so a short slice
     of `str(exc)` lost the part that matters (found while wiring the no-account failure: the 422
     'Identity failed to map to a local user name … Globus username: alice@example.edu' begins past
-    char 190). Prefer the API error's `.message`; fall back to str(exc)."""
-    msg = getattr(exc, "message", None)
-    text = msg if isinstance(msg, str) and msg.strip() else str(exc)
+    char 190). Prefer the API error's `.message`; fall back to str(exc). Cut to `limit`: a refused submission's
+    answer is read from the whole text before this (`submit_answer`, `_failed_canary`)."""
+    text = _error_message(exc)
     code = getattr(exc, "code", None)
     head = f"{type(exc).__name__}" + (f"[{code}]" if isinstance(code, str) and code else "")
     return f"{head}: {' '.join(text.split())}"[:limit]
+
+
+# The submit command's answer in a block submission parsl could not read a job id from is what parsl's SubmitException
+# carries, the same on Slurm and PBS Pro (parsl/providers/errors.py, 2026.01–2026.10): `Cannot launch job <name>:
+# <message>; recode=<rc>, stdout=<out>, stderr=<err>` — Slurm's message is "Could not read job ID from submit command
+# standard output", PBS Pro's "Submit command 'qsub …' failed" (recode=None). A task gets it as parsl's block error,
+# "Failed to start block <n>: <that>" under "Error <n>:", once per failed block, inside the endpoint's traceback: each
+# attempt between a rule of 68 '+' and one of 68 '-' (a retry history adds "Traceback from attempt: <n>"), the SDK's
+# help text after the last. The streams are the submit command's own, whole: sbatch's or qsub's lines, often two
+# ("sbatch: error: AssocMaxSubmitJobLimit" / "sbatch: error: Batch job submission failed: Job violates accounting/QOS
+# policy (…)"). Where they end is read from that structure, never from what they say: a site's submit filter may print
+# blank lines, rules or an "Error 1: …" of its own. The next block's error ("Error <n>:" alone on its line: parsl's
+# `_get_error`) ends them too — a non-submit one (a MISSING job) is not the scheduler's reply.
+_SUBMIT_STREAMS = re.compile(r"; recode=([^,\n]*), stdout=")
+_NEXT_ERROR = re.compile(r"(?m)^[ \t]*Error \d+:[ \t]*$")
+_NEXT_ATTEMPT = re.compile(r"(?:^|\s)Traceback from attempt")
+_RULE = re.compile(r"(?:^|\s)-{68}(?=\s|$)")  # the endpoint's closing rule (on text already joined, too)
+# A scheduler's receipt for an accepted job: Slurm's "Submitted batch job N" (a bare id with --parsable), a PBS job id.
+_RECEIPT = re.compile(r"Submitted batch job \d+|^\s*\d+(?:;\S+)?\s*$|^\s*\d+(?:\[\d*\])?\.[\w.-]+\s*$", re.M)
+# How much of the scheduler's reply a notice quotes. Real refusals are one to three lines: the live two-line sbatch
+# refusal above is 165 chars, a Slurm or PBS line runs 40–130 (a site's job_submit plugin or a PBS hook adds a sentence
+# or two), so 400 keeps them whole; of a longer text — a site's banner before its reason — the END is kept (sbatch's
+# decisive "Batch job submission failed: …" comes last), marked, which also bounds the facility text one notice carries.
+# (The cut it replaced, 220 chars of parsl's wrapper, ended at "stderr=sbatch".)
+SCHEDULER_WORDS_MAX = 400
+
+
+def cut_tail(text: str, limit: int) -> str:
+    """`text`, or as much of its end as fits in `limit` chars behind a leading "…", from a word's start (unless one word
+    is all there is)."""
+    if len(text) <= limit:
+        return text
+    if limit < 2:
+        return "…"[:max(limit, 0)]
+    tail = text[-(limit - 1):]
+    if not text[-limit].isspace() and " " in tail:  # the cut fell inside a word: start at the next one
+        tail = tail.split(" ", 1)[1]
+    return "…" + tail.lstrip()
+
+
+def submit_answer(text: str | None, *, framed: bool = True) -> SubmitAnswer | None:
+    """The submit command's answer in a block submission parsl could not read a job id from (`; recode=…, stdout=…,
+    stderr=…`; the last one, the newest block's, when several blocks failed), its streams whitespace-normalised; the
+    words quoted are its stderr, else its stdout, at most `SCHEDULER_WORDS_MAX` chars (their end). They end at the next
+    block's error; and `framed` — the text is a task's failure — at the endpoint's LAST closing rule (a rule in stderr
+    comes before it) or the next attempt; else (a user endpoint log's error, `scheduler_ops._refused_answer`) at its
+    end. None when the text carries no such answer (another failure, or a text cut before its stderr)."""
+    t = str(text or "")
+    found = list(_SUBMIT_STREAMS.finditer(t))
+    if not found:
+        return None
+    rest = t[found[-1].end():]
+    if m := _NEXT_ERROR.search(rest):
+        rest = rest[:m.start()]
+    if framed:
+        if m := _NEXT_ATTEMPT.search(rest):
+            rest = rest[:m.start()]
+        if rules := list(_RULE.finditer(rest)):
+            rest = rest[:rules[-1].start()]
+    out, sep, err = rest.rpartition(", stderr=")
+    if not sep:
+        return None
+    recode = found[-1].group(1).strip()
+    words = " ".join(err.split()) or " ".join(out.split())
+    printed = bool(words)
+    if not words or recode == "0" or _RECEIPT.search(out) or _RECEIPT.search(err):
+        return SubmitAnswer(recode, printed, None)
+    return SubmitAnswer(recode, printed, cut_tail(words, SCHEDULER_WORDS_MAX))
+
 
 
 def _answered(fut) -> bool:
@@ -175,8 +275,10 @@ def _task_client(executor) -> Any:
 
 
 def _failed_canary(exc: BaseException) -> CanaryResult:
-    """A canary that failed with `exc`: its diagnosis, and whether it was the stored Globus login that failed."""
-    return CanaryResult(ok=False, error=dispatch_error_text(exc), login_expired=login_expired(exc))
+    """A canary that failed with `exc`: its diagnosis, what the scheduler said if it refused a block submission (read
+    from the whole text, before the diagnosis is cut), and whether it was the stored Globus login that failed."""
+    return CanaryResult(ok=False, error=dispatch_error_text(exc), submit=submit_answer(_error_message(exc)),
+                        login_expired=login_expired(exc))
 
 
 def _canary_result(res: object, answered_at: float) -> CanaryResult:
