@@ -77,14 +77,30 @@ def locked_globus_sdk(repo_root: Path | None = None) -> str | None:
 
 def build_endpoint_venv_cmd(gce: str, python: str, sdk: str | None = None) -> str:
     """Make sure the keyed venv exists and runs, built as the plugin builds it (relocatable, no package cache, files
-    copied, globus-sdk co-pinned; here in place, as a harness shortcut) — for a scenario that then plants a break in
-    it. Leaves a working one as it is."""
+    copied, globus-sdk co-pinned, texttable pinned below 1.7.2; here in place, as a harness shortcut) — for a scenario
+    that then plants a break in it. Leaves a working one as it is; one whose texttable breaks `list` (texttable 1.7.2,
+    built 2026-10-18 on) is rebuilt here, or the plugin's own check would rebuild it and lose the planted break."""
     k = keyed_endpoint_venv(gce, python)
-    reqs = f'"globus-compute-endpoint=={gce}"' + (f' "globus-sdk=={sdk}"' if sdk else "")
-    return (f'K="{k}"; "$K/bin/globus-compute-endpoint" version >/dev/null 2>&1 || {{ rm -rf "$K"; '
+    reqs = f'"globus-compute-endpoint=={gce}"' + (f' "globus-sdk=={sdk}"' if sdk else "") + ' "texttable<1.7.2"'
+    tt = ("import texttable as t; x = t.Texttable(); x.header(['a']); x.add_row(['b']); x._compute_cols_width(); "
+          "x._width[0]")
+    return (f'K="{k}"; "$K/bin/globus-compute-endpoint" version >/dev/null 2>&1 && '
+            f'"$K/bin/python" -c "{tt}" >/dev/null 2>&1 || {{ rm -rf "$K"; '
             f'mkdir -p "$HOME/hpc-bridge" && uv venv -q --relocatable --no-cache --python {python} "$K" && '
             f'uv pip install -q --no-cache --link-mode=copy --python "$K/bin/python" {reqs}; }} && '
             '"$K/bin/globus-compute-endpoint" version')
+
+
+def build_unkeyed_venv_cmd(gce: str, python: str) -> str:
+    """The unkeyed `$HOME/hpc-bridge/gce-venv` as 0.1.23's discovery line builds it (`uv venv` at the client's Python,
+    then the endpoint at the plugin's pin), plus `texttable<1.7.2`. Built ahead of that line, its own guards (`[ -d ]
+    ||`, `command -v ||`) skip its unbounded install, which since texttable 1.7.2 (2026-10-18) breaks
+    `globus-compute-endpoint list`: the old bootstrap's `start` then could not find its endpoint, and left a manager
+    running on the pool user."""
+    return ('V="$HOME/hpc-bridge/gce-venv"; mkdir -p "$HOME/hpc-bridge" && '
+            f'uv venv -q "$V" --python {python} && '
+            f'uv pip install -q --python "$V/bin/python" "globus-compute-endpoint=={gce}" "texttable<1.7.2" && '
+            '"$V/bin/globus-compute-endpoint" version')
 
 
 def endpoint_uuid_cmd(endpoint_name: str) -> str:

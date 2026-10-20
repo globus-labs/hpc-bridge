@@ -45,6 +45,18 @@ _STATES = {  # (version rc, version line, python line)
     "broken": (1, "ImportError: cannot import name 'X' from 'globus_sdk'", f"({PY.replace('.', ', ')})"),
     "slow": (124, "", ""),
 }
+# what the check's python reports about texttable (`ev._PY_PROBE`); a state not named here reports nothing about it
+_TEXTTABLE = {
+    "ok": ["TEXTTABLE=ok", "TEXTTABLE_VERSION=1.7.1", "TEXTTABLE_ERROR="],
+    "oldtable": ["TEXTTABLE=broken", "TEXTTABLE_VERSION=1.7.2",
+                 "TEXTTABLE_ERROR=AttributeError: 'Texttable' object has no attribute '_width'"],
+    "notable": ["TEXTTABLE=absent", "TEXTTABLE_VERSION=", "TEXTTABLE_ERROR=ModuleNotFoundError: No module named"],
+    # a 1.7.1 venv whose python imports 1.7.2 from a site module's PYTHONPATH
+    "shadowed": ["TEXTTABLE=broken", "TEXTTABLE_VERSION=1.7.2",
+                 "TEXTTABLE_ERROR=AttributeError: 'Texttable' object has no attribute '_width'",
+                 "TEXTTABLE_FILE=/apps/python/3.13/lib/site-packages/texttable.py", "TEXTTABLE_OUTSIDE=1"],
+}
+_STATES["oldtable"] = _STATES["notable"] = _STATES["shadowed"] = _STATES["ok"]  # only texttable differs
 
 
 class Remote:
@@ -111,6 +123,7 @@ class Remote:
         if state in _STATES:
             rc, ver, py = _STATES[state]
             lines += ["ENTRY=1", f"VERSION_RC={rc}", f"VERSION={ver}", f"PY_RC={rc if rc == 124 else 0}", f"PY={py}"]
+            lines += _TEXTTABLE.get(state, [])
         if arch and state != "missing":
             lines.append(f"ARCH={arch}")
         lines.append("MACHINE=x86_64")
@@ -181,7 +194,7 @@ async def test_a_broken_keyed_venv_never_falls_back_to_the_unkeyed_one():
 def test_the_check_reads_versions_through_the_entry_point():
     script = ev.check_script(_mv())
     assert '"$k/bin/globus-compute-endpoint" version' in script
-    assert "-c 'import sys;print(sys.version_info[:2])'" in script
+    assert '"$k/bin/python" -c ' in script and "print(sys.version_info[:2])\\n" in script  # its last line, as before
     assert "import globus_compute_endpoint" not in script  # fails under -c on a real install
     assert "PYTHONDONTWRITEBYTECODE=1" in script and "timeout 60" in script and "INODE=" in script
     s = ev.parse_check("x\nHPCB_VENV_BEGIN\nEXISTS=1\nPYVENV=1\nENTRY=1\nVERSION_RC=0\n"
@@ -1310,3 +1323,336 @@ async def test_a_line_an_earlier_plugin_generated_is_never_run_even_through_the_
     assert await cli.use_working_venv(_OLD_UV.replace("{venv}", "/home/u/hpc-bridge/gce-venv")) == (True, "")
     prefix = cli._env_prefix()
     assert ev.is_line(prefix.removesuffix(" && ")) and "pip install" not in prefix and "uv venv" not in prefix
+
+
+# ---- texttable 1.7.2 broke `globus-compute-endpoint list` (released 2026-10-18; live on the fake cluster 2026-10-20) ---
+# gce 4.18's `Endpoint.print_endpoint_table` calls `_compute_cols_width()` and then reads `Texttable._width`, which 1.7.2
+# no longer sets: `list` raises AttributeError whenever an endpoint is configured, and hpc-bridge finds its endpoint's id
+# with `list`. The endpoint leaves texttable unbounded, so every venv built since then broke every SSH bring-up, and the
+# check (`version` + the python) passed it. Now every build pins `texttable<1.7.2`, the check runs what `list` runs on
+# texttable, and a venv that fails it is rebuilt beside and renamed in, as any broken venv is.
+
+_ATTR = "AttributeError: 'Texttable' object has no attribute '_width'"
+
+
+@pytest.mark.parametrize("method", ["uv", "bootstrap"])
+@pytest.mark.parametrize(("gce", "sdk"), [(PIN, SDK), (PIN, None), (None, None)], ids=["pinned", "no-sdk", "unpinned"])
+def test_every_build_pins_texttable_in_the_endpoints_own_install(method, gce, sdk):
+    s = ev.build_script(_mv(), token="t0", method=method, gce=gce, python=PY, sdk=sdk)
+    installs = re.findall(r'"\$u" pip install [^&]*', s)
+    assert len(installs) == 1, s  # one install: the endpoint and the pin resolve together
+    words = shlex.split(installs[0])
+    assert "texttable<1.7.2" in words
+    assert (f"globus-compute-endpoint=={gce}" if gce else "globus-compute-endpoint") in words
+    assert "'texttable<1.7.2'" in installs[0]  # quoted: a bare `<` is a redirect to the shell
+    assert (method == "bootstrap") == ("astral.sh" in s)  # the bootstrap path installs uv first, then the same install
+
+
+async def test_a_venv_whose_texttable_breaks_list_is_rebuilt_beside_and_renamed_in():
+    r = Remote("oldtable", arch="x86_64")
+    res = await _ensure(r)
+    assert r.steps == ["check", "build", "verify", "claim"]  # the module's repair: built beside, verified, renamed in
+    assert res.built and res.moved_aside is not None and r.venv == "ok"
+    assert res.reason == f"its texttable 1.7.2 breaks `globus-compute-endpoint list` ({_ATTR})"
+    assert "'texttable<1.7.2'" in r.script("build")
+
+
+@pytest.mark.parametrize("state", ["ok", "notable"], ids=["texttable-1.7.1", "no-texttable"])
+async def test_a_venv_whose_texttable_serves_list_or_that_has_none_costs_one_check(state):
+    r = Remote(state, arch="x86_64")
+    res = await _ensure(r)
+    assert r.steps == ["check"] and not res.built
+
+
+async def test_an_unkeyed_venv_whose_texttable_breaks_list_is_never_changed_and_says_why():
+    # the unkeyed {venv} may be the user's own (a login node without internet): it is never repaired, the keyed venv is
+    # built instead, and the bring-up says why the unkeyed one was passed over
+    r = Remote("missing", unkeyed="oldtable")
+    res = await _ensure(r)
+    assert r.steps == ["check", "check unkeyed", "build", "verify", "claim"] and res.path == _mv().key
+    assert f"{_mv().base} was not used: its texttable 1.7.2 breaks" in res.reason
+    assert all(f'"{_mv().base}"' not in s for st, s in r.scripts if st != "check unkeyed")  # only ever read
+    r = Remote("missing", unkeyed="oldtable", build_rc=1, build_err="error: Failed to fetch: `https://pypi.org/x`")
+    with pytest.raises(EndpointVenvError) as e:
+        await _ensure(r)
+    assert f"{_mv().base} was not used: its texttable 1.7.2 breaks `globus-compute-endpoint list` ({_ATTR})." \
+        in str(e.value) and str(e.value).endswith("Nothing was started or billed.")
+
+
+def test_the_check_runs_what_list_runs_on_texttable_in_one_line():
+    script = ev.check_script(_mv())
+    assert "\n" not in script  # still one line, as the check always was
+    for call in ("tb._compute_cols_width()", "tb._width[2] = max(10, tb._width[2])", "tb.set_max_width(68)"):
+        assert call in ev._PY_PROBE
+    assert "grep '^TEXTTABLE'" in script
+    assert re.search(r"\bf['\"]", ev._PY_PROBE) is None  # no f-strings: an old python still reports its version
+    s = ev.parse_check("HPCB_VENV_BEGIN\nEXISTS=1\nPYVENV=1\nENTRY=1\nVERSION_RC=0\n"
+                       "VERSION=Globus Compute endpoint version: 4.18.0\nPY_RC=0\nTEXTTABLE=broken\n"
+                       f"TEXTTABLE_VERSION=1.7.2\nTEXTTABLE_ERROR={_ATTR}\nPY=(3, 13)\nHPCB_VENV_END\n")
+    want = f"its texttable 1.7.2 breaks `globus-compute-endpoint list` ({_ATTR})"
+    assert ev.problem(s, gce="4.18.0", python="3.13") == want
+    assert ev.problem(s, gce="4.18.0", python="3.12") == "its python is 3.13, not 3.12"  # the python is named first
+
+
+@pytest.mark.parametrize(("texttable", "want"), [("1.7.1", "ok"), ("1.7.2", "broken"), (None, "absent")])
+def test_the_probe_itself_against_a_stub_texttable_on_pythonpath(tmp_path, texttable, want):
+    import sys
+
+    lib: dict = {}
+    exec(compile(vs.LIB, "hpcb_stub", "exec"), lib)  # noqa: S102 - the tests' own stub library
+    site = tmp_path / "site"
+    site.mkdir()
+    if texttable:
+        body = "self._width = widths" if texttable == "1.7.1" else "return widths"
+        (site / "texttable.py").write_text(lib["TEXTTABLE"] % (texttable, body))
+    # -S: no site-packages, so this interpreter's own texttable stays out; the stub comes in on PYTHONPATH. A
+    # texttable.py in the cwd (the login shell's: $HOME) is never what it reads, as an entry point never reads it.
+    (tmp_path / "texttable.py").write_text("raise SystemExit('the cwd was imported')\n")
+    r = subprocess.run([sys.executable, "-S", "-c", f"exec({ev._PY_PROBE!r})"], capture_output=True, text=True,
+                       cwd=tmp_path, env={"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"}, check=False)
+    assert r.returncode == 0, r.stderr
+    s = ev.parse_check("HPCB_VENV_BEGIN\n" + r.stdout + "HPCB_VENV_END\n")
+    assert s.texttable == want and r.stdout.splitlines()[-1] == str(sys.version_info[:2])
+    assert (s.texttable_error == _ATTR) is (want == "broken") and s.texttable_version == (texttable or "")
+    # it came in on PYTHONPATH, outside this interpreter's prefix: named, and marked as from outside
+    assert s.texttable_outside is bool(texttable) and s.texttable_file == (str((site / "texttable.py").resolve())
+                                                                           if texttable else "")
+
+
+# -- the same in a real shell, with the stub texttable in the venvs (its `list` draws the table as gce 4.18 does)
+
+def _list(v: Path, home: Path, endpoint: str = "hpc-bridge-login") -> subprocess.CompletedProcess:
+    (home / ".globus_compute" / endpoint).mkdir(parents=True, exist_ok=True)
+    return subprocess.run([str(v / "bin" / "globus-compute-endpoint"), "list"], capture_output=True, text=True,
+                          env={"HOME": str(home), "PATH": "/usr/bin:/bin"}, check=False)
+
+
+async def test_real_a_venv_built_now_runs_list(box):
+    res = await _real(box)
+    assert res.built
+    install = next(c for c in vs.calls(box) if c[:3] == ["uv", "pip", "install"])
+    assert "texttable<1.7.2" in install  # the `<` reached uv: no redirect, no stray file named 1.7.2
+    assert not list(box["home"].rglob("1.7.2")) and not list(box["tmp"].glob("1.7.2"))
+    r = _list(box["key"], box["home"])
+    assert r.returncode == 0 and "hpc-bridge-login" in r.stdout, r.stderr
+
+
+async def test_real_a_venv_whose_texttable_breaks_list_is_rebuilt(box):
+    v = vs.venv(box, box["key"], PIN, texttable="1.7.2")  # built 2026-10-18 on: `version` runs, `list` does not
+    assert _ATTR in _list(v, box["home"]).stderr
+    res = await _real(box)
+    assert res.built and "texttable 1.7.2 breaks" in res.reason and not (v / "sentinel").exists()
+    assert (Path(res.moved_aside) / "sentinel").read_text() == "old"  # kept, as every broken venv is
+    assert _list(box["key"], box["home"]).returncode == 0 and _relocatable(box["key"])
+    assert (box["key"] / ".hpcb-arch").read_text().strip() == os.uname().machine
+
+
+@pytest.mark.parametrize("texttable", ["1.7.1", None], ids=["texttable-1.7.1", "no-texttable"])
+async def test_real_a_venv_whose_texttable_serves_list_or_that_has_none_is_left_alone(box, texttable):
+    v = vs.venv(box, box["key"], PIN, texttable=texttable)
+    res = await _real(box)
+    assert not res.built and vs.calls(box) == [] and (v / "sentinel").exists()
+
+
+async def test_real_an_unkeyed_venv_whose_texttable_breaks_list_is_never_changed(box):
+    u = vs.venv(box, box["venv"], PIN, texttable="1.7.2")  # the user's own, perhaps
+    theirs = next((u / "lib").rglob("texttable.py"))
+    before = theirs.read_text()
+    res = await _real(box)
+    assert res.built and res.path == str(box["key"]) and "was not used: its texttable 1.7.2" in res.reason
+    assert (u / "sentinel").exists() and theirs.read_text() == before
+    assert _list(box["key"], box["home"]).returncode == 0
+
+
+# -- the list failure says what it is
+
+_LIST_TRACEBACK = """Traceback (most recent call last):
+  File "/home/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13/bin/globus-compute-endpoint", line 12, in <module>
+    sys.exit(cli_run())
+             ~~~~~~~^^
+  File "/home/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13/lib/python3.13/site-packages/click/core.py", line 1485, \
+in __call__
+    return self.main(*args, **kwargs)
+  File "/home/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13/lib/python3.13/site-packages/globus_compute_endpoint/\
+cli.py", line 1095, in list_endpoints
+    Endpoint.print_endpoint_table(compute_dir)
+  File "/home/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13/lib/python3.13/site-packages/globus_compute_endpoint/\
+endpoint/endpoint.py", line 906, in print_endpoint_table
+    if table._width[idx_id] < width_id:
+       ^^^^^^^^^^^^
+AttributeError: 'Texttable' object has no attribute '_width'
+"""
+
+
+def _gce_answers(monkeypatch, answers: dict[str, tuple[int, str, str]]) -> None:
+    from hpc_bridge.facility import remote
+
+    async def fake_ssh(target, cmd, **kw):
+        for word, answer in answers.items():
+            if f"globus-compute-endpoint {word}" in cmd:
+                return answer
+        raise AssertionError(cmd)
+
+    monkeypatch.setattr(remote, "ssh_exec", fake_ssh)
+
+
+async def test_a_list_that_raises_says_its_exception_and_the_texttable_fix(monkeypatch):
+    from hpc_bridge.notices import _explain_provision_error
+
+    _gce_answers(monkeypatch, {"list": (1, "", _LIST_TRACEBACK)})
+    with pytest.raises(RuntimeError) as e:
+        await _cli(_line()).endpoint_id("hpc-bridge-login")
+    msg = str(e.value)
+    assert msg.startswith(f"remote list failed: {_ATTR} (at endpoint/endpoint.py:906, in print_endpoint_table). "), msg
+    assert "texttable 1.7.2 breaks globus-compute-endpoint's `list`" in msg and "pip install 'texttable<1.7.2'" in msg
+    notice = _explain_provision_error(e.value)  # what the agent reads: the notice's 500-character cut keeps all of it
+    assert _ATTR in notice and notice.endswith("run `pip install 'texttable<1.7.2'` there."), notice
+    assert "Traceback" not in notice
+
+
+async def test_a_list_failure_that_is_not_this_one_is_quoted_as_before(monkeypatch):
+    from hpc_bridge.notices import _explain_provision_error
+
+    _gce_answers(monkeypatch, {"list": (255, "", "Host key verification failed.")})
+    with pytest.raises(RuntimeError) as e:
+        await _cli(_line()).endpoint_id("hpc-bridge-login")
+    assert str(e.value) == "remote list failed: Host key verification failed."  # what the notices classify
+    assert _explain_provision_error(e.value, host="h", user="u").startswith("UNKNOWN HOST KEY for h")
+    other = _LIST_TRACEBACK.replace(_ATTR, "ImportError: cannot import name 'X' from 'globus_sdk'")
+    _gce_answers(monkeypatch, {"list": (1, "", other)})
+    with pytest.raises(RuntimeError) as e:
+        await _cli(_line()).endpoint_id("hpc-bridge-login")
+    assert "ImportError: cannot import name 'X' from 'globus_sdk'" in str(e.value) and "texttable" not in str(e.value)
+
+
+async def test_a_refused_start_whose_list_fails_too_says_both(monkeypatch):
+    # gce 4.13 refuses a second start with exit 73 and nothing on either stream: before, that was the whole error
+    _gce_answers(monkeypatch, {"start": (73, "", ""), "list": (1, "", _LIST_TRACEBACK)})
+    cli = _cli(_line())
+    with pytest.raises(RuntimeError) as e:
+        await cli.start("hpc-bridge-login")
+    msg = str(e.value)
+    assert msg.startswith(f"remote start failed (rc=73): no output; `list` failed too: {_ATTR} (at "), msg
+    assert msg.endswith("run `pip install 'texttable<1.7.2'` there.")
+    from hpc_bridge.notices import _explain_provision_error
+
+    assert _explain_provision_error(e.value).endswith("there."), "the notice's 500-character cut took the fix"
+    _gce_answers(monkeypatch, {"list": (0, "No endpoints configured!", "")})
+    assert await cli.status("hpc-bridge-login") is None and cli.last_list_error is None  # a list that works clears it
+
+
+async def test_real_the_list_failure_of_a_venv_hpc_bridge_does_not_manage(box, monkeypatch):
+    # the stub's own Python traceback, through `endpoint_id` as a bring-up runs it, in a venv behind a hand-written
+    # env_setup: hpc-bridge never checks or repairs that one, so the error is all the user gets
+    from hpc_bridge.facility import remote
+
+    v = vs.venv(box, box["tmp"] / "theirs", PIN, texttable="1.7.2")
+    (box["home"] / ".globus_compute" / "hpc-bridge-login").mkdir(parents=True)
+
+    async def local_ssh(target, cmd, timeout=None, **kw):
+        p = await asyncio.create_subprocess_exec("bash", "-c", cmd, env={**vs.env(box), "HOME": str(box["home"])},
+                                                 stdout=asyncio.subprocess.PIPE, stderr=asyncio.subprocess.PIPE)
+        out, err = await asyncio.wait_for(p.communicate(), 60)
+        return p.returncode or 0, out.decode(), err.decode()
+
+    monkeypatch.setattr(remote, "ssh_exec", local_ssh)
+    cli = _cli(f'export PATH="{v}/bin:$PATH"')
+    assert cli.venv is None
+    with pytest.raises(RuntimeError) as e:
+        await cli.endpoint_id("hpc-bridge-login")
+    msg = str(e.value)
+    assert msg.startswith(f"remote list failed: {_ATTR} (at globus_compute_endpoint/cli.py:"), msg
+    assert "pip install 'texttable<1.7.2'" in msg
+
+
+# -- review round 1 (2026-10-20)
+
+def test_the_pin_and_the_probe_go_together():
+    # The probe tests texttable alone, never the endpoint: a build without the pin would take texttable 1.7.2 and fail
+    # its own verify on every bring-up (a .failed.<ts> each). Drop both together, once globus-compute-endpoint stops
+    # reading `_width`, or neither.
+    probes = "tb._width" in ev._PY_PROBE
+    pins = "'texttable<1.7.2'" in ev.build_script(_mv(), token="t0", method="uv", gce=PIN, python=PY, sdk=SDK)
+    assert probes == pins, "the probe's texttable calls and TEXTTABLE_PIN come out together, or neither does"
+
+
+def test_the_probe_draws_the_table_as_list_does(tmp_path):
+    # gce's `list` ends in `draw()`: a texttable that has `_width` but cannot draw with gce's widths breaks it too
+    import sys
+
+    adjust = ev._PY_PROBE.index("tb._width[2] = max(10, tb._width[2])")
+    assert ev._PY_PROBE.index("tb.draw()") > adjust
+    site = tmp_path / "site"
+    site.mkdir()
+    (site / "texttable.py").write_text(
+        "__version__ = '9.9'\nclass Texttable:\n    def header(self, r): self._width = [1] * len(r)\n"
+        "    def add_row(self, r): pass\n    def set_max_width(self, w): pass\n"
+        "    def _compute_cols_width(self): pass\n"
+        "    def draw(self): raise ValueError('cannot draw with these widths')\n")
+    r = subprocess.run([sys.executable, "-S", "-c", f"exec({ev._PY_PROBE!r})"], capture_output=True, text=True,
+                       env={"PYTHONPATH": str(site), "PATH": "/usr/bin:/bin"}, check=False)
+    s = ev.parse_check("HPCB_VENV_BEGIN\n" + r.stdout + "HPCB_VENV_END\n")
+    assert s.texttable == "broken" and s.texttable_error == "ValueError: cannot draw with these widths", r.stdout
+
+
+async def test_a_texttable_shadowed_from_outside_the_venv_is_named_and_never_rebuilt():
+    # a site module's PYTHONPATH puts texttable 1.7.2 ahead of the venv's own 1.7.1: `list` breaks with the same
+    # environment, and no build can change that — so nothing is built, every connect, and the file is named
+    r = Remote("shadowed", arch="x86_64")
+    with pytest.raises(EndpointVenvError) as e:
+        await _ensure(r)
+    msg = str(e.value)
+    assert r.steps == ["check"], r.steps  # no build, no .failed copy, no move aside
+    named = "texttable 1.7.2 from /apps/python/3.13/lib/site-packages/texttable.py, outside hpc-bridge's endpoint venv "
+    assert named + _mv().key in msg
+    assert "shadowed from outside the venv (PYTHONPATH" in msg and "a rebuild cannot help" in msg
+    assert msg.endswith("Nothing was started or billed.")
+
+
+async def test_a_first_build_that_is_shadowed_is_claimed_once_and_then_named_without_rebuilding():
+    r = Remote("missing", built="shadowed")
+    with pytest.raises(EndpointVenvError, match="shadowed from outside the venv"):
+        await _ensure(r)
+    assert r.steps == ["check", "check unkeyed", "build", "verify", "claim"] and r.venv == "shadowed"
+    r.steps.clear()
+    with pytest.raises(EndpointVenvError, match="shadowed from outside the venv"):
+        await _ensure(r)  # the next connect: said at its check, no second build
+    assert r.steps == ["check"]
+
+
+async def test_a_prepared_unkeyed_venv_that_is_shadowed_is_named_not_passed_over():
+    r = Remote("missing", unkeyed="shadowed")
+    with pytest.raises(EndpointVenvError, match=f"outside hpc-bridge's endpoint venv {_mv().base} "):
+        await _ensure(r)
+    assert r.steps == ["check", "check unkeyed"]
+
+
+async def test_a_build_that_got_the_broken_texttable_despite_the_pin_says_the_pin_was_overridden():
+    r = Remote("missing", built="oldtable")  # a uv override on the login node: the build has 1.7.2 inside
+    with pytest.raises(EndpointVenvError) as e:
+        await _ensure(r)
+    assert "fails its check: its texttable 1.7.2 breaks" in str(e.value)
+    assert "asked for 'texttable<1.7.2' and got 1.7.2 all the same: a uv override or constraint" in str(e.value)
+
+
+@pytest.mark.parametrize(("tools", "refusal"), [("none", "no uv, no curl and no python3"), ("olduv", "is too old")])
+async def test_a_refusal_to_build_says_why_the_prepared_venv_was_passed_over(tools, refusal):
+    r = Remote("missing", unkeyed="oldtable", tools=tools)
+    with pytest.raises(EndpointVenvError) as e:
+        await _ensure(r)
+    msg = str(e.value)
+    assert refusal in msg and f"{_mv().base} was not used: its texttable 1.7.2 breaks" in msg, msg
+    assert msg.endswith("Nothing was started or billed.") and r.steps == ["check", "check unkeyed"]
+
+
+async def test_real_a_texttable_on_pythonpath_shadowing_the_venvs_is_named_and_nothing_is_built(box):
+    v = vs.venv(box, box["key"], PIN, texttable="1.7.1")  # the venv's own texttable serves `list`
+    site = box["tmp"] / "site-module"
+    site.mkdir()
+    (site / "texttable.py").write_text(box["lib"]["TEXTTABLE"] % ("1.7.2", "return widths"))
+    with pytest.raises(EndpointVenvError) as e:
+        await _real(box, PYTHONPATH=str(site))
+    msg = str(e.value)
+    assert f"texttable 1.7.2 from {(site / 'texttable.py').resolve()}, outside" in msg and "PYTHONPATH" in msg, msg
+    assert vs.calls(box) == [] and (v / "sentinel").exists() and _leftovers(box) == []  # nothing built or moved
+    assert _list(v, box["home"]).returncode == 0  # without that PYTHONPATH, the venv's own texttable serves `list`

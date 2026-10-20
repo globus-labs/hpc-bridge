@@ -414,6 +414,27 @@ _ANOTHER_INSTANCE = "another instance"
 _sleep = asyncio.sleep  # indirection so tests can run the poll loop without waiting
 _JOBID = re.compile(r"^\d+(_\d+)?$")  # plain or array slurm job id (guards what we scancel)
 _JOBID_PBS = re.compile(r"^\d+(\.\S+)?$")  # PBS: bare or host-qualified (1234567.polaris-pbs-01)
+_TRACEBACK = "Traceback (most recent call last)"
+_FRAME = re.compile(r'File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<fn>\S+)')
+
+
+def _cli_said(out: str, err: str) -> str:
+    """What a failed `globus-compute-endpoint` call said, for its error. Short text is kept as it is (the notices read
+    ssh's own verdict from it). A Python traceback becomes its LAST line, the exception, and the frame that raised it:
+    a notice keeps a message's first 500 characters, which of a traceback was only "Traceback (most recent call
+    last): File …, line 12, in" (texttable 1.7.2, live 2026-10-20). That texttable break also says what it is."""
+    text = (err or out or "").strip()
+    if _TRACEBACK in text:
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
+        frames = list(_FRAME.finditer(text))
+        where = ""
+        if frames:
+            f = frames[-1]
+            where = f" (at {'/'.join(f['path'].split('/')[-2:])}:{f['line']}, in {f['fn']})"
+        text = lines[-1][:300] + where
+    if endpoint_venv.BROKEN_LIST.search(text):
+        text = f"{text}. {endpoint_venv.BROKEN_LIST_HINT}"
+    return text
 
 
 class RemoteEndpointCLI:
@@ -426,6 +447,7 @@ class RemoteEndpointCLI:
     def __init__(self, target: SshTarget, env_setup: str, *, remote_dir: str = "$HOME/.globus_compute") -> None:
         self.target = target
         self.last_whoami_error: str | None = None  # the remote's words when `whoami` last failed
+        self.last_list_error: str | None = None  # …and when `status`'s `list` last failed (it then reads None)
         self.gce_python: str | None = None  # python3 inside the gce environment, seen by whoami (it has sqlite3)
         self.env_setup = env_setup
         self.remote_dir = remote_dir
@@ -587,8 +609,11 @@ class RemoteEndpointCLI:
         return rows
 
     async def status(self, name: str) -> str | None:
-        """'running' | 'configured' | None — drives idempotent (re)provisioning."""
-        rc, out, _err = await self._gce("list")
+        """'running' | 'configured' | None — drives idempotent (re)provisioning. A `list` that fails reads None, as
+        it always has (teardown's re-checks rely on it never raising for that); its words are kept in
+        `last_list_error`, which a refused `start` quotes."""
+        rc, out, err = await self._gce("list")
+        self.last_list_error = (_cli_said(out, err) or f"rc={rc}") if rc != 0 else None
         if rc != 0:
             return None
         for cells in self._parsed_rows(out):
@@ -700,7 +725,10 @@ class RemoteEndpointCLI:
             if _ANOTHER_INSTANCE in (err + out).lower() or await self.status(name) == "running":
                 out = ""
             else:
-                raise RuntimeError(f"remote start failed (rc={rc}): {(err or out).strip() or 'no output'}")
+                # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
+                # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
+                listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
+                raise RuntimeError(f"remote start failed (rc={rc}): {(err or out).strip() or 'no output'}{listed}")
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
@@ -855,7 +883,7 @@ class RemoteEndpointCLI:
     async def endpoint_id(self, name: str) -> str:
         rc, out, err = await self._gce("list")
         if rc != 0:
-            raise RuntimeError(f"remote list failed: {(err or out).strip()}")
+            raise RuntimeError(f"remote list failed: {_cli_said(out, err) or f'rc={rc}'}")
         for cells in self._parsed_rows(out):
             if cells[-1] == name:  # exact Endpoint Name match, not a line substring
                 m = _UUID.search(cells[0])

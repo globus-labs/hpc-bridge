@@ -146,6 +146,36 @@ def world(tmp_path, monkeypatch):
     return {"box": box, "key": key, "gce": gce, "vs": vs}
 
 
+def test_the_upgrade_scenarios_setup_leaves_0_1_23s_line_a_venv_whose_list_works(tmp_path, monkeypatch):
+    # 0.1.23's line installs the endpoint unbounded, so since texttable 1.7.2 (2026-10-18) its venv's `list` raised and
+    # the old bootstrap failed after its `start`, leaving a manager on the pool user. SETUP now builds the unkeyed venv
+    # first, with texttable pinned; the line's guards leave it, and its own install never runs.
+    import endpoint_upgrade_reuse as sc
+
+    from tests import venv_stubs as vs
+
+    (tmp_path / "stubs").mkdir()
+    (tmp_path / "box").mkdir()
+    stubs = vs.make_stubs(tmp_path / "stubs")
+    monkeypatch.setenv("HPCB_TEST_TEMPLATE", str(stubs["template"]))
+    box = vs.make_box(tmp_path / "box", stubs)
+
+    def sh(cmd: str) -> subprocess.CompletedProcess:
+        return subprocess.run(["bash", "-c", cmd], env=vs.env(box), capture_output=True, text=True, timeout=60,
+                              check=False)
+
+    for cmd in sc.SETUP:  # as the cell runs them, in order
+        r = sh(cmd)
+        assert r.returncode == 0, (cmd, r.stderr)
+    (box["home"] / ".globus_compute" / "hpc-bridge-fake-local").mkdir(parents=True)
+    old = sc._OLD_LINE.replace("{venv}", str(box["venv"]))  # resolved, as old_endpoint.py resolves it
+    r = sh(f"{old} && globus-compute-endpoint list")
+    assert r.returncode == 0 and "hpc-bridge-fake-local" in r.stdout, r.stderr
+    installs = [c for c in vs.calls(box) if c[:3] == ["uv", "pip", "install"]]
+    assert len(installs) == 1 and "texttable<1.7.2" in installs[0]  # SETUP's: the line's own install was skipped
+    assert f"globus-compute-endpoint=={sc.GCE_V}" in installs[0]
+
+
 def _sh(cmd: str, home: Path, extra_path: str = "") -> subprocess.CompletedProcess:
     return subprocess.run(["bash", "-c", cmd], env={"HOME": str(home), "PATH": f"{extra_path}/usr/bin:/bin", "LANG": "C"},
                           capture_output=True, text=True, timeout=60, check=False)

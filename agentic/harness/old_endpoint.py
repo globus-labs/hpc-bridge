@@ -5,11 +5,13 @@ with the plugin's own environment:
 
 A per-phase build of an older plugin is too heavy for a cell, so this drives the CURRENT code with exactly what 0.1.23
 wrote: the env_setup line its discovery proposed (`[ -d {venv} ] || uv venv …; command -v globus-compute-endpoint ||
-uv pip install …`), which builds the unkeyed `{venv}` itself on the bring-up's first gce call, and a UEP template whose
-worker_init default is JSON-encoded ONCE (0.1.24 encodes it twice). The profile is built directly, so the upgrade-on-read
-never touches the line; the line is not hpc-bridge's new one, so the Python build never runs. The rest — seeding the
-token store, configure, start, the endpoint record — is the plugin's own bootstrap, as it was. The endpoint's name is the
-run's (HPC_BRIDGE_ENDPOINT_NAME), so the agent's connect finds it online over the web and reuses it.
+uv pip install …`), which would build the unkeyed `{venv}` itself on the bring-up's first gce call (the scenario's SETUP
+builds it first with `texttable<1.7.2`, `cluster_ops.build_unkeyed_venv_cmd`, and the line's guards leave it), and a
+UEP template whose worker_init default is JSON-encoded ONCE (0.1.24 encodes it twice). The profile is built directly,
+so the upgrade-on-read never touches the line; the line is not hpc-bridge's new one, so the Python build never runs.
+The rest — seeding the token store, configure, start, the endpoint record — is the plugin's own bootstrap, as it was.
+The endpoint's name is the run's (HPC_BRIDGE_ENDPOINT_NAME), so the agent's connect finds it online over the web and
+reuses it.
 """
 from __future__ import annotations
 
