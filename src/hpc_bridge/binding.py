@@ -17,7 +17,16 @@ import os
 import re
 
 from . import config
-from .catalog.entry import Allocation, CatalogEntry, Compute, Defaults, scheduler_terms_directive
+from .catalog.entry import (
+    Allocation,
+    CatalogEntry,
+    Compute,
+    Defaults,
+    SchedulerOptionsError,
+    directive_lines,
+    scheduler_options_problem,
+    scheduler_terms_directive,
+)
 from .config import _env_endpoint_id, _require_env
 from .endpoint import EndpointCLI
 from .facility.base import Facility
@@ -310,24 +319,43 @@ def _facility_store():
 
     return FacilityStore()
 
-class TermsDirectiveError(ValueError):
+class TermsDirectiveError(SchedulerOptionsError):
     """details= whose scheduler_options set the account or the partition/queue (refused: `_entry_from_details`)."""
+
+
+def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[tuple[str, str]]]:
+    """details= with its scheduler_options as the submit script will carry them (`directive_lines`: a bare option
+    such as "-l filesystems=home:eagle" written as "#PBS -l filesystems=home:eagle", blank lines dropped), and each
+    rewrite made as (given, written) for the connect to report. Idempotent: written details give no rewrite. A line that
+    is not a directive is refused (`SchedulerOptionsError`), as is one that sets the account or the partition/queue —
+    read AFTER the prefix, so "-A x" is the directive it becomes (`TermsDirectiveError`)."""
+    written, rewrites, other = directive_lines(details.scheduler_options, details.scheduler)
+    if other:
+        raise SchedulerOptionsError(scheduler_options_problem(other, details.scheduler))
+    if line := scheduler_terms_directive(written):
+        # it would charge an account or pick a queue that the block's terms (and the user) never see
+        was = next((g for g, w in rewrites if w.strip() == line), None)
+        raise TermsDirectiveError(
+            f"scheduler_options sets the account or the partition/queue ({line!r}"
+            + (f", as hpc-bridge writes {was!r}" if was else "") + "; #SBATCH -A/--account/-p/--partition, "
+            "#PBS -A/-q): take it out — give the partition as details' `partition` and the account to "
+            "ensure_endpoint_up(account=…), so the spend question names what the block charges")
+    if written != details.scheduler_options:
+        details = details.model_copy(update={"scheduler_options": written})
+    return details, rewrites
 
 
 def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry:
     """Build a SESSION-LOCAL CatalogEntry from user-supplied details — the Socratic fallback for a
     machine not in the catalog. provenance="session"; never written to the shared index. Identity is
     defaulted from the id; the transfer endpoint is omitted (compute-only); the allocation block is
-    set only when a listing command + a parser were given (else the human supplies the account)."""
+    set only when a listing command + a parser were given (else the human supplies the account).
+    Its scheduler_options are written as directives first (`_directive_details`, which also refuses the account,
+    the queue and any line that is not a directive)."""
+    details, _rewrites = _directive_details(details)
     if details.env_setup is None:
         raise ValueError("env_setup is missing and there is no proposal to take it from: call connect_facility with "
                          "ssh_host=… (no details) for a proposed config, or give env_setup")
-    if line := scheduler_terms_directive(details.scheduler_options):
-        # sent verbatim, it would charge an account or pick a queue that the block's terms (and the user) never see
-        raise TermsDirectiveError(
-            f"scheduler_options sets the account or the partition/queue ({line!r}; #SBATCH -A/--account/-p/"
-            "--partition, #PBS -A/-q): take it out — give the partition as details' `partition` and the account to "
-            "ensure_endpoint_up(account=…), so the spend question names what the block charges")
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)

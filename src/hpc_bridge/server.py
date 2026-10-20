@@ -559,6 +559,9 @@ async def _ensure_endpoint_up(
     # keeps a not-yet-visible pilot during normal cold-start from being cried as rejected.
     # (The query rides the free login shape — a compute-only facility has none, so skip it there; the
     # #37 failure-signal path for a MEP is the dispatch-error suffix already on the notice.)
+    # the block's scheduler job: the one its check answered from, once it is up; while it provisions, the newest pilot
+    # the probe lists for this endpoint (the one its verdict names)
+    job_id = rt.block_job if status == "up" and billable else None
     if status == "provisioning" and billable and eid and _has_login_shape(app):
         # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
         # (and when a worker last answered, so the record can tell one that answered DURING the probe)
@@ -567,13 +570,19 @@ async def _ensure_endpoint_up(
         # a log read is not conclusive, so nothing is voided on it — the block stays `provisioning`)
         notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
                                                                   _login_runner(app), confirmed_at=rt.confirmed_at,
-                                                                  block=rt.user_endpoint_config.get("hpcb_block"))
-        if probe is not None and probe.dead is not None:
-            # A pilot that ran and died before any worker answered: the check it was started for is still queued, and
-            # the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of that check, which
-            # its own state decides) — on the runtime and terms the probe was for (live 2026-10-15, slurm_worker_died).
+                                                                  block=rt.user_endpoint_config.get("hpcb_block"),
+                                                                  requested_at=rt.requested_at)
+        if probe is not None and probe.category != "unknown":
+            job_id = probe.subject
             async with app.lock:
-                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
+                # what is still queued or HELD, for a switch or a reconnect to say (a held pilot never idle-releases)
+                warmth._record_pilots(app, shape, rt, eid, probe_epoch, probe.live, probe.subject)
+                if probe.dead is not None:
+                    # A pilot that ran and died before any worker answered: the check it was started for is still
+                    # queued, and the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of
+                    # that check, which its own state decides) — on the runtime and terms the probe was for (live
+                    # 2026-10-15, slurm_worker_died).
+                    warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
     return EndpointStatus(
         status=status,
         block_state=block,
@@ -581,6 +590,7 @@ async def _ensure_endpoint_up(
         session_spend=spend,
         partition=active_partition,
         account=active_account,
+        block_job_id=job_id,
         block=receipt_terms,
         notice=said(notice),
     )

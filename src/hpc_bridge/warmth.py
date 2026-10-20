@@ -47,8 +47,10 @@ from .context import (
     AppCtx,
     DeadPilot,
     LeftBlock,
+    SeenPilots,
     SentCheck,
     ShapeRuntime,
+    SshLeft,
     TaskHandle,
     _has_login_shape,
     _idle_release_s,
@@ -639,6 +641,7 @@ async def _provision(
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
+        rt.switch_left_up, rt.switch_left_pilots = None, None
         new_request = not kicked_up  # this confirmation asks for a block (not one already answering)
         rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
         rt.confirmed_at = time.monotonic()  # a pilot that died before this is an earlier session's, not this block's
@@ -786,6 +789,34 @@ def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoc
         return
     if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
         _note_dead_pilot(rt, job, exit_status, jobs)
+
+def _record_pilots(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
+                   live: tuple[tuple[str, str], ...], subject: str | None) -> None:
+    """The provisioning probe's live pilots (scheduler_ops.PilotProbe.live, and the one its verdict is about),
+    recorded on the runtime and terms it was for — as `_record_dead_pilot` guards it — so a switch (`_repoint`) or a
+    reconnect (`_ssh_left`) can say what is still queued or held. Callers hold app.lock."""
+    if app.state.endpoint_id != eid or app.shapes.get(shape) is not rt or rt.block_epoch != epoch:
+        return
+    rt.pilots = SeenPilots(jobs=live, at=time.monotonic(), subject=subject)
+
+def _came_up(rt: ShapeRuntime) -> bool:
+    """A worker answered on this shape's block (it was up), and no reap has been found since."""
+    return rt.reaped is None and (rt.block_since is not None or rt.warm_confirmed_at is not None
+                                  or rt.last_proof_at is not None)
+
+def _ssh_left(rt: ShapeRuntime | None) -> SshLeft | None:
+    """What a re-bind leaves of an SSH endpoint's compute shape, to say (connect._left_checks_note): nothing cancels a
+    block on a re-bind. The block, if it came up (it idle-releases after its last task), and the pilots the last probe
+    saw live other than that block's own job. None: nothing of it is known in the scheduler."""
+    if rt is None or not _billable(rt):
+        return None
+    up = rt.spend_confirmed and _came_up(rt)
+    jobs = tuple((j, s) for j, s in (rt.pilots.jobs if rt.pilots is not None else ()) if not (up and j == rt.block_job))
+    if not up and not jobs:
+        return None
+    seen = rt.pilots
+    pilots = SeenPilots(jobs=jobs, at=seen.at, subject=seen.subject) if seen is not None and jobs else None
+    return SshLeft(up=up, job=rt.block_job if up else None, pilots=pilots)
 
 def _check_key(c: SentCheck) -> str:
     """One task, however it was found: its task id once registered, else the key of its row on disk — for a future of
@@ -1361,6 +1392,7 @@ def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
     # a whole number (digits only once the template renders it `| int`, whatever a config carries): the user endpoint's
     # own log names it from its start (the template's endpoint_setup line), which is how a stop finds that endpoint
     rt.user_endpoint_config["hpcb_block"] = secrets.randbelow(_BLOCK_MAX - 1) + 1
+    rt.requested_at = time.monotonic()  # its pilot is submitted after this; a live one submitted before is not its own
     rt.runner_stale = True
 
 # Partition names come from the discovery gate (agent/user-supplied), then flow into a Jinja
@@ -1447,6 +1479,9 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     if confirmed:
         rt.spend_confirmed = False
         rt.switched_terms = terms
+        # what the old terms' block does now (notices._switch_fate): a block that came up idle-releases after its last
+        # task; one that never did may sit HELD, which never starts or idle-releases
+        rt.switch_left_up, rt.switch_left_pilots = _came_up(rt), rt.pilots
     elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
         rt.reap_terms = terms
     # A check of the old terms still queued may have asked their user endpoint for a block that can still land: the
@@ -1462,6 +1497,7 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age
+    rt.pilots = None  # the new terms' block request gets a probe of its own
     _forget_presumed(rt)
     rt.block_epoch += 1
 

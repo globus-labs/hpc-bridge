@@ -115,6 +115,60 @@ class ShapeRuntime:
     # When spend was last confirmed for this shape (time.monotonic()): a pilot that FINISHED and was submitted before it
     # is an earlier session's, not this block's (scheduler_ops._probe_pilots_over_login's `since_s`).
     confirmed_at: float | None = None
+    # The pilots the last provisioning probe listed live for this endpoint (scheduler_ops.PilotProbe.live; recorded by
+    # server._ensure_endpoint_up on the block request it was for): so a switch or a reconnect can say what of it is
+    # still queued or HELD — a held pilot never starts on its own, so it runs no task and never idle-releases.
+    pilots: SeenPilots | None = None
+    # When this shape's current block request was made (time.monotonic(); warmth._fresh_block: a new compute user
+    # endpoint, whose pilot is submitted after it). A live pilot submitted before it is an earlier request's — one a
+    # switch or a reconnect left queued or HELD — so the probe names it beside the verdict, never as this block's.
+    # None: no fresh request on this runtime (every live pilot may be this block's).
+    requested_at: float | None = None
+    # What a partition or account switch on an SSH endpoint left (warmth._repoint): whether the old terms' block had
+    # come up (a worker answered on it: then it idle-releases after its last task), and the pilots last seen for it.
+    # Cleared by a confirmation, as `switched_terms` is.
+    switch_left_up: bool | None = None
+    switch_left_pilots: SeenPilots | None = None
+
+
+@dataclass(frozen=True)
+class SeenPilots:
+    """Pilot jobs a provisioning probe listed LIVE for this endpoint (queued, held or running in the scheduler), oldest
+    first by job number, as (job, state letter: the scheduler's own — PBS's Q/H/R/W…, Slurm's PENDING/RUNNING…
+    first letter), and when it looked (time.monotonic()). A probe lists every pilot of the endpoint (its `uep.<eid>`
+    marker): an earlier block request's, left by a switch or a reconnect, is listed beside the current one."""
+
+    jobs: tuple[tuple[str, str], ...]
+    at: float
+    subject: str | None = None  # the pilot the probe's verdict was about (its block request's newest), if listed
+
+    @property
+    def subject_state(self) -> str | None:
+        return next((s for j, s in self.jobs if j == self.subject), None)
+
+    @property
+    def held(self) -> tuple[str, ...]:
+        return tuple(j for j, s in self.jobs if s == "H")
+
+    @property
+    def waiting(self) -> tuple[str, ...]:
+        """Not running and not held: a pilot that may still start."""
+        return tuple(j for j, s in self.jobs if s not in ("H", "R"))
+
+    @property
+    def running(self) -> tuple[str, ...]:
+        return tuple(j for j, s in self.jobs if s == "R")
+
+
+@dataclass(frozen=True)
+class SshLeft:
+    """What a re-bind leaves of an SSH endpoint's compute shape (warmth._ssh_left), to say: nothing cancels a block on
+    a re-bind. `up`: its block came up (a worker answered), so it idle-releases after its last task; `job`: that block's
+    scheduler job, when known; `pilots`: other pilots the last probe saw live (queued, held or starting)."""
+
+    up: bool
+    job: str | None = None
+    pilots: SeenPilots | None = None
 
 
 @dataclass

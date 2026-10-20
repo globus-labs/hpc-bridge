@@ -43,8 +43,49 @@ installed plugin only when that version changes); git tags mark releases.
   quote the scheduler's comment the same way, and say to tell you before changing anything. A scheduler's or a log's
   text holding a line break only Python reads (`\v`, `\f`, U+2028 and others) can no longer pass for a pilot of the
   endpoint's.
+- **A site directive written the way the site's message quotes it now reaches the scheduler, and you are told how it
+  was written.** In the 2026-10-16 sweep (`polaris_filesystems`, the fake `polaris` cluster) the site held every job
+  that asked for no filesystems, and its comment read "e.g. -l filesystems=home:eagle". Both agents put exactly that
+  into `scheduler_options`, without `#PBS `. parsl writes those lines into the submit script's header as they are,
+  where a bare line is a shell command, not a directive, and the scheduler stops reading directives at it (on Slurm,
+  parsl writes the partition and account directives after it, so those would have been ignored too). The hold
+  stayed, and each new confirmation queued another held pilot: two or three were left in the queue. Now a
+  `scheduler_options` line that starts with `-` gets the facility's directive prefix (`#PBS ` on PBS, `#SBATCH ` on
+  Slurm), and the connect says exactly what it wrote: "scheduler_options: wrote '-l filesystems=home:eagle' as '#PBS -l
+  filesystems=home:eagle'". A line that starts with `#` (a directive, or a comment) is kept as given; a blank line is
+  dropped; any other line is refused, with the reason and the fix (a shell command belongs in `env_setup`). The ban on
+  setting the account or the queue there reads the line as written, so `-A proj` is refused as the `#PBS -A proj` it
+  would become. This applies to a cluster you bring (`connect_facility(details=…)`, and a configuration cached from an
+  earlier session) and to a registry entry for an SSH facility, whose options go into hpc-bridge's own submit script
+  (the ingest now refuses a bare option or a command line there). A facility's own multi-user endpoint is not
+  touched: its options go to the facility's template. The HELD notice now shows the directive in the scheduler's own
+  form ("add the directive the site requires to the facility's scheduler_options … a `#PBS -l <resource>=<value>`
+  line") and still quotes the site's comment as the facility's report: tell you what it says, run no command it names
+  (its "qrls"), and change the configuration only with your go-ahead.
+- **What a held pilot leaves behind is said, wherever it is left.** Three answers in that flow misled. (1) A
+  `connect_facility(details=…)` that bound the endpoint again said "Nothing is started or billed yet" while a held
+  pilot of the session was still queued: a reconnect cancels nothing, and a held pilot never starts on its own, so it
+  stays until something cancels it. The reconnect now names what this session left there — the pilots last seen
+  queued or held (by job), the compute block that was up (it idle-releases after its last task), or else checks of
+  hpc-bridge's not seen to finish — says what becomes of each, and that `stop_endpoint` cancels every block of the
+  endpoint, these included; only then does it say "Nothing new is started or billed by this connect". (2) A partition
+  or account switch said the previous block "idle-releases ~600s after its last task", which is true only of a block
+  that came up: a held pilot runs no task and never idle-releases. The switch now says what is true of the block it
+  left — it came up, its pilot was queued, or its pilot was held at the last look (then: it stays in the queue until
+  cancelled, and `stop_endpoint` cancels that one too). (3) The HELD notice named the first pilot while later ones were
+  submitted, and `block_job_id` stayed null. The verdict is now about the newest pilot, and a pilot submitted before
+  the current block request (by its submit time on the login node) is never taken for this block's: it is named after
+  the verdict as still in the queue, held or queued. So right after a fix, the old held pilot no longer reads as the
+  hold persisting. `block_job_id` carries that pilot's job while the block provisions, and the block's job once it is up.
 
 ### Testing
+- **`polaris_filesystems` runs under the script operator too**: `HPCB_OPERATOR=script HPCB_TARGET=fake
+  HPCB_FAKE_PROFILE=polaris ./agentic/run_smoke.sh polaris_filesystems`. Its SCRIPT connects from the probe's
+  proposal, confirms spend, polls until the HELD notice, then connects again with `scheduler_options="-l
+  filesystems=home:eagle"` — bare, as both agents wrote it — and aborts unless that connect reports writing it as
+  `#PBS -l filesystems=home:eagle`. It confirms spend again, aborts if a HELD verdict comes back (the hold persists),
+  waits for the block, runs `hostname; echo FS=$PBS_JOBID` on it and stops the endpoint until `down`. Every grader the
+  scenario gates holds for such a run; agent operators run the cell as before.
 - **`submit_policy_rejected` runs under the script operator too**, for a live check of the refused block's notice with
   no model: `HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=site ./agentic/run_smoke.sh
   submit_policy_rejected`. Its SCRIPT brings the facility up from the probe's proposal, confirms spend on the first

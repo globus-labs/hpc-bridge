@@ -125,9 +125,10 @@ class EndpointStatus(BaseModel):
     # Allocation/account this scheduler shape charges to (from connect_facility's selection, or the
     # facility default). None for the login shape.
     account: str | None = None
-    # The scheduler job id of the billed block this result is about, when hpc-bridge knows it (from the block's
-    # check): on a stop or a detach of a facility endpoint, the block left running (the notice names the command that
-    # ends it). None: unknown, or no block.
+    # The scheduler job id of the billed block this result is about, when hpc-bridge knows it: from the block's check
+    # once it is up; while it provisions on an SSH endpoint, the newest pilot job the scheduler lists for the endpoint
+    # (the one the notice's pilot verdict names — queued, HELD or starting); on a stop or a detach of a facility
+    # endpoint, the block left running (the notice names the command that ends it). None: unknown, or no block.
     block_job_id: str | None = None
     # stop_endpoint / teardown_endpoint: is the spend stopped? True ONLY when an SSH stop's cancel was confirmed
     # (`down`). False: a block may still bill — a facility endpoint left one running or a check of ours queued there
@@ -237,11 +238,13 @@ class FacilityDetails(BaseModel):
     )
     scheduler_options: str | None = Field(
         default=None,
-        description="Raw scheduler directives injected verbatim into the submit script (Parsl "
-        "scheduler_options) — e.g. a PBS site that holds every job without a filesystems directive needs "
-        "'#PBS -l filesystems=home:eagle'. Omit if none. Multiple directives: newline-separate them. Never the "
-        "account or partition/queue (#SBATCH -A/-p, #PBS -A/-q): those are ensure_endpoint_up(account=…) and "
-        "`partition`, so the spend question names them.",
+        description="Scheduler directives for the submit script's header (Parsl scheduler_options) — e.g. a PBS site "
+        "that holds every job without a filesystems directive needs '#PBS -l filesystems=home:eagle'. Omit if none. "
+        "Multiple directives: newline-separate them. Each line must be a directive ('#PBS …' / '#SBATCH …'); a bare "
+        "option ('-l filesystems=…', as a scheduler's message quotes it) is written with the scheduler's prefix and "
+        "the connect says so; any other line is refused (a shell command belongs in env_setup). Never the account "
+        "or partition/queue (#SBATCH -A/-p, #PBS -A/-q, bare or prefixed): those are ensure_endpoint_up(account=…) "
+        "and `partition`, so the spend question names them.",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")

@@ -207,6 +207,63 @@ def _without_terms_directives(opts: str | None) -> str | None:
     return "\n".join(kept) or None
 
 
+# The prefix each scheduler reads a directive by, at the start of a line of a submit script's header.
+DIRECTIVE_PREFIX = {"slurm": "#SBATCH", "pbs": "#PBS"}
+
+
+class SchedulerOptionsError(ValueError):
+    """scheduler_options with a line that is neither a directive nor an option hpc-bridge writes as one."""
+
+
+def directive_lines(opts: str | None, scheduler: str | None) -> tuple[str | None, list[tuple[str, str]], list[str]]:
+    """`opts` as a submit script's header carries them, for `scheduler`'s directive prefix (`DIRECTIVE_PREFIX`).
+
+    parsl writes scheduler_options into the header verbatim, so a line there must be a directive. A line that starts
+    with "-" is an option written bare, as a scheduler's own message quotes one ("-l filesystems=…"): it gets the prefix
+    ("#PBS -l filesystems=…"). A line that starts with "#" (a directive, or a comment) is kept as given. A blank line
+    carries nothing and is dropped. Any other line is not a directive: in the script it is a shell command, and the
+    scheduler stops reading directives at it — on Slurm, parsl writes the partition and account directives AFTER
+    scheduler_options, so they would be ignored. Returns (the text, None when nothing is left; each rewrite as (given,
+    written); each such other line). Lines are split as Python splits them (`scheduler_terms_directive` reads them so)
+    and joined with "\n", so every break that check reads is a line break in the script too. A scheduler with no prefix
+    here (LSF, not supported) gets `opts` back unchanged."""
+    prefix = DIRECTIVE_PREFIX.get(scheduler or "")
+    if prefix is None or not opts:
+        return opts or None, [], []
+    kept: list[str] = []
+    rewrites: list[tuple[str, str]] = []
+    other: list[str] = []
+    for line in opts.splitlines():
+        given = line.strip()
+        if not given:
+            continue
+        if given.startswith("#"):
+            kept.append(line)
+        elif given.startswith("-"):
+            kept.append(f"{prefix} {given}")
+            rewrites.append((given, kept[-1]))
+        else:
+            other.append(given)
+    return "\n".join(kept) or None, rewrites, other
+
+
+def scheduler_options_problem(other: list[str], scheduler: str | None) -> str:
+    """Why scheduler_options with `other` (non-directive lines) are refused, and what to write instead."""
+    prefix = DIRECTIVE_PREFIX.get(scheduler or "", "#PBS")
+    shown = ", ".join(repr(ln[:120]) for ln in other[:3]) + (f" and {len(other) - 3} more" if len(other) > 3 else "")
+    return (f"scheduler_options has a line that is not a scheduler directive ({shown}): in the submit script it would "
+            "be a shell command, and the scheduler stops reading directives at it (on Slurm the partition and account "
+            f"directives come after it). Write each line as a directive ({prefix} …) or as an option (-l …, written as "
+            f"{prefix} -l …); a shell command belongs in env_setup")
+
+
+def ssh_scheduler_options(opts: str | None, scheduler: str | None) -> str | None:
+    """An SSH entry's `compute.scheduler_options` read leniently (the registry's, the local cache's): as
+    `directive_lines` writes them, with any line that is not a directive dropped — it would end the header's directives
+    in our submit script. The ingest refuses both a bare option and such a line (`defaults_extra_raw_problems`)."""
+    return directive_lines(opts, scheduler)[0]
+
+
 def _extra_terms_keys(extra: dict | None, key_map: dict | None) -> list[str]:
     """`defaults.extra` keys that would set the account or the partition behind hpc-bridge's own (and the block's
     terms): `account`/`partition` themselves, or the facility template's names for them (`compute.key_map`)."""
@@ -227,9 +284,19 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
     problems = [f"defaults.extra sets {bad}: the account and the partition are ensure_endpoint_up's (account=, "
                 "partition=) and defaults.partition, so the block's terms name them"] if bad else []
     extra_opts = extra.get("scheduler_options") if isinstance(extra, dict) else None
-    for where, opts in (("compute.scheduler_options", compute.get("scheduler_options")),
-                        ("defaults.extra.scheduler_options", extra_opts)):
-        if isinstance(opts, str) and (line := scheduler_terms_directive(opts)):
+    opts = compute.get("scheduler_options")
+    if isinstance(opts, str) and not row.get("compute_mep_uuid"):
+        # an SSH entry's options reach hpc-bridge's own submit script: each line a directive, as the curator writes it
+        # (the client prefixes a bare option and drops any other line; a facility endpoint's template is its own)
+        written, rewrites, other = directive_lines(opts, compute.get("scheduler"))
+        if rewrites:
+            problems.append(f"compute.scheduler_options has a bare option ({rewrites[0][0]!r}): write it as the "
+                            f"directive {rewrites[0][1]!r}")
+        if other:
+            problems.append("compute." + scheduler_options_problem(other, compute.get("scheduler")))
+        opts = written  # the account/queue check reads the lines as the script would carry them
+    for where, o in (("compute.scheduler_options", opts), ("defaults.extra.scheduler_options", extra_opts)):
+        if isinstance(o, str) and (line := scheduler_terms_directive(o)):
             problems.append(f"{where} sets the account or the partition/queue ({line!r}): the block's terms must "
                             "name them")
     return problems
@@ -289,7 +356,9 @@ class Compute(BaseModel):
     # manager's 4.12 there launched a 4.12 worker pool under a 4.16 UEP: `unrecognized arguments: --logconf`).
     # Or an explicit version string. Set from the live check that validates the entry.
     worker_version: str = "manager"
-    scheduler_options: str | None = None  # raw scheduler directives, verbatim (e.g. #SBATCH for Slurm, #PBS for PBS)
+    # scheduler directives for the submit script's header (#SBATCH for Slurm, #PBS for PBS): on an SSH entry read as
+    # directives (`ssh_scheduler_options`); a facility endpoint's are `defaults.extra`'s, for its own template
+    scheduler_options: str | None = None
     # Facility-MEP entries only: renames for the user_endpoint_config keys hpc-bridge itself picks names for
     # (account/partition/walltime/max_workers_per_node/nodes_per_block/init_blocks/max_blocks/interface —
     # see MEPFacility.from_entry's `opts` dict). A facility's OWN template picks these names, case-sensitive,
@@ -505,7 +574,15 @@ class CatalogEntry(BaseModel):
         """Read leniently: an account or partition in `defaults.extra` (or the template's name for one), or a
         `scheduler_options` directive setting one (compute's or extra's), would reach the facility past
         ensure_endpoint_up's choice and the block's terms — drop it (the key, or the directive line), keep the entry.
-        The ingest refuses them (`defaults_extra_raw_problems`)."""
+        The ingest refuses them (`defaults_extra_raw_problems`).
+
+        An SSH entry's `compute.scheduler_options` reach hpc-bridge's own submit script: they are read as directives
+        first (`ssh_scheduler_options`: a bare option prefixed, any other non-directive line dropped), so the account
+        and queue check reads the lines the script carries — a bare "-A x" is "#PBS -A x" there. A facility endpoint's
+        options go to the facility's own template, which hpc-bridge does not rewrite."""
+        if self.compute_mep_uuid is None and self.compute.scheduler_options is not None:
+            self.compute.scheduler_options = ssh_scheduler_options(self.compute.scheduler_options,
+                                                                   self.compute.scheduler)
         bad = _extra_terms_keys(self.defaults.extra, self.compute.key_map)
         if bad and self.defaults.extra is not None:
             self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k not in bad}

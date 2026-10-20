@@ -190,6 +190,9 @@ python3 agentic/run_suite.py --target fake --profile f2b --reset-cluster --scena
 #   ^ fail2ban: no retry storm on a refused key (no ban recorded); a pre-banned client is told CANNOT REACH
 python3 agentic/run_suite.py --target fake --profile polaris --reset-cluster --scenarios polaris_filesystems
 #   ^ a PBS site rule: the pilot is HELD with a comment; the tool relays it; the agent adds -l filesystems=…
+HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=polaris ./agentic/run_smoke.sh polaris_filesystems
+#   ^ the same cell scripted (no model): the directive given BARE (`-l filesystems=home:eagle`, as the comment quotes
+#     it); the connect must report writing it as `#PBS -l …`, and the new block must come up and run `hostname`
 python3 agentic/run_suite.py --target fake --profile pbs_mep --reset-cluster --scenarios fake_pbs_mep_compute
 #   ^ a Polaris-shaped facility endpoint on PBS: the registry's default queue reaches `qsub -q` through key_map; the
 #     stop names the PBS job and `qdel` (needs HPCB_MEP_EMAIL). Live 2026-10-15: READY 14 s after a wipe; codex OK
