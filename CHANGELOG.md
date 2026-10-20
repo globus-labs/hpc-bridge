@@ -58,13 +58,16 @@ installed plugin only when that version changes); git tags mark releases.
     had. Each of its five confirmed starts answered `provisioning`, and the next answer about that block was the
     REJECTED one ("The new block was not created: nothing is queued and it bills nothing"). No pilot was ever queued,
     and the world check passed. The server voids such a confirmation itself, and the two stop graders now leave the
-    start out (`invariants._starts_to_release`). Only that answer voids a start. The pilot probe's "likely REJECTED —
-    not yet conclusive" does not, since that user endpoint may start again. A start also stays billed when something
+    start out (`invariants._starts_to_release`). Only that answer voids a start, and only one on the same partition
+    and account. The pilot probe's "likely REJECTED — not yet conclusive" voids nothing, since that user endpoint may
+    start again. A switch confirmed and refused in one call ("The partition or account changed from partition
+    'debug' in this call. Nothing cancels the previous block on a switch …") refused the new terms only: the block on
+    the old ones bills on, and the server's own stop answers `draining`. A start also stays billed when something
     about a block comes between it and the refusal: an `up`, a compute result that ran, any other compute answer, a
-    stop, a reconfigure, or a request on other terms (nothing cancels the block a switch leaves). The spend graders
-    still count every confirm (`spend_follows_question`, `no_spend_after_decline`, `account_from_listing`,
-    `balance_in_gate`, `revocation_honoured`): the agent did confirm spend, and a wrong account is just what a
-    rejection follows.
+    stop, any `connect_facility` that is not a no-op answer (a re-bind cancels nothing, and the next block goes out on
+    the new binding's terms), or a request on other terms in a later call. The spend graders still count every
+    confirm (`spend_follows_question`, `no_spend_after_decline`, `account_from_listing`, `balance_in_gate`,
+    `revocation_honoured`): the agent did confirm spend, and a wrong account is just what a rejection follows.
   - `first_details_connect_succeeds` failed hermes21's `teardown_slow_fs` cell on its opening
     `connect_facility(details=…)`, which the server refused before any SSH: "details= has no env_setup and there is
     no proposal for this facility to take it from … Nothing was started." The proposal and the details= connect after
@@ -79,8 +82,9 @@ installed plugin only when that version changes); git tags mark releases.
   `long_task_via_handle` stays FAILED. Over all 1173 stored bundles, 9 checks moved in 7 bundles, all from FAIL to PASS
   and all one of these three cases. The other four are hermes21 cells: three from 2026-10-15 that opened with the same
   refused connect (one now OK), and a `submit_policy_rejected` cell whose two starts were both REJECTED (still FAILED,
-  on its blind confirm and the policy it never relayed). The hermetic tests drive the server's own REJECTED notice and
-  refused connect, so the graders follow its words.
+  on its blind confirm and the policy it never relayed). The hermetic tests drive the server's own REJECTED notice,
+  its switch refused in one call (with the unit tier's fakes) and its three refused connects, so the graders follow
+  its words.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 

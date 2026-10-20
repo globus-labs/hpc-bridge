@@ -325,48 +325,65 @@ def test_first_bring_up_skips_a_result_with_no_phase():
     assert not r.ok and "call 1" in r.detail
 
 
-def _product_connect_refusals() -> list[dict]:
-    """What the SERVER answers a connect_facility(details=…) without env_setup — with no proposal for the facility,
-    and with a proposal for another host: refused before any SSH (connect._connect_facility). Driven through the real
-    code, so the grader's match follows its wording."""
+def _product_connect_refusals(monkeypatch) -> list[tuple[dict, dict]]:
+    """(input, answer) for each connect_facility the SERVER refuses before any SSH (connect._connect_facility):
+    details= without env_setup, with no proposal for the facility and with a proposal for another host; and a plain
+    connect whose cached config is no longer accepted (a scheduler_options line that sets the account). Driven through
+    the real code, so the grader's match follows its wording."""
     import asyncio
 
-    from hpc_bridge import connect
+    from hpc_bridge import binding, connect
     from hpc_bridge.context import AppCtx
     from hpc_bridge.models import FacilityDetails
     from hpc_bridge.profile import Profile
+    from hpc_bridge.state import FacilityStore
 
     class _Implicit:
         name = "local"
         implicit = True
 
+    class _NoEntry:   # the registry knows no such facility (and the live one is never asked)
+        async def get(self, _facility):
+            return None
+
     async def no_login(*_a, **_k):
         raise AssertionError("a refused connect runs nothing on the login node")
 
     details = FacilityDetails(ssh_host="login", interface="eth0", scratch_root="/scratch/{user}", partition="debug")
+    monkeypatch.setattr(binding, "make_catalog", lambda *_a, **_k: _NoEntry())
+    # the local-discovery cache (in this test's state dir) holds a config from before such directives were refused
+    FacilityStore().put("login", details.model_dump(mode="json") | {"env_setup": "true",
+                                                                    "scheduler_options": "#SBATCH -A proj"})
 
-    async def go() -> list[dict]:
+    async def go() -> list[tuple[dict, dict]]:
         out = []
         for draft_host in (None, "login02"):
             app = AppCtx(facility=_Implicit(), profile=Profile())
             if draft_host:
                 app.proposed_drafts["f"] = details.model_copy(update={"ssh_host": draft_host, "env_setup": "true"})
-            out.append((await connect._connect_facility(app, "f", details=details, run_login=no_login)).model_dump())
+            res = await connect._connect_facility(app, "f", details=details, run_login=no_login)
+            out.append(({"facility": "f", "ssh_host": "login", "details": {"ssh_host": "login"}}, res.model_dump()))
+        app = AppCtx(facility=_Implicit(), profile=Profile())
+        res = await connect._connect_facility(app, "f", ssh_host="login", run_login=no_login)
+        out.append(({"facility": "f", "ssh_host": "login"}, res.model_dump()))
         return out
 
     return asyncio.run(go())
 
 
-def test_first_bring_up_skips_a_connect_that_refused_its_own_details():
+def test_first_bring_up_skips_a_connect_that_refused_its_own_details(monkeypatch):
     """hermes21 teardown_slow_fs (1792178995, 2026-10-16) opened with connect_facility(details=…) before any proposal:
     "details= has no env_setup and there is no proposal for this facility to take it from … Nothing was started." —
     refused before any SSH, so no bring-up; the proposal and the details= connect after it landed, and
     first_details_connect_succeeds failed the run on the refusal."""
     from invariants import first_bring_up_had_details, first_details_connect_succeeds, no_op_answer
     det = {"facility": "f", "ssh_host": "login", "details": {"ssh_host": "login"}}
-    for res in _product_connect_refusals():
+    refusals = _product_connect_refusals(monkeypatch)
+    assert [r["notice"][:30] for _, r in refusals] == ["details= has no env_setup and ", "details= has no env_setup, and",
+                                                       "the configuration cached for '"]
+    for inp, res in refusals:
         assert res["phase"] == "failed" and res["notice"].endswith("Nothing was started."), res["notice"]
-        refused = ToolCall.of("mcp__endpoint__connect_facility", det, res)
+        refused = ToolCall.of("mcp__endpoint__connect_facility", inp, res)
         t = Trace([refused, _conn(False, "proposed_facility_details"), _conn(False, "provisioning", details=True)])
         r = first_details_connect_succeeds(t)
         assert r.ok and "call 2" in r.detail, r.detail
@@ -1455,6 +1472,20 @@ def _server_rejected_notice() -> str:
         "'hpcb-gpu'")
 
 
+def _start(partition: str | None = "gpu", account: str | None = None, status: str = "provisioning",
+           notice: str | None = None) -> ToolCall:
+    """ensure_endpoint_up(confirm_spend=True) on `partition` / `account` (None: not named), answered `status`."""
+    inp = {"confirm_spend": True} | ({"partition": partition} if partition else {}) | (
+        {"account": account} if account else {})
+    return ToolCall.of("mcp__endpoint__ensure_endpoint_up", inp, {
+        "status": status, "endpoint_id": "e1", "notice": notice or f"allocating nodes on '{partition or 'main'}'…"})
+
+
+def _byo_conn(facility: str = "f") -> ToolCall:
+    return ToolCall.of("mcp__endpoint__connect_facility", {"facility": facility, "details": {"ssh_host": "login"}},
+                       {"phase": "needs_account", "allocations": [{"account": "hpcb-cpu", "balance": 10}]})
+
+
 def test_a_start_the_scheduler_rejected_leaves_no_block_to_stop():
     """codex gpu_rule (1792181697, 2026-10-16): five confirmed starts, each answered `provisioning` and then REJECTED
     ("The new block was not created: nothing is queued and it bills nothing"); no pilot was ever queued (the world
@@ -1464,14 +1495,8 @@ def test_a_start_the_scheduler_rejected_leaves_no_block_to_stop():
     from invariants import account_from_listing, ends_with_stop, spend_follows_question, stop_confirmed_or_retried
     rejected = _server_rejected_notice()
     assert "REJECTED" in rejected and "bills nothing" in rejected      # the words the grader reads, the server's own
-
-    def start(partition="gpu", account=None, status="provisioning", notice=None):
-        inp = {"partition": partition, "confirm_spend": True} | ({"account": account} if account else {})
-        return ToolCall.of("mcp__endpoint__ensure_endpoint_up", inp, {
-            "status": status, "endpoint_id": "e1", "notice": notice or f"allocating nodes on '{partition}'…"})
-
-    conn = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": {"ssh_host": "login"}},
-                       {"phase": "needs_account", "allocations": [{"account": "hpcb-cpu", "balance": 10}]})
+    start = _start
+    conn = _byo_conn()
     compute = {"command": "hostname", "shape": "compute"}
     run_rejected = ToolCall.of("mcp__endpoint__run_shell", compute,
                                {"phase": "failed", "notice": "scheduler compute shape: " + rejected})
@@ -1499,7 +1524,8 @@ def test_a_start_the_scheduler_rejected_leaves_no_block_to_stop():
     assert _starts_to_release(Trace([conn, start(), up, down])) == [1]               # the block came up
     ran = ToolCall.of("mcp__endpoint__run_shell", compute, {"phase": "running", "task_id": "compute-1"})
     assert _starts_to_release(Trace([conn, start(), ran, run_rejected])) == [1]      # work ran on it
-    # a switch: nothing cancels the block it leaves, so the refusal of the new terms voids only the new start
+    # a switch in two calls: nothing cancels the block it leaves, so the refusal of the new terms voids only the new
+    # start (a switch confirmed and refused in ONE call: test_a_switch_refused_in_the_same_call_…)
     switched = Trace([conn, start("main"), start(account="hpcb-gpu"), down])
     assert _starts_to_release(switched) == [1] and not ends_with_stop(switched).ok
     stop = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down", "endpoint_id": "e1"})
@@ -1507,6 +1533,107 @@ def test_a_start_the_scheduler_rejected_leaves_no_block_to_stop():
     assert _starts_to_release(Trace([conn, start(status="up"), down])) == [1]        # a start answered up
     cut = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"partition": "gpu", "confirm_spend": True}, None)
     assert _starts_to_release(Trace([conn, cut, down])) == [1]                       # no result: conservatively
+    # reset_session carries the refusal as run_shell does (server._ready_session); poll_task never does, so its
+    # `failed` is a compute answer that keeps the start billed
+    reset = ToolCall.of("mcp__endpoint__reset_session", {"shape": "compute"},
+                        {"phase": "failed", "notice": "scheduler compute shape: " + rejected})
+    assert _starts_to_release(Trace([conn, start(), reset])) == []
+    polled = ToolCall.of("mcp__endpoint__poll_task", {"task_id": "compute-1"}, {"phase": "failed", "notice": rejected})
+    assert _starts_to_release(Trace([conn, start(), polled])) == [1]
+
+
+def _product_rejected_switch(monkeypatch) -> tuple[dict, dict, dict]:
+    """What the SERVER answers a switch confirmed and REJECTED in one call (server._ensure_endpoint_up's
+    `_rejected_switch_note`): a confirm on `debug` answered `provisioning` (its check queued), then
+    ensure_endpoint_up(partition="compute", confirm_spend=True) whose check meets sbatch's refusal, then a stop.
+    Driven through the real code with the unit tier's fakes (tests/test_server.py, as its
+    test_a_switch_then_a_rejection_says_what_exists_and_the_stop_names_the_old_block does)."""
+    import asyncio
+    import sys
+    from pathlib import Path
+    root = str(Path(__file__).resolve().parents[2])
+    if root not in sys.path:
+        sys.path.insert(0, root)
+    from hpc_bridge import server, warmth
+    from hpc_bridge.runner import CanaryResult
+    from tests import test_server as ts
+
+    app, _runner = ts._queued_app(monkeypatch)
+
+    async def go() -> tuple[dict, dict, dict]:
+        first = await ts._ensure_endpoint_up(app, partition="debug", confirm_spend=True)
+        app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: ts._FakeRunner(
+            eid, ts._Res(0, "", ""), canary_result=CanaryResult(ok=False, error=ts._SBATCH_REFUSED))
+        switched = await ts._ensure_endpoint_up(app, partition="compute", confirm_spend=True)
+        ts._scripted_login(monkeypatch)
+        stop = await server._stop_endpoint(app)
+        return first.model_dump(), switched.model_dump(), stop.model_dump()
+
+    try:
+        return asyncio.run(go())
+    finally:
+        warmth._STORE_POOL.submit(lambda: None).result(5)   # the record of checks: its writes land in this test's dir
+
+
+def test_a_switch_refused_in_the_same_call_leaves_the_old_block_billing(monkeypatch):
+    """A switch confirmed and REJECTED in one call refused only the NEW terms: "The partition or account changed from
+    partition 'debug' in this call. Nothing cancels the previous block on a switch …", and the block on debug bills
+    on — the server's own stop answers `draining`, naming it. On 38b907c the refusal voided the debug start too, and
+    both stop graders passed a run that never stopped (review of 38b907c, driven through the real server)."""
+    from invariants import _starts_to_release, ends_with_stop, stop_confirmed_or_retried
+    first, switched, stop = _product_rejected_switch(monkeypatch)
+    assert first["status"] == "provisioning" and switched["status"] == "down", (first, switched)
+    assert switched["notice"].startswith("The partition or account changed from partition 'debug' in this call. "
+                                         "Nothing cancels"), switched["notice"]
+    assert "REJECTED" in switched["notice"] and "bills nothing" in switched["notice"]
+    debug = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"partition": "debug", "confirm_spend": True}, first)
+    to_compute = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"partition": "compute", "confirm_spend": True},
+                             switched)
+    t = Trace([_byo_conn(), debug, to_compute])
+    assert not ends_with_stop(t).ok, ends_with_stop(t).detail
+    assert not stop_confirmed_or_retried(t).ok
+    assert _starts_to_release(t) == [1]
+    # the server's stop after it: `draining` (the debug block's check is still queued) — stopped, but not confirmed
+    assert stop["status"] == "draining" and "partition 'debug'" in stop["notice"], stop
+    stopped = Trace([*t.calls, ToolCall.of("mcp__endpoint__stop_endpoint", {}, stop)])
+    assert ends_with_stop(stopped).ok and not stop_confirmed_or_retried(stopped).ok
+
+
+def test_a_reconnect_between_a_start_and_a_refusal_keeps_the_start_billed():
+    """A connect_facility that is not a no-op re-binds (warmth._drop_all_shapes) and cancels nothing: on an SSH endpoint
+    the old block's checks stay with the endpoint, on a facility endpoint its block bills on. So a REJECTED answer
+    after a plain reconnect refused a request of the NEW binding, on its default terms — never the block the start
+    before it asked for. On 38b907c a plain connect was passed over, and the refusal voided the earlier start (review
+    of 38b907c)."""
+    from invariants import _starts_to_release, ends_with_stop, stop_confirmed_or_retried
+    rejected = _server_rejected_notice()
+    reconnect = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"}, {"phase": "needs_account", "notice": (
+        "reconnected to the endpoint this session started (zero-SSH). login node is up; your allocations are listed "
+        "(`allocations`). Nothing is started or billed yet.")})
+    # start on gpu → plain reconnect → a confirm on the binding's default terms, REJECTED
+    t = Trace([_byo_conn(), _start(), reconnect, _start(None, status="down", notice=rejected)])
+    assert not ends_with_stop(t).ok and not stop_confirmed_or_retried(t).ok
+    # the new binding's own start on default terms, then its refusal: that start is voided, the one before it is not
+    t = Trace([_byo_conn(), _start(), reconnect, _start(None), ToolCall.of(
+        "mcp__endpoint__ensure_endpoint_up", {}, {"status": "down", "endpoint_id": "e1", "notice": rejected})])
+    assert _starts_to_release(t) == [1] and not ends_with_stop(t).ok
+
+
+def test_a_connect_to_another_facility_between_a_start_and_a_refusal_keeps_the_start_billed():
+    """Start on facility X → connect_facility(Y) (a catalog attach: no details=) → REJECTED on Y, even on a partition of
+    the same name: the refusal is Y's, and X's block bills on. On 38b907c only a details= connect ended the search."""
+    from invariants import _starts_to_release, ends_with_stop, stop_confirmed_or_retried
+    rejected = _server_rejected_notice()
+    attach_y = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "y"}, {"phase": "needs_account"})
+    t = Trace([_byo_conn("x"), _start("gpu"), attach_y, _start("gpu", status="down", notice=rejected)])
+    assert not ends_with_stop(t).ok and not stop_confirmed_or_retried(t).ok
+    # a no-op connect (refused before any SSH) re-binds nothing: the refusal after it still voids the start
+    noop = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": {"ssh_host": "login"}}, {
+        "phase": "failed", "notice": "details= has no env_setup and there is no proposal for this facility to take it "
+                                     "from. Call connect_facility('f', ssh_host=…) without details for a proposed "
+                                     "config, or give env_setup. Nothing was started."})
+    t = Trace([_byo_conn(), _start(), noop, _start(status="down", notice=rejected)])
+    assert _starts_to_release(t) == [] and ends_with_stop(t).ok
 
 
 def test_long_task_cut_grader_ignores_a_probe_that_never_started():

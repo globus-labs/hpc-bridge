@@ -170,26 +170,28 @@ def _billed_start_idxs(t: Trace) -> list[int]:
 
 def _rejected_answer(c: ToolCall) -> bool:
     """hpc-bridge's answer that the scheduler REFUSED a block's submission (notices._submit_rejected_notice), on the
-    call that met it — ensure_endpoint_up `down`, a compute run_shell or poll_task `failed`: "the scheduler REJECTED
-    the block submission … The new block was not created: nothing is queued and it bills nothing". Not the pilot
-    probe's `provisioning` "likely REJECTED — not yet conclusive" (that user endpoint may start again), nor the re-ask
-    or the stop that refer back to a refusal. (`_REJECTED`: the #32 graders' marker, below.)"""
+    call that met it — ensure_endpoint_up `down`, a compute run_shell or reset_session `failed` (both through
+    server._ready_session → notices._cold_outcome; poll_task never carries it): "the scheduler REJECTED the block
+    submission … The new block was not created: nothing is queued and it bills nothing". Not the pilot probe's
+    `provisioning` "likely REJECTED — not yet conclusive" (that user endpoint may start again), nor the re-ask or the
+    stop that refer back to a refusal. (`_REJECTED`: the #32 graders' marker, below.)"""
     r = c.result or {}
     notice = str(r.get("notice") or "")
-    return (c.name in ("ensure_endpoint_up", "run_shell", "poll_task")
-            and (c.name != "run_shell" or _shape(c) == "compute")
+    return (c.name in ("ensure_endpoint_up", "run_shell", "reset_session") and _shape(c) == "compute"
             and str(r.get("status") or r.get("phase")) in ("down", "failed")
             and _REJECTED in notice and "bills nothing" in notice)
 
 
 def _asked_terms(t: Trace, i: int) -> tuple[Any, Any]:
     """The partition and account a compute block requested at call `i` went out on, as the agent sent them: each
-    ensure_endpoint_up's own, else the last one named before it (the server keeps them for the next block)."""
+    ensure_endpoint_up's own, else the last one named before it since the last connect_facility that was not a no-op
+    answer. The server keeps them for the next block until a connect re-binds (warmth._drop_all_shapes forgets the
+    binding's choices), and then the next block goes out on the new binding's default terms (None here)."""
     partition = account = None
-    for j, c in t.named("ensure_endpoint_up"):
-        if j > i:
-            break
-        if _shape(c) == "compute":
+    for c in t.calls[: i + 1]:
+        if c.name == "connect_facility" and not no_op_answer(c):
+            partition = account = None
+        elif c.name == "ensure_endpoint_up" and _shape(c) == "compute":
             partition = c.input.get("partition") or partition
             account = c.input.get("account") or account
     return partition, account
@@ -199,28 +201,32 @@ def _voided_by_rejection(t: Trace, k: int) -> bool:
     """Billed start `k` (answered `provisioning`) asked for a block that was never created: the scheduler REJECTED its
     submission (`_rejected_answer`) before any other billed activity — "REJECTED voids the confirm", as the server
     itself rules (warmth._void_rejected: no job id was issued, so no block was created and the confirmation covered
-    nothing). Read forward from `k`, the first answer about a block decides; calls about no block (the login shape,
-    a plain reconnect, a question) and the same request still pending (a `provisioning` poll or re-confirm on the same
-    partition and account, a compute run_shell's `cold_start`) are passed over. The REJECTED answer voids it. Anything
-    else keeps it billed: a block live (`up`, a compute result `complete` / `running`), any other compute answer, a
-    stop or teardown, a reconfigure (connect_facility with details=), or a request on other terms — a switch, and
-    nothing cancels the block a switch leaves. A start answered `up`, or with no result, is never voided."""
+    nothing). Read forward from `k`, the first answer about a block decides; calls about no block (the login shape, a
+    question) and the same request still pending (a `provisioning` poll or re-confirm on the same partition and
+    account, a compute run_shell's or reset_session's `cold_start`) are passed over. A REJECTED answer voids it only
+    on the same partition and account: a switch confirmed and refused in ONE call ("The partition or account changed
+    from … in this call. Nothing cancels the previous block on a switch …") refused the new terms, and the block on
+    the old ones bills on. Anything else keeps it billed: a block live (`up`, a compute result `complete` /
+    `running`), any other compute answer, a stop or teardown, any connect_facility that is not a no-op answer (a
+    re-bind cancels nothing: on a facility endpoint the old block bills on, on an SSH one its checks stay with the
+    endpoint), or a request on other terms (nothing cancels the block a switch leaves). A start answered `up`, or with
+    no result, is never voided."""
     if str((t.calls[k].result or {}).get("status")) != "provisioning":
         return False
     terms = _asked_terms(t, k)
     for j in range(k + 1, len(t.calls)):
         c = t.calls[j]
-        r = c.result or {}
         if _rejected_answer(c):
-            return True
-        if c.name in ("stop_endpoint", "teardown_endpoint") or (c.name == "connect_facility" and c.input.get("details")):
+            return _asked_terms(t, j) == terms
+        if c.name in ("stop_endpoint", "teardown_endpoint") or (c.name == "connect_facility" and not no_op_answer(c)):
             return False
+        r = c.result or {}
         if c.name == "ensure_endpoint_up" and _shape(c) == "compute":
             pending = str(r.get("status")) == "provisioning" and _asked_terms(t, j) == terms
-        elif c.name == "poll_task" or (c.name == "run_shell" and _shape(c) == "compute"):
+        elif c.name == "poll_task" or (c.name in ("run_shell", "reset_session") and _shape(c) == "compute"):
             pending = str(r.get("phase")) == "cold_start"
         else:
-            continue   # about no block: the login shape, a plain reconnect, a question
+            continue   # about no block: the login shape, a question, a no-op connect
         if not pending:
             return False
     return False
