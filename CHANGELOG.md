@@ -52,6 +52,21 @@ installed plugin only when that version changes); git tags mark releases.
   "likely REJECTED"), and aborts unless that notice quotes sbatch's "Job violates accounting/QOS policy", so a build
   without the scheduler's words fails plainly. It relays the words and stops the endpoint; every grader the scenario
   gates holds for such a run (none needs a question to the user). Agent operators run the cell as before.
+- **A fake MEP no longer hands the next cell a dead user endpoint's pid file.** Every fake-MEP cell maps to `hpcbmep`
+  with the same user-endpoint config, so all of them share one user endpoint dir on the persistent `/home`. Each
+  run_suite runs `fakecluster/bin/up.sh`, and its `docker compose up -d --build` recreates a running stack whenever
+  the shared image's tag lands on a different service's build (compose labels each service's build with the service's
+  name). In a sweep that happens at every operator after the first. The recreate killed the previous cell's user
+  endpoint and left its `daemon.pid`. globus-compute-endpoint refuses to start a user endpoint whose pid file is under
+  3 heartbeats old (rc 73, "Another instance of this endpoint is running"), and in the free sweep of 2026-10-16 the
+  next cell's first task arrived inside that window: on `pbs_mep` codex's endpoint came 45 s late and hermes21 never
+  got one (both cells FAILED), and on `mep` codex's came about 50 s late. Now the login setup of both MEP profiles
+  removes those pid files before any manager starts (`mep_clear_stale_uep_pids`, in the shared `mep/tools.sh`; on
+  `mep`, on login01 only). It removes only `daemon.pid` files, only under the mapped user's home, only for its own
+  managers' uuids (read from their `endpoint.json`), and never one whose user endpoint is running in that container,
+  because a live user endpoint stops itself when its pid file goes. Without `pgrep` it removes none. The container
+  log gives the count. Hermetic tests (`agentic/harness/test_mep_uep_pidfiles.py`) run the helper in a real bash
+  under the entrypoint's `set -euo pipefail`, and check that both setups call it before their managers start.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 

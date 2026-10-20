@@ -33,6 +33,11 @@ if [ "$(hostname -s)" = login01 ]; then
     echo "[mep] WARNING: HPCB_MEP_EMAIL is unset — NOT starting the managers (a Globus registration needs a real contact address; set it in agentic/.env)"
     return 0
   fi
+  # The user endpoints both managers forked died with this container, but their pid files stayed on the shared /home
+  # and would refuse the next cell's user endpoint (rc 73). Here, on login01 only (login02 shares /home but runs no
+  # manager; a pid file removed under a LIVE user endpoint stops it), and before either manager starts.
+  mep_clear_stale_uep_pids "$h" /root/.globus_compute/hpcb-mep-strict /root/.globus_compute/hpcb-mep-open \
+    || echo "[mep] WARNING: could not clear stale user-endpoint pid files"
   for kind in strict open; do
     name="hpcb-mep-$kind"; d="/root/.globus_compute/$name"
     mkdir -p "$d" && chmod 700 "$d"
