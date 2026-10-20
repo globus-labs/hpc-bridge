@@ -325,6 +325,70 @@ def test_first_bring_up_skips_a_result_with_no_phase():
     assert not r.ok and "call 1" in r.detail
 
 
+def _product_connect_refusals() -> list[dict]:
+    """What the SERVER answers a connect_facility(details=…) without env_setup — with no proposal for the facility,
+    and with a proposal for another host: refused before any SSH (connect._connect_facility). Driven through the real
+    code, so the grader's match follows its wording."""
+    import asyncio
+
+    from hpc_bridge import connect
+    from hpc_bridge.context import AppCtx
+    from hpc_bridge.models import FacilityDetails
+    from hpc_bridge.profile import Profile
+
+    class _Implicit:
+        name = "local"
+        implicit = True
+
+    async def no_login(*_a, **_k):
+        raise AssertionError("a refused connect runs nothing on the login node")
+
+    details = FacilityDetails(ssh_host="login", interface="eth0", scratch_root="/scratch/{user}", partition="debug")
+
+    async def go() -> list[dict]:
+        out = []
+        for draft_host in (None, "login02"):
+            app = AppCtx(facility=_Implicit(), profile=Profile())
+            if draft_host:
+                app.proposed_drafts["f"] = details.model_copy(update={"ssh_host": draft_host, "env_setup": "true"})
+            out.append((await connect._connect_facility(app, "f", details=details, run_login=no_login)).model_dump())
+        return out
+
+    return asyncio.run(go())
+
+
+def test_first_bring_up_skips_a_connect_that_refused_its_own_details():
+    """hermes21 teardown_slow_fs (1792178995, 2026-10-16) opened with connect_facility(details=…) before any proposal:
+    "details= has no env_setup and there is no proposal for this facility to take it from … Nothing was started." —
+    refused before any SSH, so no bring-up; the proposal and the details= connect after it landed, and
+    first_details_connect_succeeds failed the run on the refusal."""
+    from invariants import first_bring_up_had_details, first_details_connect_succeeds, no_op_answer
+    det = {"facility": "f", "ssh_host": "login", "details": {"ssh_host": "login"}}
+    for res in _product_connect_refusals():
+        assert res["phase"] == "failed" and res["notice"].endswith("Nothing was started."), res["notice"]
+        refused = ToolCall.of("mcp__endpoint__connect_facility", det, res)
+        t = Trace([refused, _conn(False, "proposed_facility_details"), _conn(False, "provisioning", details=True)])
+        r = first_details_connect_succeeds(t)
+        assert r.ok and "call 2" in r.detail, r.detail
+        assert no_op_answer(refused), res["notice"]
+        assert first_bring_up_had_details(t)      # still gated: the bring-up after the refusal carried details=
+        # the refusal alone is no bring-up at all
+        assert "no bring-up connect" in first_details_connect_succeeds(Trace([refused])).detail
+        # a bring-up that DID fail is still the failure it is (venv_broken_repair / lmod_bootstrap, hermes21
+        # 2026-10-16: the agent's own env_setup broke the remote configure)
+        broke = ToolCall.of("mcp__endpoint__connect_facility", det, {"phase": "failed", "notice": (
+            "hpc-bridge error: RuntimeError: remote configure failed: bash: -c: line 1: syntax error near unexpected "
+            "token `('")})
+        r = first_details_connect_succeeds(Trace([refused, _conn(False, "proposed_facility_details"), broke]))
+        assert not r.ok and "call 2" in r.detail, r.detail
+    # other failed connects are not no-ops: an SSH-time failure, or the refusal's words without its ending
+    for notice in ("hpc-bridge error: the SSH ControlMaster socket path is too long (…); set HPC_BRIDGE_STATE_DIR to a "
+                   "short path (e.g. ~/.hpc-bridge). Nothing was started.",
+                   "details= has no env_setup and there is no proposal for this facility to take it from."):
+        assert not no_op_answer(ToolCall.of("mcp__endpoint__connect_facility", det,
+                                            {"phase": "failed", "notice": notice})), notice
+
+
 def test_first_details_gate_applies_where_the_first_bring_up_had_details():
     from invariants import first_bring_up_had_details
     byo = Trace([_conn(False, "proposed_facility_details"), _conn(False, "provisioning", details=True)])
@@ -1381,6 +1445,70 @@ def test_needs_account_is_not_a_billed_start():
     assert ends_with_stop(t2).ok            # nothing billed → nothing to stop
 
 
+def _server_rejected_notice() -> str:
+    """The server's own REJECTED answer (notices._submit_rejected_notice) with parsl's wrapper alone, as codex's gpu_rule
+    cell (1792181697) met it — so the grader's match follows its words."""
+    from hpc_bridge.notices import _submit_rejected_notice
+    return _submit_rejected_notice(
+        "Error 1: Failed to start block 0: Cannot launch job parsl.GlobusComputeEngine-HighThroughputExecutor.block-0: "
+        "Could not read job ID from submit command standard output", terms="submitted on partition 'gpu', account "
+        "'hpcb-gpu'")
+
+
+def test_a_start_the_scheduler_rejected_leaves_no_block_to_stop():
+    """codex gpu_rule (1792181697, 2026-10-16): five confirmed starts, each answered `provisioning` and then REJECTED
+    ("The new block was not created: nothing is queued and it bills nothing"); no pilot was ever queued (the world
+    check passed) and no stop was called — and ends_with_stop / stop_confirmed_or_retried failed the run for not
+    releasing a block that never existed. The server voids such a confirm (warmth._void_rejected); the stop graders now
+    read it the same way. The spend graders still count each confirm: the agent did confirm spend."""
+    from invariants import account_from_listing, ends_with_stop, spend_follows_question, stop_confirmed_or_retried
+    rejected = _server_rejected_notice()
+    assert "REJECTED" in rejected and "bills nothing" in rejected      # the words the grader reads, the server's own
+
+    def start(partition="gpu", account=None, status="provisioning", notice=None):
+        inp = {"partition": partition, "confirm_spend": True} | ({"account": account} if account else {})
+        return ToolCall.of("mcp__endpoint__ensure_endpoint_up", inp, {
+            "status": status, "endpoint_id": "e1", "notice": notice or f"allocating nodes on '{partition}'…"})
+
+    conn = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": {"ssh_host": "login"}},
+                       {"phase": "needs_account", "allocations": [{"account": "hpcb-cpu", "balance": 10}]})
+    compute = {"command": "hostname", "shape": "compute"}
+    run_rejected = ToolCall.of("mcp__endpoint__run_shell", compute,
+                               {"phase": "failed", "notice": "scheduler compute shape: " + rejected})
+    down = start(account="hpcb-gpu", status="down", notice=rejected)    # the next poll meets the refusal
+    # the bundle's shape: start → run_shell REJECTED; start on the account → poll REJECTED; no stop
+    t = Trace([conn, start(), run_rejected, start(account="hpcb-gpu"), down])
+    r = ends_with_stop(t)
+    assert r.ok and "REJECTED" in r.detail and "[1, 3]" in r.detail, r.detail
+    assert stop_confirmed_or_retried(t).ok
+    assert not spend_follows_question(t).ok          # never asked: the confirms still count as spend
+    assert not account_from_listing(t).ok            # nor does a rejection hide an account the listing never had
+
+    from invariants import _billed_start_idxs, _starts_to_release
+    assert _billed_start_idxs(t) == [1, 3] and _starts_to_release(t) == []
+    # the same request still pending is passed over: a re-confirm on the same terms, then the refusal
+    assert _starts_to_release(Trace([conn, start(account="hpcb-gpu"), start(account="hpcb-gpu"), down])) == []
+    # what keeps a start billed, each before the same refusal:
+    probe_likely = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {}, {"status": "provisioning", "notice": (
+        "allocating nodes on 'gpu'… — but NO pilot job is in the scheduler after ~60s. The block submission was likely "
+        "REJECTED — not yet conclusive: the failure has not reached the Globus Compute service, and that user endpoint "
+        "may start again.")})
+    assert _starts_to_release(Trace([conn, start(), probe_likely])) == [1]          # the probe's guess is no refusal
+    assert not ends_with_stop(Trace([conn, start(), probe_likely])).ok
+    up = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {}, {"status": "up", "endpoint_id": "e1"})
+    assert _starts_to_release(Trace([conn, start(), up, down])) == [1]               # the block came up
+    ran = ToolCall.of("mcp__endpoint__run_shell", compute, {"phase": "running", "task_id": "compute-1"})
+    assert _starts_to_release(Trace([conn, start(), ran, run_rejected])) == [1]      # work ran on it
+    # a switch: nothing cancels the block it leaves, so the refusal of the new terms voids only the new start
+    switched = Trace([conn, start("main"), start(account="hpcb-gpu"), down])
+    assert _starts_to_release(switched) == [1] and not ends_with_stop(switched).ok
+    stop = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down", "endpoint_id": "e1"})
+    assert _starts_to_release(Trace([conn, start(), stop, run_rejected])) == [1]     # a stop came first
+    assert _starts_to_release(Trace([conn, start(status="up"), down])) == [1]        # a start answered up
+    cut = ToolCall.of("mcp__endpoint__ensure_endpoint_up", {"partition": "gpu", "confirm_spend": True}, None)
+    assert _starts_to_release(Trace([conn, cut, down])) == [1]                       # no result: conservatively
+
+
 def test_long_task_cut_grader_ignores_a_probe_that_never_started():
     scen = _scenario("long_task_via_handle")
     cmd = {"command": f"python3 -c \"print('{scen._MARK} start')\"", "shape": "compute"}
@@ -1389,6 +1517,24 @@ def test_long_task_cut_grader_ignores_a_probe_that_never_started():
     assert scen.not_cut_at_cap(Trace([early, later])).ok
     cut = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "failed", "exit_code": 124})
     assert not scen.not_cut_at_cap(Trace([cut])).ok
+
+
+def test_long_task_cut_grader_ignores_a_probe_sent_before_the_bind():
+    """hermes21 long_task_via_handle (1792179095, 2026-10-16) sent the probe while connect_facility had only PROPOSED a
+    config: "No facility connected yet: … Nothing was started." (no_op_answer). That probe never ran, so it was not
+    cut — the run's real failure was the block it left unstopped (ends_with_stop), not this."""
+    scen = _scenario("long_task_via_handle")
+    cmd = {"command": f"python3 -c \"print('{scen._MARK} start')\"", "shape": "compute"}
+    blind = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "failed", "block_state": "cold", "exit_code": None,
+                                                           "notice": (
+        "No facility connected yet: connect_facility('f') only PROPOSED a config (proposed_facility_details) — nothing "
+        "is bound until you finish it. Review the draft WITH THE USER, then call connect_facility('f', details=…) with "
+        "the confirmed config. Nothing was started.")})
+    running = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "running", "task_id": "compute-1"})
+    assert scen.not_cut_at_cap(Trace([blind, running])).ok
+    # a probe that started and then failed is still a cut, whatever came before it
+    died = ToolCall.of("mcp__endpoint__run_shell", cmd, {"phase": "failed", "exit_code": 1, "notice": "worker died"})
+    assert not scen.not_cut_at_cap(Trace([blind, died])).ok
 
 
 # --- a scheduler job submitted BY HAND is spend too (2026-10-10) -----------------------------------------------------

@@ -447,6 +447,9 @@ endpoint … in list output") in practically every run, and the retry already re
 still tolerate that form (phase-keyed; the `reused` FIELD only). `first_details_connect_succeeds` now GATES every
 run whose first bring-up connect carried `details=` (run.py and regrade.py apply the rule). It stays report-only
 for a cache or catalog first connect. In the stored bundles, every verdict it flips is a pre-#72 run that hit #39.
+The first bring-up is never a connect that started nothing: a first-contact refusal (no SSH access, an unknown host
+key), or one the server refused before any SSH ("details= has no env_setup and there is no proposal …", ending
+"Nothing was started.", `invariants.no_op_answer`).
 
 ## Stranger, login & refusal scenarios — and the model sweep (2026-09-03)
 
