@@ -91,6 +91,18 @@ def build_endpoint_venv_cmd(gce: str, python: str, sdk: str | None = None) -> st
             '"$K/bin/globus-compute-endpoint" version')
 
 
+def build_unkeyed_venv_cmd(gce: str, python: str) -> str:
+    """The unkeyed `$HOME/hpc-bridge/gce-venv` as 0.1.23's discovery line builds it (`uv venv` at the client's Python,
+    then the endpoint at the plugin's pin), plus `texttable<1.7.2`. Built ahead of that line, its own guards (`[ -d ]
+    ||`, `command -v ||`) skip its unbounded install, which since texttable 1.7.2 (2026-10-18) breaks
+    `globus-compute-endpoint list`: the old bootstrap's `start` then could not find its endpoint, and left a manager
+    running on the pool user."""
+    return ('V="$HOME/hpc-bridge/gce-venv"; mkdir -p "$HOME/hpc-bridge" && '
+            f'uv venv -q "$V" --python {python} && '
+            f'uv pip install -q --python "$V/bin/python" "globus-compute-endpoint=={gce}" "texttable<1.7.2" && '
+            '"$V/bin/globus-compute-endpoint" version')
+
+
 def endpoint_uuid_cmd(endpoint_name: str) -> str:
     """Print this endpoint's registered uuid (from its endpoint.json), or nothing if unregistered."""
     ep = shlex.quote(endpoint_name)

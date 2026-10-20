@@ -9,8 +9,10 @@ sends the endpoint's OWN worker_init with every task. The difference between the
 so the connect and the pilot notices say nothing about it.
 
 Phase 1 is simulated (a per-phase build of an older plugin is too heavy for a cell): SEED_FACILITY_CACHE writes 0.1.23's
-cached config, SETUP clears this client's keyed venv and the unkeyed one (so 0.1.23's line builds it fresh), and
-LOCAL_SETUP runs `harness/old_endpoint.py`, which stands up the endpoint with exactly what 0.1.23 wrote.
+cached config, SETUP clears this client's keyed venv and the unkeyed one, then builds the unkeyed one as 0.1.23's line
+would but with `texttable<1.7.2` (that line's unbounded install now takes texttable 1.7.2, whose `list` failure stops
+the old bootstrap after its `start`; its guards leave a venv that is there as it is), and LOCAL_SETUP runs
+`harness/old_endpoint.py`, which stands up the endpoint with exactly what 0.1.23 wrote.
 
 Graded: the connect reports reused=True; compute ran; one endpoint id throughout; no notice carries the env-differs
 note; the endpoint's template still holds the old line (never rewritten) and the keyed venv was never built (zero SSH).
@@ -22,7 +24,7 @@ import re
 import shlex
 from pathlib import Path
 
-from cluster_ops import keyed_endpoint_venv, plugin_versions
+from cluster_ops import build_unkeyed_venv_cmd, keyed_endpoint_venv, plugin_versions
 from invariants import Result, Trace, compute_ran
 
 NEEDS_COMPUTE_NODE = True
@@ -45,7 +47,12 @@ _DETAILS = {   # what 0.1.23 cached for the fake cluster's login node (facilitie
 }
 SEED_FACILITY_CACHE = {"login": _DETAILS}
 
-SETUP = [f'rm -rf "{KEY}" "{KEY}".broken.* "{KEY}".failed.* "{KEY}.lock" "$HOME/hpc-bridge/gce-venv"; true']
+SETUP = [
+    f'rm -rf "{KEY}" "{KEY}".broken.* "{KEY}".failed.* "{KEY}.lock" "$HOME/hpc-bridge/gce-venv"; true',
+    # the unkeyed venv 0.1.23's line would build, with texttable pinned below 1.7.2 (its own unbounded install now
+    # takes 1.7.2, whose `list` stops the old bootstrap); the line's guards then leave it as it is
+    build_unkeyed_venv_cmd(GCE_V, PY_V),
+]
 LOCAL_SETUP = [  # the cached details ride as one shell word (the old line has single quotes of its own)
     f"uv run --project {_ROOT} --no-sync python {_ROOT}/agentic/harness/old_endpoint.py {shlex.quote(json.dumps(_DETAILS))}",
 ]

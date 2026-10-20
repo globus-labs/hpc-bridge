@@ -172,7 +172,9 @@ def uv_main(args):
         make_venv(path, relocatable="--relocatable" in args)
     elif args[:2] == ["pip", "install"]:
         rest = args[2:]
-        py = rest[rest.index("--python") + 1]
+        # no --python: the activated venv, as uv does (0.1.23's line installs after `. {venv}/bin/activate`)
+        py = rest[rest.index("--python") + 1] if "--python" in rest else os.path.join(os.environ["VIRTUAL_ENV"],
+                                                                                      "bin", "python")
         do_install(py, [a for a in rest if not a.startswith("-") and a != py])
     else:
         sys.exit(f"uv stub: unexpected {args}")

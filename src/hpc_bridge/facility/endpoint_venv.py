@@ -53,8 +53,10 @@ ARCH_MARKER = ".hpcb-arch"
 # (`Endpoint.print_endpoint_table`: `_compute_cols_width()`, then `_width`; gce 4.18 and its main branch), so `list`
 # raises AttributeError whenever an endpoint is configured, and hpc-bridge finds its endpoint's id with `list`. The
 # endpoint leaves texttable unbounded (the SDK's `texttable>=1.7`): every build pins it, and the check runs exactly what
-# `list` calls on a venv already built (`_PY_PROBE`), so it is rebuilt. Drop the pin once the endpoint stops reading
-# `_width` (the probe needs no change either way).
+# `list` calls on a venv already built (`_PY_PROBE`), so it is rebuilt. The pin and the probe's texttable calls come
+# out TOGETHER, once the endpoint stops reading `_width`: the probe tests texttable alone, never the endpoint, so a
+# build without the pin would take 1.7.2 and fail its own verify (every bring-up, a `.failed.<ts>` each).
+# `test_the_pin_and_the_probe_go_together` holds them to that.
 TEXTTABLE_PIN = "texttable<1.7.2"
 # what that `list` raises (its traceback's last line), and what to do; `facility.remote` adds it to the list failure
 BROKEN_LIST = re.compile(r"'Texttable' object has no attribute '_width'")
@@ -275,6 +277,8 @@ class VenvState:
     texttable: str = ""      # ok | absent | broken: what `list` calls on texttable (`_PY_PROBE`; "" = not reported)
     texttable_version: str = ""
     texttable_error: str = ""
+    texttable_file: str = ""       # the texttable it imported (resolved)
+    texttable_outside: bool = False  # …from outside the venv's own prefix: a rebuild cannot change it
     arch: str | None = None  # the .hpcb-arch marker
     machine: str = ""        # this login node's `uname -m`
     uv: str = ""
@@ -296,14 +300,16 @@ def _cap(seconds: int) -> str:
 
 
 # The check's one python call: whether the venv's texttable does what globus-compute-endpoint's `list` does with it
-# (`Endpoint.print_endpoint_table`, gce 4.18: the same calls, so a texttable that brings `_width` back, or an endpoint
-# that stops reading it, needs no change here), then the python's major.minor as the LAST line, as before. A venv with
-# no texttable at all is not a problem: its endpoint cannot be reading it. Never raises, and no f-strings, so an old
-# python still reports its version. The login shell's cwd is dropped from the path, as an entry point never has it.
+# (`Endpoint.print_endpoint_table`, gce 4.18: the same calls, through `draw()`, so a texttable that brings `_width`
+# back needs no change here; it tests texttable alone, never the endpoint: see TEXTTABLE_PIN), where the texttable it
+# imported lives (`TEXTTABLE_OUTSIDE`: not under the venv's own prefix, e.g. a site module's PYTHONPATH shadowing it, a
+# break no rebuild can mend), then the python's major.minor as the LAST line, as before. A venv with no texttable at
+# all is not a problem: its endpoint cannot be reading it. Never raises, and no f-strings, so an old python still
+# reports its version. The login shell's cwd is dropped from the path, as an entry point never has it.
 _PY_PROBE = (
-    "import sys\n"
+    "import os, sys\n"
     "sys.path[:1] = [p for p in sys.path[:1] if p]\n"
-    "t, e, v = 'ok', '', ''\n"
+    "t, e, v, f = 'ok', '', '', ''\n"
     "try:\n"
     "    import texttable\n"
     "except ImportError as x:\n"
@@ -311,6 +317,7 @@ _PY_PROBE = (
     "    e = '%s: %s' % (type(x).__name__, x)\n"
     "else:\n"
     "    v = str(getattr(texttable, '__version__', ''))\n"
+    "    f = os.path.realpath(getattr(texttable, '__file__', None) or '')\n"
     "    try:\n"
     "        tb = texttable.Texttable()\n"
     "        tb.header(['Endpoint ID', 'Status', 'Endpoint Name'])\n"
@@ -318,11 +325,15 @@ _PY_PROBE = (
     "        tb.set_max_width(68)\n"
     "        tb._compute_cols_width()\n"
     "        tb._width[2] = max(10, tb._width[2])\n"
+    "        tb.draw()\n"
     "    except Exception as x:\n"
     "        t, e = 'broken', '%s: %s' % (type(x).__name__, x)\n"
     "print('TEXTTABLE=' + t)\n"
     "print('TEXTTABLE_VERSION=' + v)\n"
     "print('TEXTTABLE_ERROR=' + ' '.join(e.split())[:200])\n"
+    "print('TEXTTABLE_FILE=' + f)\n"
+    "if f and not f.startswith(os.path.join(os.path.realpath(sys.prefix), '')):\n"
+    "    print('TEXTTABLE_OUTSIDE=1')\n"
     "print(sys.version_info[:2])\n"
 )
 # sent as `exec(<its repr>)`: one line, so the check stays a single line, as it always was
@@ -376,8 +387,9 @@ def parse_check(out: str) -> VenvState:
     s.version_rc = int(raw["VERSION_RC"]) if raw.get("VERSION_RC", "").lstrip("-").isdigit() else None
     s.py_rc = int(raw["PY_RC"]) if raw.get("PY_RC", "").lstrip("-").isdigit() else None
     s.version, s.py = raw.get("VERSION", "").strip(), raw.get("PY", "").strip()
-    s.texttable, s.texttable_version, s.texttable_error = (
-        raw.get(x, "").strip() for x in ("TEXTTABLE", "TEXTTABLE_VERSION", "TEXTTABLE_ERROR"))
+    s.texttable, s.texttable_version, s.texttable_error, s.texttable_file = (
+        raw.get(x, "").strip() for x in ("TEXTTABLE", "TEXTTABLE_VERSION", "TEXTTABLE_ERROR", "TEXTTABLE_FILE"))
+    s.texttable_outside = raw.get("TEXTTABLE_OUTSIDE") == "1"
     s.arch = raw["ARCH"].strip() if "ARCH" in raw else None
     s.inode, s.machine, s.uv, s.py3, s.curl = (raw.get(x, "").strip()
                                                for x in ("INODE", "MACHINE", "UV", "PY3", "CURL"))
@@ -418,10 +430,25 @@ def problem(s: VenvState, *, gce: str | None, python: str) -> str | None:
     have = reported_python(s.py)
     if have != python:
         return f"its python is {have or s.py or 'unknown'}, not {python}"
-    if s.texttable == "broken":  # its `version` runs, but its `list` cannot draw a table (TEXTTABLE_PIN)
+    if s.texttable == "broken" and not s.texttable_outside:  # `version` runs, `list` cannot draw (TEXTTABLE_PIN)
         tt = f"texttable {s.texttable_version}" if s.texttable_version else "texttable"
         return f"its {tt} breaks `{GCE} list` ({s.texttable_error or 'no error text'})"
-    return None
+    return None  # a texttable from OUTSIDE the venv is not the venv's to mend: `shadowed` says so
+
+
+def shadowed(s: VenvState, path: str, host: str) -> EndpointVenvError | None:
+    """The error for a venv whose python imports a texttable that breaks `list` from OUTSIDE the venv (a site module's
+    PYTHONPATH, say), or None. Its own texttable is not what runs, so a rebuild cannot help: nothing is built, and the
+    message names the file. `list` runs with the same environment, so the bring-up could not get past it either."""
+    if s.texttable != "broken" or not s.texttable_outside:
+        return None
+    tt = f"texttable {s.texttable_version}" if s.texttable_version else "a texttable"
+    return EndpointVenvError(
+        f"{tt} from {s.texttable_file or 'an unknown file'}, outside hpc-bridge's endpoint venv {path} on {host}, "
+        f"breaks `{GCE} list` ({s.texttable_error or 'no error text'}): it is shadowed from outside the venv "
+        "(PYTHONPATH, from the site setup in env_setup or a login profile?), so a rebuild cannot help. Take that "
+        "directory off the path, or make its texttable older than 1.7.2 (`pip install 'texttable<1.7.2'` there), then "
+        "connect_facility again. Nothing was started or billed.")
 
 
 # -------------------------------------------------------------------------------------------------- the build
@@ -451,15 +478,18 @@ def _transport(step: str, host: str, rc: int, out: str, err: str) -> RuntimeErro
     return RuntimeError(f"endpoint venv {step} on {host} failed: {(err or out).strip()[:600] or f'rc={rc}'}")
 
 
-def _method(s: VenvState, python: str) -> str:
+def _method(s: VenvState, python: str, skipped: str = "") -> str:
     """How to get uv: the login node's (after the site prefix), or installed first — from astral.sh with curl, else
-    with the node's python3 and pip. A node with none of them cannot build."""
+    with the node's python3 and pip. A node with none of them cannot build. `skipped`: why a prepared unkeyed venv was
+    not used, said in either refusal (it is why a build was needed at all)."""
+    why = f" {skipped}." if skipped else ""
     if s.uv:
         if not s.uv_relocatable:
             raise EndpointVenvError(
                 f"this node's uv ({s.uv_version or 'unknown version'}, {s.uv}) is too old to build hpc-bridge's venv "
                 "(it has no `uv venv --relocatable`, uv 0.2.31+): upgrade uv (`uv self update`), or remove it from "
-                "PATH so hpc-bridge installs its own, then connect_facility again. Nothing was started or billed.")
+                f"PATH so hpc-bridge installs its own, then connect_facility again.{why} Nothing was started or "
+                "billed.")
         return "uv"
     if s.curl or s.py3:
         return "bootstrap"
@@ -467,7 +497,7 @@ def _method(s: VenvState, python: str) -> str:
         f"no uv, no curl and no python3 on the login node, so hpc-bridge cannot build its endpoint venv (Python "
         f"{python}) there. Make uv or python3 available (a site `module load …` before hpc-bridge's line in "
         "env_setup), or prepare a venv with globus-compute-endpoint at HPC_BRIDGE_REMOTE_VENV, then connect_facility "
-        "again. Nothing was started or billed.")
+        f"again.{why} Nothing was started or billed.")
 
 
 # uv for a node that has none: astral.sh's installer (told not to edit the user's shell profiles), else pip in a
@@ -602,9 +632,15 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
                  sdk: str | None) -> EnsureResult:
     """Make the keyed venv serve this client — check, and build only when the check fails. See the module docstring.
     Raises EndpointVenvError (what to do, shown as it is) or RuntimeError (ssh itself failed)."""
+    def serves(state: VenvState, path: str) -> None:
+        """A venv that passed: unless a texttable from outside it breaks `list` (`shadowed`), which no build mends."""
+        if (err := shadowed(state, path, host)) is not None:
+            raise err
+
     s = await _check(run, mv, host, "check")
     why = problem(s, gce=gce, python=python)
     if why is None:
+        serves(s, mv.key)
         await _ensure_marker(run, mv.key, s, host)
         return EnsureResult(path=mv.key)
     if why == "timed out":
@@ -617,6 +653,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         if u.exists:
             why_u = problem(u, gce=gce, python=python)
             if why_u is None:
+                serves(u, mv.base)
                 await _ensure_marker(run, mv.base, u, host)
                 return EnsureResult(path=mv.base)
             skipped = f"{mv.base} was not used: {why_u}"
@@ -626,7 +663,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
             f"{mv.key} on {host} exists and is not a venv: hpc-bridge will not move or replace it. Move it away "
             "(or set HPC_BRIDGE_REMOTE_VENV to another path), then connect_facility again. Nothing was started or "
             "billed.")
-    method = _method(s, python)
+    method = _method(s, python, skipped)
     token = uuid.uuid4().hex[:16]
     b = build_dir(mv, token)
     what = f"{GCE} {gce or '(latest)'} on Python {python}"
@@ -663,8 +700,12 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
             mode = "keep"  # not a failed build: left where it is
             raise _timed_out(b, host, "verifying the newly built")
         if bad is not None:
+            # a broken texttable INSIDE a build that asked for TEXTTABLE_PIN: the node's uv was told otherwise
+            pin = (f" The build asked for '{TEXTTABLE_PIN}' and got {v.texttable_version or 'another'} all the same: a "
+                   "uv override or constraint on the login node (UV_OVERRIDE, UV_CONSTRAINT, a uv.toml)?"
+                   if v.texttable == "broken" else "")
             raise await failed(f"built hpc-bridge's endpoint venv for {mv.key} on {host} ({what}), but it fails its "
-                               f"check: {bad}.")
+                               f"check: {bad}.{pin}")
         mode = "keep"  # verified: whatever happens next (an ssh blip, a rename error), it is never moved to .failed
         rc, out, err = await run("claim", claim_script(mv, token, s.inode if s.exists else ""), _SHORT_S)
         if rc == 255:
@@ -675,6 +716,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
             print(f"hpc-bridge: a venv another bring-up put in place was left at {stranded} on {host}", file=sys.stderr)
         if claim == "ok":
             done = True
+            serves(v, mv.key)  # claimed all the same: the next connect then says so at its check, with no new build
             return EnsureResult(path=mv.key, built=True, moved_aside=_field(out, "HPCB_MOVED"), reason=why)
         if not claim.startswith("lost"):
             raise EndpointVenvError(
@@ -690,6 +732,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
             raise EndpointVenvError(
                 f"another bring-up put a venv at {mv.key} on {host} first, and it fails its check ({won}). "
                 "connect_facility again. Nothing was started or billed.")
+        serves(w, mv.key)
         return EnsureResult(path=mv.key)
     except asyncio.CancelledError:
         if mode == "failed":

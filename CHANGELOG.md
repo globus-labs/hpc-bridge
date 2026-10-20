@@ -77,13 +77,16 @@ installed plugin only when that version changes); git tags mark releases.
     rebuilt like any broken one: built beside it, checked, renamed into place, with the old one kept as
     `.broken.<time>`. That costs one build, once per venv. A venv with no texttable at all passes;
   - an environment you prepared yourself at `HPC_BRIDGE_REMOTE_VENV` is never changed. When it fails the check,
-    hpc-bridge builds its own venv beside it and says why yours was not used;
+    hpc-bridge builds its own venv beside it and says why yours was not used, also when it then cannot build one;
+  - a texttable 1.7.2 that comes from outside the venv (a site module's `PYTHONPATH`, say) breaks `list` all the
+    same, and no rebuild can change it. hpc-bridge builds nothing then, and the message names the file;
   - a failing `list` now names its exception, not the first lines of its traceback (the agent saw only "Traceback …
     line 12, in"). For this failure it adds what it is and the fix for an environment hpc-bridge does not manage (a
     hand-written `env_setup`, a facility's own install): `pip install 'texttable<1.7.2'` there. A refused
     `start` whose `list` also failed quotes `list`'s error, where it used to say only "no output".
 
-  The pin comes out when globus-compute-endpoint stops reading `_width`; the check needs no change either way.
+  The pin and the check's texttable test come out together, once globus-compute-endpoint stops reading `_width`. The
+  check tests texttable, not the endpoint, so without the pin every new build would take 1.7.2 and fail it.
 - **A stop no longer stays `draining` for good when the endpoint loses its report on hpc-bridge's own check.** Seen
   live twice (2026-10-16, the fake `site` cluster: `submit_policy_rejected`, `slurm_worker_died`): after a rejected
   submission or a pilot that died, the user endpoint holding hpc-bridge's check went into an error state ("bad
@@ -362,7 +365,10 @@ installed plugin only when that version changes); git tags mark releases.
   `texttable<1.7.2`. A real-shell test can then build a venv and run its `list`, with no network. The harness's own
   venv build for the venv scenarios (`cluster_ops.build_endpoint_venv_cmd`) pins texttable too, and rebuilds a venv
   whose texttable breaks `list`. Otherwise the plugin's check would rebuild that venv itself and lose the break the
-  scenario planted.
+  scenario planted. `endpoint_upgrade_reuse`'s SETUP now builds the unkeyed venv that 0.1.23's line would build, but
+  with texttable pinned (`cluster_ops.build_unkeyed_venv_cmd`), so the line's guards skip its own unbounded install.
+  Before, the old bootstrap's `list` failed after its `start` and left a manager running on the pool user. The cached
+  old line is unchanged.
 - **INFRA for a final answer that is a tool call never made.** In the free-operator sweep rerun of 2026-10-15, six
   Codex cells on ALCF's gpt-oss ended after one model response, with no call of any kind: the final message was the
   call itself. Either it was raw harmony tokens (`<|start|>assistant<|channel|>commentary
