@@ -5,6 +5,8 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## Unreleased
 
+## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
+
 ### Added
 - **The spend question names the block.** The spend question never said which project a block would charge, and named
   the queue only sometimes. Now every spend answer, from `ensure_endpoint_up` and from `run_shell`, carries the block's
