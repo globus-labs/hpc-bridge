@@ -64,9 +64,15 @@ installed plugin only when that version changes); git tags mark releases.
   removes those pid files before any manager starts (`mep_clear_stale_uep_pids`, in the shared `mep/tools.sh`; on
   `mep`, on login01 only). It removes only `daemon.pid` files, only under the mapped user's home, only for its own
   managers' uuids (read from their `endpoint.json`), and never one whose user endpoint is running in that container,
-  because a live user endpoint stops itself when its pid file goes. Without `pgrep` it removes none. The container
-  log gives the count. Hermetic tests (`agentic/harness/test_mep_uep_pidfiles.py`) run the helper in a real bash
-  under the entrypoint's `set -euo pipefail`, and check that both setups call it before their managers start.
+  because a live user endpoint stops itself when its pid file goes. A file goes only when `pgrep` finds no match
+  (exit 1); a match, a pgrep error or no `pgrep` keeps it. The helper runs as root over a directory the agent's
+  account can write, so it follows no symlink (a symlinked `~/.globus_compute`, user endpoint dir or `daemon.pid` is
+  kept), takes only the names a manager writes, and unlinks from inside the user endpoint dir once that is checked
+  to be the real path. The container log gives the count. Hermetic tests (`agentic/harness/test_mep_uep_pidfiles.py`,
+  now in CI's harness tier) run the helper in a real bash under the entrypoint's `set -euo pipefail`: a live stand-in
+  by command line and one by the process title 4.18 sets, pgrep errors, planted symlinks. They also check that both
+  setups call it before their managers start. Its first version (before the symlink and pgrep-exit checks) was
+  live-checked on `pbs_mep` on 2026-10-20: a cell, a forced restart of the login container, a cell, both OK, no rc 73.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 

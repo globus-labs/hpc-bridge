@@ -242,8 +242,11 @@ python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --
 #   ~50 s late). So before any manager starts, the login setup (on `mep`, login01's alone) removes the pid files left by
 #   the user endpoints ITS managers forked (`mep_clear_stale_uep_pids`, in the shared `mep/tools.sh`). It removes only
 #   pid files, only under ~hpcbmep, only for its own managers' uuids (from their endpoint.json), and never one whose
-#   user endpoint is running there (a live one stops itself when its pid file goes; with no `pgrep`, none is removed).
-#   The container log says how many: `docker logs hpcb-fake-login-1 | grep 'pid files removed'`.
+#   user endpoint is running there (a live one stops itself when its pid file goes, so a file goes only when `pgrep`
+#   finds no match: a match, a pgrep error or no pgrep keeps it). It follows no symlink (the agent runs as hpcbmep and
+#   can plant one) and takes only the names a manager writes. The container log says how many: `docker logs hpcb-fake-login-1 | grep 'pid files removed'`.
+#   In short: up.sh's per-service builds make compose recreate the stack on (in practice) every run_suite, and this
+#   cleanup makes that harmless; a follow-up could stop the recreates (`compose build login`, then `up -d --no-build`).
 HPCB_TARGET=fake ./agentic/run_smoke.sh spend_refusal          # one cell
 HPCB_TARGET=fake ./agentic/run_smoke.sh teardown_slow_fs       # a slow teardown (#91): `tearing_down`, the call again, only what the run created removed
 HPCB_TARGET=fake ./agentic/sweep_pool_user.sh hpcbridge-test-00 # hand sweep (rarely needed: --reset-cluster instead)

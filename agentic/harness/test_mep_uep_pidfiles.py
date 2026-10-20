@@ -29,6 +29,7 @@ TOOLS = {p: FC / "profiles" / p / "mep" / "tools.sh" for p in ("mep", "pbs_mep")
 EID = "2b3bdf70-f46d-44ee-8f13-4c83e4c3e1dc"        # this manager's uuid (the sweep's pbs_mep manager)
 OTHER = "93a1a7d7-66a2-43f7-b74a-360d5be0244d"      # a manager this node does not run
 HASH_A, HASH_B = "beaeb44d-18c0-57b1-9356-c8bd1214674c", "6749391c-68cd-05d9-66fe-2af86343891a"
+HASH_C, HASH_D = "75ff860e-1941-035c-b9a1-630cf7f34aaf", "0a1b2c3d-4e5f-5a6b-8c7d-9e0f1a2b3c4d"
 
 
 def _tree(tmp_path: Path) -> tuple[Path, Path]:
@@ -70,43 +71,126 @@ def test_a_dead_user_endpoints_pid_file_is_removed_and_nothing_else(tmp_path, pr
     assert "stale user-endpoint pid files removed: 2" in r.stdout
 
 
+def _wait_for_pgrep(pattern: str) -> None:
+    deadline = time.monotonic() + 10   # until pgrep sees it (the exec may lag the Popen)
+    while subprocess.run(["pgrep", "-f", pattern], capture_output=True).returncode != 0:
+        assert time.monotonic() < deadline, f"the stand-in user endpoint {pattern} never showed in pgrep"
+        time.sleep(0.1)
+
+
 def test_a_live_user_endpoint_keeps_its_pid_file(tmp_path):
     # A live user endpoint shuts itself down when its pid file disappears (it re-touches it every 15 s): one running
-    # here must keep it, whatever path ran the cleanup.
-    home, mgr = _tree(tmp_path)
+    # here must keep it, whatever path ran the cleanup. Two stand-ins: one still showing its entry-point command line,
+    # one showing the process title 4.18 sets once it runs (`Globus Compute Endpoint (<id>, <name>) [<state>]`).
     if shutil.which("pgrep") is None:
         pytest.skip("no pgrep on this host")
-    live = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
+    home, mgr = _tree(tmp_path)
+    gc = home / ".globus_compute"
+    (gc / f"uep.{EID}.{HASH_C}").mkdir()
+    (gc / f"uep.{EID}.{HASH_C}" / "daemon.pid").write_text("460\n")   # a third, dead one
+    argv = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)",
                              "globus-compute-endpoint", "_start-user-endpoint", f"uep.{EID}.{HASH_B}"])
+    title = subprocess.Popen([shutil.which("bash") or "/bin/bash", "-c",
+                              f"exec -a 'Globus Compute Endpoint ({HASH_A}, uep.{EID}.{HASH_A}) [running]' sleep 60"])
     try:
-        deadline = time.monotonic() + 10   # until pgrep sees it (the exec may lag the Popen)
-        while subprocess.run(["pgrep", "-f", f"uep.{EID}.{HASH_B}"], capture_output=True).returncode != 0:
-            assert time.monotonic() < deadline, "the stand-in user endpoint never showed in pgrep"
-            time.sleep(0.1)
+        _wait_for_pgrep(f"uep.{EID}.{HASH_B}")
+        _wait_for_pgrep(f"Globus Compute Endpoint .*uep.{EID}.{HASH_A}")
         r = _clear(TOOLS["pbs_mep"], str(home), str(mgr))
     finally:
-        live.kill()
-        live.wait()
-    gc = home / ".globus_compute"
+        for proc in (argv, title):
+            proc.kill()
+            proc.wait()
     assert r.returncode == 0 and "ENTRYPOINT CONTINUED" in r.stdout, r.stdout + r.stderr
-    assert (gc / f"uep.{EID}.{HASH_B}" / "daemon.pid").read_text() == "459\n"      # live: kept
-    assert not (gc / f"uep.{EID}.{HASH_A}" / "daemon.pid").exists()               # dead: removed
-    assert f"uep.{EID}.{HASH_B} is running here" in r.stdout and "removed: 1" in r.stdout
+    assert (gc / f"uep.{EID}.{HASH_B}" / "daemon.pid").read_text() == "459\n"      # live (argv): kept
+    assert (gc / f"uep.{EID}.{HASH_A}" / "daemon.pid").read_text() == "459\n"      # live (process title): kept
+    assert not (gc / f"uep.{EID}.{HASH_C}" / "daemon.pid").exists()               # dead: removed
+    assert f"uep.{EID}.{HASH_B} is running here" in r.stdout and f"uep.{EID}.{HASH_A} is running here" in r.stdout
+    assert "removed: 1" in r.stdout
+
+
+def _bin(tmp_path: Path, pgrep: str | None = None) -> str:
+    """A PATH holding only what the helper needs, and `pgrep` only as given (a script body), else none."""
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    for tool in ("sed", "head", "rm"):
+        (bin_ / tool).symlink_to(shutil.which(tool))
+    if pgrep is not None:
+        (bin_ / "pgrep").write_text(f"#!/bin/sh\n{pgrep}\n")
+        (bin_ / "pgrep").chmod(0o755)
+    return str(bin_)
 
 
 def test_without_pgrep_nothing_is_removed(tmp_path):
     # no way to rule out a live user endpoint -> keep every pid file (the precondition alone is not trusted)
     home, mgr = _tree(tmp_path)
-    bin_ = tmp_path / "bin"
-    bin_.mkdir()
-    for tool in ("sed", "head", "basename", "dirname", "rm"):
-        (bin_ / tool).symlink_to(shutil.which(tool))
-    r = _clear(TOOLS["pbs_mep"], str(home), str(mgr), path=str(bin_))
+    r = _clear(TOOLS["pbs_mep"], str(home), str(mgr), path=_bin(tmp_path))
     assert r.returncode == 0 and "ENTRYPOINT CONTINUED" in r.stdout, r.stdout + r.stderr
     gc = home / ".globus_compute"
     for h in (HASH_A, HASH_B):
         assert (gc / f"uep.{EID}.{h}" / "daemon.pid").read_text() == "459\n", h
     assert "no pgrep" in r.stdout and "removed: 0" in r.stdout
+
+
+@pytest.mark.parametrize("rc", [2, 3])
+def test_a_pgrep_error_keeps_the_file(tmp_path, rc):
+    # only pgrep's "no process matched" (exit 1) lets a file go; a syntax error (2) or a fatal one (3, /proc trouble)
+    # says nothing about whether the user endpoint runs
+    home, mgr = _tree(tmp_path)
+    r = _clear(TOOLS["mep"], str(home), str(mgr), path=_bin(tmp_path, pgrep=f"exit {rc}"))
+    assert r.returncode == 0 and "ENTRYPOINT CONTINUED" in r.stdout, r.stdout + r.stderr
+    gc = home / ".globus_compute"
+    for h in (HASH_A, HASH_B):
+        assert (gc / f"uep.{EID}.{h}" / "daemon.pid").read_text() == "459\n", h
+    assert f"pgrep failed (rc {rc})" in r.stdout and "removed: 0" in r.stdout
+    # and the same PATH with a "no match" pgrep does remove them: the error, not the PATH, is what kept them
+    (tmp_path / "again").mkdir()
+    r = _clear(TOOLS["mep"], str(home), str(mgr), path=_bin(tmp_path / "again", pgrep="exit 1"))
+    assert r.returncode == 0 and "removed: 2" in r.stdout, r.stdout + r.stderr
+
+
+def test_the_pgrep_pattern_is_the_name_with_its_dots_literal(tmp_path):
+    # the uep name reaches pgrep as an ERE: its dots escaped, nothing else to escape (a manager writes only hex, dashes
+    # and dots, and no other name is taken)
+    home, mgr = _tree(tmp_path)
+    r = _clear(TOOLS["pbs_mep"], str(home), str(mgr),
+               path=_bin(tmp_path, pgrep='printf "%s\\n" "$*" >> "${0%/bin/pgrep}/pgrep.args"; exit 1'))
+    assert r.returncode == 0 and "removed: 2" in r.stdout, r.stdout + r.stderr
+    want = sorted("-f " + f"uep.{EID}.{h}".replace(".", "\\.") for h in (HASH_A, HASH_B))
+    assert sorted((tmp_path / "pgrep.args").read_text().splitlines()) == want
+
+
+def test_symlinks_and_foreign_names_are_never_followed_or_taken(tmp_path):
+    # Root runs this over ~hpcbmep/.globus_compute, which the agent (running as hpcbmep) can write: a planted symlink
+    # must never make root unlink a daemon.pid somewhere else, and a name a manager never writes is not taken.
+    home, mgr = _tree(tmp_path)
+    gc = home / ".globus_compute"
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    (outside / "daemon.pid").write_text("victim\n")
+    (outside / "victim").write_text("victim\n")
+    (gc / f"uep.{EID}.{HASH_C}").symlink_to(outside, target_is_directory=True)       # a symlinked uep dir
+    real = gc / f"uep.{EID}.{HASH_D}"
+    real.mkdir()
+    (real / "daemon.pid").symlink_to(outside / "victim")                              # a symlinked daemon.pid
+    for odd in ("x[", "ABCDEF", "a b", ""):                                           # not a manager's names
+        (gc / f"uep.{EID}.{odd}").mkdir(exist_ok=True)
+        (gc / f"uep.{EID}.{odd}" / "daemon.pid").write_text("459\n")
+    r = _clear(TOOLS["pbs_mep"], str(home), str(mgr))
+    assert r.returncode == 0 and "ENTRYPOINT CONTINUED" in r.stdout, r.stdout + r.stderr
+    assert (outside / "daemon.pid").read_text() == "victim\n" and (outside / "victim").read_text() == "victim\n"
+    assert (gc / f"uep.{EID}.{HASH_C}").is_symlink() and (real / "daemon.pid").is_symlink()
+    for odd in ("x[", "ABCDEF", "a b", ""):
+        assert (gc / f"uep.{EID}.{odd}" / "daemon.pid").read_text() == "459\n", odd
+    assert r.stdout.count("a symlink, never followed") == 2
+    assert "removed: 2" in r.stdout                                                   # HASH_A, HASH_B still go
+    # a symlinked ~/.globus_compute: nothing under it is touched
+    home2 = tmp_path / "home2"
+    home2.mkdir()
+    (home2 / ".globus_compute").symlink_to(gc, target_is_directory=True)
+    (gc / f"uep.{EID}.{HASH_A}" / "daemon.pid").write_text("459\n")
+    r = _clear(TOOLS["mep"], str(home2), str(mgr))
+    assert r.returncode == 0 and "a symlink, never followed" in r.stdout and "removed: 0" in r.stdout, r.stdout
+    assert (gc / f"uep.{EID}.{HASH_A}" / "daemon.pid").is_file()
 
 
 def test_an_unregistered_manager_clears_nothing_and_never_stops_the_entrypoint(tmp_path):
