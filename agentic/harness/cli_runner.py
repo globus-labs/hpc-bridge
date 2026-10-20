@@ -699,8 +699,9 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     # when there is no final message, or when the run errored (Codex's last message is then whatever it said last: "I'll
     # first connect to the facility.", draining_restop 1792178055); the stderr tail only when nothing better exists — in
     # every Codex cell it is "Reading additional input from stdin...", which is no reason (sweep 2026-10-16: happy_path
-    # 1792181717, hand_batch_job 1792181634). The bundle keeps the final message itself as it was (`final`).
-    cause = ended_on(harness, out or "", hops)
+    # 1792181717, hand_batch_job 1792181634). A turn the harness cut off (rc 124) ended on that: run_turn_process's own
+    # last stderr line, "timed out after N s". The bundle keeps the final message itself as it was (`final`).
+    cause = (err or "").rstrip().rsplit("\n", 1)[-1] if rc == 124 else ended_on(harness, out or "", hops)
     final = CliFinal(result=((cause or text) if rc != 0 else (text or cause)) or (err or "")[-400:], is_error=rc != 0)
     # the run dir dies with the jail: carry the journal, the harness's own record and the relay log into the bundle
     messages = [{"harness": harness, "argv": argv[:6], "rc": rc, "seconds": round(time.monotonic() - t0, 1),

@@ -96,16 +96,40 @@ def test_the_tool_defaults_are_the_servers_mcp_schema():
     assert schema["run_shell"]["shape"] == "compute"   # the case the freeze missed
 
 
-def test_tool_defaults_follow_a_constant_to_the_module_it_is_imported_from(tmp_path):
-    (tmp_path / "context.py").write_text('DEFAULT_SHAPE = "compute"\n')
-    (tmp_path / "server.py").write_text(
-        "from .context import DEFAULT_SHAPE\nLIMIT: int = 5\nmcp = None\n\n"
+def test_tool_defaults_follow_a_constant_to_the_module_it_is_imported_from(tmp_path, capsys):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "context.py").write_text('DEFAULT_SHAPE = "compute"\nWAIT = 2 * 60\nALIASED = DEFAULT_SHAPE\n')
+    (pkg / "broken.py").write_text("def (:\n")
+    (pkg / "server.py").write_text(
+        "from .context import DEFAULT_SHAPE, WAIT as POLL_WAIT\nfrom pkg.context import ALIASED\n"
+        "from .broken import GONE\nfrom elsewhere import OUTSIDE\nLIMIT: int = 5\nmcp = None\n\n"
         "@mcp.tool()\nasync def run(command: str, ctx, shape: str = DEFAULT_SHAPE, *, n: int = LIMIT, k=object()):\n"
         "    pass\n\n"
-        '@mcp.tool(name="poll")\ndef _poll(task_id: str, wait: float = 0.0):\n    pass\n\n'
+        '@mcp.tool(name="poll")\ndef _poll(task_id: str, wait: float = POLL_WAIT, neg: int = -LIMIT):\n    pass\n\n'
+        '@mcp.tool("named")\ndef _named(a=ALIASED, b=GONE, c=OUTSIDE, d=1):\n    pass\n\n'
         "def helper(x=1):\n    pass\n")
-    assert hooks.tool_defaults(tmp_path / "server.py") == {"run": {"shape": "compute", "n": 5}, "poll": {"wait": 0.0}}
+    got = hooks.tool_defaults(pkg / "server.py")
+    assert got == {"run": {"shape": "compute", "n": 5}, "poll": {"wait": 120, "neg": -5},
+                   "named": {"a": "compute", "d": 1}}
+    err = capsys.readouterr().err   # each default left out is SAID, never silently dropped
+    assert "run(k=…): default not read (object())" in err and "named(c=…): default not read (OUTSIDE)" in err
+    assert "named(b=…): default not read (SyntaxError" in err   # a followed module that does not parse: that one only
+
+
+def test_tool_defaults_never_raise_and_say_when_they_read_nothing(tmp_path, capsys):
+    # a hook watcher that raised would end the Claude SDK feed's run, or stop the journal follower (NEVER FIRED)
+    (tmp_path / "broken.py").write_text("def (:\n")
+    (tmp_path / "plain.py").write_text("def f(x=1):\n    pass\n")
     assert hooks.tool_defaults(tmp_path / "missing.py") == {}   # unreadable: when_input matches the args as sent
+    assert hooks.tool_defaults(tmp_path / "broken.py") == {}
+    assert hooks.tool_defaults(tmp_path / "plain.py") == {}
+    err = capsys.readouterr().err
+    assert err.count("could not read the tools' defaults") == 2 and "no @mcp.tool function in" in err
+    # the real server, read afresh (past the cache): every default read, no warning
+    assert hooks.tool_defaults.__wrapped__(hooks._SERVER_SRC) == hooks.tool_defaults()
+    assert capsys.readouterr().err == ""
 
 
 def test_the_freeze_fires_on_compute_runs_that_sent_no_shape():

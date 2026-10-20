@@ -74,7 +74,9 @@ import asyncio
 import functools
 import json
 import math
+import operator
 import re
+import sys
 from collections.abc import Awaitable, Callable, Iterable
 from pathlib import Path
 from typing import Any
@@ -86,46 +88,89 @@ from trace_adapter import _result_to_dict
 # imported — the harness' interpreter in the jail has no Globus Compute SDK, which importing the server pulls in (the
 # repo is in the jail: the server runs from it). test_midrun_hooks pins what this reads to the server's MCP schema.
 _SERVER_SRC = Path(__file__).resolve().parents[2] / "src" / "hpc_bridge" / "server.py"
-_LITERAL_ERRORS =(ValueError, TypeError, SyntaxError, MemoryError, RecursionError)
+_LITERAL_ERRORS = (ValueError, TypeError, SyntaxError, MemoryError, RecursionError)
+_ARITHMETIC: dict[type, Callable[[Any, Any], Any]] = {
+    ast.Add: operator.add, ast.Sub: operator.sub, ast.Mult: operator.mul, ast.Div: operator.truediv,
+    ast.FloorDiv: operator.floordiv, ast.Mod: operator.mod, ast.Pow: operator.pow}
+_MAX_HOPS = 8   # constant → constant → module: how far a default is followed before it is called unresolved
+
+
+class _Unresolved(Exception):
+    """A default the source does not state as a literal, arithmetic on literals, or a module constant."""
+
+
+def _warn(msg: str) -> None:
+    print(f"midrun_hooks: {msg}", file=sys.stderr, flush=True)
+
+
+def _package_module(path: Path, module: str | None, level: int) -> Path | None:
+    """The source file of `from <module> import …` in `path`: relative (`level` dots), or absolute inside the same
+    package (`hpc_bridge.context`); None for a module outside it (another distribution's: never read), and for
+    `from . import binding` (a submodule, not a constant)."""
+    if not module:
+        return None
+    if level:
+        base = path.parent
+        for _ in range(level - 1):
+            base = base.parent
+        parts = module.split(".")
+    else:
+        top = path.parent
+        while (top.parent / "__init__.py").exists():
+            top = top.parent
+        parts = module.split(".")
+        if parts[0] != top.name:
+            return None
+        base, parts = top, parts[1:]
+    target = base.joinpath(*parts)
+    for src in (target.parent / f"{target.name}.py", target / "__init__.py"):
+        if src.exists():
+            return src
+    return None
 
 
 @functools.cache
-def _module_names(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
-    """A module's literal top-level constants (`NAME = <literal>`), and the names it imports from a module of its own
-    package (`from .context import DEFAULT_SHAPE` → {"DEFAULT_SHAPE": "context"})."""
-    consts: dict[str, Any] = {}
-    imported: dict[str, str] = {}
+def _module_names(path: Path) -> tuple[dict[str, ast.expr], dict[str, tuple[Path, str]]]:
+    """A module's top-level `NAME = <expr>` (the expression, resolved when asked for), and the names it imports from
+    its own package: `from .context import DEFAULT_SHAPE as SHAPE` → {"SHAPE": (<…>/context.py, "DEFAULT_SHAPE")}."""
+    assigned: dict[str, ast.expr] = {}
+    imported: dict[str, tuple[Path, str]] = {}
     for node in ast.parse(path.read_text()).body:
         if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
             targets = node.targets if isinstance(node, ast.Assign) else [node.target]
-            if len(targets) == 1 and isinstance(targets[0], ast.Name):
-                try:
-                    consts[targets[0].id] = ast.literal_eval(node.value)
-                except _LITERAL_ERRORS:
-                    pass
-        elif isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
-            for alias in node.names:
-                imported[alias.asname or alias.name] = node.module
-    return consts, imported
+            for t in targets:
+                if isinstance(t, ast.Name):
+                    assigned[t.id] = node.value
+        elif isinstance(node, ast.ImportFrom):
+            src = _package_module(path, node.module, node.level)
+            for alias in node.names if src is not None else ():
+                imported[alias.asname or alias.name] = (src, alias.name)
+    return assigned, imported
 
 
-def _resolve(node: ast.expr, path: Path, depth: int = 0) -> tuple[bool, Any]:
-    """(True, value) for a default the source states: a literal, or a module constant — this module's, or one it
-    imports from its own package (`DEFAULT_SHAPE`, which server.py imports from context.py). (False, None) otherwise."""
+def _value(node: ast.expr, path: Path, hops: int = 0) -> Any:
+    """What a default expression in `path` evaluates to, read from the source: a literal, arithmetic on literals
+    (`2 * 60`), or a module constant — this module's, or one it imports from its own package, under any alias
+    (`DEFAULT_SHAPE`, which server.py imports from context.py). Raises _Unresolved for anything else."""
+    if hops > _MAX_HOPS:
+        raise _Unresolved("too many hops")
     try:
-        return True, ast.literal_eval(node)
+        return ast.literal_eval(node)
     except _LITERAL_ERRORS:
         pass
-    if not isinstance(node, ast.Name) or depth > 3:
-        return False, None
-    consts, imported = _module_names(path)
-    if node.id in consts:
-        return True, consts[node.id]
-    mod = imported.get(node.id, "").replace(".", "/")
-    for src in ((path.parent / f"{mod}.py", path.parent / mod / "__init__.py") if mod else ()):
-        if src.exists():
-            return _resolve(node, src, depth + 1)
-    return False, None
+    if isinstance(node, ast.BinOp) and type(node.op) in _ARITHMETIC:
+        return _ARITHMETIC[type(node.op)](_value(node.left, path, hops + 1), _value(node.right, path, hops + 1))
+    if isinstance(node, ast.UnaryOp) and isinstance(node.op, (ast.USub, ast.UAdd)):
+        v = _value(node.operand, path, hops + 1)
+        return -v if isinstance(node.op, ast.USub) else +v
+    if isinstance(node, ast.Name):
+        assigned, imported = _module_names(path)
+        if node.id in assigned:
+            return _value(assigned[node.id], path, hops + 1)
+        if node.id in imported:
+            src, original = imported[node.id]
+            return _value(ast.Name(id=original), src, hops + 1)
+    raise _Unresolved(ast.unparse(node))
 
 
 def _is_tool_decorator(d: ast.expr) -> bool:
@@ -133,36 +178,54 @@ def _is_tool_decorator(d: ast.expr) -> bool:
     return isinstance(f, ast.Attribute) and f.attr == "tool" and isinstance(f.value, ast.Name) and f.value.id == "mcp"
 
 
-@functools.cache
-def tool_defaults(server_src: Path = _SERVER_SRC) -> dict[str, dict[str, Any]]:
-    """Each hpc-bridge tool's defaults, {tool: {argument: default}}, as its `@mcp.tool` signature in server.py states
-    them — what the server takes for an argument a call leaves out (run_shell's `shape` is "compute"). Arguments with no
-    default, and a default the source does not state as a literal or a module constant, are left out. {} when the
-    source cannot be read: `when_input` then matches the arguments as sent, as it did before."""
-    try:
-        tree = ast.parse(server_src.read_text())
-    except (OSError, SyntaxError, ValueError):
-        return {}
+def _tool_name(deco: ast.expr, fn: ast.FunctionDef | ast.AsyncFunctionDef) -> str:
+    """The tool's name: `@mcp.tool("x")` or `@mcp.tool(name="x")` (FastMCP's first parameter), else the function's."""
+    if isinstance(deco, ast.Call):
+        given = deco.args[0] if deco.args else next((k.value for k in deco.keywords if k.arg == "name"), None)
+        if isinstance(given, ast.Constant) and isinstance(given.value, str):
+            return given.value
+    return fn.name
+
+
+def _read_tool_defaults(server_src: Path) -> dict[str, dict[str, Any]]:
     out: dict[str, dict[str, Any]] = {}
-    for node in tree.body:
+    for node in ast.parse(server_src.read_text()).body:
         if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
             continue
         deco = next((d for d in node.decorator_list if _is_tool_decorator(d)), None)
         if deco is None:
             continue
-        named = next((k.value for k in getattr(deco, "keywords", []) if k.arg == "name"), None)
-        name = named.value if isinstance(named, ast.Constant) and isinstance(named.value, str) else node.name
+        name = _tool_name(deco, node)
         a = node.args
         positional = [*a.posonlyargs, *a.args]
         pairs = [*zip(positional[len(positional) - len(a.defaults):], a.defaults, strict=True),
                  *((k, d) for k, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is not None)]
-        defaults: dict[str, Any] = {}
+        out[name] = {}
         for arg, default in pairs:
-            ok, value = _resolve(default, server_src)
-            if ok:
-                defaults[arg.arg] = value
-        out[name] = defaults
+            try:
+                out[name][arg.arg] = _value(default, server_src)
+            except Exception as exc:  # noqa: BLE001 - one default the reader cannot follow leaves only that one out
+                why = str(exc) if isinstance(exc, _Unresolved) else f"{type(exc).__name__}: {exc}"
+                _warn(f"{name}({arg.arg}=…): default not read ({why}) — when_input matches it only as sent")
+    if not out:
+        _warn(f"no @mcp.tool function in {server_src} — when_input matches the arguments as sent")
     return out
+
+
+@functools.cache
+def tool_defaults(server_src: Path = _SERVER_SRC) -> dict[str, dict[str, Any]]:
+    """Each hpc-bridge tool's defaults, {tool: {argument: default}}, as its `@mcp.tool` signature in server.py states
+    them — what the server takes for an argument a call leaves out (run_shell's `shape` is "compute"). An argument with
+    no default is left out; so is a default the source does not state as a literal, arithmetic on literals or a
+    package constant, with a warning on stderr. Never raises: a source that cannot be read gives {} and a warning, and
+    `when_input` then matches the arguments as sent, as it did before — a hook watcher that raised would end the SDK
+    feed's run, or stop the journal follower (every hook then NEVER FIRED)."""
+    try:
+        return _read_tool_defaults(server_src)
+    except Exception as exc:  # noqa: BLE001 - see above: never a reason a run or its hooks fail
+        _warn(f"could not read the tools' defaults from {server_src} ({type(exc).__name__}: {exc}) — when_input "
+              "matches the arguments as sent")
+        return {}
 
 
 def effective_input(tool: str, inp: dict | None) -> dict:
@@ -170,7 +233,7 @@ def effective_input(tool: str, inp: dict | None) -> dict:
     return {**tool_defaults().get(tool, {}), **(inp or {})}
 
 
-ACTIONS =("cmd", "interrupt", "interject")
+ACTIONS = ("cmd", "interrupt", "interject")
 # What each hpc-bridge tool's answer carries (server.py's return types; test_midrun_hooks pins both to the product's
 # models): a `phase` with these values (ShellOutcome, ConnectResult, LoginStatus, PreauthStatus) — or, for the
 # EndpointStatus tools, a `status` and an `endpoint_id` and no phase.

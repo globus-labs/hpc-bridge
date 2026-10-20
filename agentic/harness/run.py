@@ -1534,7 +1534,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             print("RESULT: RATE_LIMITED — session/rate limit; run not graded, suite should halt")
         elif failed and (infra := infra_reason(
                 outcome_of(operator, res.trace, res.messages, res.final), failed,
-                absences([(r.name, r.detail) for r in world if not r.ok], getattr(scen, "POSTCHECKS", [])))):
+                absences([(r.name, r.detail) for r in [*watched, *world] if not r.ok], getattr(scen, "POSTCHECKS", [])))):
             # The operator did nothing (no tool call of any kind) and its MODEL ENDPOINT's outage is on record (infra.py):
             # not a verdict on hpc-bridge. Its own rc, so a sweep counts it apart.
             rc = INFRA_RC

@@ -666,6 +666,13 @@ def test_an_errored_codex_turn_is_reported_by_its_cause_not_its_last_words(tmp_p
     assert r.final.is_error and r.final.result.startswith("the model endpoint refused the relay's request (HTTP 500")
 
 
+def test_a_turn_the_harness_cut_off_is_reported_by_its_timeout(tmp_path, monkeypatch):
+    # rc 124: run_turn_process's own last stderr line says what the run ended on, not the agent's last prose
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.started"}', rc=124,
+                    stderr="Reading additional input from stdin...\ntimed out after 2700 s", final="Polling again in 30 s.")
+    assert r.final.is_error and r.final.result == "timed out after 2700 s"
+
+
 def test_the_stderr_tail_stays_the_reason_only_when_nothing_better_exists(tmp_path, monkeypatch):
     # no turn.failed and no refused request: the stderr tail, as before; a clean run's final message is its result
     r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}',

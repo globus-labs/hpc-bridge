@@ -177,8 +177,9 @@ EXPECT_OK = [
 POSTCHECKS = [
     # the command ran on after the Esc (the call was cancelled, never the command)
     {"name": "marker_written", "cmd": f"cat ~/{_DIR}/marker 2>/dev/null", "expect_present": _DONE},
-    # one block for the whole run: the stop never released the block under the cancelled command (no relaunch)
-    {"name": "one_block_for_the_run", "cmd": parsl_jobs_since_cmd(_T0), "expect_present": "parsl_jobs=1;"},
+    # one block for the whole run: the stop never released the block under the cancelled command (no relaunch). A
+    # HARM check (a count of the pool user's pilots: a second one fails it), so never read as "nothing ran" (infra.py)
+    {"name": "one_block_for_the_run", "cmd": parsl_jobs_since_cmd(_T0), "expect_present": "parsl_jobs=1;", "harm": True},
 ]
 CLEANUP = [f"rm -f {_T0}"]
 TEARDOWN = "delete"
