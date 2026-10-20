@@ -42,6 +42,8 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
+from .base import ConfigStepFailed
+
 GCE = "globus-compute-endpoint"
 # Where hpc-bridge's venv lives by default, as the login shell expands it: a teardown searches it even when the
 # facility's env_setup is not hpc-bridge's line (emptied or hand-written after the endpoint was started).
@@ -83,6 +85,12 @@ _TOKEN_PREFIX = "hpcb-venv-build-"
 
 class EndpointVenvError(RuntimeError):
     """hpc-bridge could not check or build its endpoint venv. The message says what to do; it is shown as it is."""
+
+
+class EndpointVenvConfigError(EndpointVenvError, ConfigStepFailed):
+    """…because of the configuration's own env_setup: the check did not run past the site's prefix, the build failed
+    (not by running out of time), or the prefix leaves no uv, curl or python3 to build with. What a different env_setup
+    can mend; a venv in the way, an old uv, a slow filesystem or a shadowing texttable stay EndpointVenvError."""
 
 
 # ---------------------------------------------------------------------------------------------- versions and paths
@@ -493,7 +501,7 @@ def _method(s: VenvState, python: str, skipped: str = "") -> str:
         return "uv"
     if s.curl or s.py3:
         return "bootstrap"
-    raise EndpointVenvError(
+    raise EndpointVenvConfigError(  # env_setup's site prefix brings none of them: a module load there would
         f"no uv, no curl and no python3 on the login node, so hpc-bridge cannot build its endpoint venv (Python "
         f"{python}) there. Make uv or python3 available (a site `module load …` before hpc-bridge's line in "
         "env_setup), or prepare a venv with globus-compute-endpoint at HPC_BRIDGE_REMOTE_VENV, then connect_facility "
@@ -669,8 +677,9 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
     what = f"{GCE} {gce or '(latest)'} on Python {python}"
     running, done, mode = True, False, "failed"  # mode: what the cleanup does with a build that did not claim the path
 
-    async def failed(message: str) -> EndpointVenvError:
-        """Move the failed build aside now, so the message says where it really is (if anywhere)."""
+    async def failed(message: str, *, config: bool = False) -> EndpointVenvError:
+        """Move the failed build aside now, so the message says where it really is (if anywhere). `config`: the build
+        failed through the configuration's env_setup (EndpointVenvConfigError)."""
         nonlocal done
         done = True
         kept = None
@@ -680,7 +689,8 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         except Exception:  # noqa: BLE001 - best-effort: it then stays as our .build.* directory
             kept = None
         where = f"The failed build is kept as {kept}." if kept else "Nothing of it was kept."
-        return EndpointVenvError(f"{message} {where} {skipped + '. ' if skipped else ''}Nothing was started or billed.")
+        return (EndpointVenvConfigError if config else EndpointVenvError)(
+            f"{message} {where} {skipped + '. ' if skipped else ''}Nothing was started or billed.")
 
     try:
         rc, out, err = await run("build", _wrap_build(
@@ -693,7 +703,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         if rc != 0:
             when = f"it did not finish within {_BUILD_CAP_S} s" if rc == _TIMED_OUT else _last_line(err, out)
             raise await failed(f"could not build hpc-bridge's endpoint venv for {mv.key} on {host} ({what}): {when}. "
-                               "Fix that, then connect_facility again.")
+                               "Fix that, then connect_facility again.", config=rc != _TIMED_OUT)
         v = await _check(run, mv, host, "verify", b)
         bad = problem(v, gce=gce, python=python)
         if bad == "timed out":
@@ -751,7 +761,7 @@ async def _check(run: Run, mv: ManagedVenv, host: str, step: str, path: str | No
     if "HPCB_VENV_BEGIN" not in out:
         if rc == 255 or not out.strip():
             raise _transport(step, host, rc, out, err)
-        raise EndpointVenvError(
+        raise EndpointVenvConfigError(  # ssh got through and the step stopped before its frame: env_setup's site prefix
             f"the {step} of hpc-bridge's endpoint venv on {host} did not run: {_last_line(err, out)}. Nothing was "
             "started or billed.")
     return parse_check(out)

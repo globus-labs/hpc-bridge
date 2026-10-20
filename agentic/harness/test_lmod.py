@@ -57,11 +57,13 @@ def test_lmod_bootstrap_graders_read_the_plugins_proposal_not_the_agents_fix():
 
 # ---- a details= that failed is not run again (live 2026-10-16) + the SCRIPT that stages it --------------------------
 
-LMOD_ERR = ('hpc-bridge error: RuntimeError: remote configure failed: Lmod has detected the following error: The '
-            'following module(s) are unknown:\n"gcc/10.2.0"\n\nPlease check the spelling or version number.')
-_STAGED_FAILED = {"phase": "failed", "notice": LMOD_ERR + "\nThis configuration (details=) is not kept: "
+_LMOD = ('remote configure failed: Lmod has detected the following error: The following module(s) are unknown:\n'
+         '"gcc/10.2.0"\n\nPlease check the spelling or version number.')
+LMOD_ERR = "hpc-bridge error: RuntimeError: " + _LMOD       # as 7012984 and before answered it
+NEW_ERR = "hpc-bridge error: ConfigStepFailed: " + _LMOD    # as the fixed product answers it (a typed step failure)
+_STAGED_FAILED = {"phase": "failed", "notice": NEW_ERR + "\nThis configuration (details=) is not kept: "
                   "connect_facility('fake-1', ssh_host='login') without details resolves the facility afresh — …"}
-_LEAD = ("The details= given earlier for 'fake-1' failed to come up (" + " ".join(LMOD_ERR.split()) + ") and is not "
+_LEAD = ("The details= given earlier for 'fake-1' failed to come up (" + " ".join(NEW_ERR.split()) + ") and is not "
          "kept: this connect did not run it. ")
 _FRESH = {"phase": "proposed_facility_details", "notice": _LEAD + "probed the login node and proposed this config — …",
           "proposed_details": {"ssh_host": "login", "interface": "eth0", "env_setup": MODULE_SETUP,
@@ -100,12 +102,15 @@ class _ScriptOps:
         return Trace([ToolCall.of(f"mcp__hpc_bridge__{t}", a, r) for t, a, r in self.calls], self.texts)
 
 
-def _gated_failures(sc, t):
-    """Every grader that gates this scenario and a trace decides (the floors and world rows are run.py's), with
-    `first_details_connect_succeeds` where run.py's rule adds it (`first_bring_up_had_details`): the failing ones."""
-    from invariants import first_bring_up_had_details
-    results = {r.name: r for r in check_all(t)} | {r.name: r for r in (fn(t) for fn in sc.EXTRA_INVARIANTS)}
-    gated = set(sc.EXPECT_OK) | ({"first_details_connect_succeeds"} if first_bring_up_had_details(t) else set())
+def _gated_failures(sc, t, operator="script"):
+    """Every grader that gates this scenario and a trace decides (the floors and world rows are run.py's), as run.py
+    builds them: the #39 row judged past a scripted run's staged failures, and gated by its rule
+    (`first_bring_up_had_details`) — the failing ones."""
+    from invariants import first_bring_up_had_details, regrade_staged, staged_connects
+    staged = staged_connects(t, sc, operator)
+    rows = regrade_staged(check_all(t), t, staged) + [fn(t) for fn in sc.EXTRA_INVARIANTS]
+    results = {r.name: r for r in rows}
+    gated = set(sc.EXPECT_OK) | ({"first_details_connect_succeeds"} if first_bring_up_had_details(t, staged) else set())
     return {n: results[n].detail for n in gated if not results[n].ok}
 
 
@@ -113,7 +118,6 @@ def test_the_lmod_script_stages_the_failure_then_brings_the_fresh_proposal_up():
     import asyncio
 
     import lmod_bootstrap as sc
-    from invariants import STAGED_FAILURE, first_bring_up_had_details, first_details_connect_succeeds
     ops = _ScriptOps({"connect_facility": [_STAGED_FAILED, _FRESH, {"phase": "provisioning"}, _UP],
                       "ensure_endpoint_up": [{"status": "provisioning"}, {"status": "up"}],
                       "run_shell": [_HOSTNAME],
@@ -123,7 +127,7 @@ def test_the_lmod_script_stages_the_failure_then_brings_the_fresh_proposal_up():
     tools = [t for t, _a, _r in ops.calls]
     assert tools == ["connect_facility"] * 4 + ["ensure_endpoint_up"] * 2 + ["run_shell"] + ["stop_endpoint"] * 2
     staged = ops.calls[0][1]["details"]
-    assert staged["env_setup"] == "module load gcc/10.2.0" and staged["display_name"] == STAGED_FAILURE
+    assert staged["env_setup"] == "module load gcc/10.2.0" and "display_name" not in staged   # no product field marks it
     assert "details" not in ops.calls[1][1]                                     # the connect without details
     confirm = ops.calls[2][1]["details"]
     assert "env_setup" not in confirm and confirm["partition"] == "debug" and "walltime" not in confirm
@@ -132,16 +136,44 @@ def test_the_lmod_script_stages_the_failure_then_brings_the_fresh_proposal_up():
     assert ops.calls[6][1] == {"shape": "compute", "command": "hostname; module list 2>&1 | tail -3"}
     assert "'down'" in final and "uv/0.12.9" in ops.texts[-1]
     t = ops.trace()
-    # the #39 gate judges the confirmed proposal's bring-up (call 2), not the staged failure — and still gates
-    assert first_bring_up_had_details(t) and "call 2" in first_details_connect_succeeds(t).detail
-    assert _gated_failures(sc, t) == {}
+    assert _gated_failures(sc, t) == {}        # every gate, the #39 rule's included (judged at the confirm, call 2)
+    # under any other operator the staged call is an ordinary first bring-up: the gate judges it, and it failed
+    assert "first_details_connect_succeeds" in _gated_failures(sc, t, operator="hermes21")
+
+
+def test_the_staged_failure_is_the_scenarios_and_the_script_operators_alone():
+    from types import SimpleNamespace
+
+    from invariants import first_bring_up_had_details, first_details_connect_succeeds, staged_connects
+
+    def conn(result, details):
+        return ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": details}, result)
+    d = {"ssh_host": "login", "env_setup": "module load gcc/10.2.0"}
+    failed = {"phase": "failed", "notice": NEW_ERR}
+    scen = SimpleNamespace(STAGED_FAILED_CONNECTS=(0,))
+    t = Trace([conn(failed, d), conn({"phase": "provisioning"}, d)])
+    assert staged_connects(t, scen, "script") == frozenset({0})
+    # nothing an agent sends earns it: other operators, or a scenario that declares none, pass over nothing
+    for op in ("claude", "hermes21", "codex", "pi", "claude-acp", None):
+        assert staged_connects(t, scen, op) == frozenset()
+    assert staged_connects(t, SimpleNamespace(), "script") == frozenset()
+    skip = staged_connects(t, scen, "script")
+    assert first_bring_up_had_details(t, skip) and first_details_connect_succeeds(t, skip).ok
+    assert "staged failure at call 0 passed over" in first_details_connect_succeeds(t, skip).detail
+    # passed over, the next bring-up is judged — its failure still fails the gate
+    t2 = Trace([conn(failed, d), conn(failed, d)])
+    assert not first_details_connect_succeeds(t2, staged_connects(t2, scen, "script")).ok
+    # a staged call that did NOT fail is an ordinary bring-up, judged as one
+    t3 = Trace([conn({"phase": "provisioning"}, d)])
+    assert staged_connects(t3, scen, "script") == frozenset()
+    # and an agent's own failed first details= (2026-10-16) is judged as before
+    assert not first_details_connect_succeeds(t).ok
 
 
 def test_the_lmod_script_aborts_on_a_build_that_runs_the_failed_details_again():
     import asyncio
 
     import lmod_bootstrap as sc
-    import pytest
     import script_runner
     rerun = {"phase": "failed", "notice": LMOD_ERR}            # 7012984: the connect without details ran it again
     ops = _ScriptOps({"connect_facility": [{"phase": "failed", "notice": LMOD_ERR}, rerun]})
@@ -167,48 +199,86 @@ def test_the_lmod_script_aborts_when_a_premise_fails(answers, match):
         asyncio.run(sc.SCRIPT(_ScriptOps({"connect_facility": answers})))
 
 
-def test_failed_details_not_rerun_reads_the_live_bug_and_spares_a_retry_by_design():
-    import lmod_bootstrap as sc
+def _conn(result, details=None, facility="f"):
+    return ToolCall.of("mcp__endpoint__connect_facility",
+                       {"facility": facility, "ssh_host": "login", **({"details": details} if details else {})}, result)
 
-    def conn(result, details=None):
-        return ToolCall.of("mcp__endpoint__connect_facility",
-                           {"facility": "f", "ssh_host": "login", **({"details": details} if details else {})}, result)
-    d = {"ssh_host": "login", "env_setup": "module load gcc/10.2.0"}
-    failed = {"phase": "failed", "notice": LMOD_ERR}
+
+_D = {"ssh_host": "login", "env_setup": "module load gcc/10.2.0"}
+
+
+def test_failed_details_not_rerun_reads_the_live_bug():
+    import lmod_bootstrap as sc
+    old = {"phase": "failed", "notice": LMOD_ERR}
     # the live run (hermes21, 1792183016): call 0's failure answered again by the connect without details — with, in
     # between, a details= the harness rejected (never reached the server) and one refused unread (no env_setup)
-    assert not sc.failed_details_not_rerun(Trace([conn(failed, d), conn(failed)])).ok
-    rejected = conn({"error": "failed argument validation: 'partition' is a required property"}, {"ssh_host": "login"})
-    refused = conn({"phase": "failed", "notice": "details= has no env_setup and there is no proposal for this "
-                    "facility to take it from. …"}, {"ssh_host": "login", "partition": "debug"})
-    r = sc.failed_details_not_rerun(Trace([conn(failed, d), rejected, refused, conn(failed)]))
+    assert not sc.failed_details_not_rerun(Trace([_conn(old, _D), _conn(old)])).ok
+    rejected = _conn({"error": "failed argument validation: 'partition' is a required property"}, {"ssh_host": "login"})
+    refused = _conn({"phase": "failed", "notice": "details= has no env_setup and there is no proposal for this "
+                     "facility to take it from. …"}, {"ssh_host": "login", "partition": "debug"})
+    r = sc.failed_details_not_rerun(Trace([_conn(old, _D), rejected, refused, _conn(old)]))
     assert not r.ok and "(call 3)" in r.detail and "at call 0" in r.detail
+    # a fixed build that claimed the drop and ran it all the same is caught by its own claim
+    assert not sc.failed_details_not_rerun(Trace([_conn(_STAGED_FAILED, _D),
+                                                  _conn({"phase": "failed", "notice": NEW_ERR})])).ok
     # fixed: the connect without details proposes afresh, or opens any answer with what failed
-    assert sc.failed_details_not_rerun(Trace([conn(failed, d), conn(_FRESH)])).ok
-    assert sc.failed_details_not_rerun(Trace([conn(failed, d), conn({"phase": "failed", "notice": _LEAD + "x"})])).ok
-    # a details= in between starts over; the agent's own retry of the same details= is its call, not a rerun
-    assert sc.failed_details_not_rerun(Trace([conn(failed, d), conn(failed, d)])).ok
-    assert sc.failed_details_not_rerun(Trace([conn(failed, d), conn({"phase": "provisioning"}, d), conn(failed)])).ok
-    # a failure outside the config is kept for the retry its notice asks for: the same answer again is by design
-    reach = {"phase": "failed", "notice": "CANNOT REACH login: ssh: connect to host login port 22: Connection refused."}
-    assert sc.failed_details_not_rerun(Trace([conn(reach, d), conn(reach)])).ok
+    assert sc.failed_details_not_rerun(Trace([_conn(_STAGED_FAILED, _D), _conn(_FRESH)])).ok
+    assert sc.failed_details_not_rerun(Trace([_conn(_STAGED_FAILED, _D),
+                                              _conn({"phase": "failed", "notice": _LEAD + "x"})])).ok
+    # the agent's own retry of the same details= is its call, not a rerun; a details= in between starts over
+    assert sc.failed_details_not_rerun(Trace([_conn(old, _D), _conn(old, _D)])).ok
+    assert sc.failed_details_not_rerun(Trace([_conn(old, _D), _conn({"phase": "provisioning"}, _D), _conn(old)])).ok
     assert sc.failed_details_not_rerun(Trace([])).ok
 
 
-def test_the_staged_failure_marker_hides_only_a_failure_the_script_staged():
-    from invariants import STAGED_FAILURE, first_bring_up_had_details, first_details_connect_succeeds
+@pytest.mark.parametrize("first", [
+    # (a) a config that CAME UP but whose allocation listing failed: proven, kept on purpose
+    {"phase": "failed", "notice": "allocation discovery ('mybalance') failed: mybalance: command timed out"},
+    # (b) the teardown-still-running refusal (it asks for connect_facility again)
+    {"phase": "failed", "notice": "a teardown of the current endpoint is still running on its login node. Call "
+                                  "teardown_endpoint to wait for it (it reports 'down' when done), then connect_facility "
+                                  "again."},
+    # (c) the Globus login (the product keeps the config: login_expired)
+    {"phase": "failed", "notice": "hpc-bridge error: LoginExpiredError: the stored Globus login has expired — Globus "
+                                  "refused to refresh it. Nothing is wrong with the facility or its config: …"},
+    # failures outside the config, kept for the retry their notices ask for
+    {"phase": "failed", "notice": "CANNOT REACH login: ssh: connect to host login port 22: Connection refused."},
+    {"phase": "failed", "notice": "hpc-bridge error: RuntimeError: remote configure failed: Connection to login closed "
+                                  "by remote host."},
+    {"phase": "failed", "notice": "hpc-bridge error: RuntimeError: remote configure failed: pip: Read timed out."},
+    # a typed failure the product KEPT (a config equal to the one proven for the host): no claim, so no drop
+    {"phase": "failed", "notice": NEW_ERR},
+])
+def test_failed_details_not_rerun_spares_every_retry_the_product_keeps_on_purpose(first):
+    import lmod_bootstrap as sc
+    assert sc.failed_details_not_rerun(Trace([_conn(first, _D), _conn(first)])).ok
 
-    def conn(result, details):
-        return ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": details}, result)
-    staged = {"ssh_host": "login", "env_setup": "module load gcc/10.2.0", "display_name": STAGED_FAILURE}
-    plain = {"ssh_host": "login", "env_setup": "module load gcc/10.2.0"}
-    failed = {"phase": "failed", "notice": LMOD_ERR}
-    # passed over: the first bring-up judged is the one after it, and a failure there still fails the gate
-    t = Trace([conn(failed, staged), conn({"phase": "provisioning"}, plain)])
-    assert first_bring_up_had_details(t) and first_details_connect_succeeds(t).ok
-    assert not first_details_connect_succeeds(Trace([conn(failed, staged), conn(failed, plain)])).ok
-    # an unmarked failure (an agent's made-up line, as on 2026-10-16) still fails it: nothing is weakened
-    assert not first_details_connect_succeeds(Trace([conn(failed, plain), conn({"phase": "provisioning"}, plain)])).ok
-    # a marked call that did NOT fail is an ordinary bring-up: judged as one
-    t = Trace([conn({"phase": "provisioning"}, staged)])
-    assert first_bring_up_had_details(t) and "call 0" in first_details_connect_succeeds(t).detail
+
+def test_failed_details_not_rerun_forgets_a_drop_once_the_facility_came_up_another_way():
+    # (d) a failed details=, then a connect without details that comes up on the registry's or the cache's config (the
+    # product forgets the drop then), then a later failure of THAT config — every Lmod error shares a long opening
+    import lmod_bootstrap as sc
+    other = {"phase": "failed", "notice": "hpc-bridge error: ConfigStepFailed: remote configure failed: Lmod has "
+                                          "detected the following error: The following module(s) are unknown: \"x\""}
+    t = Trace([_conn(_STAGED_FAILED, _D), _conn({"phase": "needs_account"}), _conn(other)])
+    assert sc.failed_details_not_rerun(t).ok
+    # and the match runs past the shared opening: a different module is a different failure
+    t2 = Trace([_conn({"phase": "failed", "notice": LMOD_ERR}, _D),
+                _conn({"phase": "failed", "notice": LMOD_ERR.replace("gcc/10.2.0", "python/3.13")})])
+    assert sc.failed_details_not_rerun(t2).ok
+
+
+def test_the_graders_words_are_the_products():
+    # the scenario keeps a copy of notices._NOT_THE_CONFIG_WORDS (it does not import the product): read the product's
+    # from THIS tree's source (a bare pytest in a worktree imports main's installed copy), so the two cannot drift
+    import ast
+    import re
+
+    import lmod_bootstrap as sc
+    src = (HERE.parents[1] / "src" / "hpc_bridge" / "notices.py").read_text()
+    node = next(n for n in ast.walk(ast.parse(src)) if isinstance(n, ast.Assign)
+                and any(isinstance(tg, ast.Name) and tg.id == "_NOT_THE_CONFIG_WORDS" for tg in n.targets))
+    call = node.value
+    assert isinstance(call, ast.Call) and isinstance(call.args[0], ast.Constant)
+    assert sc.NOT_THE_CONFIG_WORDS.pattern == call.args[0].value
+    assert sc.NOT_THE_CONFIG_WORDS.flags & re.IGNORECASE and ast.unparse(call.args[1]) == "re.IGNORECASE"

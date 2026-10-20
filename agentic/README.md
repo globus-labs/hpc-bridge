@@ -137,12 +137,12 @@ HPCB_RELAUNCH_PHASE=first HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFIL
 HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh lmod_bootstrap
 ```
 `lmod_bootstrap`'s SCRIPT stages the 2026-10-16 Hermes run (fake `lmod`): `details=` with `module load gcc/10.2.0`
-(marked `invariants.STAGED_FAILURE`) must fail on the login node naming the module; the connect without details after
-it must answer a FRESH proposal — module-based, its own line, opening with what failed — or the cell aborts (a build
-that runs the failed config again aborts there). It then confirms the proposal, brings up the login shape and a block,
-runs `hostname; module list` on the compute node and stops. Agent operators run the cell's prompt as before; on every
-operator the gated `failed_details_not_rerun` fails a connect without details that answers a failed `details=`'s own
-failure again.
+(its first `connect_facility`, declared in the scenario's `STAGED_FAILED_CONNECTS`) must fail on the login node naming
+the module; the connect without details after it must answer a FRESH proposal — module-based, its own line, opening
+with what failed — or the cell aborts (a build that runs the failed config again aborts there). It then confirms the
+proposal, brings up the login shape and a block, runs `hostname; module list` on the compute node and stops. Agent
+operators run the cell's prompt as before; on every operator the gated `failed_details_not_rerun` fails a connect
+without details that answers again the failure of a `details=` the product dropped.
 `queued_check_relaunch` (fake, Slurm: `default` or `site`) brings the login shape up from the probe's proposal. Phase
 `first`: every pilot is held PENDING by an `#SBATCH --begin` hold (on idle fake nodes the worker answers the canary
 within ~5 s of the sbatch), it confirms a compute block, polls `squeue` on the login shape until its pilot is queued,
@@ -456,9 +456,10 @@ endpoint … in list output") in practically every run, and the retry already re
 still tolerate that form (phase-keyed; the `reused` FIELD only). `first_details_connect_succeeds` now GATES every
 run whose first bring-up connect carried `details=` (run.py and regrade.py apply the rule). It stays report-only
 for a cache or catalog first connect. In the stored bundles, every verdict it flips is a pre-#72 run that hit #39.
-A connect a SCRIPT stages to fail carries `invariants.STAGED_FAILURE` as its details' `display_name`; the grader
-passes over such a call only when it failed, and judges the first bring-up after it (no prompt names the marker, so
-an agent's own failed `details=` is judged as before).
+A connect a SCRIPT stages to fail is declared by its scenario (`STAGED_FAILED_CONNECTS`: ordinals among its
+`connect_facility` calls); run.py and regrade.py pass over such a call (`invariants.staged_connects`) only under the
+script operator and only when it failed, and the gate judges the first bring-up after it. No tool argument carries it,
+so nothing an agent sends can earn it: an agent's own failed `details=` is judged as before.
 
 ## Stranger, login & refusal scenarios — and the model sweep (2026-09-03)
 

@@ -16,8 +16,17 @@ from typing import Literal
 
 from . import config
 from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
-from .context import AppCtx, LeftBlock, SentCheck, ShapeRuntime, _has_login_shape, _idle_release_s
+from .context import (
+    AppCtx,
+    DroppedConfigError,
+    LeftBlock,
+    SentCheck,
+    ShapeRuntime,
+    _has_login_shape,
+    _idle_release_s,
+)
 from .cost import _block_nodes, _with_spend
+from .facility.base import ConfigStepFailed
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
@@ -65,8 +74,13 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     raw = str(exc)
     # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
     # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
-    if type(exc).__name__ in ("RemoteTokenStoreExists", "EndpointVenvError"):
+    # By name along the class's line, so a subclass (EndpointVenvConfigError) is one too.
+    if any(c.__name__ in ("RemoteTokenStoreExists", "EndpointVenvError") for c in type(exc).__mro__):
         return raw
+    if isinstance(exc, ConfigStepFailed):
+        # ssh got through and the login node ran the step: a "Permission denied" or "Connection refused" in its words
+        # is the configuration's (a file env_setup sources, a server it calls), never sshd's or the login host's
+        return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -125,18 +139,28 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
     return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
 
-# The explanations above whose cause lies outside the configuration being brought up: SSH itself (refused, unreachable,
-# a host key not trusted or revoked, the local socket path), a login node that did not answer in time, its filesystem
-# refusing a write. Each asks for connect_facility again once that is fixed, and that call runs the same configuration
-# again — connect keeps a details= one for it (connect._drop_failed_details drops only the others).
-_OUTSIDE_THE_CONFIG = ("NO SSH ACCESS", "REVOKED HOST KEY", "UNKNOWN HOST KEY", "REMOTE FILESYSTEM", "CANNOT REACH",
-                       "TIMED OUT", "hpc-bridge error: the SSH ControlMaster socket path")
+# Words that make a step that ran the configuration fail for something else: the network or a timeout (a pip or a
+# license server env_setup calls that did not answer in time), the Globus service, an ssh connection lost under the
+# step, an endpoint still registering, a full disk or quota. The same configuration may come up on the next try, so it
+# is kept. (agentic/scenarios/lmod_bootstrap.py keeps a copy for its grader; a hermetic test holds the two equal.)
+_NOT_THE_CONFIG_WORDS = re.compile(
+    r"timed? ?out|globus_sdk|globus ?api ?error|globus ?connection ?error|auth\.globus\.org|api\.globus\.org"
+    r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
+    r"|ssh: connect to host|could not find endpoint|no space left on device|disk quota exceeded",
+    re.IGNORECASE,
+)
 
 
-def _failure_outside_config(exc: BaseException, notice: str) -> bool:
-    """A bring-up failure (`notice`: `_explain_provision_error`'s for `exc`) that says nothing about the configuration:
-    the Globus login, or one of `_OUTSIDE_THE_CONFIG`. Every other failure ran the configuration on the login node."""
-    return login_expired(exc) or notice.startswith(_OUTSIDE_THE_CONFIG)
+def _failure_of_the_config(exc: BaseException) -> bool:
+    """Did the configuration being brought up fail on the login node? Decided POSITIVELY: only a step that ran through
+    its env_setup and was refused there (`ConfigStepFailed`: configure, start, list, the endpoint venv's check or
+    build — never ssh's own exit status 255) whose words name none of `_NOT_THE_CONFIG_WORDS`. Everything else says
+    nothing about the configuration and connect keeps it, for the retry its answer asks for: ssh refused or
+    unreachable, a host key, the socket path, a timeout, the Globus service (the manager check's web error), the Globus
+    login, an endpoint still registering, a write the remote filesystem refused, a token store hpc-bridge will not
+    replace, a venv in the way or an old uv."""
+    return (isinstance(exc, ConfigStepFailed) and not login_expired(exc)
+            and not _NOT_THE_CONFIG_WORDS.search(str(exc)))
 
 def _local_dill() -> str | None:
     try:
@@ -1361,6 +1385,8 @@ def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
 def _hpc_bridge_error(exc: BaseException) -> str:
     """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
     renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
+    if isinstance(exc, DroppedConfigError):  # its text is the whole answer: the dropped config, and what to do instead
+        return str(exc)
     if login_expired(exc):
         # the gate before a bootstrap raised it: no SSH was made and nothing was copied or started
         gated = " Nothing was started, and no login was copied to the login node." \

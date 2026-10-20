@@ -11,26 +11,28 @@ itself. A block that comes up and runs `hostname` proves the second (`compute_ra
 Autonomous: the agent accepts discovered config; if the proposal is wrong it may correct env_setup, but the graders
 read the PLUGIN's proposal (the proposed_facility_details result), so a fix by the agent does not mask a bad proposal.
 
-A details= whose bring-up failed is never run again by a connect without details (`failed_details_not_rerun`). Live
-2026-10-16 (free sweep, hermes21, run 1792183016): the agent's FIRST connect carried a made-up env_setup (`module load
-gcc/10.2.0`), the remote configure failed with Lmod's "module(s) are unknown", and the connect without details that
-the next refusal's advice named answered the same Lmod error: the session had kept the unproven entry and re-ran it.
+A details= whose bring-up failed on the login node is never run again by a connect without details
+(`failed_details_not_rerun`). Live 2026-10-16 (free sweep, hermes21, run 1792183016): the agent's FIRST connect carried
+a made-up env_setup (`module load gcc/10.2.0`), the remote configure failed with Lmod's "module(s) are unknown", and the
+connect without details that the next refusal's advice named answered the same Lmod error: the session had kept the
+unproven entry and re-ran it.
 
 Scripted too (HPCB_OPERATOR=script, harness/script_runner.py), to stage exactly that with no model:
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh lmod_bootstrap
 
-The SCRIPT sends that made-up `module load` first (details= marked `invariants.STAGED_FAILURE`, so the #39 gate judges
-the first bring-up after it), aborts unless it fails on the login node naming the module, then connects without
-details and aborts unless the answer is a FRESH proposal — module-based, its own line, opening with what failed (a
-build that runs the failed details= again, 7012984 and before, aborts here). It confirms the proposal (env_setup left
-out: the server keeps the proposed line), waits for the login shape, confirms spend on the first non-GPU allocation,
-waits for the block, runs `hostname; module list` on it and stops the endpoint. Every grader the scenario gates holds
-for such a run.
+The SCRIPT sends that made-up `module load` first — its first connect_facility, declared in STAGED_FAILED_CONNECTS, so
+under the script operator the #39 gate judges the first bring-up after it (invariants.staged_connects) — aborts unless
+it fails on the login node naming the module, then connects without details and aborts unless the answer is a FRESH
+proposal — module-based, its own line, opening with what failed (a build that runs the failed details= again, 7012984
+and before, aborts here). It confirms the proposal (env_setup left out: the server keeps the proposed line), waits for
+the login shape, confirms spend on the first non-GPU allocation, waits for the block, runs `hostname; module list` on
+it and stops the endpoint. Every grader the scenario gates holds for such a run.
 """
+import re
 import time
 
-from invariants import STAGED_FAILURE, Result, Trace, compute_ran
+from invariants import Result, Trace, compute_ran
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)
@@ -91,11 +93,21 @@ def module_reinit_in_env_setup(t: Trace) -> Result:
     return Result("module_reinit_in_env_setup", ok, "ok" if ok else f"proposal(s) assume `module` exists: {[p[:80] for p in props]}")
 
 
-# A failed bring-up of a details= config whose cause is outside it (SSH, the network, a timeout): the product KEEPS that
-# config for the retry the notice asks for, so a connect without details may meet the same failure again, rightly.
-_KEPT_FOR_RETRY = ("UNKNOWN HOST KEY", "REVOKED HOST KEY", "NO SSH ACCESS", "CANNOT REACH", "REMOTE FILESYSTEM",
-                   "TIMED OUT", "hpc-bridge error: the SSH ControlMaster")
-
+# The product's own claim that it dropped a details= config whose bring-up failed (connect._drop_failed_details).
+_NOT_KEPT = "This configuration (details=) is not kept"
+# Builds without that claim (7012984 and before), which typed no step failure: the live bug's class — the remote
+# configure that ran env_setup and failed — by its words.
+_OLD_CONFIGURE_FAILED = "RuntimeError: remote configure failed:"
+# hpc-bridge's notices._NOT_THE_CONFIG_WORDS, copied (a scenario does not import the product; test_lmod.py holds the two
+# equal): a failure in these words was the network's, a timeout's, Globus's, a lost connection's, a full disk's — the
+# product keeps that config for a retry, rightly.
+NOT_THE_CONFIG_WORDS = re.compile(
+    r"timed? ?out|globus_sdk|globus ?api ?error|globus ?connection ?error|auth\.globus\.org|api\.globus\.org"
+    r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
+    r"|ssh: connect to host|could not find endpoint|no space left on device|disk quota exceeded",
+    re.IGNORECASE,
+)
+_MATCH = 200   # how much of a failure's opening a later answer must repeat to be "the same failure"
 
 # A details= the server refused before taking it as the session's config (the login gate, a bad host, no env_setup to
 # take, invalid details): it replaced nothing, so the config before it is still the session's.
@@ -110,25 +122,42 @@ def _took_details(c) -> bool:
             and not str(r.get("notice") or "").startswith(_REFUSED_UNREAD))
 
 
+def _dropped_failure(notice: str) -> str | None:
+    """The opening of a details= failure the product must not run again by a connect without details, else None: one
+    it says it dropped (`_NOT_KEPT`), or on a build before that claim a configure failure in none of
+    NOT_THE_CONFIG_WORDS. Never a failure it keeps on purpose — a proven config's, an allocation listing's (the config
+    came up), a teardown still running, the Globus login, ssh's, the network's."""
+    if _NOT_KEPT in notice:
+        return notice.split(_NOT_KEPT)[0].strip()[:_MATCH]
+    if _OLD_CONFIGURE_FAILED in notice and not NOT_THE_CONFIG_WORDS.search(notice):
+        return notice[:_MATCH]
+    return None
+
+
 def failed_details_not_rerun(t: Trace) -> Result:
-    """No connect without details= answers the very failure of a details= bring-up of the same facility before it (the
-    live bug: the session kept the unproven config and ran it again); a details= the server took in between starts
-    over (one it refused unread, or a call that never reached it, does not). A failure outside the config
-    (`_KEPT_FOR_RETRY`) is retried as it is by design, and does not count."""
-    failed: dict[str, tuple[int, str]] = {}   # facility -> (call, the failure's opening) of its last failed details=
+    """No connect without details= answers the very failure (its first `_MATCH` characters) of a details= bring-up of
+    the same facility that the product dropped (`_dropped_failure`) — the live bug: the session kept the unproven
+    config and ran it again. A details= the server took in between starts over (one it refused unread, or a call that
+    never reached it, does not); so does a connect without details that came up (needs_account): the product forgets
+    the dropped config then, and a later failure of the config it came up on is that config's."""
+    failed: dict[str, tuple[int, str]] = {}   # facility -> (call, the failure's opening) of its dropped details=
     for i, c in t.named("connect_facility"):
         fid, r = str(c.input.get("facility") or ""), c.result or {}
         notice = " ".join(str(r.get("notice") or "").split())
+        phase = str(r.get("phase"))
         if c.input.get("details"):
             if not _took_details(c):
                 continue
             failed.pop(fid, None)
-            if str(r.get("phase")) == "failed" and notice and not notice.startswith(_KEPT_FOR_RETRY):
-                failed[fid] = (i, notice[:80])
-        elif fid in failed and str(r.get("phase")) == "failed" and notice.startswith(failed[fid][1]):
+            opening = _dropped_failure(notice) if phase == "failed" else None
+            if opening:
+                failed[fid] = (i, opening)
+        elif phase == "needs_account":
+            failed.pop(fid, None)
+        elif fid in failed and phase == "failed" and notice.startswith(failed[fid][1]):
             return Result("failed_details_not_rerun", False,
                           f"connect_facility without details (call {i}) answered the failure of the details= at call "
-                          f"{failed[fid][0]} again — it ran that config again: {failed[fid][1]!r}")
+                          f"{failed[fid][0]} again — it ran that config again: {failed[fid][1][:120]!r}")
     return Result("failed_details_not_rerun", True, "ok")
 
 
@@ -147,6 +176,9 @@ EXPECT_OK = [
     "stop_confirmed_or_retried",
 ]
 TEARDOWN = "delete"
+# The SCRIPT's first connect_facility fails on purpose (a made-up module): under the script operator, run.py and
+# regrade.py pass over it for the #39 gate (invariants.staged_connects). Agent runs are graded as before.
+STAGED_FAILED_CONNECTS = (0,)
 
 
 # --- the script operator's run (harness/script_runner.py) -------------------------------------------------------------
@@ -164,9 +196,9 @@ def _brief(r: dict) -> str:
 
 
 def staged_details(host: str) -> dict:
-    """The staged failure: a config with a made-up `module load` before any proposal, marked STAGED_FAILURE."""
+    """The staged failure (STAGED_FAILED_CONNECTS): a config with a made-up `module load`, before any proposal."""
     return {"ssh_host": host, "interface": "eth0", "scratch_root": "/home/{user}/.hpc-bridge", "partition": "debug",
-            "env_setup": STAGED_ENV_SETUP, "display_name": STAGED_FAILURE}
+            "env_setup": STAGED_ENV_SETUP}
 
 
 def _proposal_details(r: dict) -> dict:
@@ -199,7 +231,7 @@ def fresh_proposal_problem(r: dict) -> str | None:
 
 async def SCRIPT(ops) -> str:   # the script operator runs it (harness/script_runner.py)
     fid, host = ops.facility, ops.ssh_host
-    # 1. the staged failure: what the agent sent first on 2026-10-16
+    # 1. the staged failure (STAGED_FAILED_CONNECTS): what the agent sent first on 2026-10-16
     bad = await ops.call("connect_facility", facility=fid, ssh_host=host, details=staged_details(host))
     if bad.get("phase") != "failed" or STAGED_MODULE not in str(bad.get("notice") or ""):
         ops.abort(f"the staged env_setup did not fail on the login node naming {STAGED_MODULE}: "

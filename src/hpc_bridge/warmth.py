@@ -46,6 +46,7 @@ from .context import (
     DEFAULT_SHAPE,
     AppCtx,
     DeadPilot,
+    DroppedConfigError,
     LeftBlock,
     SentCheck,
     ShapeRuntime,
@@ -613,7 +614,14 @@ async def _provision(
     NOTHING until spend is acknowledged (confirm_spend=True, or confirmed for the block that is still up — a reaped
     block voids it, and the call that finds the reap stops even with confirm_spend=True).
     The carve-out only applies to billable shapes — a login (LocalProvider) shape is free and
-    provisions straight through."""
+    provisions straight through.
+
+    A bound facility whose configuration connect dropped (`AppCtx.dropped_binding`) is never bootstrapped: refused
+    first, before any spend or state changes — ensure_endpoint_up and run_shell would otherwise run that config
+    again."""
+    if (app.state.endpoint_id is None and app.dropped_binding is not None
+            and app.dropped_binding[0] is app.facility):
+        raise DroppedConfigError(app.dropped_binding[1])
     rt = _shape_runtime(app, shape)
     _check_reaped(app, shape, rt)
     if rt.reaped is not None and not rt.reap_told:

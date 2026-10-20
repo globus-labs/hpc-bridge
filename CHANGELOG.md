@@ -6,27 +6,41 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
-- **A configuration you gave that failed to come up is no longer run again when you connect without it.** In the
+- **A configuration you gave that failed on the login node is no longer run again unless you give it again.** In the
   October free sweep (`lmod_bootstrap`, the fake Lmod cluster, Hermes), the agent's first `connect_facility` carried
   a made-up `env_setup` (`module load gcc/10.2.0`) and the login node refused it ("Lmod has detected the following
   error: The following module(s) are unknown"). The next answer told it to call `connect_facility(…, ssh_host=…)`
   without `details=` for a proposed configuration; it did, and got the same Lmod error back: hpc-bridge had kept the
   configuration for the session before it was ever proven, and the connect without `details=` ran it again. Now a
-  `details=` configuration whose bring-up fails on the login node before it ever came up is dropped, and the
-  failure's answer says so: a connect without `details=` resolves the facility afresh — the registry's entry if it
-  lists the id, else a configuration already proven for that host, else a probe of the login node that proposes one
-  (with no `ssh_host`, the host the dropped configuration named) — and never runs the dropped one; to retry it as it
-  is, give the same `details=` again. Every answer to such a connect opens with what failed ("The details= given
-  earlier for '…' failed to come up (…) and is not kept: this connect did not run it."), until a new `details=`
-  replaces it or the facility comes up. The dropped configuration is never written to the local facility cache.
-  Unchanged: a bring-up still coming up (`provisioning`) keeps being polled by a connect without `details=`; a
-  configuration that came up is reused (the zero-SSH reconnect), even if a later bring-up of it fails; a failure
-  outside the configuration — SSH refused, a host unreachable, an unknown or revoked host key, a timeout, the remote
-  filesystem, the Globus login — keeps it, since those answers ask for `connect_facility` again once the cause is
-  fixed; a one-time-code handoff resumes it; a registry entry is never dropped. The two refusals of a `details=`
-  without `env_setup` now say what a connect without `details=` does from where the session stands: it resolves the
-  facility afresh, or, while the session keeps a configuration for it, reconnects with that one and proposes nothing
-  (they used to promise a proposal in both cases).
+  `details=` configuration that the login node itself refused, before it ever came up, is dropped. That is decided
+  from what failed, never guessed from its words: a step that ran through the configuration's `env_setup` —
+  `globus-compute-endpoint configure`, `start` or `list`, or the check or build of hpc-bridge's endpoint venv after
+  the site's prefix — and was refused there (any exit status but ssh's own 255), unless its words name a timeout, the
+  network, Globus, a lost ssh connection, an endpoint still registering or a full disk or quota. Everything else
+  keeps the configuration, for the retry its answer asks for: ssh refused or unreachable, an unknown or revoked host
+  key, a timeout, the Globus service or login, a home directory that refused a write, a token store hpc-bridge will
+  not replace, a venv in the way, an old uv. So a poll of a bring-up still coming up no longer loses it to a slow
+  registration, a 503 or a dropped connection; and a failure the configuration causes whose words mention
+  "Permission denied" or "Connection refused" (a file `env_setup` sources, a license server it calls) is now said as
+  the login node's answer, not as NO SSH ACCESS or CANNOT REACH, and drops it. The failure's answer says what happens
+  next, in one piece with any "connect_facility again" before it: without `details=`, `connect_facility(…,
+  ssh_host=…)` resolves the facility afresh — the registry's entry if it lists the id, else a configuration already
+  proven for that host, else a probe of the login node that proposes one (with no `ssh_host`, the host the dropped
+  configuration named) — and does not run the dropped one; with `details=` it runs what is given, this one again or
+  a corrected one (an `env_setup` left out comes from the latest proposal for the facility). Every answer to a
+  connect without `details=` then opens with what failed ("The details= given earlier for '…' failed to come up (…)
+  and is not kept: this connect did not run it."), until a new `details=` replaces it or the facility comes up. The
+  facility stays bound, so `teardown_endpoint` still reaches that login node, but `ensure_endpoint_up` and `run_shell`
+  no longer bring the dropped configuration up: they answer with the failure and the same two routes, and start
+  nothing. A connect without `details=` that waited behind the failing one resolves again instead of running what
+  that one just dropped. The dropped configuration is never written to the local facility cache, and one equal to
+  the configuration proven for that host in an earlier session is kept as proven. Unchanged: a bring-up still coming
+  up keeps being polled by a connect without `details=`; a configuration that came up is reused (the zero-SSH
+  reconnect), even if a later bring-up of it fails; a one-time-code handoff resumes it; a registry entry is never
+  dropped. The two refusals of a `details=` without `env_setup` now say what a connect without `details=` does from
+  where the session stands: it resolves the facility afresh, or, while the session keeps a configuration for the id,
+  reconnects with that one and proposes nothing — a proposal for another host then comes under another facility id
+  (they used to promise a proposal in every case).
 - **A block the scheduler refuses is answered with the scheduler's own reply, to relay to you.** In every October
   sweep (`submit_policy_rejected`, the fake `site` cluster), sbatch refused the block with two lines, "sbatch: error:
   AssocMaxSubmitJobLimit" and "sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job
@@ -71,12 +85,19 @@ installed plugin only when that version changes); git tags mark releases.
   made-up `module load gcc/10.2.0` first, aborts unless the login node refuses it naming the module, then connects
   without `details=` and aborts unless the answer is a fresh, module-based proposal that names the failure (a build
   that runs the failed configuration again aborts here). It confirms the proposal, brings the login shape and a block
-  up, runs `hostname; module list` on the compute node and stops. The staged call carries the marker
-  `invariants.STAGED_FAILURE` in its `display_name`: `first_details_connect_succeeds` passes over a marked call only
-  when it failed, and still gates the first bring-up after it (an agent's own failed `details=` is judged as before).
-  A new gated grader, `failed_details_not_rerun`, fails any run in which a connect without `details=` answers the
-  failure of an earlier `details=` bring-up again (a failure outside the configuration, retried by design, excepted);
-  replayed over the 2026-10-16 bundle, it fails that run at the re-run.
+  up, runs `hostname; module list` on the compute node and stops. The scenario declares the staged call
+  (`STAGED_FAILED_CONNECTS = (0,)`, its first `connect_facility`); run.py and regrade.py pass over it for the
+  `first_details_connect_succeeds` gate only under the script operator and only if it failed
+  (`invariants.staged_connects`), and the gate judges the first bring-up after it. No tool argument carries it, so
+  nothing an agent sends can earn the exemption. A new gated grader, `failed_details_not_rerun`, fails a run in which
+  a connect without `details=` answers again the failure of a `details=` bring-up the product dropped (its answer says
+  "This configuration (details=) is not kept"; on builds before that claim, a configure failure in none of the words
+  that mark the network, a timeout or Globus), matched on the failure's first 200 characters. It forgets the drop once
+  a connect without `details=` comes up on another configuration, and spares every retry the product keeps on
+  purpose: a failed allocation listing on a configuration that came up, a teardown still running, the Globus login,
+  ssh, the network. Its copy of the product's words is held equal to `notices._NOT_THE_CONFIG_WORDS` by a hermetic
+  test that reads this tree's source. Replayed over every stored `lmod_bootstrap` bundle, it fails only the
+  2026-10-16 run, at the re-run.
 - **`submit_policy_rejected` runs under the script operator too**, for a live check of the refused block's notice with
   no model: `HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=site ./agentic/run_smoke.sh
   submit_policy_rejected`. Its SCRIPT brings the facility up from the probe's proposal, confirms spend on the first

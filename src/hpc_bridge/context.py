@@ -196,6 +196,12 @@ class FailedDetails:
     error: str
 
 
+class DroppedConfigError(RuntimeError):
+    """A bring-up asked of the facility still bound after connect dropped its configuration
+    (connect._drop_failed_details): refused before anything runs (warmth._provision) — the configuration is not kept,
+    so no tool brings it up. Its text is the whole answer (notices._hpc_bridge_error shows it as it is)."""
+
+
 @dataclass
 class SentCheck:
     """A task of ours sent to a COMPUTE user endpoint that has not been seen to finish — #24's evidence: a check
@@ -265,6 +271,12 @@ class AppCtx:
     # 2026-10-16, lmod_bootstrap), and opens its answer with what failed. Cleared by the next details= for that id and
     # by a connect of it that comes up (needs_account).
     failed_details: dict[str, FailedDetails] = field(default_factory=dict)
+    # The facility object a failed connect left BOUND (the bind precedes the bring-up) when it dropped that config, and
+    # what a bring-up of it answers instead (DroppedConfigError, raised by warmth._provision): ensure_endpoint_up and
+    # run_shell must not bootstrap the dropped config either. Not an unbind — teardown_endpoint still reaches that login
+    # node (a failed bring-up may have seeded the token store there). Matched by identity, so the next bind (a new
+    # facility object) ends it; connect also clears it there.
+    dropped_binding: tuple[Any, str] | None = None
     # The facility id the LAST connect_facility answered with proposed_facility_details (a draft config, nothing bound).
     # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
     # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.
