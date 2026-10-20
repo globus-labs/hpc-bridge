@@ -7,6 +7,9 @@ ALCF inference gateway (vLLM), which answers it NON-streamed and knows only plai
   then `response.completed` (or `response.incomplete`).
 - An assistant message in the history is refused unless it carries an id, a status and annotations, which Codex
   doesn't send back: it is resent in the plain `{role, content}` form.
+- A tool output in the history is refused unless it is a string, and Codex sends an MCP tool's result that has no
+  structured content (in practice, its error) as a list of content items: it is resent as their text, with a short
+  placeholder for an item that has none.
 - A tool call the model addresses in a form vLLM doesn't recognise as a function (gpt-oss sometimes writes
   `mcp__hpc_bridge__.run_shell`) comes back as an `mcp_call` item, which Codex ignores — ending the turn mid-task.
   It is resolved to the offered tool it meant and returned as a function call.
@@ -90,7 +93,8 @@ def adapt_request(req: dict) -> tuple[dict, dict[str, tuple[str | None, str, str
                 it = {"type": "function_call", "call_id": it["call_id"],
                       "name": _flat(it.get("namespace"), it["name"]), "arguments": json.dumps({"input": it["input"]})}
             elif kind in ("function_call_output", "custom_tool_call_output"):
-                it = {"type": "function_call_output", "call_id": it.get("call_id"), "output": it.get("output")}
+                it = {"type": "function_call_output", "call_id": it.get("call_id"),
+                      "output": _tool_output(it.get("output"))}
             elif kind == "message" and it.get("role") == "assistant":
                 # vLLM validates an assistant message as OpenAI's output message (id, status, annotations required)
                 # and Codex replays it without them; the plain {role, content} form carries the same text
@@ -170,6 +174,19 @@ def _output_text(out: Any) -> str:
     if isinstance(out, list):  # structured content items
         return "\n".join(str(x.get("text") or "") for x in out if isinstance(x, dict))
     return out if isinstance(out, str) else json.dumps(out, default=str)
+
+
+def _tool_output(out: Any) -> str:
+    """A tool output as the one string vLLM takes: content items as their text, one per line. An item without text
+    (an image, audio, encrypted content) is named, not inlined — the model hears it was there, and a base64 image
+    never lands in its context. No output at all is an empty one."""
+    if out is None:
+        return ""
+    if isinstance(out, list):
+        return "\n".join(str(x.get("text") or "") if "text" in x else
+                         f"[{x.get('type') or 'item'} omitted: this endpoint takes text only]"
+                         for x in out if isinstance(x, dict))
+    return _output_text(out)
 
 
 def new_outputs(req: dict, seen: set[str]) -> list[dict]:

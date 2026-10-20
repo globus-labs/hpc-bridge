@@ -363,6 +363,31 @@ def test_the_relay_resolves_vllms_mcp_call_items_to_the_offered_tool():
     assert [c["name"] for c in calls] == ["run_shell", "stop_endpoint", "nonsense"]
 
 
+def test_the_relay_sends_vllm_every_tool_output_as_one_string():
+    import responses_relay
+    error = "Wall time: 0.0069 seconds\nOutput:\nError executing tool connect_facility: 1 validation error"
+    image = {"type": "input_image", "image_url": "data:image/png;base64,iVBORw0KGgo"}
+    req = {"input": [
+        {"type": "function_call", "call_id": "a", "namespace": "mcp__hpc_bridge__", "name": "connect_facility",
+         "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "a", "output": [{"type": "input_text", "text": error}]},
+        {"type": "custom_tool_call", "call_id": "b", "name": "apply_patch", "input": "*** Begin Patch"},
+        {"type": "custom_tool_call_output", "call_id": "b",
+         "output": [{"type": "input_text", "text": "Success."}, {"type": "input_text", "text": "M a.py"}, image]},
+        {"type": "function_call", "call_id": "c", "name": "exec_command", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "c", "output": "Wall time: 0.7 seconds\nOutput:\nc1\n"},
+        {"type": "function_call", "call_id": "d", "name": "exec_command", "arguments": "{}"},
+        {"type": "function_call_output", "call_id": "d"}]}
+    adapted, _ = responses_relay.adapt_request(req)
+    sent = [it["output"] for it in adapted["input"] if it["type"] == "function_call_output"]
+    assert sent == [error, "Success.\nM a.py\n[input_image omitted: this endpoint takes text only]",
+                    "Wall time: 0.7 seconds\nOutput:\nc1\n", ""]   # a string as it was; none is an empty output
+    assert "base64" not in json.dumps(adapted)
+    # the record's text (new_outputs) is the same for a string or text items
+    recorded = [o["output"] for o in responses_relay.new_outputs(req, set())]
+    assert recorded[0] == sent[0] and recorded[2] == sent[2]
+
+
 def test_arguments_a_harness_coerced_still_match():
     rows = [{"ts": 1, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "provisioning"}},
             {"ts": 2, "tool": "ensure_endpoint_up", "args": {"confirm_spend": True}, "result": {"status": "up"}},
