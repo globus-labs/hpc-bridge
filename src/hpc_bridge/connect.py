@@ -5,8 +5,9 @@ read and any SSH), then the resolution ladder — explicit details this session 
 BYO cache → the SSH probe (`_propose_or_ask`, which proposes a config for the user to confirm) — then the
 switch of shapes/state to the bound facility, the attach (`_connect_mep`, identity-blind) or the
 bootstrap, and the allocation listing over the login shape. `_commit_proven_facility` writes a BYO
-config to the local cache only once the login-shape canary has answered; `_drop_dead_pin` forgets a
-login-node pin whose host is unreachable.
+config to the local cache only once the login-shape canary has answered; `_drop_failed_details` drops one whose
+bring-up failed on the login node before that, so a connect without details resolves the facility afresh instead of
+running it again; `_drop_dead_pin` forgets a login-node pin whose host is unreachable.
 
 The login-shape channel is INJECTED (`run_login`), as in scheduler_ops: `server._connect_facility` is a
 thin wrapper that supplies `server._login_runner(app)`, so tests that call `server._connect_facility` and
@@ -21,7 +22,15 @@ import os
 from . import binding, config, login_gate, warmth
 from .catalog.entry import CatalogEntry
 from .catalog.parsers import PARSERS
-from .context import DEFAULT_SHAPE, AppCtx, LeftBlock, ShapeRuntime, _facility_shapes, _has_login_shape
+from .context import (
+    DEFAULT_SHAPE,
+    AppCtx,
+    FailedDetails,
+    LeftBlock,
+    ShapeRuntime,
+    _facility_shapes,
+    _has_login_shape,
+)
 from .discovery import discover_facility_details
 from .dispatch import for_agent
 from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
@@ -31,6 +40,7 @@ from .notices import (
     _block_terms,
     _connect_terms_note,
     _explain_provision_error,
+    _failure_outside_config,
     _first_contact_note,
     _hpc_bridge_error,
     _left_block_clause,
@@ -56,6 +66,65 @@ def _commit_proven_facility(app: AppCtx, facility: str) -> None:
         # canary did run on these details (live 2026-09-04: a fresh BYO bring-up was never cached).
         return
     binding._facility_store().put(*pending)
+
+
+def _drop_failed_details(app: AppCtx, facility: str, notice: str) -> str:
+    """A configuration this session gave with details= failed to come up ON THE LOGIN NODE before it was ever proven:
+    drop it from the session (and from what would be cached once proven), so a connect without details= resolves the
+    facility afresh — the registry, a config already proven for that host, else a probe that proposes one — instead
+    of running it again. Live 2026-10-16 (lmod_bootstrap): a made-up `module load gcc/10.2.0` failed the remote
+    configure; the connect without details that the refusal's advice named re-ran it and failed the same way, because
+    the session kept the entry before the bring-up had proven it.
+
+    Dropped, not marked: every reader of `AppCtx.session_facilities` (the no-details rung, `_without_details`,
+    scheduler_ops' pilot probe) then keeps one meaning — a config the session keeps is one still coming up or proven —
+    and none has to learn to skip a mark. Why it failed is kept apart (`AppCtx.failed_details`), for the next answer
+    to say. Kept: a PROVEN config (the login shape came up on it, or the local cache had it — never pending), whose
+    later failure is the facility's or the network's, and any config whose failure lies outside it
+    (`notices._failure_outside_config`: SSH, the network, a timeout, the login): those answers ask for connect_facility
+    again, and that call runs it again. `notice`: the failure's own. Returns the sentence that ends that answer: what a
+    connect without details does next. Callers hold app.lock."""
+    pending = app.pending_facility_cache.pop(facility, None)
+    if pending is None:
+        return ""
+    app.session_facilities.pop(facility, None)
+    host = pending[0]
+    app.failed_details[facility] = FailedDetails(ssh_host=host, error=notice)
+    # on its own line: the failure before it is often the login node's own text, with no full stop of its own
+    return (f"\nThis configuration (details=) is not kept: {_afresh(facility, host)}, and does not run this one; to "
+            "try it again as it is, give the same details= again.")
+
+
+def _afresh(facility: str, host: str) -> str:
+    """What connect_facility(facility, ssh_host=host) without details= does when this session keeps no configuration for
+    `facility`: the resolution ladder below the session's own rung, said as it will happen."""
+    return (f"connect_facility({facility!r}, ssh_host={host!r}) without details resolves the facility afresh — the "
+            f"registry's entry if it lists {facility!r}, else a configuration already proven for that host, else a "
+            "probe of the login node that proposes one")
+
+
+def _without_details(app: AppCtx, facility: str, host: str) -> str:
+    """What a connect_facility without details= for `facility` does next, said as it will happen (advice that sends the
+    agent there must come true): while this session keeps a configuration for it, that one wins over every other rung,
+    whatever ssh_host the call names."""
+    kept = app.session_facilities.get(facility)
+    if kept is not None:
+        return (f"connect_facility({facility!r}) without details reconnects with the configuration this session keeps "
+                f"for it (for {kept.ssh_host!r}) and proposes nothing while that one is kept")
+    return _afresh(facility, host)
+
+
+_LEAD_ERROR_CAP = 300  # of the dropped config's failure, in the next answer's opening
+
+
+def _failed_details_lead(facility: str, failed: FailedDetails) -> str:
+    """How every answer to a connect without details= opens while a details= of this session lies dropped
+    (`_drop_failed_details`): what failed, so the fresh answer is read against it."""
+    why = " ".join(failed.error.split())
+    if len(why) > _LEAD_ERROR_CAP:
+        why = why[: _LEAD_ERROR_CAP - 1] + "…"
+    return (f"The details= given earlier for {facility!r} failed to come up ({why}) and is not kept: this connect did "
+            "not run it. ")
 
 
 def _reuse_note(app: AppCtx, facility: str, reused: bool, fac) -> str:
@@ -157,6 +226,21 @@ async def _connect_facility(
     app: AppCtx, facility: str, ssh_host: str | None = None, details: FacilityDetails | None = None,
     *, run_login: LoginRunner,
 ) -> ConnectFacilityResult:
+    """The connect flow (`_connect`). While a details= this session gave for `facility` lies dropped after its bring-up
+    failed (`_drop_failed_details`), a connect without details= resolves the facility afresh, and its answer opens with
+    what failed (a proposal says it within its own cap; a login gate, which resolved nothing yet, does not) — until a
+    details= replaces it or the facility comes up."""
+    failed = app.failed_details.get(facility) if details is None else None
+    res = await _connect(app, facility, ssh_host, details, run_login=run_login, failed=failed)
+    if failed is not None and res.phase not in ("needs_login", "proposed_facility_details"):
+        res.notice = _failed_details_lead(facility, failed) + (res.notice or "")
+    return res
+
+
+async def _connect(
+    app: AppCtx, facility: str, ssh_host: str | None, details: FacilityDetails | None,
+    *, run_login: LoginRunner, failed: FailedDetails | None,
+) -> ConnectFacilityResult:
     # Globus login gate — FIRST, before the catalog read and before any SSH. Every non-`unsupported`
     # outcome needs Globus (the SSH path seeds the endpoint's credential from our token storage; the
     # MEP path dispatches with it) — and, found in review, constructing the Compute SDK Client for
@@ -199,19 +283,19 @@ async def _connect_facility(
         if details.env_setup is None:
             # env_setup is optional after a proposal: the proposal's line is used, never an agent's copy of it
             draft = app.proposed_drafts.get(facility)
+            # the advice says what a connect without details does from HERE (this session may keep a config for it)
             if draft is None or draft.env_setup is None:
                 return ConnectFacilityResult(
                     phase="failed", facility=facility,
                     notice=("details= has no env_setup and there is no proposal for this facility to take it from. "
-                            f"Call connect_facility({facility!r}, ssh_host=…) without details for a proposed config, "
-                            "or give env_setup. Nothing was started."))
+                            f"Give env_setup; otherwise {_without_details(app, facility, details.ssh_host)}. Nothing "
+                            "was started."))
             if draft.ssh_host != details.ssh_host:
                 return ConnectFacilityResult(
                     phase="failed", facility=facility,
                     notice=(f"details= has no env_setup, and the proposal for {facility!r} was for {draft.ssh_host!r}, "
-                            f"not {details.ssh_host!r}: its env_setup may not fit. Give env_setup, or call "
-                            f"connect_facility({facility!r}, ssh_host={details.ssh_host!r}) for a proposal for that "
-                            "host. Nothing was started."))
+                            f"not {details.ssh_host!r}: its env_setup may not fit. Give env_setup; otherwise "
+                            f"{_without_details(app, facility, details.ssh_host)}. Nothing was started."))
             details = details.model_copy(update={"env_setup": draft.env_setup})
         try:
             entry = binding._entry_from_details(facility, details)
@@ -221,11 +305,16 @@ async def _connect_facility(
                 facility=facility,
                 notice=f"invalid facility details: {type(exc).__name__}: {exc}"[:300],
             )
-        app.session_facilities[facility] = entry  # this session's config; on disk only once PROVEN (below)
+        # this session's config, kept from here so a connect while it comes up keeps polling it (and a one-time-code
+        # handoff resumes it); on disk only once PROVEN (below); dropped if it fails on the login node first
+        app.session_facilities[facility] = entry
+        app.failed_details.pop(facility, None)  # a new config replaces the one that failed
         if details.ssh_host:  # persist for LOCAL DISCOVERY — but only once the login shape is PROVEN warm
             app.pending_facility_cache[facility] = (details.ssh_host, details.model_dump(mode="json"))
     else:
-        entry = app.session_facilities.get(facility)
+        if failed is not None and not ssh_host:
+            ssh_host = failed.ssh_host  # the host the dropped details= named: the facility is resolved afresh for it
+        entry = app.session_facilities.get(facility)  # never the dropped config: _drop_failed_details took it out
         registry_error: Exception | None = None
         if entry is None:
             # THE REGISTRY WINS for any catalogued id (decision 2026-09-03: curated entries are the stable
@@ -256,17 +345,20 @@ async def _connect_facility(
                                 "for a fresh proposal. Nothing was started."))
                 except Exception:  # noqa: BLE001 - stale/invalid cached config
                     entry = None
+        lead = _failed_details_lead(facility, failed) if failed is not None else ""
         if entry is None and registry_error is not None:
             return await _propose_or_ask(
                 facility, ssh_host,
                 f"registry unavailable ({type(registry_error).__name__}); give me this facility's SSH "
-                "host (ssh_host=… or HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app)
+                "host (ssh_host=… or HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app,
+                proposal_lead=lead)
         if entry is None:
             return await _propose_or_ask(
                 facility, ssh_host,
                 f"{facility!r} isn't in the catalog. Give me its SSH host (ssh_host=… or "
                 "HPC_BRIDGE_SSH_HOST) and I'll probe the login node to propose a config, or supply "
-                "details= directly (or list_facilities() if you meant a catalogued one).", app=app)
+                "details= directly (or list_facilities() if you meant a catalogued one).", app=app,
+                proposal_lead=lead)
     reason = binding._unsupported_entry_reason(entry)
     if reason is None and entry.allocation is not None and entry.allocation.parser not in PARSERS:
         reason = (
@@ -331,6 +423,8 @@ async def _connect_facility(
         app.scratch_root = binding._resolve_scratch_root(fac)
         if not _has_login_shape(app):  # a facility-run multi-user endpoint: attach, don't provision
             res = await _connect_mep(app, facility, fac)
+            if res.phase == "needs_account":  # attached, on another config: the details= that failed is history
+                app.failed_details.pop(facility, None)
             if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
                 res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
             res.notice = login_note + presets_note + _left_checks_note(app, old_eid, queued_left) + (res.notice or "")
@@ -364,9 +458,12 @@ async def _connect_facility(
             notice = _explain_provision_error(exc, fac)
             if notice.startswith(("CANNOT REACH", "UNKNOWN HOST KEY")) and await asyncio.to_thread(_drop_dead_pin, fac):
                 notice += " (The remembered login-node pin was dropped: the next connect resolves the facility's host afresh.)"  # noqa: E501
+            if not _failure_outside_config(exc, notice):  # it ran on the login node and failed: not run again unasked
+                notice += _drop_failed_details(app, facility, notice)
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
         if block == "warm":
             _commit_proven_facility(app, facility)
+            app.failed_details.pop(facility, None)  # up, on whichever config: the details= that failed is history
     wi_note = getattr(fac, "worker_init_note", "")  # an edited env_setup that a reused endpoint does not run
     reuse_note = (login_note + presets_note + _reuse_note(app, facility, app.state.reused, fac)
                   + (wi_note if isinstance(wi_note, str) else "") + _venv_note(fac))
@@ -496,11 +593,12 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
 
 async def _propose_or_ask(
     facility: str, ssh_host: str | None, ask_notice: str
-, *, app: AppCtx | None = None) -> ConnectFacilityResult:
+, *, app: AppCtx | None = None, proposal_lead: str = "") -> ConnectFacilityResult:
     """Index miss + no details: if we have an SSH host, probe the login node and PROPOSE a draft
     config; otherwise ask the agent for the host (SSH access is the one irreducible input). The
     discovery target carries the same ControlMaster socket as the later bootstrap, so probing warms
-    the master the bootstrap then rides — no extra authentication."""
+    the master the bootstrap then rides — no extra authentication. `proposal_lead` opens a proposal's notice, beyond
+    its cap, so no note is cut for it (`_failed_details_lead`; `_connect_facility` opens every other answer with it)."""
     host = (ssh_host or config.ssh_host() or "").strip()
     if not host:
         return ConnectFacilityResult(
@@ -536,7 +634,7 @@ async def _propose_or_ask(
                 fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}"[:400],
             ),
         )
-    notice = (
+    notice = proposal_lead + (
         "probed the login node and proposed this config — review/correct it WITH THE USER "
         "(confirm the flagged fields, above all `interface`), then call connect_facility(details=…). "
         "Leave env_setup OUT of details= unless the user wants to change it: the server keeps the proposed one. "
@@ -551,7 +649,7 @@ async def _propose_or_ask(
         phase="proposed_facility_details",
         facility=facility,
         proposed_details=draft,
-        notice=notice[:_PROPOSAL_CAP],
+        notice=notice[:_PROPOSAL_CAP + len(proposal_lead)],
     )
 
 

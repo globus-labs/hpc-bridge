@@ -125,6 +125,19 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
     return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
 
+# The explanations above whose cause lies outside the configuration being brought up: SSH itself (refused, unreachable,
+# a host key not trusted or revoked, the local socket path), a login node that did not answer in time, its filesystem
+# refusing a write. Each asks for connect_facility again once that is fixed, and that call runs the same configuration
+# again — connect keeps a details= one for it (connect._drop_failed_details drops only the others).
+_OUTSIDE_THE_CONFIG = ("NO SSH ACCESS", "REVOKED HOST KEY", "UNKNOWN HOST KEY", "REMOTE FILESYSTEM", "CANNOT REACH",
+                       "TIMED OUT", "hpc-bridge error: the SSH ControlMaster socket path")
+
+
+def _failure_outside_config(exc: BaseException, notice: str) -> bool:
+    """A bring-up failure (`notice`: `_explain_provision_error`'s for `exc`) that says nothing about the configuration:
+    the Globus login, or one of `_OUTSIDE_THE_CONFIG`. Every other failure ran the configuration on the login node."""
+    return login_expired(exc) or notice.startswith(_OUTSIDE_THE_CONFIG)
+
 def _local_dill() -> str | None:
     try:
         import dill

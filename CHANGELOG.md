@@ -6,6 +6,27 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A configuration you gave that failed to come up is no longer run again when you connect without it.** In the
+  October free sweep (`lmod_bootstrap`, the fake Lmod cluster, Hermes), the agent's first `connect_facility` carried
+  a made-up `env_setup` (`module load gcc/10.2.0`) and the login node refused it ("Lmod has detected the following
+  error: The following module(s) are unknown"). The next answer told it to call `connect_facility(…, ssh_host=…)`
+  without `details=` for a proposed configuration; it did, and got the same Lmod error back: hpc-bridge had kept the
+  configuration for the session before it was ever proven, and the connect without `details=` ran it again. Now a
+  `details=` configuration whose bring-up fails on the login node before it ever came up is dropped, and the
+  failure's answer says so: a connect without `details=` resolves the facility afresh — the registry's entry if it
+  lists the id, else a configuration already proven for that host, else a probe of the login node that proposes one
+  (with no `ssh_host`, the host the dropped configuration named) — and never runs the dropped one; to retry it as it
+  is, give the same `details=` again. Every answer to such a connect opens with what failed ("The details= given
+  earlier for '…' failed to come up (…) and is not kept: this connect did not run it."), until a new `details=`
+  replaces it or the facility comes up. The dropped configuration is never written to the local facility cache.
+  Unchanged: a bring-up still coming up (`provisioning`) keeps being polled by a connect without `details=`; a
+  configuration that came up is reused (the zero-SSH reconnect), even if a later bring-up of it fails; a failure
+  outside the configuration — SSH refused, a host unreachable, an unknown or revoked host key, a timeout, the remote
+  filesystem, the Globus login — keeps it, since those answers ask for `connect_facility` again once the cause is
+  fixed; a one-time-code handoff resumes it; a registry entry is never dropped. The two refusals of a `details=`
+  without `env_setup` now say what a connect without `details=` does from where the session stands: it resolves the
+  facility afresh, or, while the session keeps a configuration for it, reconnects with that one and proposes nothing
+  (they used to promise a proposal in both cases).
 - **A block the scheduler refuses is answered with the scheduler's own reply, to relay to you.** In every October
   sweep (`submit_policy_rejected`, the fake `site` cluster), sbatch refused the block with two lines, "sbatch: error:
   AssocMaxSubmitJobLimit" and "sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job
@@ -45,6 +66,17 @@ installed plugin only when that version changes); git tags mark releases.
   endpoint's.
 
 ### Testing
+- **`lmod_bootstrap` runs under the script operator too, and grades the re-run on every operator.** Its SCRIPT
+  (`HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh lmod_bootstrap`) sends the
+  made-up `module load gcc/10.2.0` first, aborts unless the login node refuses it naming the module, then connects
+  without `details=` and aborts unless the answer is a fresh, module-based proposal that names the failure (a build
+  that runs the failed configuration again aborts here). It confirms the proposal, brings the login shape and a block
+  up, runs `hostname; module list` on the compute node and stops. The staged call carries the marker
+  `invariants.STAGED_FAILURE` in its `display_name`: `first_details_connect_succeeds` passes over a marked call only
+  when it failed, and still gates the first bring-up after it (an agent's own failed `details=` is judged as before).
+  A new gated grader, `failed_details_not_rerun`, fails any run in which a connect without `details=` answers the
+  failure of an earlier `details=` bring-up again (a failure outside the configuration, retried by design, excepted);
+  replayed over the 2026-10-16 bundle, it fails that run at the re-run.
 - **`submit_policy_rejected` runs under the script operator too**, for a live check of the refused block's notice with
   no model: `HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=site ./agentic/run_smoke.sh
   submit_policy_rejected`. Its SCRIPT brings the facility up from the probe's proposal, confirms spend on the first

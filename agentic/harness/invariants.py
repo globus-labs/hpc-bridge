@@ -1192,16 +1192,30 @@ _PROBE_PHASES = {"proposed_facility_details", "needs_facility_details", "needs_p
 
 _FIRST_CONTACT_REFUSALS = ("UNKNOWN HOST KEY", "NO SSH ACCESS", "CANNOT REACH", "NO ACCOUNT", "REMOTE FILESYSTEM")
 
+# A bring-up a SCRIPT stages to fail on purpose carries this display_name in its details= (lmod_bootstrap's: a made-up
+# `module load`, to prove the connect after it does not run it again). It is the cell's premise, not a bring-up of a
+# confirmed config: `_first_bring_up` passes over it — only when it FAILED, so it can hide nothing but the failure it
+# staged — and the #39 gate judges the first bring-up after it. No prompt names it: only a SCRIPT sends it.
+STAGED_FAILURE = "hpcb staged failure (harness script)"
+
+
+def staged_failure(c: ToolCall) -> bool:
+    """A connect_facility a SCRIPT staged to fail (`STAGED_FAILURE` in its details=) that did fail."""
+    det = c.input.get("details")
+    return (isinstance(det, dict) and det.get("display_name") == STAGED_FAILURE
+            and str((c.result or {}).get("phase")) == "failed")
+
 
 def _first_bring_up(t: Trace) -> tuple[int, ToolCall] | None:
     """The first `connect_facility` that went past probing/asking — a `details=` confirm, or a plain connect served
     from the local facilities cache / the catalog. Skipped: a FIRST-CONTACT refusal (no access / unknown key /
-    unreachable: the user's access, not a bring-up) and a result with no `phase` at all (a tool error, a cut stream —
-    it says nothing about the bring-up, and taking it as one hid a real `failed` after it)."""
+    unreachable: the user's access, not a bring-up), a result with no `phase` at all (a tool error, a cut stream —
+    it says nothing about the bring-up, and taking it as one hid a real `failed` after it), and a failure a SCRIPT
+    staged (`staged_failure`)."""
     for i, c in t.named("connect_facility"):
         r = c.result or {}
         if (r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
-                and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)):
+                and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS) and not staged_failure(c)):
             return i, c
     return None
 

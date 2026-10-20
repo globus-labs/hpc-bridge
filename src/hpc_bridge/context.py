@@ -186,6 +186,16 @@ class DeadPilot:
     known: frozenset[str] = frozenset()  # every pilot job of this endpoint the probe listed with it
 
 
+@dataclass(frozen=True)
+class FailedDetails:
+    """A configuration given this session with details= whose bring-up failed on the login node before it was ever
+    proven (connect._drop_failed_details): the host it named, and the failure as its answer said it — for the next
+    connect without details= to resolve the facility afresh, and to say what failed."""
+
+    ssh_host: str
+    error: str
+
+
 @dataclass
 class SentCheck:
     """A task of ours sent to a COMPUTE user endpoint that has not been seen to finish — #24's evidence: a check
@@ -249,6 +259,12 @@ class AppCtx:
     # BYO configs supplied this session but not yet PROVEN (login-shape canary answered) — written to
     # facilities.json only then (decision 2026-09-03: "proven", not "accepted"): facility id -> (ssh_host, details)
     pending_facility_cache: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    # BYO configs dropped from both of the above because their bring-up FAILED on the login node before they were
+    # proven (connect._drop_failed_details): a connect without details= then resolves the facility afresh — the
+    # registry, a config proven for that host, else a probe that proposes one — instead of running them again (live
+    # 2026-10-16, lmod_bootstrap), and opens its answer with what failed. Cleared by the next details= for that id and
+    # by a connect of it that comes up (needs_account).
+    failed_details: dict[str, FailedDetails] = field(default_factory=dict)
     # The facility id the LAST connect_facility answered with proposed_facility_details (a draft config, nothing bound).
     # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
     # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.
