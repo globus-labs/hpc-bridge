@@ -52,8 +52,9 @@ network to PyPI (or to astral.sh when `uv` is being installed), a full home quot
 where hpc-bridge expects it (`Permission denied` creating `/home/<you>/hpc-bridge`: set `HPC_BRIDGE_REMOTE_VENV` to a
 path under your real home). The message says where the failed build is kept (`<path>.failed.<time>`), if anything
 of it was made, and the environment that was there before is left as it was. Fix the cause and connect again. A login node with no internet can still be used: put a
-venv with `globus-compute-endpoint` at `HPC_BRIDGE_REMOTE_VENV` yourself (same endpoint version and Python as your
-client); hpc-bridge uses it when it passes the same check.
+venv with `globus-compute-endpoint` and `texttable<1.7.2` at `HPC_BRIDGE_REMOTE_VENV` yourself (same endpoint version
+and Python as your client); hpc-bridge uses it when it passes the same check, and when it does not, the message says
+why it was not used.
 
 **"this node's uv (…) is too old to build hpc-bridge's venv"**. The login node's own `uv` predates
 `uv venv --relocatable` (0.2.31). Upgrade it (`uv self update`, or a newer site module), or remove it from your PATH

@@ -66,6 +66,24 @@ installed plugin only when that version changes); git tags mark releases.
   a block, and waits for that on an endpoint hpc-bridge set up (`HPC_BRIDGE_STOP_CHECK_WAIT_S`).
 
 ### Fixed
+- **SSH bring-ups work again on an endpoint venv built since 2026-10-18.** Every SSH bring-up on such a venv failed at
+  "remote list failed", on real facilities as well as the fake cluster (seen 2026-10-20). texttable 1.7.2, released
+  2026-10-18, dropped a private attribute (`Texttable._width`) that globus-compute-endpoint 4.18's `list` reads, so
+  `list` raises `AttributeError` whenever an endpoint is configured. hpc-bridge finds its endpoint's id with `list`.
+  The endpoint leaves texttable unbounded, so every venv hpc-bridge built after the release got 1.7.2. Its check only
+  ran `globus-compute-endpoint version`, which still works, so the venv was never repaired. Now:
+  - every venv hpc-bridge builds installs `texttable<1.7.2` in the same install as the endpoint;
+  - the check also runs the calls `list` makes on texttable, in the venv's own python. A venv that fails them is
+    rebuilt like any broken one: built beside it, checked, renamed into place, with the old one kept as
+    `.broken.<time>`. That costs one build, once per venv. A venv with no texttable at all passes;
+  - an environment you prepared yourself at `HPC_BRIDGE_REMOTE_VENV` is never changed. When it fails the check,
+    hpc-bridge builds its own venv beside it and says why yours was not used;
+  - a failing `list` now names its exception, not the first lines of its traceback (the agent saw only "Traceback …
+    line 12, in"). For this failure it adds what it is and the fix for an environment hpc-bridge does not manage (a
+    hand-written `env_setup`, a facility's own install): `pip install 'texttable<1.7.2'` there. A refused
+    `start` whose `list` also failed quotes `list`'s error, where it used to say only "no output".
+
+  The pin comes out when globus-compute-endpoint stops reading `_width`; the check needs no change either way.
 - **A stop no longer stays `draining` for good when the endpoint loses its report on hpc-bridge's own check.** Seen
   live twice (2026-10-16, the fake `site` cluster: `submit_policy_rejected`, `slurm_worker_died`): after a rejected
   submission or a pilot that died, the user endpoint holding hpc-bridge's check went into an error state ("bad
@@ -338,6 +356,13 @@ installed plugin only when that version changes); git tags mark releases.
   `connect_facility(details=…)` only for a facility you bring yourself.
 
 ### Testing
+- **The venv stubs draw `list` as globus-compute-endpoint 4.18 does.** The stub endpoint in `tests/venv_stubs.py` now
+  has a `list` that calls texttable as `Endpoint.print_endpoint_table` does, over a stub texttable that behaves as 1.7.1
+  or as 1.7.2. The stub install resolves texttable as PyPI has since 2026-10-18: 1.7.2 unless the install asks for
+  `texttable<1.7.2`. A real-shell test can then build a venv and run its `list`, with no network. The harness's own
+  venv build for the venv scenarios (`cluster_ops.build_endpoint_venv_cmd`) pins texttable too, and rebuilds a venv
+  whose texttable breaks `list`. Otherwise the plugin's check would rebuild that venv itself and lose the break the
+  scenario planted.
 - **INFRA for a final answer that is a tool call never made.** In the free-operator sweep rerun of 2026-10-15, six
   Codex cells on ALCF's gpt-oss ended after one model response, with no call of any kind: the final message was the
   call itself. Either it was raw harmony tokens (`<|start|>assistant<|channel|>commentary

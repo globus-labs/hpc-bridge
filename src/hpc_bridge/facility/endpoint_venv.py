@@ -10,11 +10,14 @@ the user prepared, so their endpoints and an older plugin reading a newer line k
 The build is Python (`ensure`): a few short commands over the facility's SSH channel, run before whoami/configure/start
 of a bring-up and never by stop/delete/list.
 1. Check the keyed venv through its entry point (`globus-compute-endpoint version`; `python -c "import
-   globus_compute_endpoint.cli"` raises on every real install, since gce's cli reads `sys.argv[0]` at import) and its
-   python's major.minor. When the keyed venv is missing, an unkeyed `{venv}` that passes the same check is used as is.
+   globus_compute_endpoint.cli"` raises on every real install, since gce's cli reads `sys.argv[0]` at import), its
+   python's major.minor, and that its texttable does what the endpoint's `list` does with it (texttable 1.7.2 broke
+   that: `TEXTTABLE_PIN`). When the keyed venv is missing, an unkeyed `{venv}` that passes the same check is used as
+   is; one that fails it is never changed (it may be the user's own) and the keyed venv is built instead.
 2. Otherwise build a RELOCATABLE uv venv (`uv venv --relocatable`) in a directory of its own, `<keyed>.build.<token>`,
    with the package cache off and files copied (uv hardlinks venvs into ~/.cache/uv, so a corrupt cache entry would
-   survive a rebuild), installing uv first where the node has none; write the `.hpcb-arch` marker; verify it there.
+   survive a rebuild), texttable pinned, installing uv first where the node has none; write the `.hpcb-arch` marker;
+   verify it there.
 3. Claim the keyed path with one atomic rename (`os.rename`, which refuses a non-empty target), after moving the broken
    venv the check saw aside to `.broken.<ts>` (only if the path still holds that same directory). Two bring-ups that
    build at once both finish; the one whose rename loses discards its own build and uses the winner's. There is no
@@ -45,6 +48,20 @@ GCE = "globus-compute-endpoint"
 HOME_VENV = "$HOME/hpc-bridge/gce-venv"
 DEFAULT_REMOTE_VENV = "/home/{user}/hpc-bridge/gce-venv"
 ARCH_MARKER = ".hpcb-arch"
+
+# texttable 1.7.2 (2026-10-18) dropped the private `Texttable._width` that globus-compute-endpoint's `list` reads
+# (`Endpoint.print_endpoint_table`: `_compute_cols_width()`, then `_width`; gce 4.18 and its main branch), so `list`
+# raises AttributeError whenever an endpoint is configured, and hpc-bridge finds its endpoint's id with `list`. The
+# endpoint leaves texttable unbounded (the SDK's `texttable>=1.7`): every build pins it, and the check runs exactly what
+# `list` calls on a venv already built (`_PY_PROBE`), so it is rebuilt. Drop the pin once the endpoint stops reading
+# `_width` (the probe needs no change either way).
+TEXTTABLE_PIN = "texttable<1.7.2"
+# what that `list` raises (its traceback's last line), and what to do; `facility.remote` adds it to the list failure
+BROKEN_LIST = re.compile(r"'Texttable' object has no attribute '_width'")
+BROKEN_LIST_HINT = (  # short: the notice keeps a message's first 500 characters
+    "texttable 1.7.2 breaks globus-compute-endpoint's `list`. hpc-bridge repairs the venvs it builds (connect_facility "
+    "again); in an environment it does not manage (a hand-written env_setup, a facility's own install) run "
+    "`pip install 'texttable<1.7.2'` there.")
 
 # (step, script, timeout) -> (rc, stdout, stderr). The production runner sends `bash -lc <script>` over the facility's
 # SSH channel; rc 255 is ssh itself failing (no connection, a denial), which `ensure` reports as a transport failure.
@@ -255,6 +272,9 @@ class VenvState:
     version: str = ""        # the entry point's version line (else its last output line)
     py_rc: int | None = None
     py: str = ""             # the venv python's last output line
+    texttable: str = ""      # ok | absent | broken: what `list` calls on texttable (`_PY_PROBE`; "" = not reported)
+    texttable_version: str = ""
+    texttable_error: str = ""
     arch: str | None = None  # the .hpcb-arch marker
     machine: str = ""        # this login node's `uname -m`
     uv: str = ""
@@ -275,10 +295,44 @@ def _cap(seconds: int) -> str:
             "else __hb_cap() { \"$@\"; }; fi; ")
 
 
+# The check's one python call: whether the venv's texttable does what globus-compute-endpoint's `list` does with it
+# (`Endpoint.print_endpoint_table`, gce 4.18: the same calls, so a texttable that brings `_width` back, or an endpoint
+# that stops reading it, needs no change here), then the python's major.minor as the LAST line, as before. A venv with
+# no texttable at all is not a problem: its endpoint cannot be reading it. Never raises, and no f-strings, so an old
+# python still reports its version. The login shell's cwd is dropped from the path, as an entry point never has it.
+_PY_PROBE = (
+    "import sys\n"
+    "sys.path[:1] = [p for p in sys.path[:1] if p]\n"
+    "t, e, v = 'ok', '', ''\n"
+    "try:\n"
+    "    import texttable\n"
+    "except ImportError as x:\n"
+    "    t = 'absent' if getattr(x, 'name', None) == 'texttable' else 'broken'\n"
+    "    e = '%s: %s' % (type(x).__name__, x)\n"
+    "else:\n"
+    "    v = str(getattr(texttable, '__version__', ''))\n"
+    "    try:\n"
+    "        tb = texttable.Texttable()\n"
+    "        tb.header(['Endpoint ID', 'Status', 'Endpoint Name'])\n"
+    "        tb.add_row(['id', 'Running', 'name'])\n"
+    "        tb.set_max_width(68)\n"
+    "        tb._compute_cols_width()\n"
+    "        tb._width[2] = max(10, tb._width[2])\n"
+    "    except Exception as x:\n"
+    "        t, e = 'broken', '%s: %s' % (type(x).__name__, x)\n"
+    "print('TEXTTABLE=' + t)\n"
+    "print('TEXTTABLE_VERSION=' + v)\n"
+    "print('TEXTTABLE_ERROR=' + ' '.join(e.split())[:200])\n"
+    "print(sys.version_info[:2])\n"
+)
+# sent as `exec(<its repr>)`: one line, so the check stays a single line, as it always was
+_PY_CHECK = shlex.quote(f"exec({_PY_PROBE!r})")
+
+
 def check_script(mv: ManagedVenv, path: str | None = None) -> str:
     """Read-only (bytecode writes off; `version` itself may create ~/.globus_compute): the venv's entry point
-    `version` and its python's major.minor (parsed in Python), its inode and arch marker, and the tools a build could
-    use. `path` defaults to the keyed venv."""
+    `version`, its python's major.minor and whether its texttable serves `list` (parsed in Python), its inode and arch
+    marker, and the tools a build could use. `path` defaults to the keyed venv."""
     k = _q(path or mv.key)
     return (
         f"export PYTHONDONTWRITEBYTECODE=1; {mv.prefix}export PATH=\"$HOME/.local/bin:$PATH\"; k={k}; "
@@ -290,8 +344,9 @@ def check_script(mv: ManagedVenv, path: str | None = None) -> str:
         f'if [ -e "$k/bin/{GCE}" ]; then echo ENTRY=1; o=$(__hb_cap "$k/bin/{GCE}" version 2>&1); '
         "echo \"VERSION_RC=$?\"; { printf '%s\\n' \"$o\" | grep 'endpoint version:' || printf '%s\\n' \"$o\"; } "
         "| tail -n 1 | sed 's/^/VERSION=/'; fi; "
-        'if [ -e "$k/bin/python" ]; then o=$(__hb_cap "$k/bin/python" -c \'import sys;print(sys.version_info[:2])\' '
-        "2>&1); echo \"PY_RC=$?\"; printf '%s\\n' \"$o\" | tail -n 1 | sed 's/^/PY=/'; fi; "
+        f'if [ -e "$k/bin/python" ]; then o=$(__hb_cap "$k/bin/python" -c {_PY_CHECK} '
+        "2>&1); echo \"PY_RC=$?\"; printf '%s\\n' \"$o\" | tail -n 1 | sed 's/^/PY=/'; "
+        "printf '%s\\n' \"$o\" | grep '^TEXTTABLE'; fi; "
         f'[ -f "$k/{ARCH_MARKER}" ] && echo "ARCH=$(head -n 1 "$k/{ARCH_MARKER}")"; '
         'echo "MACHINE=$(uname -m)"; echo "UV=$(command -v uv 2>/dev/null)"; '
         'if command -v uv >/dev/null 2>&1; then echo "UV_VERSION=$(uv --version 2>/dev/null)"; '
@@ -321,6 +376,8 @@ def parse_check(out: str) -> VenvState:
     s.version_rc = int(raw["VERSION_RC"]) if raw.get("VERSION_RC", "").lstrip("-").isdigit() else None
     s.py_rc = int(raw["PY_RC"]) if raw.get("PY_RC", "").lstrip("-").isdigit() else None
     s.version, s.py = raw.get("VERSION", "").strip(), raw.get("PY", "").strip()
+    s.texttable, s.texttable_version, s.texttable_error = (
+        raw.get(x, "").strip() for x in ("TEXTTABLE", "TEXTTABLE_VERSION", "TEXTTABLE_ERROR"))
     s.arch = raw["ARCH"].strip() if "ARCH" in raw else None
     s.inode, s.machine, s.uv, s.py3, s.curl = (raw.get(x, "").strip()
                                                for x in ("INODE", "MACHINE", "UV", "PY3", "CURL"))
@@ -361,6 +418,9 @@ def problem(s: VenvState, *, gce: str | None, python: str) -> str | None:
     have = reported_python(s.py)
     if have != python:
         return f"its python is {have or s.py or 'unknown'}, not {python}"
+    if s.texttable == "broken":  # its `version` runs, but its `list` cannot draw a table (TEXTTABLE_PIN)
+        tt = f"texttable {s.texttable_version}" if s.texttable_version else "texttable"
+        return f"its {tt} breaks `{GCE} list` ({s.texttable_error or 'no error text'})"
     return None
 
 
@@ -434,8 +494,10 @@ def build_dir(mv: ManagedVenv, token: str) -> str:
 
 
 def build_script(mv: ManagedVenv, *, token: str, method: str, gce: str | None, python: str, sdk: str | None) -> str:
-    """Build a relocatable venv in its own directory (`build_dir`), cache off, files copied, and mark its arch."""
-    reqs = (f"'{GCE}=={gce}'" + (f" 'globus-sdk=={sdk}'" if sdk else "")) if gce else GCE
+    """Build a relocatable venv in its own directory (`build_dir`), cache off, files copied, and mark its arch. The one
+    install (uv the node's, or the one `_BOOTSTRAP_UV` installed) also pins texttable (`TEXTTABLE_PIN`), quoted: `<`
+    is a redirect to the shell."""
+    reqs = ((f"'{GCE}=={gce}'" + (f" 'globus-sdk=={sdk}'" if sdk else "")) if gce else GCE) + f" '{TEXTTABLE_PIN}'"
     b = _q(build_dir(mv, token))
     return (f"{mv.prefix}export PATH=\"$HOME/.local/bin:$PATH\"; b={b}; mkdir -p \"${{b%/*}}\" || exit 1; "
             + _SWEEP.replace("@KEY@", mv.key.rsplit("/", 1)[-1])
@@ -547,13 +609,18 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         return EnsureResult(path=mv.key)
     if why == "timed out":
         raise _timed_out(mv.key, host)
+    skipped = ""  # why an unkeyed venv that is there was not used (it is never changed: it may be the user's own)
     if not s.exists:
         # no keyed venv at all: the line falls back to the unkeyed {venv}, so one there that passes the same check (one
         # the user prepared, or an older plugin's at this pin) is used as it is — a login node without internet works
         u = await _check(run, mv, host, "check unkeyed", mv.base)
-        if u.exists and problem(u, gce=gce, python=python) is None:
-            await _ensure_marker(run, mv.base, u, host)
-            return EnsureResult(path=mv.base)
+        if u.exists:
+            why_u = problem(u, gce=gce, python=python)
+            if why_u is None:
+                await _ensure_marker(run, mv.base, u, host)
+                return EnsureResult(path=mv.base)
+            skipped = f"{mv.base} was not used: {why_u}"
+            why = f"{why}; {skipped}"
     if s.exists and not s.pyvenv and not s.empty:
         raise EndpointVenvError(
             f"{mv.key} on {host} exists and is not a venv: hpc-bridge will not move or replace it. Move it away "
@@ -576,7 +643,7 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         except Exception:  # noqa: BLE001 - best-effort: it then stays as our .build.* directory
             kept = None
         where = f"The failed build is kept as {kept}." if kept else "Nothing of it was kept."
-        return EndpointVenvError(f"{message} {where} Nothing was started or billed.")
+        return EndpointVenvError(f"{message} {where} {skipped + '. ' if skipped else ''}Nothing was started or billed.")
 
     try:
         rc, out, err = await run("build", _wrap_build(
