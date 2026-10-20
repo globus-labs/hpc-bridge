@@ -604,3 +604,76 @@ def test_a_journal_hook_skips_the_blind_opening_batch_and_fires_on_the_call_it_i
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,
                                             midrun_hooks=draining_restop.MIDRUN_HOOKS))
     assert ran == [] and sorted(h["out"] for h in r.hooks_fired) == ["NEVER FIRED", "NEVER FIRED"]
+
+
+# A Codex cell that wrote no final message (happy_path 1792181717, hand_batch_job 1792181634, 2026-10-16): its event
+# stream ends on turn.failed, the relay's last request came back as ALCF's 500 around vLLM's 400, and its stderr says only
+# that it read stdin — which `run_completed` used to give as the reason.
+_TURN_FAILED = "\n".join(json.dumps(e) for e in [
+    {"type": "turn.started"},
+    {"type": "error", "message": "Reconnecting... 5/5 (We’re currently experiencing high demand, which may cause "
+                                 "temporary errors.)"},
+    {"type": "turn.failed", "error": {"message": "We’re currently experiencing high demand, which may cause temporary "
+                                                 "errors."}}])
+_STDIN = "Reading additional input from stdin...\n"
+
+
+def _codex_turn(tmp_path, monkeypatch, *, relay_hops, stdout=_TURN_FAILED, rc=1, stderr=_STDIN, final=""):
+    import asyncio
+    _cli_jail(tmp_path, monkeypatch)
+    monkeypatch.setenv("HPCB_RELAY_LOG", str(tmp_path / "unused.jsonl"))   # run_scenario points it at the run dir
+    relay = type("Relay", (), {"base_url": "http://127.0.0.1:9/v1", "shutdown": lambda self: None})()
+    monkeypatch.setattr(cli_runner, "start_relay", lambda model: relay)
+
+    async def fake_turn(argv, *, cwd, env, timeout_s):
+        with (Path(env["HPC_BRIDGE_JOURNAL"]).parent / "relay.jsonl").open("a") as fh:
+            fh.writelines(json.dumps(h) + "\n" for h in relay_hops)
+        return rc, stdout, stderr
+
+    monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], final))
+    return asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex"))
+
+
+def _relay_hop(status, error=None):
+    return {"t": 1.0, "s": 1.0, "method": "POST", "path": "/responses", "status": status, "outputs": [],
+            **({"error": error} if error else {"output": ["message"], "calls": [], "texts": []})}
+
+
+_GATEWAY_500 = json.dumps({"error": {"code": "internal_endpoint_error", "message": (
+    "\n Traceback (most recent call last):\n Exception: API request failed with status code: 400\n Response text: "
+    + json.dumps({"error": {"message": "1 validation error for Message\ncontent.0\n  Input should be a valid dictionary",
+                            "type": "BadRequestError", "code": 400}}, separators=(",", ":"))
+    + "\n Response headers: {'server': 'uvicorn'}")}})
+
+
+def test_a_codex_turn_with_no_final_message_is_reported_by_what_it_ended_on(tmp_path, monkeypatch):
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200), _relay_hop(500, _GATEWAY_500)])
+    assert r.final.is_error and _STDIN.strip() not in r.final.result
+    assert r.final.result == ("the model endpoint refused the relay's request (HTTP 500 wrapping 400: 1 validation error "
+                              "for Message content.0 Input should be a valid dictionary); codex turn.failed: We’re "
+                              "currently experiencing high demand, which may cause temporary errors.")
+    # an outage with nothing refused in the relay's log: Codex's own words alone
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(503, '{"error": {"message": "upstream overloaded"}}')])
+    assert r.final.result == "codex turn.failed: We’re currently experiencing high demand, which may cause temporary errors."
+
+
+def test_an_errored_codex_turn_is_reported_by_its_cause_not_its_last_words(tmp_path, monkeypatch):
+    # draining_restop 1792178055 (codex, 2026-10-16): two calls, then the relay's request refused 30 times; Codex's last
+    # message was the prose it wrote beside its first call, which `run_completed` gave as the reason
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(500, _GATEWAY_500)],
+                    final="I'll first connect to the facility.")
+    assert r.final.is_error and r.final.result.startswith("the model endpoint refused the relay's request (HTTP 500")
+
+
+def test_the_stderr_tail_stays_the_reason_only_when_nothing_better_exists(tmp_path, monkeypatch):
+    # no turn.failed and no refused request: the stderr tail, as before; a clean run's final message is its result
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}',
+                    stderr="Error: something the harness printed\n")
+    assert r.final.result == "Error: something the harness printed\n"
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}',
+                    final="I stopped here.")
+    assert r.final.result == "I stopped here."
+    r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}', rc=0,
+                    final="Done.")
+    assert r.final.result == "Done." and not r.final.is_error

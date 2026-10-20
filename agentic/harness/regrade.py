@@ -23,7 +23,7 @@ _HERE = Path(__file__).resolve().parent
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(_HERE.parents[0] / "scenarios"))
 
-from infra import PREFLIGHT_ROW, bundle_final, infra_reason, outcome_of  # noqa: E402
+from infra import PREFLIGHT_ROW, absences, bundle_final, infra_reason, outcome_of  # noqa: E402
 from invariants import (  # noqa: E402
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -103,17 +103,20 @@ def _preflight(rec: dict) -> str | None:
     return None if pre is None else str(pre.get("detail") or "the model endpoint was unhealthy before launch")
 
 
-def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str]) -> str | None:
-    """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None."""
+def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str], postchecks=()) -> str | None:
+    """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None. `postchecks`: the scenario's
+    POSTCHECKS, which say which stored world failures only found missing what the agent's work would have left."""
     if not crit_fail_names or rec.get("rc") == 3 or rec.get("result") not in (None, "OK", "FAILED", "INFRA"):
         return None   # INFRA replaces a graded FAILED only: never RATE_LIMITED, INTERRUPTED, SETUP FAILED or CRASHED
     # what was not re-run here but did fail live — world checks, the harness rows (the leak probe after the teardown):
-    # INFRA never hides one
-    stored = list(rec.get("failed") or []) + [g["name"] for g in rec.get("grading", [])
-                                              if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    # INFRA never hides one, except a world check that failed only because nothing ran (infra.absences)
+    world = [(str(g["name"]), str(g.get("detail") or "")) for g in rec.get("grading", [])
+             if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    stored = list(rec.get("failed") or []) + [name for name, _ in world]
     rows = _rows(d)
     operator = (rec.get("config") or {}).get("operator") or "claude"
-    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored)
+    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored,
+                        absences(world, postchecks))
 
 
 def regrade(runs_dir: Path, *, strict: bool = False) -> int:
@@ -174,7 +177,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         crit_fail_names = [r.name for r in results if not r.ok and r.name in critical]
         label = (f"{cfg.get('persona') or 'auto'}"
                  f"{', ~skill' if cfg.get('ablate_skill') else ''}")
-        infra = bundle_infra(d, rec, t, crit_fail_names)
+        infra = bundle_infra(d, rec, t, crit_fail_names, getattr(scen, "POSTCHECKS", ()))
         tag = "INFRA" if infra else "FAIL" if crit_fail_names else "OK  "
         if infra:
             now_infra += 1

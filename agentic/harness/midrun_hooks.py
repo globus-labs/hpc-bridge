@@ -11,8 +11,12 @@ A hook has ONE trigger:
 - `on_tool` — a DURING hook: fires `after_s` seconds after a matching call STARTED, if that call is still in flight
   then (`nth` counts the matching calls that were). This is how a scenario presses Esc in the middle of a call.
 
-`when_input` is a dict (each key equal to the call's argument, case-insensitively: True and "true" alike) or a string
-(a regex searched in the call's argument values, e.g. a marker in the command).
+`when_input` is a dict (each key equal to the call's EFFECTIVE argument, case-insensitively: True and "true" alike) or a
+string (a regex searched in the argument values the call sent, e.g. a marker in the command). Effective: an argument
+the call left out takes the tool's own default (`tool_defaults`, read from hpc-bridge's source), so `{"shape":
+"compute"}` matches a `run_shell` that sends only its command — the product runs it on the compute shape. hermes21
+sent every run_shell as `{"command": "hostname"}` (draining_restop, live 2026-10-16) and the freeze, matched against
+the arguments as sent, NEVER FIRED. A regex reads only what the call sent: a default is no marker the agent wrote.
 
 A call that does not match is not counted, so `nth` counts only the calls a hook is about. That matters because a
 model may open with a blind parallel batch before anything is connected — hermes21 on gpt-oss, live 2026-10-15:
@@ -65,7 +69,9 @@ Pure and SDK-free (cli_runner and the hermetic tests import it; runner.py re-exp
 """
 from __future__ import annotations
 
+import ast
 import asyncio
+import functools
 import json
 import math
 import re
@@ -76,7 +82,95 @@ from typing import Any
 from invariants import ToolCall, logical_name
 from trace_adapter import _result_to_dict
 
-ACTIONS = ("cmd", "interrupt", "interject")
+# hpc-bridge's tools, as the product defines them: the `@mcp.tool` functions of its server. Read from the source, not
+# imported — the harness' interpreter in the jail has no Globus Compute SDK, which importing the server pulls in (the
+# repo is in the jail: the server runs from it). test_midrun_hooks pins what this reads to the server's MCP schema.
+_SERVER_SRC = Path(__file__).resolve().parents[2] / "src" / "hpc_bridge" / "server.py"
+_LITERAL_ERRORS =(ValueError, TypeError, SyntaxError, MemoryError, RecursionError)
+
+
+@functools.cache
+def _module_names(path: Path) -> tuple[dict[str, Any], dict[str, str]]:
+    """A module's literal top-level constants (`NAME = <literal>`), and the names it imports from a module of its own
+    package (`from .context import DEFAULT_SHAPE` → {"DEFAULT_SHAPE": "context"})."""
+    consts: dict[str, Any] = {}
+    imported: dict[str, str] = {}
+    for node in ast.parse(path.read_text()).body:
+        if isinstance(node, (ast.Assign, ast.AnnAssign)) and node.value is not None:
+            targets = node.targets if isinstance(node, ast.Assign) else [node.target]
+            if len(targets) == 1 and isinstance(targets[0], ast.Name):
+                try:
+                    consts[targets[0].id] = ast.literal_eval(node.value)
+                except _LITERAL_ERRORS:
+                    pass
+        elif isinstance(node, ast.ImportFrom) and node.level == 1 and node.module:
+            for alias in node.names:
+                imported[alias.asname or alias.name] = node.module
+    return consts, imported
+
+
+def _resolve(node: ast.expr, path: Path, depth: int = 0) -> tuple[bool, Any]:
+    """(True, value) for a default the source states: a literal, or a module constant — this module's, or one it
+    imports from its own package (`DEFAULT_SHAPE`, which server.py imports from context.py). (False, None) otherwise."""
+    try:
+        return True, ast.literal_eval(node)
+    except _LITERAL_ERRORS:
+        pass
+    if not isinstance(node, ast.Name) or depth > 3:
+        return False, None
+    consts, imported = _module_names(path)
+    if node.id in consts:
+        return True, consts[node.id]
+    mod = imported.get(node.id, "").replace(".", "/")
+    for src in ((path.parent / f"{mod}.py", path.parent / mod / "__init__.py") if mod else ()):
+        if src.exists():
+            return _resolve(node, src, depth + 1)
+    return False, None
+
+
+def _is_tool_decorator(d: ast.expr) -> bool:
+    f = d.func if isinstance(d, ast.Call) else d
+    return isinstance(f, ast.Attribute) and f.attr == "tool" and isinstance(f.value, ast.Name) and f.value.id == "mcp"
+
+
+@functools.cache
+def tool_defaults(server_src: Path = _SERVER_SRC) -> dict[str, dict[str, Any]]:
+    """Each hpc-bridge tool's defaults, {tool: {argument: default}}, as its `@mcp.tool` signature in server.py states
+    them — what the server takes for an argument a call leaves out (run_shell's `shape` is "compute"). Arguments with no
+    default, and a default the source does not state as a literal or a module constant, are left out. {} when the
+    source cannot be read: `when_input` then matches the arguments as sent, as it did before."""
+    try:
+        tree = ast.parse(server_src.read_text())
+    except (OSError, SyntaxError, ValueError):
+        return {}
+    out: dict[str, dict[str, Any]] = {}
+    for node in tree.body:
+        if not isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef)):
+            continue
+        deco = next((d for d in node.decorator_list if _is_tool_decorator(d)), None)
+        if deco is None:
+            continue
+        named = next((k.value for k in getattr(deco, "keywords", []) if k.arg == "name"), None)
+        name = named.value if isinstance(named, ast.Constant) and isinstance(named.value, str) else node.name
+        a = node.args
+        positional = [*a.posonlyargs, *a.args]
+        pairs = [*zip(positional[len(positional) - len(a.defaults):], a.defaults, strict=True),
+                 *((k, d) for k, d in zip(a.kwonlyargs, a.kw_defaults, strict=True) if d is not None)]
+        defaults: dict[str, Any] = {}
+        for arg, default in pairs:
+            ok, value = _resolve(default, server_src)
+            if ok:
+                defaults[arg.arg] = value
+        out[name] = defaults
+    return out
+
+
+def effective_input(tool: str, inp: dict | None) -> dict:
+    """A call's arguments with the tool's own defaults filled in for those it left out (`tool_defaults`)."""
+    return {**tool_defaults().get(tool, {}), **(inp or {})}
+
+
+ACTIONS =("cmd", "interrupt", "interject")
 # What each hpc-bridge tool's answer carries (server.py's return types; test_midrun_hooks pins both to the product's
 # models): a `phase` with these values (ShellOutcome, ConnectResult, LoginStatus, PreauthStatus) — or, for the
 # EndpointStatus tools, a `status` and an `endpoint_id` and no phase.
@@ -226,11 +320,14 @@ def operator_refusal(operator: str, *, persona: str | None, phases: bool, hooks:
     return None
 
 
-def _input_matches(want: Any, inp: dict) -> bool:
+def _input_matches(want: Any, inp: dict, tool: str = "") -> bool:
+    """Does a call of `tool` with arguments `inp` match `when_input`? A dict compares the call's EFFECTIVE arguments
+    (an argument left out is the tool's default); a regex searches the values the call sent."""
     if not want:
         return True
     if isinstance(want, dict):
-        return all(str(inp.get(k)).lower() == str(v).lower() for k, v in want.items())   # True/"true" alike
+        args = effective_input(tool, inp) if tool else (inp or {})
+        return all(str(args.get(k)).lower() == str(v).lower() for k, v in want.items())   # True/"true" alike
     blob = "\n".join(v if isinstance(v, str) else json.dumps(v, default=str) for v in (inp or {}).values())
     return re.search(str(want), blob) is not None
 
@@ -274,7 +371,7 @@ class HookWatcher:
         for k, h in enumerate(self.hooks):
             if k in self._fired or not is_during(h) or h.get("on_tool") != name:
                 continue
-            if _input_matches(h.get("when_input"), args):
+            if _input_matches(h.get("when_input"), args, name):
                 self._armed.append({**h, "index": k, "call_index": index, "call_id": call_id})
 
     def call_ended(self, call_id: str, result: dict | None) -> list[dict]:
@@ -293,7 +390,7 @@ class HookWatcher:
         for k, h in enumerate(self.hooks):
             if k in self._fired or is_during(h) or h.get("after_tool") != name:
                 continue
-            if not _input_matches(h.get("when_input"), inp):
+            if not _input_matches(h.get("when_input"), inp, name):
                 continue
             if h.get("after_hook") and h["after_hook"] not in fired_before:
                 continue

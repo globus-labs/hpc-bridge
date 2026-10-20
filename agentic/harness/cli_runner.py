@@ -34,6 +34,7 @@ from pathlib import Path
 from typing import Any
 
 import yaml
+from infra import ended_on
 from invariants import ToolCall, Trace
 from midrun_hooks import HookWatcher, fired_record, follow_journal, hook_label, trigger_text, unsupported_hook_needs
 from proctree import kill_group
@@ -694,7 +695,13 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     rows = _journal_rows(journal)
     trace, stats = build_trace(rows, events, texts or ([text] if text else []))
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
-    final = CliFinal(result=text or (err or "")[-400:], is_error=rc != 0)
+    # `run_completed`'s reason: what the run ENDED on (the relay's refused request, Codex's turn.failed, Pi's last error)
+    # when there is no final message, or when the run errored (Codex's last message is then whatever it said last: "I'll
+    # first connect to the facility.", draining_restop 1792178055); the stderr tail only when nothing better exists — in
+    # every Codex cell it is "Reading additional input from stdin...", which is no reason (sweep 2026-10-16: happy_path
+    # 1792181717, hand_batch_job 1792181634). The bundle keeps the final message itself as it was (`final`).
+    cause = ended_on(harness, out or "", hops)
+    final = CliFinal(result=((cause or text) if rc != 0 else (text or cause)) or (err or "")[-400:], is_error=rc != 0)
     # the run dir dies with the jail: carry the journal, the harness's own record and the relay log into the bundle
     messages = [{"harness": harness, "argv": argv[:6], "rc": rc, "seconds": round(time.monotonic() - t0, 1),
                  "trace_stats": stats, "stdout_tail": (out or "")[-4000:], "stderr_tail": (err or "")[-4000:]},
