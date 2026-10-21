@@ -49,7 +49,7 @@ from cluster_ops import (
     token_store_cleanup_cmd,
     uep_dirs_cleanup_cmd,
 )
-from infra import INFRA_RC, infra_reason, outcome_of
+from infra import INFRA_RC, absences, infra_reason, outcome_of
 from invariants import (
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -1384,7 +1384,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         completed = res.final is not None and not getattr(res.final, "is_error", False)
         results.append(Result("run_completed", completed,
                               "ok" if completed else "the agent run errored or never returned a result: "
-                              + str(getattr(res.final, "result", "") or "")[:160]))
+                              + str(getattr(res.final, "result", "") or "")[:400]))
         if persona:
             n = getattr(res, "prose_followups", 0)
             capped = getattr(res, "followups_capped", False)
@@ -1532,7 +1532,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             rc = 3
             result_label = "RATE_LIMITED"
             print("RESULT: RATE_LIMITED — session/rate limit; run not graded, suite should halt")
-        elif failed and (infra := infra_reason(outcome_of(operator, res.trace, res.messages, res.final), failed)):
+        elif failed and (infra := infra_reason(
+                outcome_of(operator, res.trace, res.messages, res.final), failed,
+                absences([(r.name, r.detail) for r in [*watched, *world] if not r.ok], getattr(scen, "POSTCHECKS", [])))):
             # The operator did nothing (no tool call of any kind) and its MODEL ENDPOINT's outage is on record (infra.py):
             # not a verdict on hpc-bridge. Its own rc, so a sweep counts it apart.
             rc = INFRA_RC

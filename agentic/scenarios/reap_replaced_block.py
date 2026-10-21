@@ -377,9 +377,10 @@ EXPECT_OK = [   # replacement_found_by and jobs_relayed are REPORT-ONLY
 _JOBS = parsl_jobs_since_cmd(_T0)
 POSTCHECKS = [
     # the old pilot really was cancelled (sacct), and the run had exactly two pilots, never at once (an empty or failed
-    # sacct reads parsl_jobs=0 — never a pass)
-    {"name": "old_block_cancelled", "cmd": _JOBS, "expect_present": "old=CANCELLED;"},
-    {"name": "one_block_at_a_time", "cmd": _JOBS, "expect_present": "parsl_jobs=2; overlap=0;"},
+    # sacct reads parsl_jobs=0 — never a pass). HARM checks — counts and states of the pool user's pilots, which a
+    # leaked endpoint's pilot also moves — so never read as "nothing ran" (infra.py)
+    {"name": "old_block_cancelled", "cmd": _JOBS, "expect_present": "old=CANCELLED;", "harm": True},
+    {"name": "one_block_at_a_time", "cmd": _JOBS, "expect_present": "parsl_jobs=2; overlap=0;", "harm": True},
 ]
 CLEANUP = [f"rm -f {_T0} {_FLAG}"]
 TEARDOWN = "delete"
