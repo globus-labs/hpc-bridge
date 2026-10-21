@@ -273,10 +273,18 @@ class AppCtx:
     failed_details: dict[str, FailedDetails] = field(default_factory=dict)
     # The facility object a failed connect left BOUND (the bind precedes the bring-up) when it dropped that config, and
     # what a bring-up of it answers instead (DroppedConfigError, raised by warmth._provision): ensure_endpoint_up and
-    # run_shell must not bootstrap the dropped config either. Not an unbind — teardown_endpoint still reaches that login
-    # node (a failed bring-up may have seeded the token store there). Matched by identity, so the next bind (a new
-    # facility object) ends it; connect also clears it there.
+    # run_shell must not bootstrap the dropped config either. A mark, not an unbind (the smaller change). NOT a way to
+    # clean up: with no endpoint id known after a failed bring-up, teardown_endpoint and stop_endpoint answer "no
+    # endpoint was up" without SSH, so what the bring-up left on the login node (the token store it seeded) stays —
+    # a known gap, older than this mark. Matched by identity, so the next bind (a new facility object) ends it; connect
+    # also clears it there.
     dropped_binding: tuple[Any, str] | None = None
+    # Facility ids whose pending details= config (pending_facility_cache) got past `start` this session — a connect's
+    # bring-up of it returned: an endpoint stands for it. Never dropped after that (connect._drop_failed_details): each
+    # later poll re-runs the venv check, whoami and list through env_setup, and a flaky login node (out of processes, a
+    # stale NFS handle) must not cost a config that started. Cleared by the next details= for the id and when it comes
+    # up.
+    details_started: set[str] = field(default_factory=set)
     # The facility id the LAST connect_facility answered with proposed_facility_details (a draft config, nothing bound).
     # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
     # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.

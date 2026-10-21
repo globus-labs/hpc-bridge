@@ -102,9 +102,12 @@ _OLD_CONFIGURE_FAILED = "RuntimeError: remote configure failed:"
 # equal): a failure in these words was the network's, a timeout's, Globus's, a lost connection's, a full disk's — the
 # product keeps that config for a retry, rightly.
 NOT_THE_CONFIG_WORDS = re.compile(
-    r"timed? ?out|globus_sdk|globus ?api ?error|globus ?connection ?error|auth\.globus\.org|api\.globus\.org"
+    r"\btimed out\b|timeout ?error|globus_sdk\.\S*error|globus ?api ?error|globus ?connection ?error"
+    r"|globus ?timeout ?error|auth\.globus\.org|api\.globus\.org"
     r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
-    r"|ssh: connect to host|could not find endpoint|no space left on device|disk quota exceeded",
+    r"|ssh: connect to host|could not find endpoint|resource temporarily unavailable|stale file handle"
+    r"|read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
+    r"|no space left on device|\[errno 28\]|disk quota exceeded|\[errno 122\]",
     re.IGNORECASE,
 )
 _MATCH = 200   # how much of a failure's opening a later answer must repeat to be "the same failure"

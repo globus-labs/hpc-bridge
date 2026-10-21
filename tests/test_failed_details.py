@@ -23,7 +23,7 @@ import pytest
 from hpc_bridge import binding, config, connect, notices, server, warmth
 from hpc_bridge.context import AppCtx, DroppedConfigError
 from hpc_bridge.facility import endpoint_venv as ev
-from hpc_bridge.facility.base import ConfigStepFailed
+from hpc_bridge.facility.base import ConfigStepFailed, step_error
 from hpc_bridge.facility.remote import RemoteEndpointCLI, RemoteTokenStoreExists, SshTarget
 from hpc_bridge.login import LoginExpiredError
 from hpc_bridge.models import FacilityDetails
@@ -171,14 +171,26 @@ async def test_a_details_bring_up_still_coming_up_keeps_polling_without_details(
     assert binding._facility_store().get(HOST)["env_setup"] == GOOD and "byo" not in app.pending_facility_cache
 
 
-async def test_a_bring_up_still_coming_up_that_then_fails_on_the_login_node_is_dropped(monkeypatch):
+async def test_a_bring_up_that_got_past_start_is_never_dropped_by_a_later_poll(monkeypatch):
+    # review round 3 (item 3): each poll re-runs the venv check, whoami and list through env_setup, so a flaky login
+    # node (out of processes, a stale NFS handle) used to drop a config whose endpoint had started — never now
     w, app = World(monkeypatch, outcome="provisioning"), _app()
     assert (await server._connect_facility(app, "byo", details=_details(GOOD))).phase == "provisioning"
-    w.fail[GOOD] = ConfigStepFailed("remote configure failed: bash: line 1: globus-compute-endpoint: command not found")
-    res = await server._connect_facility(app, "byo")   # still unproven: its failure drops it
-    assert res.phase == "failed" and "is not kept" in (res.notice or "") and "byo" not in app.session_facilities
-    assert (await server._connect_facility(app, "byo")).phase == "proposed_facility_details"
-    assert w.brought_up == [GOOD, GOOD]
+    assert "byo" in app.details_started
+    for said in ("bash: fork: retry: Resource temporarily unavailable\nbash: fork: Resource temporarily unavailable",
+                 "OSError: [Errno 116] Stale file handle",
+                 "bash: line 1: globus-compute-endpoint: command not found"):   # even the config's own words: it started
+        w.fail[GOOD] = ConfigStepFailed(f"remote list failed: {said}")
+        res = await server._connect_facility(app, "byo")
+        assert res.phase == "failed" and "is not kept" not in (res.notice or "") and "byo" in app.session_facilities
+    del w.fail[GOOD]
+    assert (await server._connect_facility(app, "byo")).phase == "provisioning" and w.probed == []
+    w.outcome = "warm"
+    assert (await server._connect_facility(app, "byo")).phase == "needs_account" and "byo" not in app.details_started
+    # a NEW details= starts unstarted: its own first failure on the login node is dropped as ever
+    w.outcome = "provisioning"
+    assert (await server._connect_facility(app, "byo", details=_details(BAD))).phase == "failed"
+    assert "byo" not in app.session_facilities and "byo" not in app.details_started
 
 
 async def test_a_proven_details_config_is_kept_even_when_a_later_bring_up_fails(monkeypatch):
@@ -390,11 +402,58 @@ EXPLAINED = [
      "hpc-bridge error: ConfigStepFailed: remote start failed", False),
     (ConfigStepFailed("remote configure failed: Connection to login closed by remote host."),
      "hpc-bridge error: ConfigStepFailed: remote configure failed: Connection", False),
-    (ConfigStepFailed("remote configure failed: OSError: [Errno 28] No space left on device"),
-     "hpc-bridge error: ConfigStepFailed: remote configure failed: OSError", False),
-    (ConfigStepFailed("remote configure failed: Disk quota exceeded"),
-     "hpc-bridge error: ConfigStepFailed: remote configure failed: Disk", False),
+    # … and a refused write of the login node's filesystem is explained as before (REMOTE FILESYSTEM) and kept
+    (ConfigStepFailed("remote configure failed: OSError: [Errno 28] No space left on device"), "REMOTE FILESYSTEM",
+     False),
+    (ConfigStepFailed("remote configure failed: Disk quota exceeded"), "REMOTE FILESYSTEM", False),
+    # round 3, item 2 — live 2026-09-03: globus-compute-endpoint's own write under ~/.globus_compute refused
+    (ConfigStepFailed("remote start failed (rc=1): PermissionError: [Errno 13] Permission denied: "
+                      "'/home/u/.globus_compute/hpc-bridge-login/endpoint.log'"), "REMOTE FILESYSTEM", False),
+    (ConfigStepFailed("remote configure failed: OSError: [Errno 30] Read-only file system: "
+                      "'/home/u/.globus_compute/hpc-bridge-login'"), "REMOTE FILESYSTEM", False),
+    # round 3, item 3: the login node's own state — out of processes, a stale NFS handle — kept
+    (ConfigStepFailed("remote configure failed: bash: fork: retry: Resource temporarily unavailable\nbash: fork: "
+                      "Resource temporarily unavailable"), "hpc-bridge error: ConfigStepFailed: remote configure", False),
+    (ConfigStepFailed("remote list failed: OSError: [Errno 116] Stale file handle"),
+     "hpc-bridge error: ConfigStepFailed: remote list failed", False),
 ]
+
+# round 3, item 1: real multi-line outputs, raised as the steps raise them (`step_error` with the step's own output).
+# Only the LAST meaningful line decides: a banner's "timeout", a `sock.settimeout` frame or a `globus_sdk` path before it
+# is no cause; a timeout or a Globus error that IS the last line is.
+_BANNER_LMOD = ("*** login02: idle sessions timeout after 30 minutes of inactivity ***\n"
+                'Lmod has detected the following error: The following module(s) are unknown: "gcc/10.2.0"\n\n'
+                'Please check the spelling or version number. Also try "module spider ..."\n'
+                "It is also possible your cache file is out-of-date; it may help to try:\n"
+                '  $ module --ignore_cache load "gcc/10.2.0"\n\n'
+                "Also make sure that all modulefiles written in TCL start with the string\n#%Module")
+_SDK_MISMATCH = ("Traceback (most recent call last):\n"
+                 '  File "/home/u/venv/bin/globus-compute-endpoint", line 5, in <module>\n'
+                 "    from globus_compute_endpoint.cli import cli_run\n"
+                 '  File "/home/u/venv/lib/python3.11/site-packages/globus_compute_endpoint/cli.py", line 21, in <module>\n'
+                 "    from globus_sdk import GlobusApp\n"
+                 "ImportError: cannot import name 'GlobusApp' from 'globus_sdk' "
+                 "(/home/u/venv/lib/python3.11/site-packages/globus_sdk/__init__.py)")
+_NO_PARSL = ("Traceback (most recent call last):\n"
+             '  File "/home/u/venv/lib/python3.11/site-packages/globus_compute_endpoint/endpoint/utils.py", line 88, '
+             "in _probe\n    sock.settimeout(self.timeout)\n"
+             '  File "/home/u/venv/lib/python3.11/site-packages/globus_compute_endpoint/engines/htex.py", line 3, in '
+             "<module>\n    import parsl\nModuleNotFoundError: No module named 'parsl'")
+_PIP_TIMEOUT = ("Traceback (most recent call last):\n"
+                '  File "/home/u/venv/lib/python3.11/site-packages/pip/_vendor/urllib3/response.py", line 438, in '
+                "_error_catcher\n    yield\npip._vendor.urllib3.exceptions.ReadTimeoutError: "
+                "HTTPSConnectionPool(host='pypi.org', port=443): Read timed out.")
+_AUTH_DOWN = ("Traceback (most recent call last):\n"
+              '  File "/home/u/venv/lib/python3.11/site-packages/globus_sdk/client.py", line 300, in request\n'
+              "    raise self.error_class(r)\nglobus_sdk.services.auth.errors.AuthAPIError: ('POST', "
+              "'https://auth.globus.org/v2/oauth2/token', None, 503, 'Error', 'Service Unavailable')")
+_SOCKET_THEN_MODULE = "Control socket connect(/tmp/cm/abc): Connection refused\nmodule: command not found"
+for _text, _drops in ((_BANNER_LMOD, True), (_SDK_MISMATCH, True), (_NO_PARSL, True), (_SOCKET_THEN_MODULE, True),
+                      (_PIP_TIMEOUT, False), (_AUTH_DOWN, False)):
+    EXPLAINED.append((step_error(1, f"remote configure failed: {_text}", output=_text),
+                      "hpc-bridge error: ConfigStepFailed: remote configure failed:", _drops))
+    EXPLAINED.append((step_error(1, f"remote start failed (rc=1): {_text}; `list` failed too: rc=1", output=_text),
+                      "hpc-bridge error: ConfigStepFailed: remote start failed", _drops))
 
 
 @pytest.mark.parametrize(("exc", "opens", "drops"), EXPLAINED, ids=[f"{type(e).__name__}-{i}" for i, (e, _o, _d)
@@ -406,25 +465,39 @@ def test_every_explanation_says_what_it_says_and_only_the_configs_own_failure_dr
     assert notices._failure_of_the_config(exc) is drops
 
 
-@pytest.mark.parametrize(("exc", "opens", "drops"), [x for x in EXPLAINED if not isinstance(x[0], LoginExpiredError)],
-                         ids=[f"{type(e).__name__}-{i}" for i, (e, _o, _d) in enumerate(EXPLAINED)
-                              if not isinstance(e, LoginExpiredError)])
-async def test_a_poll_of_a_config_coming_up_drops_it_only_for_the_configs_own_failure(monkeypatch, exc, opens, drops):
-    # every poll re-runs the bootstrap's steps (each connect resets app.state), so each answer above can meet a config
-    # that is still coming up: only the config's own failure drops it (round 1: six transients dropped it)
+_CONNECTED = [x for x in EXPLAINED if not isinstance(x[0], LoginExpiredError)]   # the gate answers that one first
+_IDS = [f"{type(e).__name__}-{i}" for i, (e, _o, _d) in enumerate(_CONNECTED)]
+
+
+@pytest.mark.parametrize(("exc", "opens", "drops"), _CONNECTED, ids=_IDS)
+async def test_a_first_bring_up_drops_its_config_only_for_the_configs_own_failure(monkeypatch, exc, opens, drops):
+    w, app = World(monkeypatch), _app()
+    w.fail[GOOD] = exc
+    res = await server._connect_facility(app, "byo", details=_details(GOOD))
+    assert res.phase == "failed" and (res.notice or "").startswith(opens)
+    assert ("byo" not in app.session_facilities) is drops and ("This configuration (details=) is not kept" in res.notice) is drops
+    del w.fail[GOOD]
+    nxt = await server._connect_facility(app, "byo")
+    assert nxt.phase == ("proposed_facility_details" if drops else "needs_account")
+    assert w.brought_up == [GOOD] + ([] if drops else [GOOD])
+
+
+@pytest.mark.parametrize(("exc", "opens", "drops"), _CONNECTED, ids=_IDS)
+async def test_a_poll_of_a_config_that_got_past_start_never_drops_it(monkeypatch, exc, opens, drops):
+    # every poll re-runs the bootstrap's steps (each connect resets app.state); once a bring-up of the config got past
+    # `start`, none of the answers above drops it (round 1: six transients did; round 3: a flaky node still could)
     w, app = World(monkeypatch, outcome="provisioning"), _app()
     assert (await server._connect_facility(app, "byo", details=_details(GOOD))).phase == "provisioning"
     w.fail[GOOD] = exc
     res = await server._connect_facility(app, "byo")
     assert res.phase == "failed" and (res.notice or "").startswith(opens)
-    assert ("byo" not in app.session_facilities) is drops and ("This configuration (details=) is not kept" in res.notice) is drops
+    assert "byo" in app.session_facilities and "This configuration (details=) is not kept" not in res.notice
     del w.fail[GOOD]
-    nxt = await server._connect_facility(app, "byo")
-    assert nxt.phase == ("proposed_facility_details" if drops else "provisioning")
-    assert w.brought_up == [GOOD, GOOD] + ([] if drops else [GOOD])
+    assert (await server._connect_facility(app, "byo")).phase == "provisioning"
+    assert w.brought_up == [GOOD] * 3 and w.probed == []
 
 
-@pytest.mark.parametrize(("rc", "config_step"), [(1, True), (127, True), (255, False)])
+@pytest.mark.parametrize(("rc", "config_step"), [(1, True), (127, True), (255, False), (-9, False)])   # -9: ssh killed
 async def test_the_steps_that_run_env_setup_raise_ConfigStepFailed_unless_ssh_itself_failed(monkeypatch, rc, config_step):
     from hpc_bridge.facility import remote
 
@@ -476,7 +549,7 @@ async def test_ensure_endpoint_up_and_run_shell_refuse_to_bring_a_dropped_config
     w, app = World(monkeypatch), _app()
     await server._connect_facility(app, "lmodfac", ssh_host=HOST, details=_details())
     bound = app.facility
-    assert app.machine == "lmodfac" and bound.env_setup == BAD          # still BOUND (teardown_endpoint needs it)
+    assert app.machine == "lmodfac" and bound.env_setup == BAD          # still BOUND (a mark, not an unbind)
     monkeypatch.setattr(warmth, "_provision", REAL_PROVISION)           # what the two tools reach
     expect = ("connect_facility('lmodfac') failed to bring up the configuration given with details= (hpc-bridge error: "
               "ConfigStepFailed: remote configure failed: Lmod has detected the following error")
@@ -509,20 +582,41 @@ async def test_a_config_equal_to_the_one_proven_for_the_host_is_kept_when_it_fai
 
 # ---- item 4: a connect without details that waited behind the failing bring-up resolves again -------------------------
 
+def _held(monkeypatch, w, app):
+    """The first bring-up holds the lock until a second call WAITS on it — deterministic, never a race of sleeps (a
+    thread hop before the lock can outlast any sleep under load). Returns the event set once that bring-up holds the
+    lock: start the second call on it."""
+    import asyncio
+
+    inside, waiting = asyncio.Event(), asyncio.Event()
+
+    class SpyLock(asyncio.Lock):
+        async def acquire(self):
+            if self.locked():
+                waiting.set()
+            return await super().acquire()
+
+    app.lock = SpyLock()
+    orig = w._provision
+
+    async def held(app_, shape, **kw):
+        if not inside.is_set():
+            inside.set()
+            await asyncio.wait_for(waiting.wait(), 5)
+        return await orig(app_, shape, **kw)
+
+    monkeypatch.setattr(warmth, "_provision", held)
+    return inside
+
+
 async def test_a_connect_without_details_queued_behind_the_failing_bring_up_resolves_again(monkeypatch):
     import asyncio
 
     w, app = World(monkeypatch), _app()
-    orig = w._provision
-
-    async def slow(app_, shape, **kw):   # a bring-up takes time on the login node
-        await asyncio.sleep(0.05)
-        return await orig(app_, shape, **kw)
-
-    monkeypatch.setattr(warmth, "_provision", slow)
+    inside = _held(monkeypatch, w, app)
 
     async def second():
-        await asyncio.sleep(0.01)   # arrives while the first holds the lock, bringing the bad config up
+        await inside.wait()   # arrives while the first holds the lock, bringing the bad config up
         return await server._connect_facility(app, "lmodfac", ssh_host=HOST)
 
     first, other = await asyncio.gather(server._connect_facility(app, "lmodfac", ssh_host=HOST, details=_details()),
@@ -544,3 +638,91 @@ async def test_advice_that_already_says_connect_again_is_made_one_with_the_drop(
     assert ("This configuration (details=) is not kept. So, to connect_facility again as above: connect_facility('byo', "
             "ssh_host='login') without details resolves the facility afresh") in notice
     assert "with details= it runs the configuration given — this one again, or a corrected one" in notice
+
+
+# ---- review round 3 ----------------------------------------------------------------------------------------------------
+
+@pytest.mark.parametrize("outcome", ["provisioning", "warm"])
+async def test_a_failing_bring_up_never_drops_the_config_another_details_put_in_its_place(monkeypatch, outcome):
+    # item 4: details=A (bad) holds the lock; details=B (good) arrives and replaces the session's config; A fails — and
+    # used to delete B's entry and pending cache with its own drop
+    import asyncio
+
+    w, app = World(monkeypatch, outcome=outcome), _app()
+    inside = _held(monkeypatch, w, app)
+
+    async def second():
+        await inside.wait()
+        return await server._connect_facility(app, "byo", ssh_host=HOST, details=_details(GOOD))
+
+    a, b = await asyncio.gather(server._connect_facility(app, "byo", ssh_host=HOST, details=_details(BAD)), second())
+    assert a.phase == "failed" and "is not kept" not in (a.notice or "")   # A's config was no longer the session's
+    assert "byo" not in app.failed_details and app.session_facilities["byo"].compute.env_setup == GOOD
+    if outcome == "provisioning":
+        assert b.phase == "provisioning" and app.pending_facility_cache["byo"][1]["env_setup"] == GOOD
+        poll = await server._connect_facility(app, "byo")                  # B is polled, not proposed over
+        assert poll.phase == "provisioning" and w.probed == [] and w.brought_up == [BAD, GOOD, GOOD]
+    else:
+        assert b.phase == "needs_account" and binding._facility_store().get(HOST)["env_setup"] == GOOD   # B proven
+
+
+async def test_teardown_on_a_dropped_binding_reaches_nothing_today(monkeypatch):
+    # item 5 — a KNOWN GAP, older than this branch, pinned so its fix changes this on purpose: after a failed bring-up no
+    # endpoint id is known, so teardown_endpoint and stop_endpoint answer "no endpoint was up" without SSH. What the
+    # failed bring-up left on the login node (the token store it seeded, ~/.globus_compute/storage.db) stays there.
+    World(monkeypatch)
+    app = _app()
+    await server._connect_facility(app, "lmodfac", ssh_host=HOST, details=_details())
+    assert app.dropped_binding is not None and app.state.endpoint_id is None
+    td = await server._teardown_endpoint(app)
+    st = await server._stop_endpoint(app)
+    assert (td.status, td.notice) == ("down", "no endpoint was up") and (st.status, st.notice) == ("down",
+                                                                                                    "no endpoint was up")
+
+
+async def test_a_config_an_older_plugin_cached_is_compared_through_the_model(monkeypatch):
+    # item 7: a record written before a field existed reads equal once the model fills its default
+    World(monkeypatch)
+    app = _app()
+    old = _details(BAD).model_dump(mode="json")
+    for newer in ("cpus_per_node", "endpoint_name", "display_name"):
+        old.pop(newer)
+    binding._facility_store().put(HOST, old)
+    first = await server._connect_facility(app, "lmodfac", details=_details(BAD))
+    assert first.phase == "failed" and "is not kept" not in (first.notice or "") and "lmodfac" in app.session_facilities
+
+
+async def test_a_login_that_landed_before_the_retry_is_still_named(monkeypatch):
+    # item 8: a connect without details whose gate completed the Globus login, then found the config it resolved dropped
+    # under the lock, resolves again — and its answer still says who logged in
+    import asyncio
+    from types import SimpleNamespace
+
+    from hpc_bridge import login_gate
+
+    w, app = World(monkeypatch), _app()
+    inside = _held(monkeypatch, w, app)
+    binding._facility_store().put(HOST, _details(GOOD).model_dump(mode="json"))   # the cache rung: the retry binds it
+    verdicts = iter(["works", "missing"])                    # A's gate: logged in; B's: the login lands during it
+
+    async def stored(flow):
+        return next(verdicts, "works"), None
+
+    async def start_and_wait(flow, mode=None):
+        return SimpleNamespace(url="https://auth.globus.org/x", mode="browser"), "done"
+
+    async def as_identity():
+        return " as u@uchicago.edu"
+
+    monkeypatch.setattr(login_gate, "_stored_login", stored)
+    monkeypatch.setattr(login_gate, "_start_login_and_wait", start_and_wait)
+    monkeypatch.setattr(login_gate, "_as_identity", as_identity)
+    app.login_flow = SimpleNamespace(error=None)
+
+    async def second():
+        await inside.wait()
+        return await server._connect_facility(app, "lmodfac", ssh_host=HOST)
+
+    a, b = await asyncio.gather(server._connect_facility(app, "lmodfac", ssh_host=HOST, details=_details()), second())
+    assert a.phase == "failed" and b.phase == "needs_account" and w.brought_up == [BAD, GOOD]
+    assert "Globus login landed as u@uchicago.edu." in (b.notice or "")

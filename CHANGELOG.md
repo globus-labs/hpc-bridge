@@ -12,35 +12,46 @@ installed plugin only when that version changes); git tags mark releases.
   error: The following module(s) are unknown"). The next answer told it to call `connect_facility(…, ssh_host=…)`
   without `details=` for a proposed configuration; it did, and got the same Lmod error back: hpc-bridge had kept the
   configuration for the session before it was ever proven, and the connect without `details=` ran it again. Now a
-  `details=` configuration that the login node itself refused, before it ever came up, is dropped. That is decided
-  from what failed, never guessed from its words: a step that ran through the configuration's `env_setup` —
+  `details=` configuration that the login node itself refused, on its first bring-up, is dropped. That is decided from
+  what failed, not guessed from the whole text: a step that ran through the configuration's `env_setup` —
   `globus-compute-endpoint configure`, `start` or `list`, or the check or build of hpc-bridge's endpoint venv after
-  the site's prefix — and was refused there (any exit status but ssh's own 255), unless its words name a timeout, the
-  network, Globus, a lost ssh connection, an endpoint still registering or a full disk or quota. Everything else
-  keeps the configuration, for the retry its answer asks for: ssh refused or unreachable, an unknown or revoked host
-  key, a timeout, the Globus service or login, a home directory that refused a write, a token store hpc-bridge will
-  not replace, a venv in the way, an old uv. So a poll of a bring-up still coming up no longer loses it to a slow
-  registration, a 503 or a dropped connection; and a failure the configuration causes whose words mention
-  "Permission denied" or "Connection refused" (a file `env_setup` sources, a license server it calls) is now said as
-  the login node's answer, not as NO SSH ACCESS or CANNOT REACH, and drops it. The failure's answer says what happens
-  next, in one piece with any "connect_facility again" before it: without `details=`, `connect_facility(…,
-  ssh_host=…)` resolves the facility afresh — the registry's entry if it lists the id, else a configuration already
-  proven for that host, else a probe of the login node that proposes one (with no `ssh_host`, the host the dropped
-  configuration named) — and does not run the dropped one; with `details=` it runs what is given, this one again or
-  a corrected one (an `env_setup` left out comes from the latest proposal for the facility). Every answer to a
-  connect without `details=` then opens with what failed ("The details= given earlier for '…' failed to come up (…)
-  and is not kept: this connect did not run it."), until a new `details=` replaces it or the facility comes up. The
-  facility stays bound, so `teardown_endpoint` still reaches that login node, but `ensure_endpoint_up` and `run_shell`
-  no longer bring the dropped configuration up: they answer with the failure and the same two routes, and start
-  nothing. A connect without `details=` that waited behind the failing one resolves again instead of running what
-  that one just dropped. The dropped configuration is never written to the local facility cache, and one equal to
-  the configuration proven for that host in an earlier session is kept as proven. Unchanged: a bring-up still coming
-  up keeps being polled by a connect without `details=`; a configuration that came up is reused (the zero-SSH
-  reconnect), even if a later bring-up of it fails; a one-time-code handoff resumes it; a registry entry is never
-  dropped. The two refusals of a `details=` without `env_setup` now say what a connect without `details=` does from
-  where the session stands: it resolves the facility afresh, or, while the session keeps a configuration for the id,
-  reconnects with that one and proposes nothing — a proposal for another host then comes under another facility id
-  (they used to promise a proposal in every case).
+  the site's prefix — and was refused there (any exit status but ssh's own 255 or a negative one), unless the step's
+  LAST meaningful line (a traceback's exception, a command's final error; never a login banner or a frame before it)
+  names a timeout, Globus, a lost ssh connection, an endpoint still registering, the login node out of processes or on
+  a stale file handle, or its filesystem refusing a write. Everything else keeps the configuration, for the retry its
+  answer asks for: ssh refused or unreachable, an unknown or revoked host key, a timeout, the Globus service or login,
+  a home directory that refused a write (globus-compute-endpoint's own `PermissionError` or read-only file system under
+  `~/.globus_compute`, a full disk or quota — said again as REMOTE FILESYSTEM), a token store hpc-bridge will not
+  replace, a venv in the way, an old uv, a venv build that could not reach PyPI or astral.sh (DNS, route, refused
+  connection) or whose write was refused. And once a bring-up of the configuration got past `start`, no later poll
+  drops it: each poll re-runs the venv check, `whoami` and `list`, and a flaky login node must not cost a configuration
+  that started. So a failure the configuration causes — an unknown module, a mismatched `globus_sdk` in a hand-made
+  venv, a missing `parsl` — drops it even when a banner says "timeout" or a frame quotes `settimeout`; one whose words
+  mention "Permission denied" or "Connection refused" (a file `env_setup` sources, a license server it calls) is said
+  as the login node's answer, not as NO SSH ACCESS or CANNOT REACH. The failure's answer says what happens next, in
+  one piece with any "connect_facility again" before it: without `details=`, `connect_facility(…, ssh_host=…)`
+  resolves the facility afresh — the registry's entry if it lists the id, else a configuration already proven for
+  that host, else a probe of the login node that proposes one (with no `ssh_host`, the host the dropped configuration
+  named) — and does not run the dropped one; with `details=` it runs what is given, this one again or a corrected one
+  (an `env_setup` left out comes from the latest proposal for the facility). Every answer to a connect without
+  `details=` then opens with what failed ("The details= given earlier for '…' failed to come up (…) and is not kept:
+  this connect did not run it."), until a new `details=` replaces it or the facility comes up. The facility stays
+  bound, but `ensure_endpoint_up` and `run_shell` no longer bring the dropped configuration up: they answer with the
+  failure and the same two routes, and start nothing. Not yet cleaned up: what a failed bring-up left on the login
+  node — the Globus token store it seeded there when `whoami` failed under the broken `env_setup`
+  (`~/.globus_compute/storage.db`) — stays, because with no endpoint known `teardown_endpoint` and `stop_endpoint`
+  answer "no endpoint was up" without SSH (a gap older than this change; a later bring-up that comes up reuses that
+  store, and its teardown removes it). A connect without `details=` that waited behind the failing one resolves again
+  instead of running what that one just dropped, and still names a Globus login that landed while it waited; a failing
+  bring-up never drops a configuration another `details=` put in its place meanwhile. The dropped configuration is
+  never written to the local facility cache, and one equal to the configuration proven for that host in an earlier
+  session (compared field by field, so one an older plugin cached counts) is kept as proven. Unchanged: a bring-up
+  still coming up keeps being polled by a connect without `details=`; a configuration that came up is reused (the
+  zero-SSH reconnect), even if a later bring-up of it fails; a one-time-code handoff resumes it; a registry entry is
+  never dropped. The two refusals of a `details=` without `env_setup` now say what a connect without `details=` does
+  from where the session stands: it resolves the facility afresh, or, while the session keeps a configuration for the
+  id, reconnects with that one and proposes nothing — a proposal for another host then comes under another facility
+  id (they used to promise a proposal in every case).
 - **A block the scheduler refuses is answered with the scheduler's own reply, to relay to you.** In every October
   sweep (`submit_policy_rejected`, the fake `site` cluster), sbatch refused the block with two lines, "sbatch: error:
   AssocMaxSubmitJobLimit" and "sbatch: error: Batch job submission failed: Job violates accounting/QOS policy (job

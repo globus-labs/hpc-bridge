@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from hpc_bridge.facility import endpoint_venv as ev
+from hpc_bridge.facility.base import ConfigStepFailed
 from hpc_bridge.facility.endpoint_venv import EndpointVenvError
 from tests import venv_stubs as vs
 
@@ -823,11 +824,47 @@ async def test_real_a_parent_that_cannot_be_created_fails_at_once(box):
     _not_root()
     box["home"].chmod(0o500)
     try:
-        with pytest.raises(EndpointVenvError, match=r"could not build .*Permission denied"):
+        with pytest.raises(EndpointVenvError, match=r"could not build .*Permission denied") as got:
             await _real(box)
         assert vs.calls(box) == []
+        # the login node's filesystem refused the write: not the configuration's (connect keeps it, review round 3)
+        assert not isinstance(got.value, ConfigStepFailed)
     finally:
         box["home"].chmod(0o700)
+
+
+# a uv that fails the way the login node made it fail (a stub: no test ever reaches the network)
+_UV_FAILS = {
+    "dns": ("error: Failed to fetch: `https://pypi.org/simple/globus-compute-endpoint/`\n  Caused by: Request failed "
+            "after 3 retries\n  Caused by: error sending request for url (https://pypi.org/simple/)\n  Caused by: "
+            "dns error: failed to lookup address information: Temporary failure in name resolution", False),
+    "refused": ("error: Failed to fetch: `https://pypi.org/simple/parsl/`\n  Caused by: tcp connect error: Connection "
+                "refused (os error 111)", False),
+    "unreachable": ("error: Request failed after 3 retries\n  Caused by: Network is unreachable (os error 101)", False),
+    "no python": ("error: No interpreter found for Python 3.13 in managed installations or search path", True),
+}
+
+
+@pytest.mark.parametrize("why", list(_UV_FAILS))
+async def test_real_a_build_the_network_failed_is_not_the_configs_and_one_the_config_failed_is(box, why):
+    # review round 3, item 3: a venv build that could not reach PyPI failed for the node's DNS or route — the same
+    # env_setup may build next time — so it is never EndpointVenvConfigError (which drops a details= config)
+    said, config = _UV_FAILS[why]
+    body = "".join(f"echo {shlex.quote(ln)} >&2; " for ln in said.splitlines())
+    (box["stub"] / "uv").rename(box["stub"] / "uv.real")   # the stub answers every probe; only its install fails
+    (box["stub"] / "uv").write_text(f'#!/bin/sh\ncase " $* " in *" pip "*) {body}exit 2;; esac\n'
+                                    'exec "$(dirname "$0")/uv.real" "$@"\n')
+    (box["stub"] / "uv").chmod(0o755)
+    with pytest.raises(EndpointVenvError, match="could not build hpc-bridge's endpoint venv") as got:
+        await _real(box)
+    assert isinstance(got.value, ConfigStepFailed) is config, str(got.value)
+
+
+@pytest.mark.parametrize("line", ["curl: (6) Could not resolve host: astral.sh",
+                                  "curl: (7) Failed to connect to astral.sh port 443: Network is unreachable"])
+def test_curl_that_cannot_reach_astral_is_the_networks(line):
+    assert ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", line))
+    assert not ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", "error: No interpreter found for 3.13"))
 
 
 async def test_real_a_directory_that_is_not_a_venv_is_never_replaced(box):

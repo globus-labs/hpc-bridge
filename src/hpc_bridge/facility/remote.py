@@ -573,7 +573,7 @@ class RemoteEndpointCLI:
             msg = (err or out).strip()
             if "already" in msg.lower() or "configexists" in msg.lower():  # dir exists -> fine
                 return
-            raise step_error(rc, f"remote configure failed: {msg}")  # ran env_setup: the config's, unless ssh's 255
+            raise step_error(rc, f"remote configure failed: {msg}", output=msg)  # ran env_setup: unless ssh's 255
 
     @staticmethod
     def _list_rows(out: str) -> list[list[str]]:
@@ -728,7 +728,8 @@ class RemoteEndpointCLI:
                 # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
                 # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
                 listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
-                raise step_error(rc, f"remote start failed (rc={rc}): {(err or out).strip() or 'no output'}{listed}")
+                said = (err or out).strip()  # the start's own words decide, never the `list` note after them
+                raise step_error(rc, f"remote start failed (rc={rc}): {said or 'no output'}{listed}", output=said)
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
@@ -883,7 +884,8 @@ class RemoteEndpointCLI:
     async def endpoint_id(self, name: str) -> str:
         rc, out, err = await self._gce("list")
         if rc != 0:
-            raise step_error(rc, f"remote list failed: {_cli_said(out, err) or f'rc={rc}'}")
+            said = _cli_said(out, err)
+            raise step_error(rc, f"remote list failed: {said or f'rc={rc}'}", output=said)
         for cells in self._parsed_rows(out):
             if cells[-1] == name:  # exact Endpoint Name match, not a line substring
                 m = _UUID.search(cells[0])

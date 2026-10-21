@@ -473,6 +473,25 @@ def _stamp() -> str:
     return time.strftime("%Y%m%d-%H%M%S", time.gmtime())
 
 
+# A venv build that could not reach the network — uv's or pip's fetch, curl's install of uv — or whose write the login
+# node's filesystem refused (the venv's own directory: a permission, a read-only or full home) failed for the node, not
+# for the configuration: EndpointVenvError (kept), never EndpointVenvConfigError. Read from the end of the build's
+# output (its error chain: uv's "Caused by:" lines), never a banner before it.
+_BUILD_NOT_THE_CONFIG = re.compile(
+    r"temporary failure in name resolution|name or service not known|nodename nor servname|could not resolve host"
+    r"|failed to lookup address|dns error|network is unreachable|no route to host|connection refused"
+    r"|connection reset|curl: \((?:5|6|7|28|35|52|56)\)"
+    r"|permission denied|read-only file system|no space left on device|disk quota exceeded",
+    re.IGNORECASE,
+)
+
+
+def _tail(*texts: str, lines: int = 6) -> str:
+    """The last `lines` non-empty lines of the outputs, joined: a build's error chain."""
+    got = [ln.strip() for t in texts for ln in re.sub(r"\x1b\[[0-9;]*m", "", t or "").splitlines() if ln.strip()]
+    return "\n".join(got[-lines:])
+
+
 def _last_line(*texts: str) -> str:
     for t in texts:
         lines = [ln.strip() for ln in re.sub(r"\x1b\[[0-9;]*m", "", t or "").splitlines() if ln.strip()]
@@ -505,7 +524,7 @@ def _method(s: VenvState, python: str, skipped: str = "") -> str:
         f"no uv, no curl and no python3 on the login node, so hpc-bridge cannot build its endpoint venv (Python "
         f"{python}) there. Make uv or python3 available (a site `module load …` before hpc-bridge's line in "
         "env_setup), or prepare a venv with globus-compute-endpoint at HPC_BRIDGE_REMOTE_VENV, then connect_facility "
-        f"again.{why} Nothing was started or billed.")
+        f"again.{why} Nothing was started or billed.", said="")  # the check's finding, not words a node printed
 
 
 # uv for a node that has none: astral.sh's installer (told not to edit the user's shell profiles), else pip in a
@@ -677,9 +696,10 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
     what = f"{GCE} {gce or '(latest)'} on Python {python}"
     running, done, mode = True, False, "failed"  # mode: what the cleanup does with a build that did not claim the path
 
-    async def failed(message: str, *, config: bool = False) -> EndpointVenvError:
+    async def failed(message: str, *, config: bool = False, said: str = "") -> EndpointVenvError:
         """Move the failed build aside now, so the message says where it really is (if anywhere). `config`: the build
-        failed through the configuration's env_setup (EndpointVenvConfigError)."""
+        failed through the configuration's env_setup (EndpointVenvConfigError, decided by `said`, the build's own last
+        line)."""
         nonlocal done
         done = True
         kept = None
@@ -689,8 +709,8 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
         except Exception:  # noqa: BLE001 - best-effort: it then stays as our .build.* directory
             kept = None
         where = f"The failed build is kept as {kept}." if kept else "Nothing of it was kept."
-        return (EndpointVenvConfigError if config else EndpointVenvError)(
-            f"{message} {where} {skipped + '. ' if skipped else ''}Nothing was started or billed.")
+        text = f"{message} {where} {skipped + '. ' if skipped else ''}Nothing was started or billed."
+        return EndpointVenvConfigError(text, said=said) if config else EndpointVenvError(text)
 
     try:
         rc, out, err = await run("build", _wrap_build(
@@ -702,8 +722,11 @@ async def ensure(run: Run, mv: ManagedVenv, *, host: str, gce: str | None, pytho
             print(f"hpc-bridge: removed a stale build of the endpoint venv on {host}: {swept}", file=sys.stderr)
         if rc != 0:
             when = f"it did not finish within {_BUILD_CAP_S} s" if rc == _TIMED_OUT else _last_line(err, out)
+            # the configuration's, unless it ran out of time, could not reach the network (PyPI, astral.sh: the login
+            # node's DNS or route) or its write was refused — the same env_setup may build next time
+            config = rc != _TIMED_OUT and not _BUILD_NOT_THE_CONFIG.search(_tail(err, out))
             raise await failed(f"could not build hpc-bridge's endpoint venv for {mv.key} on {host} ({what}): {when}. "
-                               "Fix that, then connect_facility again.", config=rc != _TIMED_OUT)
+                               "Fix that, then connect_facility again.", config=config, said=when)
         v = await _check(run, mv, host, "verify", b)
         bad = problem(v, gce=gce, python=python)
         if bad == "timed out":
@@ -761,9 +784,10 @@ async def _check(run: Run, mv: ManagedVenv, host: str, step: str, path: str | No
     if "HPCB_VENV_BEGIN" not in out:
         if rc == 255 or not out.strip():
             raise _transport(step, host, rc, out, err)
+        said = _last_line(err, out)
         raise EndpointVenvConfigError(  # ssh got through and the step stopped before its frame: env_setup's site prefix
-            f"the {step} of hpc-bridge's endpoint venv on {host} did not run: {_last_line(err, out)}. Nothing was "
-            "started or billed.")
+            f"the {step} of hpc-bridge's endpoint venv on {host} did not run: {said}. Nothing was "
+            "started or billed.", said=said)
     return parse_check(out)
 
 
