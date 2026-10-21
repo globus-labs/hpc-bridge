@@ -47,6 +47,13 @@ elif [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = 
   # inference token ON THE HOST (a short-lived bearer minted from the maintainer's Globus login — never the
   # Globus creds themselves) and pass only that in. Base URL + model default to Sophia/gpt-oss-120b.
   echo "operator: $OPERATOR (ALCF-hosted model) — no Anthropic auth needed"
+  if [ "${HPCB_ALCF_NO_AUTH:-}" = "1" ]; then
+    # A keyless OpenAI-compatible endpoint (e.g. a self-hosted vLLM on the tailnet) stands in for ALCF: nothing is
+    # minted, so the maintainer's ALCF token never reaches another host. OpenAI clients insist on a key: a placeholder.
+    [ -n "${HPCB_ALCF_BASE_URL:-}" ] || { echo "ERROR: HPCB_ALCF_NO_AUTH=1 needs HPCB_ALCF_BASE_URL (the keyless endpoint)"; exit 1; }
+    echo "model endpoint: $HPCB_ALCF_BASE_URL (keyless: no ALCF token minted)"
+    ALCF_INFERENCE_TOKEN="no-auth"
+  fi
   ALCF_INFERENCE_TOKEN="${ALCF_INFERENCE_TOKEN:-$(uv run --directory "$REPO_ROOT" --extra integration \
     python "$REPO_ROOT/agentic/harness/inference_auth_token.py" get_access_token 2>/dev/null || true)}"
   [ -n "$ALCF_INFERENCE_TOKEN" ] || { echo "ERROR: could not mint an ALCF inference token — run once: uv run --extra integration python agentic/harness/inference_auth_token.py authenticate"; exit 1; }

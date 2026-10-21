@@ -8,6 +8,9 @@
 #   agentic/sweep_profiles.sh --operators pi,codex,hermes21   # the free wave for three operators, each profile booted
 #                                                    # ONCE (--reset-cluster) and its cells run for each operator in turn;
 #                                                    # every summary row is tagged [operator], one log per profile+operator
+#   HPCB_ALCF_NO_AUTH=1 HPCB_ALCF_BASE_URL=http://api.globus.internal/v1 HPCB_ALCF_MODEL=qwen3.8-flash-next \
+#     agentic/sweep_profiles.sh --operators pi,codex,hermes21   # the free wave on a keyless self-hosted model instead
+#                                                    # of ALCF: no ALCF token is minted (run_smoke.sh)
 #   agentic/sweep_profiles.sh --paid-only            # the Claude operator on the paid_only() cells only — the half the
 #                                                    # free wave cannot drive; a profile with none is not booted
 #
