@@ -46,6 +46,9 @@ if mkdir -p "$d" && chmod 700 "$d" \
    && cp "$PROFILE_DIR/mep/pbs_user_config_template.yaml.j2" "$d/user_config_template.yaml.j2" \
    && cp "$PROFILE_DIR/mep/pbs_user_config_schema.json" "$d/user_config_schema.json"; then
   rm -f "$d/daemon.pid"   # a stale pidfile from a killed container blocks the start for 90 s
+  # ...and so do its user endpoints' (rc 73 at the next cell's first task): they died with this container, and only
+  # this node runs the manager, so none can be alive. Before the manager starts, so it has forked none yet.
+  mep_clear_stale_uep_pids "$h" "$d" || echo "[pbs_mep] WARNING: could not clear stale user-endpoint pid files"
   ( cd / && nohup "$MEP_GCE/bin/globus-compute-endpoint" start "$name" >"/var/log/$name.log" 2>&1 & ) || true
   echo "[pbs_mep] started $name (log /var/log/$name.log)"
 else
