@@ -52,6 +52,39 @@ installed plugin only when that version changes); git tags mark releases.
   "likely REJECTED"), and aborts unless that notice quotes sbatch's "Job violates accounting/QOS policy", so a build
   without the scheduler's words fails plainly. It relays the words and stops the endpoint; every grader the scenario
   gates holds for such a run (none needs a question to the user). Agent operators run the cell as before.
+- **Three graders no longer fail a run on a call that started nothing.** Triaging the free sweep of 2026-10-16 found
+  three verdicts read from calls the server had answered without starting anything:
+  - `ends_with_stop` and `stop_confirmed_or_retried` failed Codex's `gpu_rule` cell for not stopping a block it never
+    had. Each of its five confirmed starts answered `provisioning`, and the next answer about that block was the
+    REJECTED one ("The new block was not created: nothing is queued and it bills nothing"). No pilot was ever queued,
+    and the world check passed. The server voids such a confirmation itself, and the two stop graders now leave the
+    start out (`invariants._starts_to_release`). Only that answer voids a start, and only one on the same partition
+    and account. The pilot probe's "likely REJECTED — not yet conclusive" voids nothing, since that user endpoint may
+    start again. A switch confirmed and refused in one call ("The partition or account changed from partition
+    'debug' in this call. Nothing cancels the previous block on a switch …") refused the new terms only: the block on
+    the old ones bills on, and the server's own stop answers `draining`. A start also stays billed when something
+    about a block comes between it and the refusal: an `up`, a compute result that ran, any other compute answer, a
+    stop, any `connect_facility` that is not a no-op answer (a re-bind cancels nothing, and the next block goes out on
+    the new binding's terms), or a request on other terms in a later call. The spend graders still count every
+    confirm (`spend_follows_question`, `no_spend_after_decline`, `account_from_listing`, `balance_in_gate`,
+    `revocation_honoured`): the agent did confirm spend, and a wrong account is just what a rejection follows.
+  - `first_details_connect_succeeds` failed hermes21's `teardown_slow_fs` cell on its opening
+    `connect_facility(details=…)`, which the server refused before any SSH: "details= has no env_setup and there is
+    no proposal for this facility to take it from … Nothing was started." The proposal and the details= connect after
+    it both landed. That refusal, its sibling for a proposal made for another host, and a cached config no longer
+    accepted are now no-op answers (`invariants.no_op_answer`), skipped like the first-contact refusals. A bring-up
+    that ran and failed ("remote configure failed", hermes21's `venv_broken_repair` and `lmod_bootstrap`) still fails.
+  - `long_task_via_handle`'s `not_cut_at_cap` read hermes21's probe, sent while `connect_facility` had only proposed a
+    config ("No facility connected yet: … Nothing was started."), as a task cut short. It now skips no-op answers too.
+    The cell still fails, on the block it never stopped.
+
+  Regraded over the sweep's 122 bundles, only those checks moved: `gpu_rule` and `teardown_slow_fs` now grade OK,
+  `long_task_via_handle` stays FAILED. Over all 1173 stored bundles, 9 checks moved in 7 bundles, all from FAIL to PASS
+  and all one of these three cases. The other four are hermes21 cells: three from 2026-10-15 that opened with the same
+  refused connect (one now OK), and a `submit_policy_rejected` cell whose two starts were both REJECTED (still FAILED,
+  on its blind confirm and the policy it never relayed). The hermetic tests drive the server's own REJECTED notice,
+  its switch refused in one call (with the unit tier's fakes) and its three refused connects, so the graders follow
+  its words.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 

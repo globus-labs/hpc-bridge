@@ -12,7 +12,7 @@ Deterministic on purpose (the prompt dictates the exact command + shape). Run wi
 `run_shell` "running" notice itself points at poll_task, so the handle path completes even without the
 skill. One short billed block. See issue #21 (https://github.com/globus-labs/hpc-bridge/issues/21).
 """
-from invariants import Result, Trace
+from invariants import Result, Trace, no_op_answer
 
 _MARK = "HPCB_LONGTASK"
 
@@ -75,10 +75,13 @@ _NOT_STARTED = ("cold_start", "needs_confirmation", "needs_account")
 def not_cut_at_cap(t: Trace) -> Result:
     """Regression guard: no compute probe result is a bare cut — a probe that STARTED and then ended in neither
     complete nor running, or an exit 124 (the old ~110s per-task guillotine). A run_shell sent while the block was
-    still allocating honestly answers `cold_start` without running anything (Codex did, 2026-10-09)."""
+    still allocating honestly answers `cold_start` without running anything (Codex did, 2026-10-09); one sent before
+    any facility was bound answers "No facility connected … Nothing was started." (`no_op_answer`: hermes21 sent the
+    probe while connect_facility had only proposed a config, 2026-10-16) — neither started."""
     runs = [
         c for _, c in t.named("run_shell")
         if c.input.get("shape") in (None, "compute") and _MARK in str(c.input.get("command", ""))
+        and not no_op_answer(c)
     ]
     cut = [
         str(c.input.get("command", ""))[:40] for c in runs
