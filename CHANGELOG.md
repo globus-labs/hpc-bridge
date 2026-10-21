@@ -85,6 +85,7 @@ installed plugin only when that version changes); git tags mark releases.
   on its blind confirm and the policy it never relayed). The hermetic tests drive the server's own REJECTED notice,
   its switch refused in one call (with the unit tier's fakes) and its three refused connects, so the graders follow
   its words.
+- **CI runs every harness test file.** The hermetic harness step listed its test files by name, so six of them (`test_alcf_inference`, `test_hostile`, `test_internal`, `test_lmod`, `test_polaris`, `test_slurm_probe_scenario`) never ran in CI, and a new file was skipped until someone added it. The step now lets pytest collect `agentic/harness/test_*.py`.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 
