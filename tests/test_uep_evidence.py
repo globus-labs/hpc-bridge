@@ -155,10 +155,17 @@ def _short_gap(monkeypatch, request):
         monkeypatch.setattr(scheduler_ops, "_EVIDENCE_GAP_S", 0.3, raising=False)
 
 
-def _verdict(out: str, cell: Cell, block: int, age: float):
+def _verdict(out: str, cell: Cell, block: int, taken: float | datetime):
+    """The command's verdict on a check for block request `block`. `taken` is the check's age in seconds, or the time it
+    was taken (the login node's local time). A time is made an age on the clock the verdict reads, the command's own at
+    its first sample, so the check sits exactly where the test put it however long the command and the test took around
+    that reading. (An age read off this process's clock after the command ran placed the check that much earlier: on a
+    loaded machine, a check taken "a second after the bad state" was read as taken before it.)"""
     from hpc_bridge import scheduler_ops
 
-    return scheduler_ops._read_uep_evidence(out, cell.eid, [("k", block, age)])["k"]
+    if isinstance(taken, datetime):
+        taken = scheduler_ops._read_samples(out)["1"].now_hi - taken.timestamp()
+    return scheduler_ops._read_uep_evidence(out, cell.eid, [("k", block, taken)])["k"]
 
 
 # --- the command, run for real on the cells' logs ---------------------------------------------------------------------
@@ -175,7 +182,7 @@ def test_the_command_finds_the_checks_user_endpoint_stopped_for_good(tmp_path, n
     assert f"HPCB_PS 1 {cell.uuid} 0" in out and f"HPCB_PID 2 {cell.uuid} none" in out
     assert re.search(rf"HPCB_MGR 1 {cell.uuid} \d+ \d+ \d+ \d+ \d+", out)
     assert cell.login_uuid is None or cell.login_uuid not in out           # the login shape's own: never matched
-    taken = (datetime.now() - started).total_seconds() + 1        # taken a second before its user endpoint started
+    taken = started - timedelta(seconds=1)                        # taken a second before its user endpoint started
     ev = _verdict(out, cell, 207612534, taken)
     assert ev.lost, ev
     assert ev.uep == f"uep.{cell.eid}.{cell.uuid}"
@@ -183,7 +190,7 @@ def test_the_command_finds_the_checks_user_endpoint_stopped_for_good(tmp_path, n
     assert timedelta(seconds=5) < bad - started < timedelta(seconds=70)
     # taken AFTER its user endpoint's bad state: it may have arrived as that endpoint quiesced (never acked, back on the
     # queue for a later life) — not this check's evidence
-    late = (datetime.now() - bad).total_seconds() - 1
+    late = bad + timedelta(seconds=1)
     assert "before the check had reached it" in _verdict(out, cell, 207612534, late).why
     # too recent: the start request sent with it may not have reached the manager yet (its 30 s grace for a cached one)
     assert "too recent" in _verdict(out, cell, 207612534, 20.0).why
@@ -218,7 +225,7 @@ def test_a_revival_between_the_two_samples_is_no_evidence(tmp_path):
         proc.kill()
         proc.wait()
     assert f"HPCB_PS 1 {cell.uuid} 0" in out and f"HPCB_PS 2 {cell.uuid} 1" in out   # it really was quiet at first
-    ev = _verdict(out, cell, 42, (datetime.now() - started).total_seconds() + 1)
+    ev = _verdict(out, cell, 42, started - timedelta(seconds=1))
     assert not ev.lost and "changed while hpc-bridge looked" in ev.why
 
 
@@ -228,7 +235,7 @@ def test_the_managers_own_log_must_show_the_stop_and_nothing_after_it(tmp_path):
 
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     base = _fixture(cell.manager)
     name = f"uep.{cell.eid}.{cell.uuid}"
     [stop] = [ln for ln in base.splitlines() if "Command stopped normally" in ln and name in ln]
@@ -272,7 +279,7 @@ def test_the_command_sees_a_process_of_that_user_endpoint_and_a_pid_file_still_r
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
     _md, ud, _ = _put_cell(tmp_path, cell, 5, started=started)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     cmd = scheduler_ops._uep_evidence_cmd(cell.eid, [5])
     # a process whose arguments name the user endpoint's directory (its title does: "Globus Compute Endpoint (<id>,
     # uep.<eid>.<id>) [...]"): still alive, whatever the logs say
@@ -301,7 +308,7 @@ def test_another_runs_stand_in_on_this_machine_is_not_counted_as_this_runs_user_
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
     _put_cell(tmp_path, cell, 5, started=started)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     [verbatim] = [v for v, own in _OWN.items() if own == cell.eid]
     assert verbatim != cell.eid
     proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{verbatim}.{cell.uuid}"])
@@ -320,7 +327,7 @@ def test_the_command_reads_no_evidence_from_a_log_that_is_not_settled(tmp_path):
 
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     shift = started - _stamps(_fixture(cell.compute))[0]
     full = _restamp(_named(_fixture(cell.compute), 7, None), shift).splitlines()
 
@@ -372,7 +379,7 @@ def test_an_unreadable_log_voids_only_the_check_it_could_belong_to(tmp_path):
         pytest.skip("root reads a 0000 file")
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     _put_cell(tmp_path, cell, 8, started=started)
     other = tmp_path / f"uep.{cell.eid}.0b1c2d3e-0000-4000-8000-000000000001"
     other.mkdir()
@@ -392,7 +399,7 @@ def test_two_user_endpoints_naming_one_block_request_are_no_evidence(tmp_path):
     from hpc_bridge import scheduler_ops
 
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     _put_cell(tmp_path, REJECTED, 8, started=started)
     twin = tmp_path / f"uep.{REJECTED.eid}.{WORKER_DIED.uuid}"
     twin.mkdir()
@@ -416,7 +423,7 @@ def test_the_command_survives_the_real_dispatch_path(tmp_path):
     env = {**os.environ, "GLOBUS_COMPUTE_USER_DIR": str(tmp_path / "gc")}
     res = subprocess.run(["bash", "-c", script], env=env, capture_output=True, text=True, timeout=60, cwd=tmp_path)
     assert res.returncode == 0, res.stderr
-    assert _verdict(res.stdout, LIVE, 11, (datetime.now() - started).total_seconds() + 1).lost
+    assert _verdict(res.stdout, LIVE, 11, started - timedelta(seconds=1)).lost
 
 
 # --- what the command is built from ----------------------------------------------------------------------------------
@@ -1006,7 +1013,7 @@ def test_a_rotated_manager_log_is_read_through_its_rotation(tmp_path):
 
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     md, _ud, _ = _put_cell(tmp_path, cell, 42, started=started)
     lines = (md / "endpoint.log").read_text().splitlines()
     cut = next(i for i, ln in enumerate(lines) if f"(pid: 886) [(hpcbridge-test-00, uep.{cell.eid}.{cell.uuid})" in ln)
@@ -1036,7 +1043,7 @@ def test_an_unreadable_twin_naming_the_same_block_request_and_alive_is_no_eviden
         pytest.skip("root reads a 0000 file")
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     _put_cell(tmp_path, cell, 42, started=started)
     twin_id = "0b1c2d3e-0000-4000-8000-000000000001"
     twin = tmp_path / f"uep.{cell.eid}.{twin_id}"
@@ -1082,7 +1089,7 @@ def test_a_read_error_grep_meets_is_said_never_an_empty_match(tmp_path):
 
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
-    taken = (datetime.now() - started).total_seconds() + 1
+    taken = started - timedelta(seconds=1)
     _put_cell(tmp_path / "gc", cell, 42, started=started)
     shim = tmp_path / "bin"
     shim.mkdir()
