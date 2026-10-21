@@ -371,7 +371,8 @@ class AppCtx:
     # (gpt-oss corrupted a 3.8 KB one doing that, 2026-10-10).
     proposed_drafts: dict[str, FacilityDetails] = field(default_factory=dict)
     # How a connect wrote a facility's scheduler_options as directives (notices._directive_note), kept until a result
-    # carries it: a connect that answers needs_preauth first is resumed later with no details (connect).
+    # carries it: a connect that answers needs_preauth first is resumed later with no details (connect). Dropped with
+    # the details= config it describes when that one's bring-up fails on the login node (connect._drop_failed_details).
     directive_notes: dict[str, str] = field(default_factory=dict)
     # What a re-bind left of an SSH endpoint's compute shape (warmth._ssh_left), by endpoint id: a later re-bind of the
     # same endpoint finds no compute shape to read and names this instead. Dropped by a confirmation there (the probe
