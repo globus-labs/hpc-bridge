@@ -578,6 +578,10 @@ A behaviour that should hold *everywhere* becomes a new universal invariant: add
 (pure — no cluster needed). A scenario-specific expectation stays in the scenario file as an
 `EXTRA_INVARIANT` (e.g. `saturation.queue_surfaced_in_gate`). Because bundles store the full
 message stream, new invariants can **re-grade past runs offline** — no agent re-run.
+`regrade.py` imports each bundle's scenario afresh under the run environment that bundle recorded
+(`regrade.RUN_ENV`: `HPCB_RUNID`, from which the canary cells build their nonce, the SSH host, the
+endpoint name, …), so graders a scenario builds at import are that run's. A scenario that reads a
+new per-run variable at import adds it to `RUN_ENV`; `test_regrade.py` fails until it does.
 
 ## Status
 - ✅ **Grading core** (`invariants.py` + `test_invariants.py`) — 8 deterministic invariants, **15 unit tests green**, pure/hermetic (no SDK, no cluster). Run: `uv run pytest agentic/harness/test_invariants.py -q`.
