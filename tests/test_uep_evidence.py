@@ -14,13 +14,15 @@ The logs under tests/uep_log_fixtures/ are those bundles' logs, verbatim: `rejec
 1792136208), `worker_died.*` (slurm_worker_died 1792140090) — both from before the template named the block request, so
 the tests insert the `endpoint_setup` lines globus-compute-endpoint 4.18 writes at a user endpoint's start
 (endpoint.py:513, :920) — and `live_*` (slurm_worker_died 1792168070, this branch's template, settled live by this
-evidence), whose block-request line is the real one. Only the timestamps are shifted, all of a cell's logs together.
+evidence), whose block-request line is the real one. Only the timestamps are shifted, all of a cell's logs together,
+and the endpoint ids are this test process's own (`_own`).
 """
 import os
 import re
 import subprocess
 import sys
 import time
+import uuid
 from datetime import datetime, timedelta
 from pathlib import Path
 from typing import NamedTuple
@@ -39,6 +41,28 @@ _STAMP = re.compile(r"^(\d{4}-\d\d-\d\d \d\d:\d\d:\d\d,\d{6})")
 
 needs_posix_shell = pytest.mark.skipif(sys.platform == "win32", reason="the login node's shell: sh, awk, ps, find, date")
 
+# The login node here is this machine, shared with every other run of these tests (another checkout's suite, this file
+# looped twice at once), and the evidence command's `ps` lists ALL of the user's processes: another run's that name
+# `uep.<eid>.<id>` (a test's stand-in for a live user endpoint, that run's own awk and grep over the logs) would count as
+# this run's — a count the two samples differ on, so "its user endpoint changed while hpc-bridge looked" (2026-10-20,
+# the not-settled test: 7 of 300 runs while another worktree ran the suite, 32 of 100 beside a loop of this file, none
+# with nothing else running). So each test process gives the cells' endpoints ids of its own, put into their logs as
+# they are read.
+_OWN: dict[str, str] = {}
+
+
+def _own(eid: str) -> str:
+    """This test process's own id for endpoint `eid`, which the cells' logs carry verbatim."""
+    return _OWN.setdefault(eid, str(uuid.uuid4()))
+
+
+def _fixture(name: str) -> str:
+    """A cell's log, verbatim but for its endpoints' ids, which are this test process's own (`_own`)."""
+    text = (_FIXTURES / name).read_text()
+    for verbatim, own in _OWN.items():
+        text = text.replace(verbatim, own)
+    return text
+
 
 class Cell(NamedTuple):
     """One live cell's logs: its endpoint, the user endpoint that held our check, and the files."""
@@ -52,12 +76,12 @@ class Cell(NamedTuple):
     login_uuid: str | None = None
 
 
-REJECTED = Cell("7a7da153-4643-4b2f-b8a6-ceee6211af97", "a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32",
+REJECTED = Cell(_own("7a7da153-4643-4b2f-b8a6-ceee6211af97"), "a9d3d64e-394f-8ad8-b2fb-aec6c96b1d32",
                 "rejected.manager.log", "rejected.endpoint.log", None,
                 "login.endpoint.log", "59f3b039-27fb-a42d-6aac-0030bfb5cef3")
-WORKER_DIED = Cell("28fae94b-1ea2-47fa-8d5b-40ab9c8c2139", "cfe285ef-7f41-943f-0e9f-a4ae1d904982",
+WORKER_DIED = Cell(_own("28fae94b-1ea2-47fa-8d5b-40ab9c8c2139"), "cfe285ef-7f41-943f-0e9f-a4ae1d904982",
                    "worker_died.manager.log", "worker_died.endpoint.log", None)
-LIVE = Cell("08d247d2-9baa-4e31-a591-2690a0b1b966", "215aec48-a89c-29b6-8e58-fa16a3b3f018",
+LIVE = Cell(_own("08d247d2-9baa-4e31-a591-2690a0b1b966"), "215aec48-a89c-29b6-8e58-fa16a3b3f018",
             "live_worker_died.manager.log", "live_worker_died.endpoint.log", 209994360702101,
             "live_login.endpoint.log", "f81aa051-0b5d-d98d-0584-71da4e888bf8")
 CELLS = {"rejected": REJECTED, "worker_died": WORKER_DIED, "live": LIVE}
@@ -97,7 +121,7 @@ def _put_cell(root: Path, cell: Cell, block: int | None, *, started: datetime, m
     """Write a cell's logs under `root` (the login node's Globus Compute directory), every timestamp shifted so the
     compute user endpoint's first one is `started` (the login node's local time). `manager` / `compute`: replace a log's
     text (before the shift). Returns the manager's and the user endpoint's directories, and the shift."""
-    raw = compute if compute is not None else (_FIXTURES / cell.compute).read_text()
+    raw = compute if compute is not None else _fixture(cell.compute)
     shift = started - _stamps(raw)[0]
     text = _named(raw, block, cell.real_block) if block is not None else raw
     ud = root / f"uep.{cell.eid}.{cell.uuid}"
@@ -105,12 +129,11 @@ def _put_cell(root: Path, cell: Cell, block: int | None, *, started: datetime, m
     (ud / "endpoint.log").write_text(_restamp(text, shift))
     md = root / "hpc-bridge-fake-cell"
     md.mkdir(parents=True, exist_ok=True)
-    (md / "endpoint.log").write_text(_restamp(manager if manager is not None else
-                                              (_FIXTURES / cell.manager).read_text(), shift))
+    (md / "endpoint.log").write_text(_restamp(manager if manager is not None else _fixture(cell.manager), shift))
     if cell.login is not None:
         ld = root / f"uep.{cell.eid}.{cell.login_uuid}"
         ld.mkdir(parents=True, exist_ok=True)
-        (ld / "endpoint.log").write_text(_restamp((_FIXTURES / cell.login).read_text(), shift))
+        (ld / "endpoint.log").write_text(_restamp(_fixture(cell.login), shift))
     return md, ud, shift
 
 
@@ -206,7 +229,7 @@ def test_the_managers_own_log_must_show_the_stop_and_nothing_after_it(tmp_path):
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
     taken = (datetime.now() - started).total_seconds() + 1
-    base = (_FIXTURES / cell.manager).read_text()
+    base = _fixture(cell.manager)
     name = f"uep.{cell.eid}.{cell.uuid}"
     [stop] = [ln for ln in base.splitlines() if "Command stopped normally" in ln and name in ln]
     stamp = stop[:26]
@@ -270,14 +293,36 @@ def test_the_command_sees_a_process_of_that_user_endpoint_and_a_pid_file_still_r
 
 
 @needs_posix_shell
+def test_another_runs_stand_in_on_this_machine_is_not_counted_as_this_runs_user_endpoint(tmp_path):
+    # (see `_own`) a stand-in for a live user endpoint that another run of these tests holds — named, as before this
+    # process's own ids, by the logs' verbatim ones — is not this run's
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    _put_cell(tmp_path, cell, 5, started=started)
+    taken = (datetime.now() - started).total_seconds() + 1
+    [verbatim] = [v for v, own in _OWN.items() if own == cell.eid]
+    assert verbatim != cell.eid
+    proc = subprocess.Popen([sys.executable, "-c", "import time; time.sleep(60)", f"uep.{verbatim}.{cell.uuid}"])
+    try:
+        out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [5]), tmp_path)
+    finally:
+        proc.kill()
+        proc.wait()
+    assert f"HPCB_PS 1 {cell.uuid} 0" in out and f"HPCB_PS 2 {cell.uuid} 0" in out
+    assert _verdict(out, cell, 5, taken).lost
+
+
+@needs_posix_shell
 def test_the_command_reads_no_evidence_from_a_log_that_is_not_settled(tmp_path):
     from hpc_bridge import scheduler_ops
 
     cell = REJECTED
     started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
     taken = (datetime.now() - started).total_seconds() + 1
-    shift = started - _stamps((_FIXTURES / cell.compute).read_text())[0]
-    full = _restamp(_named((_FIXTURES / cell.compute).read_text(), 7, None), shift).splitlines()
+    shift = started - _stamps(_fixture(cell.compute))[0]
+    full = _restamp(_named(_fixture(cell.compute), 7, None), shift).splitlines()
 
     def verdict(lines: list[str]) -> str:
         _put_cell(tmp_path, cell, None, started=started, compute="\n".join(lines) + "\n")
@@ -289,7 +334,7 @@ def test_the_command_reads_no_evidence_from_a_log_that_is_not_settled(tmp_path):
     assert "no bad state" in verdict([ln for ln in full if "Awaiting messages from queue" not in ln])  # never subscribed
     assert "not logged its shutdown" in verdict([ln for ln in full if not ln.startswith("---------- Endpoint shutdown")])
     # started again for the same block request after that shutdown: the new life has no bad state, or is starting
-    again = _restamp(_named((_FIXTURES / cell.compute).read_text(), 7, None), shift + timedelta(seconds=40)).splitlines()
+    again = _restamp(_named(_fixture(cell.compute), 7, None), shift + timedelta(seconds=40)).splitlines()
     assert "no bad state since it last started" in verdict(full + again[:8])
     assert "starting again" in verdict(full + again[:3])            # its endpoint_setup ran, its interchange has not
     # no user endpoint names the block request (not started yet) — or names another one (a prefix of ours is not ours)
@@ -305,8 +350,8 @@ def test_a_bad_state_in_an_hour_a_clock_change_repeats_is_no_evidence(tmp_path):
 
     cell = REJECTED
     tz = {"TZ": "America/Chicago"}
-    bad = next(ln for ln in (_FIXTURES / cell.compute).read_text().splitlines() if "Setting bad state" in ln)
-    to_bad = _stamps(bad)[0] - _stamps((_FIXTURES / cell.compute).read_text())[0]
+    bad = next(ln for ln in _fixture(cell.compute).splitlines() if "Setting bad state" in ln)
+    to_bad = _stamps(bad)[0] - _stamps(_fixture(cell.compute))[0]
     started = datetime(2026, 11, 1, 1, 30, 0) - to_bad                    # its bad state at 01:30, the repeated hour
     _put_cell(tmp_path, cell, 3, started=started)
     out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [3]), tmp_path, env=tz)
@@ -669,7 +714,7 @@ async def test_a_check_whose_user_endpoint_is_alive_or_unsettled_keeps_the_stop_
         log = _login_node(monkeypatch, tmp_path)
         return app, log, await _stop_endpoint(app)
 
-    raw = (_FIXTURES / REJECTED.compute).read_text()
+    raw = _fixture(REJECTED.compute)
     app, log, res = await stop(compute="\n".join(ln for ln in raw.splitlines() if "Setting bad state" not in ln) + "\n")
     assert res.status == "draining" and res.spend_stopped is not True and "evidence" in _kinds(log)
     assert ("hpc-bridge also looked on the login node and cannot rule out that it can still start a block: its user "
@@ -688,7 +733,7 @@ async def test_a_check_whose_user_endpoint_is_alive_or_unsettled_keeps_the_stop_
         proc.wait()
     assert res.status == "draining" and "a process of its user endpoint is still running there" in res.notice
     # its manager has not reaped it yet (no stop logged), or revived it
-    base = (_FIXTURES / REJECTED.manager).read_text()
+    base = _fixture(REJECTED.manager)
     unreaped = "\n".join(ln for ln in base.splitlines() if "Command stopped normally (886)" not in ln) + "\n"
     _app, _log, res = await stop(manager=unreaped)
     assert res.status == "draining" and "does not show that user endpoint's stop" in res.notice
