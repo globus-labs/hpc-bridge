@@ -23,6 +23,7 @@ from pathlib import Path
 import pytest
 
 from hpc_bridge.facility import endpoint_venv as ev
+from hpc_bridge.facility.base import ConfigStepFailed
 from hpc_bridge.facility.endpoint_venv import EndpointVenvError
 from tests import venv_stubs as vs
 
@@ -823,11 +824,80 @@ async def test_real_a_parent_that_cannot_be_created_fails_at_once(box):
     _not_root()
     box["home"].chmod(0o500)
     try:
-        with pytest.raises(EndpointVenvError, match=r"could not build .*Permission denied"):
+        with pytest.raises(EndpointVenvError, match=r"could not build .*Permission denied") as got:
             await _real(box)
         assert vs.calls(box) == []
+        # a permission refused on the venv's OWN path is the configuration's (its base, from env_setup or
+        # HPC_BRIDGE_REMOTE_VENV — review round 4: a made-up `/sw/hpc-bridge` in details=), so connect drops it; a
+        # read-only, full or over-quota filesystem is the node's (below)
+        assert isinstance(got.value, ConfigStepFailed)
     finally:
         box["home"].chmod(0o700)
+
+
+# a uv that fails the way the login node made it fail (a stub: no test ever reaches the network)
+_UV_FAILS = {
+    "dns": ("error: Failed to fetch: `https://pypi.org/simple/globus-compute-endpoint/`\n  Caused by: Request failed "
+            "after 3 retries\n  Caused by: error sending request for url (https://pypi.org/simple/)\n  Caused by: "
+            "dns error: failed to lookup address information: Temporary failure in name resolution", False),
+    "refused": ("error: Failed to fetch: `https://pypi.org/simple/parsl/`\n  Caused by: tcp connect error: Connection "
+                "refused (os error 111)", False),
+    "unreachable": ("error: Request failed after 3 retries\n  Caused by: Network is unreachable (os error 101)", False),
+    # review round 4: uv's own timeout words, and a full disk — the node's
+    "uv timeout": ("error: Failed to download `globus-compute-endpoint==4.15.0`\n  Caused by: Failed to download "
+                   "distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: 30s).", False),
+    "full": ("error: Failed to write to /home/u/hpc-bridge/x.build: No space left on device (os error 28)", False),
+    "no python": ("error: No interpreter found for Python 3.13 in managed installations or search path", True),
+    # review round 4 (F5): a base the config made up, refused — the configuration's own failure
+    "made-up base": ("mkdir: cannot create directory '/sw/hpc-bridge': Permission denied", True),
+}
+
+
+@pytest.mark.parametrize("why", list(_UV_FAILS))
+async def test_real_a_build_the_network_failed_is_not_the_configs_and_one_the_config_failed_is(box, why):
+    # review round 3, item 3: a venv build that could not reach PyPI failed for the node's DNS or route — the same
+    # env_setup may build next time — so it is never EndpointVenvConfigError (which drops a details= config)
+    said, config = _UV_FAILS[why]
+    body = "".join(f"echo {shlex.quote(ln)} >&2; " for ln in said.splitlines())
+    (box["stub"] / "uv").rename(box["stub"] / "uv.real")   # the stub answers every probe; only its install fails
+    (box["stub"] / "uv").write_text(f'#!/bin/sh\ncase " $* " in *" pip "*) {body}exit 2;; esac\n'
+                                    'exec "$(dirname "$0")/uv.real" "$@"\n')
+    (box["stub"] / "uv").chmod(0o755)
+    with pytest.raises(EndpointVenvError, match="could not build hpc-bridge's endpoint venv") as got:
+        await _real(box)
+    assert isinstance(got.value, ConfigStepFailed) is config, str(got.value)
+
+
+@pytest.mark.parametrize("line", ["curl: (6) Could not resolve host: astral.sh",
+                                  "curl: (7) Failed to connect to astral.sh port 443: Network is unreachable"])
+def test_curl_that_cannot_reach_astral_is_the_networks(line):
+    assert ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", line))
+    assert not ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", "error: No interpreter found for 3.13"))
+
+
+def test_the_build_reads_its_error_chain_from_stderr_never_pushed_out_by_a_stdout_banner():
+    # review round 4 (F4): the build runs `bash -lc`, so a profile.d banner on stdout used to fill the window after
+    # stderr and push uv's "Caused by:" chain out of it
+    err = ("error: Request failed after 3 retries\n  Caused by: Failed to fetch: `https://pypi.org/simple/x/`\n"
+           "  Caused by: dns error: failed to lookup address information: Name or service not known")
+    out = "\n".join(f"Site notice line {i}" for i in range(7))
+    assert not ev._BUILD_NOT_THE_CONFIG.search(ev._tail(err, out))       # the old reading lost it
+    assert ev._BUILD_NOT_THE_CONFIG.search(ev._build_tail(err, out))     # stderr's own end
+    assert ev._build_tail("", out) == ev._tail(out)                      # stdout's when stderr is empty
+
+
+async def test_a_check_cut_by_a_signal_is_ssh_s_not_the_configs():
+    # review round 4 (F7): a negative exit status (the local ssh killed) with partial stdout, as step_error reads it
+    mv = ev.managed_venv(ev.short_env_setup("/home/u/.hpc-bridge/gce", prefix="module load python/3.13; "))
+    assert mv is not None
+
+    async def killed(step, script, timeout):
+        return -15, "a banner line\n", ""
+
+    with pytest.raises(RuntimeError) as got:
+        await ev._check(killed, mv, "login", "check")
+    assert not isinstance(got.value, ConfigStepFailed)
+    assert 137 in ev._BUILD_CUT and 124 in ev._BUILD_CUT   # a build KILLed by `timeout -k` (or the kernel) was cut short
 
 
 async def test_real_a_directory_that_is_not_a_venv_is_never_replaced(box):

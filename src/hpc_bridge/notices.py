@@ -16,8 +16,17 @@ from typing import Literal
 
 from . import config
 from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
-from .context import AppCtx, LeftBlock, SentCheck, ShapeRuntime, _has_login_shape, _idle_release_s
+from .context import (
+    AppCtx,
+    DroppedConfigError,
+    LeftBlock,
+    SentCheck,
+    ShapeRuntime,
+    _has_login_shape,
+    _idle_release_s,
+)
 from .cost import _block_nodes, _with_spend
+from .facility.base import ConfigStepFailed
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
@@ -65,8 +74,21 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     raw = str(exc)
     # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
     # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
-    if type(exc).__name__ in ("RemoteTokenStoreExists", "EndpointVenvError"):
+    # By name along the class's line, so a subclass (EndpointVenvConfigError) is one too.
+    if any(c.__name__ in ("RemoteTokenStoreExists", "EndpointVenvError") for c in type(exc).__mro__):
         return raw
+    cli = getattr(fac, "cli", None)
+    target = getattr(cli, "target", None) or getattr(cli, "_target", None)
+    host = host or getattr(target, "host", None) or getattr(fac, "alias", None) or "the login host"
+    if isinstance(exc, ConfigStepFailed):
+        # ssh got through and the login node ran the step. globus-compute-endpoint's own write refused on its
+        # ~/.globus_compute (a read-only or full home, a permission): the remote filesystem's, as before — the
+        # configuration is kept. Any other "Permission denied" or "Connection refused" in its words is the
+        # configuration's (a file env_setup sources, a server it calls), never sshd's or the login host's.
+        refused = next((ln for ln in exc.tail.splitlines() if _REMOTE_FS_REFUSED.search(ln)), None)
+        if refused is not None:
+            return _remote_fs_notice(host, refused)
+        return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -74,9 +96,6 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                if "permission denied" in ln.lower() or "denied" in ln.lower() or "host key" in ln.lower()]
     if verdict:
         ssh_line = verdict[-1].strip()
-    cli = getattr(fac, "cli", None)
-    target = getattr(cli, "target", None) or getattr(cli, "_target", None)
-    host = host or getattr(target, "host", None) or getattr(fac, "alias", None) or "the login host"
     if user is None:
         user = getattr(target, "user", None)
     if _SSH_AUTH_DENIED.search(raw) or "too many authentication failures" in low:
@@ -106,9 +125,7 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                 f"already trusts, and {why}. Verify the fingerprint and connect once from your own terminal "
                 f"(`ssh {who}`), which saves the key; then call connect_facility again. Nothing was started or billed.")
     if "permission denied" in low:  # a denial from the remote FILESYSTEM (quota, read-only home), not from sshd
-        return (f"REMOTE FILESYSTEM refused a write on {host}: {ssh_line[:200]}. The login worked; the home "
-                "directory is over quota, read-only, or not writable. Free space or fix permissions there, then "
-                "call connect_facility again. Nothing was started or billed.")
+        return _remote_fs_notice(host, ssh_line)
     if any(k in low for k in ("could not resolve hostname", "connection timed out", "connection refused",
                               "no route to host", "network is unreachable", "operation timed out",  # macOS strerror
                               "host is down", "network is down", "connection reset by peer",
@@ -124,6 +141,57 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         return (f"hpc-bridge error: the SSH ControlMaster socket path is too long ({ssh_line[:160]}); set "
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
     return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+
+def _remote_fs_notice(host: str, line: str) -> str:
+    """A write the login node's own filesystem refused (quota, read-only home, permission): the login worked."""
+    return (f"REMOTE FILESYSTEM refused a write on {host}: {line[:200]}. The login worked; the home "
+            "directory is over quota, read-only, or not writable. Free space or fix permissions there, then "
+            "call connect_facility again. Nothing was started or billed.")
+
+
+# A write refused by the login node's filesystem, in a step's last few lines: globus-compute-endpoint's own under
+# ~/.globus_compute (Errno 13, a read-only file system — live 2026-09-03: `PermissionError: [Errno 13] Permission
+# denied: '…/.globus_compute/…/endpoint.log'`), or a full disk or quota anywhere. Explained as REMOTE FILESYSTEM.
+_REMOTE_FS_REFUSED = re.compile(
+    r"read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
+    r"|no space left on device|\[errno 28\]|disk quota exceeded|\[errno 122\]",
+    re.IGNORECASE,
+)
+
+# Words that make a step that ran the configuration fail for something else, read from the step's LAST FEW meaningful
+# lines (`ConfigStepFailed.tail`, `base.TAIL_LINES`: the final error and what printed just before it — pip's "Connection
+# to pypi.org timed out" warning above its "No matching distribution", a site script's `curl: (28)` above its own last
+# line — but never a banner far above): the network or a timeout (a pip, uv or license server env_setup calls that did
+# not answer in time), the Globus service — globus-compute-endpoint's own "Network failure; unable to register endpoint:
+# ConnectionError on request" (exit 75, EX_TEMPFAIL) and its "Endpoint registration blocked" (409/423) — an ssh
+# connection lost under the step, an endpoint still registering, the login node's own state (out of processes, a stale
+# NFS handle) or its filesystem (`_REMOTE_FS_REFUSED`). The same configuration may come up on the next try, so it is
+# kept. Narrow on purpose: a bare "timeout" (`sock.settimeout`, "idle sessions timeout") or a `globus_sdk` path is no
+# cause. (agentic/scenarios/lmod_bootstrap.py keeps a copy for its grader; a hermetic test holds the two equal.)
+_NOT_THE_CONFIG_WORDS = re.compile(
+    r"\btimed out\b|timeout ?error|network timeout|globus_sdk\.\S*error|globus ?api ?error|globus ?connection ?error"
+    r"|globus ?timeout ?error|auth\.globus\.org|api\.globus\.org"
+    r"|network failure|unable to register endpoint|(?:connect)?(?:connection|timeout)error on request"
+    r"|registration blocked"
+    r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
+    r"|ssh: connect to host|could not find endpoint|resource temporarily unavailable|stale file handle"
+    r"|read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
+    r"|no space left on device|\[errno 28\]|disk quota exceeded|\[errno 122\]",
+    re.IGNORECASE,
+)
+
+
+def _failure_of_the_config(exc: BaseException) -> bool:
+    """Did the configuration being brought up fail on the login node? Decided POSITIVELY: only a step that ran through
+    its env_setup and was refused there (`ConfigStepFailed`: configure, start, list, the endpoint venv's check or
+    build — never ssh's own exit status 255 or a negative one) whose last few meaningful lines (`tail`) name none of
+    `_NOT_THE_CONFIG_WORDS`. Everything else says nothing about the configuration and connect keeps it, for the retry
+    its answer asks for: ssh refused or unreachable, a host key, the socket path, a timeout, the Globus service (the
+    manager check's web error), the Globus login, an endpoint still registering, the login node out of processes or on
+    a stale handle, a write the remote filesystem refused, a token store hpc-bridge will not replace, a venv in the way,
+    an old uv, a venv build that could not reach the network."""
+    return (isinstance(exc, ConfigStepFailed) and not login_expired(exc)
+            and not _NOT_THE_CONFIG_WORDS.search(exc.tail))
 
 def _local_dill() -> str | None:
     try:
@@ -1348,6 +1416,8 @@ def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
 def _hpc_bridge_error(exc: BaseException) -> str:
     """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
     renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
+    if isinstance(exc, DroppedConfigError):  # its text is the whole answer: the dropped config, and what to do instead
+        return str(exc)
     if login_expired(exc):
         # the gate before a bootstrap raised it: no SSH was made and nothing was copied or started
         gated = " Nothing was started, and no login was copied to the login node." \

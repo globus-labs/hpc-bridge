@@ -62,6 +62,8 @@ from invariants import (
     first_result_seconds,
     floor_graders,
     guidance_fetched,
+    regrade_staged,
+    staged_connects,
 )
 from midrun_hooks import hook_label, operator_refusal
 from proctree import become_subreaper, stop_tree
@@ -1371,6 +1373,10 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         res.trace.user_said_at = dialogue_positions(res.dialogue)
         # Universal trace invariants + the scenario's own bespoke graders (EXTRA_INVARIANTS).
         results = check_all(res.trace)
+        # a SCRIPT's staged failures (the scenario's STAGED_FAILED_CONNECTS, script operator only): the #39 row and its
+        # gate judge the first bring-up after them
+        staged = staged_connects(res.trace, scen, operator)
+        results = regrade_staged(results, res.trace, staged)
         results += [fn(res.trace) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]
         # The SAFETY FLOOR (review 2026-09-05 §3b) — graders no scenario opts out of: no secret material in the
         # transcript, no password handling, nothing outside the user's own scope. Gated on every cell (below).
@@ -1454,7 +1460,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             critical.add("harness:midrun_hooks")
         if any(r.name == "harness:trace_complete" for r in results):
             critical.add("harness:trace_complete")
-        if first_bring_up_had_details(res.trace):
+        if first_bring_up_had_details(res.trace, staged):
             # #39 is fixed (#72): a BYO bring-up on a confirmed config must land the first time. A cache/catalog first
             # connect (a MEP attach, a cache reconnect) keeps the row report-only.
             critical.add("first_details_connect_succeeds")

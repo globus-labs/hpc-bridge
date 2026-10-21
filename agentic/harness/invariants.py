@@ -1282,51 +1282,77 @@ _PROBE_PHASES = {"proposed_facility_details", "needs_facility_details", "needs_p
 
 _FIRST_CONTACT_REFUSALS = ("UNKNOWN HOST KEY", "NO SSH ACCESS", "CANNOT REACH", "NO ACCOUNT", "REMOTE FILESYSTEM")
 
+def staged_connects(t: Trace, scen: Any, operator: str | None) -> frozenset[int]:
+    """The trace indices of the connect_facility calls a SCRIPT staged to fail on purpose — the scenario's
+    `STAGED_FAILED_CONNECTS`, ordinals among its connect_facility calls (lmod_bootstrap's `(0,)`: a made-up `module
+    load` first, to prove the connect after it does not run it again). Such a call is the cell's premise, not a
+    bring-up of a confirmed config, so the #39 gate judges the first bring-up after it. Declared by the scenario and
+    honoured by run.py and regrade.py only under the script operator — nothing an agent sends can earn it — and only
+    for a call that did fail (a staged call that came up is an ordinary bring-up, judged as one)."""
+    if operator != "script":
+        return frozenset()
+    wanted = set(getattr(scen, "STAGED_FAILED_CONNECTS", ()) or ())
+    return frozenset(i for n, (i, c) in enumerate(t.named("connect_facility"))
+                     if n in wanted and str((c.result or {}).get("phase")) == "failed")
 
-def _first_bring_up(t: Trace) -> tuple[int, ToolCall] | None:
+
+def _first_bring_up(t: Trace, skip: frozenset[int] = frozenset()) -> tuple[int, ToolCall] | None:
     """The first `connect_facility` that went past probing/asking — a `details=` confirm, or a plain connect served
     from the local facilities cache / the catalog. Skipped: a FIRST-CONTACT refusal (no access / unknown key /
     unreachable: the user's access, not a bring-up), a refusal of the call's own arguments before any SSH
     (`no_op_answer`: "details= has no env_setup and there is no proposal … Nothing was started." — hermes21 sent
-    details= before asking for a proposal, teardown_slow_fs 2026-10-16), and a result with no `phase` at all (a tool
-    error, a cut stream — it says nothing about the bring-up, and taking it as one hid a real `failed` after it)."""
+    details= before asking for a proposal, teardown_slow_fs 2026-10-16), a result with no `phase` at all (a tool
+    error, a cut stream — it says nothing about the bring-up, and taking it as one hid a real `failed` after it), and a
+    call in `skip` (the failures a SCRIPT staged: `staged_connects`)."""
     for i, c in t.named("connect_facility"):
         r = c.result or {}
-        if (r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
+        if (i not in skip and r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
                 and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)
                 and not no_op_answer(c)):
             return i, c
     return None
 
 
-def first_bring_up_had_details(t: Trace) -> bool:
+def first_bring_up_had_details(t: Trace, skip: frozenset[int] = frozenset()) -> bool:
     """Was the first bring-up connect a `details=` connect (a BYO bring-up on a confirmed config)? Where it was,
     `first_details_connect_succeeds` GATES the run (run.py and regrade.py add it to the critical set); a first
-    bring-up served from the cache or the catalog (a facility-MEP attach, a cache reconnect) keeps it report-only."""
-    first = _first_bring_up(t)
+    bring-up served from the cache or the catalog (a facility-MEP attach, a cache reconnect) keeps it report-only.
+    `skip`: the staged failures of a scripted run (`staged_connects`)."""
+    first = _first_bring_up(t, skip)
     return first is not None and bool(first[1].input.get("details"))
 
 
-def first_details_connect_succeeds(t: Trace) -> Result:
+def regrade_staged(results: list[Result], t: Trace, skip: frozenset[int]) -> list[Result]:
+    """`results` with the `first_details_connect_succeeds` row judged past the staged failures `skip` (run.py and
+    regrade.py, for a scripted run whose scenario declares STAGED_FAILED_CONNECTS); unchanged when there are none."""
+    if not skip:
+        return results
+    return [first_details_connect_succeeds(t, skip) if r.name == "first_details_connect_succeeds" else r
+            for r in results]
+
+
+def first_details_connect_succeeds(t: Trace, skip: frozenset[int] = frozenset()) -> Result:
     """Did the FIRST bring-up connect — the first `connect_facility` that went past probing/asking, i.e. a `details=`
     confirm OR a plain connect served from the local facilities cache / the catalog — return a non-`failed` phase?
     GATES every run whose first bring-up carried `details=` (`first_bring_up_had_details`, applied by run.py and
     regrade.py); a cache/catalog first bring-up stays report-only. Why: issue #39 failed it in practically every run
     until #72 (a wrapped `gce list` table); a confirmed config must now land the first time. (Name kept for report
-    continuity.)"""
-    first = _first_bring_up(t)
+    continuity.) `skip`: the failures a SCRIPT staged (`staged_connects`), passed over and named in the detail."""
+    first = _first_bring_up(t, skip)
+    staged = f" (staged failure{'s' if len(skip) > 1 else ''} at call {', '.join(map(str, sorted(skip)))} passed over)" \
+        if skip else ""
     if first is None:
         return Result("first_details_connect_succeeds", True,
-                      "no bring-up connect in the trace (probe/ask phases only)")
+                      "no bring-up connect in the trace (probe/ask phases only)" + staged)
     i, c = first
     path = "details=" if c.input.get("details") else "cached/catalog, no details="
     phase = str((c.result or {}).get("phase"))
     ok = phase != "failed"
     return Result(
         "first_details_connect_succeeds", ok,
-        f"ok: first bring-up connect (call {i}, {path}) returned {phase!r}" if ok else
-        f"first bring-up connect (call {i}, {path}) FAILED (it must land first time since #72 fixed #39): "
-        f"{str((c.result or {}).get('notice', ''))[:120]!r}",
+        (f"ok: first bring-up connect (call {i}, {path}) returned {phase!r}" if ok else
+         f"first bring-up connect (call {i}, {path}) FAILED (it must land first time since #72 fixed #39): "
+         f"{str((c.result or {}).get('notice', ''))[:120]!r}") + staged,
     )
 
 

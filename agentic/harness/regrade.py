@@ -38,6 +38,8 @@ from invariants import (  # noqa: E402
     dialogue_words,
     first_bring_up_had_details,
     floor_graders,
+    regrade_staged,
+    staged_connects,
 )
 from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
 
@@ -212,13 +214,16 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         # the scenario's USER_SECRETS (a fixture in the module: the replay compares exactly what the live run did)
         results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"),
                                                                  user_secrets=getattr(scen, "USER_SECRETS", None))]
+        # a SCRIPT's staged failures, as run.py honours them: only under the script operator
+        staged = staged_connects(t, scen, cfg.get("operator"))
+        results = regrade_staged(results, t, staged)
         critical = {"agent_engaged", *FLOOR_NAMES}
         if scen is not None:
             results += [fn(t) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]
             critical |= set(getattr(scen, "EXPECT_OK", []))
             if getattr(scen, "LOCAL_BASELINE", False):
                 critical.discard("agent_engaged")   # a calibration run that must not use hpc-bridge (run.py, same rule)
-        if first_bring_up_had_details(t):   # the same conditional gate as run.py: a details= bring-up must land first time
+        if first_bring_up_had_details(t, staged):   # the same conditional gate as run.py: a details= bring-up must land first time
             critical.add("first_details_connect_succeeds")
         # the completion gate, from what the bundle recorded (not from the trace)
         fin = rec.get("final") or {}
