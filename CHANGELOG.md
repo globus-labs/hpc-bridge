@@ -16,15 +16,18 @@ installed plugin only when that version changes); git tags mark releases.
   what failed, not guessed from the whole text: a step that ran through the configuration's `env_setup` —
   `globus-compute-endpoint configure`, `start` or `list`, or the check or build of hpc-bridge's endpoint venv after
   the site's prefix — and was refused there (any exit status but ssh's own 255 or a negative one), unless the step's
-  LAST meaningful line (a traceback's exception, a command's final error; never a login banner or a frame before it)
-  names a timeout, Globus, a lost ssh connection, an endpoint still registering, the login node out of processes or on
-  a stale file handle, or its filesystem refusing a write. Everything else keeps the configuration, for the retry its
+  last few meaningful lines (the final error and what printed just before it: a traceback's exception, pip's timeout
+  warning above its last error; never a login banner far above, a shell's trailer or a window-title escape) name a
+  timeout, the network, Globus (globus-compute-endpoint's own "Network failure; unable to register endpoint" or
+  "Endpoint registration blocked"), a lost ssh connection, an endpoint still registering, the login node out of
+  processes or on a stale file handle, or its filesystem refusing a write. Everything else keeps the configuration, for the retry its
   answer asks for: ssh refused or unreachable, an unknown or revoked host key, a timeout, the Globus service or login,
   a home directory that refused a write (globus-compute-endpoint's own `PermissionError` or read-only file system under
   `~/.globus_compute`, a full disk or quota — said again as REMOTE FILESYSTEM), a token store hpc-bridge will not
-  replace, a venv in the way, an old uv, a venv build that could not reach PyPI or astral.sh (DNS, route, refused
-  connection) or whose write was refused. And once a bring-up of the configuration got past `start`, no later poll
-  drops it: each poll re-runs the venv check, `whoami` and `list`, and a flaky login node must not cost a configuration
+  replace, a venv in the way, an old uv, a venv build that could not reach PyPI or astral.sh (DNS, route, a refused
+  connection, uv's network timeout) or found no room to write (a read-only, full or over-quota filesystem; a
+  permission refused on the venv's own path is the configuration's choice of path, and drops it). And once a bring-up of the configuration got past `start` on an endpoint of
+  its own (not one of an earlier configuration that was still online), no later poll drops it: each poll re-runs the venv check, `whoami` and `list`, and a flaky login node must not cost a configuration
   that started. So a failure the configuration causes — an unknown module, a mismatched `globus_sdk` in a hand-made
   venv, a missing `parsl` — drops it even when a banner says "timeout" or a frame quotes `settimeout`; one whose words
   mention "Permission denied" or "Connection refused" (a file `env_setup` sources, a license server it calls) is said
@@ -43,7 +46,8 @@ installed plugin only when that version changes); git tags mark releases.
   answer "no endpoint was up" without SSH (a gap older than this change; a later bring-up that comes up reuses that
   store, and its teardown removes it). A connect without `details=` that waited behind the failing one resolves again
   instead of running what that one just dropped, and still names a Globus login that landed while it waited; a failing
-  bring-up never drops a configuration another `details=` put in its place meanwhile. The dropped configuration is
+  bring-up never drops a configuration another `details=` put in its place meanwhile, and a bring-up that comes up
+  meanwhile never caches that waiting configuration as proven. The dropped configuration is
   never written to the local facility cache, and one equal to the configuration proven for that host in an earlier
   session (compared field by field, so one an older plugin cached counts) is kept as proven. Unchanged: a bring-up
   still coming up keeps being polled by a connect without `details=`; a configuration that came up is reused (the

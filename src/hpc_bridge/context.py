@@ -285,6 +285,11 @@ class AppCtx:
     # stale NFS handle) must not cost a config that started. Cleared by the next details= for the id and when it comes
     # up.
     details_started: set[str] = field(default_factory=set)
+    # The catalog entry the bound facility was built from (connect's bind); None for a startup pin or nothing bound. A
+    # warm login shape proves THIS config only: connect._commit_proven_facility commits a pending details= only while
+    # the session's config for the machine is still this one (review round 4: one another connect's details= put in its
+    # place, while this binding came up, was cached as PROVEN without ever running).
+    bound_entry: CatalogEntry | None = None
     # The facility id the LAST connect_facility answered with proposed_facility_details (a draft config, nothing bound).
     # While no facility is bound, the "No facility connected" notice tells the agent to FINISH that connect with
     # details=… rather than start over. Every connect_facility clears it first; only a new proposal sets it again.

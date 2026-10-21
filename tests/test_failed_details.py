@@ -726,3 +726,102 @@ async def test_a_login_that_landed_before_the_retry_is_still_named(monkeypatch):
     a, b = await asyncio.gather(server._connect_facility(app, "lmodfac", ssh_host=HOST, details=_details()), second())
     assert a.phase == "failed" and b.phase == "needs_account" and w.brought_up == [BAD, GOOD]
     assert "Globus login landed as u@uchicago.edu." in (b.notice or "")
+
+
+# ---- review round 4 ----------------------------------------------------------------------------------------------------
+
+_GCE_NET = ("2026-10-20 12:00:00 CRITICAL MainProcess-1234 MainThread-1 globus_compute_endpoint.cli:832 "
+            "_do_register_endpoint Network failure; unable to register endpoint: ConnectionError on request")
+_GCE_BLOCKED = 'Endpoint registration blocked.  [{"code": "CONFLICT", "detail": "name in use"}]'
+_LMOD_NEW = ('Lmod has detected the following error:  The following module(s) are unknown: "gcc/10.2.0"\n\n'
+             'Please check the spelling or version number. Also try "module spider ..."\n'
+             "It is also possible your cache file is out-of-date; it may help to try:\n"
+             '  $ module --ignore_cache load "gcc/10.2.0"\n\n'
+             "Also make sure that all modulefiles written in TCL start with the string #%Module\n\n\n")
+_PIP_NET = ("WARNING: Retrying (Retry(total=4, connect=None, read=None, redirect=None, status=None)) after connection "
+            "broken by 'ConnectTimeoutError(<pip._vendor.urllib3.connection.HTTPSConnection object at 0x7f>, "
+            "'Connection to pypi.org timed out. (connect timeout=15)')': /simple/foo/\n"
+            "ERROR: Could not find a version that satisfies the requirement foo (from versions: none)\n"
+            "ERROR: No matching distribution found for foo")
+_CURL_LIC = "curl: (28) Connection timed out after 10001 milliseconds\nsite-setup: license check failed"
+_UV_TIMEOUT = ("error: Failed to download `globus-compute-endpoint==4.15.0`\n  Caused by: Failed to download "
+               "distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: 30s).")
+
+
+@pytest.mark.parametrize(("output", "said", "drops"), [
+    # F3: globus-compute-endpoint's own registration failures (exit 75, EX_TEMPFAIL; a 409/423) — Globus's, kept
+    (_GCE_NET, _GCE_NET, False),
+    (_GCE_BLOCKED, _GCE_BLOCKED, False),
+    # F6: a network cause printed just before the final error is in the tail — kept; uv's own timeout words too
+    (_PIP_NET, "ERROR: No matching distribution found for foo", False),
+    (_CURL_LIC, "site-setup: license check failed", False),
+    (_UV_TIMEOUT, _UV_TIMEOUT.splitlines()[-1].strip(), False),
+    # the config's own: Lmod's newer one-paragraph format
+    (_LMOD_NEW, "Also make sure that all modulefiles written in TCL start with the string #%Module", True),
+    # a shell's trailer (`clear` in ~/.bash_logout) and a window-title escape are never the line that decides
+    ("ERROR: something\nTERM environment variable not set.", "ERROR: something", True),
+    ("real error: bad thing\n\x1b]0;user@login:~\x07", "real error: bad thing", True),
+], ids=["gce-net", "gce-blocked", "pip-net", "curl-lic", "uv-timeout", "lmod-new", "bash-logout", "osc"])
+def test_a_steps_cause_is_read_from_its_last_few_lines(output, said, drops):
+    exc = step_error(1, f"remote start failed (rc=1): {output}; `list` failed too: rc=1", output=output)
+    assert isinstance(exc, ConfigStepFailed) and exc.said == said
+    assert notices._failure_of_the_config(exc) is drops
+
+
+def test_a_banner_far_above_the_error_never_keeps_it_and_the_list_note_never_decides():
+    # the tail is the last few lines: a banner well above an Lmod error stays out of it
+    text = "*** idle sessions timed out after 30 minutes ***\n" + _LMOD_NEW + "\nmore\nlines\nhere"
+    assert notices._failure_of_the_config(step_error(1, f"remote configure failed: {text}", output=text))
+    # F7: a start that printed nothing is judged by nothing — never by the `list` note the message adds after it
+    quiet = step_error(73, "remote start failed (rc=73): no output; `list` failed too: Read timed out", output="")
+    assert isinstance(quiet, ConfigStepFailed) and quiet.said == "" and notices._failure_of_the_config(quiet)
+
+
+@pytest.mark.parametrize("waiting_on", ["details", "poll"])
+async def test_a_warm_bring_up_never_commits_a_config_that_waited_on_the_lock(monkeypatch, waiting_on):
+    # F1: connect A (details=GOOD, or a poll of it) holds the lock and comes up WARM while connect B (details=BAD)
+    # waits; B wrote its pending and session entries before the lock, and A's warm branch used to cache BAD as PROVEN
+    import asyncio
+
+    w, app = World(monkeypatch, outcome="provisioning" if waiting_on == "poll" else "warm"), _app()
+    if waiting_on == "poll":
+        assert (await server._connect_facility(app, "byo", details=_details(GOOD))).phase == "provisioning"
+        w.outcome = "warm"
+    inside = _held(monkeypatch, w, app)
+
+    async def second():
+        await inside.wait()
+        return await server._connect_facility(app, "byo", ssh_host=HOST, details=_details(BAD))
+
+    first = (server._connect_facility(app, "byo") if waiting_on == "poll"
+             else server._connect_facility(app, "byo", ssh_host=HOST, details=_details(GOOD)))
+    a, b = await asyncio.gather(first, second())
+    assert a.phase == "needs_account" and b.phase == "failed"
+    assert binding._facility_store().get(HOST) is None                # BAD never ran: never cached as proven
+    assert "is not kept" in (b.notice or "") and "byo" not in app.session_facilities   # …so its failure drops it
+    again = await server._connect_facility(app, "byo")
+    assert again.phase == "proposed_facility_details" and w.brought_up.count(BAD) == 1
+
+
+async def test_a_bring_up_that_reused_an_endpoint_never_marks_the_config_started(monkeypatch):
+    # F2: the first details= reuses an endpoint of an EARLIER config (a ghost still online): nothing of BAD ran; when
+    # the ghost goes, BAD's own configure fails for the first time — and is dropped, not kept forever
+    from hpc_bridge.lifecycle import EndpointState
+
+    World(monkeypatch, outcome="provisioning")
+    app = _app()
+    calls: list[str] = []
+
+    async def prov(app_, shape, **kw):
+        calls.append(app_.facility.env_setup)
+        if len(calls) == 1:
+            app_.state = EndpointState(endpoint_id="ghost", reused=True)
+            return "provisioning"
+        raise ConfigStepFailed(LMOD)
+
+    monkeypatch.setattr(warmth, "_provision", prov)
+    first = await server._connect_facility(app, "byo", details=_details(BAD))
+    assert first.phase == "provisioning" and "byo" not in app.details_started
+    second = await server._connect_facility(app, "byo")
+    assert second.phase == "failed" and "is not kept" in (second.notice or "") and "byo" not in app.session_facilities
+    assert (await server._connect_facility(app, "byo")).phase == "proposed_facility_details" and len(calls) == 2

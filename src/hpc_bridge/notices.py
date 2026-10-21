@@ -85,8 +85,9 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         # ~/.globus_compute (a read-only or full home, a permission): the remote filesystem's, as before — the
         # configuration is kept. Any other "Permission denied" or "Connection refused" in its words is the
         # configuration's (a file env_setup sources, a server it calls), never sshd's or the login host's.
-        if _REMOTE_FS_REFUSED.search(exc.said):
-            return _remote_fs_notice(host, exc.said)
+        refused = next((ln for ln in exc.tail.splitlines() if _REMOTE_FS_REFUSED.search(ln)), None)
+        if refused is not None:
+            return _remote_fs_notice(host, refused)
         return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
@@ -148,7 +149,7 @@ def _remote_fs_notice(host: str, line: str) -> str:
             "call connect_facility again. Nothing was started or billed.")
 
 
-# A write refused by the login node's filesystem, in a step's last line: globus-compute-endpoint's own under
+# A write refused by the login node's filesystem, in a step's last few lines: globus-compute-endpoint's own under
 # ~/.globus_compute (Errno 13, a read-only file system — live 2026-09-03: `PermissionError: [Errno 13] Permission
 # denied: '…/.globus_compute/…/endpoint.log'`), or a full disk or quota anywhere. Explained as REMOTE FILESYSTEM.
 _REMOTE_FS_REFUSED = re.compile(
@@ -157,16 +158,21 @@ _REMOTE_FS_REFUSED = re.compile(
     re.IGNORECASE,
 )
 
-# Words that make a step that ran the configuration fail for something else, read from the step's LAST meaningful line
-# (`ConfigStepFailed.said`: a traceback's exception, a command's final error — never a banner or a frame before it):
-# the network or a timeout (a pip or a license server env_setup calls that did not answer in time), the Globus service,
-# an ssh connection lost under the step, an endpoint still registering, the login node's own state (out of processes, a
-# stale NFS handle) or its filesystem (`_REMOTE_FS_REFUSED`). The same configuration may come up on the next try, so it
-# is kept. Narrow on purpose: a bare "timeout" (`sock.settimeout`, "idle sessions timeout") or a `globus_sdk` path is
-# no cause. (agentic/scenarios/lmod_bootstrap.py keeps a copy for its grader; a hermetic test holds the two equal.)
+# Words that make a step that ran the configuration fail for something else, read from the step's LAST FEW meaningful
+# lines (`ConfigStepFailed.tail`, `base.TAIL_LINES`: the final error and what printed just before it — pip's "Connection
+# to pypi.org timed out" warning above its "No matching distribution", a site script's `curl: (28)` above its own last
+# line — but never a banner far above): the network or a timeout (a pip, uv or license server env_setup calls that did
+# not answer in time), the Globus service — globus-compute-endpoint's own "Network failure; unable to register endpoint:
+# ConnectionError on request" (exit 75, EX_TEMPFAIL) and its "Endpoint registration blocked" (409/423) — an ssh
+# connection lost under the step, an endpoint still registering, the login node's own state (out of processes, a stale
+# NFS handle) or its filesystem (`_REMOTE_FS_REFUSED`). The same configuration may come up on the next try, so it is
+# kept. Narrow on purpose: a bare "timeout" (`sock.settimeout`, "idle sessions timeout") or a `globus_sdk` path is no
+# cause. (agentic/scenarios/lmod_bootstrap.py keeps a copy for its grader; a hermetic test holds the two equal.)
 _NOT_THE_CONFIG_WORDS = re.compile(
-    r"\btimed out\b|timeout ?error|globus_sdk\.\S*error|globus ?api ?error|globus ?connection ?error"
+    r"\btimed out\b|timeout ?error|network timeout|globus_sdk\.\S*error|globus ?api ?error|globus ?connection ?error"
     r"|globus ?timeout ?error|auth\.globus\.org|api\.globus\.org"
+    r"|network failure|unable to register endpoint|(?:connect)?(?:connection|timeout)error on request"
+    r"|registration blocked"
     r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
     r"|ssh: connect to host|could not find endpoint|resource temporarily unavailable|stale file handle"
     r"|read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
@@ -178,14 +184,14 @@ _NOT_THE_CONFIG_WORDS = re.compile(
 def _failure_of_the_config(exc: BaseException) -> bool:
     """Did the configuration being brought up fail on the login node? Decided POSITIVELY: only a step that ran through
     its env_setup and was refused there (`ConfigStepFailed`: configure, start, list, the endpoint venv's check or
-    build — never ssh's own exit status 255 or a negative one) whose LAST meaningful line (`said`) names none of
+    build — never ssh's own exit status 255 or a negative one) whose last few meaningful lines (`tail`) name none of
     `_NOT_THE_CONFIG_WORDS`. Everything else says nothing about the configuration and connect keeps it, for the retry
     its answer asks for: ssh refused or unreachable, a host key, the socket path, a timeout, the Globus service (the
     manager check's web error), the Globus login, an endpoint still registering, the login node out of processes or on
     a stale handle, a write the remote filesystem refused, a token store hpc-bridge will not replace, a venv in the way,
     an old uv, a venv build that could not reach the network."""
     return (isinstance(exc, ConfigStepFailed) and not login_expired(exc)
-            and not _NOT_THE_CONFIG_WORDS.search(exc.said))
+            and not _NOT_THE_CONFIG_WORDS.search(exc.tail))
 
 def _local_dill() -> str | None:
     try:

@@ -827,8 +827,10 @@ async def test_real_a_parent_that_cannot_be_created_fails_at_once(box):
         with pytest.raises(EndpointVenvError, match=r"could not build .*Permission denied") as got:
             await _real(box)
         assert vs.calls(box) == []
-        # the login node's filesystem refused the write: not the configuration's (connect keeps it, review round 3)
-        assert not isinstance(got.value, ConfigStepFailed)
+        # a permission refused on the venv's OWN path is the configuration's (its base, from env_setup or
+        # HPC_BRIDGE_REMOTE_VENV — review round 4: a made-up `/sw/hpc-bridge` in details=), so connect drops it; a
+        # read-only, full or over-quota filesystem is the node's (below)
+        assert isinstance(got.value, ConfigStepFailed)
     finally:
         box["home"].chmod(0o700)
 
@@ -841,7 +843,13 @@ _UV_FAILS = {
     "refused": ("error: Failed to fetch: `https://pypi.org/simple/parsl/`\n  Caused by: tcp connect error: Connection "
                 "refused (os error 111)", False),
     "unreachable": ("error: Request failed after 3 retries\n  Caused by: Network is unreachable (os error 101)", False),
+    # review round 4: uv's own timeout words, and a full disk — the node's
+    "uv timeout": ("error: Failed to download `globus-compute-endpoint==4.15.0`\n  Caused by: Failed to download "
+                   "distribution due to network timeout. Try increasing UV_HTTP_TIMEOUT (current value: 30s).", False),
+    "full": ("error: Failed to write to /home/u/hpc-bridge/x.build: No space left on device (os error 28)", False),
     "no python": ("error: No interpreter found for Python 3.13 in managed installations or search path", True),
+    # review round 4 (F5): a base the config made up, refused — the configuration's own failure
+    "made-up base": ("mkdir: cannot create directory '/sw/hpc-bridge': Permission denied", True),
 }
 
 
@@ -865,6 +873,31 @@ async def test_real_a_build_the_network_failed_is_not_the_configs_and_one_the_co
 def test_curl_that_cannot_reach_astral_is_the_networks(line):
     assert ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", line))
     assert not ev._BUILD_NOT_THE_CONFIG.search(ev._tail("a login banner\n", "error: No interpreter found for 3.13"))
+
+
+def test_the_build_reads_its_error_chain_from_stderr_never_pushed_out_by_a_stdout_banner():
+    # review round 4 (F4): the build runs `bash -lc`, so a profile.d banner on stdout used to fill the window after
+    # stderr and push uv's "Caused by:" chain out of it
+    err = ("error: Request failed after 3 retries\n  Caused by: Failed to fetch: `https://pypi.org/simple/x/`\n"
+           "  Caused by: dns error: failed to lookup address information: Name or service not known")
+    out = "\n".join(f"Site notice line {i}" for i in range(7))
+    assert not ev._BUILD_NOT_THE_CONFIG.search(ev._tail(err, out))       # the old reading lost it
+    assert ev._BUILD_NOT_THE_CONFIG.search(ev._build_tail(err, out))     # stderr's own end
+    assert ev._build_tail("", out) == ev._tail(out)                      # stdout's when stderr is empty
+
+
+async def test_a_check_cut_by_a_signal_is_ssh_s_not_the_configs():
+    # review round 4 (F7): a negative exit status (the local ssh killed) with partial stdout, as step_error reads it
+    mv = ev.managed_venv(ev.short_env_setup("/home/u/.hpc-bridge/gce", prefix="module load python/3.13; "))
+    assert mv is not None
+
+    async def killed(step, script, timeout):
+        return -15, "a banner line\n", ""
+
+    with pytest.raises(RuntimeError) as got:
+        await ev._check(killed, mv, "login", "check")
+    assert not isinstance(got.value, ConfigStepFailed)
+    assert 137 in ev._BUILD_CUT and 124 in ev._BUILD_CUT   # a build KILLed by `timeout -k` (or the kernel) was cut short
 
 
 async def test_real_a_directory_that_is_not_a_venv_is_never_replaced(box):

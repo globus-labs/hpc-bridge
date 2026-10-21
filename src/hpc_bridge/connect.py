@@ -53,10 +53,21 @@ from .scheduler_ops import LoginRunner
 from .warmth import _drop_all_shapes
 
 
+def _session_is_ours(app: AppCtx, facility: str, entry: CatalogEntry | None) -> bool:
+    """Is the session's config for `facility` the one `entry` (what came up) was built from — or none at all (a registry
+    entry, a direct call)? Not when a details= of another connect replaced it while this one held the lock: that config
+    never ran here (review round 4: a warm bring-up committed the waiting call's untried config as PROVEN)."""
+    current = app.session_facilities.get(facility)
+    return current is None or current is entry
+
+
 def _commit_proven_facility(app: AppCtx, facility: str) -> None:
     """PROVEN: the login shape's canary answered — the only step that exercises the network interface
     the probe flags as its riskiest guess. Only now does a BYO config earn a zero-probe reconnect
-    (decision 2026-09-03; caching on acceptance remembered a wrong interface every session)."""
+    (decision 2026-09-03; caching on acceptance remembered a wrong interface every session). Only the BOUND config's
+    pending entry (`AppCtx.bound_entry`): another connect's details= that replaced it meanwhile is left pending."""
+    if not _session_is_ours(app, facility, app.bound_entry):
+        return
     pending = app.pending_facility_cache.pop(facility, None)
     if pending is None:
         return
@@ -479,6 +490,7 @@ async def _connect(
         if not app.left_blocks and (here is None or here != old_eid):
             app.worker_user = None
         app.facility = fac
+        app.bound_entry = entry   # what this binding was built from: only its pending config may be committed as proven
         app.dropped_binding = None  # a new facility object: what a dropped config's bring-up refused is behind it
         app.machine = facility
         # where this binding's default partition and account come from, for every block's terms (BlockTerms)
@@ -512,7 +524,8 @@ async def _connect(
             block = await warmth._provision(app, "login", force_canary=True)
             if not app.state.reused:  # a FRESH bootstrap: later calls re-find it online and read as reused
                 app.bootstrapped_facilities.add(facility)
-            if facility in app.pending_facility_cache and app.session_facilities.get(facility) is entry:
+            if (facility in app.pending_facility_cache and app.session_facilities.get(facility) is entry
+                    and not app.state.reused):  # a reused endpoint ran none of this config: nothing of it started
                 app.details_started.add(facility)  # past `start` on it: a later poll's failure never drops it
         except Exception as exc:  # noqa: BLE001 - provisioning unavailable (e.g. non-Linux host)
             # A denial that OFFERS an interactive method is the pre-auth handoff, not "no access": the
@@ -528,7 +541,7 @@ async def _connect(
             if _failure_of_the_config(exc):  # the login node ran the config and refused it: not run again unasked
                 notice += _drop_failed_details(app, facility, notice, entry)
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
-        if block == "warm":
+        if block == "warm" and _session_is_ours(app, facility, entry):  # never another connect's waiting config
             _commit_proven_facility(app, facility)
             app.failed_details.pop(facility, None)  # up, on whichever config: the details= that failed is history
             app.details_started.discard(facility)   # proven now (or the cache's): nothing pending to protect
