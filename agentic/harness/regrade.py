@@ -10,18 +10,23 @@ EXTRA_INVARIANTS, and diff per-invariant verdicts against what record.json store
 postchecks are skipped — they measured the live cluster, which is gone). Reports verdict
 flips and fresh critical failures, then a summary. A failing bundle whose operator produced
 nothing to grade because its model endpoint failed is reported INFRA, as run.py decides it
-live (infra.py), and does not count as "would now grade FAIL".
+live (infra.py), and does not count as "would now grade FAIL". Each bundle's scenario is
+imported afresh under that bundle's own run environment (RUN_ENV, load_scenario): a scenario
+builds graders from it at import — the canary cells' nonce comes from HPCB_RUNID.
 """
 from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
+from types import ModuleType
 
 _HERE = Path(__file__).resolve().parent
+SCENARIOS_DIR = _HERE.parents[0] / "scenarios"
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE.parents[0] / "scenarios"))
+sys.path.insert(0, str(SCENARIOS_DIR))
 
 from infra import PREFLIGHT_ROW, absences, bundle_final, infra_reason, outcome_of  # noqa: E402
 from invariants import (  # noqa: E402
@@ -35,6 +40,65 @@ from invariants import (  # noqa: E402
     floor_graders,
 )
 from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
+
+# The per-run environment a scenario module reads WHEN IT IS IMPORTED — so the replay must re-create it per bundle:
+# HPCB_RUNID (canaries.nonce: the canary cells' graders, SETUP and POSTCHECKS), HPC_BRIDGE_SSH_HOST (the login host
+# no_ssh_access's and the f2b cells' graders name), HPC_BRIDGE_ENDPOINT_NAME and HPCB_TARGET_NODES (POSTCHECKS, SETUP),
+# HPCB_RELAUNCH_* (queued_check_relaunch's watch and NEEDS_COMPUTE_NODE). test_regrade holds every scenario to it.
+RUN_ENV = ("HPCB_RUNID", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPCB_TARGET_NODES",
+           "HPCB_RELAUNCH_PHASE", "HPCB_RELAUNCH_HOLD_S", "HPCB_RELAUNCH_WATCH_S", "HPCB_RELAUNCH_PILOT_WAIT_S")
+
+
+def run_env(rec: dict) -> dict[str, str | None]:
+    """RUN_ENV as the live run had it: the record's env snapshot (provenance._safe_env), HPCB_RUNID falling back to
+    config.runid (run.py's copy of it, in every bundle). None = unset, as it was in the jail."""
+    env = rec.get("env") or {}
+    out = {k: None if env.get(k) is None else str(env[k]) for k in RUN_ENV}
+    runid = (rec.get("config") or {}).get("runid")
+    if out["HPCB_RUNID"] is None and runid is not None:
+        out["HPCB_RUNID"] = str(runid)
+    return out
+
+
+def _setenv(k: str, v: str | None) -> None:
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+
+
+def _scenario_modules() -> dict[str, ModuleType]:
+    """The cached modules that are scenario FILES (a test's stand-in module, with no file, is not one)."""
+    return {k: m for k, m in list(sys.modules.items())
+            if getattr(m, "__file__", None) and Path(m.__file__).parent.name == SCENARIOS_DIR.name
+            and Path(m.__file__).parent.resolve() == SCENARIOS_DIR}
+
+
+def load_scenario(name: str, rec: dict) -> ModuleType | None:
+    """Import scenario `name` FRESH under its bundle's run environment (run_env); None when there is no such scenario.
+
+    A scenario derives state from that environment at import — the canary cells build their nonce, and with it their
+    graders, from HPCB_RUNID — so a module cached from another bundle, or imported under the regrading shell's env,
+    grades the wrong run (every canary bundle's `canary_reached_agent` flipped to FAIL). Every scenario module is
+    dropped from the cache for the import (they import each other), and the env and the cache are put back after it:
+    the module returned keeps its own state."""
+    saved_env = {k: os.environ.get(k) for k in RUN_ENV}
+    saved_mods = _scenario_modules()
+    try:
+        for k, v in run_env(rec).items():
+            _setenv(k, v)
+        for k in saved_mods:
+            del sys.modules[k]
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            return None
+    finally:
+        for k, v in saved_env.items():
+            _setenv(k, v)
+        for k in _scenario_modules():
+            del sys.modules[k]
+        sys.modules.update(saved_mods)
 
 
 def _first_line(d: Path) -> dict:
@@ -143,10 +207,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         t = insert_interjections(bundle_trace(d, rec), [e for e in rec.get("events") or [] if e.get("interject")])
         t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
         t.user_said_at = dialogue_positions(rec.get("dialogue"))
-        try:
-            scen = importlib.import_module(scen_name)
-        except ModuleNotFoundError:
-            scen = None
+        scen = load_scenario(scen_name, rec)   # under THIS bundle's run env: its graders are this run's
         # the floor replays too — without the jail's secret material (no_secret_material says so, vacuously), but with
         # the scenario's USER_SECRETS (a fixture in the module: the replay compares exactly what the live run did)
         results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"),

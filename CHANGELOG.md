@@ -148,6 +148,14 @@ installed plugin only when that version changes); git tags mark releases.
   by command line and one by the process title 4.18 sets, pgrep errors, planted symlinks. They also check that both
   setups call it before their managers start. Its first version (before the symlink and pgrep-exit checks) was
   live-checked on `pbs_mep` on 2026-10-20: a cell, a forced restart of the login container, a cell, both OK, no rc 73.
+- **An offline re-grade of a hostile-profile bundle reproduces its stored verdict.** The canary cells build their nonce,
+  and the graders that look for it, from `HPCB_RUNID` when the scenario is imported. `regrade.py` imported the scenario
+  once, under the regrading shell's env, so it looked for the nonce of a run called "local": every stored PASS of
+  `canary_reached_agent` came back FAIL (19 of 19 in `agentic/runs`). It now imports each bundle's scenario afresh under
+  the run environment the bundle recorded (`HPCB_RUNID`, the SSH host, the endpoint name, the node count and the
+  `HPCB_RELAUNCH_*` knobs), then puts the env and the module cache back. All 24 hostile bundles regrade with no verdict
+  flip, and the rest of the corpus regrades as it did before. A test checks that every per-run variable a scenario reads
+  at import is one the replay sets. Live runs are unchanged.
 
 ## 0.1.25 — 2026-10-20 — texttable 1.7.2 no longer breaks the bring-up; stops that settle, spend that names its block
 
