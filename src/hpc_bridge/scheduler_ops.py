@@ -130,10 +130,11 @@ def _release_failure(detail: str) -> str | None:
 # line when the venv does not run on the compute node. The rows commands emit `HPCB_ERR <jobid> <stderr path>` for each
 # pilot that FINISHED with an exit status of its own (Slurm: sacct's SubmitLine names the script, parsl writes
 # `<script>.stderr`; PBS: the record's Error_Path), and this loop turns them into `HPCB_SAID <jobid> <line>` — scoped to
-# that job, so a later pilot (another partition) is never told what an earlier one said.
+# that job, so a later pilot (another partition) is never told what an earlier one said. The path is the rest of the
+# line after the job id, never a word of it (a HOME with a space).
 _SAID_LOOP = (
-    "while IFS= read -r l; do case $l in (\"HPCB_ERR \"*) set -- $l; "
-    "s=$(sed -n '/^hpc-bridge: /p' \"$3\" 2>/dev/null | tail -n 1); [ -n \"$s\" ] && echo \"HPCB_SAID $2 $s\";; "
+    "while IFS= read -r l; do case $l in (\"HPCB_ERR \"*) j=${l#\"HPCB_ERR \"}; p=${j#* }; j=${j%% *}; "
+    "s=$(sed -n '/^hpc-bridge: /p' \"$p\" 2>/dev/null | tail -n 1); [ -n \"$s\" ] && echo \"HPCB_SAID $j $s\";; "
     # a PBS pilot's creation time as qstat prints it, as epoch seconds (GNU date; elsewhere it is left out, unknown)
     "(\"HPCB_QT \"*) set -- $l; j=$2; shift 2; t=$(date -d \"$*\" +%s 2>/dev/null) && echo \"HPCB_SUB $j $t\";; "
     "(*) echo \"$l\";; esac; done; true"
@@ -248,11 +249,15 @@ def _user_endpoint_logs(app: AppCtx | None, block: object = None, eid: str | Non
 # last start is that user endpoint starting again): every endpoint_setup line and every "Endpoint begins" starts a new
 # life and forgets what an earlier one logged, so a life that started and has not failed quotes nothing. It is printed
 # as `HPCB_REFUSED <line>` rows for that life's LAST such error (the newest block's), and only when the log names the
-# probed block request exactly (BLOCK_REQUEST_LOG).
+# probed block request exactly (BLOCK_REQUEST_LOG). A log that names it also prints `HPCB_BREQ <its user endpoint> <n>`
+# (its directory's id, a UUID only), whether or not it failed: so the probe knows THIS request's user endpoint even
+# before it has a pilot listed (the lookup, `_request_cmd`, reads only the listed pilots' ones) — one line, after the
+# rows, however many user endpoint directories there are.
 _REFUSAL_AWK = (
     # keep(x): the last 11 lines in c[1..k] (d: some were left out); blank lines count only before a line that is not
     "function keep(x,j){if(k==11){for(j=1;j<11;j++)c[j]=c[j+1];d=1}else k++;c[k]=x} "
     "function life(){h=\"\";k=0;d=0;b=0;on=0;bad=0} "
+    "FNR==1{u=FILENAME; sub(/\\/endpoint\\.log$/,\"\",u); sub(/.*\\/uep\\.[^\\/]*\\./,\"\",u)} "
     "index($0,p){life();if(substr($0,index($0,p)+length(p))==n)hit=1;next} "
     "index($0,s)==1{life();next} "
     "/^[0-9][0-9][0-9][0-9]-[0-9][0-9]-[0-9][0-9] /{on=0;bad=index($0,\"Setting bad state due to exception\")>0;next} "
@@ -261,7 +266,8 @@ _REFUSAL_AWK = (
     "on&&/^Error [0-9]+:[ \\t]*$/{on=0;next} "
     "on&&/^[ \\t]*$/{b++;next} "
     "on{l=length($0)>400?substr($0,length($0)-399):$0;gsub(/[\\r\\v\\f]/,\" \",l);for(;b>0;b--)keep(\"\");keep(l)} "
-    "END{if(hit&&h!=\"\"){print \"HPCB_REFUSED \"h;if(d)print \"HPCB_REFUSED ...\";"
+    "END{if(hit&&length(u)==36&&u ~ /^[0-9A-Fa-f-]+$/)print \"HPCB_BREQ \"u\" \"n; "
+    "if(hit&&h!=\"\"){print \"HPCB_REFUSED \"h;if(d)print \"HPCB_REFUSED ...\";"
     "for(j=1;j<=k;j++)print \"HPCB_REFUSED \"c[j]}}"
 )
 
@@ -352,9 +358,11 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
     # Reason ("launch failed requeued held", "ReqNodeNotAvail, UnavailableNodes:…", as squeue cuts it at 60) is the
     # third field, whatever its spaces or the StdOut path's. A squeue that prints no suffix gets the reading by words:
     # what lies between the job id and the StdOut path the marker is in (a path with a space then leaves its head in
-    # the reason, and a reason of 60 characters, run into the path, loses its last word: what the suffix avoids).
+    # the reason, and a reason of 60 characters, run into the path, loses its last word: what the suffix avoids). A
+    # squeue that REFUSES the suffix (an older Slurm) is asked again without it, so it never reads as a failed query.
     return (
-        now + 'if q=$(squeue -u "$USER" -h -O "State:20|,JobID:24|,Reason:60|,StdOut:1024" 2>/dev/null); '
+        now + 'if q=$(squeue -u "$USER" -h -O "State:20|,JobID:24|,Reason:60|,StdOut:1024" 2>/dev/null) || '
+        'q=$(squeue -u "$USER" -h -O "State:20,JobID:24,Reason:60,StdOut:1024" 2>/dev/null); '
         f"then printf '%s\\n' \"$q\" | awk -v m={m} 'index($0,m){{"
         'd=0; if (split($0,f,"|")>=4) {s=f[1]; j=f[2]; gsub(/^[ \\t]+|[ \\t]+$/,"",s); gsub(/^[ \\t]+|[ \\t]+$/,"",j); '
         'd=(s!="" && j!="" && s !~ /[ \\t]/ && j !~ /[ \\t]/)} '
@@ -375,9 +383,11 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
         'if ($5 ~ /^[0-9]+$/) print "HPCB_SUB "$2" "$5; '
         'i=index($4,m"."); if (i) {u=substr($4,i+length(m)+1); '
         'if (match(u,/^[0-9A-Za-z-]+/)) print "HPCB_DIR "$2" "substr(u,1,RLENGTH)} '
-        # where a pilot that ran and died wrote its stderr: parsl's `<script>.stderr`, the script being the last word
-        # of SubmitLine
-        'if (x != "-") {n=split($4,w," "); print "HPCB_ERR "$2" "w[n]".stderr"}}\'; '
+        # where a pilot that ran and died wrote its stderr: parsl's `<script>.stderr`, the script being SubmitLine's
+        # path the marker is in — from the last " /" before the marker (a HOME with a space keeps its whole path), or
+        # else the last word
+        'if (x != "-") {k=index($4,m); b=0; for (i=k-1; i>1; i--) if (substr($4,i-1,2)==" /") {b=i; break} '
+        'n=split($4,w," "); print "HPCB_ERR "$2" "(b ? substr($4,b) : w[n])".stderr"}}\'; '
         'else echo "HPCB_FAIL sacct"; fi; true'
     )
 
@@ -819,13 +829,16 @@ async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_
     # a pilot's user endpoint, only when it reads as a whole id (a path cut short, or a wrapped record unjoined, names
     # none: unknown — a candidate, never "another's"); and the block request each user endpoint was started for
     pilot_dir = {w[1]: w[2] for w in meta if w[0] == "HPCB_DIR" and len(w) > 2 and _UUID.fullmatch(w[2])}
-    uep_req = {w[1]: int(w[2]) for w in meta if w[0] == "HPCB_BREQ" and len(w) > 2 and _DIGITS.fullmatch(w[2])}
+    told = _request_cmd(eid, request) != ""  # the probe asked which block request each user endpoint was started for
+    # (from the listed pilots' user endpoints, and — past the grace — from the log naming this request, `_refusal_cmd`;
+    # read only where the template names block requests, so `request` is the number they are compared with)
+    uep_req = {w[1]: int(w[2]) for w in meta
+               if told and w[0] == "HPCB_BREQ" and len(w) > 2 and _DIGITS.fullmatch(w[2])}
     n = block_number(request)
     ours = {u for u, v in uep_req.items() if v == n}
     # in EVERY branch: a pilot whose user endpoint was started for ANOTHER block request is not this request's
     elsewhere = {r[1] for r in rows if len(r) > 1 and (u := pilot_dir.get(r[1])) is not None and u in uep_req
                  and u not in ours}
-    told = _request_cmd(eid, request) != ""  # the probe asked which block request each user endpoint was started for
     if told and ours:  # by user endpoint: a pilot of another one is not this request's (one with no path read may be)
         other = {r[1] for r in rows if len(r) > 1 and r[1] in pilot_dir and pilot_dir[r[1]] not in ours}
         kept = _rows_text(stdout, lambda r: r[1] not in other or r[0][:1].upper() not in _DONE_STATES)

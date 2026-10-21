@@ -17,7 +17,18 @@ from hpc_bridge.context import AppCtx, SeenPilots, SshLeft
 from hpc_bridge.models import FacilityDetails, ShellOutcome
 from hpc_bridge.profile import Profile
 from tests.fakes import fake_entry, fake_mep_entry
-from tests.test_scheduler_directives import _PBS, _SLURM, EID, UEP_A, _no_login, _refusal, _stub, _uep_app, _uep_log
+from tests.test_scheduler_directives import (
+    _PBS,
+    _SLURM,
+    EID,
+    UEP_A,
+    UEP_B,
+    _no_login,
+    _refusal,
+    _stub,
+    _uep_app,
+    _uep_log,
+)
 from tests.test_scheduler_directives_r3 import _parsl_select_line, _rendered_provider
 
 # --- 1. a Slurm pilot left by a reconnect is named in Slurm's words ----------------------------------------------------
@@ -96,16 +107,26 @@ async def test_thousands_of_user_endpoint_directories_never_read_as_a_rejection(
     assert out.count("HPCB_BREQ ") == 1 and len(out.splitlines()) < 10   # one line per listed pilot's user endpoint
 
 
-async def test_a_lookup_cut_short_only_leaves_the_probe_unable_to_tell(tmp_path, monkeypatch):
-    # however long the listing, a cut drops the lookup (printed first) before any pilot row: the probe falls back to
-    # "cannot tell" (every live pilot may be this block's), never to "no pilot"
-    from hpc_bridge import runner
-
-    env = _stub(tmp_path, f"PENDING 57 Priority /h/.globus_compute/uep.{EID}.{UEP_A}/submit_scripts/a.stdout\n")
+async def test_a_cut_drops_the_lookup_before_any_pilot_row(tmp_path):
+    # round 5, N2: the lookup is printed FIRST, so a cut that keeps exactly as many lines as the rows hold keeps every
+    # row, and the probe falls back to "cannot tell" (every live pilot may be this block's), never to "no pilot". With
+    # the lookup after the rows (117afe2), that cut took HPCB_NOW and pilot 57's row, and read "likely REJECTED". (The
+    # order itself is also pinned by test_the_lookup_reads_the_rotated_copy_and_only_each_logs_first_lines and
+    # test_the_pbs_lookup_reads_the_pilots_own_user_endpoint.)
+    died = f"FAILED|60|1:0|sbatch /h/.globus_compute/uep.{EID}.{UEP_B}/b.sh|1792538300\n"
+    env = _stub(tmp_path, f"PENDING 57 Priority /h/.globus_compute/uep.{EID}.{UEP_A}/submit_scripts/a.stdout\n", died)
     _uep_log(tmp_path, UEP_A, 12)
-    monkeypatch.setattr(runner, "SNIPPET_LINES", 3)        # HPCB_NOW, the row and its HPCB_DIR: the lookup is cut
-    p = await scheduler_ops._probe_pilots_over_login(_uep_app(), EID, 120.0, _cut_runner(env), block=12)
-    assert p is not None and p.category == "queued" and p.subject == "57"
+    _uep_log(tmp_path, UEP_B, 11)
+
+    async def run_login(cmd):
+        r = subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True, check=False)
+        lines = r.stdout.splitlines()
+        rows = [ln for ln in lines if not ln.startswith("HPCB_BREQ ")]
+        assert len(lines) > len(rows) >= 4                 # the cut below takes something, and there are rows to keep
+        return ShellOutcome(phase="complete", exit_code=r.returncode, stdout="\n".join(lines[-len(rows):]) + "\n",
+                            block_state="warm")
+    p = await scheduler_ops._probe_pilots_over_login(_uep_app(), EID, 120.0, run_login, block=12)
+    assert p is not None and p.category == "queued" and p.subject == "57" and "REJECTED" not in p.suffix
 
 
 def test_the_lookup_runs_in_a_subshell_and_never_without_a_block_request():

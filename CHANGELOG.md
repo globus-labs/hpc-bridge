@@ -120,13 +120,16 @@ installed plugin only when that version changes); git tags mark releases.
   endpoint a listed pilot belongs to, and no other: its cost and its output stay flat however many user endpoint
   directories pile up (one per block request, until a teardown), and it prints before the pilot rows, so the worker,
   which keeps a long output's last 2,001 lines, never cuts a pilot row for it (a lookup of every directory had made
-  2,100 of them read as "likely REJECTED"). A Slurm pilot's reason is read whole ("launch failed requeued held" had
-  read as "launch", a queue wait), by a delimiter squeue prints after each field, so a StdOut path with a space or a
-  reason squeue cut at 60 characters stays out of it, and its state by its whole word (REQUEUE_HOLD had read as
-  "RUNNING; the worker is starting"); requeued holds, SPECIAL_EXIT and QOSNotAllowed are said for what they are, an
+  2,100 of them read as "likely REJECTED"). Past the cold-start grace, the log naming this block request is found
+  even when it has no pilot (its submission refused), so an earlier request's pilot is never taken for this block's.
+  A Slurm pilot's reason is read whole ("launch failed requeued held" had read as "launch", a queue wait), by a
+  delimiter squeue prints after each field (an older squeue that refuses it is asked again without one), so a StdOut
+  path with a space or a reason squeue cut at 60 characters stays out of it, and its state by its whole word
+  (REQUEUE_HOLD had read as "RUNNING; the worker is starting"); requeued holds, SPECIAL_EXIT and QOSNotAllowed are said for what they are, an
   exhausted allocation (AssocGrpBillingMinutes and its kin, the commonest wait on ACCESS sites) is named as used up and
   not promised soon, PBS Pro's "Can Never Run" reads as never, and each pilot's state is said in its scheduler's own
-  words, by a reconnect too (a Slurm PENDING is never a "PBS state P"). A stop forgets what a re-bind left only when
+  words, by a reconnect too (a Slurm PENDING is never a "PBS state P"). A pilot that ran and died under a home
+  directory with a space in its path now says why, as any other does. A stop forgets what a re-bind left only when
   its release was confirmed.
 
 ### Testing

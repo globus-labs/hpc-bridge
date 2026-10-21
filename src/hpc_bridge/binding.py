@@ -25,6 +25,7 @@ from .catalog.entry import (
     Defaults,
     SchedulerOptionsError,
     directive_lines,
+    read_as_directive,
     scheduler_options_problem,
     scheduler_terms_directive,
     scheduler_terms_kind,
@@ -333,8 +334,8 @@ def _select_words(line: str, scheduler: str | None) -> str:
     as a line of their own (`select_advice`). On any other scheduler (sbatch translates a #PBS line): an #SBATCH
     directive — select_options is PBS only."""
     adv = select_advice(line)
-    if scheduler != "pbs":
-        gpus = re.search(r"(?:^|:)ngpus=(\d+)", adv.options or "") if adv is not None else None
+    if scheduler != "pbs":  # the GPUs the line names, whatever select_advice makes of it (two chunks, a walltime too)
+        gpus = re.search(r"(?<![\w])ngpus=(\d+)", line, re.I)
         return ("take it out — on Slurm a chunk's resources are #SBATCH directives in scheduler_options, its GPUs "
                 f"`#SBATCH --gres=gpu:{gpus.group(1) if gpus else '<n>'}` (select_options is PBS only)")
     how = ("hpc-bridge writes select=<the block's node count>:ncpus=<cpus_per_node>:<select_options>, so the node "
@@ -404,8 +405,11 @@ def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[
             raise SchedulerOptionsError(f"{why}; hpc-bridge writes select=<the block's node count>:ncpus="
                                         "<cpus_per_node>:<select_options>")
     written, rewrites, other = directive_lines(details.scheduler_options, details.scheduler)
-    if line := scheduler_terms_directive("\n".join(other)):
-        # another batch system's directive that sets a term (sbatch translates `#PBS -A`): that is the reason to give
+    read = [ln for ln in other if read_as_directive(ln, details.scheduler)]
+    if line := scheduler_terms_directive("\n".join(read)):
+        # a refused line the scheduler still reads as a directive, setting a term (sbatch translates `#PBS -A`, reads
+        # `#SLURM`; `#PBS-Ax` on PBS): that is the reason to give. qsub reads `#PBS` alone, so on PBS an `#SBATCH`
+        # line is only not a directive of this scheduler (the reason below).
         raise TermsDirectiveError(_terms_refusal(line, None, details.scheduler))
     if other:
         raise SchedulerOptionsError(scheduler_options_problem(other, details.scheduler))

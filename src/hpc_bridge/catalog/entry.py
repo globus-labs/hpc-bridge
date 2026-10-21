@@ -354,6 +354,14 @@ def select_advice(line: str, nodes: int = 1) -> SelectAdvice | None:
     return SelectAdvice(others or None, int(cpus) if cpus is not None and cpus.isdigit() else None, rest)
 
 
+def read_as_directive(line: str, scheduler: str | None) -> bool:
+    """Whether this scheduler's submit command reads `line` as one of its directives (`_DIRECTIVE`'s words, with or
+    without a space): sbatch reads `#SBATCH` and `#SLURM` and translates `#PBS` and `#BSUB` lines; qsub reads `#PBS`
+    alone — any other directive word is a comment to it."""
+    m = _DIRECTIVE.match(line)
+    return m is not None and (scheduler != "pbs" or m.group(1) == "PBS")
+
+
 def scheduler_terms_kind(line: str) -> str | None:
     """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes"), or None. Any batch
     system's directive word is read (`_DIRECTIVE`), with its own options."""
@@ -497,8 +505,12 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
                             f"the directive {rewrites[0][1][:120]!r}")
         if other:
             problems.append("compute." + scheduler_options_problem(other, compute.get("scheduler")))
-        # the terms check reads the lines as the script would carry them, and the refused ones too (`#SLURM --account`)
-        opts = "\n".join([*([written] if written else []), *other]) or None
+        # the terms check reads the lines as the script would carry them, and the refused ones the scheduler still
+        # reads as directives (`#SLURM --account` on Slurm; an `#SBATCH` line is only a comment to qsub)
+        sched = compute.get("scheduler")
+        opts = "\n".join([*([written] if written else []),
+                          *(ln for ln in other if read_as_directive(ln, sched if isinstance(sched, str) else None))]
+                         ) or None
     for where, o in (("compute.scheduler_options", opts), ("defaults.extra.scheduler_options", extra_opts)):
         if isinstance(o, str) and (line := scheduler_terms_directive(o)):
             what = TERMS_WORDS[scheduler_terms_kind(line) or "account"]
