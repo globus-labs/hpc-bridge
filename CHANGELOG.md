@@ -76,11 +76,18 @@ installed plugin only when that version changes); git tags mark releases.
   node's resources (GPUs, a system type) go in the new `select_options` setting instead of a `-l select=` line, which
   is refused and pointed at it: `select_options="ngpus=4"` makes the block ask for `select=1:ncpus=…:ngpus=4` — parsl's
   own select with the resources appended, so the node count stays the one the spend question named (a registry PBS
-  entry may carry it too; an endpoint configured before it must be torn down and connected again, and the connect
-  says so; a cached `select=1:…` line is offered back as `select_options`). The pilot's own output or error file
-  (`#SBATCH -o/-e`) and a job array (`#SBATCH -a`, `#PBS -J`) are refused too: hpc-bridge finds and cancels its
-  Slurm pilots by the output path parsl writes, so another one made a stop answer "released none" while the pilot
-  held or billed, and an array starts several blocks behind one spend question.
+  entry may carry it too, and the ingest refuses it on a Slurm or a facility endpoint's entry, where nothing renders
+  it; an endpoint configured before it must be torn down and connected again, and the connect says so). The refusal
+  works the line out: `#PBS -l select=1:ncpus=64:ngpus=4` becomes `select_options="ngpus=4"` and `cpus_per_node=64`
+  (with no ncpus it adds that `cpus_per_node` is needed, or parsl's chunk asks for `ncpus=1`), and whatever else the
+  line names stays a line of its own — `#PBS -l select=1:ngpus=4,filesystems=home:eagle` keeps `#PBS -l
+  filesystems=home:eagle`, said in the refusal, so a site hook that holds jobs without it never sees it go. A cached
+  `select=1:…` line is offered back the same way. On Slurm a `#PBS -l select=` line (sbatch translates it) is pointed
+  at an `#SBATCH` directive (`--gres=gpu:4`), never at the PBS-only `select_options`. The pilot's own output file
+  (`#SBATCH -o`), its error file (`#SBATCH -e`) and a job array (`#SBATCH -a`, `#PBS -J`) are refused too: hpc-bridge
+  finds and cancels its Slurm pilots by the output path parsl writes, so another one made a stop answer "released
+  none" while the pilot held or billed; the error file beside it is where hpc-bridge reads why a dead pilot exited;
+  and an array starts several blocks behind one spend question.
 - **What a held pilot leaves behind is said, wherever it is left.** Three answers in that flow misled. (1) A
   `connect_facility(details=…)` that bound the endpoint again said "Nothing is started or billed yet" while a held
   pilot of the session was still queued: a reconnect cancels nothing, and a held pilot never starts on its own, so it
@@ -99,8 +106,8 @@ installed plugin only when that version changes); git tags mark releases.
   (a per-job limit, `PartitionTimeLimit`, an invalid account) is said to never run. A block's pilot leaves that record
   once a worker answers on it, and when the block is found gone. (3) The HELD notice named the first pilot while later
   ones were submitted, and `block_job_id` stayed null. The probe now tells this block request's pilots by their own
-  user endpoint: it reads which user endpoint the request started (the one whose log names the request, from the
-  first 64 KB of each log) and which user endpoint each pilot's own path is in, so the verdict is about this
+  user endpoint: it reads which user endpoint each pilot's own path is in and which block request each of those user
+  endpoints was started for (its log names the request), so the verdict is about this
   request's newest pilot whatever the job numbers, the clocks or another session on the same endpoint; every other
   pilot is named after the verdict, and another user endpoint's dead pilot is no longer this block's FINISHED. So right
   after a fix, the old held pilot no longer reads as the hold persisting, and a laptop that slept through a long queue
@@ -109,12 +116,18 @@ installed plugin only when that version changes); git tags mark releases.
   now the larger of the monotonic and the wall clock's (the monotonic one stops while the machine sleeps).
   `block_job_id` carries the verdict's pilot while the block provisions, and the block's job once it is up. A pilot
   whose own user endpoint was started for another block request is never this block's, even where this request's
-  user endpoint is not found; the lookup reads the first 50 lines of each user endpoint log in one awk process. A
-  Slurm pilot's reason is read whole ("launch failed requeued held" had read as "launch", a queue wait) and its state
-  by its whole word (REQUEUE_HOLD had read as "RUNNING; the worker is starting"); requeued holds, SPECIAL_EXIT and
-  QOSNotAllowed are said for what they are, an exhausted allocation (AssocGrpBillingMinutes and its kin, the commonest
-  wait on ACCESS sites) is named as used up and not promised soon, PBS Pro's "Can Never Run" reads as never, and a PBS
-  pilot's state is said in PBS's words. A stop forgets what a re-bind left only when its release was confirmed.
+  user endpoint is not found. The lookup reads, in one awk process, the first 50 lines of the log of each user
+  endpoint a listed pilot belongs to, and no other: its cost and its output stay flat however many user endpoint
+  directories pile up (one per block request, until a teardown), and it prints before the pilot rows, so the worker,
+  which keeps a long output's last 2,001 lines, never cuts a pilot row for it (a lookup of every directory had made
+  2,100 of them read as "likely REJECTED"). A Slurm pilot's reason is read whole ("launch failed requeued held" had
+  read as "launch", a queue wait), by a delimiter squeue prints after each field, so a StdOut path with a space or a
+  reason squeue cut at 60 characters stays out of it, and its state by its whole word (REQUEUE_HOLD had read as
+  "RUNNING; the worker is starting"); requeued holds, SPECIAL_EXIT and QOSNotAllowed are said for what they are, an
+  exhausted allocation (AssocGrpBillingMinutes and its kin, the commonest wait on ACCESS sites) is named as used up and
+  not promised soon, PBS Pro's "Can Never Run" reads as never, and each pilot's state is said in its scheduler's own
+  words, by a reconnect too (a Slurm PENDING is never a "PBS state P"). A stop forgets what a re-bind left only when
+  its release was confirmed.
 
 ### Testing
 - **`polaris_filesystems` runs under the script operator too**: `HPCB_OPERATOR=script HPCB_TARGET=fake

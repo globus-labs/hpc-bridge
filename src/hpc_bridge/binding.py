@@ -327,21 +327,35 @@ class TermsDirectiveError(SchedulerOptionsError):
     """details= whose scheduler_options set the account or the partition/queue (refused: `_entry_from_details`)."""
 
 
-def _select_words(line: str) -> str:
-    """Where a refused `-l select=…` line's resources go: `select_options` (and its ncpus to `cpus_per_node`), worked
-    out from the line where it holds one chunk of the block's node count."""
-    adv, cpus = select_advice(line)
+def _select_words(line: str, scheduler: str | None) -> str:
+    """Where a refused `-l select=…` line's resources go. On PBS: `select_options` (and its ncpus to `cpus_per_node`),
+    worked out from the line where it holds one chunk of the block's node count, with the line's other resources kept
+    as a line of their own (`select_advice`). On any other scheduler (sbatch translates a #PBS line): an #SBATCH
+    directive — select_options is PBS only."""
+    adv = select_advice(line)
+    if scheduler != "pbs":
+        gpus = re.search(r"(?:^|:)ngpus=(\d+)", adv.options or "") if adv is not None else None
+        return ("take it out — on Slurm a chunk's resources are #SBATCH directives in scheduler_options, its GPUs "
+                f"`#SBATCH --gres=gpu:{gpus.group(1) if gpus else '<n>'}` (select_options is PBS only)")
     how = ("hpc-bridge writes select=<the block's node count>:ncpus=<cpus_per_node>:<select_options>, so the node "
            "count and the spend terms stay its own")
-    if adv is None and cpus is None:
+    if adv is None:
         return f"write the resources after the chunk as select_options='ngpus=4' (for instance; {how})"
-    said = " and ".join(([f"select_options={adv!r}"] if adv else []) + ([f"cpus_per_node={cpus}"] if cpus else []))
-    return f"write it as {said} ({how})"
+    said = " and ".join(([f"select_options={adv.options!r}"] if adv.options else [])
+                        + ([f"cpus_per_node={adv.cpus}"] if adv.cpus else []))
+    out = f"write it as {said}" if said else "take the select out"
+    if adv.cpus is None:
+        out += (", with cpus_per_node=<the cores per node> if it is not set (without it parsl's chunk asks for "
+                "ncpus=1)")
+    if adv.rest:
+        out += f", and keep the line's other resources as {adv.rest[:120]!r} in scheduler_options"
+    return f"{out} ({how})"
 
 
-def _terms_refusal(line: str, was: str | None) -> str:
+def _terms_refusal(line: str, was: str | None, scheduler: str | None = None) -> str:
     """Why a written scheduler_options line that sets one of the block's terms (or hpc-bridge's own hold on its pilot)
-    is refused, and where it goes instead. Each echoed line is cut to 120 characters."""
+    is refused, and where it goes instead (`scheduler`: the facility's, for where a select's resources go). Each echoed
+    line is cut to 120 characters."""
     kind = scheduler_terms_kind(line) or "account"
     head = (f"scheduler_options sets {TERMS_WORDS[kind]} ({line[:120]!r}"
             + (f", as hpc-bridge writes {was[:120]!r}" if was else ""))
@@ -349,14 +363,21 @@ def _terms_refusal(line: str, was: str | None) -> str:
         return (head + "; #SBATCH -A/--account/-p/--partition, #PBS -A/-q): take it out — give the partition as "
                 "details' `partition` and the account to ensure_endpoint_up(account=…), so the spend question names "
                 "what the block charges")
+    if kind == "select" and scheduler != "pbs":
+        return (head + "): sbatch reads a #PBS line as its own, and a select there would size the block behind "
+                f"hpc-bridge's node count — {_select_words(line, scheduler)}")
     if kind == "select":
         return (head + "): parsl writes the block's own select=<nodes>:ncpus=… before scheduler_options, and a second "
-                f"select would replace it — {_select_words(line)}")
+                f"select would replace it — {_select_words(line, scheduler)}")
     if kind == "output":
-        return (head + "; #SBATCH -o/--output/-e/--error): take it out — parsl writes the pilot's own files in its "
-                "user endpoint's directory, the path hpc-bridge finds and cancels the pilot by (squeue's StdOut) and "
-                "reads a dead pilot's stderr from: with another, stop_endpoint could not cancel the pilot, and the "
-                "probe would read it as missing")
+        return (head + "; #SBATCH -o/--output): take it out — parsl writes the pilot's output in its user endpoint's "
+                "directory, the path squeue's StdOut shows and hpc-bridge finds and cancels the pilot by: with "
+                "another, stop_endpoint could not cancel the pilot, and the probe would read it as missing")
+    if kind == "error":
+        return (head + "; #SBATCH -e/--error): take it out — parsl writes the pilot's error file beside its script in "
+                "its user endpoint's directory, where hpc-bridge reads why a pilot that died exited (its own "
+                "`hpc-bridge: …` line): with another, such a pilot is reported without that reason. (hpc-bridge has "
+                "no setting that moves that directory.)")
     if kind == "array":
         return (head + "; #SBATCH -a/--array, #PBS -J): take it out — an array starts several blocks behind one spend "
                 "question")
@@ -385,13 +406,13 @@ def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[
     written, rewrites, other = directive_lines(details.scheduler_options, details.scheduler)
     if line := scheduler_terms_directive("\n".join(other)):
         # another batch system's directive that sets a term (sbatch translates `#PBS -A`): that is the reason to give
-        raise TermsDirectiveError(_terms_refusal(line, None))
+        raise TermsDirectiveError(_terms_refusal(line, None, details.scheduler))
     if other:
         raise SchedulerOptionsError(scheduler_options_problem(other, details.scheduler))
     if line := scheduler_terms_directive(written):
         # it would charge an account, pick a queue or size the block behind the terms the user confirmed
         was = next((g for g, w in rewrites if w.strip() == line), None)
-        raise TermsDirectiveError(_terms_refusal(line, was))
+        raise TermsDirectiveError(_terms_refusal(line, was, details.scheduler))
     if written != details.scheduler_options:
         details = details.model_copy(update={"scheduler_options": written})
     return details, rewrites
@@ -401,8 +422,9 @@ def _accepted_details(details: FacilityDetails) -> tuple[FacilityDetails, list[s
     """`details` with every scheduler_options line `_directive_details` would refuse left out (the rest as written), and
     why each was left out — for a configuration cached before such lines were refused, offered back as a proposal for
     the user to confirm (connect) rather than a dead end that re-reads the same record. A one-chunk `-l select=<n>:…`
-    line of the block's node count is offered as what it means now: its resources as `select_options`, its ncpus as
-    `cpus_per_node` (where those are not set already)."""
+    line of the block's node count (on PBS) is offered as what it means now: its resources as `select_options`, its
+    ncpus as `cpus_per_node` (where those are not set already), and whatever else the line names kept as a line of its
+    own (`select_advice`), so nothing beside the select is lost."""
     kept: list[str] = []
     dropped: list[str] = []
     update: dict = {}
@@ -412,24 +434,30 @@ def _accepted_details(details: FacilityDetails) -> tuple[FacilityDetails, list[s
             dropped.append(f"{other[0][:120]!r} (not a directive of this scheduler)")
         elif written and (line := scheduler_terms_directive(written)):
             kind = scheduler_terms_kind(line) or "account"
-            adv, cpus = select_advice(line) if kind == "select" else (None, None)
-            if kind == "select" and (adv or cpus):
+            adv = select_advice(line) if kind == "select" and details.scheduler == "pbs" else None
+            if adv is not None:
                 offered = []
-                if adv and details.select_options is None and "select_options" not in update:
-                    update["select_options"] = adv
-                    offered.append(f"select_options={adv!r}")
-                if cpus and details.cpus_per_node is None:
-                    update["cpus_per_node"] = cpus
-                    offered.append(f"cpus_per_node={cpus}")
+                if adv.options and details.select_options is None and "select_options" not in update:
+                    update["select_options"] = adv.options
+                    offered.append(f"select_options={adv.options!r}")
+                if adv.cpus and details.cpus_per_node is None and "cpus_per_node" not in update:
+                    update["cpus_per_node"] = adv.cpus
+                    offered.append(f"cpus_per_node={adv.cpus}")
                 where = ("its resources are offered as " + " and ".join(offered) if offered else
                          "a select of its own: its resources go in select_options")
+                if adv.rest:
+                    kept.append(adv.rest)
+                    where += f", and the line's other resources are kept as {adv.rest[:120]!r}"
             elif kind in ("account", "queue"):
                 where = "give those as `partition` and ensure_endpoint_up(account=…)"
             elif kind in ("walltime", "nodes", "select"):
                 where = "the walltime is `walltime`, the size hpc-bridge's"
+            elif kind == "output":
+                where = "hpc-bridge finds and cancels its pilots by their own output file"
+            elif kind == "error":
+                where = "hpc-bridge reads why a pilot died from its own error file"
             else:
-                where = "hpc-bridge finds and cancels its pilots by their own files" if kind == "output" else (
-                    "it would start several blocks")
+                where = "it would start several blocks"
             dropped.append(f"{line[:120]!r} (it sets {TERMS_WORDS[kind]}: {where})")
         elif written:
             kept.append(written)

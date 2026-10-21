@@ -359,8 +359,9 @@ def _directive_note(rewrites: list[tuple[str, str]]) -> str:
 
 
 def _pilot_rows_of(pilots: SeenPilots) -> list[list[str]]:
-    """Recorded pilots as the probe's rows (state, job, -, reason), for scheduler_ops._pilot_fates' words."""
-    return [[state, job, "-", reason] for job, state, reason in pilots.jobs]
+    """Recorded pilots as the probe's rows (the state as the scheduler listed it, job, -, reason), for
+    scheduler_ops._pilot_fates' words — Slurm's PENDING named as Slurm's, never read as a PBS letter."""
+    return [[word, job, "-", reason] for job, _state, reason, word in pilots.jobs]
 
 
 def _pilots_left_words(pilots: SeenPilots) -> list[str]:

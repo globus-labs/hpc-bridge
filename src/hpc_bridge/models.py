@@ -243,7 +243,8 @@ class FacilityDetails(BaseModel):
         "and the spend terms stay hpc-bridge's. name=value pairs joined by ':', e.g. 'ngpus=4' or "
         "'system=polaris:ngpus=4'; never a chunk count, a second chunk ('+'), select=, ncpus (that is "
         "cpus_per_node), the walltime, the node count, the account or the queue. Omit if none. A '-l select=…' line "
-        "in scheduler_options is refused: its resources go here.",
+        "in scheduler_options is refused: its resources go here (set cpus_per_node too: without it the chunk asks for "
+        "ncpus=1).",
         examples=["ngpus=4", "system=polaris"],
     )
     scheduler_options: str | None = Field(
@@ -257,8 +258,10 @@ class FacilityDetails(BaseModel):
         "no space after it, is not read as you mean). Never the account, partition/queue, walltime or node count "
         "(#SBATCH -A/-p/-t/-N, #PBS -A/-q/-l walltime=/select=, bare or prefixed): those are "
         "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them — a PBS "
-        "chunk's resources (ngpus=4) go in `select_options`. Never the pilot's output or error file (#SBATCH -o/-e: "
-        "hpc-bridge finds and cancels its pilots by parsl's own) or an array (#SBATCH -a, #PBS -J).",
+        "chunk's resources (ngpus=4) go in `select_options`, the line's other resources (filesystems=…) on a line of "
+        "their own; on Slurm a GPU is '#SBATCH --gres=gpu:4'. Never the pilot's output file (#SBATCH -o: hpc-bridge "
+        "finds and cancels its pilots by parsl's own) or error file (#SBATCH -e: where it reads why a pilot died), or "
+        "an array (#SBATCH -a, #PBS -J).",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")

@@ -68,11 +68,13 @@ told how it was written. A line that is not this scheduler's directive (a shell 
 `#SLURM`, `#PBS` or `#BSUB` line) is refused, and the block's terms are never set there — the account, the queue, the
 walltime and the node count: you name the account and the queue when the agent asks before the first block, and the
 walltime is part of the configuration. Neither are the pilot job's output or error files (hpc-bridge finds and cancels
-its pilots by the ones parsl writes) or a job array. On PBS, resources for each node of the block — GPUs, a system
+its pilots by the output file parsl writes, and reads why one died from the error file beside it) or a job array. On PBS, resources for each node of the block — GPUs, a system
 type — go in the configuration's `select_options` instead of a `-l select=` line: `select_options="ngpus=4"` makes the
 block ask for `select=1:ncpus=…:ngpus=4`, so the node count stays the one the agent named when it asked you to confirm
-the spend (an endpoint configured before this setting existed must be torn down and connected again to use it; the
-connect says so). A job the site holds stays in its queue until it is cancelled: reconnecting with a corrected
+the spend (set `cpus_per_node` too, or the chunk asks for one core; an endpoint configured before this setting existed
+must be torn down and connected again to use it; the connect says so). Anything else a select line named, such as
+`filesystems=home:eagle`, stays a `#PBS -l …` line of its own. On Slurm a node's GPUs are an `#SBATCH --gres=gpu:4`
+line instead. A job the site holds stays in its queue until it is cancelled: reconnecting with a corrected
 configuration does not cancel it, and stopping the endpoint does.
 
 To make a cluster available to everyone, add it to the registry: see

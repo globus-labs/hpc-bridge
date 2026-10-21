@@ -133,41 +133,42 @@ class ShapeRuntime:
 @dataclass(frozen=True)
 class SeenPilots:
     """Pilot jobs a provisioning probe listed LIVE for this endpoint (queued, held or running in the scheduler), oldest
-    first by job number, as (job, state, reason), and when it looked (time.monotonic()). The state is
+    first by job number, as (job, state, reason, word), and when it looked (time.monotonic()). The state is
     scheduler_ops._pilot_state's: H — held (PBS state H, a Slurm JobHeld* reason): it never starts until released; N —
     it will not start as submitted (a per-job limit, an invalid account …: the reason says which); R — running; any
-    other letter (PBS Q/W…, Slurm's PENDING) — waiting, which may start later, a limit or an outage included. A probe
-    lists every pilot of the endpoint (its `uep.<eid>` marker): an earlier block request's, left by a switch or a
-    reconnect, or another session's, is listed beside the current one."""
+    other letter (PBS Q/W…, Slurm's PENDING) — waiting, which may start later, a limit or an outage included. The word
+    is the state as the scheduler listed it (Slurm's PENDING, PBS's Q), for a notice to name it in that scheduler's
+    words. A probe lists every pilot of the endpoint (its `uep.<eid>` marker): an earlier block request's, left by a
+    switch or a reconnect, or another session's, is listed beside the current one."""
 
-    jobs: tuple[tuple[str, str, str], ...]
+    jobs: tuple[tuple[str, str, str, str], ...]
     at: float
     subject: str | None = None  # the pilot the probe's verdict was about (its block request's newest), if listed
 
     @property
     def subject_state(self) -> str | None:
-        return next((s for j, s, _r in self.jobs if j == self.subject), None)
+        return next((p[1] for p in self.jobs if p[0] == self.subject), None)
 
     def reason(self, job: str) -> str:
-        return next((r for j, _s, r in self.jobs if j == job), "")
+        return next((p[2] for p in self.jobs if p[0] == job), "")
 
     @property
     def held(self) -> tuple[str, ...]:
-        return tuple(j for j, s, _r in self.jobs if s == "H")
+        return tuple(p[0] for p in self.jobs if p[1] == "H")
 
     @property
     def never(self) -> tuple[str, ...]:
         """Will not start as submitted: never runs, never idle-releases, until cancelled."""
-        return tuple(j for j, s, _r in self.jobs if s == "N")
+        return tuple(p[0] for p in self.jobs if p[1] == "N")
 
     @property
     def waiting(self) -> tuple[str, ...]:
         """Not running, held or refused as submitted: a pilot that may still start."""
-        return tuple(j for j, s, _r in self.jobs if s not in ("H", "N", "R"))
+        return tuple(p[0] for p in self.jobs if p[1] not in ("H", "N", "R"))
 
     @property
     def running(self) -> tuple[str, ...]:
-        return tuple(j for j, s, _r in self.jobs if s == "R")
+        return tuple(p[0] for p in self.jobs if p[1] == "R")
 
     def without(self, jobs: Collection[str | None]) -> SeenPilots | None:
         """These pilots less `jobs` (a block's own, once it came up or is gone); None when none is left."""

@@ -224,16 +224,23 @@ def test_pbs_words_for_pbs_rows():
 
 
 @pytest.mark.parametrize(("base", "opts", "kind"), [
-    (_SLURM, "--output=/scratch/u/%x-%j.out", "the pilot's output or error file"),
-    (_SLURM, "-o /scratch/u/x.out", "the pilot's output or error file"),
-    (_SLURM, "--error=/scratch/u/x.err", "the pilot's output or error file"),
-    (_SLURM, "-e x.err", "the pilot's output or error file"), (_SLURM, "--out=x", "the pilot's output or error file"),
+    (_SLURM, "--output=/scratch/u/%x-%j.out", "the pilot's output file"),
+    (_SLURM, "-o /scratch/u/x.out", "the pilot's output file"),
+    (_SLURM, "--error=/scratch/u/x.err", "the pilot's error file"),
+    (_SLURM, "-e x.err", "the pilot's error file"), (_SLURM, "--out=x", "the pilot's output file"),
+    (_SLURM, "--err=x", "the pilot's error file"), (_SLURM, "-vo x", "the pilot's output file"),
     (_SLURM, "--array=0-9", "a job array"), (_SLURM, "-a 0-9", "a job array"), (_PBS, "-J 0-9", "a job array"),
 ])
 def test_the_pilots_files_and_an_array_are_refused(base, opts, kind):
     msg = _refusal(opts, base)
     assert f"sets {kind}" in msg
-    assert ("stop_endpoint could not cancel the pilot" in msg) if "file" in kind else ("several blocks" in msg)
+    if "output" in kind:   # the release and the probe find the pilot by its StdOut (squeue), the output file only
+        assert "stop_endpoint could not cancel the pilot" in msg
+    elif "error" in kind:  # round 4 #5: the error file is where a dead pilot's reason is read, nothing more
+        assert "stop_endpoint could not cancel" not in msg and "reported without that reason" in msg
+        assert "no setting that moves that directory" in msg and "GLOBUS_COMPUTE_USER_DIR" not in msg
+    else:
+        assert "several blocks" in msg
 
 
 @pytest.mark.parametrize("opts", ["#PBS -o /scratch/u/out.log", "#PBS -e /scratch/u/err.log", "#SBATCH --open-mode=append",
@@ -299,7 +306,7 @@ async def test_a_cut_user_endpoint_id_never_makes_this_requests_pilot_another_on
 
 
 def _left() -> SshLeft:
-    return SshLeft(up=False, pilots=SeenPilots(jobs=(("0.pbsserver", "H", "x"),), at=time.monotonic(), subject=None))
+    return SshLeft(up=False, pilots=SeenPilots(jobs=(("0.pbsserver", "H", "x", "H"),), at=time.monotonic(), subject=None))
 
 
 async def test_an_unconfirmed_stop_keeps_naming_the_held_pilot_and_a_confirmed_one_forgets_it(monkeypatch):

@@ -799,7 +799,7 @@ def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoc
         _note_dead_pilot(rt, job, exit_status, jobs)
 
 def _record_pilots(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
-                   live: tuple[tuple[str, str, str], ...], subject: str | None) -> None:
+                   live: tuple[tuple[str, str, str, str], ...], subject: str | None) -> None:
     """The provisioning probe's live pilots (scheduler_ops.PilotProbe.live, and the one its verdict is about),
     recorded on the runtime and terms it was for — as `_record_dead_pilot` guards it — so a switch (`_repoint`) or a
     reconnect (`_ssh_left`) can say what is still queued or held. Callers hold app.lock."""

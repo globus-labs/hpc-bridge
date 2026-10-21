@@ -41,6 +41,7 @@ _COMMENT = ("HELD by the site: every job must request the filesystems it uses, e
             "directive, then qrls the job or submit again)")
 EID = "11111111-2222-3333-4444-555555555555"
 UEP_A, UEP_B = "aaaaaaaa-0000-0000-0000-00000000000a", "bbbbbbbb-0000-0000-0000-00000000000b"
+UEP_C = "cccccccc-0000-0000-0000-00000000000c"
 
 
 def _written(opts, base=_PBS):
@@ -459,19 +460,25 @@ async def test_this_requests_pilot_is_told_by_its_own_user_endpoint_not_by_its_j
     assert probe is not None and probe.subject == "57" and probe.category == "queued"
     assert probe.suffix.startswith("— pilot 57 is queued") and "pilot 61, held" in probe.suffix
     assert probe.dead is None and probe.died == ()  # the other user endpoint's dead pilot is not this block's
-    assert probe.live == (("57", "P", "Priority"), ("61", "H", "JobHeldUser"))
+    assert probe.live == (("57", "P", "Priority", "PENDING"), ("61", "H", "JobHeldUser", "PENDING"))
 
 
 async def test_the_lookup_reads_the_rotated_copy_and_only_each_logs_first_lines(tmp_path):
     # review r3 #7: one awk process, the first 50 lines of each log (getline: POSIX, no `nextfile`), whatever piles up
-    env = _stub(tmp_path, f"RUNNING 9 None /x/uep.{EID}.{UEP_A}/s.stdout\n")
+    died = f"FAILED|60|1:0|sbatch /x/uep.{EID}.{UEP_B}/b.sh|1792538300\n"
+    env = _stub(tmp_path, f"RUNNING 9 None /x/uep.{EID}.{UEP_A}/s.stdout\n", died)
     _uep_log(tmp_path, UEP_A, 7, name="endpoint.log.1")
     log = tmp_path / ".globus_compute" / f"uep.{EID}.{UEP_A}" / "endpoint.log"
     log.write_text("filler\n" * 60 + "running endpoint_setup command: true hpcb_block=8\n")  # past line 50: not read
     _uep_log(tmp_path, UEP_B, 123)
+    _uep_log(tmp_path, UEP_C, 5)                          # no pilot of it listed: never read (round 4, #2)
     cmd = scheduler_ops._pilot_status_cmd("slurm", EID, request=7)
     out = subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True).stdout
     assert f"HPCB_BREQ {UEP_A} 7\n" in out and f"HPCB_BREQ {UEP_B} 123\n" in out and " 8\n" not in out
+    assert UEP_C not in out
+    # the lookup comes BEFORE the rows (a cut keeps the LAST lines), a finished pilot's user endpoint before a live one's
+    lines = out.split("\n")
+    assert lines.index(f"HPCB_BREQ {UEP_B} 123") < lines.index(f"HPCB_BREQ {UEP_A} 7") < lines.index("RUNNING 9 - None")
     assert cmd.count("awk") == 3 and "head" not in cmd     # rows (squeue, sacct) and the lookup: no process per log
 
 
@@ -536,7 +543,7 @@ async def test_a_limit_on_another_pilot_is_named_as_waiting_not_held():
     out = (f"HPCB_NOW 1\nPENDING 41 - QOSMaxJobsPerUserLimit\nHPCB_DIR 41 {UEP_B}\nPENDING 57 - Priority\n"
            f"HPCB_DIR 57 {UEP_A}\nHPCB_BREQ {UEP_A} 12\n")
     p = await _probe_of(out, app=_uep_app(), elapsed=30.0, block=12)
-    assert p is not None and p.subject == "57" and p.live[0] == ("41", "P", "QOSMaxJobsPerUserLimit")
+    assert p is not None and p.subject == "57" and p.live[0] == ("41", "P", "QOSMaxJobsPerUserLimit", "PENDING")
     assert "pilot 41 (PENDING, reason 'QOSMaxJobsPerUserLimit')" in p.suffix and "held" not in p.suffix
 
 
@@ -547,7 +554,7 @@ async def test_ensure_names_the_held_pilot_in_block_job_id(monkeypatch):
     assert first.status == "provisioning" and "pilot 0.pbsserver is HELD" in first.notice
     assert first.block_job_id == "0.pbsserver"
     rt = app.shapes["compute"]
-    assert rt.pilots is not None and rt.pilots.jobs == (("0.pbsserver", "H", _COMMENT[:120]),)
+    assert rt.pilots is not None and rt.pilots.jobs == (("0.pbsserver", "H", _COMMENT[:120], "H"),)
     assert rt.pilots.subject == "0.pbsserver" and rt.confirmed_wall is not None
 
 
@@ -557,14 +564,15 @@ async def test_ensure_names_the_held_pilot_in_block_job_id(monkeypatch):
 def test_a_reaped_blocks_pilot_is_not_named_by_a_reconnect():
     # review P3 (repro_reap): the last provisioning probe saw job 100 running; it came up, then was reaped
     rt = ShapeRuntime(user_endpoint_config={"provider_type": "SlurmProvider", "compute": True})
-    rt.pilots = SeenPilots(jobs=(("100", "R", "None"), ("88", "H", "x")), at=time.monotonic() - 3600, subject="100")
+    rt.pilots = SeenPilots(jobs=(("100", "R", "None", "RUNNING"), ("88", "H", "x", "H")), at=time.monotonic() - 3600,
+                       subject="100")
     rt.spend_confirmed, rt.block_since, rt.block_job = True, time.monotonic() - 3000, "100"
     up = warmth._ssh_left(rt)
-    assert up is not None and up.up and up.pilots is not None and [j for j, _s, _r in up.pilots.jobs] == ["88"]
+    assert up is not None and up.up and up.pilots is not None and [p[0] for p in up.pilots.jobs] == ["88"]
     app = AppCtx(facility=SimpleNamespace(supported_shapes=("login", "compute")), profile=Profile())
     warmth._mark_reaped(app, rt, "job 100 gone (scancel)", None)
     left = warmth._ssh_left(rt)
-    assert left is not None and not left.up and [j for j, _s, _r in left.pilots.jobs] == ["88"]
+    assert left is not None and not left.up and [p[0] for p in left.pilots.jobs] == ["88"]
     note = _ssh_left_note(app, "eid", same=True, queued=0, left=left)
     assert "100" not in note and "pilot 88, held" in note
 
@@ -578,7 +586,7 @@ async def test_a_worker_answering_takes_its_pilot_out_of_the_record(monkeypatch)
     rt.runner._canary = CanaryResult(ok=True, worker_host="c1", worker_python="3.11", worker_dill="0.3.9",
                                      worker_job="5.pbsserver")
     assert (await _ensure_endpoint_up(app)).status == "up"
-    assert rt.pilots is not None and [j for j, _s, _r in rt.pilots.jobs] == ["2.pbsserver"]
+    assert rt.pilots is not None and [p[0] for p in rt.pilots.jobs] == ["2.pbsserver"]
     assert rt.pilots.subject is None
 
 
@@ -629,10 +637,10 @@ async def test_a_switch_away_from_a_held_pilot_does_not_promise_an_idle_release(
 def test_a_switch_away_from_a_pilot_refused_as_submitted_says_it_never_runs():
     from hpc_bridge.notices import _ssh_block_fate
     app = AppCtx(facility=SimpleNamespace(supported_shapes=("login", "compute")), profile=Profile())
-    seen = SeenPilots(jobs=(("7", "N", "PartitionTimeLimit"),), at=time.monotonic() - 5, subject="7")
+    seen = SeenPilots(jobs=(("7", "N", "PartitionTimeLimit", "PENDING"),), at=time.monotonic() - 5, subject="7")
     fate, stays = _ssh_block_fate(app, False, seen)
     assert stays and "will not start as submitted" in fate and "'PartitionTimeLimit'" in fate and "never runs" in fate
-    waiting = SeenPilots(jobs=(("8", "P", "QOSMaxJobsPerUserLimit"),), at=time.monotonic() - 5, subject="8")
+    waiting = SeenPilots(jobs=(("8", "P", "QOSMaxJobsPerUserLimit", "PENDING"),), at=time.monotonic() - 5, subject="8")
     fate, stays = _ssh_block_fate(app, False, waiting)
     assert not stays and "may clear" in fate and "idle-releases" in fate
     assert "never runs" not in fate and "never starts" not in fate and "never idle-releases" not in fate

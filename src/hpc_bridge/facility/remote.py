@@ -1231,8 +1231,10 @@ class SlurmFacility:
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
             return
         self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
-        if (self.profile.select_options and self.profile.scheduler == "pbs"
-                and not takes_select_options(md.get("user_config_template"))):
+        tmpl = md.get("user_config_template")
+        # only a template READ says what it renders: metadata without one says nothing about select_options
+        if (self.profile.select_options and self.profile.scheduler == "pbs" and isinstance(tmpl, str) and tmpl.strip()
+                and not takes_select_options(tmpl)):
             self.select_note = (
                 f"this endpoint was configured before hpc-bridge wrote select_options into its template, so its blocks "
                 f"ask for select=<nodes>:ncpus=… without {self.profile.select_options[:60]!r}: teardown_endpoint, then "

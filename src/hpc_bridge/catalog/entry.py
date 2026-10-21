@@ -7,7 +7,7 @@ import json
 import re
 import unicodedata
 import uuid
-from typing import Any, Literal
+from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
@@ -180,21 +180,23 @@ _DIRECTIVE = re.compile(r"\s*#(SBATCH|SLURM|PBS|BSUB)(.*)")
 # What a directive the block's terms (or hpc-bridge's own hold on its pilots) cannot take sets, in a refusal's words.
 TERMS_WORDS = {"account": "the account or the partition/queue", "queue": "the account or the partition/queue",
                "walltime": "the walltime or the node count", "nodes": "the walltime or the node count",
-               "select": "the node count (a select)", "output": "the pilot's output or error file",
-               "array": "a job array"}
-# Slurm short options for those, and their kinds: -o/-e (the files: parsl writes its own in the pilot's user endpoint
-# directory, the path hpc-bridge's probe and stop find the pilot by) and -a (an array: several blocks behind one
-# spend question) besides the terms.
-_SLURM_SHORT = {"A": "account", "p": "queue", "N": "nodes", "t": "walltime", "o": "output", "e": "output",
+               "select": "the node count (a select)", "output": "the pilot's output file",
+               "error": "the pilot's error file", "array": "a job array"}
+# Slurm short options for those, and their kinds: -o (the output file: parsl writes its own in the pilot's user
+# endpoint directory, the path squeue's StdOut shows, which hpc-bridge's probe and stop find the pilot by), -e (the
+# error file, beside it: where the probe reads why a pilot died) and -a (an array: several blocks behind one spend
+# question) besides the terms.
+_SLURM_SHORT = {"A": "account", "p": "queue", "N": "nodes", "t": "walltime", "o": "output", "e": "error",
                 "a": "array"}
 
 
 def _slurm_terms(toks: list[str]) -> str | None:
     """Slurm's options for the block's terms: -A/--account and -p/--partition (long options by any prefix sbatch
     accepts: --acco…, --part…; short ones bundled too, "-vA x"; its -q is the QOS), the size parsl writes before
-    scheduler_options and a later directive overrides (-N/--nodes, -t/--time), the pilot's files (-o/--output,
-    -e/--error: parsl's own carry the `uep.<eid>` marker squeue's StdOut shows — the stop cancels by it, the probe finds
-    the pilot by it, and reads a dead pilot's own stderr there) and an array (-a/--array: several blocks)."""
+    scheduler_options and a later directive overrides (-N/--nodes, -t/--time), the pilot's files (-o/--output: parsl's
+    own carries the `uep.<eid>` marker squeue's StdOut shows — the stop cancels by it, the probe finds the pilot by it;
+    -e/--error: parsl's own, beside it, is where the probe reads why a dead pilot exited) and an array (-a/--array:
+    several blocks)."""
     for tok in toks:
         if m := re.match(r"--(acco|part)[a-z-]*(?:=|$)", tok):
             return "account" if m.group(1) == "acco" else "queue"
@@ -202,8 +204,10 @@ def _slurm_terms(toks: list[str]) -> str | None:
             return "nodes"
         if re.match(r"--time(?:=|$)", tok):
             return "walltime"
-        if re.match(r"--(?:ou|er)[a-z]*(?:=|$)", tok):
+        if re.match(r"--ou[a-z]*(?:=|$)", tok):
             return "output"
+        if re.match(r"--er[a-z]*(?:=|$)", tok):
+            return "error"
         if re.match(r"--ar[a-z]*(?:=|$)", tok):
             return "array"
         if re.match(r"-[^-]", tok):
@@ -297,26 +301,59 @@ def select_options_problem(opts: str | None) -> str | None:
     return None
 
 
-def select_advice(line: str, nodes: int = 1) -> tuple[str | None, int | None]:
-    """For a PBS directive line with a one-chunk `-l select=<n>:…` (n the block's nodes): the chunk's other resources
-    as `select_options` and its ncpus as `cpus_per_node` — what a refused select line becomes — else (None, None)."""
+class SelectAdvice(NamedTuple):
+    """What a refused one-chunk `-l select=<n>:…` line becomes (`select_advice`): the chunk's other resources as
+    `select_options`, its ncpus as `cpus_per_node`, and the line's OTHER resources and options (`-l filesystems=…`
+    beside the select, or another `-l` list) as a directive line of their own — None for each that the line has not."""
+
+    options: str | None
+    cpus: int | None
+    rest: str | None
+
+
+def select_advice(line: str, nodes: int = 1) -> SelectAdvice | None:
+    """For a PBS directive line with a one-chunk `-l select=<n>:…` (n the block's nodes) whose chunk resources are
+    `select_options`' own: what it becomes (`SelectAdvice`) — the select taken out of its `-l` list, and whatever else
+    the line names kept as `#PBS <the rest>`, so nothing beside the select (a Polaris `filesystems=`) is lost. None
+    where it is no such line, or where the rest sets one of the block's terms too (a second select, a walltime)."""
     m = _DIRECTIVE.match(line)
     if m is None or m.group(1) != "PBS":
-        return None, None
-    for listed in _pbs_l_lists(m.group(2).split()):
-        value = _pbs_select(listed)
-        if value is None:
+        return None
+    toks = m.group(2).split()
+    value: str | None = None
+    kept: list[str] = []
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if not tok.startswith("-l"):
+            kept.append(tok)
+            i += 1
             continue
-        count, _sep, rest = value.partition(":")
-        if not count.isdigit() or int(count) != nodes or "+" in rest:
-            return None, None
-        parts = [p for p in rest.split(":") if p]
-        cpus = next((p.split("=", 1)[1] for p in parts if p.lower().startswith("ncpus=")), None)
-        others = ":".join(p for p in parts if not p.lower().startswith("ncpus="))
-        if others and select_options_problem(others) is not None:
-            return None, None
-        return others or None, int(cpus) if cpus is not None and cpus.isdigit() else None
-    return None, None
+        listed = tok[2:] or (toks[i + 1] if i + 1 < len(toks) else "")
+        i += 1 if tok[2:] else 2
+        items = listed.split(",")
+        at = next((k for k, it in enumerate(items) if it.partition("=")[0].strip().lower() == "select"), None)
+        if at is not None and value is None:
+            value = items[at].partition("=")[2].strip()
+            items = items[:at] + items[at + 1:]
+        if items := [it for it in items if it.strip()]:
+            kept += ["-l", ",".join(items)]
+    if value is None:
+        return None
+    count, _sep, chunk = value.partition(":")
+    if not count.isdigit() or int(count) != nodes or "+" in chunk:
+        return None
+    parts = [p for p in chunk.split(":") if p]
+    cpus = next((p.split("=", 1)[1] for p in parts if p.lower().startswith("ncpus=")), None)
+    others = ":".join(p for p in parts if not p.lower().startswith("ncpus="))
+    if others and select_options_problem(others) is not None:
+        return None
+    rest = "#PBS " + " ".join(kept) if kept else None
+    if rest is not None and scheduler_terms_kind(rest) is not None:
+        return None
+    return SelectAdvice(others or None, int(cpus) if cpus is not None and cpus.isdigit() else None, rest)
+
+
 def scheduler_terms_kind(line: str) -> str | None:
     """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes"), or None. Any batch
     system's directive word is read (`_DIRECTIVE`), with its own options."""
@@ -444,6 +481,11 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
     sel = (row.get("defaults") or {}).get("select_options") if isinstance(row.get("defaults"), dict) else None
     if sel is not None and (why := select_options_problem(str(sel))):  # the client drops it on read: never publish it
         problems.append(f"defaults.{why}")
+    elif sel is not None and (compute.get("scheduler") != "pbs" or row.get("compute_mep_uuid")):
+        # only hpc-bridge's own PBS template renders it: anywhere else it would be published only to be ignored
+        problems.append("defaults.select_options is for an SSH entry on PBS (hpc-bridge's own PBS template writes it "
+                        "into the block's select): a Slurm entry's resources are #SBATCH lines in "
+                        "compute.scheduler_options, and a facility endpoint's template is its own")
     extra_opts = extra.get("scheduler_options") if isinstance(extra, dict) else None
     opts = compute.get("scheduler_options")
     if isinstance(opts, str) and not row.get("compute_mep_uuid"):
