@@ -328,7 +328,8 @@ def test_first_bring_up_skips_a_result_with_no_phase():
 def _product_connect_refusals(monkeypatch) -> list[tuple[dict, dict]]:
     """(input, answer) for each connect_facility the SERVER refuses before any SSH (connect._connect_facility):
     details= without env_setup, with no proposal for the facility and with a proposal for another host; and a plain
-    connect whose cached config is no longer accepted (a scheduler_options line that sets the account). Driven through
+    connect whose cached config is no longer accepted as it is (a scheduler_options line that sets the account; since
+    #221 it is offered back as a proposal, so it comes last). Driven through
     the real code, so the grader's match follows its wording."""
     import asyncio
 
@@ -378,9 +379,16 @@ def test_first_bring_up_skips_a_connect_that_refused_its_own_details(monkeypatch
     first_details_connect_succeeds failed the run on the refusal."""
     from invariants import first_bring_up_had_details, first_details_connect_succeeds, no_op_answer
     det = {"facility": "f", "ssh_host": "login", "details": {"ssh_host": "login"}}
-    refusals = _product_connect_refusals(monkeypatch)
-    assert [r["notice"][:30] for _, r in refusals] == ["details= has no env_setup and ", "details= has no env_setup, and",
-                                                       "the configuration cached for '"]
+    *refusals, (cached_inp, cached) = _product_connect_refusals(monkeypatch)
+    assert [r["notice"][:30] for _, r in refusals] == ["details= has no env_setup and ", "details= has no env_setup, and"]
+    # a cached config with a line hpc-bridge no longer sends is offered back as a proposal (#221), not refused: a
+    # proposal is no bring-up and no no-op (main's old "… no longer accepted … Nothing was started." refusal stays in
+    # _CONNECT_REFUSALS for older bundles)
+    assert cached["phase"] == "proposed_facility_details", cached["notice"]
+    assert cached["notice"].startswith("the configuration cached for '"), cached["notice"]
+    offered = ToolCall.of("mcp__endpoint__connect_facility", cached_inp, cached)
+    assert not no_op_answer(offered)
+    assert "no bring-up connect" in first_details_connect_succeeds(Trace([offered])).detail
     for inp, res in refusals:
         assert res["phase"] == "failed" and res["notice"].endswith("Nothing was started."), res["notice"]
         refused = ToolCall.of("mcp__endpoint__connect_facility", inp, res)
