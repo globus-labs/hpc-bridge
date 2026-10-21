@@ -132,7 +132,9 @@ def test_byo_scheduler_options_may_not_set_the_account_or_queue(opts):
 @pytest.mark.parametrize("opts", ["#SBATCH -q normal", "#PBS -l filesystems=home:eagle", "#SBATCH --gpus-per-node=1",
                                   "#SBATCH --parsable"])
 def test_other_directives_pass(opts):
-    assert binding._entry_from_details("mine", FacilityDetails(**_DRAFT, scheduler_options=opts))
+    # each on its own scheduler: a `#PBS` line on Slurm is another batch system's directive, refused since 2026-10-20
+    scheduler = "pbs" if opts.startswith("#PBS") else "slurm"
+    assert binding._entry_from_details("mine", FacilityDetails(**_DRAFT, scheduler=scheduler, scheduler_options=opts))
 
 
 async def test_a_details_connect_with_an_account_directive_fails_and_says_why(monkeypatch):

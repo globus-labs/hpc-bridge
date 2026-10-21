@@ -17,7 +17,21 @@ import os
 import re
 
 from . import config
-from .catalog.entry import Allocation, CatalogEntry, Compute, Defaults, scheduler_terms_directive
+from .catalog.entry import (
+    TERMS_WORDS,
+    Allocation,
+    CatalogEntry,
+    Compute,
+    Defaults,
+    SchedulerOptionsError,
+    directive_lines,
+    read_as_directive,
+    scheduler_options_problem,
+    scheduler_terms_directive,
+    scheduler_terms_kind,
+    select_advice,
+    select_options_problem,
+)
 from .config import _env_endpoint_id, _require_env
 from .endpoint import EndpointCLI
 from .facility.base import Facility
@@ -310,24 +324,164 @@ def _facility_store():
 
     return FacilityStore()
 
-class TermsDirectiveError(ValueError):
+class TermsDirectiveError(SchedulerOptionsError):
     """details= whose scheduler_options set the account or the partition/queue (refused: `_entry_from_details`)."""
+
+
+def _select_words(line: str, scheduler: str | None) -> str:
+    """Where a refused `-l select=…` line's resources go. On PBS: `select_options` (and its ncpus to `cpus_per_node`),
+    worked out from the line where it holds one chunk of the block's node count, with the line's other resources kept
+    as a line of their own (`select_advice`). On any other scheduler (sbatch translates a #PBS line): an #SBATCH
+    directive — select_options is PBS only."""
+    adv = select_advice(line)
+    if scheduler != "pbs":  # the GPUs the line names, whatever select_advice makes of it (two chunks, a walltime too)
+        gpus = re.search(r"(?<![\w])ngpus=(\d+)", line, re.I)
+        return ("take it out — on Slurm a chunk's resources are #SBATCH directives in scheduler_options, its GPUs "
+                f"`#SBATCH --gres=gpu:{gpus.group(1) if gpus else '<n>'}` (select_options is PBS only)")
+    how = ("hpc-bridge writes select=<the block's node count>:ncpus=<cpus_per_node>:<select_options>, so the node "
+           "count and the spend terms stay its own")
+    if adv is None:
+        return f"write the resources after the chunk as select_options='ngpus=4' (for instance; {how})"
+    said = " and ".join(([f"select_options={adv.options!r}"] if adv.options else [])
+                        + ([f"cpus_per_node={adv.cpus}"] if adv.cpus else []))
+    out = f"write it as {said}" if said else "take the select out"
+    if adv.cpus is None:
+        out += (", with cpus_per_node=<the cores per node> if it is not set (without it parsl's chunk asks for "
+                "ncpus=1)")
+    if adv.rest:
+        out += f", and keep the line's other resources as {adv.rest[:120]!r} in scheduler_options"
+    return f"{out} ({how})"
+
+
+def _terms_refusal(line: str, was: str | None, scheduler: str | None = None) -> str:
+    """Why a written scheduler_options line that sets one of the block's terms (or hpc-bridge's own hold on its pilot)
+    is refused, and where it goes instead (`scheduler`: the facility's, for where a select's resources go). Each echoed
+    line is cut to 120 characters."""
+    kind = scheduler_terms_kind(line) or "account"
+    head = (f"scheduler_options sets {TERMS_WORDS[kind]} ({line[:120]!r}"
+            + (f", as hpc-bridge writes {was[:120]!r}" if was else ""))
+    if kind in ("account", "queue"):
+        return (head + "; #SBATCH -A/--account/-p/--partition, #PBS -A/-q): take it out — give the partition as "
+                "details' `partition` and the account to ensure_endpoint_up(account=…), so the spend question names "
+                "what the block charges")
+    if kind == "select" and scheduler != "pbs":
+        return (head + "): sbatch reads a #PBS line as its own, and a select there would size the block behind "
+                f"hpc-bridge's node count — {_select_words(line, scheduler)}")
+    if kind == "select":
+        return (head + "): parsl writes the block's own select=<nodes>:ncpus=… before scheduler_options, and a second "
+                f"select would replace it — {_select_words(line, scheduler)}")
+    if kind == "output":
+        return (head + "; #SBATCH -o/--output): take it out — parsl writes the pilot's output in its user endpoint's "
+                "directory, the path squeue's StdOut shows and hpc-bridge finds and cancels the pilot by: with "
+                "another, stop_endpoint could not cancel the pilot, and the probe would read it as missing")
+    if kind == "error":
+        return (head + "; #SBATCH -e/--error): take it out — parsl writes the pilot's error file beside its script in "
+                "its user endpoint's directory, where hpc-bridge reads why a pilot that died exited (its own "
+                "`hpc-bridge: …` line): with another, such a pilot is reported without that reason. (hpc-bridge has "
+                "no setting that moves that directory.)")
+    if kind == "array":
+        return (head + "; #SBATCH -a/--array, #PBS -J): take it out — an array starts several blocks behind one spend "
+                "question")
+    return (head + "; #SBATCH -t/--time/-N/--nodes, #PBS -l walltime=/nodes=): take it out — the block's walltime is "
+            "details' `walltime` and its size is hpc-bridge's (one node per block), so the spend question names what "
+            "the block asks for (parsl writes both before scheduler_options, and a later directive would override "
+            "them)")
+
+
+def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[tuple[str, str]]]:
+    """details= with its scheduler_options as the submit script will carry them (`directive_lines`: a bare option
+    such as "-l filesystems=home:eagle" written as "#PBS -l filesystems=home:eagle", an indented directive unindented,
+    blank lines dropped), and each rewrite made as (given, written) for the connect to report. Idempotent: written
+    details give no rewrite. A line that is not this scheduler's directive or a plain comment is refused
+    (`SchedulerOptionsError`), as is one that sets one of the block's terms — the account, the partition/queue, the
+    walltime, the node count (a select of its own: its resources go in `select_options`), the pilot's files, an array
+    — read AFTER the prefix, so "-A x" is the directive it becomes (`TermsDirectiveError`). `select_options` (PBS) must
+    be chunk resources only (`select_options_problem`)."""
+    if details.select_options is not None:
+        if details.scheduler != "pbs":
+            raise SchedulerOptionsError("select_options is PBS only: on Slurm a resource is an #SBATCH directive in "
+                                        "scheduler_options (e.g. --gres=gpu:4)")
+        if why := select_options_problem(details.select_options):
+            raise SchedulerOptionsError(f"{why}; hpc-bridge writes select=<the block's node count>:ncpus="
+                                        "<cpus_per_node>:<select_options>")
+    written, rewrites, other = directive_lines(details.scheduler_options, details.scheduler)
+    read = [ln for ln in other if read_as_directive(ln, details.scheduler)]
+    if line := scheduler_terms_directive("\n".join(read)):
+        # a refused line the scheduler still reads as a directive, setting a term (sbatch translates `#PBS -A`, reads
+        # `#SLURM`; `#PBS-Ax` on PBS): that is the reason to give. qsub reads `#PBS` alone, so on PBS an `#SBATCH`
+        # line is only not a directive of this scheduler (the reason below).
+        raise TermsDirectiveError(_terms_refusal(line, None, details.scheduler))
+    if other:
+        raise SchedulerOptionsError(scheduler_options_problem(other, details.scheduler))
+    if line := scheduler_terms_directive(written):
+        # it would charge an account, pick a queue or size the block behind the terms the user confirmed
+        was = next((g for g, w in rewrites if w.strip() == line), None)
+        raise TermsDirectiveError(_terms_refusal(line, was, details.scheduler))
+    if written != details.scheduler_options:
+        details = details.model_copy(update={"scheduler_options": written})
+    return details, rewrites
+
+
+def _accepted_details(details: FacilityDetails) -> tuple[FacilityDetails, list[str]]:
+    """`details` with every scheduler_options line `_directive_details` would refuse left out (the rest as written), and
+    why each was left out — for a configuration cached before such lines were refused, offered back as a proposal for
+    the user to confirm (connect) rather than a dead end that re-reads the same record. A one-chunk `-l select=<n>:…`
+    line of the block's node count (on PBS) is offered as what it means now: its resources as `select_options`, its
+    ncpus as `cpus_per_node` (where those are not set already), and whatever else the line names kept as a line of its
+    own (`select_advice`), so nothing beside the select is lost."""
+    kept: list[str] = []
+    dropped: list[str] = []
+    update: dict = {}
+    for raw in (details.scheduler_options or "").splitlines():
+        written, _rewrites, other = directive_lines(raw, details.scheduler)
+        if other:
+            dropped.append(f"{other[0][:120]!r} (not a directive of this scheduler)")
+        elif written and (line := scheduler_terms_directive(written)):
+            kind = scheduler_terms_kind(line) or "account"
+            adv = select_advice(line) if kind == "select" and details.scheduler == "pbs" else None
+            if adv is not None:
+                offered = []
+                if adv.options and details.select_options is None and "select_options" not in update:
+                    update["select_options"] = adv.options
+                    offered.append(f"select_options={adv.options!r}")
+                if adv.cpus and details.cpus_per_node is None and "cpus_per_node" not in update:
+                    update["cpus_per_node"] = adv.cpus
+                    offered.append(f"cpus_per_node={adv.cpus}")
+                where = ("its resources are offered as " + " and ".join(offered) if offered else
+                         "a select of its own: its resources go in select_options")
+                if adv.rest:
+                    kept.append(adv.rest)
+                    where += f", and the line's other resources are kept as {adv.rest[:120]!r}"
+            elif kind in ("account", "queue"):
+                where = "give those as `partition` and ensure_endpoint_up(account=…)"
+            elif kind in ("walltime", "nodes", "select"):
+                where = "the walltime is `walltime`, the size hpc-bridge's"
+            elif kind == "output":
+                where = "hpc-bridge finds and cancels its pilots by their own output file"
+            elif kind == "error":
+                where = "hpc-bridge reads why a pilot died from its own error file"
+            else:
+                where = "it would start several blocks"
+            dropped.append(f"{line[:120]!r} (it sets {TERMS_WORDS[kind]}: {where})")
+        elif written:
+            kept.append(written)
+    if details.select_options is not None and select_options_problem(details.select_options):
+        update["select_options"] = None
+        dropped.append(f"select_options {details.select_options[:120]!r} (not chunk resources only)")
+    return details.model_copy(update={"scheduler_options": "\n".join(kept) or None, **update}), dropped
 
 
 def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry:
     """Build a SESSION-LOCAL CatalogEntry from user-supplied details — the Socratic fallback for a
     machine not in the catalog. provenance="session"; never written to the shared index. Identity is
     defaulted from the id; the transfer endpoint is omitted (compute-only); the allocation block is
-    set only when a listing command + a parser were given (else the human supplies the account)."""
+    set only when a listing command + a parser were given (else the human supplies the account).
+    Its scheduler_options are written as directives first (`_directive_details`, which also refuses the account,
+    the queue and any line that is not a directive)."""
+    details, _rewrites = _directive_details(details)
     if details.env_setup is None:
         raise ValueError("env_setup is missing and there is no proposal to take it from: call connect_facility with "
                          "ssh_host=… (no details) for a proposed config, or give env_setup")
-    if line := scheduler_terms_directive(details.scheduler_options):
-        # sent verbatim, it would charge an account or pick a queue that the block's terms (and the user) never see
-        raise TermsDirectiveError(
-            f"scheduler_options sets the account or the partition/queue ({line!r}; #SBATCH -A/--account/-p/"
-            "--partition, #PBS -A/-q): take it out — give the partition as details' `partition` and the account to "
-            "ensure_endpoint_up(account=…), so the spend question names what the block charges")
     alloc = None
     if details.allocation_command and details.allocation_parser:
         alloc = Allocation(command=details.allocation_command, parser=details.allocation_parser)
@@ -364,6 +518,7 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
             partition=details.partition,
             walltime=details.walltime,
             cpus_per_node=details.cpus_per_node,
+            select_options=details.select_options,
         ),
         provenance="session",
         last_validated=datetime.date.today(),

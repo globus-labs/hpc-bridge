@@ -559,6 +559,9 @@ async def _ensure_endpoint_up(
     # keeps a not-yet-visible pilot during normal cold-start from being cried as rejected.
     # (The query rides the free login shape — a compute-only facility has none, so skip it there; the
     # #37 failure-signal path for a MEP is the dispatch-error suffix already on the notice.)
+    # the block's scheduler job: the one its check answered from, once it is up; while it provisions, the newest pilot
+    # the probe lists for this endpoint (the one its verdict names)
+    job_id = rt.block_job if status == "up" and billable else None
     if status == "provisioning" and billable and eid and _has_login_shape(app):
         # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
         # (and when a worker last answered, so the record can tell one that answered DURING the probe)
@@ -567,13 +570,19 @@ async def _ensure_endpoint_up(
         # a log read is not conclusive, so nothing is voided on it — the block stays `provisioning`)
         notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
                                                                   _login_runner(app), confirmed_at=rt.confirmed_at,
-                                                                  block=rt.user_endpoint_config.get("hpcb_block"))
-        if probe is not None and probe.dead is not None:
-            # A pilot that ran and died before any worker answered: the check it was started for is still queued, and
-            # the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of that check, which
-            # its own state decides) — on the runtime and terms the probe was for (live 2026-10-15, slurm_worker_died).
+                                                                  block=rt.user_endpoint_config.get("hpcb_block"),
+                                                                  confirmed_wall=rt.confirmed_wall)
+        if probe is not None and probe.category != "unknown":
+            job_id = probe.subject
             async with app.lock:
-                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
+                # what is still queued or HELD, for a switch or a reconnect to say (a held pilot never idle-releases)
+                warmth._record_pilots(app, shape, rt, eid, probe_epoch, probe.live, probe.subject)
+                if probe.dead is not None:
+                    # A pilot that ran and died before any worker answered: the check it was started for is still
+                    # queued, and the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of
+                    # that check, which its own state decides) — on the runtime and terms the probe was for (live
+                    # 2026-10-15, slurm_worker_died).
+                    warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
     return EndpointStatus(
         status=status,
         block_state=block,
@@ -581,6 +590,7 @@ async def _ensure_endpoint_up(
         session_spend=spend,
         partition=active_partition,
         account=active_account,
+        block_job_id=job_id,
         block=receipt_terms,
         notice=said(notice),
     )
@@ -1080,6 +1090,8 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # A worker answered a check of another call AFTER this stop's last cancel began: that block is up now.
         up_late = _answered_since(app.shapes.get(DEFAULT_SHAPE), settled.released_at)
         warmth._drop_compute_shape_locked(app)  # its spend stays in the session total, its checks with the endpoint
+        if confirmed:  # the release cancelled every pilot of this endpoint: a re-bind names none (an unconfirmed one —
+            app.ssh_left.pop(eid, None)  # a cold channel, a refused qdel, out of time — may have left a held one)
         warmth._settle_checks(app, eid, checks, states)
         # a check sent while the release ran (a concurrent ensure_endpoint_up) was not looked at: what its own future
         # says, else queued
@@ -1608,6 +1620,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         ours = app.state.endpoint_id in (eid, None)
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
         warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
+        app.ssh_left.pop(eid, None)
     await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",

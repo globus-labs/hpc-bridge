@@ -29,6 +29,7 @@ from .context import (
     FailedDetails,
     LeftBlock,
     ShapeRuntime,
+    SshLeft,
     _facility_shapes,
     _has_login_shape,
 )
@@ -40,6 +41,7 @@ from .models import BlockTerms, ConnectFacilityResult, FacilityDetails, validate
 from .notices import (
     _block_terms,
     _connect_terms_note,
+    _directive_note,
     _explain_provision_error,
     _failure_of_the_config,
     _first_contact_note,
@@ -47,6 +49,7 @@ from .notices import (
     _left_block_clause,
     _needs_login_result,
     _needs_preauth_result,
+    _ssh_left_note,
     _unapplied_presets_note,
 )
 from .scheduler_ops import LoginRunner
@@ -94,11 +97,13 @@ def _drop_failed_details(app: AppCtx, facility: str, notice: str, entry: Catalog
     to say, and the facility this failed connect left BOUND is marked (`AppCtx.dropped_binding`), so ensure_endpoint_up
     and run_shell do not bring the dropped config up either (warmth._provision refuses). Kept: a PROVEN config (the
     login shape came up on it, or the local cache had it — never pending), whose later failure is the facility's or the
-    network's — and so one equal to the config the local cache holds as proven for that host (re-sent as it was: the
-    cache rung would serve it again anyway), and one whose bring-up already got past `start` this session
+    network's — and so one equal to the config the local cache holds as proven for that host (re-sent as it was, or as
+    an older plugin cached it with a bare scheduler option: compared as written, the cache rung would serve it again
+    anyway), and one whose bring-up already got past `start` this session
     (`AppCtx.details_started`: a later poll re-runs the venv check, whoami and list through env_setup, and a flaky
     login node must not cost a config that started). Only this connect's OWN config is dropped (`entry`): a details=
-    that replaced it while this bring-up held the lock is another call's, and stays. `notice`: the failure's own.
+    that replaced it while this bring-up held the lock is another call's, and stays. How its scheduler_options were
+    written (`AppCtx.directive_notes`) is dropped with it: no later answer says it. `notice`: the failure's own.
     Returns the sentence that ends that answer: what a connect does next, with details= and without. Callers hold
     app.lock."""
     pending = app.pending_facility_cache.get(facility)
@@ -107,13 +112,17 @@ def _drop_failed_details(app: AppCtx, facility: str, notice: str, entry: Catalog
     host, dump = pending
     try:  # compared through the model: a config an older plugin cached carries no field it now defaults
         stored = binding._facility_store().get(host)
-        proven = FacilityDetails(**stored).model_dump(mode="json") if stored is not None else None
+        # …and as the cache rung serves it: its scheduler_options written as directives, as `dump`'s are (a bare
+        # option an older plugin cached is the same config); one with a line now refused is not served as it is
+        proven = (binding._directive_details(FacilityDetails(**stored))[0].model_dump(mode="json")
+                  if stored is not None else None)
     except Exception:  # noqa: BLE001 - an unreadable or invalid cache proves nothing: the config stays unproven
         proven = None
     if proven == dump:
         return ""
     del app.pending_facility_cache[facility]
     app.session_facilities.pop(facility, None)
+    app.directive_notes.pop(facility, None)  # how it was written goes with it: no later answer says it of another
     failed = FailedDetails(ssh_host=host, error=notice)
     app.failed_details[facility] = failed
     app.dropped_binding = (app.facility, (
@@ -340,6 +349,7 @@ async def _connect(
     else:
         login_note = carried
     entry: CatalogEntry | None = None
+    directive_note = ""  # how the details' scheduler_options were written as directives, said back
     session_scoped = False  # a connect without details= took this session's own config (or put the cache's there)
     # Resolve the entry: a session-local one the agent already supplied wins; else the catalog. An
     # index error is treated as "unresolved" (the agent can still supply details), not a hard fail.
@@ -366,13 +376,20 @@ async def _connect(
                             f"{_without_details(app, facility, details.ssh_host)}. Nothing was started."))
             details = details.model_copy(update={"env_setup": draft.env_setup})
         try:
+            # scheduler_options as the submit script carries them (a bare "-l …" gets the scheduler's prefix), said back
+            details, rewrites = binding._directive_details(details)
             entry = binding._entry_from_details(facility, details)
         except Exception as exc:  # noqa: BLE001 - bad details -> structured failure, not a crash
             return ConnectFacilityResult(
                 phase="failed",
                 facility=facility,
-                notice=f"invalid facility details: {type(exc).__name__}: {exc}"[:300],
+                notice=f"invalid facility details: {type(exc).__name__}: {exc}"[:_DETAILS_ERROR_CAP],
             )
+        directive_note = _directive_note(rewrites)
+        if directive_note:  # kept until a result carries it (a needs_preauth first is resumed with no details)
+            app.directive_notes[facility] = directive_note
+        else:
+            app.directive_notes.pop(facility, None)
         # this session's config, kept from here so a connect while it comes up keeps polling it (and a one-time-code
         # handoff resumes it); on disk only once PROVEN (below); dropped if it fails on the login node first
         app.session_facilities[facility] = entry
@@ -385,6 +402,10 @@ async def _connect(
             ssh_host = failed.ssh_host  # the host the dropped details= named: the facility is resolved afresh for it
         entry = app.session_facilities.get(facility)  # never the dropped config: _drop_failed_details took it out
         session_scoped = entry is not None  # read before the lock: checked again once it is held (below)
+        # the rewrite of the session's own config, said until a result carries it — never a dropped config's (its note
+        # went with it: _drop_failed_details)
+        directive_note = app.directive_notes.get(facility, "") if entry is not None else ""
+        lead = _failed_details_lead(facility, failed) if failed is not None else ""
         registry_error: Exception | None = None
         if entry is None:
             # THE REGISTRY WINS for any catalogued id (decision 2026-09-03: curated entries are the stable
@@ -405,18 +426,19 @@ async def _connect(
                 cached = None
             if cached is not None:
                 try:
-                    entry = binding._entry_from_details(facility, FacilityDetails(**cached))
+                    cached_details, rewrites = binding._directive_details(FacilityDetails(**cached))
+                    entry = binding._entry_from_details(facility, cached_details)
                     app.session_facilities[facility] = entry
                     session_scoped = True
-                except binding.TermsDirectiveError as exc:  # cached before such directives were refused: say so
-                    return ConnectFacilityResult(
-                        phase="failed", facility=facility,
-                        notice=(f"the configuration cached for {facility!r} from an earlier session is no longer "
-                                f"accepted: {exc}. Connect with details= (without that directive), or with ssh_host= "
-                                "for a fresh proposal. Nothing was started."))
+                    directive_note = _directive_note(rewrites)  # a bare option cached by an earlier plugin
+                    if directive_note:
+                        app.directive_notes[facility] = directive_note
+                except binding.SchedulerOptionsError:  # cached before such lines were refused: offered back, without
+                    # them, for the user to confirm — "with ssh_host=" would re-read this same record (keyed on it);
+                    # after a dropped details=, it opens with what failed, as a probe's proposal does
+                    return _cached_refusal_proposal(app, facility, FacilityDetails(**cached), lead=lead)
                 except Exception:  # noqa: BLE001 - stale/invalid cached config
                     entry = None
-        lead = _failed_details_lead(facility, failed) if failed is not None else ""
         if entry is None and registry_error is not None:
             return await _propose_or_ask(
                 facility, ssh_host,
@@ -477,7 +499,15 @@ async def _connect(
             # the old binding is a facility endpoint: nothing cancels its block, which bills on — remember it (#178)
             left = warmth._leave_block(app, DEFAULT_SHAPE, compute, how="reconnect")
         sched = getattr(app.facility, "scheduler", None)
-        prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's blocks/handles are gone
+        # an SSH endpoint's block and pilots: a re-bind cancels none of them (a stop does) — said, not "nothing billed"
+        ssh_left = None if old_mep else warmth._ssh_left(compute)
+        if ssh_left is None and not old_mep and old_eid is not None:
+            # an earlier re-bind left it and dropped the shape it was read from: name it again (the live polaris run's
+            # follow-up connect fell back to "a check … may still be queued")
+            ssh_left = app.ssh_left.get(old_eid)
+        if ssh_left is not None and old_eid is not None:  # until a confirmation or a stop there (warmth, server)
+            app.ssh_left[old_eid] = ssh_left
+        prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's runners and handles are gone
         # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
         queued_left = 0 if old_mep or old_eid is None else warmth._unresolved_count(
             app, old_eid, await warmth._read_checks(old_eid, 2.0))
@@ -499,12 +529,13 @@ async def _connect(
         # ~/.hpc-bridge path on the remote node (same resolution as lifespan's).
         app.scratch_root = binding._resolve_scratch_root(fac)
         if not _has_login_shape(app):  # a facility-run multi-user endpoint: attach, don't provision
-            res = await _connect_mep(app, facility, fac)
+            checks_note = _left_checks_note(app, old_eid, queued_left, ssh_left)
+            res = await _connect_mep(app, facility, fac, left=bool(checks_note) or left is not None)
             if res.phase == "needs_account":  # attached, on another config: the details= that failed is history
                 app.failed_details.pop(facility, None)
             if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
                 res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
-            res.notice = login_note + presets_note + _left_checks_note(app, old_eid, queued_left) + (res.notice or "")
+            res.notice = login_note + presets_note + checks_note + (res.notice or "")
             return res
         # An MFA facility (curated `auth_method: mfa-otp`) with no shared connection yet: don't burn a failing
         # SSH attempt (and a fail2ban strike) to learn what the entry already says — hand off first. But ONLY
@@ -546,15 +577,20 @@ async def _connect(
             app.failed_details.pop(facility, None)  # up, on whichever config: the details= that failed is history
             app.details_started.discard(facility)   # proven now (or the cache's): nothing pending to protect
     wi_note = getattr(fac, "worker_init_note", "")  # an edited env_setup that a reused endpoint does not run
-    reuse_note = (login_note + presets_note + _reuse_note(app, facility, app.state.reused, fac)
-                  + (wi_note if isinstance(wi_note, str) else "") + _venv_note(fac))
+    sel_note = getattr(fac, "select_note", "")  # select_options a reused endpoint's older template does not render
+    reuse_note = (login_note + presets_note + directive_note + _reuse_note(app, facility, app.state.reused, fac)
+                  + (wi_note if isinstance(wi_note, str) else "") + (sel_note if isinstance(sel_note, str) else "")
+                  + _venv_note(fac))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities
     if prior_spend > 0 or left is not None:  # say what it cost, and name a block left billing, rather than lose them
         reuse_note = _prior_note(prior_spend, left, sched, same=False, old_mep=old_mep) + reuse_note
-    reuse_note = _left_checks_note(app, old_eid, queued_left) + reuse_note
+    checks_note = _left_checks_note(app, old_eid, queued_left, ssh_left)
+    reuse_note = checks_note + reuse_note
+    still = bool(checks_note) or left is not None  # something of this session is still there: never "nothing billed"
     terms = _next_block_terms(app)
+    rewrite_held = app.directive_notes.pop(facility, None)  # the result below carries it (bar a failed listing)
     if block != "warm":  # login node still coming up — nothing to read yet
         return ConnectFacilityResult(
             phase="provisioning",
@@ -572,10 +608,12 @@ async def _connect(
             allocations=[],
             block=terms,
             notice=reuse_note + "login node is up; hpc-bridge reads no allocation listing here. "
-            + _connect_terms_note(app, terms),
+            + _connect_terms_note(app, terms, left=still),
         )
     out = await run_login(entry.allocation.command)
     if out.phase != "complete" or out.exit_code != 0:
+        if rewrite_held:  # not said here: the next connect says it
+            app.directive_notes[facility] = rewrite_held
         return ConnectFacilityResult(
             phase="failed",
             facility=facility,
@@ -591,26 +629,50 @@ async def _connect(
         block=terms,
         notice=reuse_note + ("login node is up; your allocations are listed (`allocations`). " if allocations else
                              "login node is up; the allocation listing returned none. ")
-        + _connect_terms_note(app, terms, listed=bool(allocations)),
+        + _connect_terms_note(app, terms, listed=bool(allocations), left=still),
     )
 
-def _left_checks_note(app: AppCtx, old_eid: str | None, queued: int) -> str:
-    """A connect that LEFT an SSH endpoint where tasks of ours were not seen to finish (#24): while one is queued
-    there, that endpoint can start a block for it — nothing of this connect ends it. Silent on a reconnect to it."""
-    if not queued or old_eid is None or app.state.endpoint_id == old_eid:
+def _cached_refusal_proposal(
+    app: AppCtx, facility: str, cached: FacilityDetails, *, lead: str = "",
+) -> ConnectFacilityResult:
+    """A configuration cached by an earlier session whose scheduler_options hold lines hpc-bridge now refuses (a shell
+    command, another batch system's directive, the account, the queue, the walltime or the size): offered back as a
+    PROPOSAL without them (`binding._accepted_details`), saying what was left out and why, for the user to confirm with
+    details= — the store is keyed on ssh_host, so "connect with ssh_host= for a fresh proposal" re-read the same record
+    and the agent looped. Nothing is bound; the draft seeds `proposed_drafts`, so details= may leave env_setup out.
+    `lead` opens the notice: what a details= this session gave for `facility` failed with, once dropped
+    (`_failed_details_lead`) — `_connect_facility` opens no proposal with it, so the proposal says it itself."""
+    draft, dropped = binding._accepted_details(cached)
+    app.proposed_facility = facility  # a run_shell meanwhile is told to finish this connect
+    app.proposed_drafts[facility] = draft
+    shown = "; ".join(dropped[:5]) + (f"; and {len(dropped) - 5} more" if len(dropped) > 5 else "")
+    return ConnectFacilityResult(
+        phase="proposed_facility_details", facility=facility, proposed_details=draft,
+        notice=(lead
+                + f"the configuration cached for {facility!r} from an earlier session is no longer accepted as it is: "
+                f"its scheduler_options carry lines hpc-bridge no longer sends — {shown}. This is that configuration "
+                "without them (`proposed_details`): review it WITH THE USER (a directive they need goes back in this "
+                f"scheduler's own form), then call connect_facility({facility!r}, details=…); leave env_setup out to "
+                "keep the cached one. Nothing was started."))
+
+
+def _left_checks_note(app: AppCtx, old_eid: str | None, queued: int, left: SshLeft | None = None) -> str:
+    """A re-bind of an SSH endpoint cancels nothing there (a stop does): what this session's earlier work left in its
+    scheduler — the block that was up, the pilots last seen queued or HELD (`left`, warmth._ssh_left), else tasks of
+    ours not seen to finish (#24: while one is queued, the endpoint can start a block for it) — on this endpoint again,
+    or on the one this connect left (notices._ssh_left_note). Empty when nothing is known left."""
+    if old_eid is None:
         return ""
-    things = "a check (or command) of hpc-bridge's" if queued == 1 else f"{queued} checks (or commands) of hpc-bridge's"
-    return (f"On the endpoint this connect left ({old_eid}), {things} not seen to finish may still be queued: while "
-            "one is, that endpoint can start a billed block to run it. Connecting back to it and calling "
-            "stop_endpoint cancels such a block and says when none is left; teardown_endpoint there ends them. ")
+    return _ssh_left_note(app, old_eid, same=app.state.endpoint_id == old_eid, queued=queued, left=left)
 
 
 def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, same: bool, old_mep: bool) -> str:
     """What a re-bind did to the previous binding's blocks, with the session spend so far. An SSH facility's shapes are
-    released; a facility endpoint's block is NOT — nothing here cancels it (#178): it bills until that facility's
-    idle-release, so the note names it (and a stop on the same endpoint names it again)."""
+    closed (nothing is cancelled: `_left_checks_note` says what is left); a facility endpoint's block is NOT — nothing
+    here cancels it (#178): it bills until that facility's idle-release, so the note names it (and a stop on the same
+    endpoint names it again)."""
     if not old_mep:
-        return f"the previous facility's shapes were released (session spend so far ≈ {spent:.2f}). "
+        return f"the previous facility's shapes were closed (session spend so far ≈ {spent:.2f}). "
     where = "this endpoint" if same else "the previous facility's endpoint"
     note = f"the previous session on {where} was closed (session spend so far ≈ {spent:.2f})"
     if left is None:
@@ -618,8 +680,9 @@ def _prior_note(spent: float, left: LeftBlock | None, scheduler: str | None, *, 
     return f"{note}, but {_left_block_clause(left, scheduler)}" + ("; stop_endpoint names it. " if same else ". ")
 
 
-async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult:
-    """Bind a facility-run multi-user endpoint (MEP). Called under app.lock, after the bind.
+async def _connect_mep(app: AppCtx, facility: str, fac, *, left: bool = False) -> ConnectFacilityResult:
+    """Bind a facility-run multi-user endpoint (MEP). Called under app.lock, after the bind. `left`: the caller's
+    notice says what an earlier binding left billing or queued, so the terms never say nothing is billed.
 
     There is nothing to stand up: the facility runs the manager and its identity mapping makes our
     Globus identity a local account — zero SSH. So we only ATTACH the catalogued UUID (free) and
@@ -668,7 +731,7 @@ async def _connect_mep(app: AppCtx, facility: str, fac) -> ConnectFacilityResult
             "channel is COMPUTE-ONLY: hpc-bridge reaches the facility only through its compute endpoint — the "
             "facility's login nodes exist but are outside this channel, so there is no free login shape here and "
             "every command runs on a billed scheduler block that stays warm between calls. "
-            + where + _connect_terms_note(app, terms)
+            + where + _connect_terms_note(app, terms, left=left)
         ),
     )
 
@@ -735,6 +798,8 @@ async def _propose_or_ask(
 
 
 _PROPOSAL_CAP = 1800  # the proposal's notice; its fixed head is under 600 chars
+# A refused details=: its reason with its remedy (the scheduler_options refusals run to ~550 chars; 300 cut the remedy)
+_DETAILS_ERROR_CAP = 800
 
 
 def _fit_notes(notes: list[str], budget: int) -> list[str]:

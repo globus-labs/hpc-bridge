@@ -20,8 +20,10 @@ from .context import (
     AppCtx,
     DroppedConfigError,
     LeftBlock,
+    SeenPilots,
     SentCheck,
     ShapeRuntime,
+    SshLeft,
     _has_login_shape,
     _idle_release_s,
 )
@@ -31,7 +33,7 @@ from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
 from .runner import CanaryResult, SubmitAnswer
-from .scheduler_ops import _QUOTED, _ask_terms, _submission_refused, _user_endpoint_logs
+from .scheduler_ops import _END_NOW, _QUOTED, _ask_terms, _pilot_fates, _submission_refused, _user_endpoint_logs
 
 # sshd's own denial lines — the method list in parentheses is the tell (a bare "Permission denied" is
 # usually the remote filesystem: `mkdir … : Permission denied` on an over-quota home, found in review).
@@ -362,13 +364,16 @@ def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: 
                  "until the facility's idle window ends it. ")
     return line
 
-def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False) -> str:
+def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False, left: bool = False) -> str:
     """connect_facility's statement of the next block's terms, before any spend, and the one question to ask: only for
     what the user has not said — a preset (HPC_BRIDGE_ACCOUNT / HPC_BRIDGE_PARTITION) counts as said — and their yes
     to it IS the spend confirmation, sent with their answer in one ensure_endpoint_up call. `listed`: the result lists
-    allocations to choose from. With no terms (they could not be read), a short instruction alone."""
+    allocations to choose from. With no terms (they could not be read), a short instruction alone. `left`: the notice
+    already says what an earlier block or pilot of this session left in the scheduler (a reconnect cancels nothing), so
+    it never says nothing is started or billed — only that this connect started nothing."""
+    lead = "Nothing new is started or billed by this connect. " if left else "Nothing is started or billed yet. "
     if terms is None:
-        return ("Nothing is started or billed yet. Before the first block, ask the user in one question for what they "
+        return (lead + "Before the first block, ask the user in one question for what they "
                 "have not said (the account to charge where one is needed, and whether the default partition is OK); "
                 "their yes is the spend confirmation: send it with their answer in one call, "
                 "ensure_endpoint_up(account=…, partition=…, confirm_spend=True).")
@@ -402,8 +407,69 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
         ask = (f"Before the first block, ask the user in one question {', and '.join(asks)} (naming these terms), "
                f"unless they already said; their yes is the spend confirmation: send it with their answer in one "
                f"call, {call}.")
-    return ("Nothing is started or billed yet. "
-            + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
+    return (lead + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
+
+
+def _cut(line: str, n: int = 120) -> str:
+    return line if len(line) <= n else line[: n - 1] + "…"
+
+
+def _directive_note(rewrites: list[tuple[str, str]]) -> str:
+    """connect_facility's report of how the details' scheduler_options were written as directives
+    (binding._directive_details): each bare option or indented directive, and the line the submit script carries
+    instead. Empty: none."""
+    if not rewrites:
+        return ""
+    # each line as given, up to 120 characters (a longer one is cut, marked by its quote's "…")
+    shown = "; ".join(f"wrote {_cut(given)!r} as {_cut(written)!r}" for given, written in rewrites[:5])
+    more = f" (and {len(rewrites) - 5} more lines the same way)" if len(rewrites) > 5 else ""
+    return (f"scheduler_options: {shown}{more} — a submit script reads a directive only from a line that starts with "
+            "it: a bare option there is a shell command (and the scheduler stops reading directives at it), an "
+            "indented directive a comment. ")
+
+
+def _pilot_rows_of(pilots: SeenPilots) -> list[list[str]]:
+    """Recorded pilots as the probe's rows (the state as the scheduler listed it, job, -, reason), for
+    scheduler_ops._pilot_fates' words — Slurm's PENDING named as Slurm's, never read as a PBS letter."""
+    return [[word, job, "-", reason] for job, _state, reason, word in pilots.jobs]
+
+
+def _pilots_left_words(pilots: SeenPilots) -> list[str]:
+    """What becomes of pilots a re-bind left in the scheduler, by their state at the last look (`_pilot_fates`: a held
+    pilot or one refused as submitted never starts; a waiting or running one runs the check queued with it, bills)."""
+    return [f"at the last look ({_ago(pilots.at)}) " + "; ".join(_pilot_fates(_pilot_rows_of(pilots)))]
+
+
+def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: SshLeft | None) -> str:
+    """A connect that re-bound an SSH endpoint cancels nothing there: what is still in its scheduler from before it —
+    the block this session had up (it idle-releases after its last task), the pilots the last probe saw live (a held one
+    never starts and never idle-releases), or else checks of ours not seen to finish (the endpoint can start a block for
+    one) — and how to end it. `same`: this connect bound that endpoint again. Empty when nothing is known left."""
+    parts = []
+    if left is not None and left.up:
+        job = f" (job {left.job})" if left.job else ""
+        parts.append(f"the compute block this session had up{job} idle-releases {_idle_window_text(app)} after its "
+                     "last task (min_blocks=0)")
+    if left is not None and left.pilots is not None:
+        parts += _pilots_left_words(left.pilots)
+    if not parts and not queued:
+        return ""
+    things = "a check (or command) of hpc-bridge's" if queued == 1 else f"{queued} checks (or commands) of hpc-bridge's"
+    if not same:
+        if not parts:  # checks only: the words a bind elsewhere has always used
+            return (f"On the endpoint this connect left ({old_eid}), {things} not seen to finish may still be queued: "
+                    "while one is, that endpoint can start a billed block to run it. Connecting back to it and "
+                    "calling stop_endpoint cancels such a block and says when none is left; teardown_endpoint there "
+                    "ends them. ")
+        return (f"This connect cancels nothing on the endpoint it left ({old_eid}): " + "; ".join(parts) + ". "
+                "Connecting back to it and calling stop_endpoint cancels its blocks and says when none is left; "
+                "teardown_endpoint there ends them. ")
+    if not parts:
+        parts.append(f"{things} sent before it, not seen to finish, may still be queued here — while one is, the "
+                     "endpoint can start a billed block to run it")
+    return ("This connect cancels nothing on this endpoint, and this endpoint still has work in its scheduler: "
+            + "; ".join(parts) + ". stop_endpoint cancels every block of this endpoint, these included, and says when "
+            f"none is left (teardown_endpoint ends them too). {_END_NOW} ")
 
 def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
     """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
@@ -453,7 +519,7 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
                                                          rt.user_endpoint_config.get("account")):  # a switch since
         out += f"The {word} or account was switched since, so a confirmation now starts a block on the new terms. "
     if app is not None and (rt.switched_terms is not None or left is not None):
-        out += _switch_fate(app, left, confirmed=False)
+        out += _switch_fate(app, left, confirmed=False, rt=rt)
     return out
 
 def _still_left(app: AppCtx, left: LeftBlock | None) -> bool:
@@ -461,18 +527,59 @@ def _still_left(app: AppCtx, left: LeftBlock | None) -> bool:
     end (the rule warmth._prune_left applies)."""
     return left is not None and left in app.left_blocks and (left.ends_by is None or left.ends_by > time.monotonic())
 
-def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool) -> str:
-    """What became of the block a partition or account switch moved away from: nothing cancels it. On an SSH endpoint it
-    idle-releases on its own (min_blocks=0), and stop_endpoint cancels every block of the endpoint by its marker (the
-    new choice survives the stop). A facility endpoint's `left` block is named as a reconnect names one
-    (`_left_block_clause`); None: no block of ours was known there. `confirmed`: the new block is already confirmed (a
-    stop now ends it too)."""
+_HELD_NEVER = ("a held pilot never starts on its own, so it runs no task and never idle-releases: it stays in the "
+               "queue, holding hpc-bridge's check, until it is cancelled")
+
+
+def _ago(at: float) -> str:
+    return f"{max(0, int(time.monotonic() - at))}s ago"
+
+
+def _ssh_block_fate(app: AppCtx, up: bool | None, pilots: SeenPilots | None) -> tuple[str, bool]:
+    """What an SSH endpoint's block that a switch left does now, nothing having cancelled it, and whether its pilot
+    sits held. A block that came up (`up`; None: not known) idle-releases after its last task (min_blocks=0). One that
+    never came up is its pilot (the one the last probe's verdict was about): held at the last look, it never starts and
+    never idle-releases; queued, it may still start — it runs the check queued with it, then idle-releases; never seen,
+    either may be true. ("held" in lower case: an upper-case HELD is a probe verdict's, about the current pilot.)"""
+    idle = f"idle-releases {_idle_window_text(app)} after its last task (min_blocks=0)"
+    if up is not False:
+        return f"it {idle}", False
+    state = pilots.subject_state if pilots is not None else None
+    if pilots is not None and pilots.subject is not None and state is not None:
+        job = pilots.subject
+        if state == "H":
+            return (f"it never came up — its pilot {job} was held at the last look ({_ago(pilots.at)}), and "
+                    f"{_HELD_NEVER}"), True
+        if state == "N":
+            return (f"it never came up — its pilot {job} was one the scheduler will not start as submitted at the "
+                    f"last look ({_ago(pilots.at)}; reason {pilots.reason(job)[:60]!r}): it never runs, and stays in "
+                    "the queue, holding hpc-bridge's check, until it is cancelled"), True
+        if state == "R":
+            return (f"it never came up — its pilot {job} was RUNNING at the last look ({_ago(pilots.at)}), its worker "
+                    f"starting: it runs hpc-bridge's check queued with it, then {idle}"), False
+        reason = pilots.reason(job)
+        why = f"; reason {reason[:60]!r}" if reason and reason.lower() != "none" else ""
+        return (f"it never came up — its pilot {job} was still queued at the last look ({_ago(pilots.at)}{why}): if "
+                f"it starts — a limit or an outage it waits on may clear — it runs hpc-bridge's check queued with it, "
+                f"then {idle}"), False
+    return (f"it never came up: if its pilot starts, it runs hpc-bridge's check queued with it, then {idle}; a pilot "
+            "the scheduler holds never starts and never idle-releases"), False
+
+
+def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool, rt: ShapeRuntime | None = None) -> str:
+    """What became of the block a partition or account switch moved away from: nothing cancels it. On an SSH endpoint
+    a block that came up idle-releases on its own (min_blocks=0), and one that never did is said by its pilot
+    (`_ssh_block_fate`, from what the switch recorded on `rt`): a HELD one never idle-releases. stop_endpoint cancels
+    every block of the endpoint by its marker (the new choice survives the stop). A facility endpoint's `left` block is
+    named as a reconnect names one (`_left_block_clause`); None: no block of ours was known there. `confirmed`: the new
+    block is already confirmed (a stop now ends it too)."""
     if _has_login_shape(app):
-        idle = f"it idle-releases {_idle_window_text(app)} after its last task (min_blocks=0)"
+        fate, held = _ssh_block_fate(app, rt.switch_left_up if rt is not None else None,
+                                     rt.switch_left_pilots if rt is not None else None)
         if confirmed:
-            return (f"Nothing cancelled the previous block: {idle}; stop_endpoint cancels every block of this "
-                    "endpoint, this new one included. ")
-        return (f"Nothing cancels the previous block on a switch, even one still queued: {idle}. To end it now, call "
+            return (f"Nothing cancelled the previous block: {fate}; stop_endpoint cancels every block of this "
+                    f"endpoint, {'that one and ' if held else ''}this new one included. ")
+        return (f"Nothing cancels the previous block on a switch, even one still queued: {fate}. To end it now, call "
                 "stop_endpoint before confirming the new block: it cancels this endpoint's blocks and keeps the new "
                 f"{_queue_word(app)} and account for the next one. ")
     if left is None:
@@ -490,7 +597,7 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
         return ""
     word = _queue_word(app)
     return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
-            + _switch_fate(app, rt.switch_left, confirmed=True))
+            + _switch_fate(app, rt.switch_left, confirmed=True, rt=rt))
 
 def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | None, str | None] | None) -> str:
     """For the call that switched the partition or account, confirmed and met a REJECTED submission at once: no new
@@ -501,7 +608,7 @@ def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | N
         return ""
     word = _queue_word(app)
     return (f"The {word} or account changed from {_terms(*switched, word)} in this call. "
-            + _switch_fate(app, rt.switch_left, confirmed=False))
+            + _switch_fate(app, rt.switch_left, confirmed=False, rt=rt))
 
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset

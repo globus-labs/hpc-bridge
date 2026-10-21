@@ -125,9 +125,10 @@ class EndpointStatus(BaseModel):
     # Allocation/account this scheduler shape charges to (from connect_facility's selection, or the
     # facility default). None for the login shape.
     account: str | None = None
-    # The scheduler job id of the billed block this result is about, when hpc-bridge knows it (from the block's
-    # check): on a stop or a detach of a facility endpoint, the block left running (the notice names the command that
-    # ends it). None: unknown, or no block.
+    # The scheduler job id of the billed block this result is about, when hpc-bridge knows it: from the block's check
+    # once it is up; while it provisions on an SSH endpoint, the newest pilot job the scheduler lists for the endpoint
+    # (the one the notice's pilot verdict names — queued, HELD or starting); on a stop or a detach of a facility
+    # endpoint, the block left running (the notice names the command that ends it). None: unknown, or no block.
     block_job_id: str | None = None
     # stop_endpoint / teardown_endpoint: is the spend stopped? True ONLY when an SSH stop's cancel was confirmed
     # (`down`). False: a block may still bill — a facility endpoint left one running or a check of ours queued there
@@ -235,13 +236,32 @@ class FacilityDetails(BaseModel):
         description="PBS only: cores per node to request (PBSProProvider.cpus_per_node). "
         "Omit for Slurm (ignored) or to accept the scheduler default. E.g. Polaris: 32.",
     )
+    select_options: str | None = Field(
+        default=None,
+        description="PBS only: resources for each chunk of the block's select — hpc-bridge writes "
+        "'select=<the block's node count>:ncpus=<cpus_per_node>' and appends ':<select_options>', so the node count "
+        "and the spend terms stay hpc-bridge's. name=value pairs joined by ':', e.g. 'ngpus=4' or "
+        "'system=polaris:ngpus=4'; never a chunk count, a second chunk ('+'), select=, ncpus (that is "
+        "cpus_per_node), the walltime, the node count, the account or the queue. Omit if none. A '-l select=…' line "
+        "in scheduler_options is refused: its resources go here (set cpus_per_node too: without it the chunk asks for "
+        "ncpus=1).",
+        examples=["ngpus=4", "system=polaris"],
+    )
     scheduler_options: str | None = Field(
         default=None,
-        description="Raw scheduler directives injected verbatim into the submit script (Parsl "
-        "scheduler_options) — e.g. a PBS site that holds every job without a filesystems directive needs "
-        "'#PBS -l filesystems=home:eagle'. Omit if none. Multiple directives: newline-separate them. Never the "
-        "account or partition/queue (#SBATCH -A/-p, #PBS -A/-q): those are ensure_endpoint_up(account=…) and "
-        "`partition`, so the spend question names them.",
+        description="Scheduler directives for the submit script's header (Parsl scheduler_options) — e.g. a PBS site "
+        "that holds every job without a filesystems directive needs '#PBS -l filesystems=home:eagle'. Omit if none. "
+        "Multiple directives: newline-separate them. Each line must be a directive of this scheduler at the line's "
+        "start ('#PBS …' on PBS, '#SBATCH …' on Slurm) or a comment ('# …'); a bare option ('-l filesystems=…', as a "
+        "scheduler's message quotes it) is written with the scheduler's prefix and the connect says so; any other "
+        "line is refused (a shell command belongs in env_setup; another batch system's directive word, or one with "
+        "no space after it, is not read as you mean). Never the account, partition/queue, walltime or node count "
+        "(#SBATCH -A/-p/-t/-N, #PBS -A/-q/-l walltime=/select=, bare or prefixed): those are "
+        "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them — a PBS "
+        "chunk's resources (ngpus=4) go in `select_options`, the line's other resources (filesystems=…) on a line of "
+        "their own; on Slurm a GPU is '#SBATCH --gres=gpu:4'. Never the pilot's output file (#SBATCH -o: hpc-bridge "
+        "finds and cancels its pilots by parsl's own) or error file (#SBATCH -e: where it reads why a pilot died), or "
+        "an array (#SBATCH -a, #PBS -J).",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")
