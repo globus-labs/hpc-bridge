@@ -110,8 +110,12 @@ async def test_a_cached_config_with_a_refused_directive_says_why(monkeypatch):
         raise AssertionError("nothing runs")
 
     res = await connect._connect_facility(app, "mine", ssh_host="login.example.edu", run_login=run_login)
-    assert res.phase == "failed" and "cached for 'mine' from an earlier session is no longer accepted" in res.notice
-    assert "#SBATCH --account=secretproj" in res.notice
+    # offered back without the line, for the user to confirm — "connect with ssh_host=" re-read this same record (T2)
+    assert res.phase == "proposed_facility_details"
+    assert "cached for 'mine' from an earlier session is no longer accepted" in res.notice
+    assert "#SBATCH --account=secretproj" in res.notice and "ensure_endpoint_up(account=…)" in res.notice
+    assert res.proposed_details is not None and res.proposed_details.scheduler_options is None
+    assert app.proposed_drafts["mine"] == res.proposed_details and app.proposed_facility == "mine"
 
 
 def test_a_registry_entry_never_sets_the_account_by_directive():

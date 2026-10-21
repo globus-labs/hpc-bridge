@@ -571,7 +571,7 @@ async def _ensure_endpoint_up(
         notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
                                                                   _login_runner(app), confirmed_at=rt.confirmed_at,
                                                                   block=rt.user_endpoint_config.get("hpcb_block"),
-                                                                  requested_at=rt.requested_at)
+                                                                  confirmed_wall=rt.confirmed_wall)
         if probe is not None and probe.category != "unknown":
             job_id = probe.subject
             async with app.lock:
@@ -1090,6 +1090,7 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # A worker answered a check of another call AFTER this stop's last cancel began: that block is up now.
         up_late = _answered_since(app.shapes.get(DEFAULT_SHAPE), settled.released_at)
         warmth._drop_compute_shape_locked(app)  # its spend stays in the session total, its checks with the endpoint
+        app.ssh_left.pop(eid, None)  # the release cancelled every pilot of this endpoint: a re-bind names none
         warmth._settle_checks(app, eid, checks, states)
         # a check sent while the release ran (a concurrent ensure_endpoint_up) was not looked at: what its own future
         # says, else queued
@@ -1618,6 +1619,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         ours = app.state.endpoint_id in (eid, None)
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
         warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
+        app.ssh_left.pop(eid, None)
     await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",

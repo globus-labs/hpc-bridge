@@ -10,7 +10,7 @@ names, so `from hpc_bridge.server import AppCtx` keeps working.
 from __future__ import annotations
 
 import asyncio
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
 from typing import Any, Literal
@@ -115,15 +115,14 @@ class ShapeRuntime:
     # When spend was last confirmed for this shape (time.monotonic()): a pilot that FINISHED and was submitted before it
     # is an earlier session's, not this block's (scheduler_ops._probe_pilots_over_login's `since_s`).
     confirmed_at: float | None = None
+    # The same moment on the wall clock (time.time()): time.monotonic() stops while the machine sleeps (macOS, Linux),
+    # so the confirmation's age the probe compares with the scheduler's submit times is the larger of the two.
+    confirmed_wall: float | None = None
     # The pilots the last provisioning probe listed live for this endpoint (scheduler_ops.PilotProbe.live; recorded by
     # server._ensure_endpoint_up on the block request it was for): so a switch or a reconnect can say what of it is
-    # still queued or HELD — a held pilot never starts on its own, so it runs no task and never idle-releases.
+    # still queued or HELD — a held pilot never starts on its own, so it runs no task and never idle-releases. The
+    # block's own pilot leaves it once a worker answers on it, and again when that block is found gone (a reap).
     pilots: SeenPilots | None = None
-    # When this shape's current block request was made (time.monotonic(); warmth._fresh_block: a new compute user
-    # endpoint, whose pilot is submitted after it). A live pilot submitted before it is an earlier request's — one a
-    # switch or a reconnect left queued or HELD — so the probe names it beside the verdict, never as this block's.
-    # None: no fresh request on this runtime (every live pilot may be this block's).
-    requested_at: float | None = None
     # What a partition or account switch on an SSH endpoint left (warmth._repoint): whether the old terms' block had
     # come up (a worker answered on it: then it idle-releases after its last task), and the pilots last seen for it.
     # Cleared by a confirmation, as `switched_terms` is.
@@ -134,30 +133,48 @@ class ShapeRuntime:
 @dataclass(frozen=True)
 class SeenPilots:
     """Pilot jobs a provisioning probe listed LIVE for this endpoint (queued, held or running in the scheduler), oldest
-    first by job number, as (job, state letter: the scheduler's own — PBS's Q/H/R/W…, Slurm's PENDING/RUNNING…
-    first letter), and when it looked (time.monotonic()). A probe lists every pilot of the endpoint (its `uep.<eid>`
-    marker): an earlier block request's, left by a switch or a reconnect, is listed beside the current one."""
+    first by job number, as (job, state, reason), and when it looked (time.monotonic()). The state is
+    scheduler_ops._pilot_state's: H — held (PBS state H, a Slurm JobHeld* reason): it never starts until released; N —
+    it will not start as submitted (a per-job limit, an invalid account …: the reason says which); R — running; any
+    other letter (PBS Q/W…, Slurm's PENDING) — waiting, which may start later, a limit or an outage included. A probe
+    lists every pilot of the endpoint (its `uep.<eid>` marker): an earlier block request's, left by a switch or a
+    reconnect, or another session's, is listed beside the current one."""
 
-    jobs: tuple[tuple[str, str], ...]
+    jobs: tuple[tuple[str, str, str], ...]
     at: float
     subject: str | None = None  # the pilot the probe's verdict was about (its block request's newest), if listed
 
     @property
     def subject_state(self) -> str | None:
-        return next((s for j, s in self.jobs if j == self.subject), None)
+        return next((s for j, s, _r in self.jobs if j == self.subject), None)
+
+    def reason(self, job: str) -> str:
+        return next((r for j, _s, r in self.jobs if j == job), "")
 
     @property
     def held(self) -> tuple[str, ...]:
-        return tuple(j for j, s in self.jobs if s == "H")
+        return tuple(j for j, s, _r in self.jobs if s == "H")
+
+    @property
+    def never(self) -> tuple[str, ...]:
+        """Will not start as submitted: never runs, never idle-releases, until cancelled."""
+        return tuple(j for j, s, _r in self.jobs if s == "N")
 
     @property
     def waiting(self) -> tuple[str, ...]:
-        """Not running and not held: a pilot that may still start."""
-        return tuple(j for j, s in self.jobs if s not in ("H", "R"))
+        """Not running, held or refused as submitted: a pilot that may still start."""
+        return tuple(j for j, s, _r in self.jobs if s not in ("H", "N", "R"))
 
     @property
     def running(self) -> tuple[str, ...]:
-        return tuple(j for j, s in self.jobs if s == "R")
+        return tuple(j for j, s, _r in self.jobs if s == "R")
+
+    def without(self, jobs: Collection[str | None]) -> SeenPilots | None:
+        """These pilots less `jobs` (a block's own, once it came up or is gone); None when none is left."""
+        kept = tuple(p for p in self.jobs if p[0] not in jobs)
+        if not kept:
+            return None
+        return SeenPilots(jobs=kept, at=self.at, subject=None if self.subject in jobs else self.subject)
 
 
 @dataclass(frozen=True)
@@ -311,6 +328,13 @@ class AppCtx:
     # that omits env_setup takes the proposal's, so the agent never has to echo hpc-bridge's env_setup line back
     # (gpt-oss corrupted a 3.8 KB one doing that, 2026-10-10).
     proposed_drafts: dict[str, FacilityDetails] = field(default_factory=dict)
+    # How a connect wrote a facility's scheduler_options as directives (notices._directive_note), kept until a result
+    # carries it: a connect that answers needs_preauth first is resumed later with no details (connect).
+    directive_notes: dict[str, str] = field(default_factory=dict)
+    # What a re-bind left of an SSH endpoint's compute shape (warmth._ssh_left), by endpoint id: a later re-bind of the
+    # same endpoint finds no compute shape to read and names this instead. Dropped by a confirmation there (the probe
+    # then lists the endpoint's pilots itself), a stop (it cancels them) and a teardown.
+    ssh_left: dict[str, SshLeft] = field(default_factory=dict)
     # Facilities THIS session bootstrapped over SSH (a fresh start, not a reattach). The very next connect
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).

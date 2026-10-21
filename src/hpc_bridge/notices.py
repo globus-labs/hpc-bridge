@@ -22,7 +22,7 @@ from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
 from .runner import CanaryResult, SubmitAnswer
-from .scheduler_ops import _QUOTED, _ask_terms, _jobs_words, _submission_refused, _user_endpoint_logs
+from .scheduler_ops import _END_NOW, _QUOTED, _ask_terms, _pilot_fates, _submission_refused, _user_endpoint_logs
 
 # sshd's own denial lines — the method list in parentheses is the tell (a bare "Permission denied" is
 # usually the remote filesystem: `mkdir … : Permission denied` on an over-quota home, found in review).
@@ -340,35 +340,38 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
     return (lead + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
 
 
+def _cut(line: str, n: int = 120) -> str:
+    return line if len(line) <= n else line[: n - 1] + "…"
+
+
 def _directive_note(rewrites: list[tuple[str, str]]) -> str:
     """connect_facility's report of how the details' scheduler_options were written as directives
-    (binding._directive_details): each bare option, and the line the submit script carries instead. Empty: none."""
+    (binding._directive_details): each bare option or indented directive, and the line the submit script carries
+    instead. Empty: none."""
     if not rewrites:
         return ""
-    shown = "; ".join(f"wrote {given!r} as {written!r}" for given, written in rewrites[:5])
+    # each line as given, up to 120 characters (a longer one is cut, marked by its quote's "…")
+    shown = "; ".join(f"wrote {_cut(given)!r} as {_cut(written)!r}" for given, written in rewrites[:5])
     more = f" (and {len(rewrites) - 5} more lines the same way)" if len(rewrites) > 5 else ""
-    return (f"scheduler_options: {shown}{more} — a submit script reads only a directive line as one: a bare option "
-            "there is a shell command, and the scheduler stops reading directives at it. ")
+    return (f"scheduler_options: {shown}{more} — a submit script reads a directive only from a line that starts with "
+            "it: a bare option there is a shell command (and the scheduler stops reading directives at it), an "
+            "indented directive a comment. ")
+
+
+def _pilot_rows_of(pilots: SeenPilots) -> list[list[str]]:
+    """Recorded pilots as the probe's rows (state, job, -, reason), for scheduler_ops._pilot_fates' words."""
+    return [[state, job, "-", reason] for job, state, reason in pilots.jobs]
 
 
 def _pilots_left_words(pilots: SeenPilots) -> list[str]:
-    """What becomes of pilots a re-bind left in the scheduler, by their state at the last look."""
-    when = f"at the last look ({_ago(pilots.at)})"
-    out = []
-    if pilots.held:
-        out.append(f"{_jobs_words(list(pilots.held))}, held {when} — {_HELD_NEVER}")
-    if pilots.running:
-        out.append(f"{_jobs_words(list(pilots.running))}, running {when} with its worker starting — it runs the "
-                   "hpc-bridge check queued with it and bills until it idle-releases after it")
-    if pilots.waiting:
-        out.append(f"{_jobs_words(list(pilots.waiting))}, still queued {when} — one that starts runs the hpc-bridge "
-                   "check queued with it and bills until it idle-releases after it")
-    return out
+    """What becomes of pilots a re-bind left in the scheduler, by their state at the last look (`_pilot_fates`: a held
+    pilot or one refused as submitted never starts; a waiting or running one runs the check queued with it, bills)."""
+    return [f"at the last look ({_ago(pilots.at)}) " + "; ".join(_pilot_fates(_pilot_rows_of(pilots)))]
 
 
 def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: SshLeft | None) -> str:
     """A connect that re-bound an SSH endpoint cancels nothing there: what is still in its scheduler from before it —
-    the block this session had up (it idle-releases after its last task), the pilots the last probe saw live (a HELD one
+    the block this session had up (it idle-releases after its last task), the pilots the last probe saw live (a held one
     never starts and never idle-releases), or else checks of ours not seen to finish (the endpoint can start a block for
     one) — and how to end it. `same`: this connect bound that endpoint again. Empty when nothing is known left."""
     parts = []
@@ -395,7 +398,7 @@ def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: 
                      "endpoint can start a billed block to run it")
     return ("This connect cancels nothing on this endpoint, and some of this session's earlier work is still there: "
             + "; ".join(parts) + ". stop_endpoint cancels every block of this endpoint, these included, and says when "
-            "none is left (teardown_endpoint ends them too). ")
+            f"none is left (teardown_endpoint ends them too). {_END_NOW} ")
 
 def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
     """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
@@ -476,11 +479,18 @@ def _ssh_block_fate(app: AppCtx, up: bool | None, pilots: SeenPilots | None) -> 
         if state == "H":
             return (f"it never came up — its pilot {job} was held at the last look ({_ago(pilots.at)}), and "
                     f"{_HELD_NEVER}"), True
+        if state == "N":
+            return (f"it never came up — its pilot {job} was one the scheduler will not start as submitted at the "
+                    f"last look ({_ago(pilots.at)}; reason {pilots.reason(job)[:60]!r}): it never runs, and stays in "
+                    "the queue, holding hpc-bridge's check, until it is cancelled"), True
         if state == "R":
             return (f"it never came up — its pilot {job} was RUNNING at the last look ({_ago(pilots.at)}), its worker "
                     f"starting: it runs hpc-bridge's check queued with it, then {idle}"), False
-        return (f"it never came up — its pilot {job} was still queued at the last look ({_ago(pilots.at)}): if it "
-                f"starts, it runs hpc-bridge's check queued with it, then {idle}"), False
+        reason = pilots.reason(job)
+        why = f"; reason {reason[:60]!r}" if reason and reason.lower() != "none" else ""
+        return (f"it never came up — its pilot {job} was still queued at the last look ({_ago(pilots.at)}{why}): if "
+                f"it starts — a limit or an outage it waits on may clear — it runs hpc-bridge's check queued with it, "
+                f"then {idle}"), False
     return (f"it never came up: if its pilot starts, it runs hpc-bridge's check queued with it, then {idle}; a pilot "
             "the scheduler holds never starts and never idle-releases"), False
 

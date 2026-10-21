@@ -240,11 +240,13 @@ class FacilityDetails(BaseModel):
         default=None,
         description="Scheduler directives for the submit script's header (Parsl scheduler_options) — e.g. a PBS site "
         "that holds every job without a filesystems directive needs '#PBS -l filesystems=home:eagle'. Omit if none. "
-        "Multiple directives: newline-separate them. Each line must be a directive ('#PBS …' / '#SBATCH …'); a bare "
-        "option ('-l filesystems=…', as a scheduler's message quotes it) is written with the scheduler's prefix and "
-        "the connect says so; any other line is refused (a shell command belongs in env_setup). Never the account "
-        "or partition/queue (#SBATCH -A/-p, #PBS -A/-q, bare or prefixed): those are ensure_endpoint_up(account=…) "
-        "and `partition`, so the spend question names them.",
+        "Multiple directives: newline-separate them. Each line must be a directive of this scheduler at the line's "
+        "start ('#PBS …' on PBS, '#SBATCH …' on Slurm) or a comment ('# …'); a bare option ('-l filesystems=…', as a "
+        "scheduler's message quotes it) is written with the scheduler's prefix and the connect says so; any other "
+        "line is refused (a shell command belongs in env_setup; another batch system's directive word, or one with "
+        "no space after it, is not read as you mean). Never the account, partition/queue, walltime or node count "
+        "(#SBATCH -A/-p/-t/-N, #PBS -A/-q/-l walltime=/select=, bare or prefixed): those are "
+        "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them.",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")

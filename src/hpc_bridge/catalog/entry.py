@@ -173,42 +173,99 @@ def account_hint_raw_problems(raw: Any) -> list[str]:
 # Slurm short options that take no argument: in a bundle ("-vA x") the scan goes on past them; any other letter takes
 # the rest of the token as its argument, so the scan stops there.
 _SLURM_NO_ARG = frozenset("hHIkOQsvVW")
-_DIRECTIVE = re.compile(r"\s*#(SBATCH|PBS)\s+(.*)")
+# A directive line of any batch system sbatch or qsub reads, with or without a space after its word (`#SBATCH-A x`,
+# `#PBS-Ax` are directives too): sbatch reads `#SLURM` as `#SBATCH`, and translates `#PBS` and `#BSUB` lines after its
+# own pass — so `#BSUB -q gpu` would override the partition parsl writes.
+_DIRECTIVE = re.compile(r"\s*#(SBATCH|SLURM|PBS|BSUB)(.*)")
+# What each of the block's terms is called, in the words a refusal uses.
+TERMS_WORDS = {"account": "the account or the partition/queue", "queue": "the account or the partition/queue",
+               "walltime": "the walltime or the node count", "nodes": "the walltime or the node count"}
+
+
+def _slurm_terms(toks: list[str]) -> str | None:
+    """Slurm's options for the block's terms: -A/--account and -p/--partition (long options by any prefix sbatch
+    accepts: --acco…, --part…; short ones bundled too, "-vA x"; its -q is the QOS), and the size parsl writes before
+    scheduler_options and a later directive overrides: -N/--nodes and -t/--time."""
+    for tok in toks:
+        if m := re.match(r"--(acco|part)[a-z-]*(?:=|$)", tok):
+            return "account" if m.group(1) == "acco" else "queue"
+        if re.match(r"--nodes(?:=|$)", tok):
+            return "nodes"
+        if re.match(r"--time(?:=|$)", tok):
+            return "walltime"
+        if re.match(r"-[^-]", tok):
+            for ch in tok[1:]:
+                if ch in "ApNt":
+                    return {"A": "account", "p": "queue", "N": "nodes", "t": "walltime"}[ch]
+                if ch not in _SLURM_NO_ARG:
+                    break
+    return None
+
+
+def _pbs_terms(toks: list[str]) -> str | None:
+    """PBS's options for the block's terms: -A and -q, and the size and time parsl writes as `-l walltime=…` and
+    `-l select=…` before scheduler_options: a `-l` list naming walltime, select, nodes or nodect."""
+    for i, tok in enumerate(toks):
+        if tok.startswith("-A"):
+            return "account"
+        if tok.startswith("-q"):
+            return "queue"
+        if tok.startswith("-l"):
+            listed = tok[2:] or (toks[i + 1] if i + 1 < len(toks) else "")
+            for item in listed.split(","):
+                name = item.split("=", 1)[0].strip().lower()
+                if name == "walltime":
+                    return "walltime"
+                if name in ("select", "nodes", "nodect"):
+                    return "nodes"
+    return None
+
+
+def _bsub_terms(toks: list[str]) -> str | None:
+    """LSF's (#BSUB, which sbatch translates): -q the queue, -P the project (account), -W the run limit, -n/-nnodes."""
+    for tok in toks:
+        for flag, kind in (("-q", "queue"), ("-P", "account"), ("-W", "walltime"), ("-n", "nodes")):
+            if tok.startswith(flag):
+                return kind
+    return None
+
+
+def scheduler_terms_kind(line: str) -> str | None:
+    """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes"), or None. Any batch
+    system's directive word is read (`_DIRECTIVE`), with its own options."""
+    m = _DIRECTIVE.match(line)
+    if m is None:
+        return None
+    word, rest = m.groups()
+    toks = rest.split()
+    if word in ("SBATCH", "SLURM"):
+        return _slurm_terms(toks)
+    if word == "PBS":
+        return _pbs_terms(toks)
+    return _bsub_terms(toks)
 
 
 def scheduler_terms_directive(opts: str | None) -> str | None:
-    """The first directive line in `opts` that sets the account or the partition/queue behind the block's terms, or
-    None: Slurm's -A/--account and -p/--partition — long options by any prefix sbatch accepts (--acco…, --part…),
-    short ones bundled too ("-vA x"; its -q is the QOS) — and PBS's -A and -q."""
+    """The first directive line in `opts` that sets one of the block's terms (`scheduler_terms_kind`: the account, the
+    partition/queue, the walltime or the node count) behind the spend question, or None."""
     for line in (opts or "").splitlines():
-        m = _DIRECTIVE.match(line)
-        if m is None:
-            continue
-        kind, rest = m.groups()
-        for tok in rest.split():
-            if kind == "PBS":
-                if re.match(r"-[Aq]", tok):
-                    return line.strip()
-                continue
-            if re.match(r"--(?:acco|part)[a-z-]*(?:=|$)", tok):
-                return line.strip()
-            if re.match(r"-[^-]", tok):
-                for ch in tok[1:]:
-                    if ch in "Ap":
-                        return line.strip()
-                    if ch not in _SLURM_NO_ARG:
-                        break
+        if scheduler_terms_kind(line) is not None:
+            return line.strip()
     return None
 
 
 def _without_terms_directives(opts: str | None) -> str | None:
-    """`opts` with every account/partition directive line dropped (None when nothing is left)."""
+    """`opts` with every directive line that sets one of the block's terms dropped (None when nothing is left)."""
     kept = [ln for ln in (opts or "").splitlines() if scheduler_terms_directive(ln) is None]
     return "\n".join(kept) or None
 
 
 # The prefix each scheduler reads a directive by, at the start of a line of a submit script's header.
 DIRECTIVE_PREFIX = {"slurm": "#SBATCH", "pbs": "#PBS"}
+# A bare option, as each scheduler's directive is shown in a refusal (sbatch has no -l).
+_OPTION_EXAMPLE = {"slurm": "--<option>=…", "pbs": "-l <resource>=…"}
+# A plain comment: "#" alone, or "#" and a space or a tab.
+_PLAIN_COMMENT = re.compile(r"#(?:[ \t].*)?")
 
 
 class SchedulerOptionsError(ValueError):
@@ -220,16 +277,20 @@ def directive_lines(opts: str | None, scheduler: str | None) -> tuple[str | None
 
     parsl writes scheduler_options into the header verbatim, so a line there must be a directive. A line that starts
     with "-" is an option written bare, as a scheduler's own message quotes one ("-l filesystems=…"): it gets the prefix
-    ("#PBS -l filesystems=…"). A line that starts with "#" (a directive, or a comment) is kept as given. A blank line
-    carries nothing and is dropped. Any other line is not a directive: in the script it is a shell command, and the
-    scheduler stops reading directives at it — on Slurm, parsl writes the partition and account directives AFTER
-    scheduler_options, so they would be ignored. Returns (the text, None when nothing is left; each rewrite as (given,
-    written); each such other line). Lines are split as Python splits them (`scheduler_terms_directive` reads them so)
-    and joined with "\n", so every break that check reads is a line break in the script too. A scheduler with no prefix
-    here (LSF, not supported) gets `opts` back unchanged."""
+    ("#PBS -l filesystems=…"). A line of THIS scheduler's directive — its prefix and a space, at the line's start — is
+    kept as given; one with whitespace before it (a comment to the scheduler) has it taken off. A plain comment (`# …`)
+    is kept. A blank line carries nothing and is dropped. Any other line is refused (`other`): a shell command (in the
+    script it runs, and the scheduler stops reading directives at it — on Slurm, parsl writes the partition and account
+    directives AFTER scheduler_options, so they would be ignored), another batch system's directive word (sbatch reads
+    `#SLURM` and translates `#PBS` and `#BSUB` lines — after its own, so they override; `#SBATCH` on PBS does nothing),
+    or a directive with no space after its word (`#SBATCH-A x`). Returns (the text, None when nothing is left; each
+    rewrite as (given, written); each refused line). Lines are split as Python splits them (`scheduler_terms_directive`
+    reads them so) and joined with "\n", so every break that check reads is a line break in the script too. A scheduler
+    with no prefix here (LSF, not supported) gets `opts` back unchanged."""
     prefix = DIRECTIVE_PREFIX.get(scheduler or "")
     if prefix is None or not opts:
         return opts or None, [], []
+    own = re.compile(rf"{re.escape(prefix)}[ \t]")
     kept: list[str] = []
     rewrites: list[tuple[str, str]] = []
     other: list[str] = []
@@ -237,24 +298,34 @@ def directive_lines(opts: str | None, scheduler: str | None) -> tuple[str | None
         given = line.strip()
         if not given:
             continue
-        if given.startswith("#"):
-            kept.append(line)
-        elif given.startswith("-"):
+        if given.startswith("-"):
             kept.append(f"{prefix} {given}")
             rewrites.append((given, kept[-1]))
+        elif own.match(given):
+            if line[:1].isspace():  # indented: the scheduler would read it as a comment
+                kept.append(given)
+                rewrites.append((line.rstrip(), given))
+            else:
+                kept.append(line)
+        elif _PLAIN_COMMENT.fullmatch(given):
+            kept.append(line)
         else:
             other.append(given)
     return "\n".join(kept) or None, rewrites, other
 
 
 def scheduler_options_problem(other: list[str], scheduler: str | None) -> str:
-    """Why scheduler_options with `other` (non-directive lines) are refused, and what to write instead."""
+    """Why scheduler_options with `other` (lines `directive_lines` refuses) are refused, and what to write instead."""
     prefix = DIRECTIVE_PREFIX.get(scheduler or "", "#PBS")
-    shown = ", ".join(repr(ln[:120]) for ln in other[:3]) + (f" and {len(other) - 3} more" if len(other) > 3 else "")
-    return (f"scheduler_options has a line that is not a scheduler directive ({shown}): in the submit script it would "
-            "be a shell command, and the scheduler stops reading directives at it (on Slurm the partition and account "
-            f"directives come after it). Write each line as a directive ({prefix} …) or as an option (-l …, written as "
-            f"{prefix} -l …); a shell command belongs in env_setup")
+    example = _OPTION_EXAMPLE.get(scheduler or "", "-l <resource>=…")
+    # at most two lines, each cut to 80 characters: the remedy after them must survive the connect's cut
+    shown = ", ".join(repr(ln[:80]) for ln in other[:2]) + (f" and {len(other) - 2} more" if len(other) > 2 else "")
+    return (f"scheduler_options has a line that is not a {prefix} directive or a plain comment ({shown}): a shell "
+            "command would run in the submit script and end the scheduler's reading of directives (on Slurm the "
+            "partition and account directives come after it), another batch system's directive word may be read as "
+            "this one's or ignored, and a directive needs a space after its word. Write each line as a directive "
+            f"({prefix} …), as an option ({example}, written as {prefix} {example}), or as a comment (# …); a shell "
+            "command belongs in env_setup")
 
 
 def ssh_scheduler_options(opts: str | None, scheduler: str | None) -> str | None:
@@ -290,15 +361,16 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
         # (the client prefixes a bare option and drops any other line; a facility endpoint's template is its own)
         written, rewrites, other = directive_lines(opts, compute.get("scheduler"))
         if rewrites:
-            problems.append(f"compute.scheduler_options has a bare option ({rewrites[0][0]!r}): write it as the "
-                            f"directive {rewrites[0][1]!r}")
+            problems.append(f"compute.scheduler_options has a bare option ({rewrites[0][0][:120]!r}): write it as "
+                            f"the directive {rewrites[0][1][:120]!r}")
         if other:
             problems.append("compute." + scheduler_options_problem(other, compute.get("scheduler")))
-        opts = written  # the account/queue check reads the lines as the script would carry them
+        # the terms check reads the lines as the script would carry them, and the refused ones too (`#SLURM --account`)
+        opts = "\n".join([*([written] if written else []), *other]) or None
     for where, o in (("compute.scheduler_options", opts), ("defaults.extra.scheduler_options", extra_opts)):
         if isinstance(o, str) and (line := scheduler_terms_directive(o)):
-            problems.append(f"{where} sets the account or the partition/queue ({line!r}): the block's terms must "
-                            "name them")
+            what = TERMS_WORDS[scheduler_terms_kind(line) or "account"]
+            problems.append(f"{where} sets {what} ({line[:120]!r}): the block's terms must name them")
     return problems
 
 

@@ -227,11 +227,16 @@ async def _connect_facility(
                 notice=f"invalid facility details: {type(exc).__name__}: {exc}"[:_DETAILS_ERROR_CAP],
             )
         directive_note = _directive_note(rewrites)
+        if directive_note:  # kept until a result carries it (a needs_preauth first is resumed with no details)
+            app.directive_notes[facility] = directive_note
+        else:
+            app.directive_notes.pop(facility, None)
         app.session_facilities[facility] = entry  # this session's config; on disk only once PROVEN (below)
         if details.ssh_host:  # persist for LOCAL DISCOVERY — but only once the login shape is PROVEN warm
             app.pending_facility_cache[facility] = (details.ssh_host, details.model_dump(mode="json"))
     else:
         entry = app.session_facilities.get(facility)
+        directive_note = app.directive_notes.get(facility, "") if entry is not None else ""
         registry_error: Exception | None = None
         if entry is None:
             # THE REGISTRY WINS for any catalogued id (decision 2026-09-03: curated entries are the stable
@@ -256,12 +261,11 @@ async def _connect_facility(
                     entry = binding._entry_from_details(facility, cached_details)
                     app.session_facilities[facility] = entry
                     directive_note = _directive_note(rewrites)  # a bare option cached by an earlier plugin
-                except binding.SchedulerOptionsError as exc:  # cached before such options were refused: say so
-                    return ConnectFacilityResult(
-                        phase="failed", facility=facility,
-                        notice=(f"the configuration cached for {facility!r} from an earlier session is no longer "
-                                f"accepted: {exc}. Connect with details= (without that directive), or with ssh_host= "
-                                "for a fresh proposal. Nothing was started."))
+                    if directive_note:
+                        app.directive_notes[facility] = directive_note
+                except binding.SchedulerOptionsError:  # cached before such lines were refused: offered back, without
+                    # them, for the user to confirm — "with ssh_host=" would re-read this same record (keyed on it)
+                    return _cached_refusal_proposal(app, facility, FacilityDetails(**cached))
                 except Exception:  # noqa: BLE001 - stale/invalid cached config
                     entry = None
         if entry is None and registry_error is not None:
@@ -320,6 +324,12 @@ async def _connect_facility(
         sched = getattr(app.facility, "scheduler", None)
         # an SSH endpoint's block and pilots: a re-bind cancels none of them (a stop does) — said, not "nothing billed"
         ssh_left = None if old_mep else warmth._ssh_left(compute)
+        if ssh_left is None and not old_mep and old_eid is not None:
+            # an earlier re-bind left it and dropped the shape it was read from: name it again (the live polaris run's
+            # follow-up connect fell back to "a check … may still be queued")
+            ssh_left = app.ssh_left.get(old_eid)
+        if ssh_left is not None and old_eid is not None:  # until a confirmation or a stop there (warmth, server)
+            app.ssh_left[old_eid] = ssh_left
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's runners and handles are gone
         # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
         queued_left = 0 if old_mep or old_eid is None else warmth._unresolved_count(
@@ -390,6 +400,7 @@ async def _connect_facility(
     reuse_note = checks_note + reuse_note
     still = bool(checks_note) or left is not None  # something of this session is still there: never "nothing billed"
     terms = _next_block_terms(app)
+    carried = app.directive_notes.pop(facility, None)  # the result below carries the rewrite (bar a failed listing)
     if block != "warm":  # login node still coming up — nothing to read yet
         return ConnectFacilityResult(
             phase="provisioning",
@@ -411,6 +422,8 @@ async def _connect_facility(
         )
     out = await run_login(entry.allocation.command)
     if out.phase != "complete" or out.exit_code != 0:
+        if carried:  # not said here: the next connect says it
+            app.directive_notes[facility] = carried
         return ConnectFacilityResult(
             phase="failed",
             facility=facility,
@@ -428,6 +441,25 @@ async def _connect_facility(
                              "login node is up; the allocation listing returned none. ")
         + _connect_terms_note(app, terms, listed=bool(allocations), left=still),
     )
+
+def _cached_refusal_proposal(app: AppCtx, facility: str, cached: FacilityDetails) -> ConnectFacilityResult:
+    """A configuration cached by an earlier session whose scheduler_options hold lines hpc-bridge now refuses (a shell
+    command, another batch system's directive, the account, the queue, the walltime or the size): offered back as a
+    PROPOSAL without them (`binding._accepted_details`), saying what was left out and why, for the user to confirm with
+    details= — the store is keyed on ssh_host, so "connect with ssh_host= for a fresh proposal" re-read the same record
+    and the agent looped. Nothing is bound; the draft seeds `proposed_drafts`, so details= may leave env_setup out."""
+    draft, dropped = binding._accepted_details(cached)
+    app.proposed_facility = facility  # a run_shell meanwhile is told to finish this connect
+    app.proposed_drafts[facility] = draft
+    shown = "; ".join(dropped[:5]) + (f"; and {len(dropped) - 5} more" if len(dropped) > 5 else "")
+    return ConnectFacilityResult(
+        phase="proposed_facility_details", facility=facility, proposed_details=draft,
+        notice=(f"the configuration cached for {facility!r} from an earlier session is no longer accepted as it is: "
+                f"its scheduler_options carry lines hpc-bridge no longer sends — {shown}. This is that configuration "
+                "without them (`proposed_details`): review it WITH THE USER (a directive they need goes back in this "
+                f"scheduler's own form), then call connect_facility({facility!r}, details=…); leave env_setup out to "
+                "keep the cached one. Nothing was started."))
+
 
 def _left_checks_note(app: AppCtx, old_eid: str | None, queued: int, left: SshLeft | None = None) -> str:
     """A re-bind of an SSH endpoint cancels nothing there (a stop does): what this session's earlier work left in its

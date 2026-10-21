@@ -140,14 +140,43 @@ _SAID_LOOP = (
 )
 
 
-def _pilot_status_cmd(scheduler: str, eid: str, block: int | None = None) -> str:
+def _pilot_status_cmd(scheduler: str, eid: str, block: int | None = None, *, request: int | None = None) -> str:
     """Login-shape one-liner that prints THIS endpoint's pilot block(s) as `STATE JOBID` lines,
     matched by the same `uep.<eid>` StdOut marker `_release_cmd` uses (so it never reads another
     endpoint's jobs). Read-only — the diagnostic twin of `_release_cmd`. Empty output ⇒ no pilot is
     in the scheduler (submission rejected, or not yet registered). `HPCB_SAID <jobid> <line>` rows carry a finished
     pilot's own `hpc-bridge: …` line (`_SAID_LOOP`); `HPCB_REFUSED <line>` rows, the submit command's answer to block
-    request `block`, from its own user endpoint's log (`_refusal_cmd`; the caller asks for it only past the grace)."""
-    return "{ " + _pilot_rows_cmd(scheduler, eid) + "; } | " + _SAID_LOOP + _refusal_cmd(eid, block)
+    request `block`, from its own user endpoint's log (`_refusal_cmd`; the caller asks for it only past the grace);
+    `HPCB_DIR <jobid> <user endpoint id>` rows, the user endpoint each pilot belongs to; `HPCB_REQ <user endpoint id>`
+    rows, the user endpoint(s) block request `request` started (`_request_cmd`)."""
+    return ("{ " + _pilot_rows_cmd(scheduler, eid) + "; } | " + _SAID_LOOP + _refusal_cmd(eid, block)
+            + _request_cmd(eid, request))
+
+
+
+def _request_cmd(eid: str, request: int | None) -> str:
+    """Which user endpoint(s) of `eid` block request `request` started: each prints `HPCB_REQ <its id>`. A user
+    endpoint's directory is `uep.<eid>.<its id>`, and its own log names its block request at its start
+    (BLOCK_REQUEST_LOG, the template's endpoint_setup line, among a life's first lines; every life logs it again) —
+    matched to the END of the line, so 12 never matches 123. Only each log's first `_REQUEST_HEAD` bytes are read (the
+    first life's start), and the rotated copy's (`endpoint.log.1`, which holds that start once the log has rotated): a
+    probe runs on every provisioning poll, and a long-lived log is never scanned through. A pilot's user endpoint is
+    read from its own path (`HPCB_DIR`), so this names THIS request's pilots exactly, whatever their job numbers or
+    submit times — or another session's on the same endpoint. "" with no block request (an endpoint configured before
+    the template named one) or an endpoint id that is not a UUID. Read-only; built only from a UUID and a whole
+    number."""
+    n = block_number(request)
+    if n is None or not _UUID.fullmatch(eid or ""):
+        return ""
+    want = shlex.quote(f"{BLOCK_REQUEST_LOG}{n}$")
+    return (f'; for f in "{_GC_DIR}"/uep.{eid}.*/endpoint.log "{_GC_DIR}"/uep.{eid}.*/endpoint.log.1; do '
+            f'[ -r "$f" ] && head -c {_REQUEST_HEAD} -- "$f" 2>/dev/null | grep -qE -e {want} && '
+            f'{{ d=${{f%/endpoint.log*}}; echo "HPCB_REQ ${{d##*/uep.{eid}.}}"; }}; done; true')
+
+
+# How much of a user endpoint log's head names its block request: the line comes before the engine starts, within a
+# life's first lines (a few KB); the margin is generous and still bounds each probe's read.
+_REQUEST_HEAD = 65536
 
 
 # Where an endpoint's user endpoints live on the login node, as the login shape (forked by the same manager, with its
@@ -275,10 +304,12 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
             'x="-"; if (match($0,/Exit_status = -?[0-9]+/)) x=substr($0,RSTART+14,RLENGTH-14); '
             'c=""; if (match($0,/comment = [^\\n]*/)) c=substr($0,RSTART+10,RLENGTH-10); '
             "print s\" \"$1\" \"x\" \"c; "
-            # every pilot's creation time, as qstat prints it (`_SAID_LOOP` turns it into HPCB_SUB): a finished one
-            # older than this block's confirmation is an earlier session's; a live one older than its block request is
-            # an earlier request's, left in the queue by a switch or a reconnect
-            'if (match($0,/ctime = [^\\n]*/)) print "HPCB_QT "$1" "substr($0,RSTART+8,RLENGTH-8); '
+            # a finished pilot's creation time, as qstat prints it (`_SAID_LOOP` turns it into HPCB_SUB)
+            'if (s ~ /^[FEX]$/ && match($0,/ctime = [^\\n]*/)) print "HPCB_QT "$1" "substr($0,RSTART+8,RLENGTH-8); '
+            # the user endpoint it is a pilot of: its Output_Path is that user endpoint's own directory,
+            # uep.<eid>.<user endpoint id>/submit_scripts/… — the one a block request names (`_request_cmd`)
+            'i=index($0,m"."); if (i) {u=substr($0,i+length(m)+1); '
+            'if (match(u,/^[0-9A-Za-z-]+/)) print "HPCB_DIR "$1" "substr(u,1,RLENGTH)} '
             # where a pilot that ran and died wrote its stderr (Error_Path is host:path)
             'if (s ~ /^[FEX]$/ && x != "-" && match($0,/Error_Path = [^\\n]*/)) '
             '{p=substr($0,RSTART+13,RLENGTH-13); sub(/^[^:]*:/,"",p); print "HPCB_ERR "$1" "p}}\'; '
@@ -292,14 +323,14 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
     # simply ended). Filter by the marker INSIDE awk (not `grep -F | awk`): grep exits non-zero on no-match, which
     # under a `set -o pipefail` shell would mask an empty result as an error and swallow the "no pilot" signal.
     # sacct is best-effort (no accounting daemon ⇒ `HPCB_FAIL sacct` and no rows). Submit comes LAST, after SubmitLine,
-    # as epoch seconds (SLURM_TIME_FORMAT is an strftime format). A live pilot's SubmitTime too (`HPCB_SUB`), BEFORE
-    # its Reason, which may hold spaces ("ReqNodeNotAvail, UnavailableNodes:…"): one older than this block's request
-    # is an earlier request's.
+    # as epoch seconds (SLURM_TIME_FORMAT is an strftime format). Each pilot's user endpoint (`HPCB_DIR`) is read from
+    # the path the marker is found in: squeue's StdOut, sacct's SubmitLine (the script), both in that user endpoint's
+    # own directory.
     return (
-        now + 'if q=$(SLURM_TIME_FORMAT=%s squeue -u "$USER" -h -O "State:20,JobID:24,SubmitTime:24,Reason:60,'
-        'StdOut:1024" 2>/dev/null); '
-        f"then printf '%s\\n' \"$q\" | awk -v m={m} 'index($0,m){{print $1\" \"$2\" - \"$4; "
-        "if ($3 ~ /^[0-9]+$/) print \"HPCB_SUB \"$2\" \"$3}'; "
+        now + 'if q=$(squeue -u "$USER" -h -O "State:20,JobID:24,Reason:60,StdOut:1024" 2>/dev/null); '
+        f"then printf '%s\\n' \"$q\" | awk -v m={m} 'index($0,m){{print $1\" \"$2\" - \"$3; "
+        'i=index($0,m"."); if (i) {u=substr($0,i+length(m)+1); '
+        "if (match(u,/^[0-9A-Za-z-]+/)) print \"HPCB_DIR \"$2\" \"substr(u,1,RLENGTH)}}'; "
         'else echo "HPCB_FAIL squeue"; fi; '
         'if a=$(SLURM_TIME_FORMAT=%s sacct -X -n -P -u "$USER" -S now-6hours -o State,JobID,ExitCode,SubmitLine,Submit '
         "2>/dev/null); "
@@ -310,17 +341,30 @@ def _pilot_rows_cmd(scheduler: str, eid: str) -> str:
         'if (st == "COMPLETED" && x == "0") x="-"; '
         "print \"F \"$2\" \"x\" \"st; "
         'if ($5 ~ /^[0-9]+$/) print "HPCB_SUB "$2" "$5; '
+        'i=index($4,m"."); if (i) {u=substr($4,i+length(m)+1); '
+        'if (match(u,/^[0-9A-Za-z-]+/)) print "HPCB_DIR "$2" "substr(u,1,RLENGTH)} '
         # where a pilot that ran and died wrote its stderr: parsl's `<script>.stderr`, the script being the last word
         # of SubmitLine
         'if (x != "-") {n=split($4,w," "); print "HPCB_ERR "$2" "w[n]".stderr"}}\'; '
         'else echo "HPCB_FAIL sacct"; fi; true'
     )
 
-# Slurm PENDING reasons that mean "never, as submitted" (Slurm leaves such a job PENDING forever unless
-# EnforcePartLimits rejects it at submit) — the Slurm analogue of a PBS hold.
-_NEVER_PENDING = re.compile(
-    r"PartitionTimeLimit|PartitionNodeLimit|PartitionConfig|QOS\w*Limit|Assoc\w*Limit|JobHeld|BadConstraints|"
-    r"InvalidAccount|InvalidQOS|ReqNodeNotAvail|DependencyNeverSatisfied|AccountNotAllowed|PartitionDown", re.I)
+# Slurm PENDING reasons the pilot verdict tells the user about (the scheduler will not start the pilot as things stand),
+# by what they mean for it (`_pilot_state`):
+# - a HOLD (JobHeldUser / JobHeldAdmin): it never starts until someone releases it — the Slurm twin of PBS's state H;
+_HOLD_REASON = re.compile(r"JobHeld", re.I)
+# - a request that can never be met AS SUBMITTED (Slurm leaves such a job PENDING forever unless EnforcePartLimits
+#   rejects it at submit): a per-job limit of the partition, QOS or association, an invalid account or QOS, a
+#   constraint no node has, a dependency that can never be satisfied;
+_NOT_AS_SUBMITTED = re.compile(
+    r"PartitionTimeLimit|PartitionNodeLimit|PartitionConfig|BadConstraints|InvalidAccount|InvalidQOS|"
+    r"AccountNotAllowed|DependencyNeverSatisfied|(?:QOS|Assoc)\w*PerJob\w*|QOSMin\w*", re.I)
+# - a limit or an outage that CLEARS — jobs or resources this user, account or group already uses (QOSMaxJobsPerUser…,
+#   AssocMaxJobsLimit, QOSGrp*/AssocGrp*), a reservation or maintenance (ReqNodeNotAvail), a partition that is down:
+#   the pilot may start later on its own, and bills from then until it idle-releases. (Checked after the two above:
+#   `QOS\w*Limit` also matches a per-job limit.)
+_WAIT_REASON = re.compile(r"QOS\w*Limit|Assoc\w*Limit|ReqNodeNotAvail|PartitionDown", re.I)
+_NEVER_PENDING = re.compile(f"{_HOLD_REASON.pattern}|{_NOT_AS_SUBMITTED.pattern}|{_WAIT_REASON.pattern}", re.I)
 
 # A finished row's state: PBS's F/E/X (with -x), and the `F` the Slurm rows command prints for sacct's finished pilots.
 _DONE_STATES = frozenset("FEX")
@@ -437,12 +481,23 @@ def _venv_verdict(m: re.Match[str]) -> str:
 
 
 def _pilot_state(row: list[str]) -> str:
-    """A live pilot row's state letter (PBS Q/H/R/W…, Slurm's word's first letter), with a waiting pilot whose reason
-    says the scheduler will never start it as submitted (`_NEVER_PENDING`: a Slurm PENDING reason) read as held: H."""
+    """A live pilot row's state: H — held (PBS state H; a Slurm `_HOLD_REASON`): it never starts until released; N — a
+    request the scheduler cannot meet as submitted (`_NOT_AS_SUBMITTED`); R — running; otherwise its own letter (PBS
+    Q/W…, Slurm's PENDING): waiting — a limit or an outage that clears (`_WAIT_REASON`) included, since that pilot may
+    start later and bill."""
     state = row[0][:1].upper()
-    if state not in ("H", "R") and len(row) > 3 and _NEVER_PENDING.search(row[3]):
+    if state in ("H", "R"):
+        return state
+    reason = row[3] if len(row) > 3 else ""
+    if _HOLD_REASON.search(reason):
         return "H"
+    if _NOT_AS_SUBMITTED.search(reason):
+        return "N"
     return state
+
+
+def _reason(row: list[str]) -> str:
+    return row[3].strip() if len(row) > 3 else ""
 
 
 def _by_age(rows: list[list[str]]) -> list[list[str]]:
@@ -454,9 +509,10 @@ def _by_age(rows: list[list[str]]) -> list[list[str]]:
     return sorted(rows, key=number)
 
 
-def _live_pilots(rows: list[list[str]]) -> tuple[tuple[str, str], ...]:
-    """(job, state letter) of each live pilot row, oldest first (`_by_age`, `_pilot_state`)."""
-    return tuple((r[1], _pilot_state(r)) for r in _by_age(rows) if len(r) > 1)
+def _live_pilots(rows: list[list[str]]) -> tuple[tuple[str, str, str], ...]:
+    """(job, state, reason) of each live pilot row, oldest first (`_by_age`, `_pilot_state`; the reason is Slurm's, or
+    PBS's comment, cut to 120 characters)."""
+    return tuple((r[1], _pilot_state(r), _reason(r)[:120]) for r in _by_age(rows) if len(r) > 1)
 
 
 _STATE_WORDS = {"Q": "queued", "P": "PENDING", "R": "RUNNING", "W": "waiting", "S": "suspended", "T": "in transit"}
@@ -466,24 +522,52 @@ def _jobs_words(jobs: list[str]) -> str:
     return f"pilot {jobs[0]}" if len(jobs) == 1 else "pilots " + ", ".join(jobs[:-1]) + f" and {jobs[-1]}"
 
 
+# What a held pilot is, and what ends it: no reconnect does (connect_facility cancels nothing), a stop does.
+_HELD_FATE = ("a held pilot runs no task and never idle-releases, so it stays in the queue until it is cancelled — "
+              "connect_facility does not cancel it; stop_endpoint does (every pilot of this endpoint).")
+# The one way to end such a pilot before another block is asked for — without it, a per-user limit on queued jobs can
+# make the new block's submission read as refused, and the old pilot stays queued.
+_END_NOW = "To end it now, call stop_endpoint before confirming the new block."
+
+
+def _pilot_fates(rows: list[list[str]]) -> list[str]:
+    """What becomes of each of these live pilots, grouped by `_pilot_state`, in words for an agent: a held one never
+    starts (lower-case "held": the upper-case HELD is a verdict's word, for the pilot a notice is about), one refused as
+    submitted never runs, a running or waiting one runs the check queued with it and bills until it idle-releases."""
+    rows = _by_age(rows)
+    by: dict[str, list[list[str]]] = {"H": [], "N": [], "R": [], "W": []}
+    for r in rows:
+        s = _pilot_state(r)
+        by[s if s in ("H", "N", "R") else "W"].append(r)
+    out = []
+    if by["H"]:
+        out.append(f"{_jobs_words([r[1] for r in by['H']])}, held — a held pilot never starts on its own, so it runs "
+                   "no task and never idle-releases: it stays in the queue until it is cancelled")
+    if by["N"]:
+        jobs = [f"{r[1]} (reason {_reason(r)[:60]!r})" for r in by["N"]]
+        out.append(f"{_jobs_words(jobs)}, which the scheduler will not start as submitted — it never runs, and stays "
+                   "in the queue until it is cancelled")
+    if by["R"]:
+        out.append(f"{_jobs_words([r[1] for r in by['R']])}, running — it runs the check queued with it, then "
+                   "idle-releases after it")
+    if by["W"]:
+        jobs = [f"{r[1]} ({_STATE_WORDS.get(r[0][:1].upper(), r[0][:20])}"
+                + (f", reason {_reason(r)[:60]!r})" if _reason(r) and _reason(r).lower() != "none" else ")")
+                for r in by["W"]]
+        out.append(f"{_jobs_words(jobs)} — one that starts later runs the check queued with it and bills until it "
+                   "idle-releases after it")
+    return out
+
+
 def _earlier_pilots(rows: list[list[str]]) -> str:
-    """The live pilots of this endpoint older than the one a verdict is about — an earlier block request's, which a
-    partition/account switch or a reconnect left in the scheduler (neither cancels one) — and what becomes of them.
-    "held" in lower case: the upper-case HELD is the verdict's word, for the pilot the notice is about."""
+    """The live pilots of this endpoint beside the one a verdict is about — an earlier block request's, which a
+    partition/account switch or a reconnect left in the scheduler (neither cancels one), or another session's on this
+    endpoint — and what becomes of them (`_pilot_fates`)."""
     if not rows:
         return ""
-    rows = _by_age(rows)
-    held = [r[1] for r in rows if _pilot_state(r) == "H"]
-    other = [f"{r[1]} ({_STATE_WORDS.get(_pilot_state(r), r[0])})" for r in rows if _pilot_state(r) != "H"]
-    parts = []
-    if held:
-        parts.append(f"{_jobs_words(held)}, held — a held pilot never starts on its own, so it runs no task and never "
-                     "idle-releases: it stays in the queue until it is cancelled")
-    if other:
-        parts.append(f"{_jobs_words(other)} — one that starts runs the hpc-bridge check queued with it, then "
-                     "idle-releases after it")
-    return (" This endpoint's earlier pilots are still in the scheduler too: " + "; ".join(parts) + ". stop_endpoint "
-            "cancels every pilot of this endpoint, these included.")
+    return (" Other pilots of this endpoint are still in the scheduler too (an earlier block request's, or another "
+            "session's): " + "; ".join(_pilot_fates(rows)) + ". stop_endpoint cancels every pilot of this endpoint, "
+            "these included.")
 
 
 def _directive_form(scheduler: str | None) -> str:
@@ -498,53 +582,80 @@ def _directive_form(scheduler: str | None) -> str:
             f"`{prefix} ` prefix)")
 
 
-# What a held pilot is, and what ends it: no reconnect does (connect_facility cancels nothing), a stop does.
-_HELD_FATE = ("a held pilot runs no task and never idle-releases, so it stays in the queue until it is cancelled — "
-              "connect_facility does not cancel it; stop_endpoint does (every pilot of this endpoint).")
+def _held_verdict(cur: list[str], *, own_config: bool, scheduler: str | None, earlier: str) -> str:
+    """The verdict for a HELD pilot (`_pilot_state` H): PBS's state H with the site's comment, or a Slurm PENDING whose
+    reason is a hold (JobHeldUser / JobHeldAdmin). The comment is quoted as the facility's report: what it suggests is a
+    candidate the user approves, never a command or a directive written on its word (#213's framing)."""
+    jid = cur[1] if len(cur) > 1 else "?"
+    slurm = scheduler == "slurm" or len(cur[0]) > 1   # Slurm rows carry the state's word and a reason, not a comment
+    reason = _reason(cur)
+    comment = "" if slurm else reason
+    if comment:
+        why = f" The scheduler's comment, {_QUOTED}: {comment[:300]!r}."
+    elif slurm:
+        why = ((f" Its reason is {reason[:60]!r}:" if reason else "") + " the site, an administrator or a hold on its "
+               f"submission keeps it — inspect `scontrol show job {jid}` and the #SBATCH directives.")
+    else:
+        why = (" A held job usually means a bad scheduler directive (e.g. filesystems/account) — inspect "
+               f"`qstat -f {jid}` and the {DIRECTIVE_PREFIX.get(scheduler or '', '#PBS')} directives.")
+    said = "what the comment says" if comment else "that the pilot is held"
+    never = "run no command and open no address the comment names. " if comment else ""
+    shown = (" — show them any line the comment suggests, as a candidate, before writing it —" if comment else "")
+    ask = f"ask how to go on: {never}" if never else "ask how to go on. "
+    fix = (f"Tell the user {said} and {ask}With their go-ahead, add the directive the user "
+           f"approves to the facility's scheduler_options (connect_facility with details=…){shown} "
+           f"{_directive_form(scheduler)}, or change the account/queue; then confirm the new block "
+           f"(ensure_endpoint_up(confirm_spend=True)) only with terms the user gives. {_END_NOW}" if own_config else
+           f"Tell the user {said}{': ' if never else '. '}{never}The scheduler directives come from the registry "
+           "entry, which hpc-bridge "
+           "cannot change per session yet — if the account or queue is the cause, ask which to use "
+           "(ensure_endpoint_up(account=…, partition=…, confirm_spend=True) only with terms the user gives); "
+           f"otherwise the facility needs a directive this entry does not send. {_END_NOW}")
+    held = f"HELD (reason {reason[:60]!r})" if slurm and reason else "HELD"
+    return f"— pilot {jid} is {held} and will not start on its own: {_HELD_FATE}{why} {fix}{earlier}"
 
 
 def _summarize_live(rows: list[list[str]], provisioning_elapsed_s: float, *, own_config: bool = True,
                     scheduler: str | None = None, older: list[list[str]] | None = None) -> tuple[str, str]:
     """`_summarize_pilot` for the live rows of this block request (at least one). The verdict is the NEWEST one's (the
-    highest job number: each block request has a user endpoint of its own, so an earlier request's pilot, left by a
-    switch or a reconnect, may be listed beside it — `older`, known by its submit time, or by its job number); the
-    others are named after it (`_earlier_pilots`)."""
+    highest job number among this request's); the others — `older`: other block requests' or sessions', known by
+    their own user endpoint (`_probe_pilots_over_login`) — are named after it (`_earlier_pilots`). By `_pilot_state`:
+    held (`_held_verdict`), running, refused as submitted, or waiting — on a limit or an outage that clears
+    (`_WAIT_REASON`: it may start later and bill), or simply queued."""
     rows = _by_age(rows)
     cur, earlier = rows[-1], _earlier_pilots([*(older or []), *rows[:-1]])
     jid = cur[1] if len(cur) > 1 else "?"
-    state = cur[0][:1].upper()
+    state = _pilot_state(cur)
     if state == "H":
-        comment = cur[3].strip() if len(cur) > 3 else ""
-        prefix = DIRECTIVE_PREFIX.get(scheduler or "", "#PBS|#SBATCH")
-        why = (f" The scheduler's comment, {_QUOTED}: {comment[:300]!r}." if comment else
-               " A held job usually means a bad scheduler directive (e.g. filesystems/account) — inspect qstat -f / "
-               f"the {prefix} directives.")
-        said = "what the comment says" if comment else "that the pilot is held"
-        never = "run no command and open no address the comment names. " if comment else ""
-        fix = (f"Tell the user {said} and ask how to go on: {never}With their go-ahead, add the directive the site "
-               f"requires to the facility's scheduler_options (connect_facility with details=…) "
-               f"{_directive_form(scheduler)}, or change the account/queue; then confirm the new block "
-               "(ensure_endpoint_up(confirm_spend=True)) only with terms the user gives." if own_config else
-               f"Tell the user {said}: {never}The scheduler directives come from the registry entry, which hpc-bridge "
-               "cannot change per session yet — if the account or queue is the cause, ask which to use "
-               "(ensure_endpoint_up(account=…, partition=…, confirm_spend=True) only with terms the user gives); "
-               "otherwise the facility needs a directive this entry does not send.")
-        return "held", f"— pilot {jid} is HELD and will not start on its own: {_HELD_FATE}{why} {fix}{earlier}"
+        return "held", _held_verdict(cur, own_config=own_config, scheduler=scheduler, earlier=earlier)
     if state == "R":
         return "starting", f"— pilot {jid} is RUNNING; the worker is starting, retry shortly.{earlier}"
-    reason = cur[3].strip() if len(cur) > 3 else ""
-    if reason and _NEVER_PENDING.search(reason):
+    reason = _reason(cur)
+    if state == "N":
         fix = ("Tell the user; with their go-ahead, fix the facility's walltime/partition/account (connect_facility "
-               "with details=), then start again." if own_config else
+               f"with details=), then start again. {_END_NOW}" if own_config else
                "Tell the user: if the partition or account is the cause, ask which to use (ensure_endpoint_up("
                "account=…, partition=…, confirm_spend=True) only with terms the user gives); a walltime or size comes "
-               "from the registry entry, which hpc-bridge cannot change per session yet.")
+               f"from the registry entry, which hpc-bridge cannot change per session yet. {_END_NOW}")
         return "held", (
-            f"— pilot {jid} is PENDING with reason {reason!r}: the scheduler will not start it as submitted (a "
-            f"walltime or size over the partition's or QOS's limit, an account/QOS it may not use, a held job). {fix}"
-            f"{earlier}"
+            f"— pilot {jid} is PENDING with reason {reason[:120]!r}: the scheduler will not start it as submitted (a "
+            "walltime or size over the partition's or QOS's limit, an account/QOS it may not use, a constraint no "
+            f"node meets): it never runs, and stays in the queue until it is cancelled. {fix}{earlier}"
         )
-    tail = f" (reason {reason})" if reason and reason.lower() != "none" else ""
+    if reason and _WAIT_REASON.search(reason):
+        other = ("another partition or account (ensure_endpoint_up(account=…, partition=…, confirm_spend=True)), or "
+                 "the facility's walltime (connect_facility with details=), only with terms the user gives, is another"
+                 if own_config else
+                 "another partition or account (ensure_endpoint_up(account=…, partition=…, confirm_spend=True), only "
+                 "with terms the user gives) is another; a walltime or size comes from the registry entry, which "
+                 "hpc-bridge cannot change per session yet")
+        return "held", (
+            f"— pilot {jid} is PENDING with reason {reason[:120]!r}: a limit or an outage the scheduler waits out "
+            "(jobs or resources this user or account already uses, a reservation or maintenance, a partition that is "
+            "down) — it may start later on its own, and then bills until it idle-releases. Tell the user: waiting is "
+            f"one choice; {other}. {_END_NOW}{earlier}"
+        )
+    tail = f" (reason {reason[:120]})" if reason and reason.lower() != "none" else ""
     return "queued", f"— pilot {jid} is queued (PENDING{tail}); waiting on the scheduler.{earlier}"
 
 class PilotProbe(NamedTuple):
@@ -553,7 +664,7 @@ class PilotProbe(NamedTuple):
     listing's order, and the scheduler queries that FAILED (`HPCB_FAIL`) — so the server can record the
     pilot a FINISHED verdict names, and a stop can tell a pilot the endpoint submitted since from one it already knew
     (server._stop_endpoint). A failed live listing reads `unknown`: it says nothing about the pilot. `live`: each pilot
-    the listing shows queued, held or running, as (job, state letter), oldest first (`_live_pilots`) — empty when the
+    the listing shows queued, held or running, as (job, state, reason), oldest first (`_live_pilots`) — empty when the
     live listing failed."""
 
     category: str
@@ -561,8 +672,8 @@ class PilotProbe(NamedTuple):
     jobs: frozenset[str]
     died: tuple[tuple[str, str], ...]
     failed: frozenset[str] = frozenset()
-    live: tuple[tuple[str, str], ...] = ()
-    # the pilot the verdict is about: the newest live one not of an earlier block request (None: none listed)
+    live: tuple[tuple[str, str, str], ...] = ()
+    # the pilot the verdict is about: the newest live one of this block request (None: none listed)
     subject: str | None = None
 
     @property
@@ -572,73 +683,91 @@ class PilotProbe(NamedTuple):
         return self.died[-1] if self.category == "finished" and self.died else None
 
 
-# A finished pilot submitted this long before the confirmation it is read against still counts as this block's. The
-# confirmation's age is read after the probe returns, so the probe's own latency only moves the cutoff earlier (toward
-# counting); the slack covers what is left — whole-second timestamps, and the login node's clock slewing against this
-# one's during the age. A pilot of an earlier session (sacct keeps 6 h, PBS's history about two weeks) is far older.
+# Where this block request's pilots cannot be told by their user endpoint (`_probe_pilots_over_login`), a finished pilot
+# submitted this long before the confirmation it is read against still counts as this block's. The confirmation's age is
+# read after the probe returns, so the probe's own latency only moves the cutoff earlier (toward counting), and it is
+# the larger of the monotonic and the wall clock's (the monotonic one stops while asleep). The submit time is
+# the SCHEDULER SERVER's clock (sacct's Submit, PBS's ctime) and `now` the login node's: the slack covers their skew and
+# whole-second timestamps. A pilot of an earlier session (sacct keeps 6 h, PBS's history about two weeks) is far older.
 _SUBMIT_SLACK_S = 60.0
-# A live pilot submitted this long before its block request's time is an earlier request's (`_probe_pilots_over_login`'s
-# `requested_at`). A request's own pilot is submitted after it (its user endpoint starts for the check the request
-# sends), so this covers only whole-second submit times and the clocks' grain.
-_REQUEST_SLACK_S = 5.0
+
+
+def _rows_text(stdout: str, keep) -> str:
+    """The probe's stdout with the pilot rows `keep(row)` refuses left out (its HPCB_ lines all kept)."""
+    return "\n".join(ln for ln in stdout.split("\n")
+                     if ln.startswith("HPCB_") or not (r := ln.split(None, 3)) or len(r) < 2 or keep(r))
 
 
 async def _probe_pilots_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner, *,
                                    confirmed_at: float | None = None, block: int | None = None,
-                                   requested_at: float | None = None) -> PilotProbe | None:
+                                   confirmed_wall: float | None = None) -> PilotProbe | None:
     """Ask the scheduler (over the login shape — AMQP, no SSH) what state THIS endpoint's pilots are in. Best-effort:
     None when it can't tell (login worker cold, scheduler unreachable). `elapsed_s` is how long the block has been
-    provisioning — it gates the rejection hint past the cold-start grace. `confirmed_at`: when the block's spend was
-    confirmed (time.monotonic()); a pilot that FINISHED and was submitted before that (an earlier session's, still in
-    the scheduler's history) is not this block's and is left out of the verdict. A pilot whose submit time is unknown
-    counts. `block`: the block request probed (`hpcb_block`), whose user endpoint's log may hold the scheduler's answer
-    to a refused submission (`_refusal_cmd`) — read only past the cold-start grace, where a `rejected` verdict can
-    come. `requested_at`: when that block request was made (a fresh user endpoint's: warmth._fresh_block, whose pilot
-    is submitted after it); a LIVE pilot submitted before it is an earlier request's — one a switch or a reconnect left
-    queued or HELD — and is named, never the verdict's pilot (`_summarize_pilot`'s `earlier`)."""
+    provisioning — it gates the rejection hint past the cold-start grace. `block`: the block request probed
+    (`hpcb_block`), whose user endpoint's log may hold the scheduler's answer to a refused submission (`_refusal_cmd`,
+    read only past the cold-start grace, where a `rejected` verdict can come) — and which names THIS request's pilots:
+
+    A probe lists every pilot of the endpoint (its `uep.<eid>` marker): an earlier block request's, which a switch or a
+    reconnect left queued or HELD, and another session's on the same endpoint, beside this request's own. Where the
+    endpoint's template logs block requests (`logs_block_requests`), the probe reads which user endpoint(s) this block
+    request started (`_request_cmd`: the log that names it) and which user endpoint each pilot belongs to (`HPCB_DIR`:
+    its own path), and so tells this request's pilots exactly — by no clock and no job number. Every other pilot is
+    named after the verdict, never taken for this block's; a finished one of another user endpoint is left out.
+    Before this request's user endpoint has logged its start (it starts within seconds of the check that asks for it,
+    before any pilot of it can exist), inside the cold-start grace, no pilot listed is this request's. Where it cannot
+    tell (an endpoint configured before the template named block requests, or that user endpoint's log unreadable past
+    the grace), every live pilot may be this block's (the newest decides), and `confirmed_at` / `confirmed_wall` (when
+    the block's spend was confirmed, on each clock) leave out a pilot that FINISHED before that, by its submit time."""
     scheduler = getattr(getattr(app.facility, "profile", None), "scheduler", "slurm")
-    out = await run_login(_pilot_status_cmd(scheduler, eid, block if elapsed_s >= PROVISION_GRACE_S else None))
+    request = block if getattr(app.facility, "logs_block_requests", False) is True else None
+    out = await run_login(_pilot_status_cmd(scheduler, eid, block if elapsed_s >= PROVISION_GRACE_S else None,
+                                            request=request))
     # The confirmation's age, read once the probe is BACK: its login-node clock (HPCB_NOW) was read while it ran, at
     # or before now, so any wait for the login worker (a sync-wait of up to two minutes) makes the age longer and the
     # cutoff earlier — a pilot is only ever counted when unsure, never dropped (read before the dispatch, a slow probe
-    # moved the cutoff past this block's own pilot: review r2, S3). The request's age likewise.
-    since_s = time.monotonic() - confirmed_at if confirmed_at is not None else None
-    req_s = time.monotonic() - requested_at if requested_at is not None else None
+    # moved the cutoff past this block's own pilot: review r2, S3). The larger of the two clocks' ages: the monotonic
+    # one stops while the machine sleeps (a laptop's lid closed through a queue wait), the wall clock may be stepped.
+    ages = [a for a in ((time.monotonic() - confirmed_at) if confirmed_at is not None else None,
+                        (time.time() - confirmed_wall) if confirmed_wall is not None else None) if a is not None]
+    since_s = max(ages) if ages else None
     if out.phase != "complete" or out.exit_code != 0:
         return None
     machine = getattr(app, "machine", None)  # bring-your-own (a session facility): its config is the user's to change
     own = machine is not None and machine in getattr(app, "session_facilities", {})
     stdout = out.stdout or ""
-    meta = [ln.split() for ln in stdout.split("\n") if ln.startswith(("HPCB_NOW ", "HPCB_SUB ", "HPCB_FAIL "))]
+    meta = [ln.split() for ln in stdout.split("\n")
+            if ln.startswith(("HPCB_NOW ", "HPCB_SUB ", "HPCB_FAIL ", "HPCB_DIR ", "HPCB_REQ "))]
     failed = frozenset(w[1] for w in meta if w[0] == "HPCB_FAIL" and len(w) > 1)
     rows = _pilot_rows(stdout)
-    old: set[str] = set()
-    now = next((float(w[1]) for w in meta if w[0] == "HPCB_NOW" and len(w) > 1 and w[1].isdigit()), None)
-    if since_s is not None and now is not None:
-        cutoff = now - since_s - _SUBMIT_SLACK_S
-        old = {w[1] for w in meta if w[0] == "HPCB_SUB" and len(w) > 2 and w[2].isdigit() and float(w[2]) < cutoff}
-    # live pilots submitted before this block request (a whole-second submit time, read on the login node's clock as
-    # `now` is): an earlier request's. Its own pilot is submitted after the request — the slack is the clocks' grain.
-    earlier: set[str] = set()
-    if req_s is not None and now is not None:
-        cut = now - req_s - _REQUEST_SLACK_S
-        earlier = {w[1] for w in meta if w[0] == "HPCB_SUB" and len(w) > 2 and w[2].isdigit() and float(w[2]) < cut}
-    # this block's finished pilots only; every live row stays (a live pilot is never an earlier session's leftover)
-    kept = "\n".join(ln for ln in stdout.split("\n")
-                     if not ((r := ln.split(None, 3)) and len(r) > 1 and r[1] in old
-                             and r[0][:1].upper() in _DONE_STATES and not ln.startswith("HPCB_")))
-    live: tuple[tuple[str, str], ...] = ()
+    pilot_dir = {w[1]: w[2] for w in meta if w[0] == "HPCB_DIR" and len(w) > 2}
+    ours = {w[1] for w in meta if w[0] == "HPCB_REQ" and len(w) > 1}
+    told = _request_cmd(eid, request) != ""  # the probe asked which user endpoint this block request started
+    if told and ours:  # by user endpoint: a pilot of another one is not this request's (one with no path read may be)
+        other = {r[1] for r in rows if len(r) > 1 and r[1] in pilot_dir and pilot_dir[r[1]] not in ours}
+        kept = _rows_text(stdout, lambda r: r[1] not in other or r[0][:1].upper() not in _DONE_STATES)
+    elif told and elapsed_s < PROVISION_GRACE_S:  # its user endpoint has not started: none of these pilots is its own
+        other = {r[1] for r in rows if len(r) > 1}
+        kept = _rows_text(stdout, lambda r: r[0][:1].upper() not in _DONE_STATES)
+    else:  # cannot tell: every live pilot may be this block's; a finished one before its confirmation is not
+        other = set()
+        old: set[str] = set()
+        now = next((float(w[1]) for w in meta if w[0] == "HPCB_NOW" and len(w) > 1 and w[1].isdigit()), None)
+        if since_s is not None and now is not None:
+            cutoff = now - since_s - _SUBMIT_SLACK_S
+            old = {w[1] for w in meta if w[0] == "HPCB_SUB" and len(w) > 2 and w[2].isdigit() and float(w[2]) < cutoff}
+        kept = _rows_text(stdout, lambda r: not (r[1] in old and r[0][:1].upper() in _DONE_STATES))
+    live: tuple[tuple[str, str, str], ...] = ()
     subject = None
     if failed & {"squeue", "qstat"}:  # the live listing failed: no verdict, never "no pilot"
         category, suffix = "unknown", ""
     else:
         category, suffix = _summarize_pilot(kept, elapsed_s, own_config=own, logs=_user_endpoint_logs(app, block, eid),
-                                            scheduler=scheduler, earlier=earlier)
+                                            scheduler=scheduler, earlier=other)
         live = _live_pilots([r for r in _pilot_rows(kept) if r and r[0][:1].upper() not in _DONE_STATES])
-        subject = next((j for j, _s in reversed(live) if j not in earlier), None)
+        subject = next((j for j, _s, _r in reversed(live) if j not in other), None)
     return PilotProbe(category, suffix, frozenset(r[1] for r in rows if len(r) > 1),
-                      tuple((r[1], r[2]) for r in _died(_pilot_rows(kept))), failed=failed, live=live,
-                      subject=subject)
+                      tuple((r[1], r[2]) for r in _died(_pilot_rows(kept)) if r[1] not in other), failed=failed,
+                      live=live, subject=subject)
 
 async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_login: LoginRunner) -> tuple[str, str] | None:  # noqa: E501
     """(category, notice-suffix) of THIS endpoint's pilot (`_probe_pilots_over_login`); None when it can't tell, so the
@@ -648,16 +777,16 @@ async def _pilot_status_over_login(app: AppCtx, eid: str, elapsed_s: float, run_
 
 async def _augment_provisioning(app: AppCtx, eid: str, notice: str, elapsed_s: float, run_login: LoginRunner, *,
                                 confirmed_at: float | None = None, block: int | None = None,
-                                requested_at: float | None = None) -> tuple[str, PilotProbe | None]:
+                                confirmed_wall: float | None = None) -> tuple[str, PilotProbe | None]:
     """Enrich a still-cold BILLED block's 'allocating nodes…' with the pilot's ACTUAL scheduler state,
     so a rejected/held submission isn't silently indistinguishable from a queue wait ([#32]), and hand back the probe
     (None: it could not tell) for the server to record a pilot that ran and died, and the pilots still live
-    (`confirmed_at`: the block's confirmation; `block`: its block request; `requested_at`: when it was made —
+    (`confirmed_at` / `confirmed_wall`: the block's confirmation on each clock; `block`: its block request —
     `_probe_pilots_over_login`). A diagnostic must never break the result it annotates, so any failure — or an empty
     suffix (the normal cold-start window) — leaves the notice as-is."""
     try:
         probe = await _probe_pilots_over_login(app, eid, elapsed_s, run_login, confirmed_at=confirmed_at, block=block,
-                                               requested_at=requested_at)
+                                               confirmed_wall=confirmed_wall)
     except Exception:  # noqa: BLE001 - the pilot probe is advisory; never fail provisioning on it
         return notice, None
     suffix = probe.suffix if probe else ""

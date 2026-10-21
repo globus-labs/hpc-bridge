@@ -64,9 +64,11 @@ Some sites hold or refuse a job that lacks a directive they require (ALCF, for e
 name the filesystems it uses). Such a directive goes into the configuration's `scheduler_options`, one per line, in the
 scheduler's own form: `#PBS -l filesystems=home:eagle` on PBS, `#SBATCH --constraint=gpu` on Slurm. A line written
 bare, the way a site's message often quotes it (`-l filesystems=home:eagle`), is given that prefix, and the agent is
-told exactly how it was written; a line that is not a directive at all is refused, and the account and the queue are
-never set there (you name them when the agent asks before the first block). A job the site holds stays in its queue
-until it is cancelled: reconnecting with a corrected configuration does not cancel it, and stopping the endpoint does.
+told how it was written. A line that is not this scheduler's directive (a shell command, another batch system's
+`#SLURM`, `#PBS` or `#BSUB` line) is refused, and the block's terms are never set there — the account, the queue, the
+walltime and the node count: you name the account and the queue when the agent asks before the first block, and the
+walltime is part of the configuration. A job the site holds stays in its queue until it is cancelled: reconnecting
+with a corrected configuration does not cancel it, and stopping the endpoint does.
 
 To make a cluster available to everyone, add it to the registry: see
 [Adding a facility](../adding-a-facility.md).

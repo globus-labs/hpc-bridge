@@ -502,7 +502,9 @@ async def test_the_probe_reads_the_log_only_past_the_grace(monkeypatch):
 
     await scheduler_ops._probe_pilots_over_login(app, EID, 10.0, run_login, block=8)
     await scheduler_ops._probe_pilots_over_login(app, EID, 60.0, run_login, block=8)
-    assert "HPCB_REFUSED" not in seen[0] and "running endpoint_setup command" not in seen[0]
+    assert "HPCB_REFUSED" not in seen[0] and "awk -v p=" not in seen[0]
+    # inside it only each user endpoint log's head is read, for which one this block request started (_request_cmd)
+    assert seen[0].count("running endpoint_setup command") == 1 and "head -c 65536" in seen[0]
     # only the log(s) naming the block request reach awk
     assert "grep -lF -e 'running endpoint_setup command: true hpcb_block=8' --" in seen[1]
     assert seen[1].index("grep -lF -e 'running") < seen[1].index("awk -v p=")
