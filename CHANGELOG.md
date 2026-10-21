@@ -72,7 +72,15 @@ installed plugin only when that version changes); git tags mark releases.
   and quotes the site's comment as the facility's report: tell you what it says, run no command it names (its
   "qrls"), show you any line it suggests as a candidate before writing it, and change the configuration only with your
   go-ahead; to end the held pilot first, stop the endpoint before confirming the new block. A Slurm hold (a PENDING job
-  whose reason is JobHeldUser or JobHeldAdmin) gets the same verdict, with `scontrol show job` as its command.
+  whose reason is JobHeldUser or JobHeldAdmin) gets the same verdict, with `scontrol show job` as its command. On PBS a
+  node's resources (GPUs, a system type) go in the new `select_options` setting instead of a `-l select=` line, which
+  is refused and pointed at it: `select_options="ngpus=4"` makes the block ask for `select=1:ncpus=…:ngpus=4` — parsl's
+  own select with the resources appended, so the node count stays the one the spend question named (a registry PBS
+  entry may carry it too; an endpoint configured before it must be torn down and connected again, and the connect
+  says so; a cached `select=1:…` line is offered back as `select_options`). The pilot's own output or error file
+  (`#SBATCH -o/-e`) and a job array (`#SBATCH -a`, `#PBS -J`) are refused too: hpc-bridge finds and cancels its
+  Slurm pilots by the output path parsl writes, so another one made a stop answer "released none" while the pilot
+  held or billed, and an array starts several blocks behind one spend question.
 - **What a held pilot leaves behind is said, wherever it is left.** Three answers in that flow misled. (1) A
   `connect_facility(details=…)` that bound the endpoint again said "Nothing is started or billed yet" while a held
   pilot of the session was still queued: a reconnect cancels nothing, and a held pilot never starts on its own, so it
@@ -99,7 +107,14 @@ installed plugin only when that version changes); git tags mark releases.
   wait never sees its own pilot called "earlier" (or "likely REJECTED"). On an endpoint configured before block
   requests were logged, the newest pilot decides, and the age that leaves out an earlier session's finished pilot is
   now the larger of the monotonic and the wall clock's (the monotonic one stops while the machine sleeps).
-  `block_job_id` carries the verdict's pilot while the block provisions, and the block's job once it is up.
+  `block_job_id` carries the verdict's pilot while the block provisions, and the block's job once it is up. A pilot
+  whose own user endpoint was started for another block request is never this block's, even where this request's
+  user endpoint is not found; the lookup reads the first 50 lines of each user endpoint log in one awk process. A
+  Slurm pilot's reason is read whole ("launch failed requeued held" had read as "launch", a queue wait) and its state
+  by its whole word (REQUEUE_HOLD had read as "RUNNING; the worker is starting"); requeued holds, SPECIAL_EXIT and
+  QOSNotAllowed are said for what they are, an exhausted allocation (AssocGrpBillingMinutes and its kin, the commonest
+  wait on ACCESS sites) is named as used up and not promised soon, PBS Pro's "Can Never Run" reads as never, and a PBS
+  pilot's state is said in PBS's words. A stop forgets what a re-bind left only when its release was confirmed.
 
 ### Testing
 - **`polaris_filesystems` runs under the script operator too**: `HPCB_OPERATOR=script HPCB_TARGET=fake

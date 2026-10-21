@@ -236,6 +236,16 @@ class FacilityDetails(BaseModel):
         description="PBS only: cores per node to request (PBSProProvider.cpus_per_node). "
         "Omit for Slurm (ignored) or to accept the scheduler default. E.g. Polaris: 32.",
     )
+    select_options: str | None = Field(
+        default=None,
+        description="PBS only: resources for each chunk of the block's select — hpc-bridge writes "
+        "'select=<the block's node count>:ncpus=<cpus_per_node>' and appends ':<select_options>', so the node count "
+        "and the spend terms stay hpc-bridge's. name=value pairs joined by ':', e.g. 'ngpus=4' or "
+        "'system=polaris:ngpus=4'; never a chunk count, a second chunk ('+'), select=, ncpus (that is "
+        "cpus_per_node), the walltime, the node count, the account or the queue. Omit if none. A '-l select=…' line "
+        "in scheduler_options is refused: its resources go here.",
+        examples=["ngpus=4", "system=polaris"],
+    )
     scheduler_options: str | None = Field(
         default=None,
         description="Scheduler directives for the submit script's header (Parsl scheduler_options) — e.g. a PBS site "
@@ -246,7 +256,9 @@ class FacilityDetails(BaseModel):
         "line is refused (a shell command belongs in env_setup; another batch system's directive word, or one with "
         "no space after it, is not read as you mean). Never the account, partition/queue, walltime or node count "
         "(#SBATCH -A/-p/-t/-N, #PBS -A/-q/-l walltime=/select=, bare or prefixed): those are "
-        "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them.",
+        "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them — a PBS "
+        "chunk's resources (ngpus=4) go in `select_options`. Never the pilot's output or error file (#SBATCH -o/-e: "
+        "hpc-bridge finds and cancels its pilots by parsl's own) or an array (#SBATCH -a, #PBS -J).",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")

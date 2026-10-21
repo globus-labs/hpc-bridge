@@ -396,7 +396,7 @@ def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: 
     if not parts:
         parts.append(f"{things} sent before it, not seen to finish, may still be queued here — while one is, the "
                      "endpoint can start a billed block to run it")
-    return ("This connect cancels nothing on this endpoint, and some of this session's earlier work is still there: "
+    return ("This connect cancels nothing on this endpoint, and this endpoint still has work in its scheduler: "
             + "; ".join(parts) + ". stop_endpoint cancels every block of this endpoint, these included, and says when "
             f"none is left (teardown_endpoint ends them too). {_END_NOW} ")
 

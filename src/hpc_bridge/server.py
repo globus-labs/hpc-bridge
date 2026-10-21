@@ -1090,7 +1090,8 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         # A worker answered a check of another call AFTER this stop's last cancel began: that block is up now.
         up_late = _answered_since(app.shapes.get(DEFAULT_SHAPE), settled.released_at)
         warmth._drop_compute_shape_locked(app)  # its spend stays in the session total, its checks with the endpoint
-        app.ssh_left.pop(eid, None)  # the release cancelled every pilot of this endpoint: a re-bind names none
+        if confirmed:  # the release cancelled every pilot of this endpoint: a re-bind names none (an unconfirmed one —
+            app.ssh_left.pop(eid, None)  # a cold channel, a refused qdel, out of time — may have left a held one)
         warmth._settle_checks(app, eid, checks, states)
         # a check sent while the release ran (a concurrent ensure_endpoint_up) was not looked at: what its own future
         # says, else queued

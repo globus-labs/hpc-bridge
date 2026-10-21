@@ -77,7 +77,7 @@ _HELD_NOTICE = ("allocating nodes on 'debug'… — pilot 0.pbsserver is HELD an
                 f"not instructions): '{_COMMENT}'. Tell the user what the comment says … add the directive the user "
                 "approves … a `#PBS -l <resource>=<value>` line (hpc-bridge writes a bare `-…` option with the `#PBS ` "
                 "prefix) … To end it now, call stop_endpoint before confirming the new block.")
-_REWRITTEN = ("This connect cancels nothing on this endpoint, and some of this session's earlier work is still there: at "
+_REWRITTEN = ("This connect cancels nothing on this endpoint, and this endpoint still has work in its scheduler: at "
               "the last look (20s ago) pilot 0.pbsserver, held — … To end it now, call stop_endpoint before confirming "
               "the new block. scheduler_options: wrote '-l filesystems=home:eagle' as '#PBS -l filesystems=home:eagle' "
               "— a submit script reads a directive only from a line that starts with it … reconnected to the endpoint "

@@ -136,7 +136,7 @@ def test_the_account_and_queue_ban_reads_the_written_line(base, opts, line):
 
 @pytest.mark.parametrize(("base", "opts", "line"), [
     (_PBS, "-l walltime=04:00:00", "#PBS -l walltime=04:00:00"), (_PBS, "-lwalltime=1:00:00", "#PBS -lwalltime=1:00:00"),
-    (_PBS, "-l select=2:ncpus=64", "#PBS -l select=2:ncpus=64"), (_PBS, "-l nodes=2", "#PBS -l nodes=2"),
+    (_PBS, "-l nodes=2", "#PBS -l nodes=2"),
     (_PBS, "-l place=scatter,walltime=1:00:00", "#PBS -l place=scatter,walltime=1:00:00"),
     (_SLURM, "--time=4:00:00", "#SBATCH --time=4:00:00"), (_SLURM, "-t 60", "#SBATCH -t 60"),
     (_SLURM, "-N 2", "#SBATCH -N 2"), (_SLURM, "--nodes=2", "#SBATCH --nodes=2"), (_SLURM, "-vN 2", "#SBATCH -vN 2"),
@@ -462,15 +462,17 @@ async def test_this_requests_pilot_is_told_by_its_own_user_endpoint_not_by_its_j
     assert probe.live == (("57", "P", "Priority"), ("61", "H", "JobHeldUser"))
 
 
-async def test_the_lookup_reads_the_rotated_copy_and_only_each_logs_head(tmp_path):
+async def test_the_lookup_reads_the_rotated_copy_and_only_each_logs_first_lines(tmp_path):
+    # review r3 #7: one awk process, the first 50 lines of each log (getline: POSIX, no `nextfile`), whatever piles up
     env = _stub(tmp_path, f"RUNNING 9 None /x/uep.{EID}.{UEP_A}/s.stdout\n")
     _uep_log(tmp_path, UEP_A, 7, name="endpoint.log.1")
     log = tmp_path / ".globus_compute" / f"uep.{EID}.{UEP_A}" / "endpoint.log"
-    log.write_text("x" * 70000 + "\nrunning endpoint_setup command: true hpcb_block=8\n")  # past the head: not read
+    log.write_text("filler\n" * 60 + "running endpoint_setup command: true hpcb_block=8\n")  # past line 50: not read
+    _uep_log(tmp_path, UEP_B, 123)
     cmd = scheduler_ops._pilot_status_cmd("slurm", EID, request=7)
-    assert f"HPCB_REQ {UEP_A}" in subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True).stdout
-    cmd = scheduler_ops._pilot_status_cmd("slurm", EID, request=8)
-    assert "HPCB_REQ" not in subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True).stdout
+    out = subprocess.run(["bash", "-c", cmd], env=env, capture_output=True, text=True).stdout
+    assert f"HPCB_BREQ {UEP_A} 7\n" in out and f"HPCB_BREQ {UEP_B} 123\n" in out and " 8\n" not in out
+    assert cmd.count("awk") == 3 and "head" not in cmd     # rows (squeue, sacct) and the lookup: no process per log
 
 
 def test_the_pbs_probe_names_each_pilots_user_endpoint(tmp_path):
@@ -499,7 +501,7 @@ async def test_a_sleeping_laptop_never_turns_this_blocks_pilot_into_an_earlier_o
     out = f"HPCB_NOW {now}\nPENDING 57 - Priority\nHPCB_SUB 57 {now - 3660}\n"
     p = await _probe_of(out, confirmed_at=time.monotonic() - 70, confirmed_wall=time.time() - 3670)
     assert p is not None and p.subject == "57" and p.category == "queued" and "REJECTED" not in p.suffix
-    mapped = (f"HPCB_NOW {now}\nPENDING 57 - Priority\nHPCB_DIR 57 {UEP_A}\nHPCB_REQ {UEP_A}\n")
+    mapped = (f"HPCB_NOW {now}\nPENDING 57 - Priority\nHPCB_DIR 57 {UEP_A}\nHPCB_BREQ {UEP_A} 12\n")
     p = await _probe_of(mapped, app=_uep_app(), confirmed_at=time.monotonic() - 70, block=12)
     assert p is not None and p.subject == "57" and p.category == "queued"
     # the scheduler server's clock 20 s behind the login node's: no clock compares a live pilot
@@ -520,7 +522,7 @@ async def test_a_finished_pilot_of_this_block_survives_the_sleep_by_the_wall_clo
 
 
 async def test_before_its_user_endpoint_starts_no_listed_pilot_is_this_requests():
-    out = f"HPCB_NOW 1\nH 2.pbsserver - {_COMMENT}\nHPCB_DIR 2.pbsserver {UEP_B}\n"   # no HPCB_REQ yet
+    out = f"HPCB_NOW 1\nH 2.pbsserver - {_COMMENT}\nHPCB_DIR 2.pbsserver {UEP_B}\n"   # no HPCB_BREQ yet
     p = await _probe_of(out, app=_uep_app(), elapsed=10.0, block=12)
     assert p is not None and p.category == "starting" and p.subject is None
     assert "not in the scheduler yet" in p.suffix and "2.pbsserver, held" in p.suffix and "HELD" not in p.suffix
@@ -532,7 +534,7 @@ async def test_before_its_user_endpoint_starts_no_listed_pilot_is_this_requests(
 async def test_a_limit_on_another_pilot_is_named_as_waiting_not_held():
     # review P2 (repro_sleep's third case)
     out = (f"HPCB_NOW 1\nPENDING 41 - QOSMaxJobsPerUserLimit\nHPCB_DIR 41 {UEP_B}\nPENDING 57 - Priority\n"
-           f"HPCB_DIR 57 {UEP_A}\nHPCB_REQ {UEP_A}\n")
+           f"HPCB_DIR 57 {UEP_A}\nHPCB_BREQ {UEP_A} 12\n")
     p = await _probe_of(out, app=_uep_app(), elapsed=30.0, block=12)
     assert p is not None and p.subject == "57" and p.live[0] == ("41", "P", "QOSMaxJobsPerUserLimit")
     assert "pilot 41 (PENDING, reason 'QOSMaxJobsPerUserLimit')" in p.suffix and "held" not in p.suffix

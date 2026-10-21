@@ -177,15 +177,24 @@ _SLURM_NO_ARG = frozenset("hHIkOQsvVW")
 # `#PBS-Ax` are directives too): sbatch reads `#SLURM` as `#SBATCH`, and translates `#PBS` and `#BSUB` lines after its
 # own pass — so `#BSUB -q gpu` would override the partition parsl writes.
 _DIRECTIVE = re.compile(r"\s*#(SBATCH|SLURM|PBS|BSUB)(.*)")
-# What each of the block's terms is called, in the words a refusal uses.
+# What a directive the block's terms (or hpc-bridge's own hold on its pilots) cannot take sets, in a refusal's words.
 TERMS_WORDS = {"account": "the account or the partition/queue", "queue": "the account or the partition/queue",
-               "walltime": "the walltime or the node count", "nodes": "the walltime or the node count"}
+               "walltime": "the walltime or the node count", "nodes": "the walltime or the node count",
+               "select": "the node count (a select)", "output": "the pilot's output or error file",
+               "array": "a job array"}
+# Slurm short options for those, and their kinds: -o/-e (the files: parsl writes its own in the pilot's user endpoint
+# directory, the path hpc-bridge's probe and stop find the pilot by) and -a (an array: several blocks behind one
+# spend question) besides the terms.
+_SLURM_SHORT = {"A": "account", "p": "queue", "N": "nodes", "t": "walltime", "o": "output", "e": "output",
+                "a": "array"}
 
 
 def _slurm_terms(toks: list[str]) -> str | None:
     """Slurm's options for the block's terms: -A/--account and -p/--partition (long options by any prefix sbatch
-    accepts: --acco…, --part…; short ones bundled too, "-vA x"; its -q is the QOS), and the size parsl writes before
-    scheduler_options and a later directive overrides: -N/--nodes and -t/--time."""
+    accepts: --acco…, --part…; short ones bundled too, "-vA x"; its -q is the QOS), the size parsl writes before
+    scheduler_options and a later directive overrides (-N/--nodes, -t/--time), the pilot's files (-o/--output,
+    -e/--error: parsl's own carry the `uep.<eid>` marker squeue's StdOut shows — the stop cancels by it, the probe finds
+    the pilot by it, and reads a dead pilot's own stderr there) and an array (-a/--array: several blocks)."""
     for tok in toks:
         if m := re.match(r"--(acco|part)[a-z-]*(?:=|$)", tok):
             return "account" if m.group(1) == "acco" else "queue"
@@ -193,31 +202,54 @@ def _slurm_terms(toks: list[str]) -> str | None:
             return "nodes"
         if re.match(r"--time(?:=|$)", tok):
             return "walltime"
+        if re.match(r"--(?:ou|er)[a-z]*(?:=|$)", tok):
+            return "output"
+        if re.match(r"--ar[a-z]*(?:=|$)", tok):
+            return "array"
         if re.match(r"-[^-]", tok):
             for ch in tok[1:]:
-                if ch in "ApNt":
-                    return {"A": "account", "p": "queue", "N": "nodes", "t": "walltime"}[ch]
+                if ch in _SLURM_SHORT:
+                    return _SLURM_SHORT[ch]
                 if ch not in _SLURM_NO_ARG:
                     break
     return None
 
 
+def _pbs_select(listed: str) -> str | None:
+    """The `select=` value in a PBS `-l` resource list, or None."""
+    for item in listed.split(","):
+        name, _eq, value = item.partition("=")
+        if name.strip().lower() == "select":
+            return value.strip()
+    return None
+
+
+def _pbs_l_lists(toks: list[str]) -> list[str]:
+    """Every `-l` resource list of a PBS directive's options (`-l a=1,b=2` or `-la=1`)."""
+    return [tok[2:] or (toks[i + 1] if i + 1 < len(toks) else "") for i, tok in enumerate(toks) if tok.startswith("-l")]
+
+
 def _pbs_terms(toks: list[str]) -> str | None:
-    """PBS's options for the block's terms: -A and -q, and the size and time parsl writes as `-l walltime=…` and
-    `-l select=…` before scheduler_options: a `-l` list naming walltime, select, nodes or nodect."""
-    for i, tok in enumerate(toks):
+    """PBS's options for the block's terms: -A and -q, the time and size parsl writes as `-l walltime=…` and
+    `-l select=…` before scheduler_options (a `-l` list naming walltime, nodes or nodect; select apart: its chunk
+    resources go in `select_options`), and an array (-J). -o and -e stay: a PBS pilot keeps the `uep.<eid>` marker in
+    its record's Submit_arguments (the script's path) whatever its output file."""
+    for tok in toks:
         if tok.startswith("-A"):
             return "account"
         if tok.startswith("-q"):
             return "queue"
-        if tok.startswith("-l"):
-            listed = tok[2:] or (toks[i + 1] if i + 1 < len(toks) else "")
-            for item in listed.split(","):
-                name = item.split("=", 1)[0].strip().lower()
-                if name == "walltime":
-                    return "walltime"
-                if name in ("select", "nodes", "nodect"):
-                    return "nodes"
+        if tok.startswith("-J"):
+            return "array"
+    for listed in _pbs_l_lists(toks):
+        for item in listed.split(","):
+            name = item.split("=", 1)[0].strip().lower()
+            if name == "walltime":
+                return "walltime"
+            if name in ("nodes", "nodect"):
+                return "nodes"
+            if name == "select":
+                return "select"
     return None
 
 
@@ -230,6 +262,61 @@ def _bsub_terms(toks: list[str]) -> str | None:
     return None
 
 
+# A chunk resource list for PBSProProvider's `select_options` (parsl writes `select=<nodes>:ncpus=<cpus_per_node>`
+# and appends `:<select_options>`): `name=value` pairs joined by ":", e.g. `ngpus=4`, `system=polaris:ngpus=4`.
+_SELECT_PAIR = re.compile(r"[A-Za-z_][A-Za-z0-9_]*=[A-Za-z0-9_.@/-]+")
+# What the chunk may not name: hpc-bridge's own (the count is the block's nodes; ncpus is `cpus_per_node`) and what
+# is no chunk resource at all.
+_SELECT_NOT = {"select": "a select of its own", "ncpus": "ncpus (that is `cpus_per_node`)", "walltime": "the walltime",
+               "nodes": "the node count", "nodect": "the node count", "place": "a placement (`-l place=` belongs in "
+               "scheduler_options)", "account": "the account", "queue": "the queue"}
+
+
+def select_options_problem(opts: str | None) -> str | None:
+    """Why `opts` is not a chunk resource list for `select_options` (PBS), or None: one `name=value` pair or several
+    joined by ":" (a leading ":" is fine: parsl adds one), with no chunk count of its own (`2:` or `+` — the count is
+    the block's nodes, hpc-bridge's), no `select=`, and none of the block's terms or hpc-bridge's own (ncpus is
+    `cpus_per_node`)."""
+    if opts is None:
+        return None
+    text = opts[1:] if opts.startswith(":") else opts
+    if not text:
+        return "select_options is empty"
+    if "+" in text:
+        return "select_options has a second chunk ('+'): the block is one chunk per node, hpc-bridge's count"
+    for part in text.split(":"):
+        if part.isdigit():
+            return (f"select_options starts a chunk count ({part!r}): the count is the block's nodes, which "
+                    "hpc-bridge writes (select=<nodes>:…)")
+        if not _SELECT_PAIR.fullmatch(part):
+            return (f"select_options has {part[:60]!r}, not a chunk resource: write name=value pairs joined by ':' "
+                    "(e.g. ngpus=4:system=polaris)")
+        name = part.split("=", 1)[0].lower()
+        if name in _SELECT_NOT:
+            return f"select_options names {_SELECT_NOT[name]} ({part[:60]!r})"
+    return None
+
+
+def select_advice(line: str, nodes: int = 1) -> tuple[str | None, int | None]:
+    """For a PBS directive line with a one-chunk `-l select=<n>:…` (n the block's nodes): the chunk's other resources
+    as `select_options` and its ncpus as `cpus_per_node` — what a refused select line becomes — else (None, None)."""
+    m = _DIRECTIVE.match(line)
+    if m is None or m.group(1) != "PBS":
+        return None, None
+    for listed in _pbs_l_lists(m.group(2).split()):
+        value = _pbs_select(listed)
+        if value is None:
+            continue
+        count, _sep, rest = value.partition(":")
+        if not count.isdigit() or int(count) != nodes or "+" in rest:
+            return None, None
+        parts = [p for p in rest.split(":") if p]
+        cpus = next((p.split("=", 1)[1] for p in parts if p.lower().startswith("ncpus=")), None)
+        others = ":".join(p for p in parts if not p.lower().startswith("ncpus="))
+        if others and select_options_problem(others) is not None:
+            return None, None
+        return others or None, int(cpus) if cpus is not None and cpus.isdigit() else None
+    return None, None
 def scheduler_terms_kind(line: str) -> str | None:
     """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes"), or None. Any batch
     system's directive word is read (`_DIRECTIVE`), with its own options."""
@@ -354,6 +441,9 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
     bad = _extra_terms_keys(extra if isinstance(extra, dict) else None, key_map if isinstance(key_map, dict) else None)
     problems = [f"defaults.extra sets {bad}: the account and the partition are ensure_endpoint_up's (account=, "
                 "partition=) and defaults.partition, so the block's terms name them"] if bad else []
+    sel = (row.get("defaults") or {}).get("select_options") if isinstance(row.get("defaults"), dict) else None
+    if sel is not None and (why := select_options_problem(str(sel))):  # the client drops it on read: never publish it
+        problems.append(f"defaults.{why}")
     extra_opts = extra.get("scheduler_options") if isinstance(extra, dict) else None
     opts = compute.get("scheduler_options")
     if isinstance(opts, str) and not row.get("compute_mep_uuid"):
@@ -476,6 +566,15 @@ class Defaults(BaseModel):
     max_workers_per_node: int = 2
     nodes_per_block: int = 1
     cpus_per_node: int | None = None  # PBSProProvider.cpus_per_node; Slurm ignores it
+    # PBSProProvider.select_options: chunk resources parsl appends to its own `select=<nodes>:ncpus=<cpus_per_node>`
+    # (`ngpus=4`, `system=polaris`), so the node count stays hpc-bridge's. Read leniently: one that would name the
+    # count, the terms or ncpus is dropped (`select_options_problem`; the ingest refuses it). Slurm ignores it.
+    select_options: str | None = None
+
+    @field_validator("select_options")
+    @classmethod
+    def _chunk_only(cls, v: str | None) -> str | None:
+        return None if v is None or select_options_problem(v) is not None else v
     # SlurmProvider.exclusive (Parsl defaults it to True: `#SBATCH --exclusive`, a WHOLE node). On a per-core
     # partition that is a node's worth of cores, which a per-job CPU cap can refuse forever — Expanse `shared`
     # (QOS max 127 CPUs/job, 128-core nodes): PENDING QOSMaxCpuPerJobLimit, 2026-10-06. None = Parsl's default.
@@ -776,6 +875,7 @@ class CatalogEntry(BaseModel):
             "scratch_root": self.compute.scratch_root,
             "scheduler": self.compute.scheduler,
             "cpus_per_node": self.defaults.cpus_per_node,
+            "select_options": self.defaults.select_options,
             "exclusive": self.defaults.exclusive,
             "account_required": self.account_required,
         }

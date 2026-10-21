@@ -88,7 +88,7 @@ def test_prefixes_and_bundles_are_refused(opts):
         binding._entry_from_details("mine", FacilityDetails(**_DRAFT, scheduler_options=opts))
 
 
-@pytest.mark.parametrize("opts", ["#SBATCH -J myApp", "#SBATCH -Jmyapp", "#SBATCH --parsable", "#SBATCH -o /tmp/Ap.log",
+@pytest.mark.parametrize("opts", ["#SBATCH -J myApp", "#SBATCH -Jmyapp", "#SBATCH --parsable", "#SBATCH --comment=Ap.log",
                                   "#SBATCH -qnormal"])
 def test_an_argument_is_not_an_option(opts):
     assert scheduler_terms_directive(opts) is None

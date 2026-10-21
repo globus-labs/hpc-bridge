@@ -67,8 +67,13 @@ bare, the way a site's message often quotes it (`-l filesystems=home:eagle`), is
 told how it was written. A line that is not this scheduler's directive (a shell command, another batch system's
 `#SLURM`, `#PBS` or `#BSUB` line) is refused, and the block's terms are never set there — the account, the queue, the
 walltime and the node count: you name the account and the queue when the agent asks before the first block, and the
-walltime is part of the configuration. A job the site holds stays in its queue until it is cancelled: reconnecting
-with a corrected configuration does not cancel it, and stopping the endpoint does.
+walltime is part of the configuration. Neither are the pilot job's output or error files (hpc-bridge finds and cancels
+its pilots by the ones parsl writes) or a job array. On PBS, resources for each node of the block — GPUs, a system
+type — go in the configuration's `select_options` instead of a `-l select=` line: `select_options="ngpus=4"` makes the
+block ask for `select=1:ncpus=…:ngpus=4`, so the node count stays the one the agent named when it asked you to confirm
+the spend (an endpoint configured before this setting existed must be torn down and connected again to use it; the
+connect says so). A job the site holds stays in its queue until it is cancelled: reconnecting with a corrected
+configuration does not cancel it, and stopping the endpoint does.
 
 To make a cluster available to everyone, add it to the registry: see
 [Adding a facility](../adding-a-facility.md).
