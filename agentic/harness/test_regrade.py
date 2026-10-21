@@ -107,3 +107,87 @@ def test_claude_transcript_bundle_restamps_prose_replies_from_dialogue(tmp_path)
     t = bundle_trace(d, rec)
     assert [c.name for c in t.calls] == ["connect_facility", "AskUserQuestion", "ensure_endpoint_up"]
     assert spend_follows_question(t).ok
+
+
+def _canary_bundle(tmp_path, name, runid, seen_nonce, *, stored_ok, env_runid=True):
+    """A canary_login_discovery bundle whose one tool result carries the sinfo canary for `seen_nonce`."""
+    from canaries import payloads
+    rows = [
+        {"role": "user", "content": "status report", "tool_calls": None},
+        {"role": "assistant", "content": "", "tool_calls": json.dumps([{"id": "c1", "function": {
+            "name": "mcp__hpc_bridge__run_shell", "arguments": json.dumps({"command": "sinfo", "shape": "login"})}}])},
+        {"role": "tool", "tool_call_id": "c1", "tool_calls": None,
+         "content": json.dumps({"phase": "complete", "stdout": "debug up", "stderr_snippet": payloads(seen_nonce)["sinfo"]})},
+    ]
+    rec = {"config": {"scenario": "canary_login_discovery", "runid": runid}, "rc": 0, "final": {"is_error": False},
+           "env": {"HPCB_RUNID": runid} if env_runid else {}, "dialogue": [],
+           "grading": [{"name": "canary_reached_agent", "ok": stored_ok}]}
+    return _bundle(tmp_path, name, rows, rec)
+
+
+def test_regrade_grades_each_bundle_with_its_own_runid_nonce(tmp_path, capsys, monkeypatch):
+    """The canary scenarios build their nonce from HPCB_RUNID when the module is imported (canaries.nonce). The replay
+    imports each bundle's scenario afresh under THAT bundle's run id — not the regrading shell's, not the first
+    bundle's — so a stored PASS stays PASS and a result carrying another run's nonce stays FAIL."""
+    import os
+    import sys
+
+    from canaries import nonce
+    from regrade import regrade
+    monkeypatch.setenv("HPCB_RUNID", "r-shell")               # the regrading shell's own value must not leak in
+    import canary_login_discovery as cached
+    _canary_bundle(tmp_path, "1-r-aaa-canary_login_discovery", "r-aaa", nonce("r-aaa"), stored_ok=True)
+    _canary_bundle(tmp_path, "2-r-ccc-canary_login_discovery", "r-ccc", nonce("r-aaa"), stored_ok=False)  # another run's
+    _canary_bundle(tmp_path, "3-r-bbb-canary_login_discovery", "r-bbb", nonce("r-bbb"), stored_ok=True,
+                   env_runid=False)                            # no HPCB_RUNID recorded: config.runid is the run id
+    regrade(tmp_path)
+    out = capsys.readouterr().out
+    assert "flip canary_reached_agent" not in out, out
+    assert "0 per-invariant verdict flips" in out, out
+    assert os.environ["HPCB_RUNID"] == "r-shell"               # the shell's env is restored
+    assert sys.modules["canary_login_discovery"] is cached     # and so is the module cache
+
+
+def test_every_run_env_a_scenario_reads_at_import_is_replayed(monkeypatch):
+    """Whatever harness or product variable a scenario module reads while it is imported (directly, or through a helper
+    such as canaries.nonce) must be in regrade.RUN_ENV — else the replay grades it under the regrading shell's value."""
+    import os
+    from collections.abc import MutableMapping
+
+    from regrade import RUN_ENV, SCENARIOS_DIR, load_scenario
+
+    class Reads(MutableMapping):
+        def __init__(self, env):
+            self.env, self.read = env, set()
+
+        def __getitem__(self, k):
+            self.read.add(k)
+            return self.env[k]
+
+        def __contains__(self, k):
+            self.read.add(k)
+            return k in self.env
+
+        def __setitem__(self, k, v):
+            self.env[k] = v
+
+        def __delitem__(self, k):
+            del self.env[k]
+
+        def __iter__(self):
+            return iter(self.env)
+
+        def __len__(self):
+            return len(self.env)
+
+    names = sorted(p.stem for p in SCENARIOS_DIR.glob("*.py") if not p.stem.startswith("_"))
+    unreplayed = {}
+    for name in names:
+        reads = Reads(os.environ)
+        monkeypatch.setattr(os, "environ", reads)
+        assert load_scenario(name, {}) is not None, name
+        monkeypatch.setattr(os, "environ", reads.env)
+        extra = {k for k in reads.read if k.startswith(("HPCB_", "HPC_BRIDGE_"))} - set(RUN_ENV)
+        if extra:
+            unreplayed[name] = sorted(extra)
+    assert len(names) > 50 and not unreplayed, unreplayed

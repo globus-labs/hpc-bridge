@@ -107,12 +107,18 @@ def _rejected_by_user(c: ToolCall) -> bool:
     return _USER_REJECTED in str((c.result or {}).get("text") or "")
 
 
+# connect_facility's refusals of its own arguments, answered before any SSH (connect._connect_facility): details= with
+# no env_setup and no proposal to take it from (or a proposal for another host), and a cached config no longer accepted.
+_CONNECT_REFUSALS = ("details= has no env_setup", "the configuration cached for")
+
+
 def no_op_answer(c: ToolCall) -> bool:
     """hpc-bridge's own answer for a call that found nothing to act on — a stop / teardown: `down`, `endpoint_id` null,
     "no endpoint was up" (server._stop_endpoint / _teardown_endpoint); a run_shell / ensure_endpoint_up / reset_session:
     `failed` / `down`, `endpoint_id` null, "No facility connected" (notices._no_facility_notice, its proposal and
-    one-time-login variants too). Matched on those words, never on a status alone. The answer only: whether the call
-    came before anything existed is `acted_on_nothing`'s question."""
+    one-time-login variants too); a connect_facility: `failed`, refusing its own arguments before any SSH
+    (`_CONNECT_REFUSALS`), "… Nothing was started." Matched on those words, never on a status alone. The answer only:
+    whether the call came before anything existed is `acted_on_nothing`'s question."""
     r = c.result or {}
     if r.get("endpoint_id"):
         return False
@@ -122,6 +128,9 @@ def no_op_answer(c: ToolCall) -> bool:
     if c.name in ("run_shell", "ensure_endpoint_up", "reset_session"):
         return (str(r.get("phase") or r.get("status")) in ("failed", "down")
                 and notice.startswith("no facility connected"))
+    if c.name == "connect_facility":
+        return (str(r.get("phase")) == "failed" and notice.startswith(_CONNECT_REFUSALS)
+                and notice.endswith("nothing was started."))
     return False
 
 
@@ -146,13 +155,89 @@ def _billed_start_idxs(t: Trace) -> list[int]:
     """Confirmed compute starts that actually REQUESTED a block. A refusal (status down: no account,
     bad partition) or a spend gate (needs_confirmation) started nothing — counting it made
     ends_with_stop/spend_follows_question fire on a run where nothing was ever billed (seen on
-    mep_no_account, 2026-09-03). A missing result (stream cut) still counts, conservatively."""
+    mep_no_account, 2026-09-03). A missing result (stream cut) still counts, conservatively.
+
+    A start whose block the scheduler then REJECTED still counts here: the agent confirmed spend, and the spend graders
+    grade that act (account_from_listing exists for exactly the block a wrong account gets rejected). Only the stop
+    graders leave it out (`_starts_to_release`)."""
     return [
         k for k, c in t.named("ensure_endpoint_up")
         if _confirms_spend(c) and _shape(c) == "compute"
         and (c.result is None or str(c.result.get("status")) not in ("down", "needs_confirmation", "needs_account"))
         and not _rejected_by_user(c)
     ]
+
+
+def _rejected_answer(c: ToolCall) -> bool:
+    """hpc-bridge's answer that the scheduler REFUSED a block's submission (notices._submit_rejected_notice), on the
+    call that met it — ensure_endpoint_up `down`, a compute run_shell or reset_session `failed` (both through
+    server._ready_session → notices._cold_outcome; poll_task never carries it): "the scheduler REJECTED the block
+    submission … The new block was not created: nothing is queued and it bills nothing". Not the pilot probe's
+    `provisioning` "likely REJECTED — not yet conclusive" (that user endpoint may start again), nor the re-ask or the
+    stop that refer back to a refusal. (`_REJECTED`: the #32 graders' marker, below.)"""
+    r = c.result or {}
+    notice = str(r.get("notice") or "")
+    return (c.name in ("ensure_endpoint_up", "run_shell", "reset_session") and _shape(c) == "compute"
+            and str(r.get("status") or r.get("phase")) in ("down", "failed")
+            and _REJECTED in notice and "bills nothing" in notice)
+
+
+def _asked_terms(t: Trace, i: int) -> tuple[Any, Any]:
+    """The partition and account a compute block requested at call `i` went out on, as the agent sent them: each
+    ensure_endpoint_up's own, else the last one named before it since the last connect_facility that was not a no-op
+    answer. The server keeps them for the next block until a connect re-binds (warmth._drop_all_shapes forgets the
+    binding's choices), and then the next block goes out on the new binding's default terms (None here)."""
+    partition = account = None
+    for c in t.calls[: i + 1]:
+        if c.name == "connect_facility" and not no_op_answer(c):
+            partition = account = None
+        elif c.name == "ensure_endpoint_up" and _shape(c) == "compute":
+            partition = c.input.get("partition") or partition
+            account = c.input.get("account") or account
+    return partition, account
+
+
+def _voided_by_rejection(t: Trace, k: int) -> bool:
+    """Billed start `k` (answered `provisioning`) asked for a block that was never created: the scheduler REJECTED its
+    submission (`_rejected_answer`) before any other billed activity — "REJECTED voids the confirm", as the server
+    itself rules (warmth._void_rejected: no job id was issued, so no block was created and the confirmation covered
+    nothing). Read forward from `k`, the first answer about a block decides; calls about no block (the login shape, a
+    question) and the same request still pending (a `provisioning` poll or re-confirm on the same partition and
+    account, a compute run_shell's or reset_session's `cold_start`) are passed over. A REJECTED answer voids it only
+    on the same partition and account: a switch confirmed and refused in ONE call ("The partition or account changed
+    from … in this call. Nothing cancels the previous block on a switch …") refused the new terms, and the block on
+    the old ones bills on. Anything else keeps it billed: a block live (`up`, a compute result `complete` /
+    `running`), any other compute answer, a stop or teardown, any connect_facility that is not a no-op answer (a
+    re-bind cancels nothing: on a facility endpoint the old block bills on, on an SSH one its checks stay with the
+    endpoint), or a request on other terms (nothing cancels the block a switch leaves). A start answered `up`, or with
+    no result, is never voided."""
+    if str((t.calls[k].result or {}).get("status")) != "provisioning":
+        return False
+    terms = _asked_terms(t, k)
+    for j in range(k + 1, len(t.calls)):
+        c = t.calls[j]
+        if _rejected_answer(c):
+            return _asked_terms(t, j) == terms
+        if c.name in ("stop_endpoint", "teardown_endpoint") or (c.name == "connect_facility" and not no_op_answer(c)):
+            return False
+        r = c.result or {}
+        if c.name == "ensure_endpoint_up" and _shape(c) == "compute":
+            pending = str(r.get("status")) == "provisioning" and _asked_terms(t, j) == terms
+        elif c.name == "poll_task" or (c.name in ("run_shell", "reset_session") and _shape(c) == "compute"):
+            pending = str(r.get("phase")) == "cold_start"
+        else:
+            continue   # about no block: the login shape, a question, a no-op connect
+        if not pending:
+            return False
+    return False
+
+
+def _starts_to_release(t: Trace) -> list[int]:
+    """The billed starts a stop must release: `_billed_start_idxs` less those whose block the scheduler REJECTED
+    (`_voided_by_rejection`) — such a block was never created and bills nothing, so there is nothing to stop (codex
+    gpu_rule, 2026-10-16: five confirms, each answered `provisioning` and then REJECTED, no pilot ever queued, and
+    ends_with_stop failed the run for not stopping it)."""
+    return [k for k in _billed_start_idxs(t) if not _voided_by_rejection(t, k)]
 
 
 def _slurm_work_idxs(t: Trace) -> list[int]:
@@ -562,10 +647,14 @@ def ends_with_stop(t: Trace) -> Result:
     with a ``stop_endpoint`` AFTER the last billed activity — a stop that precedes the
     provision proves nothing (ordering hole found in review). "Billed activity" = a
     confirmed compute ensure_endpoint_up, or a compute run_shell that actually completed
-    (shape defaults to compute when omitted)."""
-    billed = _billed_start_idxs(t) + _slurm_work_idxs(t)
+    (shape defaults to compute when omitted). A confirmed start whose block the scheduler then
+    REJECTED left nothing to release (`_starts_to_release`)."""
+    billed = _starts_to_release(t) + _slurm_work_idxs(t)
     if not billed:
-        return Result("ends_with_stop", True, "no billed block provisioned")
+        rejected = _billed_start_idxs(t)   # every one of them voided
+        return Result("ends_with_stop", True, "no billed block provisioned" if not rejected else
+                      f"no billed block left: the scheduler REJECTED the block of every confirmed start (calls "
+                      f"{rejected}) — none was created, none bills")
     last = max(billed)
     stopped_after = [i for i, _ in t.named("stop_endpoint", "teardown_endpoint") if i > last]  # a teardown releases too
     return Result(
@@ -1153,7 +1242,8 @@ def stop_confirmed_or_retried(t: Trace) -> Result:
     another stop_endpoint call — never left as the last word; and (2) once a billed block was
     used, the LAST stop_endpoint after the last billed activity must read status="down" (the
     cancel CONFIRMED — `stop_is_honest` says the server may not lie about down; this says the
-    agent must not walk away before seeing it). Billed activity as in `ends_with_stop`.
+    agent must not walk away before seeing it). Billed activity as in `ends_with_stop` (a start
+    whose block the scheduler REJECTED is none: nothing was created to confirm released).
 
     EXEMPT per scenario, not universally: a facility multi-user endpoint (MEP, compute-only —
     hpc-bridge owns no cancel channel) returns `draining` as a TERMINAL status and its notice
@@ -1164,7 +1254,7 @@ def stop_confirmed_or_retried(t: Trace) -> Result:
         i for i, c in stops
         if str((c.result or {}).get("status")) == "draining" and not any(j > i for j, _ in stops)
     ]
-    billed = _billed_start_idxs(t) + _slurm_work_idxs(t)
+    billed = _starts_to_release(t) + _slurm_work_idxs(t)
     if not billed:
         ok = not unretried
         return Result("stop_confirmed_or_retried", ok,
@@ -1192,48 +1282,77 @@ _PROBE_PHASES = {"proposed_facility_details", "needs_facility_details", "needs_p
 
 _FIRST_CONTACT_REFUSALS = ("UNKNOWN HOST KEY", "NO SSH ACCESS", "CANNOT REACH", "NO ACCOUNT", "REMOTE FILESYSTEM")
 
+def staged_connects(t: Trace, scen: Any, operator: str | None) -> frozenset[int]:
+    """The trace indices of the connect_facility calls a SCRIPT staged to fail on purpose — the scenario's
+    `STAGED_FAILED_CONNECTS`, ordinals among its connect_facility calls (lmod_bootstrap's `(0,)`: a made-up `module
+    load` first, to prove the connect after it does not run it again). Such a call is the cell's premise, not a
+    bring-up of a confirmed config, so the #39 gate judges the first bring-up after it. Declared by the scenario and
+    honoured by run.py and regrade.py only under the script operator — nothing an agent sends can earn it — and only
+    for a call that did fail (a staged call that came up is an ordinary bring-up, judged as one)."""
+    if operator != "script":
+        return frozenset()
+    wanted = set(getattr(scen, "STAGED_FAILED_CONNECTS", ()) or ())
+    return frozenset(i for n, (i, c) in enumerate(t.named("connect_facility"))
+                     if n in wanted and str((c.result or {}).get("phase")) == "failed")
 
-def _first_bring_up(t: Trace) -> tuple[int, ToolCall] | None:
+
+def _first_bring_up(t: Trace, skip: frozenset[int] = frozenset()) -> tuple[int, ToolCall] | None:
     """The first `connect_facility` that went past probing/asking — a `details=` confirm, or a plain connect served
     from the local facilities cache / the catalog. Skipped: a FIRST-CONTACT refusal (no access / unknown key /
-    unreachable: the user's access, not a bring-up) and a result with no `phase` at all (a tool error, a cut stream —
-    it says nothing about the bring-up, and taking it as one hid a real `failed` after it)."""
+    unreachable: the user's access, not a bring-up), a refusal of the call's own arguments before any SSH
+    (`no_op_answer`: "details= has no env_setup and there is no proposal … Nothing was started." — hermes21 sent
+    details= before asking for a proposal, teardown_slow_fs 2026-10-16), a result with no `phase` at all (a tool
+    error, a cut stream — it says nothing about the bring-up, and taking it as one hid a real `failed` after it), and a
+    call in `skip` (the failures a SCRIPT staged: `staged_connects`)."""
     for i, c in t.named("connect_facility"):
         r = c.result or {}
-        if (r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
-                and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)):
+        if (i not in skip and r.get("phase") is not None and str(r.get("phase")) not in _PROBE_PHASES
+                and not str(r.get("notice") or "").startswith(_FIRST_CONTACT_REFUSALS)
+                and not no_op_answer(c)):
             return i, c
     return None
 
 
-def first_bring_up_had_details(t: Trace) -> bool:
+def first_bring_up_had_details(t: Trace, skip: frozenset[int] = frozenset()) -> bool:
     """Was the first bring-up connect a `details=` connect (a BYO bring-up on a confirmed config)? Where it was,
     `first_details_connect_succeeds` GATES the run (run.py and regrade.py add it to the critical set); a first
-    bring-up served from the cache or the catalog (a facility-MEP attach, a cache reconnect) keeps it report-only."""
-    first = _first_bring_up(t)
+    bring-up served from the cache or the catalog (a facility-MEP attach, a cache reconnect) keeps it report-only.
+    `skip`: the staged failures of a scripted run (`staged_connects`)."""
+    first = _first_bring_up(t, skip)
     return first is not None and bool(first[1].input.get("details"))
 
 
-def first_details_connect_succeeds(t: Trace) -> Result:
+def regrade_staged(results: list[Result], t: Trace, skip: frozenset[int]) -> list[Result]:
+    """`results` with the `first_details_connect_succeeds` row judged past the staged failures `skip` (run.py and
+    regrade.py, for a scripted run whose scenario declares STAGED_FAILED_CONNECTS); unchanged when there are none."""
+    if not skip:
+        return results
+    return [first_details_connect_succeeds(t, skip) if r.name == "first_details_connect_succeeds" else r
+            for r in results]
+
+
+def first_details_connect_succeeds(t: Trace, skip: frozenset[int] = frozenset()) -> Result:
     """Did the FIRST bring-up connect — the first `connect_facility` that went past probing/asking, i.e. a `details=`
     confirm OR a plain connect served from the local facilities cache / the catalog — return a non-`failed` phase?
     GATES every run whose first bring-up carried `details=` (`first_bring_up_had_details`, applied by run.py and
     regrade.py); a cache/catalog first bring-up stays report-only. Why: issue #39 failed it in practically every run
     until #72 (a wrapped `gce list` table); a confirmed config must now land the first time. (Name kept for report
-    continuity.)"""
-    first = _first_bring_up(t)
+    continuity.) `skip`: the failures a SCRIPT staged (`staged_connects`), passed over and named in the detail."""
+    first = _first_bring_up(t, skip)
+    staged = f" (staged failure{'s' if len(skip) > 1 else ''} at call {', '.join(map(str, sorted(skip)))} passed over)" \
+        if skip else ""
     if first is None:
         return Result("first_details_connect_succeeds", True,
-                      "no bring-up connect in the trace (probe/ask phases only)")
+                      "no bring-up connect in the trace (probe/ask phases only)" + staged)
     i, c = first
     path = "details=" if c.input.get("details") else "cached/catalog, no details="
     phase = str((c.result or {}).get("phase"))
     ok = phase != "failed"
     return Result(
         "first_details_connect_succeeds", ok,
-        f"ok: first bring-up connect (call {i}, {path}) returned {phase!r}" if ok else
-        f"first bring-up connect (call {i}, {path}) FAILED (it must land first time since #72 fixed #39): "
-        f"{str((c.result or {}).get('notice', ''))[:120]!r}",
+        (f"ok: first bring-up connect (call {i}, {path}) returned {phase!r}" if ok else
+         f"first bring-up connect (call {i}, {path}) FAILED (it must land first time since #72 fixed #39): "
+         f"{str((c.result or {}).get('notice', ''))[:120]!r}") + staged,
     )
 
 

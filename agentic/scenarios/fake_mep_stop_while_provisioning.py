@@ -227,7 +227,7 @@ _POLL = 32   # × 15 s after the 240 s settle: at most 720 s after the agent's t
 POSTCHECKS = [
     # non-vacuity: the queued check made the facility submit a pilot during THIS cell (else "gone" proves nothing)
     {"name": "mep_pilot_submitted",
-     "cmd": (f"s=$(cat {_STAMP} 2>/dev/null); [ -n \"$s\" ] || {{ echo NO_STAMP; exit 0; }}; "
+     "cmd": (f"s=$(cat {_STAMP} 2>/dev/null); [ -n \"$s\" ] || {{ echo NO_STAMP; exit 1; }}; "
              f"sacct -u {MAPPED_USER} -X -n -P -S \"$s\" -o JobID,JobName,Submit 2>&1 "
              "| awk -F'|' -v s=\"$s\" '$2 ~ /parsl/ && $3 >= s' | grep parsl "
              "|| echo \"no pilot of the mapped account submitted since $s\""),

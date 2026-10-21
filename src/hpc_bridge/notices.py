@@ -16,13 +16,24 @@ from typing import Literal
 
 from . import config
 from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
-from .context import AppCtx, LeftBlock, SentCheck, ShapeRuntime, _has_login_shape, _idle_release_s
+from .context import (
+    AppCtx,
+    DroppedConfigError,
+    LeftBlock,
+    SeenPilots,
+    SentCheck,
+    ShapeRuntime,
+    SshLeft,
+    _has_login_shape,
+    _idle_release_s,
+)
 from .cost import _block_nodes, _with_spend
+from .facility.base import ConfigStepFailed
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
 from .runner import CanaryResult, SubmitAnswer
-from .scheduler_ops import _QUOTED, _ask_terms, _submission_refused, _user_endpoint_logs
+from .scheduler_ops import _END_NOW, _QUOTED, _ask_terms, _pilot_fates, _submission_refused, _user_endpoint_logs
 
 # sshd's own denial lines — the method list in parentheses is the tell (a bare "Permission denied" is
 # usually the remote filesystem: `mkdir … : Permission denied` on an over-quota home, found in review).
@@ -65,8 +76,21 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     raw = str(exc)
     # These already say what to do; their quoted text (whoami's, a build's last error line) could otherwise be misread
     # as an SSH denial or a network error ("error: Failed to fetch … connection timed out" from PyPI is not the host).
-    if type(exc).__name__ in ("RemoteTokenStoreExists", "EndpointVenvError"):
+    # By name along the class's line, so a subclass (EndpointVenvConfigError) is one too.
+    if any(c.__name__ in ("RemoteTokenStoreExists", "EndpointVenvError") for c in type(exc).__mro__):
         return raw
+    cli = getattr(fac, "cli", None)
+    target = getattr(cli, "target", None) or getattr(cli, "_target", None)
+    host = host or getattr(target, "host", None) or getattr(fac, "alias", None) or "the login host"
+    if isinstance(exc, ConfigStepFailed):
+        # ssh got through and the login node ran the step. globus-compute-endpoint's own write refused on its
+        # ~/.globus_compute (a read-only or full home, a permission): the remote filesystem's, as before — the
+        # configuration is kept. Any other "Permission denied" or "Connection refused" in its words is the
+        # configuration's (a file env_setup sources, a server it calls), never sshd's or the login host's.
+        refused = next((ln for ln in exc.tail.splitlines() if _REMOTE_FS_REFUSED.search(ln)), None)
+        if refused is not None:
+            return _remote_fs_notice(host, refused)
+        return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
     # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
@@ -74,9 +98,6 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                if "permission denied" in ln.lower() or "denied" in ln.lower() or "host key" in ln.lower()]
     if verdict:
         ssh_line = verdict[-1].strip()
-    cli = getattr(fac, "cli", None)
-    target = getattr(cli, "target", None) or getattr(cli, "_target", None)
-    host = host or getattr(target, "host", None) or getattr(fac, "alias", None) or "the login host"
     if user is None:
         user = getattr(target, "user", None)
     if _SSH_AUTH_DENIED.search(raw) or "too many authentication failures" in low:
@@ -106,9 +127,7 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                 f"already trusts, and {why}. Verify the fingerprint and connect once from your own terminal "
                 f"(`ssh {who}`), which saves the key; then call connect_facility again. Nothing was started or billed.")
     if "permission denied" in low:  # a denial from the remote FILESYSTEM (quota, read-only home), not from sshd
-        return (f"REMOTE FILESYSTEM refused a write on {host}: {ssh_line[:200]}. The login worked; the home "
-                "directory is over quota, read-only, or not writable. Free space or fix permissions there, then "
-                "call connect_facility again. Nothing was started or billed.")
+        return _remote_fs_notice(host, ssh_line)
     if any(k in low for k in ("could not resolve hostname", "connection timed out", "connection refused",
                               "no route to host", "network is unreachable", "operation timed out",  # macOS strerror
                               "host is down", "network is down", "connection reset by peer",
@@ -124,6 +143,57 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         return (f"hpc-bridge error: the SSH ControlMaster socket path is too long ({ssh_line[:160]}); set "
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
     return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+
+def _remote_fs_notice(host: str, line: str) -> str:
+    """A write the login node's own filesystem refused (quota, read-only home, permission): the login worked."""
+    return (f"REMOTE FILESYSTEM refused a write on {host}: {line[:200]}. The login worked; the home "
+            "directory is over quota, read-only, or not writable. Free space or fix permissions there, then "
+            "call connect_facility again. Nothing was started or billed.")
+
+
+# A write refused by the login node's filesystem, in a step's last few lines: globus-compute-endpoint's own under
+# ~/.globus_compute (Errno 13, a read-only file system — live 2026-09-03: `PermissionError: [Errno 13] Permission
+# denied: '…/.globus_compute/…/endpoint.log'`), or a full disk or quota anywhere. Explained as REMOTE FILESYSTEM.
+_REMOTE_FS_REFUSED = re.compile(
+    r"read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
+    r"|no space left on device|\[errno 28\]|disk quota exceeded|\[errno 122\]",
+    re.IGNORECASE,
+)
+
+# Words that make a step that ran the configuration fail for something else, read from the step's LAST FEW meaningful
+# lines (`ConfigStepFailed.tail`, `base.TAIL_LINES`: the final error and what printed just before it — pip's "Connection
+# to pypi.org timed out" warning above its "No matching distribution", a site script's `curl: (28)` above its own last
+# line — but never a banner far above): the network or a timeout (a pip, uv or license server env_setup calls that did
+# not answer in time), the Globus service — globus-compute-endpoint's own "Network failure; unable to register endpoint:
+# ConnectionError on request" (exit 75, EX_TEMPFAIL) and its "Endpoint registration blocked" (409/423) — an ssh
+# connection lost under the step, an endpoint still registering, the login node's own state (out of processes, a stale
+# NFS handle) or its filesystem (`_REMOTE_FS_REFUSED`). The same configuration may come up on the next try, so it is
+# kept. Narrow on purpose: a bare "timeout" (`sock.settimeout`, "idle sessions timeout") or a `globus_sdk` path is no
+# cause. (agentic/scenarios/lmod_bootstrap.py keeps a copy for its grader; a hermetic test holds the two equal.)
+_NOT_THE_CONFIG_WORDS = re.compile(
+    r"\btimed out\b|timeout ?error|network timeout|globus_sdk\.\S*error|globus ?api ?error|globus ?connection ?error"
+    r"|globus ?timeout ?error|auth\.globus\.org|api\.globus\.org"
+    r"|network failure|unable to register endpoint|(?:connect)?(?:connection|timeout)error on request"
+    r"|registration blocked"
+    r"|connection (?:to \S+ )?closed|client_loop:|broken pipe|connection reset by peer|kex_exchange_identification"
+    r"|ssh: connect to host|could not find endpoint|resource temporarily unavailable|stale file handle"
+    r"|read-only file system|\[errno 30\]|(?:\[errno 13\]|permission denied)[^\n]*\.globus_compute"
+    r"|no space left on device|\[errno 28\]|disk quota exceeded|\[errno 122\]",
+    re.IGNORECASE,
+)
+
+
+def _failure_of_the_config(exc: BaseException) -> bool:
+    """Did the configuration being brought up fail on the login node? Decided POSITIVELY: only a step that ran through
+    its env_setup and was refused there (`ConfigStepFailed`: configure, start, list, the endpoint venv's check or
+    build — never ssh's own exit status 255 or a negative one) whose last few meaningful lines (`tail`) name none of
+    `_NOT_THE_CONFIG_WORDS`. Everything else says nothing about the configuration and connect keeps it, for the retry
+    its answer asks for: ssh refused or unreachable, a host key, the socket path, a timeout, the Globus service (the
+    manager check's web error), the Globus login, an endpoint still registering, the login node out of processes or on
+    a stale handle, a write the remote filesystem refused, a token store hpc-bridge will not replace, a venv in the way,
+    an old uv, a venv build that could not reach the network."""
+    return (isinstance(exc, ConfigStepFailed) and not login_expired(exc)
+            and not _NOT_THE_CONFIG_WORDS.search(exc.tail))
 
 def _local_dill() -> str | None:
     try:
@@ -294,13 +364,16 @@ def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: 
                  "until the facility's idle window ends it. ")
     return line
 
-def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False) -> str:
+def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False, left: bool = False) -> str:
     """connect_facility's statement of the next block's terms, before any spend, and the one question to ask: only for
     what the user has not said — a preset (HPC_BRIDGE_ACCOUNT / HPC_BRIDGE_PARTITION) counts as said — and their yes
     to it IS the spend confirmation, sent with their answer in one ensure_endpoint_up call. `listed`: the result lists
-    allocations to choose from. With no terms (they could not be read), a short instruction alone."""
+    allocations to choose from. With no terms (they could not be read), a short instruction alone. `left`: the notice
+    already says what an earlier block or pilot of this session left in the scheduler (a reconnect cancels nothing), so
+    it never says nothing is started or billed — only that this connect started nothing."""
+    lead = "Nothing new is started or billed by this connect. " if left else "Nothing is started or billed yet. "
     if terms is None:
-        return ("Nothing is started or billed yet. Before the first block, ask the user in one question for what they "
+        return (lead + "Before the first block, ask the user in one question for what they "
                 "have not said (the account to charge where one is needed, and whether the default partition is OK); "
                 "their yes is the spend confirmation: send it with their answer in one call, "
                 "ensure_endpoint_up(account=…, partition=…, confirm_spend=True).")
@@ -334,8 +407,69 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
         ask = (f"Before the first block, ask the user in one question {', and '.join(asks)} (naming these terms), "
                f"unless they already said; their yes is the spend confirmation: send it with their answer in one "
                f"call, {call}.")
-    return ("Nothing is started or billed yet. "
-            + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
+    return (lead + _terms_line(app, terms, compute_note=False, lead="The next block's terms") + said + ask)
+
+
+def _cut(line: str, n: int = 120) -> str:
+    return line if len(line) <= n else line[: n - 1] + "…"
+
+
+def _directive_note(rewrites: list[tuple[str, str]]) -> str:
+    """connect_facility's report of how the details' scheduler_options were written as directives
+    (binding._directive_details): each bare option or indented directive, and the line the submit script carries
+    instead. Empty: none."""
+    if not rewrites:
+        return ""
+    # each line as given, up to 120 characters (a longer one is cut, marked by its quote's "…")
+    shown = "; ".join(f"wrote {_cut(given)!r} as {_cut(written)!r}" for given, written in rewrites[:5])
+    more = f" (and {len(rewrites) - 5} more lines the same way)" if len(rewrites) > 5 else ""
+    return (f"scheduler_options: {shown}{more} — a submit script reads a directive only from a line that starts with "
+            "it: a bare option there is a shell command (and the scheduler stops reading directives at it), an "
+            "indented directive a comment. ")
+
+
+def _pilot_rows_of(pilots: SeenPilots) -> list[list[str]]:
+    """Recorded pilots as the probe's rows (the state as the scheduler listed it, job, -, reason), for
+    scheduler_ops._pilot_fates' words — Slurm's PENDING named as Slurm's, never read as a PBS letter."""
+    return [[word, job, "-", reason] for job, _state, reason, word in pilots.jobs]
+
+
+def _pilots_left_words(pilots: SeenPilots) -> list[str]:
+    """What becomes of pilots a re-bind left in the scheduler, by their state at the last look (`_pilot_fates`: a held
+    pilot or one refused as submitted never starts; a waiting or running one runs the check queued with it, bills)."""
+    return [f"at the last look ({_ago(pilots.at)}) " + "; ".join(_pilot_fates(_pilot_rows_of(pilots)))]
+
+
+def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: SshLeft | None) -> str:
+    """A connect that re-bound an SSH endpoint cancels nothing there: what is still in its scheduler from before it —
+    the block this session had up (it idle-releases after its last task), the pilots the last probe saw live (a held one
+    never starts and never idle-releases), or else checks of ours not seen to finish (the endpoint can start a block for
+    one) — and how to end it. `same`: this connect bound that endpoint again. Empty when nothing is known left."""
+    parts = []
+    if left is not None and left.up:
+        job = f" (job {left.job})" if left.job else ""
+        parts.append(f"the compute block this session had up{job} idle-releases {_idle_window_text(app)} after its "
+                     "last task (min_blocks=0)")
+    if left is not None and left.pilots is not None:
+        parts += _pilots_left_words(left.pilots)
+    if not parts and not queued:
+        return ""
+    things = "a check (or command) of hpc-bridge's" if queued == 1 else f"{queued} checks (or commands) of hpc-bridge's"
+    if not same:
+        if not parts:  # checks only: the words a bind elsewhere has always used
+            return (f"On the endpoint this connect left ({old_eid}), {things} not seen to finish may still be queued: "
+                    "while one is, that endpoint can start a billed block to run it. Connecting back to it and "
+                    "calling stop_endpoint cancels such a block and says when none is left; teardown_endpoint there "
+                    "ends them. ")
+        return (f"This connect cancels nothing on the endpoint it left ({old_eid}): " + "; ".join(parts) + ". "
+                "Connecting back to it and calling stop_endpoint cancels its blocks and says when none is left; "
+                "teardown_endpoint there ends them. ")
+    if not parts:
+        parts.append(f"{things} sent before it, not seen to finish, may still be queued here — while one is, the "
+                     "endpoint can start a billed block to run it")
+    return ("This connect cancels nothing on this endpoint, and this endpoint still has work in its scheduler: "
+            + "; ".join(parts) + ". stop_endpoint cancels every block of this endpoint, these included, and says when "
+            f"none is left (teardown_endpoint ends them too). {_END_NOW} ")
 
 def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
     """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
@@ -385,7 +519,7 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
                                                          rt.user_endpoint_config.get("account")):  # a switch since
         out += f"The {word} or account was switched since, so a confirmation now starts a block on the new terms. "
     if app is not None and (rt.switched_terms is not None or left is not None):
-        out += _switch_fate(app, left, confirmed=False)
+        out += _switch_fate(app, left, confirmed=False, rt=rt)
     return out
 
 def _still_left(app: AppCtx, left: LeftBlock | None) -> bool:
@@ -393,18 +527,59 @@ def _still_left(app: AppCtx, left: LeftBlock | None) -> bool:
     end (the rule warmth._prune_left applies)."""
     return left is not None and left in app.left_blocks and (left.ends_by is None or left.ends_by > time.monotonic())
 
-def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool) -> str:
-    """What became of the block a partition or account switch moved away from: nothing cancels it. On an SSH endpoint it
-    idle-releases on its own (min_blocks=0), and stop_endpoint cancels every block of the endpoint by its marker (the
-    new choice survives the stop). A facility endpoint's `left` block is named as a reconnect names one
-    (`_left_block_clause`); None: no block of ours was known there. `confirmed`: the new block is already confirmed (a
-    stop now ends it too)."""
+_HELD_NEVER = ("a held pilot never starts on its own, so it runs no task and never idle-releases: it stays in the "
+               "queue, holding hpc-bridge's check, until it is cancelled")
+
+
+def _ago(at: float) -> str:
+    return f"{max(0, int(time.monotonic() - at))}s ago"
+
+
+def _ssh_block_fate(app: AppCtx, up: bool | None, pilots: SeenPilots | None) -> tuple[str, bool]:
+    """What an SSH endpoint's block that a switch left does now, nothing having cancelled it, and whether its pilot
+    sits held. A block that came up (`up`; None: not known) idle-releases after its last task (min_blocks=0). One that
+    never came up is its pilot (the one the last probe's verdict was about): held at the last look, it never starts and
+    never idle-releases; queued, it may still start — it runs the check queued with it, then idle-releases; never seen,
+    either may be true. ("held" in lower case: an upper-case HELD is a probe verdict's, about the current pilot.)"""
+    idle = f"idle-releases {_idle_window_text(app)} after its last task (min_blocks=0)"
+    if up is not False:
+        return f"it {idle}", False
+    state = pilots.subject_state if pilots is not None else None
+    if pilots is not None and pilots.subject is not None and state is not None:
+        job = pilots.subject
+        if state == "H":
+            return (f"it never came up — its pilot {job} was held at the last look ({_ago(pilots.at)}), and "
+                    f"{_HELD_NEVER}"), True
+        if state == "N":
+            return (f"it never came up — its pilot {job} was one the scheduler will not start as submitted at the "
+                    f"last look ({_ago(pilots.at)}; reason {pilots.reason(job)[:60]!r}): it never runs, and stays in "
+                    "the queue, holding hpc-bridge's check, until it is cancelled"), True
+        if state == "R":
+            return (f"it never came up — its pilot {job} was RUNNING at the last look ({_ago(pilots.at)}), its worker "
+                    f"starting: it runs hpc-bridge's check queued with it, then {idle}"), False
+        reason = pilots.reason(job)
+        why = f"; reason {reason[:60]!r}" if reason and reason.lower() != "none" else ""
+        return (f"it never came up — its pilot {job} was still queued at the last look ({_ago(pilots.at)}{why}): if "
+                f"it starts — a limit or an outage it waits on may clear — it runs hpc-bridge's check queued with it, "
+                f"then {idle}"), False
+    return (f"it never came up: if its pilot starts, it runs hpc-bridge's check queued with it, then {idle}; a pilot "
+            "the scheduler holds never starts and never idle-releases"), False
+
+
+def _switch_fate(app: AppCtx, left: LeftBlock | None, *, confirmed: bool, rt: ShapeRuntime | None = None) -> str:
+    """What became of the block a partition or account switch moved away from: nothing cancels it. On an SSH endpoint
+    a block that came up idle-releases on its own (min_blocks=0), and one that never did is said by its pilot
+    (`_ssh_block_fate`, from what the switch recorded on `rt`): a HELD one never idle-releases. stop_endpoint cancels
+    every block of the endpoint by its marker (the new choice survives the stop). A facility endpoint's `left` block is
+    named as a reconnect names one (`_left_block_clause`); None: no block of ours was known there. `confirmed`: the new
+    block is already confirmed (a stop now ends it too)."""
     if _has_login_shape(app):
-        idle = f"it idle-releases {_idle_window_text(app)} after its last task (min_blocks=0)"
+        fate, held = _ssh_block_fate(app, rt.switch_left_up if rt is not None else None,
+                                     rt.switch_left_pilots if rt is not None else None)
         if confirmed:
-            return (f"Nothing cancelled the previous block: {idle}; stop_endpoint cancels every block of this "
-                    "endpoint, this new one included. ")
-        return (f"Nothing cancels the previous block on a switch, even one still queued: {idle}. To end it now, call "
+            return (f"Nothing cancelled the previous block: {fate}; stop_endpoint cancels every block of this "
+                    f"endpoint, {'that one and ' if held else ''}this new one included. ")
+        return (f"Nothing cancels the previous block on a switch, even one still queued: {fate}. To end it now, call "
                 "stop_endpoint before confirming the new block: it cancels this endpoint's blocks and keeps the new "
                 f"{_queue_word(app)} and account for the next one. ")
     if left is None:
@@ -422,7 +597,7 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
         return ""
     word = _queue_word(app)
     return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
-            + _switch_fate(app, rt.switch_left, confirmed=True))
+            + _switch_fate(app, rt.switch_left, confirmed=True, rt=rt))
 
 def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | None, str | None] | None) -> str:
     """For the call that switched the partition or account, confirmed and met a REJECTED submission at once: no new
@@ -433,7 +608,7 @@ def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | N
         return ""
     word = _queue_word(app)
     return (f"The {word} or account changed from {_terms(*switched, word)} in this call. "
-            + _switch_fate(app, rt.switch_left, confirmed=False))
+            + _switch_fate(app, rt.switch_left, confirmed=False, rt=rt))
 
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -1348,6 +1523,8 @@ def _orphaned_outcome(app: AppCtx, task_id: str) -> ShellOutcome:
 def _hpc_bridge_error(exc: BaseException) -> str:
     """'hpc-bridge error: <type>: <text>' for a failure no notice explains — but a stored Globus login Globus refuses to
     renew (`login_expired`) gets its remedy instead of the raw token-endpoint tuple."""
+    if isinstance(exc, DroppedConfigError):  # its text is the whole answer: the dropped config, and what to do instead
+        return str(exc)
     if login_expired(exc):
         # the gate before a bootstrap raised it: no SSH was made and nothing was copied or started
         gated = " Nothing was started, and no login was copied to the login node." \

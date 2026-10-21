@@ -5,6 +5,8 @@
 
 ## What it does
 
+- **`ConfigStepFailed`** and **`step_error(rc, message)`** (2026-10-20): the error of a bring-up step that ran through the configuration's `env_setup` and was refused on the login node — `configure`, `start`, `list` ([[facility-remote]]) and the endpoint venv's config-caused errors ([[facility-endpoint_venv]] `EndpointVenvConfigError`). `step_error` gives it for any exit status but ssh's own 255 or a negative one (the local ssh killed by a signal) — then a plain RuntimeError: nothing of the config is known to have run. Its `said` is the step's own last meaningful line (`last_said`: a traceback's exception, a command's final error, never a banner, a shell trailer or a title escape) and its `tail` its last four (`said_tail`), which is all `notices._failure_of_the_config` reads; a step that printed nothing is judged by nothing, never by a note the message adds; [[connect]] drops a `details=` config only for one of these.
+
 - **`Facility`** Protocol (`facility/base.py:27`) — the contract the runtime depends on: `provision(profile)`, `manager_online(endpoint_id)`, `config_template(profile)`. Concrete facilities add optional capabilities the server reads via `getattr`: `bootstrap`/`teardown`/`login_exec`/`scratch_root`/`profile` (SSH facilities), **`supported_shapes`** / `max_idletime_s` (a facility MEP), and `account_required` (any facility built from a catalog entry: a MEP, and since 2026-10-14 an SSH one) — absent `supported_shapes` means every shape.
 - **`EndpointHandle`** (`:19`) — `provision`/`bootstrap` return value: `endpoint_id`, `name`, `login_host` (the pinned FQDN), `reused` (True if reused over the web — or attached to a facility's endpoint — with no SSH).
 

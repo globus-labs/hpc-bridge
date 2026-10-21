@@ -10,20 +10,25 @@ EXTRA_INVARIANTS, and diff per-invariant verdicts against what record.json store
 postchecks are skipped — they measured the live cluster, which is gone). Reports verdict
 flips and fresh critical failures, then a summary. A failing bundle whose operator produced
 nothing to grade because its model endpoint failed is reported INFRA, as run.py decides it
-live (infra.py), and does not count as "would now grade FAIL".
+live (infra.py), and does not count as "would now grade FAIL". Each bundle's scenario is
+imported afresh under that bundle's own run environment (RUN_ENV, load_scenario): a scenario
+builds graders from it at import — the canary cells' nonce comes from HPCB_RUNID.
 """
 from __future__ import annotations
 
 import importlib
 import json
+import os
 import sys
 from pathlib import Path
+from types import ModuleType
 
 _HERE = Path(__file__).resolve().parent
+SCENARIOS_DIR = _HERE.parents[0] / "scenarios"
 sys.path.insert(0, str(_HERE))
-sys.path.insert(0, str(_HERE.parents[0] / "scenarios"))
+sys.path.insert(0, str(SCENARIOS_DIR))
 
-from infra import PREFLIGHT_ROW, bundle_final, infra_reason, outcome_of  # noqa: E402
+from infra import PREFLIGHT_ROW, absences, bundle_final, infra_reason, outcome_of  # noqa: E402
 from invariants import (  # noqa: E402
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -33,8 +38,69 @@ from invariants import (  # noqa: E402
     dialogue_words,
     first_bring_up_had_details,
     floor_graders,
+    regrade_staged,
+    staged_connects,
 )
 from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
+
+# The per-run environment a scenario module reads WHEN IT IS IMPORTED — so the replay must re-create it per bundle:
+# HPCB_RUNID (canaries.nonce: the canary cells' graders, SETUP and POSTCHECKS), HPC_BRIDGE_SSH_HOST (the login host
+# no_ssh_access's and the f2b cells' graders name), HPC_BRIDGE_ENDPOINT_NAME and HPCB_TARGET_NODES (POSTCHECKS, SETUP),
+# HPCB_RELAUNCH_* (queued_check_relaunch's watch and NEEDS_COMPUTE_NODE). test_regrade holds every scenario to it.
+RUN_ENV = ("HPCB_RUNID", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPCB_TARGET_NODES",
+           "HPCB_RELAUNCH_PHASE", "HPCB_RELAUNCH_HOLD_S", "HPCB_RELAUNCH_WATCH_S", "HPCB_RELAUNCH_PILOT_WAIT_S")
+
+
+def run_env(rec: dict) -> dict[str, str | None]:
+    """RUN_ENV as the live run had it: the record's env snapshot (provenance._safe_env), HPCB_RUNID falling back to
+    config.runid (run.py's copy of it, in every bundle). None = unset, as it was in the jail."""
+    env = rec.get("env") or {}
+    out = {k: None if env.get(k) is None else str(env[k]) for k in RUN_ENV}
+    runid = (rec.get("config") or {}).get("runid")
+    if out["HPCB_RUNID"] is None and runid is not None:
+        out["HPCB_RUNID"] = str(runid)
+    return out
+
+
+def _setenv(k: str, v: str | None) -> None:
+    if v is None:
+        os.environ.pop(k, None)
+    else:
+        os.environ[k] = v
+
+
+def _scenario_modules() -> dict[str, ModuleType]:
+    """The cached modules that are scenario FILES (a test's stand-in module, with no file, is not one)."""
+    return {k: m for k, m in list(sys.modules.items())
+            if getattr(m, "__file__", None) and Path(m.__file__).parent.name == SCENARIOS_DIR.name
+            and Path(m.__file__).parent.resolve() == SCENARIOS_DIR}
+
+
+def load_scenario(name: str, rec: dict) -> ModuleType | None:
+    """Import scenario `name` FRESH under its bundle's run environment (run_env); None when there is no such scenario.
+
+    A scenario derives state from that environment at import — the canary cells build their nonce, and with it their
+    graders, from HPCB_RUNID — so a module cached from another bundle, or imported under the regrading shell's env,
+    grades the wrong run (every canary bundle's `canary_reached_agent` flipped to FAIL). Every scenario module is
+    dropped from the cache for the import (they import each other), and the env and the cache are put back after it:
+    the module returned keeps its own state."""
+    saved_env = {k: os.environ.get(k) for k in RUN_ENV}
+    saved_mods = _scenario_modules()
+    try:
+        for k, v in run_env(rec).items():
+            _setenv(k, v)
+        for k in saved_mods:
+            del sys.modules[k]
+        try:
+            return importlib.import_module(name)
+        except ModuleNotFoundError:
+            return None
+    finally:
+        for k, v in saved_env.items():
+            _setenv(k, v)
+        for k in _scenario_modules():
+            del sys.modules[k]
+        sys.modules.update(saved_mods)
 
 
 def _first_line(d: Path) -> dict:
@@ -103,17 +169,20 @@ def _preflight(rec: dict) -> str | None:
     return None if pre is None else str(pre.get("detail") or "the model endpoint was unhealthy before launch")
 
 
-def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str]) -> str | None:
-    """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None."""
+def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str], postchecks=()) -> str | None:
+    """Why a bundle that fails is INFRA, as run.py decided it live (infra.py), or None. `postchecks`: the scenario's
+    POSTCHECKS, which say which stored world failures only found missing what the agent's work would have left."""
     if not crit_fail_names or rec.get("rc") == 3 or rec.get("result") not in (None, "OK", "FAILED", "INFRA"):
         return None   # INFRA replaces a graded FAILED only: never RATE_LIMITED, INTERRUPTED, SETUP FAILED or CRASHED
     # what was not re-run here but did fail live — world checks, the harness rows (the leak probe after the teardown):
-    # INFRA never hides one
-    stored = list(rec.get("failed") or []) + [g["name"] for g in rec.get("grading", [])
-                                              if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    # INFRA never hides one, except a world check that failed only because nothing ran (infra.absences)
+    world = [(str(g["name"]), str(g.get("detail") or "")) for g in rec.get("grading", [])
+             if str(g.get("name", "")).startswith("world:") and not g.get("ok")]
+    stored = list(rec.get("failed") or []) + [name for name, _ in world]
     rows = _rows(d)
     operator = (rec.get("config") or {}).get("operator") or "claude"
-    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored)
+    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored,
+                        absences(world, postchecks))
 
 
 def regrade(runs_dir: Path, *, strict: bool = False) -> int:
@@ -140,21 +209,21 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         t = insert_interjections(bundle_trace(d, rec), [e for e in rec.get("events") or [] if e.get("interject")])
         t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
         t.user_said_at = dialogue_positions(rec.get("dialogue"))
-        try:
-            scen = importlib.import_module(scen_name)
-        except ModuleNotFoundError:
-            scen = None
+        scen = load_scenario(scen_name, rec)   # under THIS bundle's run env: its graders are this run's
         # the floor replays too — without the jail's secret material (no_secret_material says so, vacuously), but with
         # the scenario's USER_SECRETS (a fixture in the module: the replay compares exactly what the live run did)
         results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"),
                                                                  user_secrets=getattr(scen, "USER_SECRETS", None))]
+        # a SCRIPT's staged failures, as run.py honours them: only under the script operator
+        staged = staged_connects(t, scen, cfg.get("operator"))
+        results = regrade_staged(results, t, staged)
         critical = {"agent_engaged", *FLOOR_NAMES}
         if scen is not None:
             results += [fn(t) for fn in getattr(scen, "EXTRA_INVARIANTS", [])]
             critical |= set(getattr(scen, "EXPECT_OK", []))
             if getattr(scen, "LOCAL_BASELINE", False):
                 critical.discard("agent_engaged")   # a calibration run that must not use hpc-bridge (run.py, same rule)
-        if first_bring_up_had_details(t):   # the same conditional gate as run.py: a details= bring-up must land first time
+        if first_bring_up_had_details(t, staged):   # the same conditional gate as run.py: a details= bring-up must land first time
             critical.add("first_details_connect_succeeds")
         # the completion gate, from what the bundle recorded (not from the trace)
         fin = rec.get("final") or {}
@@ -174,7 +243,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         crit_fail_names = [r.name for r in results if not r.ok and r.name in critical]
         label = (f"{cfg.get('persona') or 'auto'}"
                  f"{', ~skill' if cfg.get('ablate_skill') else ''}")
-        infra = bundle_infra(d, rec, t, crit_fail_names)
+        infra = bundle_infra(d, rec, t, crit_fail_names, getattr(scen, "POSTCHECKS", ()))
         tag = "INFRA" if infra else "FAIL" if crit_fail_names else "OK  "
         if infra:
             now_infra += 1

@@ -46,9 +46,12 @@ from .context import (
     DEFAULT_SHAPE,
     AppCtx,
     DeadPilot,
+    DroppedConfigError,
     LeftBlock,
+    SeenPilots,
     SentCheck,
     ShapeRuntime,
+    SshLeft,
     TaskHandle,
     _has_login_shape,
     _idle_release_s,
@@ -451,6 +454,8 @@ def _mark_reaped(app: AppCtx, rt: ShapeRuntime, why: str, released_at: float | N
     lived, not now), forget its warmth, and require a fresh acknowledgement for the next block. `kicked`: the reap
     was found by a check that may already have asked for a new block."""
     _bank_warm_interval(rt, app, until=released_at)
+    if rt.pilots is not None:  # that block's pilot is gone with it: never named as still in the queue
+        rt.pilots = rt.pilots.without({rt.pilots.subject, rt.block_job})
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None
     rt.provisioning_since = None
@@ -613,7 +618,14 @@ async def _provision(
     NOTHING until spend is acknowledged (confirm_spend=True, or confirmed for the block that is still up — a reaped
     block voids it, and the call that finds the reap stops even with confirm_spend=True).
     The carve-out only applies to billable shapes — a login (LocalProvider) shape is free and
-    provisions straight through."""
+    provisions straight through.
+
+    A bound facility whose configuration connect dropped (`AppCtx.dropped_binding`) is never bootstrapped: refused
+    first, before any spend or state changes — ensure_endpoint_up and run_shell would otherwise run that config
+    again."""
+    if (app.state.endpoint_id is None and app.dropped_binding is not None
+            and app.dropped_binding[0] is app.facility):
+        raise DroppedConfigError(app.dropped_binding[1])
     rt = _shape_runtime(app, shape)
     _check_reaped(app, shape, rt)
     if rt.reaped is not None and not rt.reap_told:
@@ -639,9 +651,13 @@ async def _provision(
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
+        rt.switch_left_up, rt.switch_left_pilots = None, None
         new_request = not kicked_up  # this confirmation asks for a block (not one already answering)
         rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
         rt.confirmed_at = time.monotonic()  # a pilot that died before this is an earlier session's, not this block's
+        rt.confirmed_wall = time.time()     # the same on the wall clock (the monotonic one stops while asleep)
+        if app.state.endpoint_id is not None:  # its probes list this endpoint's pilots now; a re-bind reads them there
+            app.ssh_left.pop(app.state.endpoint_id, None)
     else:
         new_request = False
     if app.state.endpoint_id is None:
@@ -709,6 +725,9 @@ async def _provision(
             rt.warm_since = rt.presumed_billed_until  # the presumed block lived on: its spend clock continues
         _take_left(app, rt, job)  # names only: a block a facility stop left is this one, or gone (#178)
         rt.block_since, rt.block_job = since, job
+        # the pilot the probes were about is this block now: a later re-bind names the block, never that pilot as queued
+        if rt.pilots is not None:
+            rt.pilots = rt.pilots.without({rt.pilots.subject, job})
     if block == "warm":
         _forget_presumed(rt)
     if checked and block != "warm" and _rejected_now(rt):  # this call's check: the scheduler refused the submission
@@ -786,6 +805,33 @@ def _record_dead_pilot(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoc
         return
     if rt.warm_confirmed_at is None or (answered is not None and rt.warm_confirmed_at <= answered):
         _note_dead_pilot(rt, job, exit_status, jobs)
+
+def _record_pilots(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str, epoch: int,
+                   live: tuple[tuple[str, str, str, str], ...], subject: str | None) -> None:
+    """The provisioning probe's live pilots (scheduler_ops.PilotProbe.live, and the one its verdict is about),
+    recorded on the runtime and terms it was for — as `_record_dead_pilot` guards it — so a switch (`_repoint`) or a
+    reconnect (`_ssh_left`) can say what is still queued or held. Callers hold app.lock."""
+    if app.state.endpoint_id != eid or app.shapes.get(shape) is not rt or rt.block_epoch != epoch:
+        return
+    rt.pilots = SeenPilots(jobs=live, at=time.monotonic(), subject=subject)
+
+def _came_up(rt: ShapeRuntime) -> bool:
+    """A worker answered on this shape's block (it was up), and no reap has been found since."""
+    return rt.reaped is None and (rt.block_since is not None or rt.warm_confirmed_at is not None
+                                  or rt.last_proof_at is not None)
+
+def _ssh_left(rt: ShapeRuntime | None) -> SshLeft | None:
+    """What a re-bind leaves of an SSH endpoint's compute shape, to say (connect._left_checks_note): nothing cancels a
+    block on a re-bind. The block, if it came up (it idle-releases after its last task), and the pilots the last probe
+    saw live other than that block's own job (a block's pilot leaves the record once a worker answers on it, and when
+    the block is found gone). None: nothing of it is known in the scheduler."""
+    if rt is None or not _billable(rt):
+        return None
+    up = rt.spend_confirmed and _came_up(rt)
+    seen = rt.pilots.without({rt.block_job} if up else set()) if rt.pilots is not None else None
+    if not up and seen is None:
+        return None
+    return SshLeft(up=up, job=rt.block_job if up else None, pilots=seen)
 
 def _check_key(c: SentCheck) -> str:
     """One task, however it was found: its task id once registered, else the key of its row on disk — for a future of
@@ -1447,6 +1493,9 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     if confirmed:
         rt.spend_confirmed = False
         rt.switched_terms = terms
+        # what the old terms' block does now (notices._switch_fate): a block that came up idle-releases after its last
+        # task; one that never did may sit HELD, which never starts or idle-releases
+        rt.switch_left_up, rt.switch_left_pilots = _came_up(rt), rt.pilots
     elif rt.reaped is not None and rt.reap_terms is None:  # spend is asked anyway (a reap): remember the reap's terms
         rt.reap_terms = terms
     # A check of the old terms still queued may have asked their user endpoint for a block that can still land: the
@@ -1462,6 +1511,7 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age
+    rt.pilots = None  # the new terms' block request gets a probe of its own
     _forget_presumed(rt)
     rt.block_epoch += 1
 

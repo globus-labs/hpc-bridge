@@ -190,6 +190,9 @@ python3 agentic/run_suite.py --target fake --profile f2b --reset-cluster --scena
 #   ^ fail2ban: no retry storm on a refused key (no ban recorded); a pre-banned client is told CANNOT REACH
 python3 agentic/run_suite.py --target fake --profile polaris --reset-cluster --scenarios polaris_filesystems
 #   ^ a PBS site rule: the pilot is HELD with a comment; the tool relays it; the agent adds -l filesystems=…
+HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=polaris ./agentic/run_smoke.sh polaris_filesystems
+#   ^ the same cell scripted (no model): the directive given BARE (`-l filesystems=home:eagle`, as the comment quotes
+#     it); the connect must report writing it as `#PBS -l …`, and the new block must come up and run `hostname`
 python3 agentic/run_suite.py --target fake --profile pbs_mep --reset-cluster --scenarios fake_pbs_mep_compute
 #   ^ a Polaris-shaped facility endpoint on PBS: the registry's default queue reaches `qsub -q` through key_map; the
 #     stop names the PBS job and `qdel` (needs HPCB_MEP_EMAIL). Live 2026-10-15: READY 14 s after a wipe; codex OK
@@ -229,6 +232,24 @@ python3 agentic/run_suite.py --target fake --profile internal --reset-cluster --
 #   owner identity. A warm restart reuses them (the `mep-state` volume keeps the UUIDs). `down.sh --wipe` runs the
 #   profile's deregister.sh FIRST — a one-off container on the mep-state + mep-tools volumes runs
 #   `globus-compute-endpoint delete` per manager — so wiping never orphans records (HPCB_FAKE_KEEP_REGISTRATIONS=1 skips).
+#
+#   USER-ENDPOINT PID FILES: every fake-MEP cell maps to hpcbmep with the same user-endpoint config, so the cells share
+#   ONE user endpoint dir on the persistent /home (`~hpcbmep/.globus_compute/uep.<manager uuid>.<config hash>/`). Every
+#   run_suite runs bin/up.sh, and its `docker compose up -d --build` RECREATES a running stack most times: each service
+#   builds the shared image with its own `com.docker.compose.service` label, so the tag lands on whichever build
+#   finished last, and compose recreates every container whose recorded image digest differs from the tag's. In a
+#   sweep that happens at every operator after the first. A recreate kills the user endpoint (it is its manager's child
+#   in the login container) and leaves its `daemon.pid`, and globus-compute-endpoint refuses to start a user endpoint
+#   whose pid file was touched within 3 heartbeats ("Another instance of this endpoint is running", rc 73): on
+#   2026-10-16 the next cell's first task found it (pbs_mep: codex's endpoint came 45 s late, hermes21 got none; mep:
+#   ~50 s late). So before any manager starts, the login setup (on `mep`, login01's alone) removes the pid files left by
+#   the user endpoints ITS managers forked (`mep_clear_stale_uep_pids`, in the shared `mep/tools.sh`). It removes only
+#   pid files, only under ~hpcbmep, only for its own managers' uuids (from their endpoint.json), and never one whose
+#   user endpoint is running there (a live one stops itself when its pid file goes, so a file goes only when `pgrep`
+#   finds no match: a match, a pgrep error or no pgrep keeps it). It follows no symlink (the agent runs as hpcbmep and
+#   can plant one) and takes only the names a manager writes. The container log says how many: `docker logs hpcb-fake-login-1 | grep 'pid files removed'`.
+#   In short: up.sh's per-service builds make compose recreate the stack on (in practice) every run_suite, and this
+#   cleanup makes that harmless; a follow-up could stop the recreates (`compose build login`, then `up -d --no-build`).
 HPCB_TARGET=fake ./agentic/run_smoke.sh spend_refusal          # one cell
 HPCB_TARGET=fake ./agentic/run_smoke.sh teardown_slow_fs       # a slow teardown (#91): `tearing_down`, the call again, only what the run created removed
 HPCB_TARGET=fake ./agentic/sweep_pool_user.sh hpcbridge-test-00 # hand sweep (rarely needed: --reset-cluster instead)

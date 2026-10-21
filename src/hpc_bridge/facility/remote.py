@@ -38,7 +38,7 @@ from ..state import EndpointRecord, LoginNodeStore
 if TYPE_CHECKING:
     from ..catalog.entry import CatalogEntry
 from . import endpoint_venv
-from .base import EndpointHandle, endpoint_metadata
+from .base import EndpointHandle, endpoint_metadata, step_error
 from .endpoint_venv import DEFAULT_REMOTE_VENV, managed_venv, migrate_env_setup, safe_base, shell_path
 
 # A Globus endpoint UUID — scopes the per-UEP pidfile-cleanup glob to one endpoint, and refuses to
@@ -342,6 +342,9 @@ class MachineProfile:
     scratch_root: str | None = None  # session-shell root on the shared filesystem
     scheduler: Literal["slurm", "pbs"] = "slurm"  # "slurm" | "pbs" — selects the config_template branch
     cpus_per_node: int | None = None  # PBS: emitted as PBSProProvider.cpus_per_node; Slurm: unused
+    # PBS: PBSProProvider.select_options, the chunk resources parsl appends to its own select=<nodes>:ncpus=<cpus>
+    # (`ngpus=4`): the node count stays the block's. Validated where it enters (catalog.entry.select_options_problem).
+    select_options: str | None = None
     exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
     account_required: bool = False  # the entry's: warmth._provision starts no block without an account (False: BYO)
 
@@ -573,7 +576,7 @@ class RemoteEndpointCLI:
             msg = (err or out).strip()
             if "already" in msg.lower() or "configexists" in msg.lower():  # dir exists -> fine
                 return
-            raise RuntimeError(f"remote configure failed: {msg}")
+            raise step_error(rc, f"remote configure failed: {msg}", output=msg)  # ran env_setup: unless ssh's 255
 
     @staticmethod
     def _list_rows(out: str) -> list[list[str]]:
@@ -728,7 +731,8 @@ class RemoteEndpointCLI:
                 # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
                 # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
                 listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
-                raise RuntimeError(f"remote start failed (rc={rc}): {(err or out).strip() or 'no output'}{listed}")
+                said = (err or out).strip()  # the start's own words decide, never the `list` note after them
+                raise step_error(rc, f"remote start failed (rc={rc}): {said or 'no output'}{listed}", output=said)
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
@@ -883,7 +887,8 @@ class RemoteEndpointCLI:
     async def endpoint_id(self, name: str) -> str:
         rc, out, err = await self._gce("list")
         if rc != 0:
-            raise RuntimeError(f"remote list failed: {_cli_said(out, err) or f'rc={rc}'}")
+            said = _cli_said(out, err)
+            raise step_error(rc, f"remote list failed: {said or f'rc={rc}'}", output=said)
         for cells in self._parsed_rows(out):
             if cells[-1] == name:  # exact Endpoint Name match, not a line substring
                 m = _UUID.search(cells[0])
@@ -1044,6 +1049,9 @@ engine:
 {% if cpus_per_node is defined and cpus_per_node %}
     cpus_per_node: {{ cpus_per_node }}
 {% endif %}
+{% if select_options is defined and select_options %}
+    select_options: {{ select_options }}
+{% endif %}
     worker_init: {{ worker_init | default(@@WORKER_INIT@@) }}
     launcher:
       type: SingleNodeLauncher
@@ -1100,6 +1108,15 @@ def logs_block_requests(template: object) -> bool:
     """Whether an endpoint's published UEP template writes each block request's number into its compute user endpoint's
     own log (the `endpoint_setup` line above): only then can a stop tell which user endpoint a check of ours went to."""
     return _BLOCK_REQUEST_LINE.search(str(template or "")) is not None
+
+
+_SELECT_LINE = re.compile(r"^\s*select_options: \{\{ select_options \}\}\s*$", re.M)
+
+
+def takes_select_options(template: object) -> bool:
+    """Whether an endpoint's published UEP template renders `select_options` into its PBS provider (this plugin's,
+    2026-10-20): one configured before it gets parsl's bare select=<nodes>:ncpus=… whatever the config carries."""
+    return _SELECT_LINE.search(str(template or "")) is not None
 
 
 def gives_fresh_ueps(template: object) -> bool:
@@ -1187,6 +1204,9 @@ class SlurmFacility:
         # with the rest; None: unknown. With 1, ANY new life of a user endpoint submits a block, task or not, so a stop
         # does not settle a check by its user endpoint's fate there (server._settle_by_evidence).
         self.compute_init_blocks: int | None = None
+        # Said at connect when the profile carries select_options and the running endpoint's template does not render
+        # them (`takes_select_options`): its blocks would get parsl's bare select, and only a fresh configure fixes it.
+        self.select_note = ""
 
     @property
     def scratch_root(self) -> str | None:
@@ -1206,12 +1226,21 @@ class SlurmFacility:
         if endpoint_id == self._adopted:
             return
         self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, "", False
+        self.select_note = ""
         self.logs_block_requests, self.compute_init_blocks = False, None
         try:
             md = await endpoint_metadata(self._client_factory, endpoint_id)
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
             return
         self._adopted = endpoint_id  # only a read that SUCCEEDED is cached (a cancel or an error is tried again)
+        tmpl = md.get("user_config_template")
+        # only a template READ says what it renders: metadata without one says nothing about select_options
+        if (self.profile.select_options and self.profile.scheduler == "pbs" and isinstance(tmpl, str) and tmpl.strip()
+                and not takes_select_options(tmpl)):
+            self.select_note = (
+                f"this endpoint was configured before hpc-bridge wrote select_options into its template, so its blocks "
+                f"ask for select=<nodes>:ncpus=… without {self.profile.select_options[:60]!r}: teardown_endpoint, then "
+                "connect_facility, to configure it again with them. ")
         self.fresh_ueps = gives_fresh_ueps(md.get("user_config_template"))
         self.logs_block_requests = logs_block_requests(md.get("user_config_template"))
         self.compute_init_blocks = compute_init_blocks(md.get("user_config_template"))
@@ -1301,6 +1330,8 @@ class SlurmFacility:
             defaults["available_accelerators"] = p.available_accelerators
         if p.cpus_per_node is not None:
             defaults["cpus_per_node"] = p.cpus_per_node
+        if p.select_options is not None and p.scheduler == "pbs":
+            defaults["select_options"] = p.select_options
         if p.exclusive is not None and p.scheduler == "slurm":
             defaults["exclusive"] = p.exclusive
         return template, defaults
@@ -1431,7 +1462,7 @@ class SlurmFacility:
         # the template on disk is this profile's now: forget what an earlier read learned, also if `start` fails below
         # (the daemon may register anyway, and a retry's reuse must read it again)
         self._adopted, self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, None, "", False
-        self.logs_block_requests, self.compute_init_blocks = False, None
+        self.logs_block_requests, self.compute_init_blocks, self.select_note = False, None, ""
         eid, host, addr = await self.cli.start(name)
         # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
         # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so

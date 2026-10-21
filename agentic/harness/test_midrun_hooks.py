@@ -69,6 +69,102 @@ def test_when_input_is_a_dict_of_equal_arguments_or_a_regex_over_the_values():
     assert m('"a": 1', {"args": {"a": 1}})                                # a nested value is searched as JSON
 
 
+# -- an argument the call left out is the tool's own default (hermes21, draining_restop, live 2026-10-16) ----------------
+
+def test_a_dict_when_input_reads_the_calls_effective_arguments():
+    m = hooks._input_matches
+    assert m({"shape": "compute"}, {"command": "hostname"}, "run_shell")            # run_shell's shape defaults to compute
+    assert not m({"shape": "compute"}, {"command": "hostname", "shape": "login"}, "run_shell")
+    assert m({"shape": "compute"}, {}, "reset_session") and m({"shape": "compute"}, {}, "ensure_endpoint_up")
+    assert not m({"confirm_spend": True}, {}, "ensure_endpoint_up")                   # its default is False
+    assert m({"confirm_spend": False}, {"shape": "compute"}, "ensure_endpoint_up")
+    assert not m({"shape": "compute"}, {"command": "x"}, "login_shell")               # no such argument: no default
+    assert not m("compute", {"command": "hostname"}, "run_shell")   # a regex reads what was SENT, never a default
+    assert hooks.effective_input("run_shell", {"command": "c"}) == {"command": "c", "session_id": "default",
+                                                                     "shape": "compute"}
+
+
+def test_the_tool_defaults_are_the_servers_mcp_schema():
+    # read from server.py's source (the jail's harness interpreter cannot import the server): pinned to what an MCP
+    # client is told — every tool, every default, nothing else
+    import asyncio
+
+    server = pytest.importorskip("hpc_bridge.server")
+    schema = {t.name: {k: p["default"] for k, p in (t.inputSchema.get("properties") or {}).items() if "default" in p}
+              for t in asyncio.run(server.mcp.list_tools())}
+    assert hooks.tool_defaults() == schema
+    assert schema["run_shell"]["shape"] == "compute"   # the case the freeze missed
+
+
+def test_tool_defaults_follow_a_constant_to_the_module_it_is_imported_from(tmp_path, capsys):
+    pkg = tmp_path / "pkg"
+    pkg.mkdir()
+    (pkg / "__init__.py").write_text("")
+    (pkg / "context.py").write_text('DEFAULT_SHAPE = "compute"\nWAIT = 2 * 60\nALIASED = DEFAULT_SHAPE\n')
+    (pkg / "broken.py").write_text("def (:\n")
+    (pkg / "server.py").write_text(
+        "from .context import DEFAULT_SHAPE, WAIT as POLL_WAIT\nfrom pkg.context import ALIASED\n"
+        "from .broken import GONE\nfrom elsewhere import OUTSIDE\nLIMIT: int = 5\nmcp = None\n\n"
+        "@mcp.tool()\nasync def run(command: str, ctx, shape: str = DEFAULT_SHAPE, *, n: int = LIMIT, k=object()):\n"
+        "    pass\n\n"
+        '@mcp.tool(name="poll")\ndef _poll(task_id: str, wait: float = POLL_WAIT, neg: int = -LIMIT):\n    pass\n\n'
+        '@mcp.tool("named")\ndef _named(a=ALIASED, b=GONE, c=OUTSIDE, d=1):\n    pass\n\n'
+        "def helper(x=1):\n    pass\n")
+    got = hooks.tool_defaults(pkg / "server.py")
+    assert got == {"run": {"shape": "compute", "n": 5}, "poll": {"wait": 120, "neg": -5},
+                   "named": {"a": "compute", "d": 1}}
+    err = capsys.readouterr().err   # each default left out is SAID, never silently dropped
+    assert "run(k=…): default not read (object())" in err and "named(c=…): default not read (OUTSIDE)" in err
+    assert "named(b=…): default not read (SyntaxError" in err   # a followed module that does not parse: that one only
+
+
+def test_tool_defaults_never_raise_and_say_when_they_read_nothing(tmp_path, capsys):
+    # a hook watcher that raised would end the Claude SDK feed's run, or stop the journal follower (NEVER FIRED)
+    (tmp_path / "broken.py").write_text("def (:\n")
+    (tmp_path / "plain.py").write_text("def f(x=1):\n    pass\n")
+    assert hooks.tool_defaults(tmp_path / "missing.py") == {}   # unreadable: when_input matches the args as sent
+    assert hooks.tool_defaults(tmp_path / "broken.py") == {}
+    assert hooks.tool_defaults(tmp_path / "plain.py") == {}
+    err = capsys.readouterr().err
+    assert err.count("could not read the tools' defaults") == 2 and "no @mcp.tool function in" in err
+    # the real server, read afresh (past the cache): every default read, no warning
+    assert hooks.tool_defaults.__wrapped__(hooks._SERVER_SRC) == hooks.tool_defaults()
+    assert capsys.readouterr().err == ""
+
+
+def test_the_freeze_fires_on_compute_runs_that_sent_no_shape():
+    # hermes21's hpc-bridge calls in 1792179366-84683-56970 (the journal, verbatim args): both compute runs sent only
+    # `{"command": "hostname"}`, and harness:midrun_hooks read NEVER FIRED for the freeze and the thaw
+    import draining_restop as sc
+    e1 = {"endpoint_id": "e1"}
+    stored = [("connect_facility", {"facility": "f", "ssh_host": "login"}, {"phase": "proposed_facility_details"}),
+              ("connect_facility", {"facility": "f", "details": {}}, {"phase": "provisioning"}),
+              ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "provisioning", **e1}),
+              ("ensure_endpoint_up", {}, {"status": "up", **e1}),
+              ("run_shell", {"command": "hostname"}, {"phase": "complete"}),
+              ("stop_endpoint", {}, {"status": "down", **e1}),
+              ("run_shell", {"command": "hostname"}, {"phase": "needs_confirmation"}),
+              ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "provisioning", **e1}),
+              ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", **e1}),
+              ("run_shell", {"command": "hostname"}, {"phase": "complete"}),
+              ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", **e1}),
+              ("stop_endpoint", {}, {"status": "down", **e1})]
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    assert _feed(w, stored) == [("freeze_login_worker", 9), ("thaw_login_worker", 11)] and w.unfired == []
+    # the login shape, named, is not the compute shape
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    login = ("run_shell", {"command": "hostname", "shape": "login"}, {"phase": "complete"})
+    assert _feed(w, [login, login, ("stop_endpoint", {}, {"status": "down", **e1})]) == []
+
+
+def test_the_reap_fires_on_the_sdk_stream_when_the_call_sent_no_shape():
+    # the during/after feed of the Claude SDK reads the ToolUseBlock's input as the model sent it
+    import block_reaped_resume as sc
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    _start(w, "u0", "run_shell", {"command": "mkdir -p ~/hpcb_reap && cd ~/hpcb_reap && echo HPCB_REAP_7c1d > marker"})
+    assert [d["name"] for d in _end(w, "u0", {"phase": "complete"})] == ["reap_block", "user_returns"]
+
+
 def test_a_during_hook_fires_only_while_its_call_is_in_flight_and_once():
     w = hooks.HookWatcher([{"name": "esc", "on_tool": "run_shell", "when_input": "MARK", "after_s": 10, "interject": "oops"}])
     _start(w, "u0", "run_shell", {"command": "hostname"})       # not the marker: never armed
@@ -297,6 +393,7 @@ _BATCH = [
     ("reset_session", {"shape": "compute"}, {"phase": "failed", "notice": _NO_FACILITY}),
     ("stop_endpoint", {}, {"status": "down", "endpoint_id": None, "block_state": "cold", "notice": "no endpoint was up"}),
     ("teardown_endpoint", {}, {"status": "down", "endpoint_id": None, "block_state": "cold", "notice": "no endpoint was up"}),
+    ("run_shell", {"command": "hostname"}, {"phase": "failed", "notice": _NO_FACILITY}),   # no shape sent: compute
 ]
 
 

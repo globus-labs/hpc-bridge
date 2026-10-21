@@ -267,6 +267,7 @@ def test_fake_mep_stop_while_provisioning_world_checks_read_the_queue_right(tmp_
     assert rc == 0 and submitted["expect_present"] not in out and "no pilot of the mapped account submitted since" in out
     rc, out = _world(tmp_path / "unstamped", submitted["cmd"], sacct="77|parsl.Gl|2099-01-01T00:00:00\\n")
     assert "NO_STAMP" in out and submitted["expect_present"] not in out   # no stamp: never a pass on old pilots
+    assert rc == 1   # …and a failed check, never a bare "missing 'parsl'" (that would read as "nothing ran": infra.py)
     # the poll: the pilot leaves on the third look -> nothing left; it never leaves -> still listed after _POLL looks
     rc, out = _world(tmp_path / "a", released["cmd"], squeue_runs=("parsl.Gl\n", "parsl.Gl\n", ""))
     assert rc == 0 and released["expect_absent"] not in out and (tmp_path / "a" / "squeue.n").read_text().strip() == "4"
