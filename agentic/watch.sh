@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # watch.sh — one screen for in-flight agentic runs: live jail containers, the newest run bundles with their
 # RESULT lines, and the tail of a log (default: the newest agentic/runs/*.log). Refreshes every 10 s; Ctrl-C to quit.
+# For a browser view of a whole sweep (a cell grid per profile and operator, vs an earlier sweep): agentic/sweep_dash.py.
 #   agentic/watch.sh                 # newest sweep/smoke log
 #   agentic/watch.sh /path/to/log    # a specific log
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"

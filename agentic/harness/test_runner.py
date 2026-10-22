@@ -351,7 +351,7 @@ def test_hook_watcher_fires_after_the_nth_matching_result_once(runner):
 
 def test_the_sdk_feed_skips_a_blind_opening_batch_for_the_hooks_that_say_so(runner, monkeypatch):
     # hermes21 opened orphaned_task with a parallel batch before any facility (live 2026-10-15); a Claude model can send
-    # the same as one AssistantMessage. The scenario's kill_manager must wait for the poll that finds the task RUNNING,
+    # the same as one AssistantMessage. The scenario's kill_manager must wait for the task's own run that answered RUNNING,
     # and a when_endpoint stop hook for the stop that reached an endpoint — on the SDK stream as on the journal.
     monkeypatch.syspath_prepend(str(HERE.parent / "scenarios"))
     import orphaned_task
@@ -371,13 +371,14 @@ def test_the_sdk_feed_skips_a_blind_opening_batch_for_the_hooks_that_say_so(runn
     fired = []
     for use, res in [
         (ToolUseBlock("u1", "mcp__hpc-bridge__ensure_endpoint_up", {"confirm_spend": True}), '{"status":"up","endpoint_id":"e1"}'),
-        (ToolUseBlock("u2", "mcp__hpc-bridge__run_shell", {"shape": "compute"}), '{"phase":"running","task_id":"compute-1"}'),
+        (ToolUseBlock("u2", "mcp__hpc-bridge__run_shell", {"shape": "compute", "command": "echo HPCB_CHAOS start; sleep 300"}),
+         '{"phase":"running","task_id":"compute-1"}'),
         (ToolUseBlock("u3", "mcp__hpc-bridge__poll_task", {"task_id": "compute-1"}), '{"phase":"running","task_id":"compute-1"}'),
         (ToolUseBlock("u4", "mcp__hpc-bridge__stop_endpoint", {}), '{"status":"draining","endpoint_id":"e1"}'),
     ]:
         w.observe(AssistantMessage([use]))
         fired += w.observe(UserMessage([ToolResultBlock(use.id, res)]))
-    assert [(f["name"], f["call_index"]) for f in fired] == [("kill_manager", 6), ("at_stop", 7)]   # trace indices
+    assert [(f["name"], f["call_index"]) for f in fired] == [("kill_manager", 5), ("at_stop", 7)]   # trace indices
     assert w.unfired == []
 
 
