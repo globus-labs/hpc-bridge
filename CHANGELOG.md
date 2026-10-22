@@ -183,6 +183,10 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **`orphaned_task` orphans the task however the agent polls.** The harness killed the endpoint manager after the
+  first poll that found the task running, so an agent whose one poll waited the task out (qwen under pi and codex,
+  2026-10-22: `poll_task(wait=200)` → `complete`) never met an orphan, and the cell failed on `orphan_reported` for a
+  kill that never happened. The kill now follows the task's own `run_shell` (its marker) that answered `running`.
 - **`lmod_bootstrap` runs under the script operator too, and grades the re-run on every operator.** Its SCRIPT
   (`HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh lmod_bootstrap`) sends the
   made-up `module load gcc/10.2.0` first, aborts unless the login node refuses it naming the module, then connects
