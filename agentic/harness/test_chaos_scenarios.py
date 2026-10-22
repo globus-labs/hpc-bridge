@@ -29,13 +29,13 @@ def test_orphaned_task_graders():
     r = sc.polls_bounded_after_orphan(forever)
     assert not r.ok and "3 poll_task calls after" in r.detail
     assert not sc.orphan_reported(Trace([_poll("running"), _poll("complete")])).ok
-    assert sc.TARGETS == ("fake",) and sc.NEEDS_COMPUTE_NODE is True and sc.MIDRUN_HOOKS[0]["after_tool"] == "poll_task"
+    assert sc.TARGETS == ("fake",) and sc.NEEDS_COMPUTE_NODE is True and sc.MIDRUN_HOOKS[0]["after_tool"] == "run_shell"
     # the manager is stopped where it runs, by the harness (stop_here_cmd on every login node) — never a blind
     # `gce stop … ; echo manager-stopped` to the round-robin alias, and no hard-coded endpoint binary here
     assert sc.MIDRUN_HOOKS[0]["world"] == "stop_manager" and "cmd" not in sc.MIDRUN_HOOKS[0]
-    # ...after the first poll that found the task RUNNING — not a placeholder poll of a blind opening batch (hermes21,
-    # live 2026-10-15: "poll_task #1" fired on poll_task("PLACEHOLDER") → failed, before any endpoint)
-    assert sc.MIDRUN_HOOKS[0]["when_phase"] == "running"
+    # ...after the task's own run_shell answered RUNNING, whatever the agent's polling (qwen, 2026-10-22: one long poll
+    # waited the task out) — not a blind opening batch's failed run (hermes21, live 2026-10-15)
+    assert sc.MIDRUN_HOOKS[0]["when_phase"] == "running" and sc.MIDRUN_HOOKS[0]["when_input"] == sc._MARK
 
 
 def test_draining_restop_and_stop_while_running_graders():

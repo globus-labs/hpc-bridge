@@ -38,12 +38,13 @@ MIDRUN_HOOKS = [
     # stopped it. The old hook — `gce stop {endpoint_name} >/dev/null 2>&1; echo manager-stopped` to the round-robin
     # alias — landed on the node without the manager and still said it worked; the task then completed normally
     # (pi, live 2026-10-13).
-    # `when_phase: running` — the first poll that found the task RUNNING, never just the first poll: hermes21 opened
-    # with a blind parallel batch, poll_task(task_id="PLACEHOLDER") → failed among it, and "poll_task #1" fired there,
-    # before any endpoint (rc 1, no manager anywhere); the orphan was never met (live 2026-10-15). A poll that waits the
-    # task out (`wait` ≥ its remaining sleep) answers `complete`: too late to orphan anything, so the hook stays unfired
-    # and harness:midrun_hooks says NEVER FIRED — not a "poll_task never reported ORPHANED" that reads as the product's.
-    {"name": "kill_manager", "after_tool": "poll_task", "when_phase": "running", "nth": 1, "world": "stop_manager"},
+    # After the run_shell of THIS task (its marker) that answered `running`: the task is in flight, whatever the agent's
+    # polling. It fired on the first RUNNING poll before, and an agent whose one poll waited the task out (qwen under pi
+    # and codex: poll_task(wait=200) → complete, live 2026-10-22) never met an orphan — the cell failed on
+    # orphan_reported for a kill that never happened. `when_phase: running` still skips a blind opening batch (hermes21,
+    # live 2026-10-15: its run_shell failed before any endpoint, and a hook there found no manager anywhere).
+    {"name": "kill_manager", "after_tool": "run_shell", "when_input": _MARK, "when_phase": "running", "nth": 1,
+     "world": "stop_manager"},
 ]
 
 

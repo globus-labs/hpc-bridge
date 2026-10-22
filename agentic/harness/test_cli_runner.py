@@ -578,7 +578,8 @@ def test_a_journal_hook_skips_the_blind_opening_batch_and_fires_on_the_call_it_i
             ("stop_endpoint", {}, {"status": "down", "endpoint_id": None, "notice": "no endpoint was up"}),
             ("connect_facility", {"facility": "f", "details": {}}, {"phase": "provisioning"}),
             ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", "endpoint_id": "e1"}),
-            ("run_shell", {"shape": "compute", "command": "sleep 300"}, {"phase": "running", "task_id": "compute-1"}),
+            ("run_shell", {"shape": "compute", "command": "python3 -c \"print('HPCB_CHAOS start')…\""},
+             {"phase": "running", "task_id": "compute-1"}),
             ("poll_task", {"task_id": "compute-1"}, {"phase": "running", "task_id": "compute-1"}),
             ("stop_endpoint", {}, {"status": "draining", "endpoint_id": "e1"})]
 
@@ -598,7 +599,7 @@ def test_a_journal_hook_skips_the_blind_opening_batch_and_fires_on_the_call_it_i
     monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,
                                             midrun_hooks=orphaned_task.MIDRUN_HOOKS))
-    assert ran == [("kill_manager", 7)] and [h["call_index"] for h in r.hooks_fired] == [7]   # the RUNNING poll
+    assert ran == [("kill_manager", 6)] and [h["call_index"] for h in r.hooks_fired] == [6]   # the task's RUNNING run
     # draining_restop's thaw is not due at the batch's stop (no freeze yet), nor its freeze at a failed compute run
     ran.clear()
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,

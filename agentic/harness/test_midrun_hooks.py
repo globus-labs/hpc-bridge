@@ -427,19 +427,26 @@ def _feed(w, seq):
     return [(d["name"], d["call_index"]) for n, i, r in seq for d in w.observe_call(ToolCall.of(f"mcp__hpc-bridge__{n}", i, r))]
 
 
-def test_the_orphaned_task_hook_waits_for_a_poll_that_finds_the_task_running():
+def test_the_orphaned_task_hook_fires_on_the_run_that_answered_running_whatever_the_polling():
     import orphaned_task as sc
+    task = "python3 -c \"import time; print('HPCB_CHAOS start', flush=True); time.sleep(300)\""
     seq = [_BATCH[0], _BATCH[2], _BATCH[3], _BATCH[5],      # the hermes21 batch: ensure, run_shell, the placeholder, stop
            ("connect_facility", {"facility": "f", "details": {}}, {"phase": "provisioning"}),
            ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", "endpoint_id": "e1"}),
-           ("run_shell", {"shape": "compute", "command": "python3 -c …"}, {"phase": "running", "task_id": "compute-1"}),
+           ("run_shell", {"shape": "login", "command": "sinfo"}, {"phase": "complete"}),
+           ("run_shell", {"shape": "compute", "command": task}, {"phase": "running", "task_id": "compute-1"}),
            ("poll_task", {"task_id": "compute-1"}, {"phase": "running", "task_id": "compute-1"}),
            ("poll_task", {"task_id": "compute-1"}, {"phase": "failed", "notice": "task compute-1 is ORPHANED"})]
-    assert _feed(hooks.HookWatcher(sc.MIDRUN_HOOKS), seq) == [("kill_manager", 7)]   # the RUNNING poll, not the placeholder
-    # hermes21's own run (2026-10-15): its one real poll waited 300 s and came back complete — too late to orphan
-    # anything; the hook stays unfired, so harness:midrun_hooks says NEVER FIRED rather than a misleading orphan failure
+    # the task's own RUNNING answer — never the batch's failed run_shell, a placeholder poll, or a login command
+    assert _feed(hooks.HookWatcher(sc.MIDRUN_HOOKS), seq) == [("kill_manager", 7)]
+    # qwen under pi and codex (2026-10-22): one poll_task(wait=200) that waited the task out. The kill is already done
+    # by then, so that poll meets the orphan instead of a `complete` (the old poll-keyed hook never fired)
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
-    assert _feed(w, [*seq[:7], ("poll_task", {"task_id": "compute-1", "wait": 300}, {"phase": "complete"})]) == []
+    assert _feed(w, [*seq[:8], ("poll_task", {"task_id": "compute-1", "wait": 200}, {"phase": "complete"})]) \
+        == [("kill_manager", 7)]
+    # a task that never answered running (it finished inline) leaves nothing to orphan: NEVER FIRED, not a product fail
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    assert _feed(w, [*seq[:7], ("run_shell", {"shape": "compute", "command": task}, {"phase": "complete"})]) == []
     assert [r["out"] for r in w.unfired_records()] == ["NEVER FIRED"]
 
 
@@ -552,10 +559,11 @@ _GOOD = {
         ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "provisioning"}),
         ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
         ("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", **_E}),
-        ("run_shell", {"shape": "compute", "command": "python3 -c …"}, {"phase": "running", "task_id": "compute-1"}),
+        ("run_shell", {"shape": "compute", "command": "python3 -c \"print('HPCB_CHAOS start')…\""},
+         {"phase": "running", "task_id": "compute-1"}),
         ("poll_task", {"task_id": "compute-1", "wait": 30}, {"phase": "running", "task_id": "compute-1"}),
         ("poll_task", {"task_id": "compute-1", "wait": 30}, {"phase": "failed"}),
-        ("stop_endpoint", {}, {"status": "down", **_E})], {"kill_manager": 5}),
+        ("stop_endpoint", {}, {"status": "down", **_E})], {"kill_manager": 4}),
     "reap_replaced_block": ("1792093389 (hermes21)", [
         ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
         ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
