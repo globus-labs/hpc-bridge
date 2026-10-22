@@ -342,8 +342,21 @@ def _setup(scen) -> bool:
         rc, out = _ssh_run(c, timeout=240, host=host)
         if rc != 0:
             print(f"setup FAILED (rc={rc}): {out.strip()[:400]}", file=sys.stderr, flush=True)
+            _note_setup_failure(f"setup{where}", c, rc, out)
             return False
     return True
+
+
+# Why the last _setup / _local_setup failed, for the bundle (write_run_record's `setup_failure`): the step, the command
+# (cut), its rc and its output's tail. It used to reach only the jail's stderr, which no bundle or sweep log keeps —
+# f2b_banned's SETUP FAILED (codex, sweep 2026-10-22) left no trace of which step failed or why.
+_SETUP_FAILURE: str | None = None
+
+
+def _note_setup_failure(step: str, cmd: str, rc: object, out: str) -> None:
+    global _SETUP_FAILURE
+    cut = cmd if len(cmd) <= 160 else cmd[:157] + "…"
+    _SETUP_FAILURE = f"{step} failed (rc={rc}): {cut!r} — output: {out.strip()[-600:] or '(none)'}"
 
 
 def _local_setup(scen, runner=None) -> bool:
@@ -358,9 +371,11 @@ def _local_setup(scen, runner=None) -> bool:
             r = run(c)
         except Exception as exc:  # noqa: BLE001 - a hung local command must not hang the cell
             print(f"local setup FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+            _note_setup_failure("local setup", c, type(exc).__name__, str(exc))
             return False
         if r.returncode != 0:
             print(f"local setup FAILED (rc={r.returncode}): {(r.stdout + r.stderr).strip()[:400]}", file=sys.stderr, flush=True)
+            _note_setup_failure("local setup", c, r.returncode, r.stdout + r.stderr)
             return False
     return True
 
@@ -1325,7 +1340,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         if getattr(scen, "TRUST_HOST_KEY", True):  # the harness' own ssh would trust the key for an untrusted-key cell
             _restore_planted_venvs()
         if not _setup(scen) or not _local_setup(scen):
-            print("RESULT: SETUP FAILED — scenario not run (world precondition unmet)")
+            why = f": {_SETUP_FAILURE[:240]}" if _SETUP_FAILURE else ""
+            print(f"RESULT: SETUP FAILED — scenario not run (world precondition unmet){why}")
             rc = 2
             result_label = "SETUP FAILED"
             return rc
@@ -1599,6 +1615,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             failed=failed,
             result=result_label,
             infra_reason=infra,
+            setup_failure=(_SETUP_FAILURE if result_label == "SETUP FAILED" else None),
             events=list(getattr(res, "hooks_fired", None) or []) if res else [],
             # side streams, one file each: the ACP client's event log (ACP operators only: the live, ordered record next
             # to the graded trace) and the admin tap's samples (a scenario with ADMIN_TAP: the scheduler as its admin saw

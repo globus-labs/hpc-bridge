@@ -32,13 +32,14 @@ SETUP = [{"on": "each_login", "cmd": f'({_COUNT.format(pat=" Ban ")}) > ~/.f2b-b
 # Runs INSIDE THE JAIL after SETUP: four refused auths per login node from this address, then WAIT until both nodes
 # refuse the connection outright — fail2ban's polling backend lands the ban ~5–10 s after the last failure (live
 # 2026-09-06 the agent's probe slipped through in that window and the cell graded the wrong world). The ban action
-# is iptables REJECT, so a banned client sees "Connection refused", not a hang.
+# is iptables REJECT, so a banned client sees "Connection refused", not a hang. The wait is 40 × 3 s (it was 20 × 3 s:
+# codex's cell SETUP FAILED once, sweep 2026-10-22, with the reason lost; run.py now records it in the bundle).
 _SSH = ("ssh -o BatchMode=yes -o StrictHostKeyChecking=no -o UserKnownHostsFile=/dev/null -o ConnectTimeout=6 "
         "-o IdentitiesOnly=yes -i /nonexistent-key")
 LOCAL_SETUP = [
     "for h in login01.hpcb.test login02.hpcb.test; do for i in 1 2 3 4; do "
     f"{_SSH} nobody-$i@$h true >/dev/null 2>&1; done; done; "
-    "for _ in $(seq 1 20); do n=0; for h in login01.hpcb.test login02.hpcb.test; do "
+    "for _ in $(seq 1 40); do n=0; for h in login01.hpcb.test login02.hpcb.test; do "
     f"{_SSH} nobody-w@$h true 2>&1 | grep -q 'Connection refused' && n=$((n+1)); done; "
     '[ "$n" = 2 ] && { echo "banned on both login nodes"; exit 0; }; sleep 3; done; '
     'echo "ban did not land on both nodes in time"; exit 1'

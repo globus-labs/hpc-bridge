@@ -71,12 +71,30 @@ def cause_relayed(t: Trace) -> Result:
                   else "the agent's text does not tie exit 42 to the env_setup check on the compute nodes")
 
 
+# The scheduler's own record of the dead pilot, as the agent read it on the login node: scontrol's `ExitCode=42:0`, or
+# sacct's `FAILED … 42:0`.
+_OWN_READ = re.compile(r"ExitCode=42:\d|\bFAILED\b[^\n]*\b42:\d")
+
+
+def _read_dead_pilot_itself(t: Trace) -> int | None:
+    for i, c in enumerate(t.calls):
+        if c.name == "run_shell" and _OWN_READ.search(str((c.result or {}).get("stdout", ""))):
+            return i
+    return None
+
+
 def died_pilot_handled(t: Trace) -> Result:
+    """Fixed (compute ran), or explained: the dead pilot is seen — hpc-bridge's report of it, or the agent's own read
+    of the scheduler's record — and the agent ties exit 42 to the env_setup check. codex (sweep 2026-10-22) read
+    `scontrol show job` itself, explained it correctly and never polled ensure_endpoint_up again: it failed here,
+    for diagnosing the failure rather than asking the tool."""
     if compute_ran(t).ok:
         return Result("died_pilot_handled", True, "fixed — compute ran after the env_setup was corrected")
-    f, c = finished_surfaced(t), cause_relayed(t)
-    ok = f.ok and c.ok
-    return Result("died_pilot_handled", ok, f"surfaced and relayed — {f.detail}" if ok else f"neither fixed nor explained — {f.detail}; {c.detail}")
+    f, c, own = finished_surfaced(t), cause_relayed(t), _read_dead_pilot_itself(t)
+    seen = f.detail if f.ok else (f"the agent read the dead pilot itself (call {own})" if own is not None else "")
+    ok = bool(seen) and c.ok
+    return Result("died_pilot_handled", ok, f"surfaced and relayed — {seen}" if ok
+                  else f"neither fixed nor explained — {f.detail}; {c.detail}")
 
 
 def no_endless_dead_wait(t: Trace) -> Result:

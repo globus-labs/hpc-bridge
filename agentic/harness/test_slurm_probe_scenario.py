@@ -42,3 +42,28 @@ def test_slurm_worker_died_graders():
     other = Trace([start, _ensure("provisioning", DEAD.replace("42", "127"), shape="compute")], ["exit 127 …mybalance"])
     assert sc.finished_surfaced(other).ok and not sc.exit_status_correct(other).ok
     assert not sc.finished_surfaced(Trace([start, _ensure("provisioning", "— but NO pilot job is in the scheduler after ~60s", shape="compute")])).ok
+
+
+def _shell(stdout, **inp):
+    return ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", **inp}, {"phase": "complete", "stdout": stdout})
+
+
+def test_a_dead_pilot_the_agent_read_itself_counts_once_it_is_explained():
+    # codex, sweep 2026-10-22 (1792695120-15080-26483): one ensure_endpoint_up saw the pilot queued; the agent then read
+    # `scontrol show job 7` itself (FAILED, ExitCode=42:0), explained it and stopped, never polling the tool again
+    import slurm_worker_died as sc
+    start = _ensure("provisioning", "allocating nodes on 'debug'… — pilot 7 is queued (PENDING (reason Resources))",
+                    shape="compute", partition="debug", account="hpcb", confirm_spend=True)
+    scontrol = _shell("JobId=7 JobName=parsl.GlobusComputeEngine-HighThroughputExecutor.block-0\n"
+                      "   JobState=FAILED Reason=NonZeroExitCode Dependency=(null)\n   ExitCode=42:0\n",
+                      command="scontrol show job 7")
+    why = ["Pilot 7 FAILED with ExitCode=42: your guard `command -v mybalance || exit 42` fails on the compute node."]
+    t = Trace([start, scontrol], why)
+    assert not sc.finished_surfaced(t).ok              # the tool never said it …
+    r = sc.died_pilot_handled(t)
+    assert r.ok and "read the dead pilot itself (call 1)" in r.detail, r.detail
+    sacct = _shell("JobID  State ExitCode\n10     FAILED     42:0\n", command="sacct -j 10")
+    assert sc.died_pilot_handled(Trace([start, sacct], why)).ok
+    # … but reading it is not explaining it, and a queued pilot is not a dead one
+    assert not sc.died_pilot_handled(Trace([start, scontrol], ["The block did not come up."])).ok
+    assert not sc.died_pilot_handled(Trace([start, _shell("7|debug|PENDING|Resources")], why)).ok

@@ -60,3 +60,13 @@ def test_a_started_cell_is_running_until_its_result_and_a_bound_keeps_one_sweep(
 def test_the_grid_rows_follow_sweep_profiles_sh(tmp_path):
     assert sweep_dash.default_profiles(_repo(tmp_path)) == "default,pbs"
     assert sweep_dash.default_profiles(tmp_path / "nowhere") == "default"
+
+
+def test_elapsed_counts_from_the_first_sweeps_stamp_not_a_summarys_mtime(tmp_path):
+    import os
+    import time
+    repo = _repo(tmp_path)
+    summary = repo / "agentic" / "runs" / "sweep-20261021-0945.md"
+    os.utime(summary, (time.time(), time.time()))           # just appended to
+    st = sweep_dash.status(repo, "20261021-0945", {}, ["default"])
+    assert st["started"] == time.mktime(time.strptime("20261021-0945", "%Y%m%d-%H%M"))

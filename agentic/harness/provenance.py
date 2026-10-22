@@ -76,7 +76,7 @@ def _block_lines(block: Any) -> list[str]:
 def _transcript_md(config: dict, messages: list[Any], dialogue: list[Any],
                    grading: list[Any], rc: int | None, gating: list[str] | None = None,
                    result: str | None = None, failed: list[str] | None = None,
-                   infra_reason: str | None = None) -> str:
+                   infra_reason: str | None = None, setup_failure: str | None = None) -> str:
     gates = set(gating or [])
     lines = [
         f"# {config.get('scenario', 'run')} — {config.get('runid', '')}",
@@ -87,7 +87,7 @@ def _transcript_md(config: dict, messages: list[Any], dialogue: list[Any],
         f"{' · ABLATED: skill' if config.get('ablate_skill') else ''} · rc {rc}"
         f" · build {config.get('build', 'unknown')}*",
         "",
-        f"RESULT: {result or '?'}" + (f": {infra_reason}" if infra_reason else "")
+        f"RESULT: {result or '?'}" + (f": {infra_reason or setup_failure}" if infra_reason or setup_failure else "")
         + (f" — gating checks that failed: {failed}" if failed else ""),
         "",
         "## Conversation",
@@ -140,6 +140,7 @@ def write_run_record(
     failed: list[str] | None = None,
     result: str | None = None,
     infra_reason: str | None = None,
+    setup_failure: str | None = None,
     events: list[dict] | None = None,
     extra_jsonl: dict[str, list[Any]] | None = None,
     arrivals: list[float | None] | None = None,
@@ -151,7 +152,8 @@ def write_run_record(
     `gating` (the check names that decided the verdict), `failed` and `result` (OK | FAILED | INFRA | RATE_LIMITED |
     SETUP FAILED | CRASHED | INTERRUPTED) are persisted so a bundle explains its own verdict — regrade.py and watch.sh
     read them (review 2026-09-05, 2.5: `run_completed` used to exist only on stdout). `infra_reason` says why a cell is
-    INFRA (infra.py; None otherwise). `server`: what the harness saw of the MCP server's processes (server_stderr:
+    INFRA (infra.py; None otherwise); `setup_failure`, which world step a SETUP FAILED cell stopped at, with its rc
+    and output (run.py; it used to reach only the jail's stderr, so the reason was lost). `server`: what the harness saw of the MCP server's processes (server_stderr:
     each start, when it went away, whether its client ran on); its stderr is `server-stderr.log`, written by run.py."""
     try:
         d = runs_dir / f"{config.get('runid', 'local')}-{config.get('scenario', 'run')}"
@@ -179,6 +181,7 @@ def write_run_record(
             "env": _safe_env(),
             "result": result,
             "infra_reason": infra_reason,   # why the cell is INFRA — the model endpoint failed, not hpc-bridge (infra.py)
+            "setup_failure": setup_failure,  # SETUP FAILED: which world step failed, its rc and output (run.py _setup)
             "failed": list(failed or []),
             "events": _jsonable(events or []),   # chaos hooks that fired (tool, nth, call index, rc, output)
             "metrics": _jsonable(metrics or {}),  # measured numbers, e.g. first_result_s (run.py)
@@ -200,7 +203,7 @@ def write_run_record(
         }
         (d / "record.json").write_text(json.dumps(record, indent=2, default=str))
         md = _transcript_md(config, messages, dialogue, grading, rc, gating=sorted(gates), result=result, failed=failed,
-                            infra_reason=infra_reason)
+                            infra_reason=infra_reason, setup_failure=setup_failure)
         if events:
             md += "\n## Harness events (chaos hooks)\n\n" + "\n".join(
                 f"- **{e.get('name')}** {_trigger(e)} at call {e.get('call_index')}: "

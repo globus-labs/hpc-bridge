@@ -64,3 +64,26 @@ def test_f2b_banned_graders():
     other = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"}, {"phase": "failed", "notice": "NO SSH ACCESS to login as x"})
     assert not fb.cannot_reach_surfaced(Trace([other])).ok
     assert not fb.unreachable_relayed(Trace([refused], ["Done."])).ok
+
+
+def test_a_failed_setup_step_says_which_and_why_in_the_bundle(harness_run, tmp_path):
+    # codex's f2b_banned (sweep 2026-10-22) was SETUP FAILED with nothing kept: the reason reached only the jail's stderr
+    import provenance
+
+    class R:
+        def __init__(self, rc, out=""):
+            self.returncode, self.stdout, self.stderr = rc, out, ""
+
+    class Scen:
+        LOCAL_SETUP: ClassVar[list[str]] = ["burn budget; wait for the ban"]
+
+    assert harness_run._local_setup(Scen(), runner=lambda c: R(1, "ban did not land on both nodes in time")) is False
+    why = harness_run._SETUP_FAILURE
+    assert why.startswith("local setup failed (rc=1): 'burn budget; wait for the ban'") and "did not land" in why
+    assert harness_run._local_setup(Scen(), runner=lambda c: (_ for _ in ()).throw(TimeoutError("hung"))) is False
+    assert "(rc=TimeoutError)" in harness_run._SETUP_FAILURE and "hung" in harness_run._SETUP_FAILURE
+    rec = provenance.write_run_record(tmp_path, config={"scenario": "f2b_banned", "runid": "r1"}, messages=[],
+                                      dialogue=[], grading=[], final=None, rc=2, result="SETUP FAILED",
+                                      setup_failure=why)
+    assert rec is not None and json.loads((rec / "record.json").read_text())["setup_failure"] == why
+    assert f"RESULT: SETUP FAILED: {why}" in (rec / "transcript.md").read_text()

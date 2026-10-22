@@ -183,6 +183,12 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **From the qwen sweep (2026-10-22).** `slurm_worker_died` counts a dead pilot the agent read from the scheduler
+  itself (`scontrol`'s `ExitCode=42:0`, `sacct`'s `FAILED 42:0`) once it explains it: codex did exactly that and failed
+  for not asking the tool again. A SETUP FAILED cell records which world step failed, with its rc and output, in its
+  bundle and on its RESULT line (it reached only the jail's stderr, so `f2b_banned`'s one setup failure left no trace),
+  and `f2b_banned` waits 120 s, not 60 s, for fail2ban to land its ban. `sweep_dash.py` counts elapsed time from the
+  sweep's stamp.
 - **`orphaned_task` orphans the task however the agent polls.** The harness killed the endpoint manager after the
   first poll that found the task running, so an agent whose one poll waited the task out (qwen under pi and codex,
   2026-10-22: `poll_task(wait=200)` → `complete`) never met an orphan, and the cell failed on `orphan_reported` for a
