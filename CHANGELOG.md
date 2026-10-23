@@ -6,6 +6,14 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A refused connection says it may be a ban, and a held pilot says more may follow.** CANNOT REACH for a connection
+  the login host REFUSED (not a name that does not resolve, not a timeout) now adds that a firewall or an
+  intrusion-prevention ban (fail2ban, after repeated failed logins from this address) refuses connections too, and to
+  wait or check with the site rather than retry — each refused attempt can extend a ban. In the 2026-10-22 sweep every
+  agent read fail2ban's "Connection refused" as a wrong host name. A HELD pilot's notice now says that while a pilot is
+  held the endpoint may submit further pilots for the block, each held the same way, until `stop_endpoint`, so stop
+  first and fix the configuration after: on the fake Polaris cluster one confirmation cost three held pilots, the
+  endpoint scaling out a new block about every minute (the scale-out itself is unchanged).
 - **A configuration you gave that failed on the login node is no longer run again unless you give it again.** In the
   October free sweep (`lmod_bootstrap`, the fake Lmod cluster, Hermes), the agent's first `connect_facility` carried
   a made-up `env_setup` (`module load gcc/10.2.0`) and the login node refused it ("Lmod has detected the following

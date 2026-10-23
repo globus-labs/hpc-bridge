@@ -825,3 +825,20 @@ async def test_a_bring_up_that_reused_an_endpoint_never_marks_the_config_started
     second = await server._connect_facility(app, "byo")
     assert second.phase == "failed" and "is not kept" in (second.notice or "") and "byo" not in app.session_facilities
     assert (await server._connect_facility(app, "byo")).phase == "proposed_facility_details" and len(calls) == 2
+
+
+@pytest.mark.parametrize(("raw", "banned"), [
+    ("discovery probe failed (rc=255): ssh: connect to host login port 22: Connection refused", True),
+    ("ssh: Could not resolve hostname login.example.edu: Name or service not known", False),
+    ("ssh: connect to host login port 22: Connection timed out", False),
+])
+def test_a_refused_connection_names_a_firewall_or_ban_and_asks_to_wait_not_retry(raw, banned):
+    # f2b_banned, sweep 2026-10-22: fail2ban's REJECT answers "Connection refused", and every agent (pi, codex,
+    # hermes21) read it as a wrong host name — a banned address that keeps retrying only extends its ban
+    notice = notices._explain_provision_error(RuntimeError(raw), host="login")
+    assert notice.startswith("CANNOT REACH login:") and notice.endswith("Nothing was started or billed.")
+    assert "call connect_facility again" in notice                       # the host name / VPN remedy stays first
+    said = ("a refused connection can also be a firewall or an intrusion-prevention ban (e.g. fail2ban, after repeated "
+            "failed logins from this address): then wait — a ban lifts after its ban time — or check with the site, "
+            "rather than retrying now")
+    assert (said in notice) is banned, notice
