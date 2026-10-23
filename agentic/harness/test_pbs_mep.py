@@ -318,9 +318,11 @@ for j in [x for x in sys.argv[1:] if not x.startswith('-')]:
 
 @pytest.mark.parametrize("jobs, passes, says", [
     ({"9.pbsserver": ("R", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 0)}, True, "still running"),
-    # the operator waited past the idle window: the block idled out before the stop — not the plugin's doing
+    # the operator waited past the idle window: the block idled out before the stop — not the plugin's doing, but the
+    # stop's words about a running block went unchecked: said so, with its own token, and the hook FAILS (it printed
+    # `BLOCK_AT_STOP: premise not met` and passed — the review of the 2026-10-22 sweep)
     ({"9.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 120),
-      "3.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.16", 4000)}, True, "premise not met"),
+      "3.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.16", 4000)}, False, "PREMISE NOT MET:"),
     # it ended at the stop (a cancel the stop must not issue): finished seconds ago, or exiting right now
     ({"9.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.17", 5),
       "3.pbsserver": ("F", "parsl.GlobusComputeEngine-HighThroughputExecutor.block-0.16", 4000)}, False, "at the stop"),

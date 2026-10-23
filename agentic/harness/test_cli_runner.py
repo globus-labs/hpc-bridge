@@ -151,14 +151,14 @@ def test_codex_events_order_shell_calls_among_hpc_bridge_calls():
                                             "tool": "run_shell", "arguments": {"command": "hostname"}}},
         {"type": "item.completed", "item": {"id": "i3", "type": "agent_message", "text": "done"}},
     ]
-    events, texts = cli_runner.codex_events("\n".join(json.dumps(x) for x in lines))
+    events, texts, at = cli_runner.codex_events("\n".join(json.dumps(x) for x in lines))
     trace, stats = cli_runner.build_trace(_J, events, texts)
     assert [c.name for c in trace.calls] == ["list_facilities", "Bash", "run_shell"]
     assert trace.calls[1].input["command"] == "bash -lc 'ssh x'" and trace.calls[1].result["exit_code"] == 255
     assert trace.calls[2].result["stdout"] == "l1\n"  # hpc-bridge's own record, not the harness's rendering
     assert stats == {"native": 1, "hpcb_matched": 2, "harness_rejected": 0, "hpcb_not_reaching_server": 0,
                      "journal_unplaced": 0}
-    assert texts == ["done"]
+    assert texts == ["done"] and at == [3]   # placed after the three calls its stream listed before it
     from invariants import no_ssh_workaround
     assert not no_ssh_workaround(trace).ok  # the agent's own ssh is now visible to the graders
 
@@ -174,9 +174,9 @@ def test_pi_events_map_its_own_tools_and_prefixed_mcp_names():
         {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "hi"}]}},
         {"type": "message_end", "message": {"role": "user", "content": "ignored"}},
     ]
-    events, texts = cli_runner.pi_events("\n".join(json.dumps(x) for x in lines))
+    events, texts, at = cli_runner.pi_events("\n".join(json.dumps(x) for x in lines))
     trace, stats = cli_runner.build_trace(_J[:1], events, texts)
-    assert [c.name for c in trace.calls] == ["list_facilities", "Read"] and texts == ["hi"]
+    assert [c.name for c in trace.calls] == ["list_facilities", "Read"] and texts == ["hi"] and at == [2]
     assert stats["hpcb_matched"] == 1 and stats["native"] == 1
     from invariants import no_harness_introspection
     assert not no_harness_introspection(trace).ok
@@ -204,10 +204,10 @@ def test_hermes_events_unwrap_the_dispatcher_and_skip_compaction_summaries(tmp_p
                     "VALUES (?,?,?,?,?)", rows)
     con.commit()
     con.close()
-    events, texts = cli_runner.hermes_events(db)
+    events, texts, at = cli_runner.hermes_events(db)
     trace, stats = cli_runner.build_trace(_J, events, texts)
     assert [c.name for c in trace.calls] == ["list_facilities", "run_shell", "Bash"]
-    assert trace.calls[2].result == {"text": "PATH=/usr/bin"} and texts == ["all done"]
+    assert trace.calls[2].result == {"text": "PATH=/usr/bin"} and texts == ["all done"] and at == [3]
     assert stats["hpcb_matched"] == 2 and stats["journal_unplaced"] == 0
 
 
@@ -252,11 +252,12 @@ def test_the_relay_record_carries_every_model_call_and_its_output():
                    {"call_id": "d", "name": "apply_patch", "input": "*** Begin Patch"}], "texts": []},
         {"outputs": [{"call_id": "c", "output": "ok"}], "calls": [], "texts": ["done"]},
     ]
-    events, texts = cli_runner.relay_events(hops)
+    events, texts, at = cli_runner.relay_events(hops)
     trace, stats = cli_runner.build_trace(_J[:1], events, texts)
     assert [c.name for c in trace.calls] == ["list_facilities", "Bash", "Bash", "Edit"]
     assert trace.calls[1].result == {"text": "denied"} and trace.calls[2].input["command"] == "pw\n"
     assert trace.calls[3].input == {"input": "*** Begin Patch"} and texts == ["looking", "done"]
+    assert at == [0, 4]   # a response's text before its own calls: "looking" came with a and b, "done" after all four
     assert stats["journal_unplaced"] == 0
 
 
@@ -300,8 +301,8 @@ def test_hermes_compaction_copies_are_not_counted_twice(tmp_path):
                     (sess, "tool", "c1", "t1"))
     con.commit()
     con.close()
-    events, texts = cli_runner.hermes_events(db)
-    assert [e.name for e in events] == ["run_shell"] and texts == ["running it"]
+    events, texts, at = cli_runner.hermes_events(db)
+    assert [e.name for e in events] == ["run_shell"] and texts == ["running it"] and at == [0]
 
 
 def test_hermes_not_invoked_marks_the_call_refused(tmp_path):
@@ -318,7 +319,7 @@ def test_hermes_not_invoked_marks_the_call_refused(tmp_path):
                 ("tool", '{"error": "missing command. The tool was NOT invoked."}', "t1"))
     con.commit()
     con.close()
-    events, _ = cli_runner.hermes_events(db)
+    events, _, _ = cli_runner.hermes_events(db)
     assert events[0].hpcb and events[0].ran is False
 
 
@@ -326,7 +327,7 @@ def test_jsonl_splits_records_on_lf_only():
     cmd = "sshpass -p hunter2 ssh x #  tail"
     line = json.dumps({"type": "tool_execution_start", "toolCallId": "a", "toolName": "bash",
                        "args": {"command": cmd}}, ensure_ascii=False)
-    events, _ = cli_runner.pi_events(line + "\n")
+    events, _, _ = cli_runner.pi_events(line + "\n")
     assert [e.args["command"] for e in events] == [cmd]
 
 
@@ -513,7 +514,7 @@ def test_a_cmd_hook_fires_from_the_journal_while_the_cli_turn_runs(tmp_path, mon
         return {"rc": 0, "out": f"scancel for {hook['endpoint_ids']}"}
 
     monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
-    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], [], "done"))
     hooks_ = [{"name": "cancel_block", "after_tool": "run_shell", "when_input": "HPCB_RR_9f3e", "when_phase": "complete",
                "cmd": "scancel"},
               {"name": "never", "after_tool": "teardown_endpoint", "cmd": "x"}]
@@ -554,7 +555,7 @@ def test_a_journal_hook_whose_runner_raises_is_recorded_failed_not_lost(tmp_path
         raise RuntimeError("ssh exploded")
 
     monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
-    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], [], "done"))
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="pi", hook_runner=broken,
                                             midrun_hooks=[{"name": "kill_manager", "after_tool": "poll_task", "cmd": "x"},
                                                           {"name": "after", "after_tool": "stop_endpoint", "cmd": "y"}]))
@@ -596,7 +597,7 @@ def test_a_journal_hook_skips_the_blind_opening_batch_and_fires_on_the_call_it_i
         return {"rc": 0, "out": "ok"}
 
     monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
-    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], "done"))
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], [], "done"))
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="hermes21", hook_runner=fake_hook,
                                             midrun_hooks=orphaned_task.MIDRUN_HOOKS))
     assert ran == [("kill_manager", 6)] and [h["call_index"] for h in r.hooks_fired] == [6]   # the task's RUNNING run
@@ -632,7 +633,7 @@ def _codex_turn(tmp_path, monkeypatch, *, relay_hops, stdout=_TURN_FAILED, rc=1,
         return rc, stdout, stderr
 
     monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
-    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], final))
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], [], final))
     return asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex"))
 
 
@@ -685,3 +686,87 @@ def test_the_stderr_tail_stays_the_reason_only_when_nothing_better_exists(tmp_pa
     r = _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}', rc=0,
                     final="Done.")
     assert r.final.result == "Done." and not r.final.is_error
+
+
+def test_the_agents_texts_are_placed_among_its_calls_and_survive_a_regrade():
+    # the review of the 2026-10-22 sweep: CLI traces carried no text_at, so every "did the agent relay what the result
+    # said" grader read the whole transcript, and a restated prompt or plan passed it. The readers place each text; the
+    # trace keeps the place; the bundle carries it to regrade.py
+    from invariants import said_after
+    lines = [
+        {"type": "item.completed", "item": {"id": "m0", "type": "agent_message", "text": "Plan: if it is ORPHANED I'll stop."}},
+        {"type": "item.started", "item": {"id": "i0", "type": "mcp_tool_call", "server": "hpc-bridge",
+                                          "tool": "list_facilities", "arguments": {}}},
+        {"type": "item.completed", "item": {"id": "i1", "type": "mcp_tool_call", "server": "hpc-bridge",
+                                            "tool": "run_shell", "arguments": {"command": "hostname"}}},
+        {"type": "item.completed", "item": {"id": "m1", "type": "agent_message", "text": "It ran on l1."}},
+    ]
+    events, texts, at = cli_runner.codex_events("\n".join(json.dumps(x) for x in lines))
+    assert at == [0, 2]
+    trace, _ = cli_runner.build_trace(_J, events, texts, at)
+    assert trace.text_at == [0, 2] and said_after(trace, 0) == ["It ran on l1."]
+    assert said_after(trace, 1) == ["It ran on l1."] and said_after(cli_runner.build_trace(_J, events, texts)[0], 0) == [
+        "It ran on l1."]   # unplaced: the final message alone
+    assert cli_runner.build_trace(_J, events, texts, [0])[0].text_at == []   # one position short: unplaced, not misplaced
+    msgs = [{"harness": "codex", "rc": 0}, *({"native": cli_runner._bundle_native(n)} for n in events),
+            *({"text": t, "at": a} for t, a in zip(texts, at, strict=True)), {"final": texts[-1]},
+            *({"journal": r} for r in _J)]
+    assert cli_runner.trace_from_bundle_messages(msgs).text_at == [0, 2]
+    old = [m for m in msgs if "text" not in m] + [{"text": t} for t in texts]   # a bundle from before: unplaced
+    assert cli_runner.trace_from_bundle_messages(old).text_at == []
+    only_final = cli_runner.trace_from_bundle_messages([{"harness": "pi", "rc": 0}, {"final": "done"}, {"journal": _J[0]}])
+    assert only_final.texts == ["done"] and only_final.text_at == [0]   # the final message: after every call
+
+
+def test_codex_texts_are_placed_in_the_relays_call_order():
+    # with a relay record the CALLS are the relay's (it sees write_stdin and sub-agents' calls exec --json omits), so
+    # exec --json's texts are placed where the relay saw the same words; one it never saw leaves them unplaced
+    hops = [{"outputs": [], "calls": [{"call_id": "a", "name": "list_facilities", "namespace": "mcp__hpc_bridge__",
+                                       "arguments": "{}"}], "texts": ["looking"]},
+            {"outputs": [{"call_id": "a", "output": "[]"}],
+             "calls": [{"call_id": "b", "name": "write_stdin", "arguments": json.dumps({"chars": "y\n"})}],
+             "texts": ["sub-agent chatter"]},
+            {"outputs": [{"call_id": "b", "output": "ok"}], "calls": [], "texts": ["all done"]}]
+    stdout = "\n".join(json.dumps({"type": "item.completed", "item": {"id": f"m{k}", "type": "agent_message", "text": t}})
+                       for k, t in enumerate(["looking", "all done"]))
+    events, texts, at, _final = cli_runner._native("codex", Path("/nonexistent"), {}, stdout, hops)
+    assert [e.name for e in events] == ["list_facilities", "write_stdin"] and texts == ["looking", "all done"]
+    assert at == [0, 2]
+    assert cli_runner._placed_by_match(["never relayed"], ["looking"], [0]) == []
+
+
+def test_pi_and_hermes_place_a_message_before_the_calls_it_asks_for(tmp_path):
+    import sqlite3
+    lines = [
+        {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "connecting"}]}},
+        {"type": "tool_execution_start", "toolCallId": "a", "toolName": "mcp__hpc-bridge__list_facilities", "args": {}},
+        {"type": "tool_execution_end", "toolCallId": "a", "result": {}, "durationMs": 4},
+        {"type": "message_end", "message": {"role": "assistant", "content": [{"type": "text", "text": "listed"}]}},
+    ]
+    assert cli_runner.pi_events("\n".join(json.dumps(x) for x in lines))[2] == [0, 1]
+    db = tmp_path / "state.db"
+    con = sqlite3.connect(db)
+    con.execute("CREATE TABLE messages (id INTEGER PRIMARY KEY, role TEXT, content TEXT, tool_calls TEXT, tool_call_id TEXT)")
+    call = json.dumps([{"id": "t1", "function": {"name": "mcp__hpc_bridge__run_shell",
+                                                 "arguments": json.dumps({"command": "hostname"})}}])
+    con.execute("INSERT INTO messages (role, content, tool_calls) VALUES (?,?,?)", ("assistant", "running it", call))
+    con.execute("INSERT INTO messages (role, content, tool_call_id) VALUES (?,?,?)", ("tool", "c1", "t1"))
+    con.execute("INSERT INTO messages (role, content) VALUES (?,?)", ("assistant", "it printed c1"))
+    con.commit()
+    con.close()
+    assert cli_runner.hermes_events(db)[1:] == (["running it", "it printed c1"], [0, 1])
+
+
+def test_a_live_turn_keeps_the_texts_places_in_its_trace_and_its_bundle(tmp_path, monkeypatch):
+    import asyncio
+    _codex_turn(tmp_path, monkeypatch, relay_hops=[_relay_hop(200)], stdout='{"type": "turn.completed"}', rc=0)
+    native = [cli_runner.Native("list_facilities", {}, hpcb=True)]
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: (native, ["looking", "found none"], [0, 1], "found none"))
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex"))
+    assert r.trace.text_at == [0, 1]
+    assert [(m["text"], m["at"]) for m in r.messages if "text" in m] == [("looking", 0), ("found none", 1)]
+    assert cli_runner.trace_from_bundle_messages(r.messages).text_at == [0, 1]   # regrade.py reads the same places
+    # nothing said but the final message: it came after every call
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: (native, [], [], "done"))
+    r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex"))
+    assert r.trace.texts == ["done"] and r.trace.text_at == [1]

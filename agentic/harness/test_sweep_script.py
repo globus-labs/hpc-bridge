@@ -156,8 +156,8 @@ n_ok = sum(s not in infra | setup | crash for s in scen)
 print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
-printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s"}\n' "$*" "${HPCB_OPERATOR:-}" \
-  "${HPCB_RELAUNCH_PHASE:-}" >> "$STUB_LOG"
+printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s"}\n' "$*" \
+  "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" >> "$STUB_LOG"
 echo "RESULT: OK"
 '''
 
@@ -204,14 +204,18 @@ def test_operators_boot_each_profile_once_and_run_its_free_cells_per_operator(tm
         assert _arg(c, "--scenarios").split(",") == want
     assert {c["wait"] for c in suites} == {"120"}                    # HPCB_ALCF_WAIT_S reaches every cell's suite
     smokes = [c for c in calls if c["tool"] == "run_smoke"]
-    # spend_gate_enforced per operator, then queued_check_relaunch ONCE (both phases) under the script operator
+    # spend_gate_enforced per operator, then queued_check_relaunch ONCE (both phases) under the script operator, and
+    # lmod_bootstrap ONCE under it on lmod (the review of the 2026-10-22 sweep: the failed-details path every sweep)
     assert [(c["argv"], c["operator"], c["phase"]) for c in smokes] == [
         ("spend_gate_enforced", op, "") for op in ("pi", "codex", "hermes21")] + [
-        ("queued_check_relaunch", "script", "second"), ("queued_check_relaunch", "script", "first")]
+        ("queued_check_relaunch", "script", "second"), ("queued_check_relaunch", "script", "first"),
+        ("lmod_bootstrap", "script", "")]
+    assert [c["profile"] for c in smokes if c["argv"] == "lmod_bootstrap"] == ["lmod"]
     # every summary row names its operator; INFRA counted apart, per operator
     rows = [ln for ln in summary.splitlines() if "RESULT:" in ln]
     assert rows and all(ln.lstrip().startswith(("[pi] ", "[codex] ", "[hermes21] ", "[script] ")) for ln in rows)
-    assert "## totals [script] — OK 2 · FAILED 0 · INFRA 0 " in summary
+    assert "    [script] lmod_bootstrap (script) — RESULT: OK" in summary
+    assert "## totals [script] — OK 3 · FAILED 0 · INFRA 0 " in summary
     assert {p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*-default-qcr-*.log")} == {
         "default-qcr-second.log", "default-qcr-first.log"}
     for op in ("pi", "codex", "hermes21"):
@@ -232,7 +236,7 @@ def test_paid_only_runs_the_claude_operator_on_paid_cells_and_never_boots_a_prof
     paid = set(_paid_only())
     assert _arg(suites[0], "--scenarios").split(",") == [s for s in _cells()["default"] if s in paid]
     assert _arg(suites[1], "--scenarios") == "gated_provision"
-    assert not [c for c in calls if c["tool"] == "run_smoke"]   # spend_gate_enforced / queued_check_relaunch: not paid-only
+    assert not [c for c in calls if c["tool"] == "run_smoke"]   # spend_gate_enforced / the script cells: not paid-only
     assert "## lmod — SKIPPED (--paid-only: no paid_only() cell here; not booted)" in summary
 
 
@@ -258,7 +262,8 @@ def test_without_the_flags_the_sweep_runs_as_before_and_counts_infra_apart(tmp_p
     n_ok = sum("RESULT: OK" in ln for ln in rows)
     assert f"## totals — OK {n_ok} · FAILED 0 · INFRA 1 " in summary
     assert sorted(p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*.log")) == [
-        "default-qcr-first.log", "default-qcr-second.log", "default-spend_gate.log", "default.log", "lmod.log"]
+        "default-qcr-first.log", "default-qcr-second.log", "default-spend_gate.log", "default.log",
+        "lmod-script-lmod_bootstrap.log", "lmod.log"]
 
 
 def test_the_cells_env_keeps_the_alcf_wait(monkeypatch):
@@ -279,3 +284,48 @@ def test_the_totals_count_setup_failed_and_crashed_rows(tmp_path):
     n = len(_cells()["default"]) + 3   # + spend_gate_enforced and queued_check_relaunch's two phases (stub: OK)
     assert (f"## totals — OK {n - 4} · FAILED 0 · INFRA 1 (the model endpoint failed: not graded) · SETUP FAILED 2 · "
             f"CRASHED 1 (no RESULT line) · other 0") in summary
+
+
+def test_the_held_and_failed_details_paths_run_once_per_sweep_under_the_script_operator(tmp_path):
+    # the review of the 2026-10-22 sweep: polaris's HELD path and lmod's failed-details path were exercised only when a
+    # model happened to take them — now ONCE per sweep with no model, on their profiles, whatever --operators names
+    r, calls, summary, root = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "polaris,lmod,site")
+    assert r.returncode == 0, r.stdout + r.stderr
+    scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke" and c["operator"] == "script"]
+    assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod")]
+    assert "    [script] polaris_filesystems (script) — RESULT: OK" in summary
+    assert any((root / "agentic" / "runs").glob("sweep-*-polaris-script-polaris_filesystems.log"))
+    # --paid-only: none (no paid cell on either profile, so neither is booted)
+    _, calls, _, _ = _sweep(tmp_path / "paid", "--paid-only", "--profiles", "polaris,lmod")
+    assert not [c for c in calls if c["tool"] == "run_smoke"]
+
+
+def test_the_summary_names_the_model_each_operator_really_drives(tmp_path):
+    # the qwen sweep's summary said "models claude-opus-5" for cells that ran HPCB_ALCF_MODEL
+    _, _, free, _ = _sweep(tmp_path / "a", "--operators", "pi,codex", "--profiles", "lmod", HPCB_ALCF_MODEL="qwen3.8-flash-next")
+    assert free.splitlines()[0].endswith("target fake, free operators: model qwen3.8-flash-next"), free.splitlines()[0]
+    _, _, paid, _ = _sweep(tmp_path / "b", "--profiles", "lmod")
+    assert paid.splitlines()[0].endswith("target fake, models claude-opus-5"), paid.splitlines()[0]
+    _, _, both, _ = _sweep(tmp_path / "c", "--operators", "claude,pi", "--profiles", "lmod")
+    assert both.splitlines()[0].endswith("models claude-opus-5; free operators: model openai/gpt-oss-120b")
+
+
+def test_a_free_operators_cell_labels_name_its_real_model(monkeypatch, tmp_path):
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_suite_labels", HERE.parent / "run_suite.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    monkeypatch.setenv("HPCB_OPERATOR", "pi")
+    monkeypatch.setenv("HPCB_ALCF_MODEL", "qwen3.8-flash-next")
+    assert mod._short_model("claude-opus-5") == "qwen3.8-flash-next"
+    assert mod._cell("claude-opus-5", None) == "qwen3.8-flash-next @ default"
+    monkeypatch.setenv("HPCB_ALCF_MODEL", "openai/gpt-oss-120b")
+    assert mod._short_model("claude-opus-5") == "gpt-oss-120b"
+    monkeypatch.delenv("HPCB_ALCF_MODEL")
+    monkeypatch.setattr(mod, "REPO", tmp_path)                     # no agentic/.env: run_smoke.sh's default
+    assert mod._free_model() == "openai/gpt-oss-120b"
+    (tmp_path / "agentic").mkdir()
+    (tmp_path / "agentic" / ".env").write_text("HPCB_ALCF_MODEL=qwen-from-env\n")
+    assert mod._short_model("claude-opus-5") == "qwen-from-env"
+    monkeypatch.setenv("HPCB_OPERATOR", "claude")
+    assert mod._short_model("claude-opus-5") == "opus" and mod._cell("claude-opus-5", "high") == "claude-opus-5 @ high"

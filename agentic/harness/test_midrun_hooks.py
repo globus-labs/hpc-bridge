@@ -150,7 +150,9 @@ def test_the_freeze_fires_on_compute_runs_that_sent_no_shape():
               ("ensure_endpoint_up", {"confirm_spend": True}, {"status": "up", **e1}),
               ("stop_endpoint", {}, {"status": "down", **e1})]
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
-    assert _feed(w, stored) == [("freeze_login_worker", 9), ("thaw_login_worker", 11)] and w.unfired == []
+    # the freeze: the FIRST compute run that ran (nth 1 since the 2026-10-22 review: after the second, a CLI operator's
+    # journal-fed hook raced the stop that came next); the thaw: the first stop after it
+    assert _feed(w, stored) == [("freeze_login_worker", 4), ("thaw_login_worker", 5)] and w.unfired == []
     # the login shape, named, is not the compute shape
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
     login = ("run_shell", {"command": "hostname", "shape": "login"}, {"phase": "complete"})
@@ -482,10 +484,15 @@ def test_after_hook_counts_only_calls_that_end_after_the_named_hook_fired():
                 for st in ("provisioning", "provisioning", "up", "up")],
               (*run, {"phase": "complete"})]
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
-    assert _feed(w, stored) == [("freeze_login_worker", 12)]      # the old hooks: thaw at 6, freeze at 7 (needs_confirm.)
-    assert [h["name"] for h in w.unfired] == ["thaw_login_worker"]   # no stop after the freeze in that run
-    # SYNTHETIC continuation (not in the bundle): the stop that would have followed — the first after the freeze — thaws
-    assert _feed(w, [("stop_endpoint", {}, {"status": "draining", **e1})]) == [("thaw_login_worker", 13)]
+    # nth 1 (the 2026-10-22 review): the first run that RAN freezes (5), the stop after it thaws (6) — never the
+    # refused `needs_confirmation` run (7), which the old hooks froze on
+    assert _feed(w, stored) == [("freeze_login_worker", 5), ("thaw_login_worker", 6)] and w.unfired == []
+    # a stop BEFORE the freeze thaws nothing: the thaw is the first stop after it
+    w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
+    early = [("stop_endpoint", {}, {"status": "down", **e1}), (*run, {"phase": "needs_confirmation"}),
+             (*run, {"phase": "complete"})]
+    assert _feed(w, early) == [("freeze_login_worker", 2)] and [h["name"] for h in w.unfired] == ["thaw_login_worker"]
+    assert _feed(w, [("stop_endpoint", {}, {"status": "draining", **e1})]) == [("thaw_login_worker", 3)]
     # ...and a stop after the freeze that answered `down` anyway still thaws (CLEANUP then has nothing left to do)
     w = hooks.HookWatcher(sc.MIDRUN_HOOKS)
     assert _feed(w, [(*run, {"phase": "complete"}), (*run, {"phase": "complete"}),
@@ -538,7 +545,7 @@ _GOOD = {
         ("run_shell", {"shape": "compute", "command": "hostname"}, {"phase": "complete"}),
         ("run_shell", {"shape": "compute", "command": "hostname"}, {"phase": "complete"}),
         ("stop_endpoint", {}, {"status": "draining", **_E}), ("stop_endpoint", {}, {"status": "down", **_E})],
-        {"freeze_login_worker": 5, "thaw_login_worker": 6}),
+        {"freeze_login_worker": 4, "thaw_login_worker": 6}),   # the freeze after the FIRST run since nth 1 (2026-10-22)
     "fake_mep_stop_names_block": ("1792101787 (hermes21)", [
         ("connect_facility", {}, {"phase": "needs_account"}),
         ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),

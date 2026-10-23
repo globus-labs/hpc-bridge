@@ -2,13 +2,16 @@
 agent must stop polling, say so, and release. Fake cluster only (the hook kills this run's endpoint manager).
 
 Flow: bring up compute → ONE long run_shell on the compute shape (outlives the sync wait → `running` + task_id) →
-the agent's first `poll_task` that finds it running fires the hook (stop this run's endpoint manager where it runs, as
-the pool user)
-→ the manager deregisters, the web reports it offline → the next poll_task must be phase=failed with "ORPHANED"
-(server._poll_task via warmth._endpoint_gone) → the agent reports it once, calls stop_endpoint (which answers
-OFFLINE/ORPHANED, down) and finishes. Before hooks (review 2026-09-05, N6) this verdict existed only hermetically.
+that run_shell's `running` answer fires the hook (stop this run's endpoint manager where it runs, as the pool user —
+#226: it used to fire on the first poll_task that found the task running, which an agent whose one long poll waited
+the task out never sent) → the manager deregisters, the web reports it offline → the next poll_task must be
+phase=failed with "ORPHANED" (server._poll_task via warmth._endpoint_gone) → the agent reports it once, after that
+answer, calls stop_endpoint (which answers OFFLINE/ORPHANED, down) and finishes. Before hooks (review 2026-09-05, N6)
+this verdict existed only hermetically.
 """
-from invariants import Result, Trace, texts_mention
+import re
+
+from invariants import Result, Trace, _typo, said_after
 
 _MARK = "HPCB_CHAOS"
 
@@ -69,7 +72,22 @@ def polls_bounded_after_orphan(t: Trace) -> Result:
     return Result("polls_bounded_after_orphan", ok, "ok" if ok else f"{len(after)} poll_task calls after the ORPHANED report")
 
 
-orphan_relayed = texts_mention("orphan_relayed", "orphan", any_of=("offline", "gone", "died", "stopped"))
+_GONE = re.compile(r"offline|gone|died|stopped")
+
+
+def orphan_relayed(t: Trace) -> Result:
+    """The agent told the user, AFTER the ORPHANED answer, that the task is orphaned and its endpoint offline / gone /
+    died / stopped. Its words before that answer are not read (invariants.said_after): qwen restated the prompt's plan
+    — "if poll_task reports it orphaned or the endpoint offline/gone, I'll stop" — before anything was orphaned, and
+    passed (the review of the 2026-10-22 sweep)."""
+    orph = _orphan_polls(t)
+    if not orph:
+        return Result("orphan_relayed", False, "no ORPHANED answer to relay")
+    blob = _typo("\n".join(said_after(t, orph[0])))
+    ok = "orphan" in blob and bool(_GONE.search(blob))
+    return Result("orphan_relayed", ok, f"ok: relayed after the ORPHANED answer (call {orph[0]})" if ok
+                  else f"the agent's text after the ORPHANED answer (call {orph[0]}) does not say the task is orphaned "
+                       "and its endpoint gone")
 
 EXTRA_INVARIANTS = [orphan_reported, polls_bounded_after_orphan, orphan_relayed]
 EXPECT_OK = [

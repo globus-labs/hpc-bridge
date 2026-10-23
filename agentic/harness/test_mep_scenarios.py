@@ -800,3 +800,35 @@ def test_a_bare_no_endpoint_down_after_the_attach_is_graded_not_skipped():
     assert nb._first_stop(t) == (4, _NOOP_STOP.result)                       # THE stop, not skipped
     assert not nb.no_cancel_claimed(t).ok
     assert nb.mep_stop_is_draining_only(Trace([_NOOP_STOP, _connect("needs_account"), up, run, _stop_result()])).ok
+
+
+def test_a_stop_refused_while_our_task_ran_then_a_draining_stop_is_the_right_sequence():
+    # the review's probe of the 2026-10-22 sweep: a stop refused with `up` (our task still on the block), the task
+    # polled, then the draining stop — mep_stop_is_draining_only failed it on the refusal's `up`
+    import fake_mep_stop_names_block as sc
+    run = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID"},
+                      {"phase": "running", "task_id": "compute-1"})
+    refused = _stop_result(status="up", notice="can't stop yet: task(s) compute-1 are still running on the block. …")
+    poll = ToolCall.of("mcp__endpoint__poll_task", {"task_id": "compute-1"}, {"phase": "complete", "stdout": "JOB=7"})
+    t = Trace([_connect("needs_account"), run, refused, poll, _stop_result("7")])
+    r = sc.mep_stop_is_draining_only(t)
+    assert r.ok and "1 stop(s), all draining" in r.detail, r.detail
+    assert not sc.mep_stop_is_draining_only(Trace([_connect("needs_account"), run, refused])).ok   # never let it go
+    assert not sc.mep_stop_is_draining_only(Trace([_connect("needs_account"), run, refused, poll, _stop_result(status="down")])).ok
+
+
+def test_no_probe_after_stop_skips_a_call_the_facility_refused_before_dispatch():
+    # the review's probe: a login-shape `squeue` the compute-only facility refused (warmth._shape_reject) after the stop
+    # counted as a probe of the block — it sent nothing
+    import fake_mep_stop_names_block as sc
+    run = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "echo JOB=$SLURM_JOB_ID"},
+                      {"phase": "complete", "stdout": "JOB=7"})
+    stop = _stop_result("7")
+    refused_login = ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": "squeue -u $USER"},
+                                {"phase": "failed", "notice": "shape 'login' isn't available on this facility (a compute-only "
+                                 "multi-user endpoint: no free login node; …)"})
+    harness_refused = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute", "command": "hostname"},
+                                  {"text": "refused by the harness; the call never reached hpc-bridge", "is_error": True})
+    for call in (refused_login, harness_refused):
+        assert sc.no_probe_after_stop(Trace([_connect("needs_account"), run, stop, call])).ok, call.result
+    assert not sc.no_probe_after_stop(Trace([_connect("needs_account"), run, stop, _run("compute", "c2")])).ok

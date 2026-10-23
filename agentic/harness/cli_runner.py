@@ -193,24 +193,41 @@ def _turn_argv(harness: str, prompt: str, ws: Path, rec: Path, session: str) -> 
     return [os.environ.get("HPCB_HERMES21_BIN", str(Path.home() / ".local/bin/hermes")), "-z", prompt, "--yolo"]
 
 
+def _placed_by_match(said: list[str], relayed: list[str], relayed_at: list[int]) -> list[int]:
+    """Positions for `exec --json`'s texts in the RELAY's call order: each said text is the relay's next text with the
+    same words (the relay sees every message the model sent, sub-agents' too). [] — positions unknown — when one
+    cannot be found in order."""
+    out, j = [], 0
+    for x in said:
+        while j < len(relayed) and relayed[j].strip() != x.strip():
+            j += 1
+        if j == len(relayed):
+            return []
+        out.append(relayed_at[j])
+        j += 1
+    return out
+
+
 def _native(harness: str, rec: Path, env: dict[str, str], stdout: str,
-            hops: list[dict]) -> tuple[list[Native], list[str], str]:
-    """(the harness's own calls in order, the agent's prose, its final message)."""
+            hops: list[dict]) -> tuple[list[Native], list[str], list[int], str]:
+    """(the harness's own calls in order, the agent's prose, where each text came among those calls — how many calls
+    before it; [] when unknown —, its final message)."""
     if harness == "codex":
         # the relay saw the model's whole wire; `exec --json` omits write_stdin, sub-agents and patch content. The
         # agent's TEXT is what the user saw: `exec --json`'s main-thread messages, not sub-agents' or compaction's
-        events, said = codex_events(stdout)
+        events, said, at = codex_events(stdout)
         texts = said
         if any("calls" in h for h in hops):
-            events, relayed = relay_events(hops)
-            texts = said or relayed
+            events, relayed, relayed_at = relay_events(hops)
+            # the calls are the relay's now: place exec --json's texts in ITS order (by their words), else its own
+            texts, at = (said, _placed_by_match(said, relayed, relayed_at)) if said else (relayed, relayed_at)
         f = rec / "last-message.txt"
-        return events, texts, f.read_text().strip() if f.exists() else (texts[-1] if texts else "")
+        return events, texts, at, f.read_text().strip() if f.exists() else (texts[-1] if texts else "")
     if harness == "pi":
-        events, texts = pi_events(stdout)
-        return events, texts, texts[-1] if texts else ""
-    events, texts = hermes_events(Path(env["HERMES_HOME"]) / "state.db")
-    return events, texts, stdout.strip()
+        events, texts, at = pi_events(stdout)
+        return events, texts, at, texts[-1] if texts else ""
+    events, texts, at = hermes_events(Path(env["HERMES_HOME"]) / "state.db")
+    return events, texts, at, stdout.strip()
 
 
 # ---------------------------------------------------------------- the trace: native order + the journal's record
@@ -349,12 +366,18 @@ def _align(events: list[Native], rows: list[dict]) -> dict[int, int]:
     return pairs
 
 
-def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tuple[Trace, dict[str, int]]:
+def build_trace(rows: list[dict], events: list[Native], texts: list[str],
+                text_at: list[int] | None = None) -> tuple[Trace, dict[str, int]]:
     """The harness's own record fixes the ORDER of every call; hpc-bridge's journal is the record of what its tools
     received and returned. The harness's hpc-bridge calls and the journal rows (in the order the calls STARTED — `ts`,
     then `seq`; a row is written when its call ends) are aligned order-preservingly (`_align`). A call the harness
     itself refused (`ran is False`) takes no row; a call with no row is kept as an error; rows no native event
-    accounts for (a reader blind spot) are appended and counted — run.py GATES on that count."""
+    accounts for (a reader blind spot) are appended and counted — run.py GATES on that count.
+
+    `text_at`, parallel to `texts`: how many of the harness's events came before each text (the readers below record
+    it). Every event becomes exactly one call, in order, before any unplaced row, so it is the number of calls before
+    the text too — the Trace's `text_at`, which lets a grader read only what the agent said AFTER a result
+    (invariants.said_after). Kept only when it is one position per text; else the texts stay unplaced."""
     ordered = sorted(rows, key=lambda r: (r.get("ts") is None, r.get("ts") or 0, r.get("seq") or 0))
     t0 = min((float(r["ts"]) for r in ordered if isinstance(r.get("ts"), int | float)), default=None)
     hp = [k for k, e in enumerate(events) if e.hpcb]
@@ -380,7 +403,8 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str]) -> tup
     left = [r for j, r in enumerate(ordered) if j not in used]
     calls.extend(_stamped(_journal_call(r), r, t0) for r in left)
     stats["journal_unplaced"] = len(left)
-    return Trace(calls, texts), stats
+    placed = list(text_at or []) if len(text_at or []) == len(texts) else []
+    return Trace(calls, texts, placed), stats
 
 
 def trace_from_journal(path: Path, texts: list[str]) -> Trace:
@@ -398,10 +422,13 @@ def trace_from_bundle_messages(messages: list[dict]) -> Trace:
     events = [Native(m["native"]["name"], m["native"].get("args") or {}, m["native"].get("result"),
                      bool(m["native"].get("hpcb")), m["native"].get("ran"), m["native"].get("call_id"))
               for m in messages if "native" in m]
-    texts = [m["text"] for m in messages if "text" in m]
+    said = [m for m in messages if "text" in m]
+    texts = [m["text"] for m in said]
+    at = [m["at"] for m in said if isinstance(m.get("at"), int)]   # a bundle from before 2026-10-22 has none
     final = next((m["final"] for m in messages if "final" in m), "")
-    return build_trace([m["journal"] for m in messages if "journal" in m], events,
-                       texts or ([final] if final else []))[0]
+    if not texts and final:
+        texts, at = [final], [len(events)]
+    return build_trace([m["journal"] for m in messages if "journal" in m], events, texts, at)[0]
 
 
 def _journal_rows(path: Path) -> list[dict]:
@@ -427,17 +454,23 @@ def _jsonl(text: str) -> list[dict]:
     return out
 
 
-def relay_events(hops: list[dict]) -> tuple[list[Native], list[str]]:
+def relay_events(hops: list[dict]) -> tuple[list[Native], list[str], list[int]]:
     """Codex, from the relay's record of the model's own wire (responses_relay): every call the model asked for, in
-    order — write_stdin, sub-agents' calls and patch contents included — with the output Codex returned for each."""
+    order — write_stdin, sub-agents' calls and patch contents included — with the output Codex returned for each. A
+    response's texts are placed before its own calls: written after every earlier call's output (this request carried
+    them), and before any of its own calls could have answered."""
     events: list[Native] = []
     by_id: dict[str, Native] = {}
     texts: list[str] = []
+    text_at: list[int] = []
     for h in hops:
         for o in h.get("outputs") or []:  # this request's new outputs answer calls from earlier responses
             n = by_id.get(str(o.get("call_id")))
             if n is not None and n.result is None:
                 n.result = {"text": str(o.get("output") or "")}
+        said = [t for t in h.get("texts") or [] if t]
+        texts += said
+        text_at += [len(events)] * len(said)
         for c in h.get("calls") or []:
             name, ns = str(c.get("name") or ""), str(c.get("namespace") or "")
             if "input" in c:
@@ -453,17 +486,17 @@ def relay_events(hops: list[dict]) -> tuple[list[Native], list[str]]:
             n = Native(hp or name, args, hpcb=hp is not None, call_id=str(c.get("call_id")))
             events.append(n)
             by_id[str(n.call_id)] = n
-        texts += [t for t in h.get("texts") or [] if t]
-    return events, texts
+    return events, texts, text_at
 
 
-def codex_events(stdout: str) -> tuple[list[Native], list[str]]:
+def codex_events(stdout: str) -> tuple[list[Native], list[str], list[int]]:
     """`codex exec --json` (the fallback when there is no relay record): item.started / item.completed for
-    command_execution, mcp_tool_call, file_change; agent_message items are the agent's prose. It does NOT report
-    write_stdin or a sub-agent's items — the relay record does."""
+    command_execution, mcp_tool_call, file_change; agent_message items are the agent's prose, each placed after the
+    calls its stream listed before it. It does NOT report write_stdin or a sub-agent's items — the relay record does."""
     order: list[str] = []
     by_id: dict[str, Native] = {}
     texts: list[str] = []
+    text_at: list[int] = []
     for ev in _jsonl(stdout):
         item = ev.get("item") if ev.get("type") in ("item.started", "item.completed") else None
         if not isinstance(item, dict):
@@ -471,6 +504,7 @@ def codex_events(stdout: str) -> tuple[list[Native], list[str]]:
         kind, iid = item.get("type"), str(item.get("id"))
         if kind == "agent_message" and ev["type"] == "item.completed" and item.get("text"):
             texts.append(item["text"])
+            text_at.append(len(order))
             continue
         if kind == "command_execution":
             n = by_id.get(iid) or Native("exec_command", {"command": item.get("command", "")})
@@ -490,7 +524,7 @@ def codex_events(stdout: str) -> tuple[list[Native], list[str]]:
         if iid not in by_id:
             by_id[iid] = n
             order.append(iid)
-    return [by_id[i] for i in order], texts
+    return [by_id[i] for i in order], texts, text_at
 
 
 def _content_text(content: Any) -> str:
@@ -499,12 +533,14 @@ def _content_text(content: Any) -> str:
     return "\n".join(str(b.get("text") or "") for b in content or [] if isinstance(b, dict) and b.get("type") == "text")
 
 
-def pi_events(stdout: str) -> tuple[list[Native], list[str]]:
+def pi_events(stdout: str) -> tuple[list[Native], list[str], list[int]]:
     """`pi --mode json`: tool_execution_start/end per call (an end without `durationMs` = the tool never ran);
-    message_end carries each assistant message."""
+    message_end carries each assistant message — placed after the calls started before it (an assistant message ends
+    before the calls it asks for start)."""
     order: list[str] = []
     by_id: dict[str, Native] = {}
     texts: list[str] = []
+    text_at: list[int] = []
     for ev in _jsonl(stdout):
         kind = ev.get("type")
         if kind == "tool_execution_start":
@@ -524,17 +560,18 @@ def pi_events(stdout: str) -> tuple[list[Native], list[str]]:
             msg = ev.get("message") or {}
             if msg.get("role") == "assistant" and (t := _content_text(msg.get("content")).strip()):
                 texts.append(t)
-    return [by_id[i] for i in order], texts
+                text_at.append(len(order))
+    return [by_id[i] for i in order], texts, text_at
 
 
-def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
+def hermes_events(db: Path) -> tuple[list[Native], list[str], list[int]]:
     """Hermes' state.db, in row order: assistant rows carry tool_calls (a deferred tool may go through the `tool_call`
     dispatcher, `{"calls": [{name, arguments}, …]}`, or its legacy single form); tool rows carry results ("The tool was
     NOT invoked" = Hermes refused it itself). A compaction summary row is Hermes' text, not the agent's, and is skipped;
     compaction also copies the kept tail into a child session, so a call id (or a text) seen before is not counted
-    twice."""
+    twice. An assistant row's text is placed before that row's own calls (the message says it, then asks for them)."""
     if not db.exists():
-        return [], []
+        return [], [], []
     import sqlite3
     con = sqlite3.connect(str(db))
     con.row_factory = sqlite3.Row
@@ -548,9 +585,11 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
     by_id: dict[str, Native] = {}
     seen_ids: set[str] = set()
     texts: list[str] = []
+    text_at: list[int] = []
     texts_from: dict[str, Any] = {}  # text → the session it first appeared in
     for r in rows:
         if r.get("role") == "assistant":
+            before = len(events)
             try:
                 tcs = json.loads(r.get("tool_calls") or "[]")
             except ValueError:
@@ -594,6 +633,7 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
             t = (r.get("content") or "").strip()
             if t and texts_from.get(t, r.get("session_id")) == r.get("session_id"):
                 texts.append(t)
+                text_at.append(before)
                 texts_from.setdefault(t, r.get("session_id"))
         elif r.get("role") == "tool":
             n = by_id.get(str(r.get("tool_call_id")))
@@ -602,7 +642,7 @@ def hermes_events(db: Path) -> tuple[list[Native], list[str]]:
                 n.result = {"text": _clip(content)}
                 if _NOT_INVOKED in content:
                     n.ran = False
-    return events, texts
+    return events, texts, text_at
 
 
 # ---------------------------------------------------------------- the operator
@@ -688,12 +728,14 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     (rec / "harness-stdout.txt").write_text(out or "")
     (rec / "harness-stderr.txt").write_text(err or "")
     hops = _journal_rows(rec / "relay.jsonl")
-    events, texts, text = _native(harness, rec, env, out or "", hops)
+    events, texts, text_at, text = _native(harness, rec, env, out or "", hops)
     print(f"  ← {harness}: rc={rc} in {time.monotonic() - t0:.0f}s; final: {text[:240]!r}", flush=True)
     if rc != 0:
         print(f"  stderr tail: {(err or '').strip()[-600:]}", flush=True)
     rows = _journal_rows(journal)
-    trace, stats = build_trace(rows, events, texts or ([text] if text else []))
+    if not texts and text:   # only the final message: it came after every call
+        texts, text_at = [text], [len(events)]
+    trace, stats = build_trace(rows, events, texts, text_at)
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # `run_completed`'s reason: what the run ENDED on (the relay's refused request, Codex's turn.failed, Pi's last error)
     # when there is no final message, or when the run errored (Codex's last message is then whatever it said last: "I'll
@@ -704,9 +746,12 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
     cause = (err or "").rstrip().rsplit("\n", 1)[-1] if rc == 124 else ended_on(harness, out or "", hops)
     final = CliFinal(result=((cause or text) if rc != 0 else (text or cause)) or (err or "")[-400:], is_error=rc != 0)
     # the run dir dies with the jail: carry the journal, the harness's own record and the relay log into the bundle
+    placed = len(text_at) == len(texts)
     messages = [{"harness": harness, "argv": argv[:6], "rc": rc, "seconds": round(time.monotonic() - t0, 1),
                  "trace_stats": stats, "stdout_tail": (out or "")[-4000:], "stderr_tail": (err or "")[-4000:]},
-                *({"native": _bundle_native(n)} for n in events), *({"text": t} for t in texts), {"final": text},
+                *({"native": _bundle_native(n)} for n in events),
+                *({"text": t, **({"at": text_at[k]} if placed else {})} for k, t in enumerate(texts)),   # at: regrade
+                {"final": text},
                 *({"journal": r} for r in rows), *({"relay": h} for h in hops)]
     return RunResult(trace=trace, final=final, messages=messages,
                      hooks_fired=(fired + watcher.unfired_records()) if midrun_hooks else None)

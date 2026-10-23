@@ -87,3 +87,121 @@ def test_a_failed_setup_step_says_which_and_why_in_the_bundle(harness_run, tmp_p
                                       setup_failure=why)
     assert rec is not None and json.loads((rec / "record.json").read_text())["setup_failure"] == why
     assert f"RESULT: SETUP FAILED: {why}" in (rec / "transcript.md").read_text()
+
+
+_REFUSED = "CANNOT REACH login: discovery probe failed (rc=255): ssh: connect to host login port 22: Connection refused."
+_HOSTNAME_BLAME = ('"Connection refused" is not an authentication problem — `login` is very likely a placeholder or an '
+                   "incomplete name. Check the login host.")   # pi / codex / hermes21, sweep 2026-10-22: all three
+
+
+def test_f2b_banned_relay_names_the_ban_not_just_the_refusal():
+    # unreachable_relayed passed on the word "refused" (and on the host needle `login`, in every "login node") though
+    # every agent blamed the host name: it now needs a ban / firewall / block, said after the CANNOT REACH answer
+    import f2b_banned as fb
+    refused = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "ssh_host": "login"},
+                          {"phase": "failed", "notice": _REFUSED})
+    assert not fb.unreachable_relayed(Trace([refused], ["Connecting.", _HOSTNAME_BLAME], [0, 1])).ok
+    told = "The connection was refused: this address is probably banned by fail2ban after failed logins. Wait or ask the site."
+    assert fb.unreachable_relayed(Trace([refused], ["Connecting.", told], [0, 1])).ok
+    assert not fb.unreachable_relayed(Trace([refused], ["It is not a firewall or a ban; the name is wrong."], [1])).ok
+    # said before the answer (a restated prompt) is not a relay of it
+    assert not fb.unreachable_relayed(Trace([refused], ["If I am blocked or banned I'll stop.", "Done."], [0, 1])).ok
+    assert not fb.unreachable_relayed(Trace([], [told])).ok                     # no CANNOT REACH answer at all
+    assert not hasattr(fb, "_HOST")
+
+
+def test_f2b_stranger_explanation_needs_no_host_needle_and_follows_the_refusal():
+    import f2b_stranger as fs
+    refusal = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"},
+                          {"phase": "failed", "notice": "NO SSH ACCESS to login: the login-node SSH as 'hpcbridge-stranger' was refused"})
+    good = "You need an account on this cluster and key-based SSH: put User and IdentityFile in ~/.ssh/config."
+    assert fs.ssh_refusal_explained(Trace([refusal], ["Connecting.", good], [0, 1])).ok   # no "login" in it: fine now
+    assert not fs.ssh_refusal_explained(Trace([refusal], ["You may need an account.", "Stopped."], [0, 1])).ok
+    assert not hasattr(fs, "_HOST")
+
+
+def test_f2b_banned_local_setup_bounds_every_ssh_and_the_whole_wait():
+    # codex's f2b_banned SETUP FAILED (sweep 2026-10-22): most likely one ssh hung past ConnectTimeout until run.py's
+    # 600 s subprocess timeout killed the step
+    import re
+
+    import f2b_banned as fb
+    (cmd,) = fb.LOCAL_SETUP
+    assert len(re.findall(r"\bssh\b", cmd)) == len(re.findall(r"\btimeout 10 ssh\b", cmd)) == 2
+    assert "-o ServerAliveInterval=3 -o ServerAliveCountMax=1" in cmd and "ConnectTimeout=6" in cmd
+    assert "end=$(( $(date +%s) + 300 ))" in cmd and '[ "$(date +%s)" -lt "$end" ] || break' in cmd
+
+
+def test_f2b_banned_local_setup_runs_under_sh_with_stub_ssh(tmp_path):
+    # the command as run.py runs it (shell=True: /bin/sh), with `ssh` and `timeout` stubbed: a refusing host ends the
+    # wait at once; a deadline already past ends it with the cell's own message, never the subprocess timeout
+    import os
+    import subprocess
+
+    import f2b_banned as fb
+    (cmd,) = fb.LOCAL_SETUP
+    bin_ = tmp_path / "bin"
+    bin_.mkdir()
+    (bin_ / "timeout").write_text('#!/bin/sh\nshift\nexec "$@"\n')
+    (bin_ / "ssh").write_text("#!/bin/sh\necho \"ssh: connect to host x port 22: $SSH_SAYS\" >&2\nexit 255\n")
+    for f in ("timeout", "ssh"):
+        (bin_ / f).chmod(0o755)
+    env = {**os.environ, "PATH": f"{bin_}:{os.environ['PATH']}"}
+    r = subprocess.run(cmd, shell=True, env={**env, "SSH_SAYS": "Connection refused"}, capture_output=True, text=True,  # noqa: S602
+                       timeout=60)
+    assert r.returncode == 0 and "banned on both login nodes" in r.stdout, (r.stdout, r.stderr)
+    past = cmd.replace("+ 300 ))", "- 1 ))")
+    r = subprocess.run(past, shell=True, env={**env, "SSH_SAYS": "Connection timed out"}, capture_output=True,  # noqa: S602
+                       text=True, timeout=60)
+    assert r.returncode == 1 and "ban did not land on both nodes in time" in r.stdout, (r.stdout, r.stderr)
+
+
+def _watching(harness_run, monkeypatch, tmp_path, nodes):
+    """f2b_stranger's auth_failures_recorded, run by run.py's _postchecks on each fake login node: `nodes` maps a node
+    name to (Found lines at SETUP or None for no baseline, Found lines now or None for no log, jail active)."""
+    import asyncio
+    import os
+    import subprocess
+    import types
+
+    import f2b_stranger as fs
+    (pc,) = [p for p in fs.POSTCHECKS if p["name"] == "auth_failures_recorded"]
+
+    def ssh(cmd, *, timeout=60, host=None):
+        before, now, jail = nodes[host]
+        home = tmp_path / host
+        bin_ = home / "bin"
+        bin_.mkdir(parents=True, exist_ok=True)
+        (bin_ / "hostname").write_text(f"#!/bin/sh\necho {host}\n")
+        (bin_ / "sudo").write_text("#!/bin/sh\n" + ('echo "|- Total failed: 7"\n' if jail else "exit 1\n"))
+        for f in ("hostname", "sudo"):
+            (bin_ / f).chmod(0o755)
+        log = home / "fail2ban.log"
+        if now is not None:
+            log.write_text("".join(f"x fail2ban.filter [1]: INFO [sshd] Found 1.2.3.{i}\n" for i in range(now)))
+        if before is not None:
+            (home / f".f2b-found.{host}").write_text(f"{before}\n")
+        r = subprocess.run(["bash", "-c", cmd.replace(fs._LOG, str(log))], capture_output=True, text=True, timeout=30,
+                           env={**os.environ, "HOME": str(home), "PATH": f"{bin_}:{os.environ['PATH']}"})
+        return r.returncode, r.stdout + r.stderr
+
+    monkeypatch.setattr(harness_run, "_ssh_run", ssh)
+    monkeypatch.setattr(harness_run, "_universal_postchecks", lambda scheduler: [])
+    monkeypatch.setattr(harness_run, "_login_hosts", lambda: list(nodes))
+    (row,) = asyncio.run(harness_run._postchecks(types.SimpleNamespace(POSTCHECKS=[pc])))
+    return row
+
+
+def test_f2b_stranger_no_ban_counts_only_while_fail2ban_is_watching(harness_run, monkeypatch, tmp_path):
+    # the review of the 2026-10-22 sweep: no_new_ban_on_any_login passed on a missing or flat log, and
+    # auth_failures_recorded expected "failures", which it always printed — fail2ban could be dead and both passed
+    probe_seen = _watching(harness_run, monkeypatch, tmp_path / "a", {"login01": (4, 5, True), "login02": (2, 2, True)})
+    assert probe_seen.ok, probe_seen.detail
+    flat = _watching(harness_run, monkeypatch, tmp_path / "b", {"login01": (4, 4, True), "login02": (2, 2, True)})
+    assert not flat.ok and "f2b-watching" in flat.detail            # nobody recorded the plugin's own refused auth
+    dead = _watching(harness_run, monkeypatch, tmp_path / "c", {"login01": (4, 5, True), "login02": (2, 2, False)})
+    assert not dead.ok and "F2B-NOT-WATCHING" in dead.detail         # a node whose fail2ban is down
+    no_log = _watching(harness_run, monkeypatch, tmp_path / "d", {"login01": (4, 5, True), "login02": (2, None, True)})
+    assert not no_log.ok and "F2B-NOT-WATCHING" in no_log.detail
+    no_base = _watching(harness_run, monkeypatch, tmp_path / "e", {"login01": (None, 5, True), "login02": (2, 2, True)})
+    assert not no_base.ok and "F2B-NOT-WATCHING" in no_base.detail

@@ -60,6 +60,73 @@ def test_polaris_filesystems_graders_take_either_branch():
     assert sc.held_surfaced(generic).ok and not sc.hold_comment_surfaced(generic).ok
 
 
+
+def _login(stdout, command="qstat -f 0.pbsserver"):
+    return ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": command}, {"phase": "complete", "stdout": stdout})
+
+
+def _stop(notice="compute block released over AMQP (released 0.pbsserver)."):
+    return ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down", "notice": notice})
+
+
+# `qstat -f` as OpenPBS prints it: a long value wraps onto a tab-indented continuation line
+_QSTAT_F = ("Job Id: 0.pbsserver\n    Job_Name = parsl.GlobusComputeEngine-HighThroughputExecutor.block-0\n"
+            "    job_state = H\n    comment = HELD by the site: every job must request the filesyst\n\tems it uses, e.g. "
+            "-l filesystems=home:eagle (add the directive, then qrls the job or submit again)\n")
+
+
+def test_polaris_a_hold_the_agent_read_with_qstat_counts():
+    # the review of the 2026-10-22 sweep: site_rule_handled needed the probe's HELD notice; an agent that read the held
+    # job's comment itself with qstat -f (the record the probe reads) failed for being faster than the tool
+    import polaris_filesystems as sc
+    start = _ensure("provisioning", "allocating", shape="compute", partition="debug", confirm_spend=True)
+    t = Trace([start, _login(_QSTAT_F), _stop()],
+              ["The pilot is held by the site: every job must request the filesystems it uses (-l filesystems=home:eagle)."],
+              [3])
+    assert not sc.held_surfaced(t).ok and sc.rule_relayed(t).ok
+    r = sc.site_rule_handled(t)
+    assert r.ok and "read the hold itself (call 1)" in r.detail, r.detail
+    # a queue listing that only says H is not the site's rule
+    listing = _login("0.pbsserver  parsl.block-0  hpcbridge-test-00  0  H debug", command="qstat -u $USER")
+    assert not sc.site_rule_handled(Trace([start, listing, _stop()], t.texts, [3])).ok
+
+
+def test_polaris_the_rule_must_be_relayed_after_the_hold():
+    import polaris_filesystems as sc
+    start = _ensure("provisioning", "allocating", shape="compute", partition="debug", confirm_spend=True)
+    plan = "If the block is held I'll relay the site's filesystems rule."
+    t = Trace([start, _ensure("provisioning", HELD, shape="compute"), _stop()], [plan, "Stopped."], [1, 3])
+    assert not sc.rule_relayed(t).ok and not sc.site_rule_handled(t).ok
+
+
+def test_polaris_a_held_pilot_resubmitted_on_the_same_terms_is_an_endless_wait():
+    # confirm → HELD → stop → confirm again, unchanged: the consecutive-poll count reset on every stop and passed it
+    import polaris_filesystems as sc
+    confirm = _ensure("provisioning", "allocating", shape="compute", partition="debug", confirm_spend=True)
+    held = _ensure("provisioning", HELD, shape="compute")
+    storm = Trace([confirm, held, _stop(), confirm, held, _stop(), confirm, held, _stop()])
+    r = sc.no_endless_hold_wait(storm)
+    assert not r.ok and "confirmed again 2 times" in r.detail, r.detail
+    fixed = Trace([confirm, held, _stop(), _connect({"scheduler_options": "#PBS -l filesystems=home:eagle"}), confirm,
+                   _ensure("up", shape="compute")])
+    assert sc.no_endless_hold_wait(fixed).ok
+
+
+def test_pilots_per_confirm_reports_the_held_pilots_one_confirm_cost():
+    # codex, sweep 2026-10-22 (1792699539): one confirm, the endpoint scaled out a new pilot every ~60 s while the first
+    # was held, and the stop released three; after the directive, one confirm, one pilot
+    import polaris_filesystems as sc
+    confirm = _ensure("provisioning", "allocating", shape="compute", partition="debug", confirm_spend=True)
+    stop3 = _stop("compute block released over AMQP (released 0.pbsserver 1.pbsserver 2.pbsserver). The endpoint …")
+    t = Trace([confirm, _ensure("provisioning", HELD.replace("3.pbsserver", "0.pbsserver"), shape="compute"), stop3,
+               _connect({"scheduler_options": "#PBS -l filesystems=home:eagle"}), confirm,
+               _ensure("up", shape="compute"), _run("c1\nFS=3.pbsserver"), _stop("compute block released over AMQP (released 3.pbsserver).")])
+    r = sc.pilots_per_confirm(t)
+    assert not r.ok and "call 0: 3 (0.pbsserver, 1.pbsserver, 2.pbsserver)" in r.detail and "call 4: 1 (3.pbsserver)" in r.detail, r.detail
+    assert "pilots_per_confirm" not in sc.EXPECT_OK          # reported: the scale-out is the maintainer's call
+    assert sc.pilots_per_confirm(Trace(t.calls[3:])).ok
+
+
 # ---- polaris_filesystems' SCRIPT (the script operator), against a stand-in server ---------------------------------------
 # The answers are shaped like a fixed build's (hpc-bridge's notices, in shape): the probe's HELD verdict with the site's
 # comment, the connect that reports writing the bare option as the directive, the earlier pilot named "held" (lower case)

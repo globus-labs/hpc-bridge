@@ -295,13 +295,36 @@ class NodeGate:
         return None
 
 
+_FREE_OPERATORS = ("codex", "pi", "hermes21", "hermes")   # the ALCF-hosted (OpenAI-compatible) model's operators
+
+
+def _free_model() -> str | None:
+    """The model a free operator's cell really runs, or None for a Claude operator: HPCB_ALCF_MODEL, else agentic/.env's,
+    else run_smoke.sh's default — the --models id never reaches such a cell (run_smoke.sh). The qwen sweep's rows
+    (2026-10-22) all read `opus/default` and its SUITE lines `claude-opus-5 @ default` for a qwen3.8 run."""
+    if os.environ.get("HPCB_OPERATOR", "claude") not in _FREE_OPERATORS:
+        return None
+    if os.environ.get("HPCB_ALCF_MODEL"):
+        return os.environ["HPCB_ALCF_MODEL"]
+    env = REPO / "agentic" / ".env"
+    for line in env.read_text().splitlines() if env.exists() else []:
+        if line.startswith("HPCB_ALCF_MODEL=") and line.split("=", 1)[1].strip():
+            return line.split("=", 1)[1].strip()
+    return "openai/gpt-oss-120b"
+
+
 def _short_model(m: str) -> str:
+    """A cell label's model: `opus` for claude-opus-5; a free operator's real model, its provider prefix dropped
+    (qwen3.8-flash-next, gpt-oss-120b)."""
+    free = _free_model()
+    if free is not None:
+        return free.rsplit("/", 1)[-1]
     parts = m.split("-")
     return parts[1] if len(parts) > 1 else m
 
 
 def _cell(model: str, effort: str | None) -> str:
-    return f"{model} @ {effort or 'default'}"
+    return f"{_free_model() or model} @ {effort or 'default'}"
 
 
 def _cell_env(user: str, runid: str) -> dict[str, str]:

@@ -9,12 +9,22 @@ satisfy the rule (a GPU request via the facility's scheduler_options) or tell th
 polling a block that will never come.
 
 Gated on the OUTCOME either way (`gpu_rule_handled`): the block ran on the GPU node with a GPU allocated (an agent
-may know the rule up front and request the GPU from the start — nothing to surface then), OR the rejection was
-surfaced by the tool AND the rule relayed to the user. `no_endless_wait` bounds the polling after a REJECTED notice.
+may know the rule up front and request the GPU from the start — nothing to surface then), OR the rule reached the agent
+— the tool's REJECTED notice, or the facility's own sbatch error read through the login shape (`rule_found_in_log`) —
+AND the agent relayed it to the user after that. `no_endless_wait` bounds the polling after a REJECTED notice.
 """
 import re
 
-from invariants import Result, Trace, _slurm_work_idxs, compute_ran, no_endless_wait, rejection_surfaced
+from invariants import (
+    Result,
+    Trace,
+    _rejected_idxs,
+    _slurm_work_idxs,
+    compute_ran,
+    no_endless_wait,
+    rejection_surfaced,
+    said_after,
+)
 
 NEEDS_COMPUTE_NODE = True
 
@@ -44,12 +54,23 @@ _RULE_WORDS = re.compile(r"gpus-per-node|--gpus\b|--gres\b|request(s|ed|ing)? (a
 _CUDA = re.compile(r"CUDA_VISIBLE_DEVICES=\d\S*")
 
 
+def _rule_evidence(t: Trace) -> int | None:
+    """The first call that put the rule in front of the agent: the tool's REJECTED notice, or a login-shape result
+    carrying the site rule's own message (`_log_read_idxs`)."""
+    return min([*_rejected_idxs(t)[:1], *_log_read_idxs(t)[:1]], default=None)
+
+
 def rule_relayed(t: Trace) -> Result:
-    """The agent's own words name the rule: the gpu partition demands a GPU request."""
-    blob = "\n".join(t.texts)
+    """The agent's own words, AFTER the rule reached it (`_rule_evidence`), name the rule: the gpu partition demands a
+    GPU request. Its words before then are not read (invariants.said_after): the prompt's own "tell me the exact site
+    rule … a resource request the partition demands", restated as a plan, named it before anything was rejected."""
+    k = _rule_evidence(t)
+    if k is None:
+        return Result("rule_relayed", False, "the rule never reached the agent (no REJECTED notice, no log read)")
+    blob = "\n".join(said_after(t, k))
     ok = "gpu" in blob.lower() and bool(_RULE_WORDS.search(blob))
-    return Result("rule_relayed", ok, "ok: the agent named the GPU-request rule" if ok
-                  else "the agent's text never names the rule (a GPU request the partition demands)")
+    return Result("rule_relayed", ok, f"ok: the agent named the GPU-request rule after call {k}" if ok
+                  else f"the agent's text after call {k} never names the rule (a GPU request the partition demands)")
 
 
 def gpu_block_ran(t: Trace) -> Result:
@@ -62,26 +83,36 @@ def gpu_block_ran(t: Trace) -> Result:
     return Result("gpu_block_ran", False, f"no compute-shape run_shell completed on {GPU_NODE} with a CUDA_VISIBLE_DEVICES value")
 
 
+def _log_read_idxs(t: Trace) -> list[int]:
+    return [i for i, c in t.named("run_shell")
+            if str(c.input.get("shape")) == "login" and "site rule" in str((c.result or {}).get("stdout", ""))]
+
+
 def rule_found_in_log(t: Trace) -> Result:
     """The agent read the rule where sbatch left it: a login-shape run_shell (the endpoint log / submit-script dir)
-    returned the site rule's own message. Reported, not gated — legibility for which path the run took. Live
-    2026-09-05 the agent got here in ~40 s, BEFORE the #32 probe's 45 s grace had elapsed (so rejection_surfaced read
-    FAIL while the rejection was real and diagnosed): the faster diagnosis, not a product miss."""
-    for i, c in t.named("run_shell"):
-        if str(c.input.get("shape")) == "login" and "site rule" in str((c.result or {}).get("stdout", "")):
-            return Result("rule_found_in_log", True, f"ok: call {i} read the rule's message from the login node")
-    return Result("rule_found_in_log", False, "no login-shape command returned the site rule's message")
+    returned the site rule's own message. Reported, not gated, as a row — legibility for which path the run took — but
+    it is evidence `gpu_rule_handled` accepts. Live 2026-09-05 the agent got here in ~40 s, BEFORE the #32 probe's 45 s
+    grace had elapsed (so rejection_surfaced read FAIL while the rejection was real and diagnosed): the faster
+    diagnosis, not a product miss."""
+    idx = _log_read_idxs(t)
+    return Result("rule_found_in_log", bool(idx), f"ok: call {idx[0]} read the rule's message from the login node" if idx
+                  else "no login-shape command returned the site rule's message")
 
 
 def gpu_rule_handled(t: Trace) -> Result:
-    """The outcome: the rule was SATISFIED (work ran on the GPU node with a GPU) or SURFACED + RELAYED."""
+    """The outcome: the rule was SATISFIED (work ran on the GPU node with a GPU) or SURFACED + RELAYED. Surfaced: the
+    tool's REJECTED notice (`rejection_surfaced`), or the facility's own sbatch error reaching the agent through a
+    login-shape result (`rule_found_in_log`) — the agent that reads the endpoint log before the #32 probe's grace has
+    diagnosed the real rejection, and failed here for being faster than the tool (live 2026-09-05; the review of the
+    2026-10-22 sweep). rejection_surfaced stays a report-only row."""
     ran = gpu_block_ran(t)
     if ran.ok:
         return Result("gpu_rule_handled", True, f"satisfied — {ran.detail}")
-    surfaced, relayed = rejection_surfaced(t), rule_relayed(t)
-    ok = surfaced.ok and relayed.ok
-    return Result("gpu_rule_handled", ok, f"surfaced and relayed — {surfaced.detail}" if ok
-                  else f"neither satisfied nor explained — {ran.detail}; {surfaced.detail}; {relayed.detail}")
+    surfaced, read, relayed = rejection_surfaced(t), rule_found_in_log(t), rule_relayed(t)
+    seen = surfaced if surfaced.ok else read
+    ok = seen.ok and relayed.ok
+    return Result("gpu_rule_handled", ok, f"surfaced and relayed — {seen.detail}" if ok
+                  else f"neither satisfied nor explained — {ran.detail}; {surfaced.detail}; {read.detail}; {relayed.detail}")
 
 
 EXTRA_INVARIANTS = [gpu_rule_handled, no_endless_wait, rejection_surfaced, rule_relayed, rule_found_in_log, gpu_block_ran, compute_ran]
@@ -96,6 +127,6 @@ EXPECT_OK = [
     "stop_confirmed_or_retried",
 ]
 # REPORTED, not gated: rejection_surfaced / rule_relayed / rule_found_in_log / gpu_block_ran / compute_ran — which branch
-# the run took and how. Live 2026-09-05: rejected → log read at ~40 s → reconnect with scheduler_options → c3, GPU 0.
+# the run took and how (gpu_rule_handled accepts either rejection_surfaced or rule_found_in_log as the evidence). Live 2026-09-05: rejected → log read at ~40 s → reconnect with scheduler_options → c3, GPU 0.
 
 TEARDOWN = "delete"

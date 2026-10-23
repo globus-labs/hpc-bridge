@@ -399,6 +399,26 @@ def _universal_postchecks(scheduler: str) -> list[dict]:
     return [{"name": "stop_honesty_no_pilot_left", "cmd": cmd, "pilots": scheduler}]
 
 
+# connect._attach_mep's notice: the run reached the facility through its multi-user endpoint (zero SSH)
+_MEP_ATTACHED = "attached to the facility's multi-user endpoint"
+
+
+def _pilots_elsewhere(trace: Trace | None) -> str | None:
+    """Why the universal pilot check does not apply to this run, or None. It lists the POOL user's queue (`whoami`); a
+    run that reached its facility only through a facility multi-user endpoint — attached, never bootstrapped over SSH —
+    has its blocks run as the MEP's mapped account (the profile's `mep_mapped_user`: hpcbmep), so that queue is empty
+    whatever the stop did, and the row read `ok` on every MEP cell of the 2026-10-22 sweep. Such a stop issues no cancel
+    (draining-only); the MEP cells' own world checks read the mapped account's queue past the facility's idle-release."""
+    if trace is None:
+        return None
+    notices = [_stop_notice(c.result) for _, c in trace.named("connect_facility")]
+    if not any(_MEP_ATTACHED in n for n in notices) or any("first contact over SSH:" in n for n in notices):
+        return None
+    user = _capabilities().get("mep_mapped_user") or "the facility's mapped account"
+    return (f"this run reached its facility only through a facility multi-user endpoint, whose blocks run as {user}, "
+            "not the pool user this check lists; the cell's own world checks read that queue")
+
+
 # A pilot the scheduler itself lists as on its way OUT: PBS `E` (exiting, still listed until the MoM's obit) and Slurm
 # `CG` (completing: its epilog running, its processes being killed — KillWait=30 on the fake cluster). And the state a
 # job a stop cancelled may still be listed in before that, on PBS ONLY: R — OpenPBS's qdel is asynchronous (below), and
@@ -615,6 +635,9 @@ async def _postchecks(scen, res=None) -> list[Result]:
     login_hosts = _login_hosts() or [os.environ.get("HPC_BRIDGE_SSH_HOST", "")]
     for pc in list(getattr(scen, "POSTCHECKS", [])) + universal:
         if "pilots" in pc:   # the universal pilot check: job states + the stops' cancels; waits out an ending pilot
+            if (why := _pilots_elsewhere(getattr(res, "trace", None))) is not None:
+                results.append(Result(f"world:{pc['name']}", True, f"not applicable: {why}"))
+                continue
             cancelled = _stop_cancelled_jobs(getattr(res, "trace", None))
             results.append(await _no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], cancelled=cancelled,
                                                 wait_s=_pilot_end_wait_s(), timeout=pc.get("timeout", 60)))

@@ -6,7 +6,7 @@ a notice: it bills the allocation like a block, hpc-bridge neither tracks nor st
 prompt carries the user's approval (autonomous), so the cell checks the notice, that the agent cancels the job, and that
 nothing of it is left on the cluster. Login shape only — no compute block.
 """
-from invariants import Result, Trace
+from invariants import Result, Trace, _hand_submit_idxs
 
 _JOB = "hpcb-handjob"
 _SCRIPT = (
@@ -44,9 +44,15 @@ TARGETS = ("fake",)
 REQUIRES = {"scheduler": "slurm", "partitions": ["debug"], "accounts": ["hpcb"]}
 
 
+def _submit_idxs(t: Trace) -> list[int]:
+    """The run_shell calls that submitted a job and ran (invariants._hand_submit_idxs, as mep_hand_batch_job reads them):
+    the product-independent detector, not the word "sbatch" — which a `cat > … <<EOF` writing `#SBATCH` lines, a `man
+    sbatch` or an `sbatch --help` also contain (the old test excluded only `cat >`), and which a refused call carries too."""
+    return [i for i in _hand_submit_idxs(t) if t.calls[i].name == "run_shell"]
+
+
 def _submits(t: Trace) -> list:
-    return [c for _, c in t.named("run_shell")
-            if "sbatch" in str(c.input.get("command", "")) and "cat >" not in str(c.input.get("command", ""))]
+    return [t.calls[i] for i in _submit_idxs(t)]
 
 
 def submission_noticed(t: Trace) -> Result:
@@ -64,8 +70,7 @@ def submission_noticed(t: Trace) -> Result:
 
 def job_cancelled(t: Trace) -> Result:
     """After the submission the agent cancelled the job (scancel) — the cell's world check confirms nothing is left."""
-    idx = [i for i, c in t.named("run_shell") if "sbatch" in str(c.input.get("command", ""))
-           and "cat >" not in str(c.input.get("command", ""))]
+    idx = _submit_idxs(t)
     if not idx:
         return Result("job_cancelled", False, "no submission")
     later = [c for i, c in t.named("run_shell") if i > idx[0] and "scancel" in str(c.input.get("command", ""))

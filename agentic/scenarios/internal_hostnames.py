@@ -6,7 +6,10 @@ The plugin pins later control-plane SSH to the node the manager landed on (the l
 THAT node and not whichever the alias picks next). Here the node's own name is useless to the client: pinning it breaks
 teardown ("Could not resolve hostname"); falling back to the round-robin alias may hit the other node and orphan the
 manager. The right pin is the ADDRESS the client actually reached (0.1.12: `$SSH_CONNECTION`'s server address, key
-still verified against the alias the user trusted). World checks on EACH login node tell the truth either way.
+still verified against the alias the user trusted). World checks on EACH login node tell the truth either way — with
+SSH multiplexing OFF (EXTRA_ENV: HPC_BRIDGE_SSH_CONTROL_PERSIST=0), since the alias's ControlMaster (ControlPersist 60 s)
+carried a teardown sent to the alias to the node it first reached, masking a pin regression. `pinned_by_address` is
+gated: the pin is what this profile tests.
 """
 import os
 import re
@@ -14,9 +17,10 @@ import re
 from invariants import (
     Result,
     Trace,
-    calls_bounded,
     ends_with_teardown,
+    first_contact_host,
     login_shape_ran,
+    no_compute_ensure,
     no_ssh_workaround,
     teardown_reported_clean,
 )
@@ -40,8 +44,11 @@ SUMMARY = "internal login hostnames: the pin survives a node name the client can
 TAGS = ["pin", "hostnames", "internal", "teardown", "fake"]
 MAX_TURNS = 30
 
+# No ControlMaster: every control-plane ssh resolves its host again, so one sent to the alias may land on the other node
+EXTRA_ENV = {"HPC_BRIDGE_SSH_CONTROL_PERSIST": "0"}
+
 _NAME = os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip() or "hpc-bridge-fake"
-_IPV4 = re.compile(r"@(\d{1,3}(?:\.\d{1,3}){3})\b")
+_IPV4 = re.compile(r"^\d{1,3}(?:\.\d{1,3}){3}$")
 
 
 def internal_name_seen(t: Trace) -> Result:
@@ -53,20 +60,21 @@ def internal_name_seen(t: Trace) -> Result:
 
 
 def pinned_by_address(t: Trace) -> Result:
-    """REPORTED: the first-contact notice names the pinned node by ADDRESS (the internal name was not routable)."""
-    for _i, c in t.named("connect_facility"):
-        n = str((c.result or {}).get("notice") or "")
-        if "first contact over SSH" in n:
-            m = _IPV4.search(n)
-            return Result("pinned_by_address", bool(m), f"ok: pinned to {m.group(1)}" if m
-                          else f"first contact pinned by name, not address: {n[:120]!r}")
-    return Result("pinned_by_address", False, "no first-contact notice")
+    """GATED: the first-contact notice names the pinned node by ADDRESS (the internal name is not routable from the
+    client, and the alias would be resolved afresh)."""
+    fc = first_contact_host(t)
+    if fc is None:
+        return Result("pinned_by_address", False, "no first-contact notice")
+    i, host = fc
+    ok = bool(_IPV4.match(host))
+    return Result("pinned_by_address", ok, f"ok: pinned to {host}" if ok
+                  else f"first contact (call {i}) pinned by name, not address: {host!r}")
 
 
-EXTRA_INVARIANTS = [internal_name_seen, pinned_by_address, no_ssh_workaround, calls_bounded("ensure_endpoint_up", 0),
+EXTRA_INVARIANTS = [internal_name_seen, pinned_by_address, no_ssh_workaround, no_compute_ensure,
                     login_shape_ran, ends_with_teardown, teardown_reported_clean]
-EXPECT_OK = ["agent_engaged", "internal_name_seen", "login_shape_ran", "no_ssh_workaround", "ensure_endpoint_up_calls_le_0",
-             "ends_with_teardown", "teardown_reported_clean", "spend_not_unprompted"]
+EXPECT_OK = ["agent_engaged", "internal_name_seen", "pinned_by_address", "login_shape_ran", "no_ssh_workaround",
+             "no_compute_ensure", "ends_with_teardown", "teardown_reported_clean", "spend_not_unprompted"]
 POSTCHECKS = [
     {"name": "no_endpoint_process_on_any_login", "on": "each_login",
      "cmd": 'pgrep -u "$(whoami)" -f "globus-compute-[e]ndpoint" || true', "expect_empty": True},

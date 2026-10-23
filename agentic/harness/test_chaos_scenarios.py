@@ -38,12 +38,29 @@ def test_orphaned_task_graders():
     assert sc.MIDRUN_HOOKS[0]["when_phase"] == "running" and sc.MIDRUN_HOOKS[0]["when_input"] == sc._MARK
 
 
+
+def test_orphan_relayed_reads_only_what_was_said_after_the_orphaned_answer():
+    # the review's probe of the 2026-10-22 sweep: qwen restated the prompt's plan — "if poll_task reports it orphaned or
+    # the endpoint offline/gone, I'll stop" — before anything was orphaned, and orphan_relayed passed on it
+    import orphaned_task as sc
+    plan = "Plan: run the task, poll it; if poll_task reports it orphaned or the endpoint offline/gone, I'll stop."
+    calls = [_poll("running"), _poll("failed", "task 't' is ORPHANED: the endpoint it was dispatched to is offline"),
+             _stop("down")]
+    assert not sc.orphan_relayed(Trace(calls, [plan, "Stopped the endpoint."], [0, 3])).ok
+    assert sc.orphan_relayed(Trace(calls, [plan, "poll_task says the task is ORPHANED: its endpoint went offline."], [0, 2])).ok
+    # unplaced texts (an operator whose record does not order them): the final message alone
+    assert not sc.orphan_relayed(Trace(calls, [plan, "Stopped the endpoint."])).ok
+    assert not sc.orphan_relayed(Trace([_poll("running")], [plan])).ok    # no ORPHANED answer: nothing to relay
+
+
 def test_draining_restop_and_stop_while_running_graders():
     import draining_restop as dr
     import stop_while_running as sw
     assert dr.draining_seen(Trace([_stop("draining"), _stop("down")])).ok
     assert not dr.draining_seen(Trace([_stop("down")])).ok
-    assert dr.MIDRUN_HOOKS[0]["when_input"] == {"shape": "compute"} and dr.MIDRUN_HOOKS[0]["nth"] == 2
+    # the FIRST compute run (nth 1, the 2026-10-22 review): after the second, a CLI operator's journal-fed hook raced
+    # the agent's next call — the stop it exists for
+    assert dr.MIDRUN_HOOKS[0]["when_input"] == {"shape": "compute"} and dr.MIDRUN_HOOKS[0]["nth"] == 1
     # freeze (not kill — a killed worker is relaunched before the stop) on EVERY login node, thaw after the first stop
     assert "-STOP" in dr.MIDRUN_HOOKS[0]["cmd"] and dr.MIDRUN_HOOKS[0]["on"] == "each_login"
     assert dr.MIDRUN_HOOKS[1]["after_tool"] == "stop_endpoint" and "-CONT" in dr.MIDRUN_HOOKS[1]["cmd"] and dr.MIDRUN_HOOKS[1]["on"] == "each_login"

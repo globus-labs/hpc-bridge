@@ -27,6 +27,10 @@
 # sweeps unnoticed. The paid wave is the default (the Claude operator runs every cell); with HPCB_OPERATOR=codex|pi|hermes21
 # the sweep is the free wave and leaves out paid_only() — what those one-shot operators cannot drive (a persona, PHASES, a
 # hook that needs the SDK interrupt). test_sweep_script.py keeps that list equal to what run.py would report SKIPPED.
+# Unless --paid-only, the SCRIPT operator (no model) runs too, once per sweep whatever --operators names: both phases of
+# queued_check_relaunch on `default`, polaris_filesystems on `polaris` (the HELD pilot → the directive) and lmod_bootstrap
+# on `lmod` (a failed details= → the proposal) — paths a model may never take. The summary header names the model each
+# operator drives: --models for the Claude ones, HPCB_ALCF_MODEL for the free ones.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep"
@@ -36,7 +40,13 @@ while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles)
 [ -f "$HERE/agentic/.env" ] && while IFS= read -r line || [ -n "$line" ]; do case "$line" in ''|\#*) continue ;; esac; k="${line%%=*}"; [ -z "${!k+x}" ] && export "$line"; done < "$HERE/agentic/.env"
 STAMP="$(date +%Y%m%d-%H%M)"
 SUMMARY="$HERE/agentic/runs/sweep-$STAMP.md"; mkdir -p "$HERE/agentic/runs"
-echo "# profile sweep $STAMP — target fake, models $MODELS" > "$SUMMARY"
+# The header names the model each operator really drives: --models reaches the Claude operators only; the free ones run
+# HPCB_ALCF_MODEL (run_smoke.sh's default when unset) — the 2026-10-22 qwen sweep's header said "models claude-opus-5".
+HAS_FREE=; HAS_PAID=
+NAMED_OPS="${OPERATORS:-${HPCB_OPERATOR:-claude}}"
+for op in ${NAMED_OPS//,/ }; do case "$op" in codex|pi|hermes21|hermes) HAS_FREE=1 ;; *) HAS_PAID=1 ;; esac; done
+MODEL_WORDS="${HAS_PAID:+models $MODELS}${HAS_PAID:+${HAS_FREE:+; }}${HAS_FREE:+free operators: model ${HPCB_ALCF_MODEL:-openai/gpt-oss-120b}}"
+echo "# profile sweep $STAMP — target fake, $MODEL_WORDS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
@@ -113,6 +123,16 @@ done
 [ -z "${FREE_WAVE:-}" ] || echo "free wave: HPCB_ALCF_WAIT_S=${HPCB_ALCF_WAIT_S:-0} — each cell probes the ALCF endpoint first; an unhealthy one is recorded INFRA, not run" | tee -a "$SUMMARY"
 [ -z "$PAID_ONLY" ] || echo "paid only: the paid_only() cells, Claude operator" | tee -a "$SUMMARY"
 
+script_cell() {  # script_cell <profile> <scenario>: ONE script-operator cell (no model) on the cluster booted above
+  # its row reads "<scenario> (script) — RESULT: …" (two words before the dash, as queued_check_relaunch's: sweep_dash
+  # reads a one-word row as the no-skill ablation)
+  echo "    ${TAGGED:+[script] }$2 (script operator):" | tee -a "$SUMMARY"
+  HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$1" HPCB_SKIP_BUILD=1 \
+    "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$2.log" \
+    | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
+    | sed "s/^/    ${TAGGED:+[script] }$2 (script) — /" | tee -a "$SUMMARY"
+}
+
 cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator runs here (order kept)
   if [ -n "$PAID_ONLY" ]; then tr ',' '\n' <<< "$2" | grep -xF -f <(paid_only) | paste -sd, -
   elif free_op "$1"; then tr ',' '\n' <<< "$2" | grep -vxF -f <(paid_only) | paste -sd, -
@@ -162,6 +182,14 @@ for prof in "${PROFS[@]}"; do
         | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
         | sed "s/^/    ${TAGGED:+[script] }queued_check_relaunch $ph — /" | tee -a "$SUMMARY"
     done
+  fi
+  if [ -z "$PAID_ONLY" ] && [ -z "$RESET" ]; then   # RESET empty: a run_suite above booted this profile
+    # The paths a model may never take, once per sweep with no model (the review of the 2026-10-22 sweep): polaris's
+    # HELD pilot → the directive → the block up, and lmod's failed details= → the proposal that loads its modules.
+    case "$prof" in
+      polaris) script_cell polaris polaris_filesystems ;;
+      lmod)    script_cell lmod lmod_bootstrap ;;
+    esac
   fi
 done
 # INFRA apart from OK and FAILED: the operator's model endpoint failed (or the ALCF probe found it unhealthy and the cell

@@ -191,6 +191,40 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **The reviews of the qwen sweep (2026-10-22): a right answer passes, a restated plan does not, a bound counts.** A
+  correct self-diagnosis counts as the evidence: `gpu_rule` takes the facility's own sbatch error read on the login
+  shape, `venv_arch_mismatch` the job's stderr line read there, `polaris_filesystems` the agent's own `qstat -f` /
+  `qstat -x` showing the site's comment (each needed the tool's notice, and failed an agent faster than the probe).
+  The CLI operators' traces (codex, pi, hermes21) place the agent's texts among its calls (`Trace.text_at`, from each
+  harness's own event order; the bundle keeps it for `regrade.py`), and so does the script operator. The graders that
+  ask whether the agent relayed a result — `orphan_relayed`, `cause_relayed`, `rule_relayed` (gpu_rule, polaris),
+  `no_false_success`, `unreachable_relayed`, `ssh_refusal_explained` — read only what it said AFTER that result
+  (`invariants.said_after`; the final message where the record places nothing): a restated prompt or an echoed plan
+  passed them. `no_false_success` also fails an explicit claim that the command ran. The f2b graders' host needle
+  (`login`, in every "login node") is gone; `unreachable_relayed` needs a ban, a firewall or a block, not the word
+  "refused" agents quoted while blaming the host name. `quote_before_spend` now grades CLI cells (report-only there).
+  `no_endless_wait` (gpu_rule, submit_policy_rejected) and its HELD / dead-pilot twins count every answer about the
+  block that carries the marker — ensure_endpoint_up, a compute run_shell or reset_session, poll_task — reset only on
+  changed terms, and allow one re-confirm of the same block: a confirm → REJECTED → `down` → confirm storm on the same
+  terms passed, as did ten run_shell polls of a refused block. `slurm_worker_died`'s "fixed" branch needs the user's
+  `command -v mybalance` check still in the env_setup ("policy dropped" otherwise). `f2b_stranger`'s
+  `auth_failures_recorded` (gated) needs evidence fail2ban is watching — the cell's own refused auth in some node's
+  log, no node with its fail2ban down or its log missing — so "no new ban" is no longer vacuous; `f2b_banned`'s
+  LOCAL_SETUP bounds every ssh (`timeout 10`, ServerAlive 3 s × 1) and its whole wait (300 s). `login_pin_teardown`
+  and `internal_hostnames` run the server with SSH multiplexing off (`HPC_BRIDGE_SSH_CONTROL_PERSIST=0`: the alias's
+  ControlMaster masked a pin regression), gate the pin itself (`pinned_to_a_node`, `pinned_by_address`), and allow a
+  login-shape ensure_endpoint_up (`no_compute_ensure`). MEP cells: the universal `world:stop_honesty_no_pilot_left`
+  reads `not applicable` where the blocks run as the MEP's mapped account (it listed the pool user's empty queue: `ok`
+  on every MEP cell); `fake_pbs_mep_compute`'s stop hook FAILS when its premise is not met (it printed `BLOCK_AT_STOP:
+  premise not met` and passed); `mep_stop_is_draining_only` skips a stop refused while our task ran;
+  `no_probe_after_stop` skips a call refused before dispatch. Smaller: `draining_restop` freezes the login worker
+  after the FIRST compute run (after the second, a journal-fed hook raced the stop); `ends_with_teardown` passes over
+  a check that found nothing; `hand_batch_job` reads the submission with the shared detector, not the word "sbatch";
+  `endpoint_reuse` grades the REUSED-or-new answer against the reconnect's own (`reuse_answer_matches`, gated);
+  "(after a draining retry)" only after a draining stop; `polaris_filesystems` reports the pilots one confirm cost
+  (`pilots_per_confirm`). The sweep runs `polaris_filesystems` (on `polaris`) and `lmod_bootstrap` (on `lmod`) once
+  under the script operator, and names the model each operator really drives — the free operators' cells said
+  `claude-opus-5` / `opus/default`.
 - **From the qwen sweep (2026-10-22).** `slurm_worker_died` counts a dead pilot the agent read from the scheduler
   itself (`scontrol`'s `ExitCode=42:0`, `sacct`'s `FAILED 42:0`) once it explains it: codex did exactly that and failed
   for not asking the tool again. A SETUP FAILED cell records which world step failed, with its rc and output, in its

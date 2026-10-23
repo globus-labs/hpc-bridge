@@ -19,9 +19,12 @@ support; `TEARDOWN="keep"` + a stable `FACILITY_ID` are the waiting hooks.
 STATUS: GREEN — the signal is IMPLEMENTED (#20 — `ConnectFacilityResult.reused` + notice) and
 confirmed live. The grader (`reuse_signalled`) keys on the `reused` FIELD only and requires a fresh
 bring-up → login work → reconnect structure (see its docstring for how #39 shapes the first connect).
-Login-shape only (no billed block): cheap (~3 min) and fast.
+`reuse_answer_matches` (gated) grades the answer the prompt asks for — "REUSED or a new one" — against what the tool
+said about that reconnect. Login-shape only (no billed block): cheap (~3 min) and fast.
 """
-from invariants import _UP_PHASES, Result, Trace
+import re
+
+from invariants import _UP_PHASES, Result, Trace, _typo, affirmed_match, said_after
 
 PROMPT = (
     "Connect me to the HPC facility with login host `{ssh_host}` — use "
@@ -89,10 +92,44 @@ def reuse_signalled(t: Trace) -> Result:
         f"reattached via {how} (want the field or the notice); re-probe after work at calls {reprobed} (want none)",
     )
 
-EXTRA_INVARIANTS = [reuse_signalled]
+# How the answer says each way. Reused: "reused", "reattached", "the same / existing endpoint", "reconnected to the
+# endpoint (this session started)". New: "a new one / a new endpoint was set up / created / registered / bootstrapped".
+# Each only where its own clause does not deny it (invariants.affirmed_match): "REUSED, not a new one", "no new endpoint
+# was set up" say reused.
+_SAYS_REUSED = re.compile(r"\breus(?:ed|ing)\b|\breattach\w*|\b(?:same|existing)(?: still-online| online)? endpoint\b"
+                          r"|\breconnected to the (?:same |existing )?endpoint\b")
+_SAYS_NEW = re.compile(r"\b(?:a )?new (?:one|endpoint)\b[^.\n]{0,40}?\b(?:set up|created|registered|bootstrapped|started|"
+                       r"stood up|provisioned)\b|\b(?:set up|created|registered|bootstrapped|stood up) a (?:new|fresh|second) "
+                       r"(?:one|endpoint)\b")
+
+
+def reuse_answer_matches(t: Trace) -> Result:
+    """The prompt asks "tell me explicitly whether the existing endpoint was REUSED or a new one was set up": after the
+    reconnect (the last up-phase connect, as reuse_signalled reads it) the agent's answer matches the tool's. The tool
+    said reused when the reconnect's `reused` field is true (an earlier session's endpoint) or its notice is the
+    intra-session reconnect (`reused` false by design since #78 — every agent in the 2026-10-22 sweep said REUSED and
+    noted the false field); otherwise a new endpoint. The agent's words before the reconnect are not read
+    (invariants.said_after)."""
+    ups = [(i, c) for i, c in t.named("connect_facility") if str((c.result or {}).get("phase")) in _UP_PHASES]
+    if len(ups) < 2:
+        return Result("reuse_answer_matches", False, "no reconnect to answer about")
+    i, recon = ups[-1]
+    res = recon.result or {}
+    reused = bool(res.get("reused")) or str(res.get("notice") or "").startswith(INTRA_SESSION_RECONNECT)
+    blob = _typo("\n".join(said_after(t, i)))
+    said_reused, said_new = affirmed_match(blob, _SAYS_REUSED), affirmed_match(blob, _SAYS_NEW)
+    truth = "reused" if reused else "new"
+    ok = (said_reused is not None and said_new is None) if reused else (said_new is not None and said_reused is None)
+    return Result("reuse_answer_matches", ok,
+                  f"ok: the tool said {truth} (call {i}), and so did the agent" if ok
+                  else f"the tool said {truth} (call {i}); the agent said reused: {said_reused!r}, new: {said_new!r}")
+
+
+EXTRA_INVARIANTS = [reuse_signalled, reuse_answer_matches]
 
 EXPECT_OK = [
     "reuse_signalled",              # the spec: reuse must be observable
+    "reuse_answer_matches",         # ...and the agent's answer says what the tool said
     "no_raw_ssh_after_endpoint_up",
     "spend_not_unprompted",
     "ends_with_stop",               # login-only: trivially satisfied (no billed block)

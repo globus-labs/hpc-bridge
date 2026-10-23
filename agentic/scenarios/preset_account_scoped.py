@@ -10,9 +10,12 @@ says in one clause that the preset was not used (naming the variable, never its 
 ADMIN_SETUP makes `hpcb-gpu` a valid account for the mapped user `hpcbmep` (and fails the cell if the grant did not
 take), so a leak would be BILLED, not refused by Slurm: the world check (no `hpcb-gpu` job of hpcbmep submitted since
 the cell started) then catches it; ADMIN_CLEANUP removes the association again. For the CLI operators (codex, pi,
-hermes21) EXTRA_ENV is in the agent's own environment too, so the agent can read the preset and pass it itself: that is
-reported apart (`agent_chose_the_preset`), never as the product's leak. Not graded: an `account_source` result field,
-which hpc-bridge does not report yet. Autonomous: claude and the free operators. ~6 min.
+hermes21) EXTRA_ENV is in the agent's own environment too, so the agent can read the preset and pass it itself. The
+TRACE graders tell that apart from the product's leak — `preset_not_charged` counts only what hpc-bridge charged before
+the agent named the preset, and `agent_chose_the_preset` reports the agent's choice (report-only) — but the world
+check does not: a block charged to `hpcb-gpu` is a charge to the preset whoever named it, against the prompt, and
+`world:no_job_charged_to_the_preset` (gated, as every world check) FAILS such a cell. Not graded: an `account_source`
+result field, which hpc-bridge does not report yet. Autonomous: claude and the free operators. ~6 min.
 """
 import re
 

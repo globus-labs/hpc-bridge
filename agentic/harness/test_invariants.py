@@ -277,6 +277,43 @@ def test_reuse_signalled_needs_a_reconnect_after_the_first_work():
     assert not r.ok and "after first work=False" in r.detail
 
 
+
+# The three answers of the 2026-10-22 sweep (pi 1792687300, codex 1792689012, hermes21 1792690994), their key lines
+_REUSE_ANSWERS = [
+    "**3. Reconnection test** - **The existing endpoint was REUSED — no new endpoint was set up.** Its notice states "
+    "explicitly: *\"reconnected to the endpoint this session started (zero-SSH)\"*. One caveat: the machine-readable "
+    "`reused` flag still reads `false` in the result.",
+    "**Reconnection test — REUSED, not new**\n- The second `connect_facility` returned the notice \"reconnected to the "
+    "endpoint this session started (zero-SSH)\" — so the existing endpoint was reused over the web with no SSH and no "
+    "new setup.",
+    "Result: **the existing endpoint was REUSED, not a new one** — its notice states verbatim: *\"reconnected to the "
+    "endpoint this session started (zero-SSH). login node is up.\"* No re-probe, no re-provisioning.",
+]
+
+
+def test_reuse_answer_matches_what_the_tool_said_about_the_reconnect():
+    # the prompt asks "tell me explicitly whether the existing endpoint was REUSED or a new one was set up": graded
+    # against the reconnect's own answer (the field, or the #78 intra-session notice)
+    from endpoint_reuse import INTRA_SESSION_RECONNECT, reuse_answer_matches
+    calls = [_conn(False, "proposed_facility_details"), _conn(False, "provisioning", notice="first contact over SSH: u@h"),
+             _conn(False, "needs_account", notice=INTRA_SESSION_RECONNECT + " (zero-SSH). login node is up"), _login_run(),
+             _conn(False, "needs_account", notice=INTRA_SESSION_RECONNECT + " (zero-SSH). login node is up")]
+    for answer in _REUSE_ANSWERS:
+        r = reuse_answer_matches(Trace(calls, ["Connecting.", answer], [0, 5]))
+        assert r.ok, (r.detail, answer[:60])
+    claude = "The existing endpoint was **reused** — a new one was *not* set up."   # 1788645200, its words
+    assert reuse_answer_matches(Trace(calls, [claude], [5])).ok
+    wrong = "The reconnect set up a new endpoint: a new one was created."
+    assert not reuse_answer_matches(Trace(calls, [wrong], [5])).ok
+    assert not reuse_answer_matches(Trace(calls, ["Done."], [5])).ok               # no answer at all
+    assert not reuse_answer_matches(Trace(calls, [_REUSE_ANSWERS[0], "Done."], [0, 5])).ok   # said before the reconnect
+    # a reconnect that DID bootstrap afresh: the right answer is "new"
+    fresh = calls[:4] + [_conn(False, "needs_account", notice="first contact over SSH: u@h")]
+    assert reuse_answer_matches(Trace(fresh, ["A new endpoint was set up: the old one was gone."], [5])).ok
+    assert not reuse_answer_matches(Trace(fresh, [_REUSE_ANSWERS[1]], [5])).ok
+    assert "reuse_answer_matches" in _scenario("endpoint_reuse").EXPECT_OK
+
+
 def test_first_bring_up_connect_is_tracked_on_the_cached_path_too():
     # 2026-09-03: a cached-config reconnect skips the probe and bootstraps directly — the first connect
     # (no details=) fails on #39 registration lag, the retry reattaches reused=True. The invariant must
@@ -2012,3 +2049,101 @@ def test_first_result_s_stays_inside_the_first_connects_session():
     c2 = ToolCall.of("mcp__endpoint__run_shell", {"shape": "compute"}, {"phase": "complete"})
     c2.t_call, c2.t_result, c2.phase = 330.0, 341.5, 0
     assert first_result_seconds(Trace([c0, c1, c2]))[0] == 41.5
+
+
+# ---- the 2026-10-22 qwen-sweep review: graders read what was said AFTER the result, bounds that count ----------------
+
+def _c(name, inp=None, res=None):
+    return ToolCall.of(f"mcp__endpoint__{name}", inp or {}, res)
+
+
+def test_said_after_reads_past_the_result_when_placed_and_the_final_message_when_not():
+    from invariants import said_after
+    t = Trace([_c("run_shell"), _c("poll_task")], ["plan: if it is orphaned I'll stop", "it was orphaned"], [0, 2])
+    assert said_after(t, 1) == ["it was orphaned"] and said_after(t, None) == []
+    # unplaced (an operator whose record does not order the texts): the final message, never the whole transcript
+    assert said_after(Trace(t.calls, t.texts), 1) == ["it was orphaned"]
+    assert said_after(Trace(t.calls, []), 1) == []
+
+
+def test_affirmed_match_skips_a_denied_claim():
+    from re import compile as rx
+
+    from invariants import _typo, affirmed_match
+    ban = rx(r"firewall|\bban(?:ned)?\b")
+    assert affirmed_match(_typo("It is not a firewall, the host name is wrong."), ban) is None
+    assert affirmed_match(_typo("Not a firewall: this address is banned by fail2ban."), ban) == "banned"
+    assert affirmed_match(_typo("No new endpoint was set up."), rx(r"new endpoint")) is None
+    # a denial inside the claim itself (claude, endpoint_reuse 1788645200: "a new one was *not* set up")
+    assert affirmed_match(_typo("REUSED — a new one was *not* set up."), rx(r"new one[^.]{0,20}set up")) is None
+
+
+def _rej_cycle(partition="gpu", account="hpcb-gpu"):
+    return [_c("ensure_endpoint_up", {"shape": "compute", "partition": partition, "account": account, "confirm_spend": True},
+               {"status": "provisioning", "notice": "allocating nodes"}),
+            _c("ensure_endpoint_up", {"shape": "compute"},
+               {"status": "provisioning", "notice": "NO pilot job is in the scheduler … likely REJECTED"}),
+            _c("ensure_endpoint_up", {"shape": "compute"},
+               {"status": "down", "notice": "the scheduler REJECTED the block submission … it bills nothing"})]
+
+
+def test_no_endless_wait_fails_a_resubmission_storm_on_the_same_terms():
+    # the review's probe of the 2026-10-22 sweep: confirm → likely REJECTED → down REJECTED, six times on the same
+    # partition and account — the consecutive-provisioning count reset on every `down` and passed it
+    from invariants import no_endless_wait
+    conn = _c("connect_facility", {"facility": "f"}, {"phase": "needs_account"})
+    storm = Trace([conn] + _rej_cycle() * 6)
+    r = no_endless_wait(storm)
+    assert not r.ok and "confirmed again" in r.detail, r.detail
+    # one retry on the same terms is allowed; a switch of partition (or a new config) is a fresh attempt
+    assert no_endless_wait(Trace([conn] + _rej_cycle() * 2)).ok
+    assert no_endless_wait(Trace([conn] + _rej_cycle() + _rej_cycle("debug", "hpcb") + _rej_cycle("compute", "hpcb"))).ok
+    recon = _c("connect_facility", {"facility": "f", "details": {"scheduler_options": "#SBATCH --gpus-per-node=1"}},
+               {"phase": "needs_account"})
+    assert no_endless_wait(Trace([conn] + _rej_cycle() * 2 + [recon] + _rej_cycle() * 2)).ok
+    # a stop then the same confirm is the same block asked for again
+    stop = _c("stop_endpoint", {}, {"status": "down", "notice": "nothing to cancel"})
+    rejected_once = _rej_cycle()[:2]
+    assert not no_endless_wait(Trace([conn] + (rejected_once + [stop]) * 3)).ok
+
+
+def test_no_endless_wait_counts_run_shell_polls_of_a_rejected_block():
+    # the review's second probe: ten compute run_shell calls answered cold_start "likely REJECTED" — only consecutive
+    # ensure_endpoint_up answers were counted, so they never were
+    from invariants import no_endless_wait
+    first = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+               {"status": "provisioning", "notice": "likely REJECTED"})
+    runs = [_c("run_shell", {"command": "hostname"}, {"phase": "cold_start", "notice": "NO pilot … likely REJECTED"})] * 10
+    r = no_endless_wait(Trace([first, *runs]))
+    assert not r.ok and "10 more answers" in r.detail, r.detail
+    # a login-shape command is about no block: never counted
+    logins = [_c("run_shell", {"shape": "login", "command": "grep REJECTED log"},
+                 {"phase": "complete", "notice": "REJECTED"})] * 10
+    assert no_endless_wait(Trace([first, *logins])).ok
+
+
+def test_ends_with_teardown_passes_over_a_check_that_found_nothing():
+    # the review of the 2026-10-22 sweep: an agent verifying its own teardown (a stop answering "no endpoint was up",
+    # a list_facilities) failed ends_with_teardown
+    from invariants import ends_with_teardown
+    t = _byo_trace()
+    verify = _c("stop_endpoint", {}, {"status": "down", "endpoint_id": None, "notice": "no endpoint was up"})
+    lst = _c("list_facilities", {}, {"value": []})
+    assert ends_with_teardown(Trace(t.calls + [verify])).ok and ends_with_teardown(Trace(t.calls + [lst])).ok
+    work = _c("run_shell", {"command": "ls", "shape": "login"}, {"phase": "complete", "exit_code": 0})
+    assert not ends_with_teardown(Trace(t.calls + [verify, work])).ok
+
+
+def test_stop_confirmed_says_draining_retry_only_after_a_draining_stop():
+    from invariants import stop_confirmed_or_retried as inv
+    refused = _stop_trace("up", "down")
+    r = inv(refused)
+    assert r.ok and "draining retry" not in r.detail, r.detail
+    assert "after a draining retry" in inv(_stop_trace("draining", "down")).detail
+
+
+def test_no_compute_ensure_lets_the_free_login_shape_wait():
+    from invariants import no_compute_ensure
+    login = _c("ensure_endpoint_up", {"shape": "login"}, {"status": "up"})
+    assert no_compute_ensure(Trace([login])).ok
+    assert not no_compute_ensure(Trace([login, _c("ensure_endpoint_up", {}, {"status": "provisioning"})])).ok

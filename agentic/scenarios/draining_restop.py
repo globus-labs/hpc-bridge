@@ -3,8 +3,11 @@
 stop_endpoint releases the block by dispatching the scheduler cancel through the LOGIN shape (AMQP). When that
 channel is cold it cannot confirm, and the product answers status=draining (never a false `down`); the skill then
 says: call stop_endpoint again until `down`. Live that happens in ~5% of stops by luck — `stop_confirmed_or_retried`
-has only ever passed on its vacuous branch. The hook kills the login-shape worker pool on the login node right after
-the agent's second compute run_shell, so the stop that follows meets a cold channel.
+has only ever passed on its vacuous branch. The hook FREEZES (SIGSTOP — a killed worker is relaunched before the stop)
+the login-shape worker pool on the login node right after the agent's FIRST compute run_shell completes, so the stop
+that follows the second meets a cold channel; the second thaws it (SIGCONT) after that first stop, so the re-stop
+answers `down`. The second compute run never touches the login channel (a warm block's run_shell sends nothing over
+it: only provisioning's pilot probe, a connect and a stop do), and it gives the freeze a whole call to land.
 """
 from invariants import Result, Trace, compute_ran
 
@@ -37,12 +40,16 @@ MIDRUN_HOOKS = [
     # `expect_any_host` makes each hook FAIL (harness:midrun_hooks) unless some node actually froze / thawed a worker.
     # Each counts only the calls it is about (midrun_hooks.py). The freeze: compute runs that RAN (`when_phase`) — not
     # one refused `needs_confirmation` (the block was gone: hermes21 froze there, live 2026-10-15), nor a `failed` one
-    # sent before any facility. The thaw: the first stop AFTER the freeze (`after_hook`), whatever it answered. hermes21
+    # sent before any facility — the FIRST of them (`nth: 1`; it was the second): a CLI operator's hook fires from the
+    # server's journal while the agent goes on, so after the second run it raced the agent's very next call, the stop,
+    # and a stop that landed first met a warm channel (the review of the 2026-10-22 sweep). The cost: the worker stays
+    # frozen across the second run too — under parsl's default heartbeat threshold (120 s; the templates set none) for
+    # an agent that keeps the two runs and the stop together, as the prompt asks. The thaw: the first stop AFTER the freeze (`after_hook`), whatever it answered. hermes21
     # called stop_endpoint before its compute runs were done (2026-10-15, both cells): "stop_endpoint #1" thawed
     # nothing there and the freeze came later and stayed; in one cell the real stops then met a frozen worker —
     # `draining` three times — and the cell gave up.
     {"name": "freeze_login_worker", "after_tool": "run_shell", "when_input": {"shape": "compute"}, "when_phase": "complete",
-     "nth": 2, "on": "each_login",
+     "nth": 1, "on": "each_login",
      "cmd": "pkill -STOP -u $(whoami) -f 'process_worker_[p]ool'; echo \"frozen pkill-rc=$?\"", "expect_any_host": "pkill-rc=0"},
     {"name": "thaw_login_worker", "after_tool": "stop_endpoint", "after_hook": "freeze_login_worker", "nth": 1,
      "on": "each_login",
