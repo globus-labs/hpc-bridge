@@ -191,6 +191,10 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **From re-run #1 (2026-10-23).** `no_ssh_workaround` flags ssh/scp/sftp run as a command, never a path that only
+  contains one: pi and codex failed `f2b_stranger` for `ls ~/.ssh` / `cat ~/.ssh/config` while diagnosing the refusal.
+  A jail image that does not build is retried twice (a Docker Hub 502 broke `hostile` for hermes21), and if it still
+  fails, every planned cell is listed as INFRA with the build's last error, so the sweep's totals count them.
 - **The reviews of the qwen sweep (2026-10-22): a right answer passes, a restated plan does not, a bound counts.** A
   correct self-diagnosis counts as the evidence: `gpu_rule` takes the facility's own sbatch error read on the login
   shape, `venv_arch_mismatch` the job's stderr line read there, `polaris_filesystems` the agent's own `qstat -f` /

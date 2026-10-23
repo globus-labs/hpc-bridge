@@ -329,3 +329,47 @@ def test_a_free_operators_cell_labels_name_its_real_model(monkeypatch, tmp_path)
     assert mod._short_model("claude-opus-5") == "qwen-from-env"
     monkeypatch.setenv("HPCB_OPERATOR", "claude")
     assert mod._short_model("claude-opus-5") == "opus" and mod._cell("claude-opus-5", "high") == "claude-opus-5 @ high"
+
+
+def test_a_build_that_fails_is_retried_and_names_its_last_error(monkeypatch):
+    # hostile[hermes21], sweep 2026-10-23: Docker Hub's token endpoint answered 502, the suite stopped, and its two
+    # cells were left out of the sweep's totals altogether
+    import asyncio
+    import importlib.util
+    spec = importlib.util.spec_from_file_location("run_suite_build", HERE.parent / "run_suite.py")
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    err = b"#5 ERROR: failed to fetch oauth token\nERROR: failed to build: unexpected status: 502 Bad Gateway\n"
+    rcs = []
+
+    class Proc:
+        def __init__(self, rc):
+            self.returncode = rc
+
+        async def communicate(self):
+            return b"", (b"" if self.returncode == 0 else err)
+
+    async def fake_exec(*a, **k):
+        return Proc(rcs.pop(0))
+
+    async def no_sleep(_s):
+        return None
+    monkeypatch.setattr(mod.asyncio, "create_subprocess_exec", fake_exec)
+    monkeypatch.setattr(mod.asyncio, "sleep", no_sleep)
+    rcs[:] = [1, 0]                                    # a hiccup, then it builds
+    assert asyncio.run(mod._build_once(waits=(1, 1))) is None and rcs == []
+    rcs[:] = [1, 1, 1]                                 # down throughout: the last error line, for the INFRA rows
+    why = asyncio.run(mod._build_once(waits=(1, 1)))
+    assert why == "ERROR: failed to build: unexpected status: 502 Bad Gateway" and rcs == []
+
+
+def test_a_suite_whose_image_did_not_build_lists_every_cell_as_infra():
+    # the INFRA row's shape is the one sweep_profiles.sh tallies and sweep_dash.py reads ("⚠ done <scen> · … — RESULT:")
+    src = (HERE.parent / "run_suite.py").read_text()
+    assert "RESULT: INFRA: the jail image did not build (" in src and "for s, m, e, pe, ab in jobs:" in src
+    sys.path.insert(0, str(HERE.parent))
+    import sweep_dash
+    line = ("⚠ done   canary_login_discovery · qwen3.8-flash-next/default · - — RESULT: INFRA: the jail image did not "
+            "build (ERROR: 502) — the cell was not run")
+    m = sweep_dash.DONE.match(line)
+    assert m and m.group(2) == "canary_login_discovery" and sweep_dash._kind(m.group(3)) == "INFRA"

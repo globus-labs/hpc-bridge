@@ -85,19 +85,33 @@ def _git_describe() -> str:
         return "unknown"
 
 
-async def _build_once() -> bool:
+# A registry hiccup is the usual build failure (Docker Hub's token endpoint answered 502 for hostile[hermes21], sweep
+# 2026-10-23): retry after these waits before giving up on the suite.
+BUILD_RETRY_WAITS_S = (30, 90)
+
+
+async def _build_once(waits=BUILD_RETRY_WAITS_S) -> str | None:
+    """Build the jail image; None when it built, else the failure's last line (for the cells' INFRA rows)."""
     print("building the jail image once (parallel jobs reuse it)…", flush=True)
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "build", "--provenance=false", "-t", "hpc-bridge-agentic",
-        "--build-arg", f"GIT_DESCRIBE={_git_describe()}",
-        "-f", str(REPO / "agentic" / "Dockerfile"), str(REPO),
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0:
-        print(f"build FAILED:\n{err.decode(errors='replace')[-1500:]}", file=sys.stderr)
-        return False
-    return True
+    why = ""
+    for attempt, wait in enumerate((0, *waits)):
+        if wait:
+            print(f"build failed ({why}); retrying in {wait}s (attempt {attempt + 1})", flush=True)
+            await asyncio.sleep(wait)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "build", "--provenance=false", "-t", "hpc-bridge-agentic",
+            "--build-arg", f"GIT_DESCRIBE={_git_describe()}",
+            "-f", str(REPO / "agentic" / "Dockerfile"), str(REPO),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode == 0:
+            return None
+        text = err.decode(errors="replace")
+        print(f"build FAILED:\n{text[-1500:]}", file=sys.stderr)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith(("ERROR", "error"))]
+        why = (lines[-1] if lines else (text.strip().splitlines() or ["no output"])[-1])[:200]
+    return why or "docker build failed"
 
 
 def _knobs(scenario: str) -> dict[str, str]:
@@ -563,7 +577,13 @@ async def _main(args) -> int:
     if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
         print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
         return 2
-    if not args.no_build and not await _build_once():
+    if not args.no_build and (why := await _build_once()) is not None:
+        # every planned cell gets its row, INFRA: a suite that stopped before its cells used to leave them out of the
+        # sweep's totals altogether (hostile[hermes21], sweep 2026-10-23: 38 rows where its peers had 40)
+        for s, m, e, pe, ab in jobs:
+            label = f"{s} · {_short_model(m)}/{e or 'default'}{f'/{pe}' if pe else ''}{' ~' + ab if ab else ''} · -"
+            print(f"⚠ done   {label} — RESULT: INFRA: the jail image did not build ({why}) — the cell was not run",
+                  flush=True)
         return 2
 
     claims = PoolClaims()
