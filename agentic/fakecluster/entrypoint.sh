@@ -103,8 +103,12 @@ role_login() {
   for u in "${POOL_USERS[@]}"; do
     h="/home/$u"
     if [ ! -d "$h" ]; then
-      mkdir -p "$h" && cp -rT /etc/skel "$h" && chown -R "$u:hpcb" "$h" && chmod 700 "$h"
+      mkdir -p "$h" && cp -rTn /etc/skel "$h" && chown -R "$u:hpcb" "$h"
     fi
+    # Unconditional, every boot: the login nodes boot onto the shared /home at once, and a node that lost the race to
+    # create a home skipped one the other had made only halfway — root-owned, 755, its .ssh the user's: the key login
+    # worked but every write to ~ was refused (f2b, re-run 2026-10-23: all six cells SETUP FAILED "Permission denied").
+    chown "$u:hpcb" "$h" && chmod 700 "$h"
     if [ -s /run/hpcb/authorized_keys ]; then
       mkdir -p "$h/.ssh" && install -m 600 /run/hpcb/authorized_keys "$h/.ssh/authorized_keys"
       chown -R "$u:hpcb" "$h/.ssh" && chmod 700 "$h/.ssh"

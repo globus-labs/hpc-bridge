@@ -191,6 +191,10 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **From re-run #2 (2026-10-23).** The fake cluster's login nodes no longer race each other into a half-made home:
+  ownership and mode are set on every boot, and the cluster is ready only once the pool user can write its home
+  (all six f2b cells were SETUP FAILED "Permission denied"). `canary_login_discovery` asks the agent to keep calling
+  `connect_facility` until it lists the allocations, so the parser it tests is always asked.
 - **From re-run #1 (2026-10-23).** `no_ssh_workaround` flags ssh/scp/sftp run as a command, never a path that only
   contains one: pi and codex failed `f2b_stranger` for `ls ~/.ssh` / `cat ~/.ssh/config` while diagnosing the refusal.
   A jail image that does not build is retried twice (a Docker Hub 502 broke `hostile` for hermes21), and if it still

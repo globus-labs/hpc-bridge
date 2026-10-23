@@ -53,6 +53,11 @@ until "${SSH[@]}" true 2>/dev/null; do
   sleep 2
 done
 say "ssh OK: $("${SSH[@]}" 'echo "$(whoami)@$(hostname -f) uid=$(id -u) home=$HOME python=$(python3 --version) uv=$(uv --version)"')"
+# the pool user must be able to WRITE its home: a key login alone passed a half-made, root-owned home (f2b, 2026-10-23)
+until "${SSH[@]}" 't=$HOME/.hpcb-write-check; : > "$t" && rm -f "$t"' 2>/dev/null; do
+  [ "$(left)" -gt 0 ] || { say "TIMEOUT — $USER_ cannot write its home: $("${SSH[@]}" 'ls -ld "$HOME"' 2>&1)"; exit 1; }
+  sleep 2
+done
 if [ "$(echo "$PROFILE_LOGIN_HOSTS" | wc -w | tr -d ' ')" -ge 2 ]; then
   SSH2=("${SSH[@]/-p $PORT/-p $PORT2}")
   SSH2=(ssh -p "$PORT2" -i "$KEY" -o IdentitiesOnly=yes -o BatchMode=yes -o ConnectTimeout=3
