@@ -34,6 +34,9 @@ def test_internal_hostnames_graders():
     by_name = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"}, {"phase": "provisioning", "notice": "first contact over SSH: hpcbridge-test-00@login02.hpcb.test; env_setup run there"})
     assert sc.pinned_by_address(Trace([by_addr])).ok and "172.20.0.6" in sc.pinned_by_address(Trace([by_addr])).detail
     assert not sc.pinned_by_address(Trace([by_name])).ok
+    # no login name configured: the note names the bare host (notices._first_contact_note), and it still pins
+    bare = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"}, {"phase": "provisioning", "notice": "first contact over SSH: 172.20.0.6 (host pinned by HPC_BRIDGE_SSH_HOST); env_setup run there"})
+    assert sc.pinned_by_address(Trace([bare])).ok
 
 
 def _first_contact(host):

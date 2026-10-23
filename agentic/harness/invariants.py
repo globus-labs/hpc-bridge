@@ -899,7 +899,9 @@ def _texts_placed(t: Trace) -> bool:
 def said_after(t: Trace, i: int | None) -> list[str]:
     """What the agent told the user AFTER call `i` — for a grader asking whether the agent relayed what that call's
     result said. Where the operator's record places the texts (`_texts_placed`), the texts after call `i`; where it does
-    not, the final message alone. Never the whole transcript: read that way, the agent restating the prompt or its plan
+    not (the hermes ACP and the Claude Code transcript readers), every text, as Trace.texts_after reads them: the final
+    message alone failed a run that relayed "poll_task says ORPHANED" before its last words "Stopped; block released."
+    Where texts are placed, never the whole transcript: read that way, the agent restating the prompt or its plan
     ("if poll_task reports it orphaned or the endpoint offline/gone, I'll stop" — the qwen sweep, 2026-10-22) passed
     `orphan_relayed` before anything was orphaned, and an env_setup echoed verbatim ("prepending `command -v mybalance
     … || exit 42`") passed `cause_relayed` for a cause never explained. `i` None (the result never came): nothing."""
@@ -907,7 +909,7 @@ def said_after(t: Trace, i: int | None) -> list[str]:
         return []
     if _texts_placed(t):
         return [x for x, at in zip(t.texts, t.text_at, strict=True) if at > i]
-    return t.texts[-1:]
+    return list(t.texts)
 
 
 def _said_between(t: Trace, after: int, upto: int) -> tuple[str, tuple[str, ...]]:
@@ -1783,7 +1785,7 @@ def no_compute_ensure(t: Trace) -> Result:
                   else f"compute-shape ensure_endpoint_up at calls {bad}")
 
 
-_FIRST_CONTACT_HOST = re.compile(r"first contact over SSH: [^@\s]+@([^\s;()]+)")
+_FIRST_CONTACT_HOST = re.compile(r"first contact over SSH: (?:[^@\s]+@)?([^\s;()]+)")   # no user@ when none is set
 
 
 def first_contact_host(t: Trace) -> tuple[int, str] | None:

@@ -48,8 +48,9 @@ def test_orphan_relayed_reads_only_what_was_said_after_the_orphaned_answer():
              _stop("down")]
     assert not sc.orphan_relayed(Trace(calls, [plan, "Stopped the endpoint."], [0, 3])).ok
     assert sc.orphan_relayed(Trace(calls, [plan, "poll_task says the task is ORPHANED: its endpoint went offline."], [0, 2])).ok
-    # unplaced texts (an operator whose record does not order them): the final message alone
-    assert not sc.orphan_relayed(Trace(calls, [plan, "Stopped the endpoint."])).ok
+    # unplaced texts (the hermes ACP / Claude Code transcript readers): every text, so a relay before the last words
+    # counts there — and a restated plan does too, the price of not knowing the order
+    assert sc.orphan_relayed(Trace(calls, ["poll_task says ORPHANED — endpoint gone; stopping.", "Stopped; block released."])).ok
     assert not sc.orphan_relayed(Trace([_poll("running")], [plan])).ok    # no ORPHANED answer: nothing to relay
 
 

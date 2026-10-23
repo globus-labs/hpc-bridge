@@ -831,6 +831,9 @@ async def test_a_bring_up_that_reused_an_endpoint_never_marks_the_config_started
     ("discovery probe failed (rc=255): ssh: connect to host login port 22: Connection refused", True),
     ("ssh: Could not resolve hostname login.example.edu: Name or service not known", False),
     ("ssh: connect to host login port 22: Connection timed out", False),
+    # a stale control socket's warning ahead of a timed-out verdict is no refused connection (the review's probe)
+    ("Control socket connect(/tmp/cm-x): Connection refused\nssh: connect to host login port 22: Connection timed out",
+     False),
 ])
 def test_a_refused_connection_names_a_firewall_or_ban_and_asks_to_wait_not_retry(raw, banned):
     # f2b_banned, sweep 2026-10-22: fail2ban's REJECT answers "Connection refused", and every agent (pi, codex,

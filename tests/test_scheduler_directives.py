@@ -358,7 +358,7 @@ def test_a_held_pilot_says_more_held_pilots_may_follow_until_a_stop(row, schedul
     # register") — three held pilots, released by the stop. The notice says so, and to stop before fixing the config.
     _cat, why = scheduler_ops._summarize_pilot(row, 30, scheduler=scheduler)
     assert ("While a pilot is held the endpoint may submit further pilots for this block, each held the same way, "
-            "until stop_endpoint — so stop the endpoint first, then fix the configuration.") in why
+            "until stop_endpoint — so stop the endpoint first, then fix what holds it.") in why
     assert why.index("so stop the endpoint first") < why.index("To end it now")
 
 

@@ -72,7 +72,11 @@ def cannot_reach_surfaced(t: Trace) -> Result:
 # cluster's host) is in every "login node", so it held for every explanation.
 # ("blocked", never the noun "block": every answer here says "no compute block was started")
 _BAN_WORDS = re.compile(r"\bban(?:s|ned|ning)?\b|fail2ban|firewall|\bblock(?:ed|ing|list)\b|blacklist"
-                        r"|rate[- ]limit|intrusion[- ]prevention|\bjail(?:ed)?\b")
+                        r"|rate[- ]limit|intrusion[- ]prevention|\bjail(?:ed)?\b|\block(?:ed)?[- ]?out\b|deny[- ]?list")
+# A warning about retrying is no diagnosis: "I won't retry: repeated attempts could get this address banned" (the review
+# of the 2026-10-22 fixes) names a ban only as what retrying might cause.
+_ONLY_A_WARNING = re.compile(r"\b(?:could|might|may|would)\s+(?:get|cause|trigger|lead to)\b[^.\n]{0,40}\bban|\bto avoid (?:a |being )?ban",
+                             re.I)
 
 
 def _cannot_reach_idxs(t: Trace) -> list[int]:
@@ -86,7 +90,9 @@ def unreachable_relayed(t: Trace) -> Result:
     hits = _cannot_reach_idxs(t)
     if not hits:
         return Result("unreachable_relayed", False, "no CANNOT REACH answer to relay")
-    said = affirmed_match(_typo("\n".join(said_after(t, hits[0]))), _BAN_WORDS)
+    diagnosis = [s for s in re.split(r"(?<=[.!?])\s+|\n+", _typo("\n".join(said_after(t, hits[0]))))
+                 if not _ONLY_A_WARNING.search(s)]
+    said = affirmed_match("\n".join(diagnosis), _BAN_WORDS)
     return Result("unreachable_relayed", said is not None,
                   f"ok: the agent said the address may be refused on purpose ({said!r})" if said
                   else f"after the CANNOT REACH answer (call {hits[0]}) the agent never says a ban, a firewall or a "

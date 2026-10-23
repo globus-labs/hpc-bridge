@@ -136,7 +136,9 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         # intrusion-prevention ban answers: fail2ban's REJECT after repeated failed logins from this address. Agents
         # read the bare "Connection refused" as a wrong host name (the f2b_banned cell, 2026-10-22 sweep) — and a
         # banned address that keeps retrying only extends its ban.
-        banned = ("" if "connection refused" not in low else
+        # ssh's own verdict, never any line of the stderr: "Control socket connect(…): Connection refused" (a stale
+        # multiplexing socket) ahead of a timed-out "connect to host" is no refused connection
+        banned = ("" if not re.search(r"connect to host [^\n]*connection refused", low) else
                   " If the name is right, a refused connection can also be a firewall or an intrusion-prevention ban "
                   "(e.g. fail2ban, after repeated failed logins from this address): then wait — a ban lifts after its "
                   "ban time — or check with the site, rather than retrying now; each refused attempt can extend a ban.")

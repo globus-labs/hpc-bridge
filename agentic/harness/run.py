@@ -356,7 +356,7 @@ _SETUP_FAILURE: str | None = None
 def _note_setup_failure(step: str, cmd: str, rc: object, out: str) -> None:
     global _SETUP_FAILURE
     cut = cmd if len(cmd) <= 160 else cmd[:157] + "…"
-    _SETUP_FAILURE = f"{step} failed (rc={rc}): {cut!r} — output: {out.strip()[-600:] or '(none)'}"
+    _SETUP_FAILURE = f"{step} failed (rc={rc}): {out.strip()[-600:] or '(no output)'} — command: {cut!r}"
 
 
 def _local_setup(scen, runner=None) -> bool:

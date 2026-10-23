@@ -79,7 +79,8 @@ def test_a_failed_setup_step_says_which_and_why_in_the_bundle(harness_run, tmp_p
 
     assert harness_run._local_setup(Scen(), runner=lambda c: R(1, "ban did not land on both nodes in time")) is False
     why = harness_run._SETUP_FAILURE
-    assert why.startswith("local setup failed (rc=1): 'burn budget; wait for the ban'") and "did not land" in why
+    assert why.startswith("local setup failed (rc=1): ban did not land on both nodes in time — command:"), why
+    assert why.endswith("'burn budget; wait for the ban'")      # the output first: the RESULT line's cut keeps it
     assert harness_run._local_setup(Scen(), runner=lambda c: (_ for _ in ()).throw(TimeoutError("hung"))) is False
     assert "(rc=TimeoutError)" in harness_run._SETUP_FAILURE and "hung" in harness_run._SETUP_FAILURE
     rec = provenance.write_run_record(tmp_path, config={"scenario": "f2b_banned", "runid": "r1"}, messages=[],
@@ -104,6 +105,11 @@ def test_f2b_banned_relay_names_the_ban_not_just_the_refusal():
     told = "The connection was refused: this address is probably banned by fail2ban after failed logins. Wait or ask the site."
     assert fb.unreachable_relayed(Trace([refused], ["Connecting.", told], [0, 1])).ok
     assert not fb.unreachable_relayed(Trace([refused], ["It is not a firewall or a ban; the name is wrong."], [1])).ok
+    # the review of the fixes: a lockout says it; a ban named only as what retrying might cause does not
+    lockout = "The host is actively denying connections from this address (likely an automatic lockout after failed logins)."
+    assert fb.unreachable_relayed(Trace([refused], [lockout], [1])).ok
+    warning = "`login` is very likely a wrong host name. I won't retry: repeated attempts could get this address banned."
+    assert not fb.unreachable_relayed(Trace([refused], [warning], [1])).ok
     # said before the answer (a restated prompt) is not a relay of it
     assert not fb.unreachable_relayed(Trace([refused], ["If I am blocked or banned I'll stop.", "Done."], [0, 1])).ok
     assert not fb.unreachable_relayed(Trace([], [told])).ok                     # no CANNOT REACH answer at all

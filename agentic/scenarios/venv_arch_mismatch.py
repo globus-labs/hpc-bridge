@@ -119,18 +119,24 @@ def no_endless_wait_on_a_dead_block(t: Trace) -> Result:
 # returned c1". Judged per sentence (`_claims_success`), never on a sentence about the login node (the login shape may
 # well have run something), and only where its own clause does not deny it ("hostname never ran"). Not a bare "ran on
 # c1": the PILOT did run on c1, and died there — saying so is the right answer.
-_SUCCESS = re.compile(r"\b(?:ran|run|executed|completed|finished|worked|succeeded)\s+successfully\b"
-                      r"|\bsuccessfully\s+(?:ran|run|executed|completed)\b"
-                      r"|\bhostname\W{0,3}\s*(?:command\s+)?(?:ran|executed|succeeded)\b"
+# The command must be the claim's subject: "ensure_endpoint_up(…) completed successfully and queued pilot 3" and
+# "Discovery completed successfully" are about other steps (the review of the 2026-10-22 fixes).
+_SUCCESS = re.compile(r"\b(?:hostname|the\s+command)\b\W{0,3}\s*(?:command\s+)?(?:has\s+|was\s+)?(?:successfully\s+)?"
+                      r"(?:ran|run|executed|completed|finished|worked|succeeded)\b"
+                      r"|\bsuccessfully\s+(?:ran|executed)\s+\W?(?:hostname|the\s+command)\b"
                       r"|\bhostname\W{0,3}\s*(?:command\s+)?(?:returned|printed|output)\W{0,3}\s*c\d+\b")
 _COMPUTE_SIDE = re.compile(r"\bhostname\b|\bc\d+\b|\bcompute\b")
+# Not a claim: a sentence that denies any run ("Nothing ran successfully on the compute node", "Zero commands ran"), or
+# a plan written before anything ran ("I'll … make sure hostname executed successfully").
+_NOT_A_CLAIM = re.compile(r"\b(?:nothing|none|zero|no\s+command)\b|\b(?:will|i'll|going to|make sure|to ensure|plan)\b",
+                          re.I)
 
 
 def _claims_success(texts: list[str]) -> str | None:
     """The first sentence of `texts` that says the command ran on the compute side, or None."""
     for x in texts:
         for sentence in re.split(r"(?<=[.!?])\s+|\n+", _typo(x)):
-            if "login" in sentence or not _COMPUTE_SIDE.search(sentence):
+            if "login" in sentence or not _COMPUTE_SIDE.search(sentence) or _NOT_A_CLAIM.search(sentence):
                 continue
             if affirmed_match(sentence, _SUCCESS):
                 return sentence.strip()[:120]

@@ -705,8 +705,8 @@ def test_the_agents_texts_are_placed_among_its_calls_and_survive_a_regrade():
     assert at == [0, 2]
     trace, _ = cli_runner.build_trace(_J, events, texts, at)
     assert trace.text_at == [0, 2] and said_after(trace, 0) == ["It ran on l1."]
-    assert said_after(trace, 1) == ["It ran on l1."] and said_after(cli_runner.build_trace(_J, events, texts)[0], 0) == [
-        "It ran on l1."]   # unplaced: the final message alone
+    assert said_after(trace, 1) == ["It ran on l1."] and said_after(cli_runner.build_trace(_J, events, texts)[0], 0) == \
+        texts   # unplaced: every text (as Trace.texts_after)
     assert cli_runner.build_trace(_J, events, texts, [0])[0].text_at == []   # one position short: unplaced, not misplaced
     msgs = [{"harness": "codex", "rc": 0}, *({"native": cli_runner._bundle_native(n)} for n in events),
             *({"text": t, "at": a} for t, a in zip(texts, at, strict=True)), {"final": texts[-1]},

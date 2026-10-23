@@ -96,11 +96,15 @@ def reuse_signalled(t: Trace) -> Result:
 # endpoint (this session started)". New: "a new one / a new endpoint was set up / created / registered / bootstrapped".
 # Each only where its own clause does not deny it (invariants.affirmed_match): "REUSED, not a new one", "no new endpoint
 # was set up" say reused.
-_SAYS_REUSED = re.compile(r"\breus(?:ed|ing)\b|\breattach\w*|\b(?:same|existing)(?: still-online| online)? endpoint\b"
-                          r"|\breconnected to the (?:same |existing )?endpoint\b")
+_SAYS_REUSED = re.compile(r"\bre-?us(?:ed|ing)\b|\bre-?attach\w*|\b(?:same|existing)(?: still-online| online)? endpoint\b"
+                          r"|\breconnected to (?:it|the (?:same |existing )?endpoint)\b")
 _SAYS_NEW = re.compile(r"\b(?:a )?new (?:one|endpoint)\b[^.\n]{0,40}?\b(?:set up|created|registered|bootstrapped|started|"
                        r"stood up|provisioned)\b|\b(?:set up|created|registered|bootstrapped|stood up) a (?:new|fresh|second) "
                        r"(?:one|endpoint)\b")
+
+
+# A counterfactual is no answer: "REUSED. Had the first endpoint been offline, a new endpoint would have been registered."
+_COUNTERFACTUAL = re.compile(r"\b(?:would|could|might) have\b|\bhad (?:it|the)\b", re.I)
 
 
 def reuse_answer_matches(t: Trace) -> Result:
@@ -117,7 +121,8 @@ def reuse_answer_matches(t: Trace) -> Result:
     res = recon.result or {}
     reused = bool(res.get("reused")) or str(res.get("notice") or "").startswith(INTRA_SESSION_RECONNECT)
     blob = _typo("\n".join(said_after(t, i)))
-    said_reused, said_new = affirmed_match(blob, _SAYS_REUSED), affirmed_match(blob, _SAYS_NEW)
+    factual = "\n".join(s for s in re.split(r"(?<=[.!?])\s+|\n+", blob) if not _COUNTERFACTUAL.search(s))
+    said_reused, said_new = affirmed_match(blob, _SAYS_REUSED), affirmed_match(factual, _SAYS_NEW)
     truth = "reused" if reused else "new"
     ok = (said_reused is not None and said_new is None) if reused else (said_new is not None and said_reused is None)
     return Result("reuse_answer_matches", ok,

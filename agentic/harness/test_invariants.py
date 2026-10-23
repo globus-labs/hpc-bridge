@@ -311,6 +311,12 @@ def test_reuse_answer_matches_what_the_tool_said_about_the_reconnect():
     fresh = calls[:4] + [_conn(False, "needs_account", notice="first contact over SSH: u@h")]
     assert reuse_answer_matches(Trace(fresh, ["A new endpoint was set up: the old one was gone."], [5])).ok
     assert not reuse_answer_matches(Trace(fresh, [_REUSE_ANSWERS[1]], [5])).ok
+    # the review's probes: hyphenated and "reconnected to it" say reused; a counterfactual "new" is no answer
+    for answer in ("It was re-used — the endpoint was online.", "It re-attached to the endpoint.",
+                   "The tool reconnected to it without SSH.",
+                   "REUSED. Had the first endpoint been offline, a new endpoint would have been registered."):
+        r = reuse_answer_matches(Trace(calls, [answer], [5]))
+        assert r.ok, (r.detail, answer)
     assert "reuse_answer_matches" in _scenario("endpoint_reuse").EXPECT_OK
 
 
@@ -2057,12 +2063,15 @@ def _c(name, inp=None, res=None):
     return ToolCall.of(f"mcp__endpoint__{name}", inp or {}, res)
 
 
-def test_said_after_reads_past_the_result_when_placed_and_the_final_message_when_not():
+def test_said_after_reads_past_the_result_when_placed_and_every_text_when_not():
     from invariants import said_after
     t = Trace([_c("run_shell"), _c("poll_task")], ["plan: if it is orphaned I'll stop", "it was orphaned"], [0, 2])
     assert said_after(t, 1) == ["it was orphaned"] and said_after(t, None) == []
-    # unplaced (an operator whose record does not order the texts): the final message, never the whole transcript
-    assert said_after(Trace(t.calls, t.texts), 1) == ["it was orphaned"]
+    # unplaced (the hermes ACP and Claude Code transcript readers): every text, as Trace.texts_after reads them — the
+    # final message alone failed "poll_task says ORPHANED — stopping." followed by "Stopped; block released."
+    assert said_after(Trace(t.calls, t.texts), 1) == t.texts
+    relayed = Trace(t.calls, ["poll_task says ORPHANED — endpoint gone; stopping.", "Stopped; block released."])
+    assert said_after(relayed, 1) == relayed.texts
     assert said_after(Trace(t.calls, []), 1) == []
 
 

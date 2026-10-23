@@ -593,7 +593,7 @@ def _jobs_words(jobs: list[str]) -> str:
 _HELD_FATE = ("a held pilot runs no task and never idle-releases, so it stays in the queue until it is cancelled — "
               "connect_facility does not cancel it; stop_endpoint does (every pilot of this endpoint). While a pilot "
               "is held the endpoint may submit further pilots for this block, each held the same way, until "
-              "stop_endpoint — so stop the endpoint first, then fix the configuration.")
+              "stop_endpoint — so stop the endpoint first, then fix what holds it.")
 # The one way to end such a pilot before another block is asked for — without it, a per-user limit on queued jobs can
 # make the new block's submission read as refused, and the old pilot stays queued.
 _END_NOW = "To end it now, call stop_endpoint before confirming the new block."
