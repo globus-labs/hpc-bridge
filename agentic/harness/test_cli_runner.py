@@ -770,3 +770,23 @@ def test_a_live_turn_keeps_the_texts_places_in_its_trace_and_its_bundle(tmp_path
     monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: (native, [], [], "done"))
     r = asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="codex"))
     assert r.trace.texts == ["done"] and r.trace.text_at == [1]
+
+
+def test_the_harness_knobs_never_reach_the_agents_shell(tmp_path, monkeypatch):
+    # f2b_stranger, re-run 2026-10-23: pi's `env | grep -i -E 'HPC_BRIDGE|SSH'` printed HPCB_TARGET_CAPS (the fake
+    # cluster's description, fail2ban and its harness port included) and the agent told the user to use that port
+    import asyncio
+    _cli_jail(tmp_path, monkeypatch)
+    monkeypatch.setenv("HPCB_TARGET_CAPS", '{"fail2ban": "sshd", "harness_ssh_port": 2200}')
+    monkeypatch.setenv("HPCB_HARNESS_SSH_PORT", "2200")
+    seen: dict[str, str] = {}
+
+    async def fake_turn(argv, *, cwd, env, timeout_s):
+        seen.update(env)
+        return 0, "", ""
+    monkeypatch.setattr(cli_runner, "run_turn_process", fake_turn)
+    monkeypatch.setattr(cli_runner, "_native", lambda *a, **k: ([], [], [], "done"))
+    asyncio.run(cli_runner.run_scenario("p", repo_root=HERE.parents[1], harness="pi"))
+    assert seen and not [k for k in seen if k.startswith("HPCB_")], sorted(k for k in seen if k.startswith("HPCB_"))
+    assert seen["HPC_BRIDGE_JOURNAL"]                                       # what the server needs stays
+    assert "HPCB_HARNESS_SSH_PORT" not in cli_runner._PASSTHROUGH          # nor is it written into the server's config

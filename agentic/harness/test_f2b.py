@@ -123,6 +123,9 @@ def test_f2b_stranger_explanation_needs_no_host_needle_and_follows_the_refusal()
     good = "You need an account on this cluster and key-based SSH: put User and IdentityFile in ~/.ssh/config."
     assert fs.ssh_refusal_explained(Trace([refusal], ["Connecting.", good], [0, 1])).ok   # no "login" in it: fine now
     assert not fs.ssh_refusal_explained(Trace([refusal], ["You may need an account.", "Stopped."], [0, 1])).ok
+    # the review of re-run #1: the bare word "account" passed "no account was charged"; the remedy has to be named
+    assert not fs.ssh_refusal_explained(Trace([refusal], ["Stopped — no account was charged."], [1])).ok
+    assert fs.ssh_refusal_explained(Trace([refusal], ["You need an account on this facility and a key it accepts."], [1])).ok
     assert not hasattr(fs, "_HOST")
 
 

@@ -112,3 +112,18 @@ def test_run_shell_polls_of_a_dead_pilot_count_toward_the_bound():
     polls = [ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname"}, {"phase": "cold_start", "notice": DEAD})] * 5
     r = sc.no_endless_dead_wait(Trace([start, _ensure("provisioning", DEAD, shape="compute"), *polls]))
     assert not r.ok and "the dead pilot" in r.detail, r.detail
+
+
+def test_a_later_details_without_the_check_is_the_policy_dropped():
+    # the review of re-run #1: the last details= decides; one that leaves env_setup out drops the check even if an
+    # earlier one carried it (the server falls back to the proposed env_setup)
+    import slurm_worker_died as sc
+
+    def connect(details):
+        return ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f", "details": details}, {"phase": "needs_account"})
+    ran = ToolCall.of("mcp__endpoint__run_shell", {"command": "hostname", "shape": "compute"},
+                      {"phase": "complete", "stdout": "c1\n", "exit_code": 0})
+    kept = {"ssh_host": "login", "env_setup": "command -v mybalance >/dev/null 2>&1 || exit 42; true"}
+    r = sc.died_pilot_handled(Trace([connect(kept), connect({"ssh_host": "login", "partition": "debug"}), ran], ["ok"]))
+    assert not r.ok and "the last details= set no env_setup" in r.detail, r.detail
+    assert sc.died_pilot_handled(Trace([connect(kept), ran], ["ok"])).ok

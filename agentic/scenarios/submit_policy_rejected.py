@@ -30,7 +30,16 @@ import ast
 import re
 import time
 
-from invariants import Result, Trace, _slurm_work_idxs, compute_ran, no_endless_wait, rejection_surfaced
+from invariants import (
+    Result,
+    Trace,
+    _rejected_idxs,
+    _slurm_work_idxs,
+    compute_ran,
+    no_endless_wait,
+    rejection_surfaced,
+    said_after,
+)
 
 NEEDS_COMPUTE_NODE = False  # the block never starts: no node is occupied, none needs to be idle
 
@@ -67,8 +76,11 @@ _REJECT_WORDS = re.compile(r"reject|refus|denied|would not accept|not accepted",
 
 
 def policy_relayed(t: Trace) -> Result:
-    """The agent told the user the block was refused AND quoted the facility's reason (the accounting/QOS policy)."""
-    blob = "\n".join(t.texts)
+    """The agent told the user the block was refused AND quoted the facility's reason (the accounting/QOS policy) —
+    after the tool reported the rejection (`said_after`; the whole transcript included its plan, and "reject" is in the
+    prompt). No rejection reported: read the agent's last words."""
+    idx = _rejected_idxs(t)
+    blob = "\n".join(said_after(t, idx[0]) if idx else t.texts[-1:])
     ok = bool(_REJECT_WORDS.search(blob)) and bool(_POLICY.search(blob))
     return Result("policy_relayed", ok, "ok: the agent relayed the rejection with the policy's words" if ok
                   else "the agent's text never relays a rejection with the facility's policy message")

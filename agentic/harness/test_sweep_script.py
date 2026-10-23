@@ -366,7 +366,8 @@ def test_a_build_that_fails_is_retried_and_names_its_last_error(monkeypatch):
 def test_a_suite_whose_image_did_not_build_lists_every_cell_as_infra():
     # the INFRA row's shape is the one sweep_profiles.sh tallies and sweep_dash.py reads ("⚠ done <scen> · … — RESULT:")
     src = (HERE.parent / "run_suite.py").read_text()
-    assert "RESULT: INFRA: the jail image did not build (" in src and "for s, m, e, pe, ab in jobs:" in src
+    assert 'unrun(f"the jail image did not build ({why})")' in src and "for s, m, e, pe, ab in jobs:" in src
+    assert 'unrun("the fake cluster did not come up")' in src
     sys.path.insert(0, str(HERE.parent))
     import sweep_dash
     line = ("⚠ done   canary_login_discovery · qwen3.8-flash-next/default · - — RESULT: INFRA: the jail image did not "

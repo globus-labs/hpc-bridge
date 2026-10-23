@@ -86,7 +86,7 @@ _UV = "/usr/local/bin/uv"
 _PASSTHROUGH = (
     "HOME", "HPC_BRIDGE_USER_DIR", "GLOBUS_COMPUTE_USER_DIR", "HPC_BRIDGE_SSH_USER", "HPC_BRIDGE_SSH_KEY",
     "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPC_BRIDGE_MACHINE", "HPC_BRIDGE_SEARCH_INDEX",
-    "HPC_BRIDGE_CATALOG_FILE", "HPCB_HARNESS_SSH_PORT", "HPC_BRIDGE_JOURNAL", "HPC_BRIDGE_OMIT_INSTRUCTIONS",
+    "HPC_BRIDGE_CATALOG_FILE", "HPC_BRIDGE_JOURNAL", "HPC_BRIDGE_OMIT_INSTRUCTIONS",
 )
 TURN_TIMEOUT_S = float(os.environ.get("HPCB_CLI_TURN_TIMEOUT_S", "2700"))
 
@@ -688,6 +688,11 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
                        Path(env.get("HERMES_HOME", rec / "hermes")) / "skills")
     for k in ("ANTHROPIC_API_KEY", "CLAUDE_CODE_OAUTH_TOKEN"):  # the operator runs on the open model only
         env.pop(k, None)
+    # the harness's own knobs never reach the agent's shell (the Claude and hermes runners scrub them too): pi ran
+    # `env | grep -i -E 'HPC_BRIDGE|SSH'` on f2b_stranger (re-run 2026-10-23), read HPCB_TARGET_CAPS — the fake
+    # cluster's description, fail2ban included — and HPCB_HARNESS_SSH_PORT, and told the user to use the harness's port
+    for k in [k for k in env if k.startswith("HPCB_")]:
+        env.pop(k)
 
     argv = _turn_argv(harness, prompt, ws, rec, str(uuid.uuid4()))
     print(f"  → {harness}: {' '.join(a if len(a) < 80 else a[:77] + '…' for a in argv[:8])} …", flush=True)

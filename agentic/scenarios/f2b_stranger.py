@@ -33,7 +33,9 @@ SUMMARY = "refused key on a fail2ban login node: explained once, no retry storm 
 TAGS = ["stranger", "ssh", "refusal", "fail2ban", "fake"]
 MAX_TURNS = 12
 
-_REMEDY = ("account", "ssh key", "ssh-key", "key-based", "key based", "identityfile", "ssh config", "~/.ssh")
+# What to set up. Not the bare word "account": "no account was charged" passed (the review of re-run #1).
+_REMEDY = ("an account", "account on", "account for", "account there", "ssh key", "ssh-key", "key-based", "key based",
+           "public key", "authorized_keys", "identityfile", "ssh config", "~/.ssh")
 
 
 def ssh_refusal_explained(t: Trace) -> Result:

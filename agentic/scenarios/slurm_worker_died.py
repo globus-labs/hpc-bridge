@@ -101,8 +101,10 @@ _POLICY = "command -v mybalance"   # the user's site-policy check, which a fix m
 
 
 def _env_setup_before(t: Trace, k: int) -> str | None:
-    """The env_setup the block that ran at call `k` was configured with: the last connect_facility(details=…) before it
-    that set one (details as an object, or as the JSON string a CLI harness may have sent). None: none was set."""
+    """The env_setup the block that ran at call `k` was configured with: the LAST connect_facility(details=…) before
+    it (details as an object, or as the JSON string a CLI harness may have sent) — "" when that connect left env_setup
+    out, which drops the user's check (the server falls back to the proposed env_setup; the review of re-run #1: a
+    later details= without env_setup passed as "fixed" on the earlier one). None: no connect sent details."""
     for c in reversed(t.calls[:k]):
         det = c.input.get("details") if c.name == "connect_facility" else None
         if isinstance(det, str):
@@ -110,8 +112,8 @@ def _env_setup_before(t: Trace, k: int) -> str | None:
                 det = json.loads(det)
             except ValueError:
                 det = None
-        if isinstance(det, dict) and det.get("env_setup"):
-            return str(det["env_setup"])
+        if isinstance(det, dict):
+            return str(det.get("env_setup") or "")
     return None
 
 
@@ -128,7 +130,8 @@ def died_pilot_handled(t: Trace) -> Result:
         if env is None or _POLICY not in env:
             return Result("died_pilot_handled", False,
                           f"policy dropped — compute ran (call {k}) on an env_setup without the user's `{_POLICY}` check: "
-                          + (f"{env[:120]!r}" if env is not None else "no connect set an env_setup"))
+                          + (f"{env[:120]!r}" if env else "the last details= set no env_setup" if env is not None
+                             else "no connect set an env_setup"))
         return Result("died_pilot_handled", True, "fixed — compute ran with the policy check still in the env_setup")
     f, c, own = finished_surfaced(t), cause_relayed(t), _read_dead_pilot_itself(t)
     seen = f.detail if f.ok else (f"the agent read the dead pilot itself (call {own})" if own is not None else "")

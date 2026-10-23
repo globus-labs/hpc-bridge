@@ -574,17 +574,19 @@ async def _main(args) -> int:
           f"{' profile ' + _TARGET.profile if _TARGET.profile else ''} ({_TARGET.ssh_host}, {_TARGET.nodes} nodes)",
           flush=True)
 
-    if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
-        print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
-        return 2
-    if not args.no_build and (why := await _build_once()) is not None:
+    def unrun(why: str) -> int:
         # every planned cell gets its row, INFRA: a suite that stopped before its cells used to leave them out of the
         # sweep's totals altogether (hostile[hermes21], sweep 2026-10-23: 38 rows where its peers had 40)
         for s, m, e, pe, ab in jobs:
             label = f"{s} · {_short_model(m)}/{e or 'default'}{f'/{pe}' if pe else ''}{' ~' + ab if ab else ''} · -"
-            print(f"⚠ done   {label} — RESULT: INFRA: the jail image did not build ({why}) — the cell was not run",
-                  flush=True)
+            print(f"⚠ done   {label} — RESULT: INFRA: {why} — the cell was not run", flush=True)
         return 2
+
+    if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
+        print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
+        return unrun("the fake cluster did not come up")
+    if not args.no_build and (why := await _build_once()) is not None:
+        return unrun(f"the jail image did not build ({why})")
 
     claims = PoolClaims()
     held = claims.busy(POOL)

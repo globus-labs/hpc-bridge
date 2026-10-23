@@ -2038,7 +2038,7 @@ def no_endless_wait_on(name: str, marked: Callable[[ToolCall], bool], *, what: s
     def grader(t: Trace) -> Result:
         hits = [i for i, c in enumerate(t.calls) if _about_the_block(c) and marked(c)]
         if not hits:
-            return Result(name, True, f"no {what} to wait on")
+            return Result(name, True, f"nothing to wait on: no answer reported {what}")
         first = hits[0]
         terms = _asked_terms(t, first)
         # `seen`: the marked answers since the first one on these terms (None: none yet since they changed — the next

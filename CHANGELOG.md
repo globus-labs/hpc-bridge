@@ -194,7 +194,11 @@ installed plugin only when that version changes); git tags mark releases.
 - **From re-run #1 (2026-10-23).** `no_ssh_workaround` flags ssh/scp/sftp run as a command, never a path that only
   contains one: pi and codex failed `f2b_stranger` for `ls ~/.ssh` / `cat ~/.ssh/config` while diagnosing the refusal.
   A jail image that does not build is retried twice (a Docker Hub 502 broke `hostile` for hermes21), and if it still
-  fails, every planned cell is listed as INFRA with the build's last error, so the sweep's totals count them.
+  fails, every planned cell is listed as INFRA with the build's last error, so the sweep's totals count them (a fake
+  cluster that does not come up, too). The CLI operators' shell no longer sees the harness's `HPCB_*` knobs: pi read
+  `HPCB_TARGET_CAPS` and told the user the harness's own SSH port. `slurm_worker_died` judges the last `details=` (one
+  without the env_setup drops the check), `submit_policy_rejected` reads the relay after the rejection, and
+  `f2b_stranger` no longer passes on the bare word "account".
 - **The reviews of the qwen sweep (2026-10-22): a right answer passes, a restated plan does not, a bound counts.** A
   correct self-diagnosis counts as the evidence: `gpu_rule` takes the facility's own sbatch error read on the login
   shape, `venv_arch_mismatch` the job's stderr line read there, `polaris_filesystems` the agent's own `qstat -f` /
