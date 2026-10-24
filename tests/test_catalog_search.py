@@ -53,7 +53,7 @@ async def test_search_falls_back_to_cache_on_error(tmp_path):
 
 async def test_search_error_without_cache_is_reported_not_swallowed(tmp_path):
     # review 2026-09-03: a registry OUTAGE used to read as "not in the catalog" (every exception was a miss)
-    # — with no offline cache to serve, the transport error propagates so connect can say "registry unavailable"
+    # — with no offline cache to serve, the transport error propagates so connect can say the registry (a Globus Search index) is unavailable
     import pytest
     c = SearchCatalog(index_id="idx", client=_FakeSearchClient(fail=True), cache_dir=tmp_path)
     with pytest.raises(RuntimeError, match="search offline"):

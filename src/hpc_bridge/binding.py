@@ -283,6 +283,18 @@ def _make_search_client(_app_factory=None):
         pass
     return SearchClient()  # anonymous: public entries only (the registry's default)
 
+def registry_outage(exc: BaseException) -> str:
+    """Why the facility registry (a Globus Search index) could not be read, in the service's own words when it gave
+    any: Search's maintenance window answered `503 Unavailable.ServiceMaintenance: We're sorry, but Globus Search is
+    currently down for maintenance…` (2026-10-24), which a bare `SearchAPIError` hid — the agent had to curl the
+    index itself to learn it was an outage and not the facility."""
+    status, code, msg = getattr(exc, "http_status", None), getattr(exc, "code", None), getattr(exc, "message", None)
+    if status is not None:
+        said = " ".join(str(x) for x in (status, code) if x not in (None, "", "Error"))
+        return f"{said}: {str(msg).strip()[:240]}" if msg else said
+    return f"{type(exc).__name__}: {str(exc).strip()[:240]}" if str(exc).strip() else type(exc).__name__
+
+
 def make_catalog():
     """The runtime catalog is the PUBLIC REGISTRY — a Globus Search index, read anonymously. The
     plugin ships its id (`PUBLIC_REGISTRY_INDEX`), so `list_facilities()` works out of the box with no

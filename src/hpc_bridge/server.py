@@ -683,6 +683,10 @@ async def ensure_endpoint_up(
     ), "ensure_endpoint_up")
 
 
+class RegistryUnavailable(RuntimeError):
+    """list_facilities could not read the registry — the network or the Search service, not an empty index."""
+
+
 def _registry_transport_error(exc: BaseException) -> bool:
     """Network / Globus API / OS failures reaching the registry — the cases an empty list may stand for."""
     if isinstance(exc, (OSError, TimeoutError)) or hasattr(exc, "http_status"):
@@ -700,7 +704,12 @@ async def _list_facilities(query: str = "") -> list[CatalogSummary]:
         # (found in review: the old blanket net reported an AttributeError as an empty registry).
         print(f"hpc-bridge: list_facilities failed ({type(exc).__name__}: {exc})", file=sys.stderr)
         if _registry_transport_error(exc):
-            return []
+            # an error, never an empty list: `[]` read as "no facilities" while Globus Search was down for
+            # maintenance (2026-10-24) — the agent had to probe the index itself to tell the two apart
+            raise RegistryUnavailable(
+                f"the facility registry (a Globus Search index) is unavailable — {binding.registry_outage(exc)}. "
+                "This is not an empty registry: list_facilities again in a few minutes. A cluster you bring still "
+                "works meanwhile (connect_facility with ssh_host=…).") from exc
         raise
 
 
@@ -782,6 +791,9 @@ async def list_facilities(query: str = "") -> list[CatalogSummary]:
     """List the HPC machines hpc-bridge can stand up, from the public facility registry (a Globus
     Search index, read anonymously — works with no login). Empty query lists all; a query filters by
     name/description.
+
+    When the registry cannot be read (the network, or a Globus Search outage), it fails with the service's reason
+    rather than an empty list — an outage is not "no facilities".
 
     Returns agent-safe summaries (no executable config or raw UUIDs). Pick one and call
     connect_facility(facility=…) to bind it and see the terms its first block would start on. No SSH, no
