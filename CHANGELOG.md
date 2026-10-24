@@ -6,6 +6,10 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **The user guide says plainly that facility output reaches the agent unfiltered** ([Trusting the facility](docs/user/trust.md)):
+  on an untrustworthy facility, planted text in command output can steer the agent. The qwen sweeps' hostile cluster
+  showed some open-model runs fetching a URL planted in a `sinfo` notice. The page covers what hpc-bridge does, what
+  it does not filter, and what to do on a facility you don't fully trust.
 - **A refused connection says it may be a ban, and a held pilot says more may follow.** CANNOT REACH for a connection
   the login host REFUSED (not a name that does not resolve, not a timeout) now adds that a firewall or an
   intrusion-prevention ban (fail2ban, after repeated failed logins from this address) refuses connections too, and to

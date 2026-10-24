@@ -15,6 +15,7 @@ Prefer to watch first? [hpc-bridge in seven minutes](https://www.youtube.com/wat
 | [The Globus login](login.md) | the one credential hpc-bridge needs, and why your browser opens |
 | [Costs and stopping](costs-and-stopping.md) | how spend is gated, what "stop" means, long-running work |
 | [Troubleshooting](troubleshooting.md) | what a refusal or a stuck state means and what to do |
+| [Trusting the facility](trust.md) | connecting to a cluster you don't fully trust: planted instructions in its output |
 
 **Three ways a facility is reached**, decided for you from the registry: a facility-run endpoint (zero SSH;
 you need an account there with your Globus identity mapped), an SSH bootstrap (an account plus key-based SSH
