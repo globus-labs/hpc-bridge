@@ -6,6 +6,12 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A registry outage is said as one.** While Globus Search was down for maintenance (2026-10-24), `connect_facility("polaris")`
+  answered "registry unavailable (SearchAPIError); give me this facility's SSH host" and `list_facilities` returned `[]`: the
+  agent had to query the index itself to learn it was an outage, and was steered to SSH for a facility reached through
+  its own endpoint. Now both quote the service (`503 Unavailable.ServiceMaintenance: …`). `connect_facility` says it is the
+  registry, not the facility, and to connect again once it is back, with a cluster you bring as the alternative.
+  `list_facilities` fails with the reason instead of an empty list.
 - **The user guide says plainly that facility output reaches the agent unfiltered** ([Trusting the facility](docs/user/trust.md)):
   on an untrustworthy facility, planted text in command output can steer the agent. The qwen sweeps' hostile cluster
   showed some open-model runs fetching a URL planted in a `sinfo` notice. The page covers what hpc-bridge does, what

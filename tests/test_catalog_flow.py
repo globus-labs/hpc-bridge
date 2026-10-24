@@ -1,5 +1,7 @@
 from __future__ import annotations
 
+import pytest
+
 from hpc_bridge import binding, config, connect, warmth
 from hpc_bridge.models import FacilityDetails
 from hpc_bridge.profile import Profile
@@ -332,13 +334,16 @@ async def test_connect_facility_index_unavailable_falls_back_to_details(monkeypa
     app = AppCtx(facility=FakeFacility(), profile=Profile())
     res = await server._connect_facility(app, "anvil")
     assert res.phase == "needs_facility_details"
-    assert res.notice and "registry unavailable" in res.notice
+    assert res.notice and "registry (a Globus Search index) is unavailable" in res.notice
 
 
-async def test_list_facilities_empty_without_catalog(monkeypatch):
+async def test_list_facilities_says_the_registry_is_down_rather_than_empty(monkeypatch):
+    # an outage is not "no facilities" (Globus Search maintenance, 2026-10-24: `[]` hid it)
+    from hpc_bridge.server import RegistryUnavailable
 
     monkeypatch.setattr(binding, "make_catalog", _no_catalog)
-    assert await _list_facilities("") == []
+    with pytest.raises(RegistryUnavailable, match=r"registry \(a Globus Search index\) is unavailable — OSError: registry unreachable"):
+        await _list_facilities("")
 
 
 # --- regressions from the live test --------------------------------------------------------------
@@ -854,7 +859,7 @@ async def test_registry_unreachable_and_nothing_cached_asks_for_a_host(monkeypat
     monkeypatch.setattr(binding, "make_catalog", down)
     app = AppCtx(facility=FakeFacility(), profile=Profile())
     res = await server._connect_facility(app, "nowhere")
-    assert res.phase == "needs_facility_details" and "registry unavailable" in (res.notice or "")
+    assert res.phase == "needs_facility_details" and "registry (a Globus Search index) is unavailable" in (res.notice or "")
 
 
 def test_control_dir_falls_back_to_a_short_path(monkeypatch, tmp_path):
@@ -926,3 +931,32 @@ async def test_probe_path_ssh_refusal_is_explained(monkeypatch):
     res = await server._connect_facility(app, "byo", ssh_host="h.example.edu")
     assert res.phase == "failed" and res.notice.startswith("NO SSH ACCESS to h.example.edu")
     assert "'hpcbridge-stranger'" in res.notice and "Identity file" not in res.notice and "rc=255" not in res.notice
+
+
+class _SearchDown(Exception):
+    """The shape of globus_sdk's SearchAPIError during a maintenance window (2026-10-24)."""
+    http_status, code = 503, "Unavailable.ServiceMaintenance"
+    message = "We're sorry, but Globus Search is currently down for maintenance. Please try again in a few minutes."
+
+
+def test_a_registry_outage_is_said_in_the_services_own_words():
+    assert binding.registry_outage(_SearchDown()) == (
+        "503 Unavailable.ServiceMaintenance: We're sorry, but Globus Search is currently down for maintenance. "
+        "Please try again in a few minutes.")
+    assert binding.registry_outage(OSError("network down")) == "OSError: network down"
+    assert binding.registry_outage(TimeoutError()) == "TimeoutError"
+
+
+async def test_connect_during_a_registry_outage_says_retry_before_ssh(monkeypatch):
+    # polaris, 2026-10-24: "registry unavailable (SearchAPIError); give me this facility's SSH host" steered the agent
+    # to SSH for a facility reached through its own endpoint, and hid that Search was down for maintenance
+    def down():
+        raise _SearchDown()
+    monkeypatch.setattr(binding, "make_catalog", down)
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    from hpc_bridge import server
+    res = await server._connect_facility(app, "polaris")
+    n = res.notice or ""
+    assert res.phase == "needs_facility_details"
+    assert "down for maintenance" in n and "That is the registry, not 'polaris'" in n
+    assert n.index("connect_facility again once the registry is back") < n.index("ssh_host=")
