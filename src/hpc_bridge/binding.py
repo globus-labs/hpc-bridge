@@ -519,6 +519,7 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
             walltime=details.walltime,
             cpus_per_node=details.cpus_per_node,
             select_options=details.select_options,
+            partitions=details.partitions,  # what the probe saw of each partition (hpc_bridge.resources)
         ),
         provenance="session",
         last_validated=datetime.date.today(),

@@ -77,16 +77,17 @@ class ShapeRuntime:
     reaped: str | None = None
     reap_told: bool = False
     reap_kicked: bool = False
-    # A partition or account switch on a block spend was confirmed for: that confirmation covered the old terms' block
-    # only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the (partition,
-    # account) it covered; `switch_left`: on a facility endpoint, the block or check the switch left billing, to name.
+    # A partition, account or size switch on a block spend was confirmed for: that confirmation covered the old terms'
+    # block only, so the switch drops it and the next start asks again (warmth._repoint). `switched_terms`: the
+    # (partition, account, size) it covered (warmth._block_key; the size is resources.size_key's); `switch_left`: on a
+    # facility endpoint, the block or check the switch left billing, to name.
     # A confirmation clears them. (A block the old terms asked for that may still land is not tracked here: the check
     # that asked for it is — the old runner's SentCheck, which the endpoint keeps when the switch retires that runner.)
-    switched_terms: tuple[str | None, str | None] | None = None
+    switched_terms: tuple[Any, ...] | None = None
     switch_left: LeftBlock | None = None
     # A switch while spend was asked anyway (a reap): the terms the reap was on. The re-ask says the terms changed since
     # while they differ from these — back on them, the block the reap found is that confirmation's again.
-    reap_terms: tuple[str | None, str | None] | None = None
+    reap_terms: tuple[Any, ...] | None = None
     # Bumped by a switch: a task handle records the epoch it was sent in, and its result is proof of life only for a
     # block of that epoch — a task that finished on the old block, polled later, must not vouch for the new one
     # (warmth._resolve_task). Its end is still the old block's last activity, which every stamp of the new block passes.
@@ -105,6 +106,8 @@ class ShapeRuntime:
     # on). Set with the confirmation it voids (warmth._void_rejected), cleared by the next confirmation. The re-ask says
     # why (notices._reask_prefix), and a stop expects no pilot from it (server._stop_endpoint).
     rejected: tuple[str, str | None, str | None] | None = None
+    # ...and the size it asked for (resources.size_key), so the re-ask tells the same terms from a changed size.
+    rejected_size: tuple[Any, ...] | None = None
     # A pilot of this shape that ran and died before any worker answered: the pilot probe reported it FINISHED with an
     # exit status of its own (scheduler_ops.PilotProbe.dead; recorded by server._ensure_endpoint_up). Cleared when a
     # worker answers a check (warmth._check_resolved) or the scheduler rejects a submission; a switch hands it to the
@@ -420,12 +423,14 @@ class AppCtx:
     # The local account the last check (canary) ran as — on a facility endpoint, the identity mapping's: a stop's
     # `squeue -u` names it. Cleared with left_blocks on a bind elsewhere, and on a new Globus login.
     worker_user: str | None = None
-    # The partition and account this session chose for the compute shape (ensure_endpoint_up partition= / account=,
-    # warmth._repoint). A stop drops the compute shape whole; the next one starts with these (warmth._shape_runtime), so
-    # the choice persists for the session as the tool says: the spend question after a stop names the partition, and
-    # its result carries both. Forgotten with the binding's shapes (warmth._drop_all_shapes: a connect_facility, a
-    # teardown or a detach); a new Globus login keeps them, as it keeps a live shape's.
-    compute_choice: dict[str, str] = field(default_factory=dict)
+    # The partition, account and size this session chose for the compute shape (ensure_endpoint_up partition= /
+    # account= / cores= / memory_gb= / gpus= / nodes= / whole_node=, by their config keys — a size key set to None is
+    # one the session cleared; warmth._repoint). A stop drops the compute shape whole; the next one starts with these
+    # (warmth._shape_runtime), so the choice persists for the session as the tool says: the spend question after a
+    # stop names the partition, and its result carries both. Forgotten with the binding's shapes
+    # (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus login keeps them, as it keeps
+    # a live shape's.
+    compute_choice: dict[str, Any] = field(default_factory=dict)
     # Where the bound facility's DEFAULT partition and account came from (the registry, an env preset, a facility you
     # bring yourself), whether its entry says an account is needed, and its account hint: recorded with the binding
     # (connect_facility, the startup pin), read for every block's terms (notices._block_terms). None: unknown (local

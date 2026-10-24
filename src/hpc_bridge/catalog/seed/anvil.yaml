@@ -46,6 +46,17 @@
     max_blocks: 1
     extra:
       cores_per_node: 1
+    # What a block can be on each (hpc_bridge.resources, 2026-10-24), from the live probe of 2026-10-24 over the
+    # login shape (sinfo, scontrol show partition: per core, DefMemPerCPU=1896, TRESBillingWeights=CPU=1.0): a request
+    # (cores=, memory_gb=, whole_node=) is checked against it and the terms carry its cost. The template's own
+    # cores_per_node / mem_per_node / exclusive take it; `wholenode` hands out whole nodes (its OverSubscribe says NO).
+    partitions:
+      - {name: shared, kind: per_core, why: "SelectType=select/cons_tres, OverSubscribe=NO", cores: 128,
+         memory_gb: 251.4, mem_per_core_mb: 1896, billing: {cpu: 1.0}}
+      - {name: debug, kind: per_core, why: "SelectType=select/cons_tres, OverSubscribe=NO", cores: 128,
+         memory_gb: 251.4, mem_per_core_mb: 1896, billing: {cpu: 1.0}}
+      - {name: wholenode, kind: whole_node, why: "Anvil's whole-node partition", cores: 128, memory_gb: 251.4,
+         billing: {cpu: 1.0}}
   provenance: curated
   last_validated: 2026-10-09
   verification:                    # written by agentic/registry_reprove.py — what the live run met

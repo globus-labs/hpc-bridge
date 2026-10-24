@@ -2,7 +2,7 @@ from __future__ import annotations
 
 import re
 from dataclasses import dataclass
-from typing import Literal
+from typing import Any, Literal
 
 from pydantic import BaseModel, Field, PrivateAttr, field_validator
 
@@ -40,6 +40,104 @@ QueueSource = Literal["registry", "env", "byo_details", "discovered", "facility_
 AccountSource = Literal["this_call", "earlier_call", "env", "none_set", "none_needed"]
 
 
+# Where a block's size (its slice of a node: cores, memory, GPUs per node; whole node or not) comes from (BlockTerms):
+#   this_call / earlier_call  ensure_endpoint_up(cores=… / memory_gb=… / gpus=… / whole_node=…) this binding
+#   proposed     hpc-bridge's default slice on a per-core partition (a few cores and their memory): ask the user
+#   partition    a whole node because the partition hands out only whole nodes (its scheduler settings say so)
+#   facility     nothing asked and nothing known of the partition: the facility's own default (a registry entry's
+#                `exclusive`, parsl's whole node, or a facility endpoint's template)
+SizeSource = Literal["this_call", "earlier_call", "proposed", "partition", "facility"]
+
+_PARTITION_NAME = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
+
+
+def _positive(v: Any, *, zero: bool = False) -> float | None:
+    """A count or amount discovery or a registry entry gives: a non-negative number (0 only where `zero`), else None —
+    read leniently, never failing the facility (a probe reads whatever a site prints)."""
+    if isinstance(v, bool) or not isinstance(v, (int, float, str)):
+        return None
+    try:
+        f = float(v)
+    except ValueError:
+        return None
+    return f if f > 0 or (zero and f == 0) else None
+
+
+class PartitionShape(BaseModel):
+    """What discovery saw of one partition (Slurm) or queue (PBS), or what a registry entry says of it: whether it hands
+    out slices of a node or only whole nodes, its node's shape, the scheduler's per-job caps, and its billing weights.
+    The terms, the default slice and the validation of a resource request read it (hpc_bridge.resources). Read
+    leniently: a value that is not usable is dropped, never the entry or the proposal."""
+
+    name: str
+    # per_core: a job may get a slice of a node (Slurm's select/cons_tres or cons_res, nodes not exclusive; PBS nodes
+    # shared by default). whole_node: only whole nodes are ever allocated. None: not known.
+    kind: Literal["per_core", "whole_node"] | None = None
+    why: str | None = None                # the evidence for `kind`, in the scheduler's words
+    cores: int | None = None              # per node (the smallest node of the partition)
+    memory_gb: float | None = None        # per node
+    gpus: int | None = None               # per node (0: none)
+    mem_per_core_mb: int | None = None    # Slurm DefMemPerCPU: what a slice gets per core when it asks for no memory
+    max_cores_per_job: int | None = None  # the QOS per-job (or per-user) cap: Expanse `shared` is 127
+    max_nodes_per_job: int | None = None
+    max_gpus_per_job: int | None = None
+    # TRESBillingWeights, per unit: "cpu" (per core), "mem_gb" (per GB), "gpu" (per GPU), "node" — what one hour of a
+    # block is charged (Slurm sums them by default). None: not known, so no cost estimate.
+    billing: dict[str, float] | None = None
+    # PBS: the `place` a slice must ask for where the queue's or server's default place is exclusive but the nodes may
+    # be shared ("free:shared"); None: the default place shares, or not known. A slice never asks for place=excl.
+    place: str | None = None
+
+    @field_validator("name")
+    @classmethod
+    def _safe_name(cls, v: str) -> str:
+        v = (v or "").strip().rstrip("*")
+        if not _PARTITION_NAME.match(v):
+            raise ValueError(f"invalid partition name {v!r}")
+        return v
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _lenient_kind(cls, v: Any) -> str | None:
+        return v if v in ("per_core", "whole_node") else None
+
+    @field_validator("why", "place", mode="before")
+    @classmethod
+    def _short_text(cls, v: Any) -> str | None:
+        if not isinstance(v, str):
+            return None
+        text = "".join(ch for ch in v if ch.isprintable()).strip()
+        return text[:120] or None
+
+    @field_validator("cores", "mem_per_core_mb", "max_cores_per_job", "max_nodes_per_job", "max_gpus_per_job",
+                     mode="before")
+    @classmethod
+    def _count(cls, v: Any) -> int | None:
+        f = _positive(v)
+        return int(f) if f is not None else None
+
+    @field_validator("gpus", mode="before")
+    @classmethod
+    def _gpus(cls, v: Any) -> int | None:
+        f = _positive(v, zero=True)
+        return int(f) if f is not None else None
+
+    @field_validator("memory_gb", mode="before")
+    @classmethod
+    def _amount(cls, v: Any) -> float | None:
+        f = _positive(v)
+        return round(f, 1) if f is not None else None
+
+    @field_validator("billing", mode="before")
+    @classmethod
+    def _weights(cls, v: Any) -> dict[str, float] | None:
+        if not isinstance(v, dict):
+            return None
+        out = {str(k): w for k, x in v.items() if str(k) in ("cpu", "mem_gb", "gpu", "node")
+               and (w := _positive(x, zero=True)) is not None}
+        return out or None
+
+
 @dataclass(frozen=True)
 class TermsOrigin:
     """Where the bound facility's DEFAULT terms came from, recorded when it is bound (connect_facility, or the startup
@@ -67,6 +165,18 @@ class BlockTerms(BaseModel):
     walltime: str | None = None             # HH:MM:SS (Slurm's D-HH:MM:SS too); None: the facility's own default
     max_node_hours: float | None = None     # nodes × walltime in hours: what this one block can bill at most
     compute_only: bool = False              # a facility endpoint: no free login shape, every command bills
+    # The block's slice of each node (hpc_bridge.resources): whole nodes (True), a slice (False), or not known (None:
+    # the facility's own default); cores, memory and GPUs per node where they are known; and where the size came from.
+    whole_node: bool | None = None
+    cores_per_node: int | None = None       # a whole node: the node's count, when discovery or the registry knows it
+    memory_gb: float | None = None          # per node
+    memory_default: bool = False            # the partition's default memory per core (DefMemPerCPU): not sent
+    gpus_per_node: int | None = None
+    size_source: SizeSource | None = None
+    # The most this block can be charged, where the partition's billing weights are known (Slurm TRESBillingWeights):
+    # `max_charge` in the facility's billing units (SU), and how it is reached ("8 cores × 0.5 h").
+    max_charge: float | None = None
+    charge_basis: str | None = None
 
 
 class ShellOutcome(BaseModel):
@@ -265,6 +375,12 @@ class FacilityDetails(BaseModel):
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],
     )
     amqp_port: int = Field(default=443, description="AMQPS port (443 is near-universally allowed).")
+    partitions: list[PartitionShape] | None = Field(
+        default=None,
+        description="What the login-node probe saw of each partition/queue: per_core (a block may take a slice of a "
+        "node) or whole_node, the node's cores/memory/GPUs, per-job caps and billing weights. Leave it OUT of "
+        "details= (the server keeps the proposed one); correct a classification only with the user.",
+    )
     endpoint_name: str | None = Field(
         default=None,
         description="On-disk/registration endpoint name. Leave unset for a session facility — it "

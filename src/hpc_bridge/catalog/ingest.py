@@ -10,6 +10,7 @@ from .bundled import BundledCatalog
 from .entry import (
     account_hint_raw_problems,
     defaults_extra_raw_problems,
+    partitions_raw_problems,
     verification_problems,
     verification_raw_problems,
     worker_env_problems,
@@ -33,13 +34,14 @@ def ingest(index_id: str, seed_path: str | Path, client) -> int:
         return (worker_env_raw_problems((row.get("compute") or {}).get("worker_env"))
                 + verification_raw_problems(row.get("verification"))
                 + account_hint_raw_problems(row.get("account_hint"))
-                + defaults_extra_raw_problems(row))
+                + defaults_extra_raw_problems(row)
+                + partitions_raw_problems(row))
 
     bad = {e.id: probs for e in catalog.entries()
            if (probs := raw_problems(e.id) + worker_env_problems(e.compute) + verification_problems(e))}
     if bad:
         raise ValueError("refusing to ingest — entry problems (worker_env / verification / account_hint / "
-                         "defaults.extra): "
+                         "defaults.extra / defaults.partitions): "
                          + "; ".join(f"{eid}: {', '.join(probs)}" for eid, probs in bad.items()))
     gmeta = [
         {

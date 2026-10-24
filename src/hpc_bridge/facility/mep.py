@@ -112,6 +112,7 @@ class MEPFacility:
         # schema its manager validates `user_endpoint_config` against (Anvil's rejects unknown keys —
         # our `interface`/`compute` would fail every submit), its endpoint version, its display name.
         self.schema: dict | None = None
+        self.template_text: str | None = None  # the published UEP template (load_template), when it was read
         self.endpoint_version: str | None = None
         self.display_name: str | None = None
         self.template_notes: list[str] = []
@@ -124,6 +125,27 @@ class MEPFacility:
         self.worker_env = None  # entry.compute.worker_env: the worker strategy + the version it was proven with
         self.verification = None  # entry.verification: what the facility looked like when the entry was proven live
         self.live_fingerprint: dict | None = None  # the same, read from the facility's metadata at attach
+        # What the registry entry knows of each partition (models.PartitionShape): a request is validated against it;
+        # the facility's template still decides how a block is sized (hpc_bridge.resources).
+        self.partitions: tuple = ()
+
+    def takes_size_key(self, key: str) -> bool:
+        """Whether this facility's own template takes a block-size key (hpc-bridge's name: cores_per_node, mem_per_node,
+        gpus_per_node, exclusive, nodes_per_block), under the facility's name for it (`key_map`). A STRICT schema
+        (additionalProperties: false, Anvil's) must list it — anything else is dropped at the wire. Otherwise (Delta's
+        lists only worker_init and endpoint_setup) the evidence is the schema listing it, the published template
+        rendering it (`{{ mem_per_node }}`), or the registry entry sending it itself (`defaults.extra`: the curator saw
+        the template consume it). Never a key it would drop: a request it does not take is refused, not silently
+        dropped (server._ensure_endpoint_up, notices._size_refusal)."""
+        wire = self.key_map.get(key, key)
+        sc = self.schema or {}
+        raw = sc.get("properties")
+        props: dict = raw if isinstance(raw, dict) else {}
+        if sc.get("additionalProperties") is False:
+            return wire in props
+        rendered = isinstance(self.template_text, str) and re.search(
+            r"\{\{-?\s*" + re.escape(wire) + r"\b", self.template_text) is not None
+        return wire in props or rendered or key in self._user_opts
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -161,6 +183,7 @@ class MEPFacility:
         )
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"
         fac.key_map = dict(getattr(c, "key_map", None) or {})
+        fac.partitions = tuple(getattr(d, "partitions", None) or ())
         fac.worker_env = getattr(c, "worker_env", None)
         fac.verification = getattr(entry, "verification", None)
         return fac
@@ -226,6 +249,8 @@ class MEPFacility:
         if self.max_idletime_s is None:  # a curated value wins; otherwise the facility's own template says
             self.max_idletime_s = _template_idle_s(md.get("user_config_template"))
         self.schema = md.get("user_config_schema") or None
+        tmpl = md.get("user_config_template")
+        self.template_text = tmpl if isinstance(tmpl, str) else None  # what it renders: a block-size key's evidence
         self.endpoint_version = str(md.get("endpoint_version") or "") or None
         self.display_name = md.get("display_name") or None
         from ..catalog.entry import facility_fingerprint

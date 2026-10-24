@@ -11,10 +11,10 @@ from __future__ import annotations
 import asyncio
 import re
 import time
-from collections.abc import Collection
-from typing import Literal
+from collections.abc import Collection, Mapping
+from typing import Any, Literal
 
-from . import config
+from . import config, resources
 from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
 from .context import (
     AppCtx,
@@ -31,7 +31,16 @@ from .cost import _block_nodes, _with_spend
 from .facility.base import ConfigStepFailed
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
-from .models import AccountSource, BlockTerms, ConnectFacilityResult, QueueSource, ShellOutcome, Submission
+from .models import (
+    AccountSource,
+    BlockTerms,
+    ConnectFacilityResult,
+    PartitionShape,
+    QueueSource,
+    ShellOutcome,
+    SizeSource,
+    Submission,
+)
 from .runner import CanaryResult, SubmitAnswer
 from .scheduler_ops import _END_NOW, _QUOTED, _ask_terms, _pilot_fates, _submission_refused, _user_endpoint_logs
 
@@ -307,6 +316,19 @@ def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) 
     nodes = _block_nodes(rt, app) if "nodes_per_block" in sent else None  # not sent: the facility's own size
     walltime = str(uec["walltime"]) if "walltime" in sent else None
     secs = _parse_hhmmss(walltime)
+    size, shape = _block_size(app, uec, sent)
+    cost = resources.charge(size, shape, secs) if nodes is not None else None
+    size_source: SizeSource
+    if set(named) & set(resources.SIZE_KEYS):
+        size_source = "this_call"
+    elif any(k in app.compute_choice for k in resources.SIZE_KEYS):
+        size_source = "earlier_call"
+    elif size.proposed:
+        size_source = "proposed"
+    elif size.by_partition:
+        size_source = "partition"
+    else:
+        size_source = "facility"
     return BlockTerms(
         facility=app.machine or config.machine() or getattr(app.facility, "name", None),
         queue=queue, queue_source=queue_source, account=account, account_source=account_source,
@@ -315,7 +337,76 @@ def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) 
         nodes=nodes, walltime=walltime,
         max_node_hours=round(nodes * secs / 3600, 2) if nodes is not None and secs > 0 else None,
         compute_only=not _has_login_shape(app),
+        whole_node=size.whole_node, cores_per_node=size.cores, memory_gb=size.memory_gb,
+        memory_default=size.memory_default, gpus_per_node=size.gpus, size_source=size_source,
+        max_charge=cost[0] if cost else None, charge_basis=cost[1] if cost else None,
     )
+
+
+def _block_size(app: AppCtx, uec: Mapping[str, Any],
+                sent: Collection[str] | None = None) -> tuple[resources.Size, PartitionShape | None]:
+    """What a block of the compute config `uec` gets on the bound facility (resources.effective) and its partition's
+    shape: hpc-bridge's own template sizes it by what discovery saw (`SlurmFacility.block_size`); a facility endpoint by
+    the keys it actually receives (`sent`, `_wire_keys`); anything else only by its node count."""
+    fac = app.facility
+    shape = resources.shape_of(getattr(fac, "partitions", None), uec.get("partition"))
+    size_of = getattr(fac, "block_size", None)
+    if callable(size_of):
+        return size_of(dict(uec)), shape
+    if not _has_login_shape(app):
+        keys = _wire_keys(app, dict(uec)) if sent is None else set(sent)
+        return resources.effective({k: v for k, v in uec.items() if k in keys}, shape, channel="mep"), shape
+    return resources.effective(uec, shape, channel="other"), shape
+
+
+def _size_channel(app: AppCtx) -> resources.Channel:
+    if callable(getattr(app.facility, "block_size", None)):
+        return "ssh"
+    return "mep" if not _has_login_shape(app) else "other"
+
+
+def _size_refusal(app: AppCtx, uec: Mapping[str, Any], updates: Mapping[str, Any],
+                  named: Collection[str]) -> str | None:
+    """Why a resource request (resources.requested's `updates`, or a partition switch, on the compute config `uec` as it
+    would be after the call) is refused — nothing is set or started then — or None:
+    - a facility endpoint's template that does not take a size key: "this facility's endpoint sets the block size";
+    - an endpoint of ours whose template predates resource requests (`takes_resources` False): only a fresh configure
+      renders them;
+    - a facility with no scheduler block (local dev): there is nothing to size;
+    - what discovery or the registry saw of the partition refuses it (resources.refusal: a slice of a whole-node
+      partition, more than a node has, over a QOS per-job cap)."""
+    fac = app.facility
+    channel = _size_channel(app)
+    asked = {k: v for k, v in updates.items() if v is not None}
+    if asked and channel == "mep":
+        takes = getattr(fac, "takes_size_key", None)
+        kmap = getattr(fac, "key_map", None) or {}
+        for key in asked:
+            if callable(takes) and not takes(key):
+                wire = kmap.get(key, key)
+                arg = resources.KEY_ARGS.get(key, key)
+                opts = getattr(fac, "_user_opts", None) or {}
+                own = f" (its own default comes from the registry entry: {key}={opts[key]!r})" if key in opts else ""
+                return (f"this facility's endpoint sets the block size: its published template has no `{wire}` "
+                        f"setting, so {arg}={updates[key]!r} would be dropped on the way and the facility's own "
+                        f"default used{own}. Nothing in this call was set or started: leave {arg}= out and send the "
+                        "rest of it again, telling the user the facility's template decides that part of the block.")
+    elif resources.needs_new_template(updates) and channel == "ssh":
+        takes = getattr(fac, "takes_resources", None)
+        if takes is False or (takes is None and app.state.endpoint_id is not None):
+            why = ("was configured before hpc-bridge wrote a block's size into its template" if takes is False else
+                   "has a template hpc-bridge could not read")
+            return (f"this endpoint {why}, so its blocks keep their old size (whole nodes, or the registry's "
+                    f"default) whatever this call asks. Nothing in this call was set or started. To size blocks: "
+                    "teardown_endpoint, then connect_facility, to configure it again (or leave the size out to run on "
+                    "the old one).")
+    elif channel == "other" and any(k in asked for k in resources.SLICE_KEYS):
+        return ("this facility runs no scheduler block (a local endpoint): there is no slice of a node to ask for. "
+                "Nothing in this call was set or started.")
+    shape = resources.shape_of(getattr(fac, "partitions", None), uec.get("partition"))
+    chosen = {k for k in resources.SIZE_KEYS if k in app.compute_choice}
+    return resources.refusal(uec, shape, named=named, word=_queue_word(app),
+                             partitions=getattr(fac, "partitions", None) or (), channel=channel, chosen=chosen)
 
 # How a source reads in a notice (BlockTerms' vocabulary: models.py).
 _QUEUE_FROM = {
@@ -362,17 +453,37 @@ def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: 
         acct = "account: none set (required here)"
     else:
         acct = "no account set (the scheduler's default account applies, if it has one)"
-    size = (f"{t.nodes} node{'' if t.nodes == 1 else 's'}" if t.nodes is not None else "the facility's default size")
+    size = resources.size_words(nodes=t.nodes, whole_node=t.whole_node, cores=t.cores_per_node,
+                                memory_gb=t.memory_gb, memory_default=t.memory_default, gpus=t.gpus_per_node)
+    charged = (f"; at most {t.max_charge:g} SU: {t.charge_basis}" if t.max_charge is not None and t.charge_basis
+               else "")
     if t.walltime:
         nh = t.max_node_hours
-        size += f" for up to {t.walltime}" + (f" (at most {nh:g} node-hour{'' if nh == 1 else 's'})" if nh else "")
+        size += f" for up to {t.walltime}" + (f" (at most {nh:g} node-hour{'' if nh == 1 else 's'}{charged})" if nh
+                                              else "")
     else:
         size += " for the facility's default walltime"
-    line = f"{lead}: {where}; {acct}; {size}. " + _hint_sentence(t)
+    line = f"{lead}: {where}; {acct}; {size}. " + _hint_sentence(t) + _size_sentence(app, t)
     if t.compute_only and compute_note:
         line += ("Compute-only through this channel: every command bills, and the block stays warm between commands "
                  "until the facility's idle window ends it. ")
     return line
+
+def _size_sentence(app: AppCtx, t: BlockTerms) -> str:
+    """What the block's size means, after its terms: a slice hpc-bridge proposes on a per-core partition (D3: the user
+    confirms or changes it), a whole node because the partition gives only those, and what N > 1 nodes is (D2)."""
+    word = _queue_word(app)
+    out = ""
+    if t.size_source == "proposed":
+        out += (f"The size is hpc-bridge's proposal for this per-core {word}, a slice and not the whole node: ask the "
+                "user to confirm it or to say what the work needs (cores=, memory_gb=, gpus=, nodes=; whole_node=True "
+                "for whole nodes). ")
+    elif t.size_source == "partition" and t.queue:
+        shape = resources.shape_of(getattr(app.facility, "partitions", None), t.queue)
+        why = f" ({shape.why})" if shape is not None and shape.why else ""
+        out += f"Whole nodes: {word} '{t.queue}' hands out only whole nodes{why}. "
+    return out + resources.multinode_note(t.nodes, t.compute_only)
+
 
 def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False, left: bool = False) -> str:
     """connect_facility's statement of the next block's terms, before any spend, and the one question to ask: only for
@@ -402,6 +513,9 @@ def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool =
     if terms.queue_source != "env" and takes_partition:
         asks.append(f"whether that {word} is OK")
         args.append("partition=…")
+    if terms.size_source == "proposed":
+        asks.append("whether that slice is enough (or the cores, memory and GPUs the work needs)")
+        args.append("cores=…")
     presets = [n for n, src in (("HPC_BRIDGE_PARTITION", terms.queue_source), ("HPC_BRIDGE_ACCOUNT",
                                                                                terms.account_source)) if src == "env"]
     many = len(presets) > 1
@@ -503,12 +617,13 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
     if rt.rejected is not None:  # warmth._void_rejected: the confirmation covered a block that was never created
         cause, partition, account = rt.rejected
         uec = rt.user_endpoint_config
-        same = (partition, account) == (uec.get("partition"), uec.get("account"))
+        same = ((partition, account) == (uec.get("partition"), uec.get("account"))
+                and rt.rejected_size in (None, resources.size_key(uec)))
         out = (f"Confirm spend again with the user: the scheduler REJECTED the last block submission, on "
                f"{_terms(partition, account, word)} ({cause}), so no block was created and the earlier confirmation "
                "covered nothing that runs. "
                + ("Confirming the same terms again repeats a request the scheduler refuses. " if same else
-                  f"The {word} or account has changed since. "))
+                  f"The {_changed(app, (partition, account, rt.rejected_size), rt)} has changed since. "))
     if rt.reaped is not None:
         # Found by a check (kicked): a replacement may already be running, and billing from when it started.
         bills = ("a replacement bills from the moment it starts, confirmed or not" if rt.reap_kicked else
@@ -516,18 +631,17 @@ def _reask_prefix(app: AppCtx | None, rt: ShapeRuntime | None) -> str:
         out += (f"Confirm spend again with the user: {rt.reaped}. The earlier confirmation covered that block only; "
                 f"{bills}. ")
     if rt.switched_terms is not None:
-        uec = rt.user_endpoint_config
-        if rt.switched_terms == (uec.get("partition"), uec.get("account")):
-            return out + (f"Confirm spend again with the user: a {word} or account switch dropped the confirmation, "
-                          "and the terms are back to the ones it covered "
-                          f"({_terms(*rt.switched_terms, word)}). Confirming "
+        if rt.switched_terms == _key(rt):
+            return out + (f"Confirm spend again with the user: a {_changed(app, rt.switched_terms, rt, back=True)} "
+                          "switch dropped the confirmation, and the terms are back to the ones it covered "
+                          f"({_old_terms(app, rt.switched_terms)}). Confirming "
                           "again uses that block if it is still up, or starts a new one. ")
-        out += (f"Confirm spend again with the user: the {word} or account has changed since spend was confirmed, "
-                "and that is a different block (the earlier confirmation covered only the one on "
-                f"{_terms(*rt.switched_terms, word)}). ")
-    elif rt.reap_terms is not None and rt.reap_terms != (rt.user_endpoint_config.get("partition"),
-                                                         rt.user_endpoint_config.get("account")):  # a switch since
-        out += f"The {word} or account was switched since, so a confirmation now starts a block on the new terms. "
+        out += (f"Confirm spend again with the user: the {_changed(app, rt.switched_terms, rt)} has changed since "
+                "spend was confirmed, and that is a different block (the earlier confirmation covered only the one on "
+                f"{_old_terms(app, rt.switched_terms)}). ")
+    elif rt.reap_terms is not None and rt.reap_terms != _key(rt):  # a switch since
+        out += (f"The {_changed(app, rt.reap_terms, rt)} was switched since, so a confirmation now starts a block on "
+                "the new terms. ")
     if app is not None and (rt.switched_terms is not None or left is not None):
         out += _switch_fate(app, left, confirmed=False, rt=rt)
     return out
@@ -602,23 +716,47 @@ def _switch_receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     this confirmation covers, and what became of it — no needs_confirmation answer told it. Empty when there was no
     confirmed block to move from, or the terms are back to the ones it covered."""
     terms = rt.switched_terms
-    uec = rt.user_endpoint_config
-    if terms is None or terms == (uec.get("partition"), uec.get("account")):
+    if terms is None or terms == _key(rt):
         return ""
-    word = _queue_word(app)
-    return (f"This confirmation is for a new block: the {word} or account changed from {_terms(*terms, word)}. "
-            + _switch_fate(app, rt.switch_left, confirmed=True, rt=rt))
+    return (f"This confirmation is for a new block: the {_changed(app, terms, rt)} changed from "
+            f"{_old_terms(app, terms)}. " + _switch_fate(app, rt.switch_left, confirmed=True, rt=rt))
 
-def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[str | None, str | None] | None) -> str:
+def _rejected_switch_note(app: AppCtx, rt: ShapeRuntime, switched: tuple[Any, ...] | None) -> str:
     """For the call that switched the partition or account, confirmed and met a REJECTED submission at once: no new
     block exists, so not `_switch_receipt` ("…this new one included") — only what became of the old terms' block, which
     nothing cancels on a switch. Empty when nothing was switched, or the terms are back to the old ones."""
-    uec = rt.user_endpoint_config
-    if switched is None or switched == (uec.get("partition"), uec.get("account")):
+    if switched is None or switched == _key(rt):
         return ""
-    word = _queue_word(app)
-    return (f"The {word} or account changed from {_terms(*switched, word)} in this call. "
+    return (f"The {_changed(app, switched, rt)} changed from {_old_terms(app, switched)} in this call. "
             + _switch_fate(app, rt.switch_left, confirmed=False, rt=rt))
+
+
+def _key(rt: ShapeRuntime) -> tuple[Any, ...]:
+    """The block's terms as warmth._block_key compares them: partition, account, size."""
+    uec = rt.user_endpoint_config
+    return uec.get("partition"), uec.get("account"), resources.size_key(uec)
+
+
+def _changed(app: AppCtx | None, old: tuple[Any, ...], rt: ShapeRuntime, *, back: bool = False) -> str:
+    """What a switch moved, in the words the notices always used: "partition or account" — "…, account or size" when
+    the block's size is among what changed (or, `back`, what a switch back undid: the old terms carry a size)."""
+    word = _queue_word(app) if app is not None else "partition"
+    size = old[2] if len(old) > 2 else None
+    moved = size is not None and size != resources.size_key(rt.user_endpoint_config)
+    if back:
+        moved = size is not None and any(v is not None for v in size[1:])
+    return f"{word}, account or size" if moved else f"{word} or account"
+
+
+def _old_terms(app: AppCtx | None, old: tuple[Any, ...]) -> str:
+    """The terms a switch moved away from: the partition and account, and the size where it was asked."""
+    word = _queue_word(app) if app is not None else "partition"
+    out = _terms(old[0], old[1], word)
+    size = old[2] if len(old) > 2 and old[2] is not None else None
+    if size is not None and (size[0] not in (None, 1) or any(v is not None for v in size[1:])):
+        asked = dict(zip(resources.SIZE_KEYS, size, strict=True))
+        out += ", " + ", ".join(f"{resources.KEY_ARGS[k]}={v!r}" for k, v in asked.items() if v is not None)
+    return out
 
 def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -> str:
     """What to do about an unconfirmed spend — ONE text for ensure_endpoint_up and run_shell/reset
@@ -630,6 +768,8 @@ def _spend_floor_guidance(app: AppCtx | None, terms: BlockTerms | None = None) -
                "ensure_endpoint_up(account=…, confirm_spend=True)")
     else:
         ask = "Ask the user, naming these terms, then call ensure_endpoint_up(confirm_spend=True)"
+    if terms is not None and terms.size_source == "proposed":
+        ask += " — with cores=/memory_gb=/gpus=/nodes= in the same call if they want another size"
     if app is not None and not _has_login_shape(app):
         return f"No free login shape here (the facility's login nodes are outside this channel). {ask}."
     return (f"{ask} (with the allocation balance where the facility's balance tool shows one: it runs free on "

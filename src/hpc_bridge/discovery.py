@@ -12,6 +12,7 @@ import re
 import shlex
 from typing import Literal
 
+from . import resources
 from .facility.endpoint_venv import (
     DEFAULT_REMOTE_VENV,
     client_gce,
@@ -97,7 +98,27 @@ if type module >/dev/null 2>&1; then
   module -t avail 2>&1 | grep -vE ':$|^$|^-|/$' | head -300 | awk '{print "MODULE="$1}'
 fi
 sinfo -h -o 'PART=%P|%a' 2>/dev/null || true
+sinfo -h -o 'PSHAPE=%P|%c|%m|%G' 2>/dev/null | head -200 || true
+hpcb_capped scontrol show config 2>/dev/null \
+  | awk '$1=="SelectType"{print "SELECT_TYPE="$3} $1=="SelectTypeParameters"{print "SELECT_PARAMS="$3}' || true
+hpcb_capped scontrol show partition -o 2>/dev/null | head -100 | sed 's/^/PDETAIL=/' || true
+hpcb_capped sacctmgr -nP show qos format=Name,MaxTRES,MaxTRESPU 2>/dev/null | head -200 | sed 's/^/QOS=/' || true
 qstat -Q 2>/dev/null | awk 'NR>2 && $1!="" {print "QUEUE="$1}' || true
+hpcb_capped pbsnodes -a 2>/dev/null | head -4000 | awk '
+  function flush() {
+    if (n != "") print "PNODE=" n "|" c "|" m "|" g "|" sh "|" q
+    n = ""; c = ""; m = ""; g = ""; sh = ""; q = ""
+  }
+  /^[^ \t]/ { flush(); n = $1; next }
+  $1 == "resources_available.ncpus" { c = $3 }
+  $1 == "resources_available.mem" { m = $3 }
+  $1 == "resources_available.ngpus" { g = $3 }
+  $1 == "sharing" { sh = $3 }
+  $1 == "queue" { q = $3 }
+  END { flush() }' | head -400 || true
+hpcb_capped qstat -Qf 2>/dev/null | awk '/^Queue:/ { q = $2; next }
+  q != "" && $1 ~ /^resources_(default|max)\./ { print "PQUEUE=" q "|" $1 "|" $3 }' | head -300 || true
+hpcb_capped qstat -Bf 2>/dev/null | awk '$1 ~ /^resources_default\./ { print "PSERVER=" $1 "|" $3 }' | head -50 || true
 ip -o -4 addr show 2>/dev/null | awk '{print "NIC="$2"|"$4}' || true
 echo HPCB_PROBE_END
 """.strip()
@@ -169,6 +190,18 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
     if alloc_note:
         notes.append(alloc_note)
 
+    # what each partition hands out — a slice of a node or only whole nodes — its node's shape, per-job caps and billing
+    # weights (hpc_bridge.resources): the block's default slice, its terms and the validation of a request read it
+    if scheduler == "pbs":
+        partitions = resources.classify_pbs(queues=f.get("QUEUE", []), nodes=f.get("PNODE", []),
+                                            queue_attrs=f.get("PQUEUE", []), server_attrs=f.get("PSERVER", []))
+    else:
+        partitions = resources.classify_slurm(select_type=f.get("SELECT_TYPE"), select_params=f.get("SELECT_PARAMS"),
+                                              shapes=f.get("PSHAPE", []), details=f.get("PDETAIL", []),
+                                              qos=f.get("QOS", []))
+    if partitions and (note := resources.summary(partitions)):
+        notes.append(note)
+
     draft = FacilityDetails(
         ssh_host=ssh_host,
         interface=interface,
@@ -178,6 +211,7 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
         scheduler=scheduler,
         allocation_command=alloc_cmd,
         allocation_parser=alloc_parser,
+        partitions=partitions or None,
     )
     return draft, notes
 
@@ -185,7 +219,8 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
 def _collect(stdout: str) -> dict:
     """Frame-bounded parse of `KEY=value` lines; PART/NIC accumulate into lists."""
     scalars: dict[str, str] = {}
-    multi: dict[str, list[str]] = {"PART": [], "NIC": [], "QUEUE": [], "MODULE": []}
+    multi: dict[str, list[str]] = {"PART": [], "NIC": [], "QUEUE": [], "MODULE": [], "PSHAPE": [], "PDETAIL": [],
+                                   "QOS": [], "PNODE": [], "PQUEUE": [], "PSERVER": []}
     in_block = False
     for raw in stdout.splitlines():
         line = raw.strip()

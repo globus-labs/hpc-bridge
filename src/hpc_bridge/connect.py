@@ -375,6 +375,12 @@ async def _connect(
                             f"not {details.ssh_host!r}: its env_setup may not fit. Give env_setup; otherwise "
                             f"{_without_details(app, facility, details.ssh_host)}. Nothing was started."))
             details = details.model_copy(update={"env_setup": draft.env_setup})
+        if details.partitions is None:
+            # what the probe saw of each partition rides the proposal: kept server-side like its env_setup, so a
+            # details= that leaves it out (as the proposal asks) still sizes the block by it (hpc_bridge.resources)
+            draft = app.proposed_drafts.get(facility)
+            if draft is not None and draft.partitions and draft.ssh_host == details.ssh_host:
+                details = details.model_copy(update={"partitions": draft.partitions})
         try:
             # scheduler_options as the submit script carries them (a bare "-l …" gets the scheduler's prefix), said back
             details, rewrites = binding._directive_details(details)

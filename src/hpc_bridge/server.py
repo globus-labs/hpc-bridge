@@ -15,7 +15,7 @@ from typing import Any, Literal, NamedTuple, TypeVar
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from . import binding, config, connect, dispatch, login_gate, scheduler_ops, session_shell, warmth
+from . import binding, config, connect, dispatch, login_gate, resources, scheduler_ops, session_shell, warmth
 from .binding import (  # noqa: F401 - re-exported for imports; PATCH binding.<name>, not server.<name>
     _catalog_facility,
     _entry_from_details,
@@ -139,6 +139,7 @@ from .notices import (  # noqa: F401 - re-exported
     _running_outcome,
     _scheduler_submit_notice,
     _shape_reject_outcome,
+    _size_refusal,
     _spend_floor_guidance,
     _stop_down_notice,
     _submit_rejected,
@@ -355,6 +356,11 @@ async def _ensure_endpoint_up(
     partition: str | None = None,
     confirm_spend: bool = False,
     account: str | None = None,
+    cores: int | None = None,
+    memory_gb: int | None = None,
+    gpus: int | None = None,
+    nodes: int | None = None,
+    whole_node: bool | None = None,
 ) -> EndpointStatus:
     if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
         return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
@@ -377,7 +383,15 @@ async def _ensure_endpoint_up(
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid account {account!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
         )
-    if partition is not None or account is not None:
+    # the block's size (hpc_bridge.resources): cores, memory and GPUs per node, the node count, whole nodes or not
+    sizing, bad_size = resources.requested(cores, memory_gb, gpus, nodes, whole_node)
+    login_only = shape == "login"  # the login shape is free and has no size: a size named for it is said ignored
+    if bad_size and not login_only:
+        async with app.lock:
+            return _dropped_term_status(app, shape, f"{bad_size}. Nothing in this call was set or started.")
+    if login_only:
+        sizing = {}
+    if partition is not None or account is not None or sizing:
         # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
         # startup-pinned one has not read its template yet (that happens at its first block): read it first.
         load = getattr(app.facility, "load_template", None)
@@ -385,6 +399,20 @@ async def _ensure_endpoint_up(
             await load()
         dropped = next((n for k, v in (("partition", partition), ("account", account))
                         if v is not None and (n := _dropped_term_notice(app, k, v))), None)  # all or nothing
+        if not dropped and (sizing or partition is not None) and not login_only:
+            # the size this call asks for, on the partition it names (or the session's), checked against what
+            # discovery or the registry saw of it — a slice of a whole-node partition, more than a node has, over a QOS
+            # per-job cap — and against what the facility's template renders; nothing is set unless all of it holds
+            base = app.shapes[shape].user_endpoint_config if shape in app.shapes else warmth._seed_uec(app, shape)
+            after = {**base, **({"partition": partition} if partition is not None else {})}
+            for k, v in sizing.items():
+                if v is None:
+                    after.pop(k, None)
+                else:
+                    after[k] = v
+            if after.get("compute"):
+                named_now = set(sizing) | ({"partition"} if partition is not None else set())
+                dropped = _size_refusal(app, after, sizing, named_now)
         if dropped:
             async with app.lock:
                 return _dropped_term_status(app, shape, dropped)
@@ -393,11 +421,17 @@ async def _ensure_endpoint_up(
         # A login shape has no partition; surface that we ignored a supplied one rather than
         # silently dropping the user's selection.
         ignored = partition is not None and not rt.user_endpoint_config.get("compute")
+        ignored_size = [a for a, v in (("cores", cores), ("memory_gb", memory_gb), ("gpus", gpus),
+                                       ("nodes", nodes), ("whole_node", whole_node))
+                        if v is not None and not rt.user_endpoint_config.get("compute")]
         # what THIS call named for the block (BlockTerms' "this_call"); the login shape has neither
         named = {k for k, v in (("partition", partition), ("account", account))
                  if v is not None and rt.user_endpoint_config.get("compute")}
+        if rt.user_endpoint_config.get("compute"):
+            named |= set(sizing)
         epoch = rt.block_epoch
-        reject = _apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
+        reject = (_apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
+                  or warmth._apply_resources(app, shape, rt, sizing))
         if reject:  # a live task blocks repointing the block (the swap would cancel it) — change nothing
             return EndpointStatus(
                 status="up",
@@ -553,6 +587,9 @@ async def _ensure_endpoint_up(
             notice += _dispatch_error_suffix(rt.last_canary)
         if ignored:
             notice = f"{notice or ''} (login shape has no partition; ignored {partition!r})".strip()
+        if ignored_size:
+            notice = (f"{notice or ''} (the login shape is the login node itself, with no block to size; ignored "
+                      f"{', '.join(ignored_size)})").strip()
     # OUTSIDE the lock (dispatch takes it): for a still-cold BILLED block, ask the scheduler whether
     # the pilot actually submitted. A rejected/held qsub is otherwise indistinguishable from a normal
     # queue wait, leaving the caller stuck on "allocating nodes…" forever ([#32]). The grace clock
@@ -655,6 +692,11 @@ async def ensure_endpoint_up(
     partition: str | None = None,
     confirm_spend: bool = False,
     account: str | None = None,
+    cores: int | None = None,
+    memory_gb: int | None = None,
+    gpus: int | None = None,
+    nodes: int | None = None,
+    whole_node: bool | None = None,
 ) -> EndpointStatus:
     """Ensure the personal HPC endpoint is up; report whether its pilot block is warm.
 
@@ -677,9 +719,19 @@ async def ensure_endpoint_up(
     with the reason — even one that passes confirm_spend=True — so the user is asked again for the new block.
     A different partition or account is a different block too: the call that changes them answers
     needs_confirmation (saying what becomes of the old block) unless it passes confirm_spend=True itself.
-    Not needed for shape="login" (free)."""
+    Not needed for shape="login" (free).
+
+    The block's size, per node — `cores`, `memory_gb` (GB), `gpus` — and `nodes` ask for what the work needs: a slice of
+    a node, not a whole one, unless `whole_node=True` or the partition hands out only whole nodes. With none of them on
+    a per-core partition the terms PROPOSE a modest slice (a few cores and their memory) for the user to confirm or
+    change. `nodes` > 1 is one shell over the whole allocation, on the first node, like salloc: run work across the
+    nodes with srun / mpiexec from it; nodes not used still bill. Like `partition`, the size persists for the session,
+    and a change is a different block (spend is asked again). A size the partition cannot give (more than a node has,
+    over a QOS per-job cap, a slice of a whole-node partition) or that the facility's template does not take is
+    refused before anything is submitted, saying why. Ignored for shape="login"."""
     return await _heartbeat(ctx, _ensure_endpoint_up(
-        ctx.request_context.lifespan_context, shape, partition, confirm_spend, account
+        ctx.request_context.lifespan_context, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
+        whole_node,
     ), "ensure_endpoint_up")
 
 

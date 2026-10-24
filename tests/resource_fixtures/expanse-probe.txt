@@ -1,0 +1,23 @@
+# SDSC Expanse's `shared` and `compute` partitions as the login-node probe would frame them. CONSTRUCTED, not captured:
+# from what the repo already records of Expanse (src/hpc_bridge/catalog/seed/sdsc-expanse.yaml, HANDOFF 2026-10-06):
+# `shared` is per-core with a QOS cap of 127 CPUs per job on 128-core nodes (PENDING QOSMaxCpuPerJobLimit for parsl's
+# default --exclusive), `compute` hands out whole nodes. Memory and the QOS name are illustrative.
+HPCB_PROBE_BEGIN
+USER=tester
+HOME=/home/tester
+SCHED=slurm
+PART=shared|up
+PART=compute|up
+PART=debug|up
+PSHAPE=shared|128|249208|(null)
+PSHAPE=compute|128|249208|(null)
+PSHAPE=debug|128|249208|(null)
+SELECT_TYPE=select/cons_tres
+SELECT_PARAMS=CR_Core_Memory
+PDETAIL=PartitionName=shared QoS=shared-normal OverSubscribe=NO ExclusiveUser=NO DefMemPerCPU=1024 State=UP
+PDETAIL=PartitionName=compute QoS=N/A OverSubscribe=EXCLUSIVE ExclusiveUser=NO State=UP
+PDETAIL=PartitionName=debug QoS=N/A OverSubscribe=NO ExclusiveUser=NO DefMemPerCPU=1024 State=UP
+QOS=shared-normal|cpu=127|
+NIC=ib0|10.21.0.1/16
+UV=/home/tester/.local/bin/uv
+HPCB_PROBE_END

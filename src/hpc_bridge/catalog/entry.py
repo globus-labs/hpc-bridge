@@ -11,7 +11,7 @@ from typing import Any, Literal, NamedTuple
 
 from pydantic import BaseModel, Field, field_validator, model_validator
 
-from ..models import validate_host
+from ..models import PartitionShape, validate_host
 
 
 class Allocation(BaseModel):
@@ -34,6 +34,8 @@ SAFE_ENDPOINT_NAME = re.compile(r"^[A-Za-z0-9][A-Za-z0-9_.-]{0,63}$")
 MEP_RENAMEABLE_KEYS = frozenset({
     "account", "partition", "walltime", "max_workers_per_node",
     "nodes_per_block", "init_blocks", "max_blocks", "interface",
+    # a block's size (hpc_bridge.resources, 2026-10-24): parsl's names, which Anvil's and Delta's templates use as is
+    "cores_per_node", "mem_per_node", "gpus_per_node", "exclusive",
 })
 
 
@@ -119,6 +121,36 @@ def verification_raw_problems(raw: Any) -> list[str]:
     for k in known & set(raw):
         if raw[k] is not None and getattr(parsed, k) is None:
             problems.append(f"verification.{k} = {raw[k]!r} is not usable (quote versions; 64-hex digests; a date)")
+    return problems
+
+
+def partitions_raw_problems(row: Any) -> list[str]:
+    """The curator's check of a seed row's RAW `defaults.partitions` (what a block can be on each partition), before
+    the lenient read can forgive it: every row must survive the read whole — a misspelt key, a kind or a number the
+    client cannot use would be dropped there, and the entry published as it was not meant."""
+    defaults = row.get("defaults") if isinstance(row, dict) else None
+    raw = defaults.get("partitions") if isinstance(defaults, dict) else None
+    if raw is None:
+        return []
+    if not isinstance(raw, list):
+        return [f"defaults.partitions must be a list, got {type(raw).__name__}"]
+    known = set(PartitionShape.model_fields)
+    problems: list[str] = []
+    for i, r in enumerate(raw):
+        if not isinstance(r, dict):
+            problems.append(f"defaults.partitions[{i}] must be a mapping, got {type(r).__name__}")
+            continue
+        unknown = sorted(str(k) for k in set(r) - known)
+        if unknown:
+            problems.append(f"defaults.partitions[{i}] has unknown key(s) {unknown}")
+        try:
+            parsed = PartitionShape.model_validate({k: v for k, v in r.items() if k in known})
+        except (ValueError, TypeError) as exc:
+            problems.append(f"defaults.partitions[{i}] does not parse: {exc}"[:200])
+            continue
+        for k in sorted(known & set(r)):
+            if r[k] is not None and getattr(parsed, k) is None:
+                problems.append(f"defaults.partitions[{i}].{k} = {r[k]!r} is not usable")
     return problems
 
 
@@ -640,6 +672,24 @@ class Defaults(BaseModel):
     # (Anvil/Delta: qos, cores_per_node, exclusive, mem_per_node, scheduler_options, resource_specification…).
     # Passed through verbatim, then filtered against the facility's published schema at attach time.
     extra: dict[str, str | int | bool] | None = None
+    # What the curator knows of each partition (PartitionShape: per-core or whole-node, the node's shape, per-job caps,
+    # billing weights), so a curated facility needs no probe: the block's terms, its default slice on a per-core
+    # partition and the validation of a resource request read it (hpc_bridge.resources). Read leniently: an unusable
+    # row is dropped, never the entry.
+    partitions: list[PartitionShape] | None = None
+
+    @field_validator("partitions", mode="before")
+    @classmethod
+    def _lenient_partitions(cls, v: Any) -> list[PartitionShape] | None:
+        if not isinstance(v, list):
+            return None
+        out: list[PartitionShape] = []
+        for row in v:
+            try:
+                out.append(row if isinstance(row, PartitionShape) else PartitionShape.model_validate(row))
+            except (ValueError, TypeError):
+                continue
+        return out or None
 
 
 class CatalogSummary(BaseModel):
@@ -932,4 +982,5 @@ class CatalogEntry(BaseModel):
             "select_options": self.defaults.select_options,
             "exclusive": self.defaults.exclusive,
             "account_required": self.account_required,
+            "partitions": tuple(self.defaults.partitions or ()),
         }

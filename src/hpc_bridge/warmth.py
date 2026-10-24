@@ -32,7 +32,7 @@ from typing import Any, Literal
 
 from globus_compute_sdk.errors import SerdeError, TaskExecutionFailed
 
-from . import dispatch, session_shell
+from . import dispatch, resources, session_shell
 from .config import (
     CANARY_TTL_S,
     SYNC_WAIT_S,
@@ -116,8 +116,12 @@ def _seed_uec(app: AppCtx, shape: str) -> dict:
     uec = {**defaults, **shape_config(shape)}
     # a facility MEP fits the config to ITS published schema (drops keys it rejects, pins worker versions)
     uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
-    if uec.get("compute"):  # the session's partition/account outlive a stop, written as _repoint writes them
-        uec.update(app.compute_choice)
+    if uec.get("compute"):  # the session's partition/account/size outlive a stop, written as _repoint writes them
+        for key, value in app.compute_choice.items():
+            if value is None:  # a size the session cleared (whole_node=True clears a slice's cores and memory)
+                uec.pop(key, None)
+            else:
+                uec[key] = value
     return uec
 
 def _shape_runtime(app: AppCtx, shape: str) -> ShapeRuntime:
@@ -647,13 +651,13 @@ async def _provision(
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
         # a replacement already up — on these terms: a kick met before a switch is the other terms' block
         kicked_up = (rt.reap_kicked and rt.last_canary is not None and rt.last_canary.ok
-                     and (rt.reap_terms is None or rt.reap_terms == _terms_of(rt)))
+                     and (rt.reap_terms is None or rt.reap_terms == _block_key(rt)))
         rt.spend_confirmed = True  # ack persists for this block (cleared when it is reaped, rejected or switched)
         rt.reaped, rt.reap_told, rt.reap_kicked = None, False, False
         rt.switched_terms, rt.switch_left, rt.reap_terms = None, None, None
         rt.switch_left_up, rt.switch_left_pilots = None, None
         new_request = not kicked_up  # this confirmation asks for a block (not one already answering)
-        rt.rejected = None  # a new request: the rejection it follows is history (its re-ask has been answered)
+        rt.rejected = rt.rejected_size = None  # a new request: the rejection it follows is history (re-ask answered)
         rt.confirmed_at = time.monotonic()  # a pilot that died before this is an earlier session's, not this block's
         rt.confirmed_wall = time.time()     # the same on the wall clock (the monotonic one stops while asleep)
         if app.state.endpoint_id is not None:  # its probes list this endpoint's pilots now; a re-bind reads them there
@@ -679,6 +683,12 @@ async def _provision(
         adopt = getattr(app.facility, "adopt_endpoint", None)
         if app.state.endpoint_id and inspect.iscoroutinefunction(adopt):
             await adopt(app.state.endpoint_id)
+        if (stale := _stale_size(app, rt)) is not None:
+            # the size was asked before this endpoint's template was known (a startup pin, before its bootstrap), and
+            # the endpoint it reached renders none of it: refuse before any check is sent, never drop it silently
+            if new_request:
+                rt.spend_confirmed = False
+            raise StaleTemplateError(stale)
         if new_request:
             _fresh_block(app, shape, rt)  # after adopt: whether this endpoint's template allows it is known now
         checked = block == "warm"
@@ -737,6 +747,28 @@ async def _provision(
         return "needs_confirmation"
     return block
 
+class StaleTemplateError(RuntimeError):
+    """The session asked for a block size (cores, memory, GPUs, several nodes) that the bound endpoint's template does
+    not render — it was configured before resource requests (facility/remote.py `takes_resources`)."""
+
+
+def _stale_size(app: AppCtx, rt: ShapeRuntime) -> str | None:
+    """Why the compute shape's size cannot reach its endpoint, or None: the session chose one (`app.compute_choice`: a
+    slice key, or more than one node) and the bound SSH endpoint's template, now read, renders none of it. The
+    validation refuses such a call up front once the template is known (notices._size_refusal); this is the one path
+    that learns it only at the bring-up — a size asked of a startup pin before its bootstrap reused an older
+    endpoint."""
+    if not rt.user_endpoint_config.get("compute") or getattr(app.facility, "takes_resources", None) is not False:
+        return None
+    asked = resources.needs_new_template(app.compute_choice)
+    if not asked:
+        return None
+    return ("this endpoint was configured before hpc-bridge wrote a block's size into its template, so its blocks "
+            f"would ignore the size this session asked for ({', '.join(resources.KEY_ARGS[k] for k in asked)}). "
+            "Nothing was started. To size blocks: teardown_endpoint, then connect_facility, to configure it again — or "
+            "leave the size out to run on the old one.")
+
+
 def _rejected_now(rt: ShapeRuntime) -> bool:
     """The check just made (the last one) failed because the scheduler REJECTED the block's submission, on a billed
     shape whose spend was confirmed: a terminal verdict (`_terminal_failure`) for every block of that user endpoint,
@@ -760,6 +792,7 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     # what the re-ask and the stop refer back to: the submit command's answer the check carried, in brief
     cause = _submit_rejection_cause(c.error if c is not None else None, c.submit if c is not None else None)
     rt.rejected = (cause, uec.get("partition"), uec.get("account"))
+    rt.rejected_size = resources.size_key(uec)  # the size it asked for too: the same terms again are refused again
     rt.spend_confirmed = False
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None
@@ -772,6 +805,12 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
 def _terms_of(rt: ShapeRuntime) -> tuple[str | None, str | None]:
     uec = rt.user_endpoint_config
     return uec.get("partition"), uec.get("account")
+
+def _block_key(rt: ShapeRuntime) -> tuple[Any, ...]:
+    """A block's terms, comparable: its partition, account and size (resources.size_key) — a change in any one is a
+    different block (`_repoint`), and a switch back to all three is back on the confirmed terms."""
+    uec = rt.user_endpoint_config
+    return uec.get("partition"), uec.get("account"), resources.size_key(uec)
 
 def _runner_terms(runner: object, rt: ShapeRuntime) -> tuple[str | None, str | None]:
     """The partition and account a runner's checks asked for: its own config's (what it was built with — the shape's
@@ -1442,7 +1481,7 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
-    _repoint(app, shape, rt, "partition", partition)
+    _repoint(app, shape, rt, {"partition": partition})
     return None
 
 def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | None) -> str | None:
@@ -1465,11 +1504,40 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
-    _repoint(app, shape, rt, "account", account)
+    _repoint(app, shape, rt, {"account": account})
     return None
 
-def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) -> None:
-    """A real partition or account change, once nothing of ours holds the block: a different block.
+def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any]) -> str | None:
+    """Point this shape's next block at a size (resources.requested's updates: cores, memory, GPUs per node, nodes,
+    whole node; None clears a key) — the analogue of _apply_partition and _apply_account. A real change is a different
+    block (`_repoint`): the confirmation covered the old size only, the old block is handled as a partition switch
+    handles it, and the size persists for the session (`app.compute_choice`), a stop included. Refused (nothing
+    applied) while a task or a command in its sync-wait is on the shape, as a partition change is. A value named again
+    unchanged is the session's choice now (BlockTerms' size_source). The caller has validated it against the partition
+    (notices._size_refusal); the login shape has no size."""
+    if not updates or not rt.user_endpoint_config.get("compute"):
+        return None
+    uec = rt.user_endpoint_config
+    changed = {k: v for k, v in updates.items() if uec.get(k) != v}
+    if not changed:
+        app.compute_choice.update(updates)  # named, though unchanged: the session's choice now (its source)
+        return None
+    what = ", ".join(f"{resources.KEY_ARGS.get(k, k)}={v!r}" for k, v in updates.items()
+                     if k in changed and (v is not None or k != resources.WHOLE))
+    live = _live_task_handles(app, shape)
+    if live:
+        return (f"can't change the block's size ({what}): a task is still running (task_id={live[0][0]!r}) on shape "
+                f"{shape!r}. poll_task it to completion first (stop_endpoint refuses while it runs).")
+    if rt.inflight:
+        return (f"can't change the block's size ({what}): a command is still running on shape {shape!r} (inside "
+                "run_shell's wait). Let it return, then change it.")
+    app.compute_choice.update({k: v for k, v in updates.items() if k not in changed})
+    _repoint(app, shape, rt, changed)
+    return None
+
+def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any]) -> None:
+    """A real partition, account or size change (`updates`: config key -> value; None clears the key), once nothing of
+    ours holds the block: a different block.
 
     The spend confirmation covered the old terms' block only, so it is dropped: the call answers needs_confirmation
     unless it carries confirm_spend=True itself, and the answer says what became of the old block
@@ -1484,7 +1552,7 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
     _settle_refusals(app, shape, rt)
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
     uec = rt.user_endpoint_config
-    terms = (uec.get("partition"), uec.get("account"))
+    terms = _block_key(rt)  # partition, account and size: what the confirmation covered
     confirmed = _billable(rt) and rt.spend_confirmed
     if _has_login_shape(app):  # an SSH endpoint: a block idles out — banked to that latest end, not named
         _leave_block(app, shape, rt, how="switch", remember=False)
@@ -1506,8 +1574,12 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, key: str, value: str) ->
         _retire_runner(app, rt)
         rt.runner = None
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
-    uec[key] = value
-    app.compute_choice[key] = value
+    for key, value in updates.items():
+        if value is None:
+            uec.pop(key, None)
+        else:
+            uec[key] = value
+        app.compute_choice[key] = value
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age
