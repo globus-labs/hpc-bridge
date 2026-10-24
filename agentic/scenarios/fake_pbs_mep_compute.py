@@ -14,11 +14,12 @@ queue PBS ran it in, the mapped user -> a stop that issues no cancel and says so
 Graded on what the plugin delivers: the receipt's `block` (queue `debug` from the registry, account `hpcb` set by the
 call) and the PBS word "queue" in every terms line; the queue PBS reports from inside the job; #178's stop graders
 (fake_mep_stop_names_block), with `qdel`. World: right after the stop, a hook lists the mapped account's RUNNING job in
-queue `debug` charged to `hpcb` (no cancel was issued; the queue and the account reached the scheduler) — or, when
-the operator waited past the idle window before stopping, a block that had idled out before the stop (the premise
-not met, said so); after the idle window the queue is empty (the 240 s release held). On this cluster a pilot without
-a filesystems request is HELD (the polaris rule), so a compute result also proves the template's filesystems
-default rendered.
+queue `debug` charged to `hpcb` (no cancel was issued; the queue and the account reached the scheduler). When the
+operator waited past the idle window before stopping, the block had idled out before the stop: the premise is not met,
+said so (`PREMISE NOT MET:`) — and the hook FAILS, as fake_mep_stop_names_block's does when its queue lists no block: a
+stop with no block left proves nothing about a stop that names one. After the idle window the queue is empty (the 240 s
+release held). On this cluster a pilot without a filesystems request is HELD (the polaris rule), so a compute result
+also proves the template's filesystems default rendered.
 
 Autonomous, `cmd` hook only: the free CLI operators (codex / pi / hermes21) drive it too. Fake cluster only. ~6 min.
 """
@@ -206,10 +207,13 @@ EXPECT_OK = [
 # Right after the stop: the mapped account's block is STILL RUNNING — no cancel was issued — in queue `debug`, charged
 # to `hpcb` (qselect filters on both, so the queue and the account reached PBS). Pool users can see hpcbmep's jobs: the
 # profile sets query_other_jobs. The premise can fail on its own: an operator that waits past the 240 s idle window
-# between the run and the stop finds the block already released, which is not the plugin's doing — so a block that
-# FINISHED at least 30 s before this check (job history: qselect -x, its mtime) also passes, said as the premise not
-# met. One that is exiting now, or finished within the last 30 s, ended at the stop: that fails (the check fires right
-# after the stop's result). The token `BLOCK_AT_STOP:` is printed only on a pass.
+# between the run and the stop finds the block already released, which is not the plugin's doing — a block that
+# FINISHED at least 30 s before this check (job history: qselect -x, its mtime) is said as the premise not met, with
+# its own token, `PREMISE NOT MET:`, and FAILS the hook: it printed `BLOCK_AT_STOP: premise not met` and passed
+# (expect_any_host matched the token), so a cell whose stop met no block graded the stop as naming one (the review of
+# the 2026-10-22 sweep; fake_mep_stop_names_block's hook fails the same case). One that is exiting now, or finished
+# within the last 30 s, ended at the stop: that fails too (the check fires right after the stop's result). The token
+# `BLOCK_AT_STOP:` is printed only on a pass.
 _Q = f"-u {MAPPED_USER} -q {DEFAULT_QUEUE} -A {ACCOUNT}"
 _AGE = ("python3 -c 'import sys, time; print(int(time.time() - time.mktime(time.strptime(sys.argv[1], "
         "\"%a %b %d %H:%M:%S %Y\"))))' \"$end\" 2>/dev/null || echo -1")
@@ -230,8 +234,8 @@ _AT_STOP = (
     f"echo \"no block at the stop: the newest finished job of {MAPPED_USER} in {DEFAULT_QUEUE}/{ACCOUNT}, $last, is not a "
     "parsl block\"; "
     "elif [ \"$age\" -ge 30 ]; then "
-    "echo \"BLOCK_AT_STOP: premise not met — job $last had already idled out ${age} s before this check (before the "
-    "stop: there was nothing left to cancel)\"; "
+    "echo \"PREMISE NOT MET: job $last had already idled out ${age} s before this check (before the "
+    "stop: there was nothing left to cancel, so the stop's words about a running block went unchecked)\"; "
     "else echo \"no block at the stop: job $last finished ${age} s before this check — at the stop\"; fi; fi; fi"
 )
 MIDRUN_HOOKS = [

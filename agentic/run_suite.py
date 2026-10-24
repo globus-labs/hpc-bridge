@@ -85,19 +85,33 @@ def _git_describe() -> str:
         return "unknown"
 
 
-async def _build_once() -> bool:
+# A registry hiccup is the usual build failure (Docker Hub's token endpoint answered 502 for hostile[hermes21], sweep
+# 2026-10-23): retry after these waits before giving up on the suite.
+BUILD_RETRY_WAITS_S = (30, 90)
+
+
+async def _build_once(waits=BUILD_RETRY_WAITS_S) -> str | None:
+    """Build the jail image; None when it built, else the failure's last line (for the cells' INFRA rows)."""
     print("building the jail image once (parallel jobs reuse it)…", flush=True)
-    proc = await asyncio.create_subprocess_exec(
-        "docker", "build", "--provenance=false", "-t", "hpc-bridge-agentic",
-        "--build-arg", f"GIT_DESCRIBE={_git_describe()}",
-        "-f", str(REPO / "agentic" / "Dockerfile"), str(REPO),
-        stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
-    )
-    _, err = await proc.communicate()
-    if proc.returncode != 0:
-        print(f"build FAILED:\n{err.decode(errors='replace')[-1500:]}", file=sys.stderr)
-        return False
-    return True
+    why = ""
+    for attempt, wait in enumerate((0, *waits)):
+        if wait:
+            print(f"build failed ({why}); retrying in {wait}s (attempt {attempt + 1})", flush=True)
+            await asyncio.sleep(wait)
+        proc = await asyncio.create_subprocess_exec(
+            "docker", "build", "--provenance=false", "-t", "hpc-bridge-agentic",
+            "--build-arg", f"GIT_DESCRIBE={_git_describe()}",
+            "-f", str(REPO / "agentic" / "Dockerfile"), str(REPO),
+            stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,
+        )
+        _, err = await proc.communicate()
+        if proc.returncode == 0:
+            return None
+        text = err.decode(errors="replace")
+        print(f"build FAILED:\n{text[-1500:]}", file=sys.stderr)
+        lines = [ln.strip() for ln in text.splitlines() if ln.strip().startswith(("ERROR", "error"))]
+        why = (lines[-1] if lines else (text.strip().splitlines() or ["no output"])[-1])[:200]
+    return why or "docker build failed"
 
 
 def _knobs(scenario: str) -> dict[str, str]:
@@ -295,13 +309,36 @@ class NodeGate:
         return None
 
 
+_FREE_OPERATORS = ("codex", "pi", "hermes21", "hermes")   # the ALCF-hosted (OpenAI-compatible) model's operators
+
+
+def _free_model() -> str | None:
+    """The model a free operator's cell really runs, or None for a Claude operator: HPCB_ALCF_MODEL, else agentic/.env's,
+    else run_smoke.sh's default — the --models id never reaches such a cell (run_smoke.sh). The qwen sweep's rows
+    (2026-10-22) all read `opus/default` and its SUITE lines `claude-opus-5 @ default` for a qwen3.8 run."""
+    if os.environ.get("HPCB_OPERATOR", "claude") not in _FREE_OPERATORS:
+        return None
+    if os.environ.get("HPCB_ALCF_MODEL"):
+        return os.environ["HPCB_ALCF_MODEL"]
+    env = REPO / "agentic" / ".env"
+    for line in env.read_text().splitlines() if env.exists() else []:
+        if line.startswith("HPCB_ALCF_MODEL=") and line.split("=", 1)[1].strip():
+            return line.split("=", 1)[1].strip()
+    return "openai/gpt-oss-120b"
+
+
 def _short_model(m: str) -> str:
+    """A cell label's model: `opus` for claude-opus-5; a free operator's real model, its provider prefix dropped
+    (qwen3.8-flash-next, gpt-oss-120b)."""
+    free = _free_model()
+    if free is not None:
+        return free.rsplit("/", 1)[-1]
     parts = m.split("-")
     return parts[1] if len(parts) > 1 else m
 
 
 def _cell(model: str, effort: str | None) -> str:
-    return f"{model} @ {effort or 'default'}"
+    return f"{_free_model() or model} @ {effort or 'default'}"
 
 
 def _cell_env(user: str, runid: str) -> dict[str, str]:
@@ -537,11 +574,19 @@ async def _main(args) -> int:
           f"{' profile ' + _TARGET.profile if _TARGET.profile else ''} ({_TARGET.ssh_host}, {_TARGET.nodes} nodes)",
           flush=True)
 
+    def unrun(why: str) -> int:
+        # every planned cell gets its row, INFRA: a suite that stopped before its cells used to leave them out of the
+        # sweep's totals altogether (hostile[hermes21], sweep 2026-10-23: 38 rows where its peers had 40)
+        for s, m, e, pe, ab in jobs:
+            label = f"{s} · {_short_model(m)}/{e or 'default'}{f'/{pe}' if pe else ''}{' ~' + ab if ab else ''} · -"
+            print(f"⚠ done   {label} — RESULT: INFRA: {why} — the cell was not run", flush=True)
+        return 2
+
     if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
         print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
-        return 2
-    if not args.no_build and not await _build_once():
-        return 2
+        return unrun("the fake cluster did not come up")
+    if not args.no_build and (why := await _build_once()) is not None:
+        return unrun(f"the jail image did not build ({why})")
 
     claims = PoolClaims()
     held = claims.busy(POOL)

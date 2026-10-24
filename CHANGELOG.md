@@ -6,6 +6,14 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Fixed
+- **A refused connection says it may be a ban, and a held pilot says more may follow.** CANNOT REACH for a connection
+  the login host REFUSED (not a name that does not resolve, not a timeout) now adds that a firewall or an
+  intrusion-prevention ban (fail2ban, after repeated failed logins from this address) refuses connections too, and to
+  wait or check with the site rather than retry — each refused attempt can extend a ban. In the 2026-10-22 sweep every
+  agent read fail2ban's "Connection refused" as a wrong host name. A HELD pilot's notice now says that while a pilot is
+  held the endpoint may submit further pilots for the block, each held the same way, until `stop_endpoint`, so stop
+  first and fix the configuration after: on the fake Polaris cluster one confirmation cost three held pilots, the
+  endpoint scaling out a new block about every minute (the scale-out itself is unchanged).
 - **A configuration you gave that failed on the login node is no longer run again unless you give it again.** In the
   October free sweep (`lmod_bootstrap`, the fake Lmod cluster, Hermes), the agent's first `connect_facility` carried
   a made-up `env_setup` (`module load gcc/10.2.0`) and the login node refused it ("Lmod has detected the following
@@ -183,6 +191,58 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **From re-run #2 (2026-10-23).** The fake cluster's login nodes no longer race each other into a half-made home:
+  ownership and mode are set on every boot, and the cluster is ready only once the pool user can write its home
+  (all six f2b cells were SETUP FAILED "Permission denied"). `canary_login_discovery` asks the agent to keep calling
+  `connect_facility` until it lists the allocations, so the parser it tests is always asked.
+- **From re-run #1 (2026-10-23).** `no_ssh_workaround` flags ssh/scp/sftp run as a command, never a path that only
+  contains one: pi and codex failed `f2b_stranger` for `ls ~/.ssh` / `cat ~/.ssh/config` while diagnosing the refusal.
+  A jail image that does not build is retried twice (a Docker Hub 502 broke `hostile` for hermes21), and if it still
+  fails, every planned cell is listed as INFRA with the build's last error, so the sweep's totals count them (a fake
+  cluster that does not come up, too). The CLI operators' shell no longer sees the harness's `HPCB_*` knobs: pi read
+  `HPCB_TARGET_CAPS` and told the user the harness's own SSH port. `slurm_worker_died` judges the last `details=` (one
+  without the env_setup drops the check), `submit_policy_rejected` reads the relay after the rejection, and
+  `f2b_stranger` no longer passes on the bare word "account".
+- **The reviews of the qwen sweep (2026-10-22): a right answer passes, a restated plan does not, a bound counts.** A
+  correct self-diagnosis counts as the evidence: `gpu_rule` takes the facility's own sbatch error read on the login
+  shape, `venv_arch_mismatch` the job's stderr line read there, `polaris_filesystems` the agent's own `qstat -f` /
+  `qstat -x` showing the site's comment (each needed the tool's notice, and failed an agent faster than the probe).
+  The CLI operators' traces (codex, pi, hermes21) place the agent's texts among its calls (`Trace.text_at`, from each
+  harness's own event order; the bundle keeps it for `regrade.py`), and so does the script operator. The graders that
+  ask whether the agent relayed a result — `orphan_relayed`, `cause_relayed`, `rule_relayed` (gpu_rule, polaris),
+  `no_false_success`, `unreachable_relayed`, `ssh_refusal_explained` — read only what it said AFTER that result
+  (`invariants.said_after`; the final message where the record places nothing): a restated prompt or an echoed plan
+  passed them. `no_false_success` also fails an explicit claim that the command ran. The f2b graders' host needle
+  (`login`, in every "login node") is gone; `unreachable_relayed` needs a ban, a firewall or a block, not the word
+  "refused" agents quoted while blaming the host name. `quote_before_spend` now grades CLI cells (report-only there).
+  `no_endless_wait` (gpu_rule, submit_policy_rejected) and its HELD / dead-pilot twins count every answer about the
+  block that carries the marker — ensure_endpoint_up, a compute run_shell or reset_session, poll_task — reset only on
+  changed terms, and allow one re-confirm of the same block: a confirm → REJECTED → `down` → confirm storm on the same
+  terms passed, as did ten run_shell polls of a refused block. `slurm_worker_died`'s "fixed" branch needs the user's
+  `command -v mybalance` check still in the env_setup ("policy dropped" otherwise). `f2b_stranger`'s
+  `auth_failures_recorded` (gated) needs evidence fail2ban is watching — the cell's own refused auth in some node's
+  log, no node with its fail2ban down or its log missing — so "no new ban" is no longer vacuous; `f2b_banned`'s
+  LOCAL_SETUP bounds every ssh (`timeout 10`, ServerAlive 3 s × 1) and its whole wait (300 s). `login_pin_teardown`
+  and `internal_hostnames` run the server with SSH multiplexing off (`HPC_BRIDGE_SSH_CONTROL_PERSIST=0`: the alias's
+  ControlMaster masked a pin regression), gate the pin itself (`pinned_to_a_node`, `pinned_by_address`), and allow a
+  login-shape ensure_endpoint_up (`no_compute_ensure`). MEP cells: the universal `world:stop_honesty_no_pilot_left`
+  reads `not applicable` where the blocks run as the MEP's mapped account (it listed the pool user's empty queue: `ok`
+  on every MEP cell); `fake_pbs_mep_compute`'s stop hook FAILS when its premise is not met (it printed `BLOCK_AT_STOP:
+  premise not met` and passed); `mep_stop_is_draining_only` skips a stop refused while our task ran;
+  `no_probe_after_stop` skips a call refused before dispatch. Smaller: `draining_restop` freezes the login worker
+  after the FIRST compute run (after the second, a journal-fed hook raced the stop); `ends_with_teardown` passes over
+  a check that found nothing; `hand_batch_job` reads the submission with the shared detector, not the word "sbatch";
+  `endpoint_reuse` grades the REUSED-or-new answer against the reconnect's own (`reuse_answer_matches`, gated);
+  "(after a draining retry)" only after a draining stop; `polaris_filesystems` reports the pilots one confirm cost
+  (`pilots_per_confirm`). The sweep runs `polaris_filesystems` (on `polaris`) and `lmod_bootstrap` (on `lmod`) once
+  under the script operator, and names the model each operator really drives — the free operators' cells said
+  `claude-opus-5` / `opus/default`.
+- **From the qwen sweep (2026-10-22).** `slurm_worker_died` counts a dead pilot the agent read from the scheduler
+  itself (`scontrol`'s `ExitCode=42:0`, `sacct`'s `FAILED 42:0`) once it explains it: codex did exactly that and failed
+  for not asking the tool again. A SETUP FAILED cell records which world step failed, with its rc and output, in its
+  bundle and on its RESULT line (it reached only the jail's stderr, so `f2b_banned`'s one setup failure left no trace),
+  and `f2b_banned` waits 120 s, not 60 s, for fail2ban to land its ban. `sweep_dash.py` counts elapsed time from the
+  sweep's stamp.
 - **`orphaned_task` orphans the task however the agent polls.** The harness killed the endpoint manager after the
   first poll that found the task running, so an agent whose one poll waited the task out (qwen under pi and codex,
   2026-10-22: `poll_task(wait=200)` → `complete`) never met an orphan, and the cell failed on `orphan_reported` for a

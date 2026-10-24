@@ -84,3 +84,16 @@ def test_pbs_profile_selects_its_own_stack_and_declares_the_scheduler(monkeypatc
     t = targets.get("fake")
     assert t.capabilities["scheduler"] == "pbs" and t.nodes == 2
     assert targets.meets({"scheduler": "pbs"}, t.capabilities)[0] and not targets.meets({"scheduler": "pbs"}, targets.load_profile("site")["capabilities"])[0]
+
+
+def test_every_boot_gives_each_pool_user_its_own_writable_home():
+    # f2b, re-run 2026-10-23: the two login nodes raced to create the shared homes; the loser skipped a half-made,
+    # root-owned home, and every SETUP write to ~ was refused — six cells SETUP FAILED "Permission denied"
+    fc = Path(__file__).resolve().parents[1] / "fakecluster"
+    ep = (fc / "entrypoint.sh").read_text()
+    loop = ep[ep.index('for u in "${POOL_USERS[@]}"; do'):ep.index("run_setup login")]
+    fi_end = loop.index("    fi\n")
+    assert 'chown "$u:hpcb" "$h" && chmod 700 "$h"' in loop[fi_end:], "ownership must be set outside the create branch"
+    assert "cp -rTn /etc/skel" in loop                                   # a second node never overwrites the first's
+    wait = (fc / "bin" / "wait-for-cluster.sh").read_text()
+    assert '.hpcb-write-check' in wait and "cannot write its home" in wait   # ready means the pool user can write ~

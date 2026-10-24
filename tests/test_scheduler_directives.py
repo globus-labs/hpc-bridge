@@ -351,6 +351,17 @@ def test_a_held_pilot_is_said_to_never_idle_release_and_what_ends_it():
     assert "never idle-releases" in why and "connect_facility does not cancel it; stop_endpoint does" in why
 
 
+@pytest.mark.parametrize(("row", "scheduler"), [(f"H 4.pbsserver - {_COMMENT}\n", "pbs"), ("PENDING 57 - JobHeldAdmin\n", "slurm")])
+def test_a_held_pilot_says_more_held_pilots_may_follow_until_a_stop(row, scheduler):
+    # polaris_filesystems, codex, sweep 2026-10-22: one confirm, and the endpoint scaled out a new pilot about every
+    # minute while the first was held ("Allocated block ID 0/1/2", each "marked as MISSING since the workers failed to
+    # register") — three held pilots, released by the stop. The notice says so, and to stop before fixing the config.
+    _cat, why = scheduler_ops._summarize_pilot(row, 30, scheduler=scheduler)
+    assert ("While a pilot is held the endpoint may submit further pilots for this block, each held the same way, "
+            "until stop_endpoint — so stop the endpoint first, then fix what holds it.") in why
+    assert why.index("so stop the endpoint first") < why.index("To end it now")
+
+
 @pytest.mark.parametrize("reason", ["JobHeldAdmin", "JobHeldUser"])
 def test_a_slurm_hold_gets_the_held_verdict_with_slurms_own_command(reason):
     # review T9: squeue never says "H" — a hold is a PENDING whose reason is JobHeld*; and its command is scontrol

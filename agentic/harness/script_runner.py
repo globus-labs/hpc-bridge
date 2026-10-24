@@ -127,6 +127,7 @@ class ScriptOps:
         self.ssh_host = ssh_host
         self.steps: list[Step] = []
         self.texts: list[str] = []
+        self.text_at: list[int] = []   # how many steps came before each text (the Trace's text_at: cli_runner)
 
     async def call(self, tool: str, **args: Any) -> dict:
         """One hpc-bridge tool call, recorded as a step. Never raises for the tool's failure (see the module doc)."""
@@ -147,8 +148,9 @@ class ScriptOps:
         return out
 
     def say(self, text: str) -> None:
-        """The script's own words: the trace's `texts`, as an agent's prose would be."""
+        """The script's own words: the trace's `texts`, as an agent's prose would be — placed after the steps so far."""
         self.texts.append(text)
+        self.text_at.append(len(self.steps))
         print(f"  ✎ {text}", flush=True)
 
     def abort(self, reason: str) -> NoReturn:
@@ -235,7 +237,8 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
           f"{'ERROR: ' + error if error else 'final: ' + repr(final_text[:240])}", flush=True)
     rows = _journal_rows(journal)
     events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}") for s in ops.steps]
-    trace, stats = build_trace(rows, events, ops.texts or ([final_text] if final_text else []))
+    texts, text_at = (ops.texts, ops.text_at) if ops.texts else (([final_text], [len(events)]) if final_text else ([], []))
+    trace, stats = build_trace(rows, events, texts, text_at)
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # The run dir dies with the jail: the steps (with their timestamps), the script's words and the journal ride in the
     # bundle — the cli_runner layout, which regrade.py and infra.py already read (the head row is `harness` + `rc`).
@@ -244,6 +247,6 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
                  "stderr_tail": (tb or error or "")[-4000:]},
                 *({"native": {**_bundle_native(e), "step": s.n, "t_start": s.t_start, "t_end": s.t_end}}
                   for s, e in zip(ops.steps, events, strict=True)),
-                *({"text": t} for t in ops.texts), {"final": final_text},
+                *({"text": t, "at": a} for t, a in zip(ops.texts, ops.text_at, strict=True)), {"final": final_text},
                 *({"journal": r} for r in rows)]
     return RunResult(trace=trace, final=CliFinal(result=final_text, is_error=error is not None), messages=messages)

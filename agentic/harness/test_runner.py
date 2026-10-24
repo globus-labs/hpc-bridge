@@ -1503,3 +1503,28 @@ def test_the_verdict_does_not_count_a_facility_endpoint_left_alone():
     only_mep = run_mod._registration_verdict(
         None, ["mep00000-1"], "mep00000 NOT deleted (not this run's endpoint: a multi-user endpoint 'hpcb-mep-open')")
     assert only_mep.startswith("none known") and "left alone" in only_mep
+
+
+def test_the_pilot_check_is_not_applicable_where_the_blocks_run_as_a_facility_meps_user(harness_run, monkeypatch):
+    # every MEP cell of the 2026-10-22 sweep read `ok` here: the check lists the POOL user's queue, and a facility
+    # multi-user endpoint's blocks run as its mapped account (hpcbmep) — vacuous, now said so
+    from invariants import ToolCall, Trace
+    monkeypatch.setenv("HPCB_TARGET_CAPS", '{"scheduler": "slurm", "pilot_end_wait_s": 60, "mep_mapped_user": "hpcbmep"}')
+    q = _Queue((0, ""))
+    monkeypatch.setattr(harness_run, "_ssh_run", lambda cmd, *, timeout=60, host=None: q.ssh(cmd))
+
+    class Scen:
+        POSTCHECKS: ClassVar[list] = []
+
+    attach = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "fake-mep-strict"},
+                         {"phase": "needs_account", "reused": True,
+                          "notice": "attached to the facility's multi-user endpoint (zero SSH, nothing to bootstrap). …"})
+    mep = types.SimpleNamespace(trace=Trace([attach]))
+    (row,) = asyncio.run(harness_run._postchecks(Scen, mep))
+    assert row.ok and row.detail.startswith("not applicable:") and "hpcbmep" in row.detail, row.detail
+    assert q.cmds == []                                                    # nothing was listed for the pool user
+    # a run that bootstrapped over SSH has pilots of the pool user: checked, as before
+    ssh = ToolCall.of("mcp__endpoint__connect_facility", {"facility": "f"},
+                      {"phase": "provisioning", "notice": "first contact over SSH: u@h; env_setup run there: 'x'"})
+    (row,) = asyncio.run(harness_run._postchecks(Scen, types.SimpleNamespace(trace=Trace([ssh]))))
+    assert row.ok and not row.detail.startswith("not applicable") and q.cmds, row.detail

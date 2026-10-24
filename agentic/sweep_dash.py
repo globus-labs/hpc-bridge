@@ -103,7 +103,8 @@ def status(repo: Path, since: str, base: dict, profiles: list[str], until: str =
                               text=True, timeout=5).stdout.split()
     except (OSError, subprocess.SubprocessError):   # no docker, or it hung: the count is a nicety
         jail = []
-    first = min((runs / f"sweep-{s}.md").stat().st_mtime for s in stamps) if stamps else time.time()
+    # the first sweep's own stamp (local time), never a summary's mtime: that moves with every line appended
+    first = time.mktime(time.strptime(stamps[0], "%Y%m%d-%H%M")) if stamps else time.time()
     return {"stamps": stamps, "ops": ops, "rows": rows, "jail": len(jail), "started": first, "now": time.time(),
             "baseline": bool(base)}
 

@@ -585,9 +585,15 @@ def _jobs_words(jobs: list[str]) -> str:
     return f"pilot {jobs[0]}" if len(jobs) == 1 else "pilots " + ", ".join(jobs[:-1]) + f" and {jobs[-1]}"
 
 
-# What a held pilot is, and what ends it: no reconnect does (connect_facility cancels nothing), a stop does.
+# What a held pilot is, and what ends it: no reconnect does (connect_facility cancels nothing), a stop does. And what
+# it costs while it waits: the endpoint scales out ANOTHER pilot for the same block request about every minute, each
+# held the same way, until a stop (the polaris profile, codex, sweep 2026-10-22: one confirm, three held pilots —
+# "Scaling out … Allocated block ID 0/1/2", each "marked as MISSING since the workers failed to register"; the stop
+# released 0.pbsserver 1.pbsserver 2.pbsserver). Said so the agent stops first and fixes the configuration after.
 _HELD_FATE = ("a held pilot runs no task and never idle-releases, so it stays in the queue until it is cancelled — "
-              "connect_facility does not cancel it; stop_endpoint does (every pilot of this endpoint).")
+              "connect_facility does not cancel it; stop_endpoint does (every pilot of this endpoint). While a pilot "
+              "is held the endpoint may submit further pilots for this block, each held the same way, until "
+              "stop_endpoint — so stop the endpoint first, then fix what holds it.")
 # The one way to end such a pilot before another block is asked for — without it, a per-user limit on queued jobs can
 # make the new block's submission read as refused, and the old pilot stays queued.
 _END_NOW = "To end it now, call stop_endpoint before confirming the new block."

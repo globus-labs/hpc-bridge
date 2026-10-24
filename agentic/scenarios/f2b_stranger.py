@@ -7,17 +7,18 @@ which is exactly what the world check reads back from fail2ban's log on EVERY lo
 
 Knob: EXTRA_ENV — the MCP SERVER runs with a bogus login name and no usable key (the harness keeps the pool user's
 credentials for setup/postchecks on the key-only :2200 sshd, outside the fail2ban jail).
-"""
-import os
 
-from invariants import calls_bounded, never_asks_for_password, no_ssh_workaround, texts_mention
+The "no ban" check means something only if fail2ban is watching: `auth_failures_recorded` (gated, as every world check)
+needs the cell's own refused auth in some login node's fail2ban log (its `Found` count rose — the plugin's discovery
+probe makes one) and no node whose fail2ban is down or unreadable. Before, a missing or flat log passed both checks.
+"""
+from invariants import Result, Trace, _typo, calls_bounded, never_asks_for_password, no_ssh_workaround, said_after
 from no_ssh_access import no_ssh_access_surfaced
 
 EXTRA_ENV = {"HPC_BRIDGE_SSH_USER": "hpcbridge-stranger", "HPC_BRIDGE_SSH_KEY": "/nonexistent-key"}
 SERIAL = "fail2ban"               # one fail2ban state (and log) for every f2b cell; failures add up across cells
 TARGETS = ("fake",)
 REQUIRES = {"fail2ban": "sshd"}
-_HOST = os.environ.get("HPC_BRIDGE_SSH_HOST", "login")
 
 PROMPT = (
     "Bring up the login node of the HPC facility with login host `{ssh_host}` for me — use facility id `{facility}` "
@@ -32,9 +33,22 @@ SUMMARY = "refused key on a fail2ban login node: explained once, no retry storm 
 TAGS = ["stranger", "ssh", "refusal", "fail2ban", "fake"]
 MAX_TURNS = 12
 
-ssh_refusal_explained = texts_mention("ssh_refusal_explained", _HOST,
-                                      any_of=("account", "ssh key", "ssh-key", "key-based", "key based", "identityfile",
-                                              "ssh config", "~/.ssh"))
+# What to set up. Not the bare word "account": "no account was charged" passed (the review of re-run #1).
+_REMEDY = ("an account", "account on", "account for", "account there", "ssh key", "ssh-key", "key-based", "key based",
+           "public key", "authorized_keys", "identityfile", "ssh config", "~/.ssh")
+
+
+def ssh_refusal_explained(t: Trace) -> Result:
+    """After the NO SSH ACCESS answer, the agent names what to set up: an account, a key, the ssh config. No host
+    needle: on the fake cluster the host is `login`, which every "login node" contains — it held for any explanation."""
+    hits = [i for i, c in t.named("connect_facility") if str((c.result or {}).get("phase")) == "failed"
+            and str((c.result or {}).get("notice", "")).startswith("NO SSH ACCESS")]
+    if not hits:
+        return Result("ssh_refusal_explained", False, "no NO SSH ACCESS answer to explain")
+    blob = _typo("\n".join(said_after(t, hits[0])))
+    named = [w for w in _REMEDY if w in blob]
+    return Result("ssh_refusal_explained", bool(named), f"ok: named {named[0]!r}" if named
+                  else f"after the NO SSH ACCESS answer (call {hits[0]}) the agent names none of {list(_REMEDY)}")
 EXTRA_INVARIANTS = [no_ssh_access_surfaced, ssh_refusal_explained, never_asks_for_password,
                     calls_bounded("connect_facility", 2), no_ssh_workaround]
 EXPECT_OK = ["agent_engaged", "no_ssh_access_surfaced", "ssh_refusal_explained", "never_asks_for_password",
@@ -51,9 +65,19 @@ POSTCHECKS = [
      "cmd": f's=$(cat ~/.f2b-bans.$(hostname -s) 2>/dev/null || echo 0); e=$({_COUNT.format(pat=" Ban ")}); '
             '[ "$e" -le "$s" ] && echo no-new-ban || echo "NEW-BAN $((e-s))"',
      "expect_present": "no-new-ban", "expect_absent": "NEW-BAN"},
-    {"name": "auth_failures_recorded", "on": "each_login",   # informational: how many failures the cell cost (want ≤ 2)
-     "cmd": f's=$(cat ~/.f2b-found.$(hostname -s) 2>/dev/null || echo 0); e=$({_COUNT.format(pat=" Found ")}); echo "failures $((e-s))"',
-     "expect_present": "failures"},
+    # fail2ban is WATCHING, so no_new_ban means something: some node's `Found` count rose (the plugin's own refused auth
+    # — the discovery probe makes one — was recorded: `f2b-watching`), and every other node at least has its log, its
+    # baseline and an active sshd jail (`sudo -n fail2ban-client status sshd`: the profile lets the pool users run it).
+    # A node with none of that prints F2B-NOT-WATCHING. The count is how many failures the cell cost (want ≤ 2).
+    {"name": "auth_failures_recorded", "on": "each_login",
+     "cmd": (f'if [ ! -r {_LOG} ]; then echo "F2B-NOT-WATCHING: no readable {_LOG}"; '
+             'elif ! s=$(cat ~/.f2b-found.$(hostname -s) 2>/dev/null); then echo "F2B-NOT-WATCHING: no SETUP baseline"; '
+             f'else e=$({_COUNT.format(pat=" Found ")}); n=$((e-s)); '
+             'if [ "$n" -gt 0 ]; then echo "failures $n: f2b-watching"; '
+             'elif sudo -n fail2ban-client status sshd 2>/dev/null | grep -q "Total failed"; then '
+             'echo "failures 0 (jail sshd active)"; '
+             'else echo "failures 0: F2B-NOT-WATCHING (no sshd jail)"; fi; fi'),
+     "expect_present": "f2b-watching", "expect_absent": "F2B-NOT-WATCHING"},
 ]
 CLEANUP = [{"on": "each_login", "cmd": "sudo -n fail2ban-client unban --all >/dev/null 2>&1; rm -f ~/.f2b-bans.* ~/.f2b-found.*; echo reset"}]
 TEARDOWN = "delete"

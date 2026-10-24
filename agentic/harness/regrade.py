@@ -45,7 +45,7 @@ from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
 
 # The per-run environment a scenario module reads WHEN IT IS IMPORTED — so the replay must re-create it per bundle:
 # HPCB_RUNID (canaries.nonce: the canary cells' graders, SETUP and POSTCHECKS), HPC_BRIDGE_SSH_HOST (the login host
-# no_ssh_access's and the f2b cells' graders name), HPC_BRIDGE_ENDPOINT_NAME and HPCB_TARGET_NODES (POSTCHECKS, SETUP),
+# no_ssh_access's graders name; the f2b cells' no longer do, 2026-10-22), HPC_BRIDGE_ENDPOINT_NAME and HPCB_TARGET_NODES (POSTCHECKS, SETUP),
 # HPCB_RELAUNCH_* (queued_check_relaunch's watch and NEEDS_COMPUTE_NODE). test_regrade holds every scenario to it.
 RUN_ENV = ("HPCB_RUNID", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPCB_TARGET_NODES",
            "HPCB_RELAUNCH_PHASE", "HPCB_RELAUNCH_HOLD_S", "HPCB_RELAUNCH_WATCH_S", "HPCB_RELAUNCH_PILOT_WAIT_S")

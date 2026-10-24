@@ -5,6 +5,9 @@
 # decision); and TWO login nodes behind the round-robin name `login` (login01.hpcb.test / login02.hpcb.test share
 # host keys like a real site does), so the endpoint lands on one and later control-plane SSH must reach THAT one
 # (the login-node pin, the class behind this week's Expanse bugs).
+# job_submit.lua (copied to /etc/slurm, readable on the nodes) carries only a site-style comment: its rule is the one NCSA
+# Delta's GPU partitions enforce, and the plugin's discovery/gate must surface it rather than let the block PEND or fail.
+# It used to say so in the file itself, which announced the test to an agent that read it (codex gpu_rule, 2026-10-23).
 name = "site"
 description = "site-like Slurm — 3 nodes, debug/compute/gpu, QOS caps, enforced accounting, fake mybalance, 2 NICs, 2 login nodes (round-robin)"
 

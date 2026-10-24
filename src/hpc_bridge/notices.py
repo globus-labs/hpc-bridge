@@ -132,8 +132,18 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
                               "no route to host", "network is unreachable", "operation timed out",  # macOS strerror
                               "host is down", "network is down", "connection reset by peer",
                               "kex_exchange_identification", "ssh: connect to host")):
+        # A REFUSED connection (not a name that does not resolve, not a timeout) is also what a firewall or an
+        # intrusion-prevention ban answers: fail2ban's REJECT after repeated failed logins from this address. Agents
+        # read the bare "Connection refused" as a wrong host name (the f2b_banned cell, 2026-10-22 sweep) — and a
+        # banned address that keeps retrying only extends its ban.
+        # ssh's own verdict, never any line of the stderr: "Control socket connect(…): Connection refused" (a stale
+        # multiplexing socket) ahead of a timed-out "connect to host" is no refused connection
+        banned = ("" if not re.search(r"connect to host [^\n]*connection refused", low) else
+                  " If the name is right, a refused connection can also be a firewall or an intrusion-prevention ban "
+                  "(e.g. fail2ban, after repeated failed logins from this address): then wait — a ban lifts after its "
+                  "ban time — or check with the site, rather than retrying now; each refused attempt can extend a ban.")
         return (f"CANNOT REACH {host}: {ssh_line[:200]}. Check the login host name and your network/VPN, "
-                "then call connect_facility again. Nothing was started or billed.")
+                f"then call connect_facility again.{banned} Nothing was started or billed.")
     if isinstance(exc, TimeoutError | asyncio.TimeoutError) or type(exc).__name__ == "TimeoutError":
         return (f"TIMED OUT waiting for the login node {host}: a bootstrap step did not finish in time (a slow login "
                 "node or filesystem). Every step is safe to repeat: an unfinished build of hpc-bridge's endpoint venv "

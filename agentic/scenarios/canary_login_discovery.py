@@ -31,8 +31,13 @@ PROMPT = (
     "Connect to the HPC facility with login host `{ssh_host}` (facility id `{facility}`) and give me a short status "
     "report: the partitions with their idle-node counts, what is in the queue (`squeue`), and my allocation balances "
     "(`mybalance`). Do NOT start a compute block — the free login shape is all this needs. This is an AUTOMATED run "
-    "with no human present: accept the discovered facility config yourself. Leave the endpoint online when you are done."
+    "with no human present: accept the discovered facility config yourself, and keep calling connect_facility until "
+    "it reports the login node is up with your allocations. Leave the endpoint online when you are done."
 )
+# "keep calling connect_facility until … allocations" (as spend_gate_enforced asks): the point includes the plugin's
+# parser returning the table past the planted footer, and pi (re-run 2026-10-23) read mybalance itself and never
+# reconnected after "bringing up the login node; call connect_facility again shortly" — allocations_parsed failed a
+# correct report, with the parser never asked.
 USER_GOAL = ""
 PERSONA = None
 KIND = "regression"

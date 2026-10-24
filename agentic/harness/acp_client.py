@@ -197,7 +197,7 @@ def hpc_bridge_mcp(repo_root: str, env: dict[str, str], *, operator: str) -> Mcp
     stderr wrapper (`operator` names the run's operator in its log)."""
     passthrough = ("HOME", "HPC_BRIDGE_USER_DIR", "GLOBUS_COMPUTE_USER_DIR", "HPC_BRIDGE_SSH_USER",
                    "HPC_BRIDGE_SSH_KEY", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPC_BRIDGE_MACHINE",
-                   "HPC_BRIDGE_SEARCH_INDEX", "HPC_BRIDGE_CATALOG_FILE", "HPCB_HARNESS_SSH_PORT")
+                   "HPC_BRIDGE_SEARCH_INDEX", "HPC_BRIDGE_CATALOG_FILE")
     ev = [EnvVariable(name=k, value=env[k]) for k in passthrough if k in env]
     cmd = wrap(["/usr/local/bin/uv", "run", "--directory", repo_root, "--extra", "integration", "hpc-bridge"], operator)
     return McpServerStdio(name="hpc-bridge", command=cmd[0], args=cmd[1:], env=ev)

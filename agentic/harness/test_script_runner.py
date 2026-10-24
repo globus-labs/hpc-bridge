@@ -153,7 +153,7 @@ def test_steps_are_recorded_with_their_times_and_the_trace_is_built_from_the_jou
     # the trace: the journal's record, in the steps' order, stamped with the server's own clock
     assert [c.name for c in r.trace.calls] == ["connect_facility", "ensure_endpoint_up", "stop_endpoint"]
     assert r.trace.calls[2].result["spend_stopped"] is True and r.trace.calls[1].t_call == 1.0
-    assert r.trace.texts == ["pilot queued"]
+    assert r.trace.texts == ["pilot queued"] and r.trace.text_at == [2]   # said after its two steps (said_after reads it)
     assert r.final.result == "stopped" and r.final.is_error is False
     head = r.messages[0]
     assert head["harness"] == "script" and head["rc"] == 0 and head["trace_stats"]["journal_unplaced"] == 0
@@ -164,6 +164,7 @@ def test_steps_are_recorded_with_their_times_and_the_trace_is_built_from_the_jou
     # the bundle replays to the same trace (regrade.py reads the cli_runner layout)
     replay = trace_from_bundle_messages(json.loads(json.dumps(r.messages)))
     assert [(c.name, c.result) for c in replay.calls] == [(c.name, c.result) for c in r.trace.calls]
+    assert replay.text_at == [2]
 
 
 def test_an_aborted_script_ends_errored_with_its_reason_and_keeps_its_steps(tmp_path, monkeypatch):

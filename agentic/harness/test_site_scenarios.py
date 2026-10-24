@@ -125,7 +125,7 @@ def test_gpu_rule_graders_take_either_branch():
     assert g.no_endless_wait(satisfied).ok
     forever = Trace([_connect("needs_account", ALLOCS), start] + [_ensure("provisioning", REJ, shape="compute")] * 6 + [_stop()],
                     ["still allocating…"])
-    assert not g.no_endless_wait(forever).ok and "5 consecutive" in g.no_endless_wait(forever).detail  # the first REJECTED notice is the signal; the 5 after it are the wait
+    assert not g.no_endless_wait(forever).ok and "5 more answers" in g.no_endless_wait(forever).detail  # the first REJECTED notice is the signal; the 5 after it are the wait
     assert not g.gpu_rule_handled(forever).ok
     # a reconfigure (connect with details) or a different answer resets the streak
     recon = Trace([_connect("needs_account", ALLOCS), start] + [_ensure("provisioning", REJ, shape="compute")] * 3
@@ -134,6 +134,34 @@ def test_gpu_rule_graders_take_either_branch():
     assert g.no_endless_wait(recon).ok
     # a run on the wrong node, or without a GPU, is not the GPU branch
     assert not g.gpu_block_ran(Trace([start, _run("compute", "c1\nCUDA_VISIBLE_DEVICES=\n")])).ok
+
+
+
+def test_gpu_rule_the_facilitys_own_error_read_in_the_log_is_the_evidence():
+    # live 2026-09-05 and again in the review of the 2026-10-22 sweep: the agent read sbatch's error in the endpoint log
+    # before the #32 probe's grace — the rejection was real and diagnosed, and gpu_rule_handled failed it for the tool's
+    # notice never having fired
+    import gpu_rule as g
+    start = _ensure("provisioning", "allocating nodes on 'gpu'…", shape="compute", account="hpcb-gpu", partition="gpu",
+                    confirm_spend=True)
+    log = _run("login", "sbatch: error: site rule: jobs on the gpu partition must request a GPU (--gpus-per-node)")
+    texts = ["Checking the endpoint log.", "The site rule: jobs on the gpu partition must request a GPU (--gpus-per-node=1)."]
+    t = Trace([_connect("needs_account", ALLOCS), start, log, _stop()], texts, [2, 3])
+    assert not g.rejection_surfaced(t).ok and g.rule_found_in_log(t).ok   # rejection_surfaced stays a report-only row
+    r = g.gpu_rule_handled(t)
+    assert r.ok and "read the rule's message from the login node" in r.detail, r.detail
+
+
+def test_gpu_rule_the_rule_must_be_relayed_after_it_reached_the_agent():
+    # a restated prompt ("…a resource request the partition demands…") named the rule before anything was rejected
+    import gpu_rule as g
+    start = _ensure("provisioning", "allocating", shape="compute", account="hpcb-gpu", partition="gpu", confirm_spend=True)
+    plan = "Plan: start the gpu block; if it is rejected I'll find the site rule — e.g. a GPU request (--gres) it must request."
+    t = Trace([_connect("needs_account", ALLOCS), start, _ensure("provisioning", REJ, shape="compute"), _stop()],
+              [plan, "The block did not start. Stopped."], [1, 3])
+    assert not g.rule_relayed(t).ok and not g.gpu_rule_handled(t).ok
+    assert g.rule_relayed(Trace(t.calls, [plan, "Rejected: the gpu partition demands a GPU request (--gpus-per-node)."],
+                                [1, 3])).ok
 
 
 def test_submit_policy_rejected_graders():
@@ -148,6 +176,10 @@ def test_submit_policy_rejected_graders():
     # relaying a rejection without the facility's words is not enough; a block that came up means the limit did not bite
     vague = Trace(good.calls, ["The block was rejected. Stopped."])
     assert not sp.policy_relayed(vague).ok
+    # said after the REJECTED answer: a plan restating the policy words before anything ran is not a relay
+    plan = "If the block is rejected for an accounting/QOS policy (job submit limit), I'll relay it and stop."
+    assert not sp.policy_relayed(Trace(good.calls, [plan, "Stopped."], [0, len(good.calls)])).ok
+    assert sp.policy_relayed(Trace(good.calls, ["Connecting.", good.texts[-1]], [0, len(good.calls)])).ok
     came_up = Trace([start, _ensure("up", shape="compute"), _run("compute", "c1"), _stop()], good.texts)
     r = sp.block_never_ran(came_up)
     assert not r.ok and "did not bite" in r.detail
@@ -293,3 +325,23 @@ def test_the_submit_policy_script_aborts_on_a_build_without_the_schedulers_words
     with pytest.raises(script_runner.ScriptAbort, match="did not bite"):
         asyncio.run(sp.SCRIPT(ops))
     assert sp.quoted_reply(_PROBE_LIKELY["notice"]) == _SBATCH and sp.quoted_reply(old["notice"]) is None
+
+
+def test_hand_batch_job_reads_the_submission_by_the_shared_detector():
+    # hand_batch_job matched the word "sbatch" (less a `cat >`): an `sbatch --help` (or `man sbatch`, or a refused call)
+    # before the real submission was read AS the submission, and submission_noticed / job_cancelled judged the wrong call
+    import hand_batch_job as sc
+
+    def shell(cmd, stdout="", notice="", phase="complete"):
+        return ToolCall.of("mcp__endpoint__run_shell", {"shape": "login", "command": cmd},
+                           {"phase": phase, "stdout": stdout, "notice": notice})
+    script = shell(sc._SCRIPT)
+    helped = shell("sbatch --help | head -5", "Usage: sbatch [OPTIONS(0)...]")
+    submit = shell("sbatch hpcb_hand.sh", "Submitted batch job 41\n",
+                   "this job bills the allocation like a block; hpc-bridge does not track it — scancel 41 to end it")
+    cancel = shell("scancel 41")
+    t = Trace([script, helped, submit, cancel])
+    assert sc.submission_noticed(t).ok, sc.submission_noticed(t).detail
+    assert sc.job_cancelled(Trace([script, submit, cancel])).ok
+    # a cancel BEFORE the real submission is not its cancel
+    assert not sc.job_cancelled(Trace([script, helped, cancel, submit])).ok

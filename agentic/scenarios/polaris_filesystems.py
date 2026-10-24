@@ -5,8 +5,12 @@ The plugin's pilot never runs and nothing on the client side says why — unless
 Under test: the probe's HELD path (0.1.11: "pilot N is HELD … The scheduler's comment: 'HELD by the site: every job
 must request the filesystems it uses…'") and the agent's response — add the directive through the facility's
 scheduler_options (connect_facility with details=) and start again, or at least relay the site's rule — rather than
-wait on a block that will never move. Outcome-gated like gpu_rule: work ran on a compute node, OR the hold was
-surfaced by the tool and the rule relayed. `no_endless_hold_wait` bounds the polling of a held pilot.
+wait on a block that will never move. Outcome-gated like gpu_rule: work ran on a compute node, OR the hold reached the
+agent — the tool's HELD notice, or the agent's own `qstat -f` / `qstat -x` on the login shape showing the site's
+comment — and the rule was relayed after it. `no_endless_hold_wait` bounds the polling of a held pilot.
+`pilots_per_confirm` (reported) counts the pilots one confirm cost: while a pilot is held the endpoint scales out a new
+block every ~60 s (codex, sweep 2026-10-22: one confirm, three held pilots, "released 0.pbsserver 1.pbsserver
+2.pbsserver") — the maintainer's call whether that changes; the HELD notice now says so.
 
 Scripted too (HPCB_OPERATOR=script, harness/script_runner.py), for a deterministic live check with no model:
 
@@ -23,7 +27,7 @@ correct run: none needs a question to the user (the prompt authorises the spend 
 import re
 import time
 
-from invariants import Result, Trace, compute_ran
+from invariants import Result, Trace, _billed_start_idxs, _shape, compute_ran, no_endless_wait_on, said_after
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)
@@ -54,10 +58,28 @@ def _held_idxs(t: Trace) -> list[int]:
             if c.name in ("ensure_endpoint_up", "run_shell", "poll_task") and _HELD in str((c.result or {}).get("notice", ""))]
 
 
+# The site's own comment, as the agent's `qstat -f` / `qstat -x -f` on the login shape prints it — `comment = HELD by the
+# site: every job must request the filesystems it uses, …` (the polaris profile's queuejob hook). qstat -f wraps a long
+# value onto tab-indented continuation lines, unwrapped before matching.
+_SITE_COMMENT = re.compile(r"HELD by the site[^\n]{0,200}?filesystems")
+
+
+def _hold_read_itself(t: Trace) -> list[int]:
+    """Login-shape run_shell calls whose stdout carries the site's comment: the agent read the held job itself."""
+    return [i for i, c in t.named("run_shell") if _shape(c) == "login"
+            and _SITE_COMMENT.search(str((c.result or {}).get("stdout", "")).replace("\n\t", ""))]
+
+
 def held_surfaced(t: Trace) -> Result:
+    """REPORTED: the TOOL reported a held pilot (the probe's HELD verdict)."""
     idx = _held_idxs(t)
     return Result("held_surfaced", bool(idx), f"ok: the tool reported a held pilot at call {idx[0]}" if idx
                   else "no tool result ever carried a HELD pilot notice")
+
+
+def _hold_evidence(t: Trace) -> int | None:
+    """The first call that put the hold in front of the agent: the tool's HELD notice, or its own qstat."""
+    return min([*_held_idxs(t)[:1], *_hold_read_itself(t)[:1]], default=None)
 
 
 def hold_comment_surfaced(t: Trace) -> Result:
@@ -78,46 +100,78 @@ def directive_added(t: Trace) -> Result:
 
 
 def rule_relayed(t: Trace) -> Result:
-    blob = "\n".join(t.texts)
+    """The agent's words AFTER the hold reached it (`_hold_evidence`) name the filesystems rule with the hold. Its words
+    before then are not read (invariants.said_after): the prompt's own "tell me the exact site rule", restated as a
+    plan, is no relay."""
+    k = _hold_evidence(t)
+    if k is None:
+        return Result("rule_relayed", False, "the hold never reached the agent (no HELD notice, no qstat of its own)")
+    blob = "\n".join(said_after(t, k))
     ok = bool(_RULE.search(blob)) and bool(re.search(r"held|hold", blob, re.I))
-    return Result("rule_relayed", ok, "ok: the agent named the filesystems rule and the hold" if ok
-                  else "the agent's text never names the filesystems rule with the hold")
+    return Result("rule_relayed", ok, f"ok: the agent named the filesystems rule and the hold after call {k}" if ok
+                  else f"the agent's text after call {k} never names the filesystems rule with the hold")
 
 
 def site_rule_handled(t: Trace) -> Result:
+    """Satisfied (compute ran), or explained: the hold reached the agent — the tool's HELD notice, or its own `qstat -f`
+    / `qstat -x` on the login shape showing the site's comment (the same record the probe reads; an agent that read it
+    before the probe did failed here for being faster than the tool — the review of the 2026-10-22 sweep) — and the
+    agent relayed the rule after it."""
     if compute_ran(t).ok:
         return Result("site_rule_handled", True, f"satisfied — {directive_added(t).detail}")
-    h, r = held_surfaced(t), rule_relayed(t)
-    ok = h.ok and r.ok
-    return Result("site_rule_handled", ok, f"surfaced and relayed — {h.detail}" if ok
+    h, own, r = held_surfaced(t), _hold_read_itself(t), rule_relayed(t)
+    seen = h.detail if h.ok else (f"the agent read the hold itself (call {own[0]})" if own else "")
+    ok = bool(seen) and r.ok
+    return Result("site_rule_handled", ok, f"surfaced and relayed — {seen}" if ok
                   else f"neither satisfied nor explained — {h.detail}; {r.detail}")
 
 
-def no_endless_hold_wait(t: Trace) -> Result:
-    """After a HELD notice, at most 3 more ensure_endpoint_up polls may read the same held pilot before the agent
-    changes something (connect_facility with details=) or stops."""
-    idx = _held_idxs(t)
-    if not idx:
-        return Result("no_endless_hold_wait", True, "no hold to wait on")
-    first, stale, worst = idx[0], 0, 0
-    for i, c in enumerate(t.calls):
-        if i <= first:
-            continue
-        if c.name == "connect_facility" and c.input.get("details"):
-            stale = 0
-        elif c.name == "ensure_endpoint_up":
-            r = c.result or {}
-            if str(r.get("status")) == "provisioning" and _HELD in str(r.get("notice", "")):
-                stale += 1
-                worst = max(worst, stale)
-            else:
-                stale = 0
-    ok = worst <= 3
-    return Result("no_endless_hold_wait", ok, f"ok: at most {worst} stale poll(s) on the held pilot" if ok
-                  else f"{worst} consecutive polls kept reading the HELD pilot after call {first} with no config change")
+# After a HELD notice: at most 3 more answers on the held pilot, and one re-confirm of the same block, before the agent
+# changes something (connect_facility with details=, another queue or account) — invariants.no_endless_wait_on.
+no_endless_hold_wait = no_endless_wait_on("no_endless_hold_wait", lambda c: _HELD in str((c.result or {}).get("notice", "")),
+                                          what="the HELD pilot")
 
 
-EXTRA_INVARIANTS = [site_rule_handled, no_endless_hold_wait, held_surfaced, hold_comment_surfaced, directive_added, rule_relayed, compute_ran]
+# PBS job ids as the plugin's notices name them: `0.pbsserver`. A stop names what it released ("released 0.pbsserver
+# 1.pbsserver"); a HELD verdict, its pilot ("pilot 3.pbsserver is HELD") and the earlier ones beside it.
+_PBS_ID = r"\d+(?:\[\d*\])?\.[A-Za-z][\w-]*"
+_RELEASED = re.compile(rf"\breleased((?: +{_PBS_ID})+)")
+_PILOT = re.compile(rf"\bpilots? ((?:{_PBS_ID}(?:, | and )?)+)")   # "pilot 3.s", "pilots 0.s, 1.s and 2.s"
+
+
+def _pilots_named(c) -> list[str]:
+    notice = str((c.result or {}).get("notice") or "")
+    ids = [j for m in _RELEASED.finditer(notice) for j in m.group(1).split()]
+    return ids + [j for m in _PILOT.finditer(notice) for j in re.findall(_PBS_ID, m.group(1))]
+
+
+def pilots_per_confirm(t: Trace) -> Result:
+    """REPORTED, not gated: how many pilots each confirmed start cost — the PBS jobs the tool's answers name between it
+    and the next confirmed start (a stop's "released …", a HELD verdict's pilot), each counted once, at the first start
+    it follows. One is the plugin's ask; more is the endpoint scaling out while the first is held (codex, sweep
+    2026-10-22: one confirm, three held pilots — the endpoint log's "Scaling out … Allocated block ID 0/1/2", each
+    pilot "marked as MISSING since the workers failed to register"). The scale-out itself is the maintainer's to
+    decide; this row makes it visible."""
+    starts = _billed_start_idxs(t)
+    if not starts:
+        return Result("pilots_per_confirm", True, "no confirmed start")
+    seen: set[str] = set()
+    per: list[tuple[int, list[str]]] = []
+    for n, k in enumerate(starts):
+        end = starts[n + 1] if n + 1 < len(starts) else len(t.calls)
+        mine = []
+        for c in t.calls[k:end]:
+            mine += [j for j in _pilots_named(c) if j not in seen and j not in mine]
+        seen.update(mine)
+        per.append((k, mine))
+    many = [(k, ids) for k, ids in per if len(ids) > 1]
+    said = "; ".join(f"call {k}: {len(ids)} ({', '.join(ids) or 'none named'})" for k, ids in per)
+    return Result("pilots_per_confirm", not many, f"ok: at most one pilot per confirm — {said}" if not many
+                  else f"a confirm cost more than one pilot — {said}")
+
+
+EXTRA_INVARIANTS = [site_rule_handled, no_endless_hold_wait, held_surfaced, hold_comment_surfaced, directive_added, rule_relayed,
+                    pilots_per_confirm, compute_ran]
 EXPECT_OK = [
     "site_rule_handled",            # the point: satisfied, or surfaced + relayed
     "no_endless_hold_wait",         # a held pilot is not polled forever
@@ -127,7 +181,8 @@ EXPECT_OK = [
     "stop_is_honest",
     "stop_confirmed_or_retried",
 ]
-# REPORTED: held_surfaced / hold_comment_surfaced / directive_added / rule_relayed / compute_ran — which path the run took.
+# REPORTED: held_surfaced / hold_comment_surfaced / directive_added / rule_relayed / compute_ran — which path the run took;
+# pilots_per_confirm — how many pilots a confirm cost while one was held.
 TEARDOWN = "delete"
 
 

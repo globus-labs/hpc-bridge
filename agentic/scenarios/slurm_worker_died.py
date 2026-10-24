@@ -7,13 +7,15 @@ only, so the login-node bootstrap sails through and every compute-node worker_in
 the pilot FAILS in seconds with exit code 42 and vanishes from `squeue`. Before 0.1.13 the probe then said the
 submission was "likely REJECTED"; now it must say the pilot FINISHED with exit status 42 and point at its output.
 
-Outcome-gated: the tool surfaced the died pilot with its exit status AND the agent relayed the cause (the env_setup's
-policy check fails on the compute nodes: exit 42), OR the agent fixed the env_setup and compute ran. Bounded polling
+Outcome-gated: the died pilot was seen with its exit status — the tool's report, or the agent's own scontrol / sacct
+read — AND the agent relayed the cause after it (the env_setup's policy check fails on the compute nodes: exit 42), OR
+compute ran with the user's policy check still in the env_setup (a run that dropped it is not a fix). Bounded polling
 of a dead pilot either way.
 """
+import json
 import re
 
-from invariants import Result, Trace, compute_ran
+from invariants import Result, Trace, _slurm_work_idxs, compute_ran, no_endless_wait_on, said_after
 
 NEEDS_COMPUTE_NODE = True
 TARGETS = ("fake",)
@@ -64,43 +66,86 @@ def exit_status_correct(t: Trace) -> Result:
     return Result("exit_status_correct", ok, "ok: exit status 42" if ok else f"exit statuses reported: {[x for _, x in hits]}")
 
 
+def _dead_pilot_evidence(t: Trace) -> int | None:
+    """The first call that showed the agent the dead pilot: the tool's FINISHED report, or its own scheduler read."""
+    own = _read_dead_pilot_itself(t)
+    return min([*(i for i, _ in _finished_idxs(t)[:1]), *([own] if own is not None else [])], default=None)
+
+
 def cause_relayed(t: Trace) -> Result:
-    blob = "\n".join(t.texts)
+    """The agent's words AFTER it saw the dead pilot (`_dead_pilot_evidence`) tie exit 42 to the env_setup check. Its
+    words before then are not read (invariants.said_after): an agent echoing its plan — "prepending `command -v
+    mybalance >/dev/null 2>&1 || exit 42; ` to env_setup" — named both before anything had died, and passed."""
+    k = _dead_pilot_evidence(t)
+    if k is None:
+        return Result("cause_relayed", False, "the dead pilot never reached the agent (no FINISHED report, no read of its own)")
+    blob = "\n".join(said_after(t, k))
     ok = "42" in blob and bool(re.search(r"mybalance|env_setup|worker_init|compute node", blob, re.I))
-    return Result("cause_relayed", ok, "ok: the agent named the exit status and the cause" if ok
-                  else "the agent's text does not tie exit 42 to the env_setup check on the compute nodes")
+    return Result("cause_relayed", ok, f"ok: the agent named the exit status and the cause after call {k}" if ok
+                  else f"the agent's text after call {k} does not tie exit 42 to the env_setup check on the compute nodes")
+
+
+# The scheduler's own record of the dead pilot, as the agent read it on the login node: scontrol's `ExitCode=42:0`, or
+# sacct's `FAILED … 42:0`.
+_OWN_READ = re.compile(r"ExitCode=42:\d|\bFAILED\b[^\n]*\b42:\d")
+
+
+def _read_dead_pilot_itself(t: Trace) -> int | None:
+    for i, c in enumerate(t.calls):
+        if c.name == "run_shell" and _OWN_READ.search(str((c.result or {}).get("stdout", ""))):
+            return i
+    return None
+
+
+_POLICY = "command -v mybalance"   # the user's site-policy check, which a fix must keep
+
+
+def _env_setup_before(t: Trace, k: int) -> str | None:
+    """The env_setup the block that ran at call `k` was configured with: the LAST connect_facility(details=…) before
+    it (details as an object, or as the JSON string a CLI harness may have sent) — "" when that connect left env_setup
+    out, which drops the user's check (the server falls back to the proposed env_setup; the review of re-run #1: a
+    later details= without env_setup passed as "fixed" on the earlier one). None: no connect sent details."""
+    for c in reversed(t.calls[:k]):
+        det = c.input.get("details") if c.name == "connect_facility" else None
+        if isinstance(det, str):
+            try:
+                det = json.loads(det)
+            except ValueError:
+                det = None
+        if isinstance(det, dict):
+            return str(det.get("env_setup") or "")
+    return None
 
 
 def died_pilot_handled(t: Trace) -> Result:
+    """Fixed (compute ran WITH the user's policy check still in the env_setup), or explained: the dead pilot is seen —
+    hpc-bridge's report of it, or the agent's own read of the scheduler's record — and the agent ties exit 42 to the
+    env_setup check. codex (sweep 2026-10-22) read `scontrol show job` itself, explained it correctly and never polled
+    ensure_endpoint_up again: it failed here, for diagnosing the failure rather than asking the tool. A block that ran
+    because the agent dropped `command -v mybalance` from the env_setup (or never added it) is no fix: the user's
+    policy went, and it passed here as "fixed"."""
     if compute_ran(t).ok:
-        return Result("died_pilot_handled", True, "fixed — compute ran after the env_setup was corrected")
-    f, c = finished_surfaced(t), cause_relayed(t)
-    ok = f.ok and c.ok
-    return Result("died_pilot_handled", ok, f"surfaced and relayed — {f.detail}" if ok else f"neither fixed nor explained — {f.detail}; {c.detail}")
+        k = _slurm_work_idxs(t)[0]
+        env = _env_setup_before(t, k)
+        if env is None or _POLICY not in env:
+            return Result("died_pilot_handled", False,
+                          f"policy dropped — compute ran (call {k}) on an env_setup without the user's `{_POLICY}` check: "
+                          + (f"{env[:120]!r}" if env else "the last details= set no env_setup" if env is not None
+                             else "no connect set an env_setup"))
+        return Result("died_pilot_handled", True, "fixed — compute ran with the policy check still in the env_setup")
+    f, c, own = finished_surfaced(t), cause_relayed(t), _read_dead_pilot_itself(t)
+    seen = f.detail if f.ok else (f"the agent read the dead pilot itself (call {own})" if own is not None else "")
+    ok = bool(seen) and c.ok
+    return Result("died_pilot_handled", ok, f"surfaced and relayed — {seen}" if ok
+                  else f"neither fixed nor explained — {f.detail}; {c.detail}")
 
 
-def no_endless_dead_wait(t: Trace) -> Result:
-    """After the tool said FINISHED, at most 3 more ensure_endpoint_up polls may read the same dead pilot before the
-    agent changes the config (connect_facility with details=) or stops."""
-    hits = _finished_idxs(t)
-    if not hits:
-        return Result("no_endless_dead_wait", True, "no dead pilot to wait on")
-    first, stale, worst = hits[0][0], 0, 0
-    for i, c in enumerate(t.calls):
-        if i <= first:
-            continue
-        if c.name == "connect_facility" and c.input.get("details"):
-            stale = 0
-        elif c.name == "ensure_endpoint_up":
-            r = c.result or {}
-            if str(r.get("status")) == "provisioning" and _FINISHED.search(str(r.get("notice", ""))):
-                stale += 1
-                worst = max(worst, stale)
-            else:
-                stale = 0
-    ok = worst <= 3
-    return Result("no_endless_dead_wait", ok, f"ok: at most {worst} stale poll(s)" if ok
-                  else f"{worst} consecutive polls kept reading the dead pilot after call {first} with no config change")
+# After the tool said FINISHED: at most 3 more answers on the dead pilot, and one re-confirm of the same block, before
+# the agent changes the config (connect_facility with details=, another partition or account) —
+# invariants.no_endless_wait_on.
+no_endless_dead_wait = no_endless_wait_on("no_endless_dead_wait",
+                                          lambda c: bool(_FINISHED.search(str((c.result or {}).get("notice", "")))),
+                                          what="the dead pilot")
 
 
 EXTRA_INVARIANTS = [died_pilot_handled, no_endless_dead_wait, finished_surfaced, exit_status_correct, cause_relayed, compute_ran]
