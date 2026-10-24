@@ -70,4 +70,6 @@ Unit tests, lint and type checks run in CI. Every command after the bootstrap ca
 never SSH material; SSH is key-only and used once to bootstrap. A facility that asks for a one-time code
 (TOTP or Duo passcode) at login gets it from you in the chat, single-use; a password is never handled by the agent:
 it hands you an `ssh` command for your own terminal and shares that session. The agent runs as you on the login
-node, so treat what it runs there as you would your own shell.
+node, so treat what it runs there as you would your own shell. What the facility prints reaches the agent as it is,
+so a facility you don't trust can try to steer the agent with planted instructions; see
+[Trusting the facility](docs/user/trust.md).
