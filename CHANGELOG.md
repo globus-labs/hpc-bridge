@@ -5,6 +5,41 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## Unreleased
 
+### Added
+- **A block asks for what the work needs: a slice of a node, and N nodes are one shell over the allocation.** On the
+  live Anvil run of 2026-10-24 a bring-your-own block on the per-core `shared` partition asked for an exclusive whole
+  node (parsl's default), queued for more than a day waiting for an idle one, and would have billed all 128 cores.
+  `ensure_endpoint_up` now takes `cores`, `memory_gb`, `gpus` (per node), `nodes` and `whole_node`. Like the partition
+  and the account they persist for the session, and a change is a different block: spend is asked again and the old
+  block is handled as a partition switch handles it.
+  - On a per-core partition with nothing asked, the spend question proposes a modest slice (8 cores, never more than
+    half a node or than a per-job cap allows, with the partition's default memory per core) for the user to confirm
+    or change; on a partition that hands out only whole nodes, it is a whole node. The terms (`block`) carry the slice
+    (`whole_node`, `cores_per_node`, `memory_gb`, `gpus_per_node`, `size_source`) and, where the partition's billing
+    weights are known, the most the block can cost (`max_charge`, "at most 4 SU: 8 cores × 0.5 h"). More than one
+    node is one shell on the first node: the terms say to run work across them with `srun` / `mpiexec`, and that nodes
+    not used still bill.
+  - Slurm blocks render parsl's `cores_per_node` / `mem_per_node` (`--cpus-per-task` with one task per node,
+    `--mem=<GB>g`) with `exclusive`, and GPUs as hpc-bridge's own `#SBATCH --gpus-per-node`; PBS blocks render ncpus,
+    `mem`/`ngpus` in the chunk and a `place` only where one is needed (a slice asks to share where the default place is
+    exclusive; never `place=excl` for a slice). A block of several nodes takes parsl's SimpleLauncher, so one worker
+    runs in the batch script on the first node (SrunLauncher started a worker pool on every node).
+  - The login-node probe classifies each partition as per-core or whole-node (Slurm `SelectType`, `OverSubscribe`,
+    `ExclusiveUser`, the QOS per-job caps, `TRESBillingWeights`, the node's cores, memory and GPUs; PBS node `sharing`
+    and the default `place`). The proposal carries it, and a registry entry can too (`defaults.partitions`, checked
+    strictly at ingest): the Expanse and Anvil entries now do, so they need a re-ingest.
+  - A size the partition cannot give is refused before anything is submitted, saying why: a slice of a whole-node
+    partition, `whole_node=True` with fewer cores than a node, more cores, memory or GPUs than a node has, more than a
+    QOS per-job cap allows (Expanse's 127 CPUs per job). So is a size an endpoint configured before this change cannot
+    render (teardown and connect again to configure it), and, on a facility endpoint, a size key its own template does
+    not take ("this facility's endpoint sets the block size"); never dropped silently.
+  - The `driving-hpc` skill says to ask what the work needs, what a slice and a whole node cost, and what several
+    nodes mean.
+- **The fake cluster's `slices` profile** (a per-core `shared` partition beside a whole-node `whole` one) and two
+  scripted scenarios: `slice_request` (2 cores and 2 GB, which sacct's AllocCPUS / ReqMem must show; a slice of
+  `whole` refused) and `multinode_allocation` (2 nodes: `srun -N2 hostname` names two nodes, hpc-bridge's worker runs
+  only on the first). Not yet run live.
+
 ### Fixed
 - **The user guide says plainly that facility output reaches the agent unfiltered** ([Trusting the facility](docs/user/trust.md)):
   on an untrustworthy facility, planted text in command output can steer the agent. The qwen sweeps' hostile cluster

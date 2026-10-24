@@ -80,6 +80,8 @@ mep_no_account                the registry tier: the real globus-labs MEP + a se
 needs_login_paste             the registry tier: a logged-out connect to the real registry's globus-labs entry
 saturation                    globus1: holds every node for 25 min (re-homing it to fake is a later change)
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
+slice_request                 new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
+multinode_allocation          new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
 EXCLUDED
 }
 

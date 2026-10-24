@@ -5,5 +5,15 @@
 
 Split step 3 (2026-09-03). A notice IS the product — the agent reads it and acts, and the harness graders key on some phrases (`NO ACCOUNT`, `not confirmed`, `ORPHANED`) — so the words live in one place. No I/O and no state mutation here: a builder reads [[context]] / [[config]] and returns text or a model. [[server]] re-exports every name, so tests that import `server._explain_provision_error` keep working; none of these is monkeypatched.
 
+**The block's size (2026-10-24, [[Resource requests]]).** `_block_terms` reads the size through `_block_size`
+(`notices.py:346`: the facility's `block_size` on hpc-bridge's own template, the received keys on a facility endpoint)
+and the cost through `resources.charge`; `_terms_line` says it ("1 node × 8 cores, 15 GB (the partition's default per
+core) …; at most 4 SU: 8 cores × 0.5 h") and `_size_sentence` (`:472`) what it means — hpc-bridge's proposal on a
+per-core partition (ask the user), whole nodes because the partition gives only those, and N > 1 nodes (D2: one shell
+on the first node, srun/mpiexec, unused nodes bill). `_connect_terms_note` asks "whether that slice is enough";
+`_spend_floor_guidance` says to send `cores=/memory_gb=/gpus=/nodes=` in the same call. `_size_refusal` (`:368`) is the
+validation ([[server]]). A switch's words come from `_changed` / `_old_terms` (`:740`): "partition or account" as
+before, "partition, account or size" when the size moved, the old size named.
+
 ## See also
 [[server]] · [[models]] · [[context]] · [[config]] · [[cost]]

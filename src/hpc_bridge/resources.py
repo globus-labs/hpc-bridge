@@ -123,11 +123,6 @@ def size_key(uec: Mapping[str, Any]) -> tuple[Any, ...]:
     return tuple(uec.get(k) for k in SIZE_KEYS)
 
 
-def explicit_keys(uec: Mapping[str, Any]) -> set[str]:
-    """The slice keys a runtime config carries."""
-    return {k for k in SLICE_KEYS if uec.get(k) is not None}
-
-
 # ---- what the block gets ---------------------------------------------------------------------------------------------
 
 @dataclass(frozen=True)
