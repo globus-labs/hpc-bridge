@@ -354,6 +354,8 @@ def _size_why(size: resources.Size, app: AppCtx) -> str | None:
         return "parsl's default: exclusive — this endpoint's template predates block sizes"
     if size.why_whole == "options":
         return "the facility's own scheduler_options ask for it"
+    if size.why_whole == "unshared":   # a slice asked where the partition is not known to hand one out (round 2)
+        return "not known to share its nodes: the partition decides, and it may hold — and bill — the whole node"
     if size.whole_node is None and not _has_login_shape(app):
         known = size.cores or size.gpus or size.memory_gb or getattr(app.facility, "partitions", None)
         # said where a size is in play (cores sent, a GPU, a partition's cost); a plain node count claims nothing
@@ -527,9 +529,11 @@ def _size_sentence(app: AppCtx, t: BlockTerms) -> str:
         out += (f"{word.capitalize()} '{t.queue}' can give a slice of a node, but this endpoint was configured before "
                 "hpc-bridge sized blocks, so it asks for parsl's default whole node there: teardown_endpoint, then "
                 "connect_facility, to configure it again for a slice. ")
-    elif t.whole_node is None and t.compute_only and t.cores_per_node:
+    elif t.whole_node is None and t.compute_only and t.cores_per_node and t.size_why and "parsl's" in t.size_why:
+        # "counted" only where a count is shown (review round 2)
         out += ("Whether that node is shared is the facility template's own default (parsl's is the whole node), so "
-                "the most it can bill is counted as a whole node. ")
+                + ("the most it can bill is counted as a whole node. " if t.max_charge is not None else
+                   "it may hold — and bill — the whole node. "))
     return out + resources.multinode_note(t.nodes, t.compute_only)
 
 

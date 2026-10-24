@@ -351,6 +351,8 @@ def _select_words(line: str, scheduler: str | None) -> str:
                 "ncpus=1)")
     if adv.rest:
         out += f", and keep the line's other resources as {adv.rest[:120]!r} in scheduler_options"
+    if re.search(r"(?<![\w])place=", line, re.I):   # taken out with the select (select_advice): hpc-bridge's to write
+        out += ", leaving its place= out (hpc-bridge writes the placement: whole_node=True for whole nodes)"
     return f"{out} ({how})"
 
 

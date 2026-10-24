@@ -256,14 +256,19 @@ def _slurm_terms(toks: list[str]) -> str | None:
 # cores_per_node / mem_per_node / exclusive, its own --gpus-per-node) so the spend question names it; a directive in
 # scheduler_options would size the block behind the terms — `#SBATCH --exclusive` plus `--mem=0` on a per-core partition
 # billed a whole node while the terms said 8 cores (review round 1). Long options by any prefix sbatch accepts; short
-# ones -c (cpus per task), -n (tasks), -G (GPUs), -s (oversubscribe), bundled too.
-_SLURM_SIZE_LONG = re.compile(r"--(?:excl|cpus-per-|ntasks|mem(?:=|-|$)|gpus|overs|cores-per|sockets-per|threads-per)")
-_SLURM_SIZE_SHORT = frozenset("cnGs")
+# ones -c (cpus per task), -n (tasks), -G (GPUs), -s (oversubscribe), -S (core-spec), bundled too.
+# (review round 2: `--exclude=<nodes>` and `--mem-bind=` are not sizes — `--exclus…` and `--mem[=|-per-]` only; the
+# core and thread specialisation, --mincpus and --tres-per-task are.)
+_SLURM_SIZE_LONG = re.compile(r"--(?:exclus|cpus-per-|ntasks|mem(?:=|$|-per-)|gpus|overs|cores-per|sockets-per"
+                              r"|threads-per|core-spec|thread-spec|mincpus|tres-per-task)")
+_SLURM_SIZE_SHORT = frozenset("cnGsS")
 
 
 def _slurm_size(toks: list[str]) -> bool:
-    """Whether a Slurm directive's options set the block's size: --exclusive, -c/--cpus-per-task, -n/--ntasks*, --mem*,
-    --gres naming a GPU, -G/--gpus*, -s/--oversubscribe (and the per-socket/core/thread shapes)."""
+    """Whether a Slurm directive's options set the block's size: --exclusive, -c/--cpus-per-task, -n/--ntasks*, --mem
+    and --mem-per-* (not --mem-bind), --gres naming a GPU, -G/--gpus*, -s/--oversubscribe, -S/--core-spec and
+    --thread-spec (each implies --exclusive), --mincpus, --tres-per-task (and the per-socket/core/thread shapes) — not
+    --exclude=<nodes>."""
     for i, tok in enumerate(toks):
         if _SLURM_SIZE_LONG.match(tok):
             return True
@@ -404,7 +409,9 @@ def select_advice(line: str, nodes: int = 1) -> SelectAdvice | None:
         if at is not None and value is None:
             value = items[at].partition("=")[2].strip()
             items = items[:at] + items[at + 1:]
-        if items := [it for it in items if it.strip()]:
+        # a `place=` beside the select is the block's size too, hpc-bridge's to write (a slice's share, N chunks'
+        # scatter): taken out with the select, so the advice still stands (review round 2)
+        if items := [it for it in items if it.strip() and it.partition("=")[0].strip().lower() != "place"]:
             kept += ["-l", ",".join(items)]
     if value is None:
         return None

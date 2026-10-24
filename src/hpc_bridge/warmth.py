@@ -1599,6 +1599,9 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any])
     session's choice (`app.compute_choice`)."""
     _settle_refusals(app, shape, rt)
     _check_reaped(app, shape, rt)  # a reap that already happened must not hide behind the switch
+    # a re-ask's "the size was read again … the block would hold X" names a block this change replaces: the terms
+    # after it are the new ones, said as such (review round 2: it was still said after cores=4)
+    rt.resized = None
     uec = rt.user_endpoint_config
     terms = _block_key(app, rt)  # partition, account and what the block holds: what the confirmation covered
     confirmed = _billable(rt) and rt.spend_confirmed

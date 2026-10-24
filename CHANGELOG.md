@@ -39,8 +39,7 @@ installed plugin only when that version changes); git tags mark releases.
     evidence (a per-core memory default, or nodes oversubscribed), never under `CR_Socket`, never when it shares a
     whole-node partition's QoS (Anvil's `standard`); elsewhere the terms say parsl's default whole node and its cost.
     A facility endpoint's whole-node partition is a whole node (Anvil's `wholenode` read "1 core, 0.25 SU" while it
-    bills 128 cores); a slice is claimed there only when `exclusive: false` reaches its template (the Anvil entry now
-    sends it); several nodes are not offered on a facility endpoint. Size directives in `scheduler_options`
+    bills 128 cores); several nodes are not offered on a facility endpoint. Size directives in `scheduler_options`
     (`--exclusive`, `-c`, `-n`, `--mem…`, `--gres=gpu`, `--gpus…`, `--oversubscribe`; `#PBS -l place/ncpus/mem/ngpus`)
     are refused, pointing at `cores=` / `memory_gb=` / `gpus=` / `whole_node=`; a facility's own ones (Delta's GPU line)
     are read into the terms. Memory beyond the per-core share bills as cores (MaxMemPerCPU, else DefMemPerCPU). A
@@ -48,6 +47,14 @@ installed plugin only when that version changes); git tags mark releases.
     read again once the endpoint's template is known is asked again before anything starts; naming what the block
     already holds is no term switch; partition limits (MaxNodes, MaxCPUsPerNode, TotalNodes) refuse a block that
     would pend.
+  - **A slice is claimed only on all the evidence** (review round 2): no `--exclusive` sent, on a partition known to
+    hand out slices, and on a facility endpoint to a template seen to render `exclusive` (a schema listing it is not
+    enough). Elsewhere a slice asked — `cores=`, or a registry's `exclusive: false` (Expanse's on `gpu`, `debug`,
+    `large-shared`) — is still sent, but the terms say the partition decides and count the whole node. The Anvil entry
+    no longer sends `exclusive: false` (on every partition it read as a slice), and its `wholenode` is sent `exclusive:
+    true` and no cores. No cost is given where the node's cores, memory or GPUs are not known. `--exclude=` and
+    `--mem-bind=` are no longer refused as sizes; `--core-spec`, `--thread-spec`, `--mincpus` and `--tres-per-task`
+    are, and a facility's own `--core-spec` is a whole node.
 - **The fake cluster's `slices` profile** (a per-core `shared` partition beside a whole-node `whole` one) and two
   scripted scenarios: `slice_request` (2 cores and 2 GB, which sacct's AllocCPUS / ReqMem must show; a slice of
   `whole` refused) and `multinode_allocation` (2 nodes: `srun -N2 hostname` names two nodes, hpc-bridge's worker runs

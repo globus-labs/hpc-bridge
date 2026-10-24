@@ -16,7 +16,7 @@ from hpc_bridge.profile import Profile
 from hpc_bridge.resources import CORES, MEM, NODES, WHOLE
 from hpc_bridge.server import AppCtx, _ensure_endpoint_up
 from tests.fakes import FakeFacility, fake_mep_entry
-from tests.test_mep_server import ANVIL_SCHEMA, DELTA_SCHEMA, _Meta
+from tests.test_mep_server import ANVIL_SCHEMA, DELTA_SCHEMA, _Meta, _Templated
 from tests.test_spend_terms import _mep_app, _runners
 
 SHARED = PartitionShape(name="shared", kind="per_core", why="SelectType=select/cons_tres, OverSubscribe=NO",
@@ -299,9 +299,10 @@ async def test_a_facility_endpoint_takes_the_size_its_strict_schema_lists(monkey
     # the entry sends cores_per_node: 1 and no exclusive: the template may keep parsl's whole node — costed as one
     assert (res.block.whole_node, res.block.cores_per_node, res.block.max_charge) == (None, 1, 32.0)
     ok = await _ensure_endpoint_up(app, shape="compute", account="cis250223", cores=8, memory_gb=16)
-    # cores= sends exclusive: false where the template takes it, so the slice is real; 16 GB counts as 9 cores
-    assert ok.block.cores_per_node == 8 and ok.block.whole_node is False and ok.block.size_source == "this_call"
-    assert ok.block.max_charge == 2.25 and "16 GB at 1.85 GB per core counts as 9 cores" in ok.notice
+    # cores= sends exclusive: false where the schema lists it — but with no template read, nothing shows the template
+    # renders it: the size is asked, and the terms still count the whole node it may be (review round 2)
+    assert ok.block.cores_per_node == 8 and ok.block.whole_node is None and ok.block.size_source == "this_call"
+    assert ok.block.max_charge == 32.0 and "a whole node's worth" in ok.notice
     gpus = await _ensure_endpoint_up(app, shape="compute", gpus=1)
     assert "this facility's endpoint sets the block size: its published template has no `gpus_per_node` setting" in (
         gpus.notice)
@@ -313,18 +314,24 @@ async def test_a_facility_endpoint_takes_the_size_its_strict_schema_lists(monkey
     assert whole.block.whole_node is True and "cores_per_node" not in _compute(app)
 
 
-async def test_a_permissive_schema_takes_what_its_template_renders_or_the_entry_sends(monkeypatch):
-    class _Rendered(_Meta):
-        def get_endpoint_metadata(self, eid):
-            return {**super().get_endpoint_metadata(eid),
-                    "user_config_template": "provider:\n  mem_per_node: {{ mem_per_node | default(none) }}\n"}
-
-    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Rendered(DELTA_SCHEMA))
+async def test_a_permissive_schema_takes_what_its_template_renders(monkeypatch):
+    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Templated(
+        DELTA_SCHEMA, "provider:\n  mem_per_node: {{ mem_per_node | default(none) }}\n"))
     app, _ = await _mep_app(monkeypatch, _anvil_like())
     assert (await _ensure_endpoint_up(app, shape="compute", account="x", memory_gb=8)).block.memory_gb == 8.0
-    assert (await _ensure_endpoint_up(app, shape="compute", cores=2)).block.cores_per_node == 2   # the entry sends it
+    # the entry sends cores_per_node, but the template read renders none of it: dropped there, so refused here (review
+    # round 2: the entry sending a key is no evidence against the template itself)
+    assert "no `cores_per_node` setting" in (await _ensure_endpoint_up(app, shape="compute", cores=2)).notice
     refused = await _ensure_endpoint_up(app, shape="compute", whole_node=True)
     assert "no `exclusive` setting" in refused.notice
+
+
+async def test_a_permissive_schema_with_no_template_read_takes_what_the_entry_sends(monkeypatch):
+    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Meta(DELTA_SCHEMA))
+    app, _ = await _mep_app(monkeypatch, _anvil_like())
+    two = await _ensure_endpoint_up(app, shape="compute", account="x", cores=2)
+    assert (two.block.cores_per_node, two.block.whole_node) == (2, None)   # sent; the template's own sharing decides
+    assert "no `mem_per_node` setting" in (await _ensure_endpoint_up(app, shape="compute", memory_gb=8)).notice
 
 
 async def test_a_facility_key_map_renames_a_size_key_at_the_wire(monkeypatch):

@@ -46,13 +46,14 @@
     max_blocks: 1
     extra:
       cores_per_node: 1
-      # a slice is only a slice when `exclusive: false` reaches the template (parsl's default is the whole node —
-      # 128 cores billed): sent so the 1-core block the entry means is the one Anvil starts (review round 1, 2026-10-24)
-      exclusive: false
+    # No `exclusive` here (review round 2, 2026-10-24): sent on every partition, it read as a slice on `wide`, `gpu`
+    # and `highmem` too, which the registry does not describe. A slice is asked per request (cores=, memory_gb=: the
+    # server adds `exclusive: false` where the template takes it), and claimed only on a per-core partition below,
+    # once the facility's published template is seen to render it — else the terms count a whole node.
     # What a block can be on each (hpc_bridge.resources, 2026-10-24), from the live probe of 2026-10-24 over the
     # login shape (sinfo, scontrol show partition: per core, DefMemPerCPU=1896, TRESBillingWeights=CPU=1.0): a request
-    # (cores=, memory_gb=, whole_node=) is checked against it and the terms carry its cost. The template's own
-    # cores_per_node / mem_per_node / exclusive take it; `wholenode` hands out whole nodes (its OverSubscribe says NO).
+    # (cores=, memory_gb=, whole_node=) is checked against it and the terms carry its cost. The template's schema lists
+    # cores_per_node / mem_per_node / exclusive; `wholenode` hands out whole nodes (its OverSubscribe says NO).
     partitions:
       - {name: shared, kind: per_core, why: "SelectType=select/cons_tres, OverSubscribe=NO", cores: 128,
          memory_gb: 251.4, mem_per_core_mb: 1896, billing: {cpu: 1.0}}

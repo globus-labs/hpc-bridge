@@ -175,8 +175,12 @@ def test_no_proposal_where_the_template_cannot_take_it_or_nothing_is_known():
     # nothing known of the partition: parsl's whole node on Slurm; the queue's placement on PBS (not known)
     assert resources.effective(_uec(), None, channel="ssh").whole_node is True
     assert resources.effective(_uec(), None, channel="ssh", scheduler="pbs", profile_cpus=32).whole_node is None
+    # the registry's exclusive: false on a partition nothing describes: sent, but no slice claimed — the partition's
+    # own sharing decides (review round 2: Expanse's `gpu` read "a slice of the scheduler's default size")
     expanse_like = resources.effective(_uec(**{WHOLE: False}), None, channel="ssh")
-    assert (expanse_like.whole_node, expanse_like.cores, expanse_like.proposed) == (False, None, False)
+    assert (expanse_like.whole_node, expanse_like.cores, expanse_like.proposed) == (None, None, False)
+    assert (expanse_like.wire_slice, expanse_like.why_whole) == (True, "unshared")
+    assert resources.slurm_wire(_uec(**{WHOLE: False}), expanse_like)[WHOLE] is False
 
 
 def test_whole_nodes_when_asked_or_when_the_partition_gives_only_those():

@@ -132,31 +132,42 @@ class MEPFacility:
 
     def block_size(self, uec: dict) -> Any:
         """What a block of the compute config `uec` holds here, read from what this facility RECEIVES (`dispatch_uec`,
-        its key_map undone): a slice only when `exclusive: false` reaches its template (hpc_bridge.resources)."""
+        its key_map undone): a slice only when `exclusive: false` reaches a template known to render it (`renders`),
+        on a partition the registry knows hands out slices (hpc_bridge.resources)."""
         from .. import resources
 
         back = {dst: src for src, dst in self.key_map.items()}
         sent = {back.get(k, k): v for k, v in self.dispatch_uec(dict(uec)).items()}
         shape = resources.shape_of(self.partitions, sent.get("partition"))
-        return resources.effective(sent, shape, channel="mep", scheduler=self.scheduler)
+        return resources.effective(sent, shape, channel="mep", takes=self.renders(resources.WHOLE),
+                                   scheduler=self.scheduler)
+
+    def renders(self, key: str) -> bool:
+        """Whether the facility's published template (when it was read: `load_template`) renders the value of a
+        block-size key, under the facility's name for it (`key_map`): `{{ exclusive }}`, `{{ mem_per_node |
+        default(none) }}`. A schema may list a key its template never uses."""
+        wire = self.key_map.get(key, key)
+        return isinstance(self.template_text, str) and re.search(
+            r"\{\{-?\s*" + re.escape(wire) + r"\b", self.template_text) is not None
 
     def takes_size_key(self, key: str) -> bool:
         """Whether this facility's own template takes a block-size key (hpc-bridge's name: cores_per_node, mem_per_node,
         gpus_per_node, exclusive, nodes_per_block), under the facility's name for it (`key_map`). A STRICT schema
-        (additionalProperties: false, Anvil's) must list it — anything else is dropped at the wire. Otherwise (Delta's
-        lists only worker_init and endpoint_setup) the evidence is the schema listing it, the published template
-        rendering it (`{{ mem_per_node }}`), or the registry entry sending it itself (`defaults.extra`: the curator saw
-        the template consume it). Never a key it would drop: a request it does not take is refused, not silently
-        dropped (server._ensure_endpoint_up, notices._size_refusal)."""
+        (additionalProperties: false, Anvil's) must list it — anything else is dropped at the wire — and where the
+        published template was read, it must render it (`renders`: review round 2 — a schema listing is no evidence
+        the template uses a key, nor is the registry entry sending it). With no template read, the schema listing it
+        (Anvil's) or the registry entry sending it itself (`defaults.extra`) lets the request through, and the terms
+        claim no slice on it (`block_size`). Never a key it would drop: a request it does not take is refused, not
+        silently dropped (server._ensure_endpoint_up, notices._size_refusal)."""
         wire = self.key_map.get(key, key)
         sc = self.schema or {}
         raw = sc.get("properties")
         props: dict = raw if isinstance(raw, dict) else {}
-        if sc.get("additionalProperties") is False:
-            return wire in props
-        rendered = isinstance(self.template_text, str) and re.search(
-            r"\{\{-?\s*" + re.escape(wire) + r"\b", self.template_text) is not None
-        return wire in props or rendered or key in self._user_opts
+        if sc.get("additionalProperties") is False and wire not in props:
+            return False
+        if isinstance(self.template_text, str):
+            return self.renders(key)
+        return wire in props or key in self._user_opts
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -336,6 +347,20 @@ class MEPFacility:
         # here so a value the server wrote under hpc-bridge's name after construction is renamed too. A None
         # value is not sent under the facility's name (a required key must fail as "missing", not as null).
         uec = dict(uec)
+        if uec.get("compute"):
+            from .. import resources
+
+            shape = resources.shape_of(self.partitions, uec.get("partition"))
+            if shape is not None and shape.kind == "whole_node":
+                # a partition the registry knows hands out whole nodes: the block IS one, so it says so where the
+                # template takes it, and sends no slice's cores or memory (review round 2: Anvil's `wholenode` was sent
+                # the entry's cores_per_node: 1 and exclusive: false)
+                uec.pop(resources.CORES, None)
+                uec.pop(resources.MEM, None)
+                if self.takes_size_key(resources.WHOLE):
+                    uec[resources.WHOLE] = True
+                else:
+                    uec.pop(resources.WHOLE, None)
         for src, dst in self.key_map.items():
             if src in uec:
                 val = uec.pop(src)

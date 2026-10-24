@@ -70,7 +70,8 @@ walltime and the node count: you name the account and the queue when the agent a
 walltime is part of the configuration. Neither are the pilot job's output or error files (hpc-bridge finds and cancels
 its pilots by the output file parsl writes, and reads why one died from the error file beside it) or a job array. Nor
 is the block's size — its cores, memory, GPUs, or a whole node (`#SBATCH --exclusive`, `-c`, `-n`, `--mem`,
-`--gres=gpu:…`, `--gpus…`; `#PBS -l place/ncpus/mem/ngpus`): the agent asks for those when it starts a block
+`--gres=gpu:…`, `--gpus…`, `--core-spec`; `#PBS -l place/ncpus/mem/ngpus`; `--exclude=` and `--mem-bind=` are fine):
+the agent asks for those when it starts a block
 (`ensure_endpoint_up(cores=…, memory_gb=…, gpus=…, whole_node=…)`), so the spend question names what the block holds and
 bills. On PBS, a system type each node must have goes in the configuration's `select_options` instead of a `-l
 select=` line: `select_options="system=polaris"` makes the block ask for `select=1:ncpus=…:system=polaris`, so the node

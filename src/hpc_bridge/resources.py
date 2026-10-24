@@ -127,7 +127,9 @@ def size_key(uec: Mapping[str, Any]) -> tuple[Any, ...]:
 #
 # The rule behind every reading here (review round 1, 2026-10-24): the terms must never UNDERSTATE what the block can
 # bill. Where the evidence is weak, the block is a whole node — parsl's default `--exclusive`, or the facility's own
-# default size — never a slice and its SU.
+# default size — never a slice and its SU. A slice is claimed only on all of it (review round 2): no `--exclusive` sent,
+# to a template that renders it, on a partition known to hand out slices (`kind == "per_core"`). Anywhere else a slice
+# the wire asks for (`wire_slice`) is the partition's own sharing to decide, and costed as the whole node it may be.
 
 @dataclass(frozen=True)
 class Size:
@@ -142,9 +144,14 @@ class Size:
     proposed: bool = False           # D3: hpc-bridge's default slice of a per-core partition (nothing was asked)
     by_partition: bool = False       # whole nodes because the partition hands out only whole nodes
     send_mem: int | None = None      # the memory the wire asks for (GB, a whole number), when any
-    # why whole nodes when nothing here asked for them: "parsl" (no exclusive sent: parsl's default --exclusive),
-    # "old_template" (the same, on an endpoint whose template predates block sizes, on a per-core partition),
-    # "options" (the facility's own scheduler_options ask for it: --exclusive, place=excl)
+    # the wire asks for a slice (no --exclusive; the cores and memory above) that the terms cannot claim: the partition
+    # is not known to hand out slices, so its own sharing decides (whole_node None, costed as a whole node)
+    wire_slice: bool = False
+    # why whole nodes — or maybe whole nodes (None) — when nothing here asked for them: "parsl" (no exclusive sent:
+    # parsl's default --exclusive), "old_template" (the same, on an endpoint whose template predates block sizes, on a
+    # per-core partition), "options" (the facility's own scheduler_options ask for it: --exclusive, place=excl,
+    # --core-spec), "unshared" (a slice asked, or a registry's `exclusive: false` sent, where the partition is not known
+    # to hand one out)
     why_whole: str | None = None
 
     def key(self) -> tuple[Any, ...]:
@@ -172,13 +179,33 @@ class OptionsSize:
     line: str | None = None   # the first such directive, as written
 
 
-_OPT_GPUS = re.compile(r"--(?:gpus(?:-per-node)?|gres)[= ](?:gpu:)?(?:[A-Za-z0-9_.-]+:)?(\d+)|-G\s*(\d+)")
+# Anchored at a directive's start (review round 2): `--exclude=gpu007` is no `--exclusive`, `--mincpus=16` and
+# `--job-name=x-c2` no `-c`. `--gres=gpu` with no count is one GPU; `--gpus-per-task` is per node (one task per node).
+_OPT_GPUS = re.compile(r"(?:^|\s)(?:--gpus(?:-per-node|-per-task)?[= ]|-G\s*)(?:[A-Za-z0-9_.-]+:)?(\d+)")
+_OPT_GRES = re.compile(r"(?:^|\s)--gres[= ](\S+)")
+_OPT_CORES = re.compile(r"(?:^|\s)(?:--cpus-per-task[= ]|-c\s*)(\d+)|(?:(?<![A-Za-z0-9_-])|(?<=-l))ncpus=(\d+)")
+# whole nodes: --exclusive (any form), --mem=0 (all of a node's memory), place=excl, and the core / thread
+# specialisation — Slurm: "explicitly setting a job's specialized core value implicitly sets its --exclusive option"
+_OPT_WHOLE = re.compile(r"(?:^|\s)(?:--exclusive|--core-spec|--thread-spec|-S\s*\d)|(?:^|\s)--mem(?:=|\s+)0(?:\s|$)"
+                        r"|place=[a-z:]*excl")
+
+
+def _gres_count(spec: str) -> int | None:
+    """The GPUs per node of a `--gres` list (`gpu:a100:2,tmpfs:10`): a bare `gpu` (or `gpu:<type>`) is one."""
+    total = None
+    for item in spec.split(","):
+        fields = item.strip().split(":")
+        if fields[0] != "gpu":
+            continue
+        last = fields[-1].split("(")[0]
+        total = (total or 0) + (int(last) if len(fields) > 1 and last.isdigit() else 1)
+    return total
 
 
 def options_size(options: str | None, select: str | None = None) -> OptionsSize:
     """The size directives a facility's own scheduler_options carry — Delta's `#SBATCH --gpus-per-node=1`, an older
-    configuration's `--gres=gpu:1` or `--exclusive`, a PBS `-l place=excl` / `-l ngpus=4` — and a PBS chunk's
-    select_options (`ngpus=4`), so the terms name what the block really asks for."""
+    configuration's `--gres=gpu:1` or `--exclusive`, a `--core-spec` (whole nodes), a PBS `-l place=excl` /
+    `-l ngpus=4` — and a PBS chunk's select_options (`ngpus=4`), so the terms name what the block really asks for."""
     whole, gpus, cores, first = False, None, None, None
     for raw in (options or "").splitlines():
         line = raw.strip()
@@ -186,17 +213,17 @@ def options_size(options: str | None, select: str | None = None) -> OptionsSize:
             continue
         body = line.split(None, 1)[1] if " " in line else ""
         hit = False
-        if re.search(r"(?:^|\s)--excl", body) or re.search(r"place=[a-z:]*excl", body):
+        if _OPT_WHOLE.search(body):
             whole, hit = True, True
-        if re.search(r"(?:^|\s)--mem(?:=|\s+)0(?:\s|$)", body):
-            whole, hit = True, True   # --mem=0: all of a node's memory, the node held whole
         for m in _OPT_GPUS.finditer(body):
-            if "gres" not in m.group(0) or "gpu" in m.group(0):
-                gpus, hit = int(m.group(1) or m.group(2)), True
-        if m2 := re.search(r"(?:^|\s)ngpus=(\d+)", body):
+            gpus, hit = int(m.group(1)), True
+        for m in _OPT_GRES.finditer(body):
+            if (n := _gres_count(m.group(1))) is not None:
+                gpus, hit = n, True
+        if m2 := re.search(r"(?<![A-Za-z0-9_])ngpus=(\d+)", body):
             gpus, hit = int(m2.group(1)), True
-        if m3 := re.search(r"(?:--cpus-per-task[= ]|-c\s*|ncpus=)(\d+)", body):
-            cores, hit = int(m3.group(1)), True
+        if m3 := _OPT_CORES.search(body):
+            cores, hit = int(m3.group(1) or m3.group(2)), True
         if hit and first is None:
             first = line
     for pair in (select or "").split(":"):
@@ -235,8 +262,10 @@ def _slice_memory(cores: int, shape: PartitionShape | None) -> tuple[float | Non
     return None, False, None
 
 
-def _whole(nodes: int, shape: PartitionShape | None, cores: int | None, gpus: int | None, **kw: Any) -> Size:
-    return Size(nodes=nodes, whole_node=True, cores=shape.cores if shape is not None and shape.cores else cores,
+def _whole(nodes: int, shape: PartitionShape | None, gpus: int | None, **kw: Any) -> Size:
+    """Whole nodes: the node's cores and memory where the partition's shape says them — never the cores asked or a
+    `-c` in the options, which a whole node holds more than (review round 2)."""
+    return Size(nodes=nodes, whole_node=True, cores=shape.cores if shape is not None else None,
                 memory_gb=shape.memory_gb if shape is not None else None, gpus=gpus, **kw)
 
 
@@ -244,13 +273,18 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
               profile_cpus: int | None = None, scheduler: str | None = "slurm") -> Size:
     """What the block `uec` asks for gets, with what is known of its partition (`shape`) — never less than it bills:
     - whole nodes when asked (`exclusive` True), when the partition hands out only whole nodes, or when the facility's
-      own scheduler_options ask for them (`--exclusive`, `--mem=0`, `place=excl`);
-    - a facility endpoint (`mep`, `uec` being the keys it RECEIVES): a slice only when `exclusive: false` reaches it;
-      otherwise its template's own default (None) — which may be parsl's whole node, so it is costed as one;
-    - hpc-bridge's own template (`ssh`): a slice when asked (cores, memory, `exclusive` False) or — D3 — the proposed
-      slice of a per-core partition, only where the endpoint's template takes it (`takes`); otherwise Slurm's block is
-      parsl's default WHOLE node (no `exclusive` is sent: `--exclusive`), PBS's its profile's ncpus on the queue's
-      default placement (None);
+      own scheduler_options ask for them (`--exclusive`, `--mem=0`, `--core-spec`, `place=excl`);
+    - a slice only on all the evidence (review round 2): a partition known to hand out slices (`per_core`), and —
+      * a facility endpoint (`mep`, `uec` being the keys it RECEIVES): `exclusive: false` reaching a template known
+        to render it (`takes`);
+      * hpc-bridge's own template (`ssh`), where it takes a size (`takes`): a slice asked (cores, memory, `exclusive`
+        False), or — D3 — the proposed slice of a per-core partition;
+    - a slice the wire asks for anywhere else (a partition not known to share nodes — Anvil's `standard` and `wide`,
+      whose OverSubscribe says NO and which bill whole nodes; one the registry does not describe; a template not read)
+      is the partition's own sharing to decide: None (`wire_slice`: the wire still asks for it), costed as a whole node;
+    - otherwise Slurm's block is parsl's default WHOLE node (no `exclusive` is sent: `--exclusive`), PBS's its
+      profile's ncpus on the queue's default placement (None), a facility endpoint's its template's own default (None,
+      parsl's being the whole node);
     - anything else (local dev): nodes only."""
     nodes = _int(uec.get(NODES)) or 1
     cores, mem = _int(uec.get(CORES)), _int(uec.get(MEM))
@@ -262,25 +296,25 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
     kind = shape.kind if shape is not None else None
     if whole is True or kind == "whole_node" or opts.whole:
         why = "options" if opts.whole and whole is not True and kind != "whole_node" else None
-        return _whole(nodes, shape, cores or opts.cores, gpus, by_partition=kind == "whole_node" and whole is not True,
-                      why_whole=why)
+        return _whole(nodes, shape, gpus, by_partition=kind == "whole_node", why_whole=why)
+    per_core = kind == "per_core"
     gb: float | None
     send: int | None
     if channel == "mep":
-        if whole is False:   # a slice reaches the facility's template
-            if mem is not None:
-                gb, mem_default, send = float(mem), False, mem
-            elif cores and shape is not None and shape.mem_per_core_mb:
-                gb, mem_default, send = round(cores * shape.mem_per_core_mb / 1024, 1), True, None
-            else:
-                gb, mem_default, send = None, False, None
+        if mem is not None:
+            gb, mem_default, send = float(mem), False, mem
+        elif whole is False and per_core and cores and shape is not None and shape.mem_per_core_mb:
+            gb, mem_default, send = round(cores * shape.mem_per_core_mb / 1024, 1), True, None
+        else:
+            gb, mem_default, send = None, False, None
+        if whole is False and per_core and takes is True:   # a slice reaches a template that renders it
             return Size(nodes=nodes, whole_node=False, cores=cores or opts.cores, memory_gb=gb,
                         memory_default=mem_default, gpus=gpus, send_mem=send)
-        return Size(nodes=nodes, whole_node=None, cores=cores or opts.cores, memory_gb=float(mem) if mem else None,
-                    gpus=gpus, send_mem=mem)
+        return Size(nodes=nodes, whole_node=None, cores=cores or opts.cores, memory_gb=gb, gpus=gpus, send_mem=send,
+                    why_whole="unshared" if whole is False and takes is True else None)
     asked = cores is not None or mem is not None or whole is False
-    if asked or (kind == "per_core" and takes is True):
-        proposed = cores is None and kind == "per_core" and takes is True
+    if asked or (per_core and takes is True):
+        proposed = cores is None and per_core and takes is True
         if proposed:
             cores = default_slice_cores(shape, nodes)
         if mem is not None:
@@ -291,13 +325,19 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
             gb, mem_default, send = None, False, None
         if cores is None and profile_cpus:  # PBS: the profile's ncpus stands
             cores = profile_cpus
-        return Size(nodes=nodes, whole_node=False, cores=cores, memory_gb=gb, memory_default=mem_default, gpus=gpus,
-                    proposed=proposed, send_mem=send)
+        if per_core:
+            return Size(nodes=nodes, whole_node=False, cores=cores, memory_gb=gb, memory_default=mem_default,
+                        gpus=gpus, proposed=proposed, send_mem=send)
+        # not known to hand out slices: asked for all the same (the user's request, or the registry's exclusive:
+        # false), and the partition's own sharing decides what the block holds (review round 2: Expanse's `gpu` read
+        # "a slice of the scheduler's default size", Anvil's `standard` would bill 128 cores for "8 cores")
+        return Size(nodes=nodes, whole_node=None, cores=cores, memory_gb=gb, memory_default=mem_default, gpus=gpus,
+                    send_mem=send, wire_slice=True, why_whole="unshared")
     if scheduler == "pbs":   # ncpus of the profile, on the queue's default placement: the queue decides
         return Size(nodes=nodes, whole_node=None, cores=profile_cpus, gpus=gpus)
     # nothing asks for a slice: parsl's SlurmProvider writes `#SBATCH --exclusive` by default — a whole node
-    why_whole = "old_template" if kind == "per_core" and takes is False else "parsl"
-    return _whole(nodes, shape, None, gpus, why_whole=why_whole)
+    why_whole = "old_template" if per_core and takes is False else "parsl"
+    return _whole(nodes, shape, gpus, why_whole=why_whole)
 
 
 def billed_cores(size: Size, shape: PartitionShape | None, *, allocated: bool = False) -> tuple[int | None, str]:
@@ -306,8 +346,8 @@ def billed_cores(size: Size, shape: PartitionShape | None, *, allocated: bool = 
     request, whichever is larger" — charges max(cores, ceil(memory / the per-core share)), the share being MaxMemPerCPU,
     else DefMemPerCPU (`allocated`: only MaxMemPerCPU, the one that changes what Slurm ALLOCATES). A whole node bills
     every core. A partition whose billing weighs memory itself (Mem=…) counts it there, not as cores."""
-    if size.whole_node is not False:
-        return (shape.cores if shape is not None and shape.cores else size.cores), ""
+    if size.whole_node is not False:   # every core of the node: known only from the partition (review round 2)
+        return (shape.cores if shape is not None else None), ""
     cores = size.cores
     if shape is None or (shape.billing or {}).get("mem_gb"):
         return cores, ""
@@ -426,11 +466,12 @@ def _with_line(options: str | None, line: str) -> str:
 def slurm_wire(uec: Mapping[str, Any], size: Size) -> dict[str, Any]:
     """The Slurm config hpc-bridge's template renders for `size`: `exclusive`, `cores_per_node`, `mem_per_node` (parsl's
     names) and the GPUs ASKED as hpc-bridge's own `#SBATCH --gpus-per-node` in scheduler_options. A whole node by
-    parsl's default (or the facility's options) sends what the config had."""
+    parsl's default (or the facility's options) sends what the config had; a slice the terms cannot claim
+    (`wire_slice`) is asked for all the same."""
     out = {k: v for k, v in uec.items() if k not in (CORES, MEM, GPUS)}
     if size.whole_node is True and size.why_whole is None:
         out[WHOLE] = True
-    elif size.whole_node is False:
+    elif size.whole_node is False or size.wire_slice:
         out[WHOLE] = False
         if size.cores:
             out[CORES] = size.cores
@@ -454,7 +495,7 @@ def pbs_wire(uec: Mapping[str, Any], size: Size, shape: PartitionShape | None) -
             out["cpus_per_node"] = size.cores
         else:
             place = "scatter:excl" if size.nodes > 1 else "excl"
-    elif size.whole_node is False:
+    elif size.whole_node is False or size.wire_slice:
         if size.cores:
             out["cpus_per_node"] = size.cores
         share = shape.place if shape is not None and shape.place else None
@@ -462,7 +503,8 @@ def pbs_wire(uec: Mapping[str, Any], size: Size, shape: PartitionShape | None) -
             place = "scatter:shared" if share else "scatter"
         elif share:
             place = share
-    select = _merge_select(uec.get("select_options"), size.send_mem if size.whole_node is False else None,
+    select = _merge_select(uec.get("select_options"), size.send_mem if size.whole_node is False or size.wire_slice
+                           else None,
                            _int(uec.get(GPUS)))
     if select is not None:
         out["select_options"] = select
@@ -483,15 +525,17 @@ def charge(size: Size, shape: PartitionShape | None, walltime_s: float) -> tuple
     (Slurm's TRESBillingWeights, summed — its default; a site that bills the max of them charges less), else None. Never
     less than it can bill: a whole node — or a size its facility decides (None), costed as a whole node — counts every
     core, the node's memory and all its GPUs; a slice counts memory beyond the per-core share as cores
-    (`billed_cores`), and says when no share is known that memory may bill too."""
+    (`billed_cores`), and says when no share is known that memory may bill too. None too where a weight's amount is not
+    known (review round 2): a whole node of unknown cores, memory or GPU count is never costed as the cores asked, nor
+    without its GPUs."""
     if shape is None or not shape.billing or walltime_s <= 0:
         return None
     w = shape.billing
     whole = size.whole_node is not False
     cores, why_cores = billed_cores(size, shape)
-    mem = (shape.memory_gb or size.memory_gb) if whole else size.memory_gb
+    mem = shape.memory_gb if whole else size.memory_gb
     node_gpus = shape.max_gpus_per_node if shape.max_gpus_per_node is not None else shape.gpus
-    gpus = max(size.gpus or 0, node_gpus or 0) if whole else (size.gpus or 0)
+    gpus: int | None = (None if node_gpus is None else max(size.gpus or 0, node_gpus)) if whole else (size.gpus or 0)
     terms: list[tuple[float, float, str]] = []   # (amount, weight, unit)
     if w.get("cpu"):
         if not cores:
@@ -501,8 +545,11 @@ def charge(size: Size, shape: PartitionShape | None, walltime_s: float) -> tuple
         if mem is None:
             return None
         terms.append((mem, w["mem_gb"], "GB"))
-    if w.get("gpu") and gpus:
-        terms.append((gpus, w["gpu"], "GPU"))
+    if w.get("gpu"):
+        if gpus is None:   # a whole node's GPUs bill, and their count is not known
+            return None
+        if gpus:
+            terms.append((gpus, w["gpu"], "GPU"))
     node_w = w.get("node") or 0.0
     if not terms and not node_w:
         return None
@@ -541,11 +588,19 @@ def size_words(*, nodes: int | None, whole_node: bool | None, cores: int | None,
             return f"{n}, a slice of the scheduler's default size (one core unless the site says otherwise)" + gpu
         bits = [_n(cores, "core")] if cores else []
         if memory_gb is not None:
-            gb = f"{memory_gb:.0f} GB" if memory_gb >= 10 else f"{memory_gb:g} GB"
-            bits.append(gb + (" (the partition's default per core)" if memory_default else ""))
+            bits.append(_gb(memory_gb, memory_default))
         return f"{n} × " + ", ".join(bits) + gpu
-    sent = f", {_n(cores, 'core')} asked" if cores else ""
+    # the facility's (or the partition's) own size: what the wire asks of it, the memory too (review round 2: a
+    # memory_gb=200 there was not said)
+    asked = ([_n(cores, "core")] if cores else []) + ([_gb(memory_gb, memory_default)] if memory_gb is not None
+                                                       else [])
+    sent = f", {', '.join(asked)} asked" if asked else ""
     return n + sent + gpu + (f" ({why})" if why else "")
+
+
+def _gb(memory_gb: float, memory_default: bool) -> str:
+    gb = f"{memory_gb:.0f} GB" if memory_gb >= 10 else f"{memory_gb:g} GB"
+    return gb + (" (the partition's default per core)" if memory_default else "")
 
 
 def multinode_note(nodes: int | None, compute_only: bool) -> str:

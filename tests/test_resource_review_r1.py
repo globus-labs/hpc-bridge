@@ -25,7 +25,7 @@ from hpc_bridge.models import FacilityDetails, PartitionShape
 from hpc_bridge.profile import Profile
 from hpc_bridge.server import AppCtx, _ensure_endpoint_up
 from tests.fakes import fake_entry, fake_mep_entry
-from tests.test_mep_server import ANVIL_SCHEMA, DELTA_SCHEMA, _Meta
+from tests.test_mep_server import ANVIL_SCHEMA, ANVIL_TEMPLATE, DELTA_SCHEMA, _Meta, _Templated
 from tests.test_resource_requests import _app, _Sized
 from tests.test_spend_terms import _mep_app, _runners
 
@@ -82,7 +82,11 @@ async def test_1_a_facility_endpoint_claims_a_slice_only_when_exclusive_false_re
         "partition": "shared", "walltime": "00:15:00", "init_blocks": 1,
         "extra": {"cores_per_node": 1, "exclusive": False}, "partitions": [SHARED.model_dump(), WHOLE.model_dump()]})
     _app2, res2 = await _mep_app(monkeypatch, entry)                                # the entry sends exclusive: false
-    assert (res2.block.whole_node, res2.block.cores_per_node, res2.block.max_charge) == (False, 1, 0.25)
+    # …to a template not read: nothing shows it renders it, so still the whole node (review round 2)
+    assert (res2.block.whole_node, res2.block.cores_per_node, res2.block.max_charge) == (None, 1, 32.0)
+    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Templated(_ANVIL, ANVIL_TEMPLATE))
+    _app3, res3 = await _mep_app(monkeypatch, entry)                                # …to one that renders it
+    assert (res3.block.whole_node, res3.block.cores_per_node, res3.block.max_charge) == (False, 1, 0.25)
 
 
 # ---- 2. size directives in scheduler_options ----------------------------------------------------------------------------
