@@ -195,6 +195,11 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **From the Claude paid pass (2026-10-24).** Three graders failed correct agents.
+  - `esc_mid_call` counts the agent's own read of the node after the Esc (the marker written, or its `sleep` still live).
+  - `fake_mep_username_not_account` reads the account a call used, so a poll repeating `confirm_spend=True` (whose
+    answer names the session's account) is no "start with no account" and no new start.
+  - `mep_hand_batch_job_ask`'s simulated user ends at the dry run instead of approving a real submission.
 - **From re-run #2 (2026-10-23).** The fake cluster's login nodes no longer race each other into a half-made home:
   ownership and mode are set on every boot, and the cluster is ready only once the pool user can write its home
   (all six f2b cells were SETUP FAILED "Permission denied"). `canary_login_discovery` asks the agent to keep calling
