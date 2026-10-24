@@ -26,7 +26,7 @@ services:
     command: [mom]
     depends_on: [pbsserver]
     volumes:
-      - home:/home
+      - home:/home:nocopy
       - ${HPCB_FAKE_PROFILE_DIR:-./profiles/pbs}:/etc/hpcb/profile:ro
   c2:
     <<: *pbs
@@ -34,7 +34,7 @@ services:
     command: [mom]
     depends_on: [pbsserver]
     volumes:
-      - home:/home
+      - home:/home:nocopy
       - ${HPCB_FAKE_PROFILE_DIR:-./profiles/pbs}:/etc/hpcb/profile:ro
   login:
     <<: *pbs
@@ -44,7 +44,7 @@ services:
     ports:
       - "${HPCB_FAKE_SSH_PORT:-2222}:${HPCB_FAKE_SSHD_PORT:-22}"
     volumes:
-      - home:/home
+      - home:/home:nocopy
       - ${HPCB_FAKE_KEY_PUB:-~/.ssh/hpcb-fake.pub}:/run/hpcb/authorized_keys:ro
       - ${HPCB_FAKE_PROFILE_DIR:-./profiles/pbs}:/etc/hpcb/profile:ro
 
