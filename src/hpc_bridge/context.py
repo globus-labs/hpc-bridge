@@ -108,6 +108,15 @@ class ShapeRuntime:
     rejected: tuple[str, str | None, str | None] | None = None
     # ...and the size it asked for (resources.size_key), so the re-ask tells the same terms from a changed size.
     rejected_size: tuple[Any, ...] | None = None
+    # The switches since the last confirmation moved the block's size (warmth._repoint): the re-ask says "partition,
+    # account or size" even when the terms are back to the confirmed ones. Cleared with `switched_terms`.
+    switched_size: bool = False
+    # Why the confirmation was dropped before anything started: the block's size read again once the endpoint's
+    # template was known differs from what the spend question named (warmth._provision). Cleared by a confirmation.
+    resized: str | None = None
+    # What the block held (resources.Size.key) as the user last saw it — the last spend question's terms, or the terms a
+    # confirming call named itself (server._ensure_endpoint_up): the confirmation covers that size and no other.
+    question_size: tuple[Any, ...] | None = None
     # A pilot of this shape that ran and died before any worker answered: the pilot probe reported it FINISHED with an
     # exit status of its own (scheduler_ops.PilotProbe.dead; recorded by server._ensure_endpoint_up). Cleared when a
     # worker answers a check (warmth._check_resolved) or the scheduler rejects a submission; a switch hands it to the
@@ -431,6 +440,9 @@ class AppCtx:
     # (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus login keeps them, as it keeps
     # a live shape's.
     compute_choice: dict[str, Any] = field(default_factory=dict)
+    # The facility's billing unit, from its allocation listing (connect_facility: e.g. "SU"); None: not known, and the
+    # terms' cost says "billing units". Forgotten with the binding's shapes (warmth._drop_all_shapes).
+    charge_unit: str | None = None
     # Where the bound facility's DEFAULT partition and account came from (the registry, an env preset, a facility you
     # bring yourself), whether its entry says an account is needed, and its account hint: recorded with the binding
     # (connect_facility, the startup pin), read for every block's terms (notices._block_terms). None: unknown (local

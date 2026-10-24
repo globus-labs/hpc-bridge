@@ -336,8 +336,9 @@ def _select_words(line: str, scheduler: str | None) -> str:
     adv = select_advice(line)
     if scheduler != "pbs":  # the GPUs the line names, whatever select_advice makes of it (two chunks, a walltime too)
         gpus = re.search(r"(?<![\w])ngpus=(\d+)", line, re.I)
-        return ("take it out — on Slurm a chunk's resources are #SBATCH directives in scheduler_options, its GPUs "
-                f"`#SBATCH --gres=gpu:{gpus.group(1) if gpus else '<n>'}` (select_options is PBS only)")
+        return ("take it out — on Slurm a chunk's GPUs are ensure_endpoint_up(gpus="
+                f"{gpus.group(1) if gpus else '<n>'}) and its cores and memory cores=/memory_gb= (select_options is "
+                "PBS only)")
     how = ("hpc-bridge writes select=<the block's node count>:ncpus=<cpus_per_node>:<select_options>, so the node "
            "count and the spend terms stay its own")
     if adv is None:
@@ -382,6 +383,11 @@ def _terms_refusal(line: str, was: str | None, scheduler: str | None = None) -> 
     if kind == "array":
         return (head + "; #SBATCH -a/--array, #PBS -J): take it out — an array starts several blocks behind one spend "
                 "question")
+    if kind == "size":
+        return (head + "; #SBATCH --exclusive/-c/--cpus-per-task/-n/--ntasks/--mem/--gres=gpu/--gpus/-G/"
+                "--oversubscribe, #PBS -l place/ncpus/mem/ngpus): take it out — ask for the size with "
+                "ensure_endpoint_up(cores=…, memory_gb=…, gpus=…, whole_node=…), so the spend question names what the "
+                "block holds and bills (a directive here would size the block behind the terms)")
     return (head + "; #SBATCH -t/--time/-N/--nodes, #PBS -l walltime=/nodes=): take it out — the block's walltime is "
             "details' `walltime` and its size is hpc-bridge's (one node per block), so the spend question names what "
             "the block asks for (parsl writes both before scheduler_options, and a later directive would override "
@@ -399,8 +405,8 @@ def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[
     be chunk resources only (`select_options_problem`)."""
     if details.select_options is not None:
         if details.scheduler != "pbs":
-            raise SchedulerOptionsError("select_options is PBS only: on Slurm a resource is an #SBATCH directive in "
-                                        "scheduler_options (e.g. --gres=gpu:4)")
+            raise SchedulerOptionsError("select_options is PBS only: on Slurm a block's GPUs, cores and memory are "
+                                        "ensure_endpoint_up(gpus=…, cores=…, memory_gb=…)")
         if why := select_options_problem(details.select_options):
             raise SchedulerOptionsError(f"{why}; hpc-bridge writes select=<the block's node count>:ncpus="
                                         "<cpus_per_node>:<select_options>")
@@ -456,6 +462,8 @@ def _accepted_details(details: FacilityDetails) -> tuple[FacilityDetails, list[s
                 where = "give those as `partition` and ensure_endpoint_up(account=…)"
             elif kind in ("walltime", "nodes", "select"):
                 where = "the walltime is `walltime`, the size hpc-bridge's"
+            elif kind == "size":
+                where = "ask for the size with ensure_endpoint_up(cores=, memory_gb=, gpus=, whole_node=)"
             elif kind == "output":
                 where = "hpc-bridge finds and cancels its pilots by their own output file"
             elif kind == "error":

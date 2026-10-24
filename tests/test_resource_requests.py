@@ -6,14 +6,14 @@ anything is submitted, saying why; the config a runner is built with carries the
 renders it. On a facility endpoint only its own template's keys size a block."""
 import dataclasses
 
-from hpc_bridge import connect, warmth
+from hpc_bridge import connect, notices, warmth
 from hpc_bridge.catalog.entry import CatalogEntry
 from hpc_bridge.facility import remote
 from hpc_bridge.facility.mep import MEPFacility
 from hpc_bridge.facility.remote import SlurmFacility
 from hpc_bridge.models import FacilityDetails, PartitionShape, ShellOutcome
 from hpc_bridge.profile import Profile
-from hpc_bridge.resources import CORES, MEM, NODES, WHOLE, size_key
+from hpc_bridge.resources import CORES, MEM, NODES, WHOLE
 from hpc_bridge.server import AppCtx, _ensure_endpoint_up
 from tests.fakes import FakeFacility, fake_mep_entry
 from tests.test_mep_server import ANVIL_SCHEMA, DELTA_SCHEMA, _Meta
@@ -79,7 +79,7 @@ async def test_the_spend_question_proposes_a_slice_on_a_per_core_partition():
         False, 8, 14.8, True, "proposed")
     assert (b.max_charge, b.charge_basis) == (4.0, "8 cores × 0.5 h")
     assert ("1 node × 8 cores, 15 GB (the partition's default per core) for up to 00:30:00 (at most 0.5 node-hours; "
-            "at most 4 SU: 8 cores × 0.5 h)") in res.notice
+            "at most 4 billing units: 8 cores × 0.5 h)") in res.notice
     assert "hpc-bridge's proposal for this per-core partition, a slice and not the whole node" in res.notice
     assert "with cores=/memory_gb=/gpus=/nodes= in the same call" in res.notice
     # confirmed as proposed: the block asks for that slice — exclusive off, 8 cores, the partition's memory default
@@ -126,20 +126,25 @@ async def test_a_size_change_is_a_term_switch_and_the_terms_can_come_back():
     switched = await _ensure_endpoint_up(app, shape="compute", cores=4)
     assert switched.status == "needs_confirmation" and not app.shapes["compute"].spend_confirmed
     assert "the partition, account or size has changed since spend was confirmed" in switched.notice
-    assert "the one on partition 'shared', nodes=1, cores=2" in switched.notice
-    assert app.shapes["compute"].switched_terms == ("shared", "", size_key({NODES: 1, CORES: 2}))
+    assert "the one on partition 'shared', 1 node × 2 cores, 3.7 GB)" in switched.notice
+    assert app.shapes["compute"].switched_terms == ("shared", "", (1, False, 2, 3.7, None))   # what the block held
     back = await _ensure_endpoint_up(app, shape="compute", cores=2)
-    assert "the terms are back to the ones it covered (partition 'shared', nodes=1, cores=2)" in back.notice
+    assert ("a partition, account or size switch dropped the confirmation, and the terms are back to the ones it "
+            "covered (partition 'shared', 1 node × 2 cores, 3.7 GB)") in back.notice
     # changing and confirming in one call: its answer says what the confirmation is for (a receipt)
     moved = await _ensure_endpoint_up(app, shape="compute", cores=6, confirm_spend=True)
     assert moved.status == "up"
     assert moved.notice.startswith("This confirmation is for a new block: the partition, account or size changed "
-                                   "from partition 'shared', nodes=1, cores=2.")
+                                   "from partition 'shared', 1 node × 2 cores, 3.7 GB.")
     # a partition switch alone keeps the old wording
-    app2 = _app()
+    # a partition switch onto a partition whose block holds the same keeps the old wording; one whose block differs
+    # (capped: no per-core memory default) says the size moved too
+    app2 = _app(partitions=(SHARED, SHARED.model_copy(update={"name": "twin"}), CAPPED))
     await _ensure_endpoint_up(app2, shape="compute", confirm_spend=True)
-    p = await _ensure_endpoint_up(app2, shape="compute", partition="capped")
+    p = await _ensure_endpoint_up(app2, shape="compute", partition="twin")
     assert "the partition or account has changed since spend was confirmed" in p.notice
+    p = await _ensure_endpoint_up(app2, shape="compute", partition="capped")
+    assert "the partition, account or size has changed since spend was confirmed" in p.notice
 
 
 async def test_whole_node_true_clears_a_slice_and_conflicts_with_fewer_cores():
@@ -168,8 +173,11 @@ async def test_an_endpoint_whose_template_predates_resource_requests_refuses_the
     app = _app(takes=False)
     app.state.endpoint_id = "e-old"
     plain = await _ensure_endpoint_up(app, shape="compute")
-    assert plain.block.whole_node is None and plain.block.size_source == "facility"   # its old size, said as before
-    assert "1 node for up to 00:30:00 (at most 0.5 node-hours)." in plain.notice
+    # its old size is parsl's default whole node — said, with the cost and the way to a slice (review round 1, #7/#8)
+    assert plain.block.whole_node is True and plain.block.size_source == "facility" and plain.block.max_charge == 64.0
+    assert ("1 whole node (parsl's default: exclusive — this endpoint's template predates block sizes; 128 cores) for "
+            "up to 00:30:00") in plain.notice
+    assert "Partition 'shared' can give a slice of a node, but this endpoint was configured before" in plain.notice
     refused = await _ensure_endpoint_up(app, shape="compute", cores=4)
     assert "configured before hpc-bridge wrote a block's size into its template" in refused.notice
     assert "teardown_endpoint, then connect_facility" in refused.notice and CORES not in _compute(app)
@@ -196,7 +204,7 @@ async def test_several_nodes_are_one_shell_on_the_first_node():
     app = _app()
     res = await _ensure_endpoint_up(app, shape="compute", nodes=2, cores=4)
     assert "2 nodes × 4 cores, 7.4 GB (the partition's default per core)" in res.notice
-    assert "2 nodes: one shell, on the first node — run work across them with srun (or mpiexec)" in res.notice
+    assert "2 nodes: one shell, on the first node — run work across them with srun from it" in res.notice
     assert "nodes you do not use still bill" in res.notice and res.block.max_charge == 4.0
     await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
     assert app.built[-1][NODES] == 2 and app.built[-1][CORES] == 4
@@ -216,7 +224,8 @@ async def test_a_rejected_block_then_a_new_size_is_not_the_same_terms_again():
     app = _app()
     await _ensure_endpoint_up(app, shape="compute", cores=2)
     rt = app.shapes["compute"]
-    rt.rejected, rt.rejected_size = ("sbatch: error: QOSMaxCpuPerJobLimit", "shared", ""), size_key(_compute(app))
+    rt.rejected = ("sbatch: error: QOSMaxCpuPerJobLimit", "shared", "")
+    rt.rejected_size = notices._size_key(app, _compute(app))   # what the rejected block held
     same = await _ensure_endpoint_up(app, shape="compute")
     assert "Confirming the same terms again repeats a request the scheduler refuses" in same.notice
     changed = await _ensure_endpoint_up(app, shape="compute", cores=1)
@@ -287,16 +296,19 @@ async def test_a_facility_endpoint_takes_the_size_its_strict_schema_lists(monkey
                                              "exclusive": {"type": "boolean"}}}
     monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Meta(schema))
     app, res = await _mep_app(monkeypatch, _anvil_like())
-    assert res.block.cores_per_node == 1 and res.block.memory_gb == 1.9 and res.block.size_source == "facility"
+    # the entry sends cores_per_node: 1 and no exclusive: the template may keep parsl's whole node — costed as one
+    assert (res.block.whole_node, res.block.cores_per_node, res.block.max_charge) == (None, 1, 32.0)
     ok = await _ensure_endpoint_up(app, shape="compute", account="cis250223", cores=8, memory_gb=16)
-    assert ok.block.cores_per_node == 8 and ok.block.size_source == "this_call" and ok.block.max_charge == 2.0
-    assert "8 cores × 0.25 h" in ok.notice
+    # cores= sends exclusive: false where the template takes it, so the slice is real; 16 GB counts as 9 cores
+    assert ok.block.cores_per_node == 8 and ok.block.whole_node is False and ok.block.size_source == "this_call"
+    assert ok.block.max_charge == 2.25 and "16 GB at 1.85 GB per core counts as 9 cores" in ok.notice
     gpus = await _ensure_endpoint_up(app, shape="compute", gpus=1)
     assert "this facility's endpoint sets the block size: its published template has no `gpus_per_node` setting" in (
         gpus.notice)
     await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
     sent = app.built[-1]
-    assert (sent["cores_per_node"], sent["mem_per_node"]) == (8, 16) and "gpus_per_node" not in sent
+    assert (sent["cores_per_node"], sent["mem_per_node"], sent["exclusive"]) == (8, 16, False)
+    assert "gpus_per_node" not in sent
     whole = await _ensure_endpoint_up(app, shape="compute", whole_node=True)
     assert whole.block.whole_node is True and "cores_per_node" not in _compute(app)
 

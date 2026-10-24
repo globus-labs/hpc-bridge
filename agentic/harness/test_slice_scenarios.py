@@ -36,7 +36,7 @@ def test_the_slices_profile_puts_a_per_core_partition_beside_a_whole_node_one():
     assert "SelectType=select/cons_tres" in conf and "SelectTypeParameters=CR_Core_Memory" in conf
     assert "DefMemPerCPU=500" in conf
     assert "PartitionName=main   Nodes=c[1-2] Default=YES" in conf            # the harness's default partition stays
-    assert "PartitionName=shared" in conf and "OverSubscribe=NO TRESBillingWeights=CPU=1.0" in conf
+    assert "PartitionName=shared" in conf and "OverSubscribe=NO DefMemPerCPU=500 TRESBillingWeights=CPU=1.0" in conf
     assert "PartitionName=whole" in conf and "OverSubscribe=EXCLUSIVE" in conf
     for sc in (sr, mn):
         assert sc.TARGETS == ("fake",) and sc.OPERATORS == ("script",)
@@ -67,7 +67,8 @@ def _proposal() -> dict:
 
 def test_the_product_probe_classifies_the_slices_partitions_and_proposes_shared():
     r = _proposal()
-    assert sr.proposal_kinds(r) == {"main": "per_core", "shared": "per_core", "whole": "whole_node"}
+    kinds = sr.proposal_kinds(r)   # `main` depends on whether scontrol shows the global DefMemPerCPU for it: not read
+    assert (kinds["shared"], kinds["whole"]) == ("per_core", "whole_node")
     assert r["proposed_details"]["partition"] == "shared"            # the probe's own pick: a cheap per-core one
     details = sr.proposal_details(r)
     assert "partitions" not in details and "env_setup" not in details and details["partition"] == "shared"

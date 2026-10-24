@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+from typing import Any
 
 from ..login import LOGIN_EXPIRED, login_expired
 from ..profile import Profile
@@ -128,6 +129,16 @@ class MEPFacility:
         # What the registry entry knows of each partition (models.PartitionShape): a request is validated against it;
         # the facility's template still decides how a block is sized (hpc_bridge.resources).
         self.partitions: tuple = ()
+
+    def block_size(self, uec: dict) -> Any:
+        """What a block of the compute config `uec` holds here, read from what this facility RECEIVES (`dispatch_uec`,
+        its key_map undone): a slice only when `exclusive: false` reaches its template (hpc_bridge.resources)."""
+        from .. import resources
+
+        back = {dst: src for src, dst in self.key_map.items()}
+        sent = {back.get(k, k): v for k, v in self.dispatch_uec(dict(uec)).items()}
+        shape = resources.shape_of(self.partitions, sent.get("partition"))
+        return resources.effective(sent, shape, channel="mep", scheduler=self.scheduler)
 
     def takes_size_key(self, key: str) -> bool:
         """Whether this facility's own template takes a block-size key (hpc-bridge's name: cores_per_node, mem_per_node,

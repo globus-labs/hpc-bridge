@@ -77,9 +77,14 @@ class PartitionShape(BaseModel):
     cores: int | None = None              # per node (the smallest node of the partition)
     memory_gb: float | None = None        # per node
     gpus: int | None = None               # per node (0: none)
+    max_gpus_per_node: int | None = None  # the LARGEST node's GPUs (a mixed CPU/GPU partition's smallest has none)
     mem_per_core_mb: int | None = None    # Slurm DefMemPerCPU: what a slice gets per core when it asks for no memory
+    # Slurm MaxMemPerCPU: memory above it per CPU raises the job's CPUs (and the charge) — the per-core memory share
+    max_mem_per_core_mb: int | None = None
+    max_cores_per_node: int | None = None  # Slurm MaxCPUsPerNode: a job's cores on one node of this partition
+    nodes: int | None = None               # the nodes the partition has (TotalNodes / the nodes serving the queue)
     max_cores_per_job: int | None = None  # the QOS per-job (or per-user) cap: Expanse `shared` is 127
-    max_nodes_per_job: int | None = None
+    max_nodes_per_job: int | None = None   # the QOS's, or the partition's MaxNodes
     max_gpus_per_job: int | None = None
     # TRESBillingWeights, per unit: "cpu" (per core), "mem_gb" (per GB), "gpu" (per GPU), "node" — what one hour of a
     # block is charged (Slurm sums them by default). None: not known, so no cost estimate.
@@ -109,14 +114,15 @@ class PartitionShape(BaseModel):
         text = "".join(ch for ch in v if ch.isprintable()).strip()
         return text[:120] or None
 
-    @field_validator("cores", "mem_per_core_mb", "max_cores_per_job", "max_nodes_per_job", "max_gpus_per_job",
+    @field_validator("cores", "mem_per_core_mb", "max_mem_per_core_mb", "max_cores_per_node", "nodes",
+                     "max_cores_per_job", "max_nodes_per_job", "max_gpus_per_job",
                      mode="before")
     @classmethod
     def _count(cls, v: Any) -> int | None:
         f = _positive(v)
         return int(f) if f is not None else None
 
-    @field_validator("gpus", mode="before")
+    @field_validator("gpus", "max_gpus_per_node", mode="before")
     @classmethod
     def _gpus(cls, v: Any) -> int | None:
         f = _positive(v, zero=True)
@@ -173,10 +179,16 @@ class BlockTerms(BaseModel):
     memory_default: bool = False            # the partition's default memory per core (DefMemPerCPU): not sent
     gpus_per_node: int | None = None
     size_source: SizeSource | None = None
+    # Where a size nothing here asked for comes from: "parsl's default: exclusive", "the facility's scheduler_options",
+    # "the facility template's own default (parsl's is the whole node)" … — the terms never claim a slice they cannot
+    # show (review round 1).
+    size_why: str | None = None
     # The most this block can be charged, where the partition's billing weights are known (Slurm TRESBillingWeights):
-    # `max_charge` in the facility's billing units (SU), and how it is reached ("8 cores × 0.5 h").
+    # `max_charge` in `charge_unit` (the facility's allocation listing's units, e.g. SU; else "billing units"), and how
+    # it is reached ("8 cores × 0.5 h"). A size the facility decides is costed as a whole node: never understated.
     max_charge: float | None = None
     charge_basis: str | None = None
+    charge_unit: str | None = None
 
 
 class ShellOutcome(BaseModel):
@@ -369,7 +381,9 @@ class FacilityDetails(BaseModel):
         "(#SBATCH -A/-p/-t/-N, #PBS -A/-q/-l walltime=/select=, bare or prefixed): those are "
         "ensure_endpoint_up(account=…), `partition` and `walltime`, so the spend question names them — a PBS "
         "chunk's resources (ngpus=4) go in `select_options`, the line's other resources (filesystems=…) on a line of "
-        "their own; on Slurm a GPU is '#SBATCH --gres=gpu:4'. Never the pilot's output file (#SBATCH -o: hpc-bridge "
+        "their own; a block's cores, memory, GPUs and whole node are ensure_endpoint_up(cores=, memory_gb=, gpus=, "
+        "whole_node=), never a directive here (#SBATCH --exclusive/-c/-n/--mem/--gres=gpu/--gpus, #PBS -l "
+        "place/ncpus/mem/ngpus). Never the pilot's output file (#SBATCH -o: hpc-bridge "
         "finds and cancels its pilots by parsl's own) or error file (#SBATCH -e: where it reads why a pilot died), or "
         "an array (#SBATCH -a, #PBS -J).",
         examples=["#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu"],

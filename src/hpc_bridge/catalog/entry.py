@@ -213,7 +213,8 @@ _DIRECTIVE = re.compile(r"\s*#(SBATCH|SLURM|PBS|BSUB)(.*)")
 TERMS_WORDS = {"account": "the account or the partition/queue", "queue": "the account or the partition/queue",
                "walltime": "the walltime or the node count", "nodes": "the walltime or the node count",
                "select": "the node count (a select)", "output": "the pilot's output file",
-               "error": "the pilot's error file", "array": "a job array"}
+               "error": "the pilot's error file", "array": "a job array",
+               "size": "the block's size (its cores, memory, GPUs or whole node)"}
 # Slurm short options for those, and their kinds: -o (the output file: parsl writes its own in the pilot's user
 # endpoint directory, the path squeue's StdOut shows, which hpc-bridge's probe and stop find the pilot by), -e (the
 # error file, beside it: where the probe reads why a pilot died) and -a (an array: several blocks behind one spend
@@ -249,6 +250,41 @@ def _slurm_terms(toks: list[str]) -> str | None:
                 if ch not in _SLURM_NO_ARG:
                     break
     return None
+
+
+# Slurm's options for a block's SIZE (resource requests, 2026-10-24): hpc-bridge writes the size itself (parsl's
+# cores_per_node / mem_per_node / exclusive, its own --gpus-per-node) so the spend question names it; a directive in
+# scheduler_options would size the block behind the terms — `#SBATCH --exclusive` plus `--mem=0` on a per-core partition
+# billed a whole node while the terms said 8 cores (review round 1). Long options by any prefix sbatch accepts; short
+# ones -c (cpus per task), -n (tasks), -G (GPUs), -s (oversubscribe), bundled too.
+_SLURM_SIZE_LONG = re.compile(r"--(?:excl|cpus-per-|ntasks|mem(?:=|-|$)|gpus|overs|cores-per|sockets-per|threads-per)")
+_SLURM_SIZE_SHORT = frozenset("cnGs")
+
+
+def _slurm_size(toks: list[str]) -> bool:
+    """Whether a Slurm directive's options set the block's size: --exclusive, -c/--cpus-per-task, -n/--ntasks*, --mem*,
+    --gres naming a GPU, -G/--gpus*, -s/--oversubscribe (and the per-socket/core/thread shapes)."""
+    for i, tok in enumerate(toks):
+        if _SLURM_SIZE_LONG.match(tok):
+            return True
+        if tok.startswith("--gres"):
+            value = tok.split("=", 1)[1] if "=" in tok else (toks[i + 1] if i + 1 < len(toks) else "")
+            if "gpu" in value.lower():
+                return True
+        if re.match(r"-[^-]", tok):
+            for ch in tok[1:]:
+                if ch in _SLURM_SIZE_SHORT:
+                    return True
+                if ch not in _SLURM_NO_ARG:
+                    break
+    return False
+
+
+def _pbs_size(toks: list[str]) -> bool:
+    """Whether a PBS directive's `-l` lists set the block's size: place, ncpus, mem, ngpus (a select is the node count's
+    own kind)."""
+    return any(item.split("=", 1)[0].strip().lower() in ("place", "ncpus", "mem", "ngpus")
+               for listed in _pbs_l_lists(toks) for item in listed.split(","))
 
 
 def _pbs_select(listed: str) -> str | None:
@@ -394,33 +430,36 @@ def read_as_directive(line: str, scheduler: str | None) -> bool:
     return m is not None and (scheduler != "pbs" or m.group(1) == "PBS")
 
 
-def scheduler_terms_kind(line: str) -> str | None:
-    """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes"), or None. Any batch
-    system's directive word is read (`_DIRECTIVE`), with its own options."""
+def scheduler_terms_kind(line: str, *, size: bool = True) -> str | None:
+    """Which of the block's terms a directive line sets ("account", "queue", "walltime", "nodes", …, and with `size`
+    the block's size: "size"), or None. Any batch system's directive word is read (`_DIRECTIVE`), with its own options.
+    `size=False` for a facility endpoint's own scheduler_options (its template's, which hpc-bridge does not size:
+    Delta's `--gpus-per-node=1` is read into the terms instead, resources.options_size)."""
     m = _DIRECTIVE.match(line)
     if m is None:
         return None
     word, rest = m.groups()
     toks = rest.split()
     if word in ("SBATCH", "SLURM"):
-        return _slurm_terms(toks)
+        return _slurm_terms(toks) or ("size" if size and _slurm_size(toks) else None)
     if word == "PBS":
-        return _pbs_terms(toks)
+        return _pbs_terms(toks) or ("size" if size and _pbs_size(toks) else None)
     return _bsub_terms(toks)
 
 
-def scheduler_terms_directive(opts: str | None) -> str | None:
+def scheduler_terms_directive(opts: str | None, *, size: bool = True) -> str | None:
     """The first directive line in `opts` that sets one of the block's terms (`scheduler_terms_kind`: the account, the
-    partition/queue, the walltime or the node count) behind the spend question, or None."""
+    partition/queue, the walltime, the node count, and with `size` the cores, memory, GPUs or whole node) behind the
+    spend question, or None."""
     for line in (opts or "").splitlines():
-        if scheduler_terms_kind(line) is not None:
+        if scheduler_terms_kind(line, size=size) is not None:
             return line.strip()
     return None
 
 
-def _without_terms_directives(opts: str | None) -> str | None:
+def _without_terms_directives(opts: str | None, *, size: bool = True) -> str | None:
     """`opts` with every directive line that sets one of the block's terms dropped (None when nothing is left)."""
-    kept = [ln for ln in (opts or "").splitlines() if scheduler_terms_directive(ln) is None]
+    kept = [ln for ln in (opts or "").splitlines() if scheduler_terms_directive(ln, size=size) is None]
     return "\n".join(kept) or None
 
 
@@ -543,9 +582,11 @@ def defaults_extra_raw_problems(row: Any) -> list[str]:
         opts = "\n".join([*([written] if written else []),
                           *(ln for ln in other if read_as_directive(ln, sched if isinstance(sched, str) else None))]
                          ) or None
-    for where, o in (("compute.scheduler_options", opts), ("defaults.extra.scheduler_options", extra_opts)):
-        if isinstance(o, str) and (line := scheduler_terms_directive(o)):
-            what = TERMS_WORDS[scheduler_terms_kind(line) or "account"]
+    ssh = not row.get("compute_mep_uuid")   # a facility endpoint's template sizes its own block: its size lines stay
+    for where, o, size in (("compute.scheduler_options", opts, ssh),
+                           ("defaults.extra.scheduler_options", extra_opts, False)):
+        if isinstance(o, str) and (line := scheduler_terms_directive(o, size=size)):
+            what = TERMS_WORDS[scheduler_terms_kind(line, size=size) or "account"]
             problems.append(f"{where} sets {what} ({line[:120]!r}): the block's terms must name them")
     return problems
 
@@ -861,11 +902,15 @@ class CatalogEntry(BaseModel):
         bad = _extra_terms_keys(self.defaults.extra, self.compute.key_map)
         if bad and self.defaults.extra is not None:
             self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k not in bad}
-        if scheduler_terms_directive(self.compute.scheduler_options):
-            self.compute.scheduler_options = _without_terms_directives(self.compute.scheduler_options)
+        # an SSH entry's size lines go too (hpc-bridge sizes its own blocks, so the terms name the size); a facility
+        # endpoint's template sizes its own, and its lines are read into the terms (resources.options_size)
+        ssh = self.compute_mep_uuid is None
+        if scheduler_terms_directive(self.compute.scheduler_options, size=ssh):
+            self.compute.scheduler_options = _without_terms_directives(self.compute.scheduler_options, size=ssh)
         extra_opts = (self.defaults.extra or {}).get("scheduler_options")
-        if isinstance(extra_opts, str) and scheduler_terms_directive(extra_opts) and self.defaults.extra is not None:
-            kept = _without_terms_directives(extra_opts)
+        if (isinstance(extra_opts, str) and scheduler_terms_directive(extra_opts, size=False)
+                and self.defaults.extra is not None):
+            kept = _without_terms_directives(extra_opts, size=False)
             self.defaults.extra = {k: v for k, v in self.defaults.extra.items() if k != "scheduler_options"}
             if kept:
                 self.defaults.extra["scheduler_options"] = kept

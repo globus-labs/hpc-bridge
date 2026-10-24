@@ -627,6 +627,10 @@ async def _connect(
             f"{out.notice or for_agent(out).stderr_snippet or out.phase}",  # its stderr, cut as run_shell's
         )
     allocations = PARSERS[entry.allocation.parser](out.stdout)
+    units = {a.units for a in allocations if a.units}
+    if len(units) == 1:  # the facility's own billing unit: the terms' cost says it (resources.charge)
+        app.charge_unit = units.pop()
+        terms = _next_block_terms(app)
     return ConnectFacilityResult(
         phase="needs_account",
         facility=facility,

@@ -15,7 +15,7 @@ from typing import Any, Literal, NamedTuple, TypeVar
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from . import binding, config, connect, dispatch, login_gate, resources, scheduler_ops, session_shell, warmth
+from . import binding, config, connect, dispatch, login_gate, notices, resources, scheduler_ops, session_shell, warmth
 from .binding import (  # noqa: F401 - re-exported for imports; PATCH binding.<name>, not server.<name>
     _catalog_facility,
     _entry_from_details,
@@ -399,6 +399,12 @@ async def _ensure_endpoint_up(
             await load()
         dropped = next((n for k, v in (("partition", partition), ("account", account))
                         if v is not None and (n := _dropped_term_notice(app, k, v))), None)  # all or nothing
+        takes_key = getattr(app.facility, "takes_size_key", None)
+        if (not _has_login_shape(app) and callable(takes_key) and sizing.get(resources.WHOLE, False) is None
+                and (sizing.get(resources.CORES) or sizing.get(resources.MEM)) and takes_key(resources.WHOLE)):
+            # on a facility endpoint a slice is only a slice when `exclusive: false` reaches its template (parsl's
+            # default is the whole node): cores= / memory_gb= send it where the template takes the key
+            sizing[resources.WHOLE] = False
         if not dropped and (sizing or partition is not None) and not login_only:
             # the size this call asks for, on the partition it names (or the session's), checked against what
             # discovery or the registry saw of it — a slice of a whole-node partition, more than a node has, over a QOS
@@ -459,6 +465,8 @@ async def _ensure_endpoint_up(
             return notice
 
         was_confirmed = rt.spend_confirmed  # after a switch dropped it: this call's own confirmation is what is new
+        if confirm_spend and named and rt.user_endpoint_config.get("compute"):
+            rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the terms this call named itself
         try:
             # force_canary: a status probe must re-verify the worker (and kick a cold block),
             # never trust the TTL — that's exactly the cold-start gap callers are asking about.
@@ -475,6 +483,7 @@ async def _ensure_endpoint_up(
             )
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             terms = _block_terms(app, rt, named=named)
+            rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the size this question names
             return EndpointStatus(
                 status="needs_confirmation",
                 block_state="provisioning" if rt.reap_kicked else "cold",
@@ -725,10 +734,12 @@ async def ensure_endpoint_up(
     a node, not a whole one, unless `whole_node=True` or the partition hands out only whole nodes. With none of them on
     a per-core partition the terms PROPOSE a modest slice (a few cores and their memory) for the user to confirm or
     change. `nodes` > 1 is one shell over the whole allocation, on the first node, like salloc: run work across the
-    nodes with srun / mpiexec from it; nodes not used still bill. Like `partition`, the size persists for the session,
-    and a change is a different block (spend is asked again). A size the partition cannot give (more than a node has,
-    over a QOS per-job cap, a slice of a whole-node partition) or that the facility's template does not take is
-    refused before anything is submitted, saying why. Ignored for shape="login"."""
+    nodes with srun from it; nodes not used still bill. Like `partition`, the size persists for the session, and a
+    change is a different block (spend is asked again). The terms never claim a slice they cannot show: where nothing
+    shows a partition shares nodes they say a whole node (parsl's default), and its cost. A size the partition cannot
+    give (more than a node has, over a QOS per-job cap, a slice of a whole-node partition — on a facility's endpoint
+    too) or that the facility's template does not take, and several nodes on a facility's endpoint, are refused before
+    anything is submitted, saying why. Ignored for shape="login"."""
     return await _heartbeat(ctx, _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
         whole_node,

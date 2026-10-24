@@ -123,13 +123,13 @@ _DRAFT = dict(ssh_host="login.example.edu", interface="ib0", env_setup="module l
 
 @pytest.mark.parametrize("opts", ["#SBATCH --account=secretproj", "#SBATCH -A secretproj", "#SBATCH -Asecretproj",
                                   "#SBATCH --partition=gpu", "#SBATCH -p gpu", "#PBS -A proj", "#PBS -q prod",
-                                  "#SBATCH --gpus-per-node=1\n#SBATCH --account secretproj"])
+                                  "#SBATCH --constraint=gpu\n#SBATCH --account secretproj"])
 def test_byo_scheduler_options_may_not_set_the_account_or_queue(opts):
     with pytest.raises(ValueError, match="sets the account or the partition/queue"):
         binding._entry_from_details("mine", FacilityDetails(**_DRAFT, scheduler_options=opts))
 
 
-@pytest.mark.parametrize("opts", ["#SBATCH -q normal", "#PBS -l filesystems=home:eagle", "#SBATCH --gpus-per-node=1",
+@pytest.mark.parametrize("opts", ["#SBATCH -q normal", "#PBS -l filesystems=home:eagle", "#SBATCH --constraint=gpu",
                                   "#SBATCH --parsable"])
 def test_other_directives_pass(opts):
     # each on its own scheduler: a `#PBS` line on Slurm is another batch system's directive, refused since 2026-10-20

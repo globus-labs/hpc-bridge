@@ -117,7 +117,7 @@ def test_a_squeue_that_fails_both_ways_is_still_a_failed_query(tmp_path):
                                   "#PBS -l select=1:ngpus=4+1:ngpus=4", "#PBS -l select=1:ncpus=8:ngpus=4"])
 def test_the_slurm_gpu_advice_keeps_the_lines_ngpus(opts):
     msg = _refusal(opts, _SLURM)
-    assert "`#SBATCH --gres=gpu:4`" in msg and "gpu:<n>" not in msg
+    assert "ensure_endpoint_up(gpus=4)" in msg and "gpus=<n>" not in msg
 
 
 # --- 6a. a foreign directive on PBS is refused as what it is -----------------------------------------------------------

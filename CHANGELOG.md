@@ -35,6 +35,19 @@ installed plugin only when that version changes); git tags mark releases.
     not take ("this facility's endpoint sets the block size"); never dropped silently.
   - The `driving-hpc` skill says to ask what the work needs, what a slice and a whole node cost, and what several
     nodes mean.
+  - **The terms never understate what a block can bill** (review round 1). A partition counts as per-core only on
+    evidence (a per-core memory default, or nodes oversubscribed), never under `CR_Socket`, never when it shares a
+    whole-node partition's QoS (Anvil's `standard`); elsewhere the terms say parsl's default whole node and its cost.
+    A facility endpoint's whole-node partition is a whole node (Anvil's `wholenode` read "1 core, 0.25 SU" while it
+    bills 128 cores); a slice is claimed there only when `exclusive: false` reaches its template (the Anvil entry now
+    sends it); several nodes are not offered on a facility endpoint. Size directives in `scheduler_options`
+    (`--exclusive`, `-c`, `-n`, `--mem…`, `--gres=gpu`, `--gpus…`, `--oversubscribe`; `#PBS -l place/ncpus/mem/ngpus`)
+    are refused, pointing at `cores=` / `memory_gb=` / `gpus=` / `whole_node=`; a facility's own ones (Delta's GPU line)
+    are read into the terms. Memory beyond the per-core share bills as cores (MaxMemPerCPU, else DefMemPerCPU). A
+    whole GPU node counts its GPUs; the unit is the facility's (its allocation listing's), else "billing units". A size
+    read again once the endpoint's template is known is asked again before anything starts; naming what the block
+    already holds is no term switch; partition limits (MaxNodes, MaxCPUsPerNode, TotalNodes) refuse a block that
+    would pend.
 - **The fake cluster's `slices` profile** (a per-core `shared` partition beside a whole-node `whole` one) and two
   scripted scenarios: `slice_request` (2 cores and 2 GB, which sacct's AllocCPUS / ReqMem must show; a slice of
   `whole` refused) and `multinode_allocation` (2 nodes: `srun -N2 hostname` names two nodes, hpc-bridge's worker runs

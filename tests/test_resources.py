@@ -52,7 +52,9 @@ def test_the_live_anvil_probe_classifies_its_partitions():
         assert (p[name].cores, p[name].memory_gb, p[name].mem_per_core_mb) == (128, 251.4, 1896)
         assert p[name].billing == {"cpu": 1.0}
     assert p["shared"].max_cores_per_job == 2048            # part-shared's MaxTRESPU cpu=2048 bounds one job too
-    assert p["standard"].kind == "per_core"                  # nothing in its scontrol line says whole nodes
+    # `standard` says OverSubscribe=NO with no per-core memory default, and shares `wholenode`'s QoS and billing: weak
+    # evidence, so NOT per-core — the terms say parsl's whole node there (review round 1)
+    assert p["standard"].kind is None and "nothing shows it shares nodes" in p["standard"].why
     # `wholenode` says OverSubscribe=NO too (a submit rule makes it whole): only its name tells, and the why says so
     assert p["wholenode"].kind == "whole_node" and "name" in p["wholenode"].why
     # no scontrol line was captured for these: their kind is not known; that sinfo had no GRES column: GPUs unknown
@@ -60,8 +62,8 @@ def test_the_live_anvil_probe_classifies_its_partitions():
     assert p["gpu"].memory_gb == 503.3 and p["ai"].cores == 96
     assert draft.partition == "debug"                        # the proposal's default partition is unchanged
     note = next(n for n in notes if n.startswith("partitions:"))
-    assert "per-core (a block is a slice): standard" in note and "whole-node: wholenode" in note
-    assert "not known: wide" in note
+    assert "per-core (a block is a slice): shared" in note and "whole-node: wholenode" in note
+    assert "not known (a block is parsl's default whole node): standard, wide" in note
 
 
 def test_expanse_shared_carries_its_127_cpu_qos_cap_and_compute_is_whole_node():
@@ -163,11 +165,16 @@ def test_d3_a_per_core_partition_with_nothing_asked_gets_a_proposed_slice():
 
 
 def test_no_proposal_where_the_template_cannot_take_it_or_nothing_is_known():
-    for takes in (False, None):   # an endpoint configured before this change, or one whose template was not read
-        size = resources.effective(_uec(), SHARED, channel="ssh", takes=takes)
-        assert size.whole_node is None and not size.proposed
-    # nothing known of the partition: the facility's own default, as before (the registry's exclusive: False)
-    assert resources.effective(_uec(), None, channel="ssh").whole_node is None
+    # an endpoint configured before this change, or one whose template was not read: no slice is sent, so parsl's
+    # default --exclusive holds the whole node — said as such (review round 1: it read "1 node")
+    old = resources.effective(_uec(), SHARED, channel="ssh", takes=False)
+    assert (old.whole_node, old.cores, old.proposed, old.why_whole) == (True, 128, False, "old_template")
+    unread = resources.effective(_uec(), SHARED, channel="ssh", takes=None)
+    assert (unread.whole_node, unread.why_whole) == (True, "parsl")
+    assert resources.slurm_wire(_uec(), old) == _uec()            # the wire as before: parsl's own default
+    # nothing known of the partition: parsl's whole node on Slurm; the queue's placement on PBS (not known)
+    assert resources.effective(_uec(), None, channel="ssh").whole_node is True
+    assert resources.effective(_uec(), None, channel="ssh", scheduler="pbs", profile_cpus=32).whole_node is None
     expanse_like = resources.effective(_uec(**{WHOLE: False}), None, channel="ssh")
     assert (expanse_like.whole_node, expanse_like.cores, expanse_like.proposed) == (False, None, False)
 
@@ -188,11 +195,20 @@ def test_an_explicit_slice_is_what_was_asked():
     assert (s.memory_gb, s.memory_default, s.send_mem) == (29.6, True, None)
 
 
-def test_a_facility_endpoint_gets_exactly_the_keys_it_receives():
+def test_a_facility_endpoint_is_a_slice_only_when_exclusive_false_reaches_it():
+    # cores_per_node alone is no slice: the facility's template may keep parsl's exclusive=True (review round 1)
     s = resources.effective({CORES: 1, NODES: 1}, SHARED, channel="mep")
-    assert (s.whole_node, s.cores, s.memory_gb, s.memory_default, s.proposed) == (False, 1, 1.9, True, False)
+    assert (s.whole_node, s.cores) == (None, 1)
+    assert resources.charge(s, SHARED, 900) == (32.0, "a whole node's worth, the most it can be: 128 cores × 0.25 h")
+    sl = resources.effective({CORES: 1, NODES: 1, WHOLE: False}, SHARED, channel="mep")
+    assert (sl.whole_node, sl.cores, sl.memory_gb, sl.memory_default, sl.proposed) == (False, 1, 1.9, True, False)
+    assert resources.charge(sl, SHARED, 900) == (0.25, "1 core × 0.25 h")
     assert resources.effective({NODES: 1}, SHARED, channel="mep").whole_node is None   # no D3 there
     assert resources.effective({WHOLE: True, NODES: 1}, SHARED, channel="mep").cores == 128
+    # a whole-node partition is whole whatever the facility receives (Anvil's `wholenode`: 128 cores, not 1)
+    w = resources.effective({CORES: 1, NODES: 1}, WHOLE_P, channel="mep")
+    assert (w.whole_node, w.cores, w.by_partition) == (True, 128, True)
+    assert resources.charge(w, WHOLE_P, 900) == (32.0, "128 cores × 0.25 h")
 
 
 # ---- the validation -------------------------------------------------------------------------------------------------
@@ -205,9 +221,11 @@ def test_a_slice_of_a_whole_node_partition_is_refused_naming_the_per_core_ones()
     assert "would hold and bill the whole node" in why
     assert "whole_node=False" in resources.refusal(_uec(partition="wholenode", **{WHOLE: False}), WHOLE_P,
                                                    named={WHOLE})
-    # the whole node itself is fine there, and a facility endpoint's template decides its own
+    # the whole node itself is fine there; a facility endpoint cannot slice it either (review round 1)
     assert resources.refusal(_uec(partition="wholenode", **{WHOLE: True}), WHOLE_P, named={WHOLE}) is None
-    assert resources.refusal(_uec(**{CORES: 8}), WHOLE_P, named={CORES}, channel="mep") is None
+    assert "hands out whole nodes only" in resources.refusal(_uec(**{CORES: 8}), WHOLE_P, named={CORES}, channel="mep")
+    # an entry's own cores default (Anvil's cores_per_node: 1) is nobody's slice request
+    assert resources.refusal(_uec(**{CORES: 1}), WHOLE_P, named={"partition"}, channel="mep") is None
 
 
 def test_whole_node_with_fewer_cores_than_a_node_is_refused():
@@ -226,7 +244,7 @@ def test_more_than_a_node_has_is_refused_and_an_earlier_choice_is_named_as_one()
     four = SHARED.model_copy(update={"gpus": 4})
     assert "(4 GPUs)" in resources.refusal(_uec(**{GPUS: 8}), four, named={GPUS})
     # the cores came from an earlier call; this call switched the partition
-    why = resources.refusal(_uec(partition="wholenode", **{CORES: 8}), WHOLE_P, named={"partition"})
+    why = resources.refusal(_uec(partition="wholenode", **{CORES: 8}), WHOLE_P, named={"partition"}, chosen={CORES})
     assert "cores=8 (chosen earlier this session)" in why
     assert resources.refusal(_uec(**{CORES: 200}), None, named={CORES}) is None   # nothing known: not refused
 
@@ -293,7 +311,9 @@ def test_the_cost_estimate_of_a_slice_a_whole_node_and_several_nodes():
     g = resources.effective(_uec(**{CORES: 4, MEM: 16, GPUS: 1}), w, channel="ssh")
     assert resources.charge(g, w, 900) == (6.0, "(4 cores + 16 GB × 0.25 + 1 GPU × 16) × 0.25 h")
     assert resources.charge(slice_, SHARED.model_copy(update={"billing": None}), 1800) is None   # weights unknown
-    assert resources.charge(resources.Size(nodes=1), SHARED, 1800) is None                     # cores unknown
+    # a size nobody knows is costed as a whole node, never less
+    assert resources.charge(resources.Size(nodes=1), SHARED, 1800) == (
+        64.0, "a whole node's worth, the most it can be: 128 cores × 0.5 h")
 
 
 def test_the_size_words():
@@ -307,9 +327,15 @@ def test_the_size_words():
     assert w(nodes=1, whole_node=None, cores=None, memory_gb=None, memory_default=False, gpus=None) == "1 node"
     assert w(nodes=None, whole_node=None, cores=None, memory_gb=None, memory_default=False, gpus=None) == (
         "the facility's default size")
+    assert w(nodes=1, whole_node=True, cores=128, memory_gb=None, memory_default=False, gpus=None,
+             why="parsl's default: exclusive") == "1 whole node (parsl's default: exclusive; 128 cores)"
+    assert w(nodes=1, whole_node=None, cores=1, memory_gb=None, memory_default=False, gpus=1,
+             why="the facility template's own default") == "1 node, 1 core asked, 1 GPU (the facility template's own default)"
     note = resources.multinode_note(2, False)
-    assert "one shell, on the first node" in note and "srun" in note and "still bill" in note
-    assert resources.multinode_note(1, False) == "" and "one of the nodes" in resources.multinode_note(3, True)
+    assert "one shell, on the first node" in note and "still bill" in note
+    # MPI across the nodes: one task slot per node, so the ranks are asked for (review round 1)
+    assert "srun -N2 -n <ranks>" in note and "--oversubscribe or --map-by" in note
+    assert resources.multinode_note(1, False) == "" and resources.multinode_note(3, True) == ""
 
 
 def test_a_registry_exclusive_false_is_no_slice_request_on_a_whole_node_partition():

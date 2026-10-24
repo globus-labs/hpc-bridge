@@ -1331,7 +1331,8 @@ class SlurmFacility:
 
         shape = resources.shape_of(self.profile.partitions, uec.get("partition"))
         cpus = self.profile.cpus_per_node if self.profile.scheduler == "pbs" else None
-        return resources.effective(uec, shape, channel="ssh", takes=self.takes_resources, profile_cpus=cpus)
+        return resources.effective(uec, shape, channel="ssh", takes=self.takes_resources, profile_cpus=cpus,
+                                   scheduler=self.profile.scheduler)
 
     def config_template(self, hpc: Profile) -> tuple[str, dict]:
         """Return (jinja_template_str, default_user_opts) for the UEP template.

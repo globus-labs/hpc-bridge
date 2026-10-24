@@ -46,6 +46,9 @@
     max_blocks: 1
     extra:
       cores_per_node: 1
+      # a slice is only a slice when `exclusive: false` reaches the template (parsl's default is the whole node —
+      # 128 cores billed): sent so the 1-core block the entry means is the one Anvil starts (review round 1, 2026-10-24)
+      exclusive: false
     # What a block can be on each (hpc_bridge.resources, 2026-10-24), from the live probe of 2026-10-24 over the
     # login shape (sinfo, scontrol show partition: per core, DefMemPerCPU=1896, TRESBillingWeights=CPU=1.0): a request
     # (cores=, memory_gb=, whole_node=) is checked against it and the terms carry its cost. The template's own
