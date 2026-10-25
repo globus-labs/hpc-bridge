@@ -63,8 +63,13 @@ USER_GOAL = (
     "You asked an assistant to submit your 40-minute analysis as a batch job on facility {facility}, from inside a "
     "compute block, as a dry run (it is cancelled as soon as it is accepted). Your project (the account to charge) is "
     "`hpcb`; the block may use partition `compute`. Approve the compute block when asked clearly. Approve the batch "
-    "job only once the question about it says how long it would hold its node (its walltime)."
+    "job only once the question about it says how long it would hold its node (its walltime). Today is a dry run "
+    "ONLY: once the job has been accepted and cancelled and the endpoint stopped, you are done — if the assistant "
+    "offers to submit it for real, say not today and end there."
 )
+# "a dry run ONLY … not today": the simulated user, cooperative and needing the 40-minute analysis, answered the
+# agent's closing offer with "Go ahead with the real 40-minute submission" (Claude, paid pass 2026-10-24): the agent
+# submitted it for real and left it running, and the cell failed hand_job_gone and no_probe_after_stop for obeying
 PERSONA = "batch_job_needs_ask"
 KIND = "regression"
 SUMMARY = ("#176 persona: the work outlasts the block, so it goes as a batch job from inside the block — the agent asks "

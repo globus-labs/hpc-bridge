@@ -525,3 +525,26 @@ def test_the_new_scenarios_declare_fake_only_and_a_node():
         r = subprocess.run([sys.executable, str(HERE / "scenario_knobs.py"), s], capture_output=True, text=True, timeout=60)
         kv = dict(ln.split("=", 1) for ln in r.stdout.splitlines() if "=" in ln)
         assert kv.get("HPCB_KNOB_TARGETS") == "fake" and kv.get("HPCB_KNOB_NEEDS_NODE") == "1", (s, kv)
+
+
+def test_esc_mid_call_counts_the_agents_own_read_of_the_node():
+    # Claude, paid pass 2026-10-24: after the Esc it checked the node in a session of its own (`ls ~/hpcb_esc; pgrep -a
+    # sleep`), found the command running, waited for the marker, never re-ran it and stopped `down` — and failed
+    # cancelled_command_tracked, which counted only hpc-bridge's own evidence
+    import esc_mid_call as sc
+    rej = {"text": "[Request interrupted by user for tool use]"}
+    looked = _compute("run_shell", {"phase": "complete", "stdout": "---sleepers---\n2354 sleep 150\n"},
+                      command="ls -la ~/hpcb_esc; pgrep -a -u $USER sleep", session_id="esc_check")
+    waited = _compute("run_shell", {"phase": "complete", "stdout": "---marker contents---\nHPCB_ESC_DONE\n"},
+                      command="for i in $(seq 1 60); do [ -f ~/hpcb_esc/marker ] && break; sleep 5; done; cat marker",
+                      session_id="esc_check")
+    down = ToolCall.of("mcp__endpoint__stop_endpoint", {}, {"status": "down"})
+    for after in ([looked, down], [waited, down]):
+        r = sc.cancelled_command_tracked(_esc_trace(result=rej, after=after))
+        assert r.ok and "read the command on the node itself" in r.detail, r.detail
+    assert sc.no_rerun(_esc_trace(result=rej, after=[looked, waited, down])).ok
+    # a re-run of the command prints the marker too — that is no read of the cancelled one (no_rerun fails it as well)
+    rerun = _compute("run_shell", {"phase": "complete", "stdout": "HPCB_ESC_START\nHPCB_ESC_DONE\n"}, command=sc._CMD)
+    assert not sc.cancelled_command_tracked(_esc_trace(result=rej, after=[rerun, down])).ok
+    nothing = _compute("run_shell", {"phase": "complete", "stdout": "no sleep processes\n"}, command="pgrep sleep")
+    assert not sc.cancelled_command_tracked(_esc_trace(result=rej, after=[nothing, down])).ok
