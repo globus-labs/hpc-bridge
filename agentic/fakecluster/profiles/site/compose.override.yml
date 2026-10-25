@@ -18,7 +18,7 @@ services:
     depends_on: [slurmctld]
     volumes:
       - munge:/etc/munge
-      - home:/home
+      - home:/home:nocopy
       - ${HPCB_FAKE_PROFILE_DIR:-./profiles/default}:/etc/hpcb/profile:ro
     networks: [default, data]
     restart: unless-stopped
@@ -41,7 +41,7 @@ services:
       - "${HPCB_FAKE_SSH_PORT2:-2223}:${HPCB_FAKE_SSHD_PORT:-22}"
     volumes:
       - munge:/etc/munge
-      - home:/home
+      - home:/home:nocopy
       - ${HPCB_FAKE_KEY_PUB:-~/.ssh/hpcb-fake.pub}:/run/hpcb/authorized_keys:ro
       - ${HPCB_FAKE_PROFILE_DIR:-./profiles/default}:/etc/hpcb/profile:ro
     networks:
