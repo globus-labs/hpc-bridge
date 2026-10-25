@@ -283,6 +283,18 @@ def _make_search_client(_app_factory=None):
         pass
     return SearchClient()  # anonymous: public entries only (the registry's default)
 
+def registry_outage(exc: BaseException) -> str:
+    """Why the facility registry (a Globus Search index) could not be read, in the service's own words when it gave
+    any: Search's maintenance window answered `503 Unavailable.ServiceMaintenance: We're sorry, but Globus Search is
+    currently down for maintenance…` (2026-10-24), which a bare `SearchAPIError` hid — the agent had to curl the
+    index itself to learn it was an outage and not the facility."""
+    status, code, msg = getattr(exc, "http_status", None), getattr(exc, "code", None), getattr(exc, "message", None)
+    if status is not None:
+        said = " ".join(str(x) for x in (status, code) if x not in (None, "", "Error"))
+        return f"{said}: {str(msg).strip()[:240]}" if msg else said
+    return f"{type(exc).__name__}: {str(exc).strip()[:240]}" if str(exc).strip() else type(exc).__name__
+
+
 def make_catalog():
     """The runtime catalog is the PUBLIC REGISTRY — a Globus Search index, read anonymously. The
     plugin ships its id (`PUBLIC_REGISTRY_INDEX`), so `list_facilities()` works out of the box with no
@@ -336,8 +348,9 @@ def _select_words(line: str, scheduler: str | None) -> str:
     adv = select_advice(line)
     if scheduler != "pbs":  # the GPUs the line names, whatever select_advice makes of it (two chunks, a walltime too)
         gpus = re.search(r"(?<![\w])ngpus=(\d+)", line, re.I)
-        return ("take it out — on Slurm a chunk's resources are #SBATCH directives in scheduler_options, its GPUs "
-                f"`#SBATCH --gres=gpu:{gpus.group(1) if gpus else '<n>'}` (select_options is PBS only)")
+        return ("take it out — on Slurm a chunk's GPUs are ensure_endpoint_up(gpus="
+                f"{gpus.group(1) if gpus else '<n>'}) and its cores and memory cores=/memory_gb= (select_options is "
+                "PBS only)")
     how = ("hpc-bridge writes select=<the block's node count>:ncpus=<cpus_per_node>:<select_options>, so the node "
            "count and the spend terms stay its own")
     if adv is None:
@@ -350,6 +363,8 @@ def _select_words(line: str, scheduler: str | None) -> str:
                 "ncpus=1)")
     if adv.rest:
         out += f", and keep the line's other resources as {adv.rest[:120]!r} in scheduler_options"
+    if re.search(r"(?<![\w])place=", line, re.I):   # taken out with the select (select_advice): hpc-bridge's to write
+        out += ", leaving its place= out (hpc-bridge writes the placement: whole_node=True for whole nodes)"
     return f"{out} ({how})"
 
 
@@ -382,6 +397,11 @@ def _terms_refusal(line: str, was: str | None, scheduler: str | None = None) -> 
     if kind == "array":
         return (head + "; #SBATCH -a/--array, #PBS -J): take it out — an array starts several blocks behind one spend "
                 "question")
+    if kind == "size":
+        return (head + "; #SBATCH --exclusive/-c/--cpus-per-task/-n/--ntasks/--mem/--gres=gpu/--gpus/-G/"
+                "--oversubscribe, #PBS -l place/ncpus/mem/ngpus): take it out — ask for the size with "
+                "ensure_endpoint_up(cores=…, memory_gb=…, gpus=…, whole_node=…), so the spend question names what the "
+                "block holds and bills (a directive here would size the block behind the terms)")
     return (head + "; #SBATCH -t/--time/-N/--nodes, #PBS -l walltime=/nodes=): take it out — the block's walltime is "
             "details' `walltime` and its size is hpc-bridge's (one node per block), so the spend question names what "
             "the block asks for (parsl writes both before scheduler_options, and a later directive would override "
@@ -399,8 +419,8 @@ def _directive_details(details: FacilityDetails) -> tuple[FacilityDetails, list[
     be chunk resources only (`select_options_problem`)."""
     if details.select_options is not None:
         if details.scheduler != "pbs":
-            raise SchedulerOptionsError("select_options is PBS only: on Slurm a resource is an #SBATCH directive in "
-                                        "scheduler_options (e.g. --gres=gpu:4)")
+            raise SchedulerOptionsError("select_options is PBS only: on Slurm a block's GPUs, cores and memory are "
+                                        "ensure_endpoint_up(gpus=…, cores=…, memory_gb=…)")
         if why := select_options_problem(details.select_options):
             raise SchedulerOptionsError(f"{why}; hpc-bridge writes select=<the block's node count>:ncpus="
                                         "<cpus_per_node>:<select_options>")
@@ -456,6 +476,8 @@ def _accepted_details(details: FacilityDetails) -> tuple[FacilityDetails, list[s
                 where = "give those as `partition` and ensure_endpoint_up(account=…)"
             elif kind in ("walltime", "nodes", "select"):
                 where = "the walltime is `walltime`, the size hpc-bridge's"
+            elif kind == "size":
+                where = "ask for the size with ensure_endpoint_up(cores=, memory_gb=, gpus=, whole_node=)"
             elif kind == "output":
                 where = "hpc-bridge finds and cancels its pilots by their own output file"
             elif kind == "error":
@@ -519,6 +541,7 @@ def _entry_from_details(facility: str, details: FacilityDetails) -> CatalogEntry
             walltime=details.walltime,
             cpus_per_node=details.cpus_per_node,
             select_options=details.select_options,
+            partitions=details.partitions,  # what the probe saw of each partition (hpc_bridge.resources)
         ),
         provenance="session",
         last_validated=datetime.date.today(),

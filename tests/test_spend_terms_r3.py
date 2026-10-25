@@ -153,7 +153,7 @@ async def test_pbs_switch_wording_uses_queue(monkeypatch):
     assert (await _ensure_endpoint_up(app, shape="compute", account="p1", confirm_spend=True)).status == "up"
     res = await _ensure_endpoint_up(app, shape="compute", partition="prod")
     assert "the queue or account has changed since spend was confirmed" in res.notice
-    assert "keeps the new queue and account" in res.notice and "partition" not in res.notice.lower()
+    assert "keeps the new queue, account and size" in res.notice and "partition" not in res.notice.lower()
     back = await _ensure_endpoint_up(app, shape="compute", partition="shared", confirm_spend=True)
     assert "partition" not in (back.notice or "").lower()
     sw = await _ensure_endpoint_up(app, shape="compute", partition="debug", confirm_spend=True)

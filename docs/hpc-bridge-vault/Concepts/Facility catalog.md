@@ -52,5 +52,10 @@ Allocation output is parsed by a **deterministic, plugin-side parser** keyed by 
 > [!warning] Trust — read-only plugin, curator-only writes
 > The plugin never writes the index — an open-write catalog of executable config (`env_setup` bash, UUIDs) is an injection vector. New machines are curated via the `hpc-bridge-catalog` ingest (`catalog/ingest.py`; PR review = the audit trail). The agent only ever sees a `CatalogSummary` (identity + provenance + the derived `access`/`access_note`/`scheduler` — no executable config or raw UUIDs).
 
+**`defaults.partitions` (2026-10-24).** An entry may carry what each partition hands out ([[models]]
+`PartitionShape`: per-core or whole-node, node shape, per-job caps, billing weights), so a curated facility needs no
+probe for the block's default slice, its validation and its cost ([[Resource requests]]). Read leniently, checked
+strictly at ingest (`partitions_raw_problems`). Expanse and Anvil carry theirs since 2026-10-24 (re-ingest pending).
+
 ## See also
 [[The MCP tools]] · [[Discovery today]] · [[Globus index discovery channel]] · [[Discovery channel model]] · [[facility-remote]] · [[facility-mep]] · [[MEP & templated endpoints]] · [[MEP facilities survey]] · [[login]] · [[state]] · [[server]]

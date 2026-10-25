@@ -32,6 +32,7 @@ from globus_compute_sdk.sdk.auth.token_storage import (
 )
 
 from ..credentials import build_minimal_storage_db
+from ..models import PartitionShape
 from ..profile import Profile
 from ..state import EndpointRecord, LoginNodeStore
 
@@ -347,6 +348,9 @@ class MachineProfile:
     select_options: str | None = None
     exclusive: bool | None = None  # Slurm: SlurmProvider.exclusive (None = Parsl's default, True — a whole node)
     account_required: bool = False  # the entry's: warmth._provision starts no block without an account (False: BYO)
+    # What discovery or the registry knows of each partition (models.PartitionShape): per-core or whole-node, the
+    # node's shape, per-job caps, billing weights — the block's default slice, its terms and the request's validation.
+    partitions: tuple[PartitionShape, ...] = ()
 
 
 def profile_from_catalog_entry(
@@ -957,6 +961,13 @@ class RemoteEndpointCLI:
 # `| int` so only digits ever reach that shell — names the block request in its log, and a stop can find the user
 # endpoint a check of ours went to (server._settle_by_evidence; `logs_block_requests`). A template without it (an
 # endpoint configured before this change) leaves the stop with nothing to match: it stays `draining` there.
+# A block's size (hpc_bridge.resources, 2026-10-24): the Slurm template renders parsl's `cores_per_node` and
+# `mem_per_node` (--cpus-per-task with one task per node, --mem=<GB>g) beside `exclusive`; a block of more than one node
+# takes SimpleLauncher on both templates — ONE worker, in the batch script on the first node, from which the user's
+# `srun -N<n>` / `mpiexec` reach every node as from an salloc shell (SrunLauncher would start a worker pool on every
+# node as a job step that holds their CPUs; SingleNodeLauncher starts <n> pools, all on the first node). One node keeps
+# SrunLauncher / SingleNodeLauncher. That launcher line marks a template that takes a resource request
+# (`takes_resources`); an endpoint configured before it renders none of it, and a request there is refused.
 # `strategy_period: 5` (both templates; 30 on endpoints configured before this change): a new user endpoint scales
 # out only on its first scaling pass, one period after it starts, and a first SSH result pays that wait twice
 # (login shape, then compute). It is not the scheduler query rate (parsl polls Slurm/PBS at most every 60 s).
@@ -991,9 +1002,15 @@ engine:
     account: {{ account | default(@@ACCOUNT@@) }}
     walltime: {{ walltime | default(@@WALLTIME@@) }}
     nodes_per_block: {{ nodes_per_block | default(@@NODES@@) }}
+{% if cores_per_node is defined and cores_per_node %}
+    cores_per_node: {{ cores_per_node }}
+{% endif %}
+{% if mem_per_node is defined and mem_per_node %}
+    mem_per_node: {{ mem_per_node }}
+{% endif %}
     worker_init: {{ worker_init | default(@@WORKER_INIT@@) }}
     launcher:
-      type: SrunLauncher
+      type: {{ 'SimpleLauncher' if (nodes_per_block | default(@@NODES@@) | int) > 1 else 'SrunLauncher' }}
     init_blocks: {{ init_blocks | default(@@EAGER@@) }}
     min_blocks: 0
     max_blocks: {{ max_blocks | default(@@MAXBLK@@) }}
@@ -1054,7 +1071,7 @@ engine:
 {% endif %}
     worker_init: {{ worker_init | default(@@WORKER_INIT@@) }}
     launcher:
-      type: SingleNodeLauncher
+      type: {{ 'SimpleLauncher' if (nodes_per_block | default(@@NODES@@) | int) > 1 else 'SingleNodeLauncher' }}
     init_blocks: {{ init_blocks | default(@@EAGER@@) }}
     min_blocks: 0
     max_blocks: {{ max_blocks | default(@@MAXBLK@@) }}
@@ -1111,6 +1128,17 @@ def logs_block_requests(template: object) -> bool:
 
 
 _SELECT_LINE = re.compile(r"^\s*select_options: \{\{ select_options \}\}\s*$", re.M)
+# The launcher line both templates carry since resource requests (2026-10-24): SimpleLauncher for a block of several
+# nodes. A template with it renders cores_per_node / mem_per_node (Slurm) and the launcher a block of N nodes needs.
+_RESOURCES_LINE = re.compile(
+    r"^\s*type: \{\{ 'SimpleLauncher' if \(nodes_per_block \| default\(\d+\) \| int\) > 1 ", re.M)
+
+
+def takes_resources(template: object) -> bool:
+    """Whether an endpoint's published UEP template renders a resource request (this plugin's, 2026-10-24): one
+    configured before it asks for whole nodes (or the registry's `exclusive`) and launches a worker on every node of a
+    multi-node block, whatever the config carries — so a request there is refused, never silently dropped."""
+    return _RESOURCES_LINE.search(str(template or "")) is not None
 
 
 def takes_select_options(template: object) -> bool:
@@ -1207,6 +1235,11 @@ class SlurmFacility:
         # Said at connect when the profile carries select_options and the running endpoint's template does not render
         # them (`takes_select_options`): its blocks would get parsl's bare select, and only a fresh configure fixes it.
         self.select_note = ""
+        # Whether the bound endpoint's template renders a resource request (`takes_resources`: cores, memory, the
+        # launcher a multi-node block needs) — set when provision writes it, read with the rest by adopt_endpoint; None
+        # until known. Only True gets the default slice of a per-core partition (hpc_bridge.resources); a request on an
+        # endpoint whose template does not take it is refused (teardown and connect again to configure it).
+        self.takes_resources: bool | None = None
 
     @property
     def scratch_root(self) -> str | None:
@@ -1216,6 +1249,15 @@ class SlurmFacility:
     def account_required(self) -> bool:
         """The account floor reads this on every facility (a facility MEP sets it too): the entry's flag."""
         return self.profile.account_required
+
+    @property
+    def partitions(self) -> tuple[PartitionShape, ...]:
+        """What discovery or the registry saw of each partition (hpc_bridge.resources reads it)."""
+        return self.profile.partitions
+
+    @property
+    def scheduler(self) -> str:
+        return self.profile.scheduler
 
     async def adopt_endpoint(self, endpoint_id: str) -> None:
         """Learn the bound endpoint's own worker_init from its published template, once per endpoint id (best-effort:
@@ -1228,6 +1270,7 @@ class SlurmFacility:
         self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, "", False
         self.select_note = ""
         self.logs_block_requests, self.compute_init_blocks = False, None
+        self.takes_resources = None
         try:
             md = await endpoint_metadata(self._client_factory, endpoint_id)
         except Exception:  # noqa: BLE001 - metadata is a courtesy: the profile's worker_init is the fallback; retried
@@ -1243,6 +1286,9 @@ class SlurmFacility:
                 "connect_facility, to configure it again with them. ")
         self.fresh_ueps = gives_fresh_ueps(md.get("user_config_template"))
         self.logs_block_requests = logs_block_requests(md.get("user_config_template"))
+        # only a template READ says what it renders (metadata without one: not known, as for select_note)
+        if isinstance(tmpl, str) and tmpl.strip():
+            self.takes_resources = takes_resources(tmpl)
         self.compute_init_blocks = compute_init_blocks(md.get("user_config_template"))
         own = configured_worker_init(md.get("user_config_template"), prefer=self.profile.worker_init)
         if own is None:
@@ -1264,10 +1310,29 @@ class SlurmFacility:
                     "stops this endpoint through the venv it was started with. ")
 
     def dispatch_uec(self, uec: dict) -> dict:
-        """The config sent with a task: the endpoint's own worker_init when known (see adopt_endpoint)."""
-        if self.endpoint_worker_init is None or "worker_init" not in uec:
+        """The config sent with a task: the endpoint's own worker_init when known (see adopt_endpoint), and — on the
+        compute shape — the block's size as this scheduler's template renders it (hpc_bridge.resources: a slice's
+        cores, memory and GPUs, or whole nodes; the request keeps hpc-bridge's names in the runtime config, mapped only
+        here)."""
+        if self.endpoint_worker_init is not None and "worker_init" in uec:
+            uec = {**uec, "worker_init": self.endpoint_worker_init}
+        if not uec.get("compute"):
             return uec
-        return {**uec, "worker_init": self.endpoint_worker_init}
+        from .. import resources
+
+        size = self.block_size(uec)
+        if self.profile.scheduler == "pbs":
+            return resources.pbs_wire(uec, size, resources.shape_of(self.profile.partitions, uec.get("partition")))
+        return resources.slurm_wire(uec, size)
+
+    def block_size(self, uec: dict) -> Any:
+        """What the compute config `uec` asks for gets on this facility (hpc_bridge.resources.effective)."""
+        from .. import resources
+
+        shape = resources.shape_of(self.profile.partitions, uec.get("partition"))
+        cpus = self.profile.cpus_per_node if self.profile.scheduler == "pbs" else None
+        return resources.effective(uec, shape, channel="ssh", takes=self.takes_resources, profile_cpus=cpus,
+                                   scheduler=self.profile.scheduler)
 
     def config_template(self, hpc: Profile) -> tuple[str, dict]:
         """Return (jinja_template_str, default_user_opts) for the UEP template.
@@ -1463,6 +1528,7 @@ class SlurmFacility:
         # (the daemon may register anyway, and a retry's reuse must read it again)
         self._adopted, self.endpoint_worker_init, self.worker_init_note, self.fresh_ueps = None, None, "", False
         self.logs_block_requests, self.compute_init_blocks, self.select_note = False, None, ""
+        self.takes_resources = None
         eid, host, addr = await self.cli.start(name)
         # WE just wrote this endpoint's template and started it, so its own worker_init is this profile's. Do not read
         # it back: on a restart under the same id `start` returns at once and the daemon re-registers seconds later, so
@@ -1472,6 +1538,7 @@ class SlurmFacility:
         self.fresh_ueps = hpc.uep_idle_heartbeats > 0  # the template just written is this plugin's
         self.logs_block_requests = True  # …and it names each block request in its compute user endpoint's log
         self.compute_init_blocks = compute_init_blocks(uep)  # …and starts this many blocks per new life
+        self.takes_resources = takes_resources(uep)  # …and renders a block's size (hpc_bridge.resources)
         # the node's FQDN when routable from here, else the address this connection reached, else the alias
         host = await asyncio.to_thread(_routable_pin, host, addr)
         if host:

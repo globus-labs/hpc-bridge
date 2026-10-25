@@ -403,6 +403,35 @@ class _Meta:
         return {"user_config_schema": self.schema, "endpoint_version": self.version, "display_name": self.name}
 
 
+class _Templated(_Meta):
+    """The same, with the facility's published user_config_template: what its template renders."""
+
+    def __init__(self, schema=None, template="", **kw):
+        super().__init__(schema, **kw)
+        self.template = template
+
+    def get_endpoint_metadata(self, eid):
+        return {**super().get_endpoint_metadata(eid), "user_config_template": self.template}
+
+
+# A facility template in the shape of Anvil's (its text is not published in its docs): a parsl SlurmProvider whose
+# block size is the user's to set — and whose own default keeps parsl's whole node.
+ANVIL_TEMPLATE = """engine:
+  type: GlobusComputeEngine
+  provider:
+    type: SlurmProvider
+    partition: {{ partition|default("shared") }}
+    account: {{ account }}
+    walltime: {{ walltime|default("00:15:00") }}
+    cores_per_node: {{ cores_per_node|default(1) }}
+    {%- if mem_per_node is defined %}
+    mem_per_node: {{ mem_per_node }}
+    {%- endif %}
+    exclusive: {{ exclusive|default(true) }}
+    scheduler_options: {{ scheduler_options|default("")|tojson }}
+"""
+
+
 ANVIL_SCHEMA = {"type": "object", "additionalProperties": False,
                 "properties": {k: {"type": "string"} for k in ("account", "partition", "qos", "walltime", "cores_per_node",
                                                                  "worker_init", "scheduler_options", "init_blocks",

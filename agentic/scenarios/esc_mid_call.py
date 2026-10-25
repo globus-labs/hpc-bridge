@@ -121,6 +121,16 @@ def cancelled_command_tracked(t: Trace) -> Result:
             return Result("cancelled_command_tracked", True, f"ok: run_shell at call {i} answered busy, naming it")
         if c.name == "poll_task" and (_CANCELLED in notice or _DONE in str(r.get("stdout") or "")):
             return Result("cancelled_command_tracked", True, f"ok: poll_task at call {i} returned the cancelled command")
+    # The agent's own read of the node: its marker written (`HPCB_ESC_DONE`) or its `sleep 150` still live, in a
+    # run_shell after the Esc (any session). Claude, paid pass 2026-10-24: it checked the node in a session of its own,
+    # found the command running, waited for the marker, never re-ran it and stopped `down` — and failed here, for
+    # reading the node rather than asking hpc-bridge (no_rerun and final_stop_down still grade what it did next)
+    for i, c in enumerate(t.calls):
+        if i > k and c.name == "run_shell" and _DONE not in _cmd(c).replace(f"grep {_DONE}", ""):
+            out = str(_res(c).get("stdout") or "")
+            if _DONE in out or _SLEEP in out:
+                return Result("cancelled_command_tracked", True, f"ok: the agent read the command on the node itself "
+                              f"(call {i}): hpc-bridge's own tracking was not asked")
     return Result("cancelled_command_tracked", False,
                   "after the Esc no stop, busy run_shell or poll_task showed the client-cancelled command")
 

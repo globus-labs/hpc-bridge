@@ -30,5 +30,12 @@
     max_workers_per_node: 2
     nodes_per_block: 1
     max_blocks: 1
+    # What a block can be on each (hpc_bridge.resources, 2026-10-24): on `shared` a slice — the first block's terms
+    # propose a few cores, and a request over the QOS's 127 CPUs per job is refused before it can pend forever; on
+    # `compute` whole nodes only. From the facts above (the 2026-10-06 re-prove); memory and billing weights not curated.
+    partitions:
+      - {name: shared, kind: per_core, why: "per-core charging; QOS max 127 CPUs per job", cores: 128,
+         max_cores_per_job: 127}
+      - {name: compute, kind: whole_node, why: "whole-node charging", cores: 128}
   provenance: curated
   last_validated: 2026-10-06

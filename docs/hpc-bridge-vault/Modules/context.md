@@ -9,5 +9,10 @@ Split step 1 of the [[Review 2026-09-03 — code quality|code-quality review]]'s
 
 `SeenPilots` (2026-10-20, `polaris_filesystems`) is the record of the live pilots a provisioning probe listed for the endpoint — (job, state, reason, word) each (the word: the state as the scheduler listed it, Slurm's PENDING or PBS's Q, which a reconnect's note names; round 4, #1), oldest first, when it looked, and the pilot its verdict was about — with the states [[scheduler_ops]] `_pilot_state` gives (H held, N refused as submitted, R running, any other letter waiting); `ShapeRuntime.pilots` holds the latest, `switch_left_pilots` what a switch left. `SshLeft` is what a re-bind leaves of an SSH endpoint's compute shape (the block that was up, those pilots), kept per endpoint in `AppCtx.ssh_left`; `AppCtx.directive_notes` keeps a connect's report of rewritten `scheduler_options` until a result carries it, or until the details= config it describes is dropped ([[connect]]).
 
+**Resource requests (2026-10-24).** `AppCtx.compute_choice` is `dict[str, Any]` now: the size keys
+([[resources]] `SIZE_KEYS`) persist there beside the partition and account, a key set to None being one the session
+cleared. `ShapeRuntime.switched_terms` / `reap_terms` are `(partition, account, size)` (warmth `_block_key`);
+`rejected_size` is a rejected block's size.
+
 ## See also
 [[server]] · [[shapes]] · [[lifecycle]] · [[runner]]

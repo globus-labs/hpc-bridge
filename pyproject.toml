@@ -81,7 +81,7 @@ warn_redundant_casts = true
 
 [[tool.mypy.overrides]]            # strict on the pure leaves (mypy has no per-module `strict`)
 module = ["hpc_bridge.context", "hpc_bridge.config", "hpc_bridge.cost", "hpc_bridge.models",
-          "hpc_bridge.shapes", "hpc_bridge.lifecycle", "hpc_bridge.profile"]
+          "hpc_bridge.shapes", "hpc_bridge.lifecycle", "hpc_bridge.profile", "hpc_bridge.resources"]
 disallow_untyped_defs = true
 disallow_incomplete_defs = true
 check_untyped_defs = true

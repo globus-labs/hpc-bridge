@@ -9,5 +9,8 @@ Split step 5 (2026-09-03). **The patch-target rule:** every caller — in [[serv
 
 **The no-facility default.** With no `HPC_BRIDGE_MACHINE`, `make_facility` (`:165`) returns `_default_local_facility()` (`:154`), and `lifespan` uses the same builder, with `unbound=True`, when a pin fails at boot. It is a [[facility-local|`LocalFacility`]] marked `implicit` (nothing chose it) unless `HPC_BRIDGE_ENDPOINT_ID` is set — the only local-dev path, an endpoint the user runs ([[Configuration]]) — and always after a failed pin. [[server]] then refuses every call that would stand up or use an endpoint with "No facility connected" (`context._no_facility_bound`), so the agent connects a facility instead of getting a local endpoint on the MCP host.
 
+`_entry_from_details` carries `FacilityDetails.partitions` into the session entry's `Defaults.partitions`, so a
+bring-your-own facility's profile knows what each partition hands out ([[Resource requests]]).
+
 ## See also
 [[server]] · [[Facility catalog]] · [[facility-remote]] · [[facility-mep]] · [[state]] · [[config]]
