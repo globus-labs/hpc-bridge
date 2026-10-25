@@ -173,7 +173,7 @@ async def test_registry_outage_surfaces_as_unavailable(monkeypatch, tmp_path):
     monkeypatch.setattr(binding, "make_catalog", lambda: SearchCatalog(index_id="idx", client=_FakeSearchClient(fail=True), cache_dir=tmp_path))
     app = AppCtx(facility=FakeFacility(), profile=Profile())
     res = await _connect_facility(app, "nowhere")
-    assert res.phase == "needs_facility_details" and "registry unavailable" in res.notice
+    assert res.phase == "needs_facility_details" and "registry (a Globus Search index) is unavailable" in res.notice
 
 
 # 10. endpoint names are an allowlist at both boundaries ---------------------------------------
@@ -264,7 +264,8 @@ async def test_list_facilities_hides_transport_only(monkeypatch):
         raise OSError("network down")
 
     monkeypatch.setattr(binding, "make_catalog", down)
-    assert await server._list_facilities("") == []
+    with pytest.raises(server.RegistryUnavailable, match="not an empty registry"):
+        await server._list_facilities("")
 
     def bug():
         raise AttributeError("'NoneType' object has no attribute 'summary'")
@@ -445,7 +446,8 @@ async def test_discover_transport_error_is_no_facilities_but_a_bug_raises(monkey
             raise AttributeError("'NoneType' object has no attribute 'get'")
 
     monkeypatch.setattr(binding, "make_catalog", lambda: SearchCatalog(index_id="idx", client=_Down(), cache_dir=tmp_path))
-    assert await server._list_facilities("") == []
+    with pytest.raises(server.RegistryUnavailable):     # a transport failure is an outage, said as one
+        await server._list_facilities("")
     monkeypatch.setattr(binding, "make_catalog", lambda: SearchCatalog(index_id="idx", client=_Buggy(), cache_dir=tmp_path))
     with pytest.raises(AttributeError):
         await server._list_facilities("")

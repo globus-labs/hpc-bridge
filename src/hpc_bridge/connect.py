@@ -440,10 +440,15 @@ async def _connect(
                 except Exception:  # noqa: BLE001 - stale/invalid cached config
                     entry = None
         if entry is None and registry_error is not None:
+            # the registry, not the facility: say so in the service's words, and put "connect again" first — a
+            # catalogued facility (polaris, reached through its own endpoint) is no SSH cluster to probe instead
             return await _propose_or_ask(
                 facility, ssh_host,
-                f"registry unavailable ({type(registry_error).__name__}); give me this facility's SSH "
-                "host (ssh_host=… or HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app,
+                f"the facility registry (a Globus Search index) is unavailable — "
+                f"{binding.registry_outage(registry_error)}. That is the registry, not {facility!r}: if it is a "
+                "catalogued facility, connect_facility again once the registry is back (a maintenance window is "
+                "usually short). To use a cluster you bring instead, give its SSH host (ssh_host=… or "
+                "HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app,
                 proposal_lead=lead)
         if entry is None:
             return await _propose_or_ask(

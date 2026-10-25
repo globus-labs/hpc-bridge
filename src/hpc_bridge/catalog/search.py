@@ -39,7 +39,8 @@ class SearchCatalog:
     async def get(self, machine_id: str) -> CatalogEntry | None:
         """Resolve a subject or a bare id. Returns None only when the registry answered "no such
         entry"; a TRANSPORT failure (network, 5xx, auth) is raised — after the offline cache has had
-        its chance — so the caller can say "registry unavailable" instead of "not in the catalog"
+        its chance — so the caller can say the registry is unavailable (in the service's own words)
+        instead of "not in the catalog"
         (found in review: every exception used to read as a miss)."""
         transport: Exception | None = None
         try:
