@@ -159,8 +159,8 @@ def test_the_pbs_lookup_reads_the_pilots_own_user_endpoint(tmp_path):
 @pytest.mark.parametrize(("line", "options", "rest"), [
     ("#PBS -l select=1:ngpus=4,filesystems=home:eagle", "ngpus=4", "#PBS -l filesystems=home:eagle"),
     ("-l select=1:system=polaris -l filesystems=home:eagle", "system=polaris", "#PBS -l filesystems=home:eagle"),
-    ("#PBS -l select=1:ngpus=4 -l place=scatter", "ngpus=4", "#PBS -l place=scatter"),
-    ("#PBS -l place=scatter,select=1:ngpus=4", "ngpus=4", "#PBS -l place=scatter"),
+    ("#PBS -l select=1:ngpus=4 -l filesystems=home", "ngpus=4", "#PBS -l filesystems=home"),
+    ("#PBS -l filesystems=home,select=1:ngpus=4", "ngpus=4", "#PBS -l filesystems=home"),
     ("#PBS -lselect=1:ngpus=4,filesystems=home -m abe", "ngpus=4", "#PBS -l filesystems=home -m abe"),
 ])
 def test_the_refusal_keeps_the_lines_other_resources(line, options, rest):
@@ -219,14 +219,16 @@ async def test_a_cached_select_line_with_filesystems_is_proposed_with_both(monke
 # --- 4. on Slurm a select gets Slurm's advice ---------------------------------------------------------------------------
 
 
-@pytest.mark.parametrize(("opts", "gres"), [("#PBS -l select=1:ngpus=4", "gpu:4"),
-                                            ("#PBS -l select=1:system=x", "gpu:<n>")])
-def test_a_slurm_facility_is_pointed_at_sbatch_not_select_options(opts, gres):
-    # review r4 #4 (slurm_select.py): "write it as select_options='ngpus=4'", which is then refused as PBS only
+@pytest.mark.parametrize(("opts", "gpus"), [("#PBS -l select=1:ngpus=4", "4"),
+                                            ("#PBS -l select=1:system=x", "<n>")])
+def test_a_slurm_facility_is_pointed_at_the_gpus_argument_not_select_options(opts, gpus):
+    # review r4 #4 (slurm_select.py): "write it as select_options='ngpus=4'", which is then refused as PBS only; since
+    # resource requests (review round 1) a Slurm block's GPUs are ensure_endpoint_up(gpus=…), never a directive
     msg = _refusal(opts, _SLURM)
-    assert f"`#SBATCH --gres={gres}`" in msg and "select_options is PBS only" in msg
+    assert f"ensure_endpoint_up(gpus={gpus})" in msg and "select_options is PBS only" in msg
     assert "write it as select_options" not in msg and "parsl writes the block's own select" not in msg
-    assert binding._entry_from_details("mine", FacilityDetails(**_SLURM, scheduler_options="#SBATCH --gres=gpu:4"))
+    with pytest.raises(binding.TermsDirectiveError, match="the block's size"):
+        binding._entry_from_details("mine", FacilityDetails(**_SLURM, scheduler_options="#SBATCH --gres=gpu:4"))
 
 
 # --- 5. the error file's refusal and the cached record's reason ---------------------------------------------------------

@@ -1,0 +1,15 @@
+# `slices` = the default cluster whose scheduler hands out SLICES of a node, beside a partition that hands out only
+# whole nodes (resource requests, 2026-10-24; vault `Planned/Resource requests.md`). select/cons_tres with
+# CR_Core_Memory, so cores AND memory are consumable: two jobs share a node by CPUs and memory, and sacct's AllocCPUS /
+# ReqMem say what a block got. `shared` is per-core (OverSubscribe=NO, DefMemPerCPU=500, billed per core:
+# TRESBillingWeights=CPU=1.0); `whole` is OverSubscribe=EXCLUSIVE (whole nodes only). `main` stays the default
+# partition (the harness's own readiness and the other scenarios read it), on the same two 4-CPU nodes.
+# The live Anvil run behind it: a bring-your-own block on Anvil's per-core `shared` asked parsl's default exclusive
+# node, queued for more than a day and would have billed all 128 cores. Scenarios: slice_request, multinode_allocation.
+name = "slices"
+description = "default + per-core `shared` (cons_tres, CR_Core_Memory, DefMemPerCPU) and whole-node `whole` (OverSubscribe=EXCLUSIVE)"
+base = "default"
+
+[capabilities]
+partitions = ["main", "shared", "whole"]
+slices = "per_core+whole_node"   # a per-core partition beside a whole-node one (REQUIRES of the slice scenarios)

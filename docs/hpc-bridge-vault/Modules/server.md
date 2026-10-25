@@ -60,6 +60,15 @@
 > [!note] In flight (PR [#51](https://github.com/globus-labs/hpc-bridge/issues/51), open)
 > Two product changes ride the agentic-scenarios PR: `TRANSIENT_CONFLICT_LIMIT` (three consecutive `RESOURCE_CONFLICT` refusals ⇒ a `down` saying another session with the same identity holds the endpoint — a model sweep showed an agent retrying 7×), and `_propose_or_ask` routing a refused probe SSH through `_explain_provision_error`. On `main` the transient hint repeats and the probe path returns the raw text.
 
+**Resource requests (2026-10-24, [[Resource requests]]).** `ensure_endpoint_up` takes `cores`, `memory_gb`,
+`gpus`, `nodes` and `whole_node`. `_ensure_endpoint_up` normalises them (`resources.requested`: a malformed value is
+refused with the shape's standing state), then — with any of them, or a partition — builds the config the call would
+leave and asks [[notices]] `_size_refusal` before the lock: a facility endpoint's template that does not take a size
+key, an endpoint whose template predates resource requests, a local facility, or what the partition cannot give
+(resources.refusal) answers `_dropped_term_status` and changes nothing. Under the lock `warmth._apply_resources` applies
+them after the partition and account; `named` carries the size keys for BlockTerms' `size_source`. The login shape
+ignores them (said in the notice).
+
 ## See also
 [[Two-channel architecture]] · [[Warmth, the canary & cold-start]] · [[Resource shapes & the spend floor]] · [[The MCP tools]] · [[login]] · [[facility-mep]] · [[runner]] · [[lifecycle]] · [[facility-remote]] · [[Facility catalog]] · [[Configuration]]
 

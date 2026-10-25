@@ -16,5 +16,14 @@
 
 The `needs_confirmation` phase/status is the [[Resource shapes & the spend floor|spend floor]] signal; `cold_start` is the no-hang cold path; `running` is a long task's poll handle ([[The MCP tools|poll_task]]) and a `failed` saying ORPHANED is that handle's endpoint having gone away; `needs_login` is the Globus login gate; `proposed_facility_details` (a probed draft to confirm), `needs_facility_details` (no SSH host yet), and `needs_preauth` (the host needs an interactive login) are the un-indexed-facility signals.
 
+**Resource requests (2026-10-24, [[Resource requests]]).** `PartitionShape` (`models.py:66`) is what discovery or a
+registry entry knows of one partition or queue — `kind` (`per_core` / `whole_node` / None) with its evidence (`why`),
+the node's cores, memory and GPUs, `mem_per_core_mb` (DefMemPerCPU), per-job caps, Slurm billing weights, a PBS slice's
+`place` — read leniently. `FacilityDetails.partitions` carries the probe's in a proposal (kept server-side like
+env_setup). `BlockTerms` (`:151`) gains the block's size: `whole_node`, `cores_per_node`, `memory_gb`
+(`memory_default`: the partition's default per core, not sent), `gpus_per_node`, `size_source` (`SizeSource`, `:49`:
+`this_call` / `earlier_call` / `proposed` — D3's slice — / `partition` — whole nodes because the partition gives only
+those — / `facility`), and where the billing weights are known `max_charge` + `charge_basis` ("8 cores × 0.5 h").
+
 ## See also
 [[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]]

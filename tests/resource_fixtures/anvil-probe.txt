@@ -1,0 +1,53 @@
+# Purdue Anvil's partitions, as the login-node probe (hpc_bridge.discovery._PROBE) frames them — from the live run of
+# 2026-10-24 (session a1b8e88b), where the agent ran over the login shape:
+#   sinfo -h -o '%P|%a|%l|%D|%c|%m|%F'
+#   for p in debug shared standard wholenode; do scontrol show partition $p | … OverSubscribe|ExclusiveUser|DefMemPerCPU|TRESBillingWeights|QoS …; done
+#   sacctmgr -nP show qos format=Name,MaxWall,MaxTRESPU
+# Rewritten into the probe's lines: PSHAPE keeps the partition, cores and memory (MB) per node (that sinfo had no %G,
+# so the GRES column is left out: GPU counts are not known from it); PDETAIL is each scontrol line as captured (the
+# fields it asked for); QOS is Name|MaxTRES|MaxTRESPU (MaxTRES — the per-job cap — was not asked: empty). Not captured
+# that day, and added here as the probe would read it: SELECT_TYPE (Anvil's `shared` partition shares nodes by core,
+# which only select/cons_res or cons_tres do). `wide` and `gpu` had no scontrol line in the capture: their kind is not
+# known. Account names and balances are left out.
+HPCB_PROBE_BEGIN
+USER=x-tester
+HOME=/home/x-tester
+SCRATCH=/anvil/scratch/x-tester
+SCHED=slurm
+PART=wholenode|up
+PART=standard|up
+PART=shared*|up
+PART=wide|up
+PART=highmem|up
+PART=debug|up
+PART=gpu|up
+PART=ai|up
+PART=gpu-debug|up
+PART=profiling|up
+PSHAPE=wholenode|128|257400
+PSHAPE=standard|128|257400
+PSHAPE=shared*|128|257400
+PSHAPE=wide|128|257400
+PSHAPE=highmem|128|1031400
+PSHAPE=debug|128|257400
+PSHAPE=gpu|128|515400
+PSHAPE=ai|96|1031000
+PSHAPE=gpu-debug|128|515400
+PSHAPE=profiling|128|257400
+SELECT_TYPE=select/cons_tres
+PDETAIL=PartitionName=debug QoS=part-debug DefaultTime=00:15:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP DefMemPerCPU=1896 TRESBillingWeights=CPU=1.0
+PDETAIL=PartitionName=shared QoS=part-shared DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP DefMemPerCPU=1896 TRESBillingWeights=CPU=1.0
+PDETAIL=PartitionName=standard QoS=part-standard DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP TRESBillingWeights=CPU=1.0
+PDETAIL=PartitionName=wholenode QoS=part-standard DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP TRESBillingWeights=CPU=1.0
+QOS=normal||
+QOS=part-standard||
+QOS=part-shared||cpu=2048
+QOS=part-wide||
+QOS=part-highmem||
+QOS=part-debug||
+QOS=part-gpu||gres/gpu=12
+QOS=part-gpu-debug||
+NIC=lo|127.0.0.1/8
+NIC=ib0|10.0.0.1/16
+UV=/home/x-tester/.local/bin/uv
+HPCB_PROBE_END

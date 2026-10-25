@@ -41,5 +41,15 @@ What keeps the evidence honest (from the review of this change): `block_since` a
 
 This is the front-end half of [[Cost control]] — the idle-release net catches the *back* end.
 
+## A block's size (2026-10-24)
+
+A billed block is no longer always whole nodes ([[Resource requests]], [[resources]]). `ensure_endpoint_up(cores=…,
+memory_gb=…, gpus=…, nodes=…, whole_node=…)` asks for what the work needs; like the partition and account the size
+persists for the session and a change is a different block (spend asked again). On a per-core partition with nothing
+asked the terms PROPOSE a slice (D3) for the user to confirm or change; on a whole-node partition they say whole nodes.
+More than one node is one shell on the first node (D2). The spend question carries the size and, where the
+partition's billing weights are known, the most the block can cost (`max_charge`). A size the partition cannot give, or
+the facility's template does not take, is refused before anything is submitted.
+
 ## See also
 [[shapes]] · [[MEP & templated endpoints]] · [[facility-mep]] · [[Cost control]] · [[server]] · [[cost]] · [[scheduler_ops]] · [[notices]]

@@ -23,7 +23,7 @@ This vault has two halves:
 - [[Facility catalog]] — the public registry (a Globus Search index, read anonymously) → `MachineProfile` or `MEPFacility`; `list_facilities` / `connect_facility`; the resolution precedence
 
 ## Modules — `src/hpc_bridge/`
-**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]]
+**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]]
 **Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-endpoint_venv]] · [[facility-mep]]
 **Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]]
 *(The `catalog/` package — `entry` · `search` · `bundled` · `ingest` · `parsers` — is documented in [[Facility catalog]].)*
@@ -45,6 +45,7 @@ This vault has two halves:
 - Code reviews 2026-09-03 — round 1: [[Review 2026-09-03 — bugs]], [[Review 2026-09-03 — code quality]], [[Review 2026-09-03 — dependencies]]; round 2: [[Review 2 2026-09-03 — bugs]], [[Review 2 2026-09-03 — static analysis]], [[Review 2 2026-09-03 — code quality]]
 
 ## Planned — design notes (core built; deferred extras remain)
+- [[Resource requests]] — **built 2026-10-24, live checks pending**: a block asks for a slice of a node (cores, memory, GPUs per node) or whole nodes, the spend question proposes a slice on a per-core partition (D3), N nodes are one shell on the first node (D2); discovery classifies partitions per-core / whole-node; module [[resources]]
 - [[Next priorities 2026-10]] — **the ordered work list after the hackathon push**: 18 items for UX, stability and usefulness, cheapest-for-the-value first (strategy tick, output truncation, honest Esc/stop, walltime …), each with effort, usefulness and the code evidence
 - [[Per-architecture endpoint venvs]] — designed, not built: a venv per CPU architecture, so a compute partition unlike the login node can run an endpoint hpc-bridge stands up over SSH (today it fails at once with a message naming both; a facility's own multi-user endpoint is not affected)
 - [[V1 release]] — **the plan of record** for the sprint (scope, tiers, what's ticked); reorient here when a task runs long

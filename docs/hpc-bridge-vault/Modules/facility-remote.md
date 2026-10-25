@@ -45,6 +45,17 @@
 > [!note] Endpoint reuse (zero-SSH reconnect)
 > `find_online_endpoint` reuse is the keystone that lets a reconnect session avoid SSH **entirely** — one of two MFA mitigations (the other is persistent SSH, above) ([#3](https://github.com/globus-labs/hpc-bridge/issues/3)). It gates on `manager_online` **alone — no liveness probe** (a probe can't tell a dead ghost from a cold-starting fresh worker); a dead "online" ghost is instead recovered downstream, where the robust [[Warmth, the canary & cold-start|canary]] maps its shut-down Executor to `provisioning` ([#37](https://github.com/globus-labs/hpc-bridge/issues/37)). See [[Two-channel architecture]] and [[Discovery today]].
 
+> [!note] A block's size (2026-10-24, [[Resource requests]])
+> `MachineProfile.partitions` (what discovery or the registry knows of each partition) rides the profile. The Slurm
+> compute branch renders parsl's `cores_per_node` / `mem_per_node` beside `exclusive`, and both templates pick the
+> launcher from `nodes_per_block` — SimpleLauncher for more than one node (one worker, in the batch script on the first
+> node), SrunLauncher / SingleNodeLauncher for one. That launcher line is `takes_resources` (`remote.py:1137`), read by
+> `adopt_endpoint` from a published template and set by `provision` when it writes one (`SlurmFacility.takes_resources`,
+> None until known). `dispatch_uec` (`:1312`) maps the compute config's size at the wire through
+> [[resources]] (`block_size`, `slurm_wire` / `pbs_wire`): the runtime config keeps hpc-bridge's keys and the session's
+> choice. An endpoint configured before this change renders none of it: no default slice there, and a size request is
+> refused (teardown and connect again).
+
 ## See also
 [[Standing up the endpoint]] · [[Credential seeding]] · [[MEP & templated endpoints]] · [[facility-base]] · [[facility-mep]] · [[state]] · [[credentials]] · [[MFA and interactive SSH auth]]
 

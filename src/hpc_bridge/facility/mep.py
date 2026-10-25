@@ -3,6 +3,7 @@ from __future__ import annotations
 import asyncio
 import re
 import sys
+from typing import Any
 
 from ..login import LOGIN_EXPIRED, login_expired
 from ..profile import Profile
@@ -112,6 +113,7 @@ class MEPFacility:
         # schema its manager validates `user_endpoint_config` against (Anvil's rejects unknown keys —
         # our `interface`/`compute` would fail every submit), its endpoint version, its display name.
         self.schema: dict | None = None
+        self.template_text: str | None = None  # the published UEP template (load_template), when it was read
         self.endpoint_version: str | None = None
         self.display_name: str | None = None
         self.template_notes: list[str] = []
@@ -124,6 +126,48 @@ class MEPFacility:
         self.worker_env = None  # entry.compute.worker_env: the worker strategy + the version it was proven with
         self.verification = None  # entry.verification: what the facility looked like when the entry was proven live
         self.live_fingerprint: dict | None = None  # the same, read from the facility's metadata at attach
+        # What the registry entry knows of each partition (models.PartitionShape): a request is validated against it;
+        # the facility's template still decides how a block is sized (hpc_bridge.resources).
+        self.partitions: tuple = ()
+
+    def block_size(self, uec: dict) -> Any:
+        """What a block of the compute config `uec` holds here, read from what this facility RECEIVES (`dispatch_uec`,
+        its key_map undone): a slice only when `exclusive: false` reaches a template known to render it (`renders`),
+        on a partition the registry knows hands out slices (hpc_bridge.resources)."""
+        from .. import resources
+
+        back = {dst: src for src, dst in self.key_map.items()}
+        sent = {back.get(k, k): v for k, v in self.dispatch_uec(dict(uec)).items()}
+        shape = resources.shape_of(self.partitions, sent.get("partition"))
+        return resources.effective(sent, shape, channel="mep", takes=self.renders(resources.WHOLE),
+                                   scheduler=self.scheduler)
+
+    def renders(self, key: str) -> bool:
+        """Whether the facility's published template (when it was read: `load_template`) renders the value of a
+        block-size key, under the facility's name for it (`key_map`): `{{ exclusive }}`, `{{ mem_per_node |
+        default(none) }}`. A schema may list a key its template never uses."""
+        wire = self.key_map.get(key, key)
+        return isinstance(self.template_text, str) and re.search(
+            r"\{\{-?\s*" + re.escape(wire) + r"\b", self.template_text) is not None
+
+    def takes_size_key(self, key: str) -> bool:
+        """Whether this facility's own template takes a block-size key (hpc-bridge's name: cores_per_node, mem_per_node,
+        gpus_per_node, exclusive, nodes_per_block), under the facility's name for it (`key_map`). A STRICT schema
+        (additionalProperties: false, Anvil's) must list it — anything else is dropped at the wire — and where the
+        published template was read, it must render it (`renders`: review round 2 — a schema listing is no evidence
+        the template uses a key, nor is the registry entry sending it). With no template read, the schema listing it
+        (Anvil's) or the registry entry sending it itself (`defaults.extra`) lets the request through, and the terms
+        claim no slice on it (`block_size`). Never a key it would drop: a request it does not take is refused, not
+        silently dropped (server._ensure_endpoint_up, notices._size_refusal)."""
+        wire = self.key_map.get(key, key)
+        sc = self.schema or {}
+        raw = sc.get("properties")
+        props: dict = raw if isinstance(raw, dict) else {}
+        if sc.get("additionalProperties") is False and wire not in props:
+            return False
+        if isinstance(self.template_text, str):
+            return self.renders(key)
+        return wire in props or key in self._user_opts
 
     @classmethod
     def from_entry(cls, entry, *, account: str | None = None, client_factory=None) -> MEPFacility:
@@ -161,6 +205,7 @@ class MEPFacility:
         )
         fac.worker_version = getattr(c, "worker_version", "manager") or "manager"
         fac.key_map = dict(getattr(c, "key_map", None) or {})
+        fac.partitions = tuple(getattr(d, "partitions", None) or ())
         fac.worker_env = getattr(c, "worker_env", None)
         fac.verification = getattr(entry, "verification", None)
         return fac
@@ -226,6 +271,8 @@ class MEPFacility:
         if self.max_idletime_s is None:  # a curated value wins; otherwise the facility's own template says
             self.max_idletime_s = _template_idle_s(md.get("user_config_template"))
         self.schema = md.get("user_config_schema") or None
+        tmpl = md.get("user_config_template")
+        self.template_text = tmpl if isinstance(tmpl, str) else None  # what it renders: a block-size key's evidence
         self.endpoint_version = str(md.get("endpoint_version") or "") or None
         self.display_name = md.get("display_name") or None
         from ..catalog.entry import facility_fingerprint
@@ -300,6 +347,20 @@ class MEPFacility:
         # here so a value the server wrote under hpc-bridge's name after construction is renamed too. A None
         # value is not sent under the facility's name (a required key must fail as "missing", not as null).
         uec = dict(uec)
+        if uec.get("compute"):
+            from .. import resources
+
+            shape = resources.shape_of(self.partitions, uec.get("partition"))
+            if shape is not None and shape.kind == "whole_node":
+                # a partition the registry knows hands out whole nodes: the block IS one, so it says so where the
+                # template takes it, and sends no slice's cores or memory (review round 2: Anvil's `wholenode` was sent
+                # the entry's cores_per_node: 1 and exclusive: false)
+                uec.pop(resources.CORES, None)
+                uec.pop(resources.MEM, None)
+                if self.takes_size_key(resources.WHOLE):
+                    uec[resources.WHOLE] = True
+                else:
+                    uec.pop(resources.WHOLE, None)
         for src, dst in self.key_map.items():
             if src in uec:
                 val = uec.pop(src)

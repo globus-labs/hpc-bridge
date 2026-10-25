@@ -60,16 +60,16 @@ def _refusal(opts, base=_PBS) -> str:
 
 @pytest.mark.parametrize(("base", "given", "want"), [
     (_PBS, BARE, WRITTEN),
-    (_PBS, "  -l place=scatter  ", "#PBS -l place=scatter"),
+    (_PBS, "  -l filesystems=home  ", "#PBS -l filesystems=home"),
     (_PBS, "\t-l filesystems=home", "#PBS -l filesystems=home"),
     (_SLURM, "--constraint=gpu", "#SBATCH --constraint=gpu"),
-    (_SLURM, "-C gpu --gres=gpu:1", "#SBATCH -C gpu --gres=gpu:1"),
+    (_SLURM, "-C gpu --gres=tmpfs:10", "#SBATCH -C gpu --gres=tmpfs:10"),
 ])
 def test_a_bare_option_is_written_with_the_schedulers_prefix(base, given, want):
     assert _written(given, base) == want
 
 
-@pytest.mark.parametrize(("base", "opts"), [(_PBS, WRITTEN), (_SLURM, "#SBATCH --gpus-per-node=1"),
+@pytest.mark.parametrize(("base", "opts"), [(_PBS, WRITTEN), (_SLURM, "#SBATCH --constraint=gpu"),
                                             (_PBS, "# a comment the site asks for"), (_SLURM, "#"),
                                             (_PBS, "#PBS\t-l filesystems=home")])
 def test_this_schedulers_directive_and_a_plain_comment_are_untouched(base, opts):
@@ -87,10 +87,10 @@ def test_an_indented_directive_is_unindented_and_said():
 
 
 def test_multi_line_options_each_line_and_blank_lines_dropped():
-    given = f"#PBS -l walltime_hint=x\n{BARE}\n\n   \n-l place=scatter\r\n"
-    assert _written(given) == f"#PBS -l walltime_hint=x\n{WRITTEN}\n#PBS -l place=scatter"
+    given = f"#PBS -l walltime_hint=x\n{BARE}\n\n   \n-l filesystems=home\r\n"
+    assert _written(given) == f"#PBS -l walltime_hint=x\n{WRITTEN}\n#PBS -l filesystems=home"
     details, rewrites = binding._directive_details(FacilityDetails(**_PBS, scheduler_options=given))
-    assert rewrites == [(BARE, WRITTEN), ("-l place=scatter", "#PBS -l place=scatter")]
+    assert rewrites == [(BARE, WRITTEN), ("-l filesystems=home", "#PBS -l filesystems=home")]
     assert binding._directive_details(details) == (details, [])            # written once: nothing to rewrite again
     assert _written("\n  \n") is None                                       # only blank lines: no options at all
 
@@ -123,7 +123,7 @@ def test_the_refusal_shows_each_schedulers_own_option_form():
     (_SLURM, "-A secretproj", "#SBATCH -A secretproj"), (_SLURM, "--account=secretproj", "#SBATCH --account=secretproj"),
     (_SLURM, "-p gpu", "#SBATCH -p gpu"), (_SLURM, "--partition gpu", "#SBATCH --partition gpu"),
     (_SLURM, "-pdebug", "#SBATCH -pdebug"), (_SLURM, "-vA x", "#SBATCH -vA x"),
-    (_SLURM, "#SBATCH --gpus-per-node=1\n--acco=x", "#SBATCH --acco=x"),
+    (_SLURM, "#SBATCH --constraint=gpu\n--acco=x", "#SBATCH --acco=x"),
     # other words and the no-space forms set the terms too (review T3)
     (_SLURM, "#SLURM --account=x", "#SLURM --account=x"), (_SLURM, "#SBATCH-A foo", "#SBATCH-A foo"),
     (_SLURM, "#SBATCH--account=foo", "#SBATCH--account=foo"), (_SLURM, "#BSUB -q gpu", "#BSUB -q gpu"),
@@ -149,7 +149,7 @@ def test_the_walltime_and_the_node_count_are_never_set_there(base, opts, line):
     assert "details' `walltime`" in msg and "one node per block" in msg
 
 
-@pytest.mark.parametrize("opts", ["#SBATCH --time-min=10", "#SBATCH -q normal", "#SBATCH --ntasks-per-node=4"])
+@pytest.mark.parametrize("opts", ["#SBATCH --time-min=10", "#SBATCH -q normal", "#SBATCH --constraint=a100"])
 def test_a_directive_beside_the_terms_passes(opts):
     assert _written(opts, _SLURM) == opts
 

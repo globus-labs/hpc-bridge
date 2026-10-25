@@ -29,5 +29,21 @@
 > [!note] Facility-named config keys — `compute.key_map` (2026-09-17)
 > A facility's template picks its own names for the keys hpc-bridge fixes (`account`, `partition`, `walltime`, …): NeSI's `reannz-slurm` wants `ACCOUNT_ID` / `WALL_TIME`, ALCF reportedly `queue`. `key_map` in the entry renames them, and the rename happens **only at the wire** (`dispatch_uec`). The runtime config keeps hpc-bridge's names because the server writes the user's confirmed `account` / `partition` into it *after* construction (`warmth._apply_account` / `_apply_partition`) and the account floor reads `account` from it; a construction-time rename silently lost a confirmed account. `sanitize_uec` keeps a key whose renamed form the strict schema accepts; a `None` value is never sent under the facility's name. Facility-native keys with no hpc-bridge equivalent stay in `defaults.extra`.
 
+> [!note] A block's size on a facility endpoint (2026-10-24, [[Resource requests]])
+> Only the facility template's own keys size its block. `takes_size_key` (`facility/mep.py:153`): a STRICT schema must
+> list the key (under its `key_map` name — `cores_per_node`, `mem_per_node`, `gpus_per_node` and `exclusive` are now
+> renameable); where the published template was read (`template_text`, by `load_template`) it must also render it
+> (`renders` `:145`, `{{ key …`: review round 2 — a schema listing, or the registry entry sending the key, is no
+> evidence the template uses it). With no template read, the schema listing it or the registry entry sending it
+> (`defaults.extra`) lets the request through. Anything else is refused — "this facility's endpoint sets the block
+> size: …" — never dropped.
+> `partitions` (from the entry's `defaults.partitions`) validates a request and prices it; there is no default slice
+> (the entry's defaults are the facility's). `block_size` (`:133`) reads the size from what the facility RECEIVES
+> (`dispatch_uec` `:341`, key_map undone): a slice only when `exclusive: false` reaches a template that renders it, on a
+> partition the entry calls per-core (review round 2); a curated whole-node partition is whole, and is sent
+> `exclusive: true` (where the template takes it) and none of the entry's `cores_per_node`/`mem_per_node`; else the
+> template's own default, costed as a whole node (review round 1). Several nodes are not offered. The Anvil entry
+> sends no `exclusive` (round 2: on every partition it read as a slice, `wide` and `gpu` too).
+
 ## See also
 [[facility-base]] · [[facility-remote]] · [[server]] · [[Facility catalog]] · [[MEP & templated endpoints]] · [[Endpoint reuse and MEP integration]] · [[MEP facilities survey]] · [[Cost control]] · [[shapes]]
