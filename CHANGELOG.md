@@ -61,6 +61,35 @@ installed plugin only when that version changes); git tags mark releases.
   only on the first). Not yet run live.
 
 ### Fixed
+- **Left-over local state no longer traps a facility (a user's Perlmutter report on 0.1.20, 2026-10-29).** Each of these
+  was proven first by a test that failed for the reported reason.
+  - A remembered login-node pin that no longer answers is dropped again when the facility is reached through an
+    ssh-config `Host` alias. The check tested the alias as a DNS name, failed, read that as the client's own outage, and
+    kept the pin (`CANNOT REACH login22…` on every connect). It now tests the HostName ssh resolves.
+  - A cached facility whose bring-up fails is taken out of the session, so the next connect reads `facilities.json`
+    again (or runs discovery if the record was removed). An explicit `ssh_host` that differs from the kept config's host
+    is used, instead of the kept config running again. A config given with `details=` is still kept: it is the only copy.
+  - A cached facility at a password+OTP site (NERSC) refused for want of a key now hands off to the user's terminal
+    (`needs_preauth`), as first contact already did, instead of NO SSH ACCESS. This applies only where this user's
+    access was proven before (the cached record); a registry entry the user never reached keeps NO SSH ACCESS.
+- **The endpoint venv lives under the login node's own `$HOME`.** The default was `/home/<user>/hpc-bridge/gce-venv`,
+  which is not the home on NERSC (`/global/homes/…`) and is not writable there. The build, the probe's existing-venv
+  check and teardown now agree on `$HOME/hpc-bridge/gce-venv`. Where `$HOME` is `/home/<user>` nothing changes, and an
+  endpoint started on the old path gets no "different env_setup" note.
+- **A failure on the login node is quoted by its end.** `configure`, `start`, `list`, the discovery probe, the venv
+  transport and teardown kept the head of stderr, where a user's shell startup noise (Lmod, a `.gitconfig` lock)
+  pushed the real error out of the notice. They now quote the last lines that fit, marked as cut. A refusal behind a
+  long login banner is still read as NO SSH ACCESS, or as the handoff where one applies.
+- **`run_shell` says why a block has not come.** When the scheduler refused the block and the check's result was lost,
+  `ensure_endpoint_up` already quoted the refusal ("likely REJECTED", #213), but `run_shell(shape="compute")` kept
+  answering "allocating nodes…". Past a 45 s grace, its cold answer now carries the same probe evidence (likely
+  REJECTED, queued, HELD or finished), reusing a probe for up to a minute.
+- **Discovery proposes terms the scheduler takes.** The probe proposed Perlmutter's starred default partition `system`,
+  which NERSC's submit policy refuses. It now drops partitions that are down, root-only or closed to the user's groups,
+  and checks its pick with `sbatch --test-only` (free; nothing is submitted) in the same SSH round trip. When the pick
+  is refused, it tries a few terms built from what it found (the nodes' features as `--constraint`, no partition so the
+  scheduler routes the block) and proposes the first that is taken. When none is, the proposal is marked UNVERIFIED,
+  quotes the scheduler's reply and asks the user. `ensure_endpoint_up(partition="")` keeps a session's "no partition".
 - **A registry outage is said as one.** While Globus Search was down for maintenance (2026-10-24), `connect_facility("polaris")`
   answered "registry unavailable (SearchAPIError); give me this facility's SSH host" and `list_facilities` returned `[]`: the
   agent had to query the index itself to learn it was an outage, and was steered to SSH for a facility reached through
@@ -256,6 +285,16 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
+  - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
+    suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses
+    `-q` with `-p`.
+  - **The scenarios** (each failed on main for its bug's own reason before the fix): `stale_login_pin` and
+    `kept_entry_after_failure` on `site`; `cached_password_otp`, `home_outside_home`, `noisy_failure_tail` and
+    `partition_proposal_policy` on `nersc`.
+  - **New harness support:** scripts can take one login node's sshd off the network and back (`NODE_ACTIONS`), run
+    commands on the cluster mid-run (`ops.world`), and seed a login-node pin (`SEED_LOGIN_PINS`).
+  - The fake login node now takes each pool user's home from passwd instead of assuming `/home/<user>`.
 - **From the Claude paid pass (2026-10-24).** Three graders failed correct agents.
   - `esc_mid_call` counts the agent's own read of the node after the Esc (the marker written, or its `sleep` still live).
   - `fake_mep_username_not_account` reads the account a call used, so a poll repeating `confirm_spend=True` (whose
