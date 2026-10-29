@@ -349,6 +349,12 @@ class AppCtx:
     # BYO configs supplied this session but not yet PROVEN (login-shape canary answered) — written to
     # facilities.json only then (decision 2026-09-03: "proven", not "accepted"): facility id -> (ssh_host, details)
     pending_facility_cache: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    # Facility ids whose session config was READ from facilities.json (connect's cache rung), not given with details=:
+    # id -> the ssh_host the call named for it (None: found under the id). One whose bring-up fails or hands off is
+    # dropped from `session_facilities` (connect._drop_cached_config) — free, its record is still on disk — so the next
+    # connect resolves it afresh: that host's record again, or a probe of it if the record is gone (Perlmutter report
+    # 2026-10-29, items 1b and 3). Left when dropped (the host for that re-read); a details= for the id removes it.
+    from_cache: dict[str, str | None] = field(default_factory=dict)
     # BYO configs dropped from both of the above because their bring-up FAILED on the login node before they were
     # proven (connect._drop_failed_details): a connect without details= then resolves the facility afresh — the
     # registry, a config proven for that host, else a probe that proposes one — instead of running them again (live

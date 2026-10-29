@@ -2,8 +2,9 @@
 
 A user who had connected `perlmutter` before (its config PROVEN and cached in facilities.json, its endpoint pinned to
 `login22` in endpoints.json) came back weeks later: login22 no longer answered, their key no longer worked (password +
-OTP site), and each piece of local state stood in the way. Each `xfail(strict=True)` test below pins one bug on main;
-its fix flips it. Item 8's endpoint reuse is by design (#27) and gets a passing regression test.
+OTP site), and each piece of local state stood in the way. Each test with a docstring starting "On 0.1.20" pinned one bug
+as a strict xfail until its fix; the controls passed throughout. Item 8's endpoint reuse is by design (#27) and gets a
+passing regression test.
 
 Hermetic, faked only at the boundary: the `ssh` binary on PATH (a fake OpenSSH client: `ssh -G` answers from a fake
 ~/.ssh/config, a connection is refused or times out per host, every connection is logged), the TCP connect the alias
@@ -130,10 +131,9 @@ def _app() -> AppCtx:
 
 # ---- item 1: the stale login-node pin ---------------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #1: _drop_dead_pin probes the ALIAS with a raw TCP connect (connect._tcp_answers); an ssh-config "
-    "Host such as 'perlmutter' is no DNS name, so the probe reads a client-side outage and keeps the dead pin"))
 async def test_1_dead_pin_is_dropped_when_the_alias_is_an_ssh_config_host(monkeypatch, tmp_path):
+    """On 0.1.20 `_drop_dead_pin` probed the ALIAS with a raw TCP connect: an ssh-config Host such as 'perlmutter' is no
+    DNS name, so the probe read a client-side outage and kept the dead pin. It now probes the HostName ssh resolves."""
     w = World(monkeypatch, tmp_path)
     _cache_proven_perlmutter()
     _pin_login22()
@@ -147,7 +147,7 @@ async def test_1_dead_pin_is_dropped_when_the_alias_is_an_ssh_config_host(monkey
 
 
 async def test_1_control_the_same_dead_pin_is_dropped_when_the_alias_is_a_dns_name(monkeypatch, tmp_path):
-    """The control for the xfail above (passes on main): the same state and the same timeout, but the alias resolves
+    """The control for the test above (passed on 0.1.20): the same state and the same timeout, but the alias resolves
     in DNS — and the pin IS dropped. So it is the alias's resolution that keeps the pin, not timeout vs refused."""
     World(monkeypatch, tmp_path, dns=(ALIAS, CANONICAL, PINNED))
     _cache_proven_perlmutter()
@@ -157,10 +157,9 @@ async def test_1_control_the_same_dead_pin_is_dropped_when_the_alias_is_a_dns_na
     assert LoginNodeStore().get(alias=ALIAS, name=ENDPOINT) is None
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #1: an explicit ssh_host is silently ignored — the config read from facilities.json stays the "
-    "session's (connect.py:409 wins over every rung), so the retry goes to the same pinned node, unsaid"))
 async def test_1_explicit_ssh_host_is_not_silently_ignored_after_the_kept_config_failed(monkeypatch, tmp_path):
+    """On 0.1.20 an explicit ssh_host was silently ignored: the config read from facilities.json stayed the session's and
+    won over every rung, so the retry went to the same pinned node, unsaid."""
     w = World(monkeypatch, tmp_path)
     _cache_proven_perlmutter()
     _pin_login22()
@@ -176,10 +175,9 @@ async def test_1_explicit_ssh_host_is_not_silently_ignored_after_the_kept_config
 
 # ---- item 2: a cached password+OTP facility ----------------------------------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #2: on the cached/registry bring-up path only key_accepted_second_factor_pending (connect.py:576) "
-    "raises the handoff; a password+OTP denial still lists publickey, so a config PROVEN before reads NO SSH ACCESS"))
 async def test_2_cached_facility_password_otp_denial_is_the_terminal_handoff(monkeypatch, tmp_path):
+    """On 0.1.20 only `key_accepted_second_factor_pending` raised the handoff on the cached/registry bring-up path; a
+    password+OTP denial still lists publickey, so a config PROVEN before read NO SSH ACCESS."""
     w = World(monkeypatch, tmp_path)
     _cache_proven_perlmutter()  # proven on an earlier day: the user HAS access (no pin: they hand-deleted it)
     app = _app()
@@ -192,7 +190,7 @@ async def test_2_cached_facility_password_otp_denial_is_the_terminal_handoff(mon
 
 async def test_2_first_contact_with_the_same_denial_is_already_the_terminal_handoff(monkeypatch, tmp_path):
     """The contrast the report drew (and its #3 confirmed): with nothing cached the discovery probe classifies the same
-    denial with `is_interactive_auth_failure` and hands off. Passes on main; guards the probe path."""
+    denial with `is_interactive_auth_failure` and hands off. Passed on 0.1.20; guards the probe path."""
     w = World(monkeypatch, tmp_path)
     res = await server._connect_facility(_app(), "perlmutter-nersc", ssh_host=ALIAS)
     assert w.ssh_log() == [(ALIAS, "probe")]
@@ -201,11 +199,10 @@ async def test_2_first_contact_with_the_same_denial_is_already_the_terminal_hand
 
 # ---- item 3: the cache entry the user removed lives on in the session -------------------------------------------------
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #3: a config read from facilities.json is put in app.session_facilities (connect.py:437) and "
-    "never dropped — not when its bring-up fails, not when the record is removed (only a failed details= is dropped, "
-    "_drop_failed_details); the next connect brings the removed config up again instead of probing afresh"))
 async def test_3_a_removed_cache_record_is_not_brought_up_again_in_the_same_session(monkeypatch, tmp_path):
+    """On 0.1.20 a config read from facilities.json stayed in app.session_facilities for the session — not dropped when
+    its bring-up failed, nor when its record was removed — so the next connect brought the removed config up again
+    instead of probing afresh."""
     w = World(monkeypatch, tmp_path)
     _cache_proven_perlmutter()
     app = _app()
@@ -217,6 +214,18 @@ async def test_3_a_removed_cache_record_is_not_brought_up_again_in_the_same_sess
     # resolved afresh: the record is gone, so a probe of the login node — never the removed config's bring-up
     assert w.ssh_log() == [(ALIAS, "probe")], (w.ssh_log(), again.notice)
     assert again.phase == "needs_preauth", again.notice
+
+
+async def test_3_a_dropped_cached_config_is_read_again_for_its_host_when_the_call_names_none(monkeypatch, tmp_path):
+    """The drop costs nothing: a connect that names no ssh_host (the handoff's resume, `connect_facility(<id>)`) re-reads
+    the record for the host the dropped config was read under — here not the facility id — instead of asking for a host."""
+    w = World(monkeypatch, tmp_path)
+    _cache_proven_perlmutter()
+    app = _app()
+    first = await server._connect_facility(app, "nersc", ssh_host=ALIAS)
+    assert first.phase == "needs_preauth" and app.preauth_resume == "connect_facility('nersc')", first.notice
+    again = await server._connect_facility(app, "nersc")
+    assert w.ssh_log() == [(ALIAS, "bringup"), (ALIAS, "bringup")] and again.phase == "needs_preauth", again.notice
 
 
 # ---- item 8: a new facility id for the same host reuses that host's endpoint — by design (#27) ------------------------

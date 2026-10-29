@@ -301,16 +301,31 @@ async def test_the_other_host_refusal_names_the_proposal_it_would_get(monkeypatc
 
 
 async def test_the_other_host_refusal_gives_a_route_to_a_proposal_while_a_config_is_kept(monkeypatch):
-    # review 2026-10-20 (7c): while this session keeps a config for the id, no connect of the id proposes — another id does
+    # review 2026-10-20 (7c) said: while this session keeps a config for the id, no connect of the id proposes — another
+    # id does. The Perlmutter report (2026-10-29, #1) changed that: an explicit other ssh_host wins and is resolved afresh
+    # under the same id; the kept config is not run for it (and stays kept for a connect that names no other host).
     w, app = World(monkeypatch, outcome="provisioning"), _app()
     await server._connect_facility(app, "byo", ssh_host=HOST)                       # a proposal for 'login'
     await server._connect_facility(app, "byo", details=_details(env_setup=None))    # taken: kept, coming up
     res = await server._connect_facility(app, "byo", details=_details(env_setup=None, host="other"))
     assert "was for 'login'" in (res.notice or "") and "reconnects with the configuration this session keeps" in res.notice
-    assert ("for 'other', connect another facility id: connect_facility('<new id>', ssh_host='other') resolves that one "
-            "afresh") in res.notice
-    assert (await server._connect_facility(app, "byo2", ssh_host="other")).phase == "proposed_facility_details"
-    assert w.probed == [HOST, "other"]
+    assert ("connect_facility('byo', ssh_host='other') without details resolves the facility afresh") in res.notice
+    assert "and does not run the kept one" in res.notice
+    assert (await server._connect_facility(app, "byo", ssh_host="other")).phase == "proposed_facility_details"
+    assert w.probed == [HOST, "other"] and w.brought_up == [GOOD]   # the kept config was not brought up for 'other'
+    assert (await server._connect_facility(app, "byo")).phase == "provisioning" and w.brought_up == [GOOD, GOOD]
+
+
+async def test_a_config_proven_for_another_named_host_replaces_the_kept_one_which_is_never_cached(monkeypatch):
+    # the same rule when the other host has a proven config: it replaces the kept one, and the kept one's pending write
+    # goes with it — never committed as PROVEN on the canary of the config that replaced it
+    w, app = World(monkeypatch, outcome="provisioning"), _app()
+    binding._facility_store().put("other", _details(GOOD, host="other").model_dump(mode="json"))
+    await server._connect_facility(app, "byo", details=_details(GOOD))           # kept for 'login', coming up
+    w.outcome = "warm"
+    up = await server._connect_facility(app, "byo", ssh_host="other")            # the cache rung for 'other'
+    assert up.phase == "needs_account" and app.session_facilities["byo"].ssh_host == "other"
+    assert binding._facility_store().get(HOST) is None and "byo" not in app.pending_facility_cache
 
 
 # ---- review 2026-10-20, item 1: which failure drops a config — POSITIVE, by type, pinned over every explanation -----

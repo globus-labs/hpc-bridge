@@ -14,5 +14,10 @@ Split step 1 of the [[Review 2026-09-03 — code quality|code-quality review]]'s
 cleared. `ShapeRuntime.switched_terms` / `reap_terms` are `(partition, account, size)` (warmth `_block_key`);
 `rejected_size` is a rejected block's size.
 
+**Configs read from the cache (2026-10-29).** `AppCtx.from_cache` marks the facility ids whose `session_facilities`
+config the cache rung read from `facilities.json` (id → the `ssh_host` the call named, None when found under the id). It
+lets [[connect]] drop such a config when its bring-up fails or hands off, and re-read the record for that host on the
+next connect (Perlmutter report, left-over local state). A `details=` for the id removes the mark.
+
 ## See also
 [[server]] · [[shapes]] · [[lifecycle]] · [[runner]]

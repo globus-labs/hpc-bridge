@@ -7,7 +7,8 @@ switch of shapes/state to the bound facility, the attach (`_connect_mep`, identi
 bootstrap, and the allocation listing over the login shape. `_commit_proven_facility` writes a BYO
 config to the local cache only once the login-shape canary has answered; `_drop_failed_details` drops one whose
 bring-up failed on the login node before that, so a connect without details resolves the facility afresh instead of
-running it again; `_drop_dead_pin` forgets a login-node pin whose host is unreachable.
+running it again; `_drop_cached_config` drops a config read from the cache whose bring-up failed or handed off, so the
+next connect reads it afresh; `_drop_dead_pin` forgets a login-node pin whose host is unreachable.
 
 The login-shape channel is INJECTED (`run_login`), as in scheduler_ops: `server._connect_facility` is a
 thin wrapper that supplies `server._login_runner(app)`, so tests that call `server._connect_facility` and
@@ -35,7 +36,13 @@ from .context import (
 )
 from .discovery import discover_facility_details
 from .dispatch import for_agent
-from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
+from .facility.remote import (
+    NeedsPreauth,
+    SshTarget,
+    is_interactive_auth_failure,
+    key_accepted_second_factor_pending,
+    offers_one_time_code,
+)
 from .lifecycle import EndpointState, ensure_warm
 from .models import BlockTerms, ConnectFacilityResult, FacilityDetails, validate_host
 from .notices import (
@@ -148,17 +155,56 @@ def _afresh(facility: str, host: str) -> str:
 
 def _without_details(app: AppCtx, facility: str, host: str) -> str:
     """What a connect_facility without details= for `facility` does next, said as it will happen (advice that sends the
-    agent there must come true): while this session keeps a configuration for it, that one wins over every other rung,
-    whatever ssh_host the call names — so a proposal for another `host` comes under another facility id."""
+    agent there must come true): while this session keeps a configuration for it, that one wins over every other rung
+    — unless the call names another ssh_host, which is resolved afresh (the kept one is not run for it)."""
     kept = app.session_facilities.get(facility)
     if kept is None:
         return _afresh(facility, host)
     said = (f"connect_facility({facility!r}) without details reconnects with the configuration this session keeps for "
             f"it (for {kept.ssh_host!r}) and proposes nothing while that one is kept")
     if host != kept.ssh_host:
-        said += (f"; for {host!r}, connect another facility id: connect_facility('<new id>', ssh_host={host!r}) "
-                 "resolves that one afresh")
+        said += f"; {_afresh(facility, host)}, and does not run the kept one"
     return said
+
+
+def _forget_kept_config(app: AppCtx, facility: str) -> None:
+    """The configuration this session keeps for `facility` is replaced by one resolved for another host the call named:
+    what was kept of it goes with it — its pending cache write (never committed as PROVEN on another config's canary),
+    its `details_started` mark, its directive note."""
+    app.session_facilities.pop(facility, None)
+    app.pending_facility_cache.pop(facility, None)
+    app.details_started.discard(facility)
+    app.directive_notes.pop(facility, None)
+
+
+def _drop_cached_config(app: AppCtx, facility: str, entry: CatalogEntry) -> None:
+    """A configuration this session READ from facilities.json (`AppCtx.from_cache`) whose bring-up failed or handed off
+    (needs_preauth) leaves the session, so the next connect resolves the facility afresh — that host's record again, or
+    a probe if the user deleted it — instead of running the kept copy (Perlmutter report 2026-10-29, items 1b and 3: a
+    retry naming the facility's own host, and one after the record was deleted, both ran it again). Free: the record is
+    still on disk. A details= config keeps its own rule (`_drop_failed_details`). Only this connect's own `entry`.
+    Callers hold app.lock."""
+    if facility in app.from_cache and app.session_facilities.get(facility) is entry:
+        del app.session_facilities[facility]
+        app.directive_notes.pop(facility, None)  # the re-read says its rewrite again
+
+
+def _access_proven(entry: CatalogEntry) -> bool:
+    """Has this user's SSH access to `entry`'s login host been PROVEN — a facilities.json record for that host, which is
+    written only once the login canary answered there (`_commit_proven_facility`)? A stranger has none."""
+    try:
+        return bool(entry.ssh_host) and binding._facility_store().get(entry.ssh_host) is not None
+    except Exception:  # noqa: BLE001 - an unreadable cache proves nothing
+        return False
+
+
+def _preauth_handoff(app: AppCtx, facility: str, target, entry: CatalogEntry, *, otp_ok: bool) -> ConnectFacilityResult:
+    """The bring-up was denied in a way an interactive login completes: hand it to the user (`_needs_preauth_result`),
+    resumed by `connect_facility(<id>)`. A config read from facilities.json is re-read then (`_drop_cached_config`)."""
+    _drop_cached_config(app, facility, entry)
+    app.pending_preauth = (facility, target)
+    app.preauth_resume = f"connect_facility({facility!r})"
+    return _needs_preauth_result(facility, target, otp_ok=otp_ok)
 
 
 _LEAD_ERROR_CAP = 300  # of the dropped config's failure, in the next answer's opening
@@ -217,9 +263,6 @@ def _tcp_answers(host: str, port: int = 22, timeout_s: float = 3.0) -> bool:
         return False
 
 
-_ALIAS_PROBE = _tcp_answers  # injectable: tests replace it; production probes the alias's sshd port
-
-
 async def _online_endpoint(fac) -> str | None:
     """UUID of an online endpoint of ours at `fac`, asked of the Globus web service only — NO SSH. None when
     there is none, or the facility cannot say (no finder, no profile, a web error: `find_online_endpoint`
@@ -238,13 +281,17 @@ def _drop_dead_pin(fac) -> bool:
     """A login-node PIN (endpoints.json) that no longer answers is dropped, so the next connect goes
     back to the facility's canonical host — pins used to be permanent (vault audit 2026-09-03). Only
     an UNREACHABLE host qualifies: a refused login keeps the pin (the host is fine; the access isn't).
-    True when a pin was in use and got dropped."""
+    True when a pin was in use and got dropped.
+
+    The facility's host is probed where ssh connects for it: the HostName `rebind` resolved for the alias (`ssh -G`,
+    kept on the target as its HostKeyAlias). An ssh-config Host such as `perlmutter` is no name a resolver knows, so a
+    probe of the alias itself read as a client-side outage and kept the dead pin (Perlmutter report 2026-10-29, #1)."""
     store, alias = getattr(fac, "store", None), getattr(fac, "alias", None)
     target = getattr(getattr(fac, "cli", None), "target", None)
     name = getattr(getattr(fac, "profile", None), "endpoint_name", None)
     if store is None or not alias or target is None or not name or getattr(target, "host", alias) == alias:
         return False
-    if not _ALIAS_PROBE(alias):
+    if not _tcp_answers(getattr(target, "host_key_alias", None) or alias):
         # The facility's canonical host doesn't answer either: a CLIENT-side outage (VPN off, no network),
         # not a dead pin. Dropping it would send teardown/login_shell to the round-robin alias later
         # and orphan the endpoint the pin protects (review 2). Keep the pin.
@@ -399,6 +446,7 @@ async def _connect(
         # this session's config, kept from here so a connect while it comes up keeps polling it (and a one-time-code
         # handoff resumes it); on disk only once PROVEN (below); dropped if it fails on the login node first
         app.session_facilities[facility] = entry
+        app.from_cache.pop(facility, None)       # the session's config is this one, not the cache's
         app.failed_details.pop(facility, None)  # a new config replaces the one that failed
         app.details_started.discard(facility)   # …and has not started yet
         if details.ssh_host:  # persist for LOCAL DISCOVERY — but only once the login shape is PROVEN warm
@@ -407,6 +455,13 @@ async def _connect(
         if failed is not None and not ssh_host:
             ssh_host = failed.ssh_host  # the host the dropped details= named: the facility is resolved afresh for it
         entry = app.session_facilities.get(facility)  # never the dropped config: _drop_failed_details took it out
+        if entry is not None and ssh_host and ssh_host != entry.ssh_host:
+            # the call names another host than the config this session keeps: resolved afresh for that host, never the
+            # kept config silently (Perlmutter report 2026-10-29, #1: a retry naming the facility's own host went to the
+            # kept config's dead login node again)
+            entry = None
+        if entry is None and not ssh_host:
+            ssh_host = app.from_cache.get(facility)  # a config read from facilities.json and dropped: that record again
         session_scoped = entry is not None  # read before the lock: checked again once it is held (below)
         # the rewrite of the session's own config, said until a result carries it — never a dropped config's (its note
         # went with it: _drop_failed_details)
@@ -434,7 +489,9 @@ async def _connect(
                 try:
                     cached_details, rewrites = binding._directive_details(FacilityDetails(**cached))
                     entry = binding._entry_from_details(facility, cached_details)
+                    _forget_kept_config(app, facility)  # one kept for another host (the call named this one)
                     app.session_facilities[facility] = entry
+                    app.from_cache[facility] = ssh_host
                     session_scoped = True
                     directive_note = _directive_note(rewrites)  # a bare option cached by an earlier plugin
                     if directive_note:
@@ -574,14 +631,20 @@ async def _connect(
             # discovery probe knew this; the registry/cached bootstrap path did not (Expanse, live 2026-09-04 —
             # a curated MFA entry came back NO SSH ACCESS and the agent went hunting in ~/.ssh/config).
             if target is not None and key_accepted_second_factor_pending(str(exc)):
-                app.pending_preauth = (facility, target)
-                app.preauth_resume = f"connect_facility({facility!r})"
-                return _needs_preauth_result(facility, target, otp_ok=True)
+                return _preauth_handoff(app, facility, target, entry, otp_ok=True)
             notice = _explain_provision_error(exc, fac)
+            # So is any denial that offers a password or keyboard-interactive on a host this user has PROVEN access to
+            # (a facilities.json record): NERSC is password + one-time code, and its denial still lists publickey
+            # (Perlmutter report 2026-10-29, #2). A stranger whose key is refused on a 2FA site (Anvil) has no such
+            # record: still NO SSH ACCESS.
+            if (target is not None and notice.startswith("NO SSH ACCESS") and is_interactive_auth_failure(255, str(exc))
+                    and _access_proven(entry)):
+                return _preauth_handoff(app, facility, target, entry, otp_ok=offers_one_time_code(str(exc)))
             if notice.startswith(("CANNOT REACH", "UNKNOWN HOST KEY")) and await asyncio.to_thread(_drop_dead_pin, fac):
                 notice += " (The remembered login-node pin was dropped: the next connect resolves the facility's host afresh.)"  # noqa: E501
             if _failure_of_the_config(exc):  # the login node ran the config and refused it: not run again unasked
                 notice += _drop_failed_details(app, facility, notice, entry)
+            _drop_cached_config(app, facility, entry)
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
         if block == "warm" and _session_is_ours(app, facility, entry):  # never another connect's waiting config
             _commit_proven_facility(app, facility)
