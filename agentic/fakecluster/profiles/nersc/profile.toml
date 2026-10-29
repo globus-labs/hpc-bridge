@@ -1,0 +1,31 @@
+# `nersc` = the `site` cluster shaped like NERSC Perlmutter, from a user's report on plugin 0.1.20 (2026-10-29), so the
+# quirks that report met are reachable here at all — every other profile has homes under /home, key-only logins, plain
+# partition names and quiet startup files:
+#   * HOMES OUTSIDE /home — /global/homes/<initial>/<user> (the shared volume, behind a /global symlink on every login
+#     and compute node); /home itself is root-owned and holds no user's home, so a path built as /home/<user> is refused
+#   * a login sshd that takes a KEY or a PASSWORD + ONE-TIME CODE (PAM: password, then google-authenticator): a key-less
+#     BatchMode login is denied with `(publickey,password,keyboard-interactive)` — NERSC's shape, where the `totp`
+#     profile's is key + code. Each pool user has a random password and code secret (nobody needs either: no cell
+#     completes that path). A cell revokes the key by moving ~/.ssh/authorized_keys aside, as an expired sshproxy key
+#     would be; a key-only harness sshd on :2200 (keys from a root-owned file) is the world channel either way
+#   * a NOISY ~/.bashrc: Lmod module-swap lines and a stale ~/.gitconfig.lock's git error on STDERR, above Ubuntu's
+#     non-interactive return guard, so every remote command's stderr starts with ~700 characters of them
+#   * Slurm with NERSC's routing: partitions `system` (the default), `regular_milan_ss11`, `shared_milan_ss11`,
+#     `realtime_ss11` (AllowQos=realtime) and `gpu_ss11`; QOS debug/regular/shared/realtime; node features cpu (c1, c2)
+#     and gpu (c3); and a submit filter (job_submit.lua) that wants a node type (-C cpu|gpu) and EITHER a QOS or a
+#     "partition" name (never both), takes debug/regular/shared only, and routes the job itself
+name = "nersc"
+description = "site shaped like NERSC Perlmutter: homes under /global/homes, key OR password+OTP sshd, a noisy .bashrc, system/*_ss11 partitions behind a QOS/constraint submit filter"
+base = "site"
+
+[capabilities]
+mfa = "password_otp"          # port 22: publickey, or password + one-time code (keyboard-interactive via PAM)
+harness_ssh_port = 2200       # the harness' key-only sshd (its own root-owned key file); the published ports map here
+home_root = "/global/homes"   # $HOME = /global/homes/<initial>/<user>; /home is not writable
+shell_noise = "bashrc"        # Lmod + git lock lines on stderr ahead of every remote command
+submit_policy = "nersc"       # job_submit.lua: -C cpu|gpu, QOS xor partition, debug/regular/shared only
+partitions = ["system", "regular_milan_ss11", "shared_milan_ss11", "realtime_ss11", "gpu_ss11"]
+default_partition = "system"
+qos = ["debug", "regular", "shared", "realtime"]
+features = ["cpu", "gpu"]
+balance_tool = "none"         # site's fake mybalance is removed (NERSC reports allocations through iris)

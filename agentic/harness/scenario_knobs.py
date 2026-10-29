@@ -14,6 +14,8 @@
     HPCB_KNOB_ADMIN_TAP='{"cmd": …, "every_s": 10}'  # ADMIN_TAP -> run_smoke.sh samples the scheduler through the target's
                                                    #   admin channel for the whole cell (harness/admin_tap.py); the
                                                    #   scenario's WORLD_CHECKS read the samples in the jail
+    HPCB_KNOB_NODE_ACTIONS=1                       # NODE_ACTIONS = True -> run_smoke.sh serves the script's node actions
+                                                   #   (harness/node_actions.py: a login node's sshd off / on, as root)
 
 Everything else a scenario declares (EXTRA_ENV, SEED_FACILITY_CACHE, …) is applied INSIDE the container
 by run.py. Scenario modules import only `invariants` (pure), so this is importable on the host."""
@@ -83,6 +85,10 @@ def main(argv: list[str]) -> int:
     if tap:
         import json
         print(f"HPCB_KNOB_ADMIN_TAP={shlex.quote(json.dumps(dict(tap), sort_keys=True))}")
+    # NODE ACTIONS: the script may take one login node away and give it back (run_smoke.sh starts
+    # harness/node_actions.py on the host, which docker-execs into the node's container). Fake target only.
+    if getattr(mod, "NODE_ACTIONS", False):
+        print("HPCB_KNOB_NODE_ACTIONS=1")
     return 0
 
 
