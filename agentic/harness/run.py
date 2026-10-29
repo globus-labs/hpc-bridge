@@ -203,19 +203,25 @@ def _ssh_run(remote: str, *, timeout: int = 60, host: str | None = None) -> tupl
 
 
 def _seed_facility_cache(scen) -> None:
-    """SEED_FACILITY_CACHE = {facility_id: FacilityDetails-shaped dict}: pre-populate the server's
-    local BYO cache (~/.hpc-bridge/facilities.json in this container) BEFORE the agent starts — e.g. a
-    stale SSH-era config for a facility the registry now serves as a MEP (registry must win)."""
-    seed = getattr(scen, "SEED_FACILITY_CACHE", None)
-    if not seed:
-        return
+    """Leftover LOCAL STATE, written into the jail's ~/.hpc-bridge BEFORE the agent starts — what a user who connected
+    before comes back with:
+    - SEED_FACILITY_CACHE = {ssh_host (or facility id): FacilityDetails-shaped dict} -> facilities.json, the BYO cache
+      of PROVEN configs: e.g. a stale SSH-era config for a facility the registry now serves as a MEP (registry must
+      win), or a proven config whose login now asks for a password + one-time code (cached_password_otp);
+    - SEED_LOGIN_PINS = [EndpointRecord-shaped dict, …] -> endpoints.json, the login-node pins (keyed `<alias>::<name>`,
+      as the plugin's LoginNodeStore keys them): an endpoint pinned to a login node by an earlier session."""
     import json
     state = Path(os.environ.get("HPC_BRIDGE_STATE_DIR") or (Path.home() / ".hpc-bridge"))
-    state.mkdir(parents=True, exist_ok=True)
-    p = state / "facilities.json"
-    p.write_text(json.dumps(dict(seed), indent=2, sort_keys=True))
-    p.chmod(0o600)
-    print(f"seeded facility cache: {sorted(seed)} -> {p}", file=sys.stderr, flush=True)
+    seeds = {"facilities.json": dict(getattr(scen, "SEED_FACILITY_CACHE", None) or {}),
+             "endpoints.json": {f"{r['alias']}::{r['name']}": dict(r) for r in getattr(scen, "SEED_LOGIN_PINS", None) or []}}
+    for fname, seed in seeds.items():
+        if not seed:
+            continue
+        state.mkdir(parents=True, exist_ok=True)
+        p = state / fname
+        p.write_text(json.dumps(seed, indent=2, sort_keys=True))
+        p.chmod(0o600)
+        print(f"seeded {fname}: {sorted(seed)} -> {p}", file=sys.stderr, flush=True)
 
 
 def _interphase_setup(scen) -> bool:
@@ -1259,7 +1265,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         if why:
             print(f"RESULT: SETUP FAILED — {why}")
             return 2
-        _run_scenario = functools.partial(_script_run, script=scen.SCRIPT, facility=facility, ssh_host=ssh_host)
+        _run_scenario = functools.partial(_script_run, script=scen.SCRIPT, facility=facility, ssh_host=ssh_host,
+                                          world=_ssh_run)
         model = "script"
     elif operator in ("codex", "pi", "hermes21"):
         # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
@@ -1305,6 +1312,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         "trust_host_key": bool(getattr(scen, "TRUST_HOST_KEY", True)),
         "extra_env": dict(getattr(scen, "EXTRA_ENV", {}) or {}),
         "seed_facility_cache": sorted(getattr(scen, "SEED_FACILITY_CACHE", {}) or {}),
+        "seed_login_pins": [f"{r.get('alias')}::{r.get('name')} -> {r.get('login_host')}"
+                            for r in getattr(scen, "SEED_LOGIN_PINS", None) or []],
+        "node_actions": bool(getattr(scen, "NODE_ACTIONS", False)),
         "no_globus_db": bool(getattr(scen, "NO_GLOBUS_DB", False)),
         "globus_db_secret": getattr(scen, "GLOBUS_DB_SECRET", None),
         "postcheck_delay_s": getattr(scen, "POSTCHECK_DELAY_S", 10),

@@ -33,6 +33,10 @@ agentic/
                            tool calls over the `mcp` stdio client; trace = its steps + hpc-bridge's journal (as above)
     admin_tap.py         ← the ADMIN TAP: the scheduler sampled as its admin (fake: root on the controller) for a
                            scenario's WORLD_CHECKS — host half started by run_smoke.sh, jail half read by run.py
+    node_actions.py      ← NODE ACTIONS: a script takes one fake login node away (its sshd off the network) and gives it
+                           back — host half started by run_smoke.sh (`docker exec`, undone on exit), jail half the script's
+    byo_script.py        ← steps the scripted bring-your-own cells share: a connect from the proposal, a bring-up polled to
+                           its end, the jail's leftover ~/.hpc-bridge state (the login pin, the facilities.json records)
     responses_relay.py   ← lets Codex use ALCF: replays an unstreamed Responses answer as SSE, flattens Codex's
                            `namespace` / `custom` tools to plain functions and restores them on the way back
     run.py               ← per-scenario orchestration: SETUP → agent → invariants → WORLD POSTCHECKS → teardown
@@ -48,7 +52,7 @@ agentic/
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 69 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 75 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -68,6 +72,9 @@ agentic/
                            adversarial: canary_login_discovery · canary_compute_output · password_pusher · wrong_code
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            block size (scripted, `slices`): slice_request · multinode_allocation
+                           the Perlmutter report (scripted RED proofs, `site` / `nersc`; fail on main until fixed):
+                             stale_login_pin · kept_entry_after_failure · cached_password_otp · home_outside_home ·
+                             noisy_failure_tail · partition_proposal_policy
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
@@ -117,7 +124,12 @@ operators do (this checkout via `uv run`, behind the stderr wrapper, with the en
 `HPC_BRIDGE_JOURNAL`) and drives it with the `mcp` stdio client. `ops.call(tool, **args)` returns the tool's result as
 a dict (an error or a closed channel as `{"is_error": True, "text": …}` — never raised), `ops.say(text)` is the
 script's own words (the trace's texts), `ops.abort(reason)` ends the run errored (`run_completed` fails: a premise
-unmet), `ops.facility` / `ops.ssh_host` are the run's. The graded trace is built as the CLI operators' is: the steps fix
+unmet), `ops.facility` / `ops.ssh_host` are the run's, and `await ops.world(cmd, host=…)` runs one command over the
+harness' world channel (ssh as the pool user, not in the trace) — how a script changes the world mid-run. A scenario
+that declares `NODE_ACTIONS = True` may also take one fake login node away and give it back
+(`harness/node_actions.py`: `sshd_off` / `sshd_on`, as root in that node's container from the host; undone when the
+cell ends); one that declares `SEED_FACILITY_CACHE` / `SEED_LOGIN_PINS` starts with that leftover local state in the
+jail's `~/.hpc-bridge` (facilities.json / endpoints.json), as a user who connected before would. The graded trace is built as the CLI operators' is: the steps fix
 the order, the journal says what each tool got and returned (`harness:trace_complete` gates), and the bundle's
 `messages.jsonl` holds each step (`native`, with its `t_start` / `t_end`), the script's words, its final message and
 the journal, so `regrade.py` replays it. No credential is needed or forwarded and the ALCF probe does not run; a scenario

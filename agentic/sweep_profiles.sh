@@ -82,6 +82,12 @@ saturation                    globus1: holds every node for 25 min (re-homing it
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
 slice_request                 new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
 multinode_allocation          new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
+stale_login_pin               Perlmutter report RED proof (scripted, `site`): fails on main by design; a script_cell once its fix lands
+kept_entry_after_failure      Perlmutter report RED proof (scripted, `site`): fails on main by design; a script_cell once its fix lands
+cached_password_otp           Perlmutter report RED proof (scripted, `nersc`): fails on main by design; a script_cell once its fix lands
+home_outside_home             Perlmutter report RED proof (scripted, `nersc`): fails on main by design; a script_cell once its fix lands
+noisy_failure_tail            Perlmutter report RED proof (scripted, `nersc`): fails on main by design; a script_cell once its fix lands
+partition_proposal_policy     Perlmutter report RED proof (scripted, `nersc`): fails on main by design; a script_cell once its fix lands
 EXCLUDED
 }
 
