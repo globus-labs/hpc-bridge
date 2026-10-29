@@ -790,7 +790,7 @@ async def _propose_or_ask(
             facility=facility,
             notice=_explain_provision_error(
                 exc, host=host, user=config.ssh_user(),
-                fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}"[:400],
+                fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}",  # bounded by its ends
             ),
         )
     notice = proposal_lead + (

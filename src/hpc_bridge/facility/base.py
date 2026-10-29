@@ -35,6 +35,30 @@ def said_tail(text: str, lines: int = TAIL_LINES) -> str:
     return "\n".join(ln[:400] for ln in said_lines(text)[-lines:])
 
 
+END_CHARS = 400  # how much of its output a failed step's message quotes, from the end (`said_end`)
+
+
+def said_end(text: str, chars: int = END_CHARS) -> str:
+    """What a failed remote step printed, for its error: its END — the last meaningful lines that fit in `chars` (the
+    last one always, cut at 400), after a cut mark when earlier lines were dropped. Every step runs in a login shell,
+    whose startup files print first (Lmod's module swaps, a stale ~/.gitconfig.lock's git error), as do ssh's warnings
+    and a site's pre-auth banner ahead of its verdict: the head is their noise, the end the step's own words (the
+    Perlmutter report, item 5, 2026-10-29). Characters, not a count of lines: a message that opens with its cause and
+    ends in help (Lmod's "The following module(s) are unknown", seven lines in all) is kept whole. "" when it printed
+    nothing."""
+    got = said_lines(text)
+    kept: list[str] = []
+    size = 0
+    for ln in reversed(got):
+        if kept and size + len(ln) + 1 > chars:
+            break
+        kept.append(ln[:400])
+        size += len(kept[-1]) + 1
+    body = "\n".join(reversed(kept))
+    n = len(got) - len(kept)
+    return f"[hpc-bridge: output cut — {n} earlier line{'s' if n != 1 else ''} dropped]\n{body}" if n else body
+
+
 class ConfigStepFailed(RuntimeError):
     """A bring-up step that ran THROUGH the configuration's env_setup on the login node failed there: `configure`,
     `start` or `list` of globus-compute-endpoint, or the check or build of hpc-bridge's endpoint venv (after the site's

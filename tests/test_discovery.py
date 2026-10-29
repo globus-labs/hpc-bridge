@@ -296,7 +296,8 @@ def test_the_probe_checks_the_venv_a_bring_up_would_use(monkeypatch):
     monkeypatch.delenv("HPC_BRIDGE_REMOTE_VENV", raising=False)
     monkeypatch.setattr(discovery, "_gce_version", lambda: "4.18.0")
     monkeypatch.setattr(discovery, "_client_python", lambda: "3.13")
-    assert 'V="/home/$(whoami)/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13"\n' in discovery._probe_script()  # keyed
+    # keyed, under the login node's own $HOME (the probe's double quotes expand it there), as the bring-up builds it
+    assert 'V="$HOME/hpc-bridge/gce-venv-endpoint-4.18.0-py3.13"\n' in discovery._probe_script()
     monkeypatch.setenv("HPC_BRIDGE_REMOTE_VENV", "/scratch/me/gce")
     assert 'V="/scratch/me/gce-endpoint-4.18.0-py3.13"\n' in discovery._probe_script()
     monkeypatch.setenv("HPC_BRIDGE_REMOTE_VENV", "~/gce")

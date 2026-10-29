@@ -20,5 +20,14 @@ facility's options, its template's default); `_size_refusal` also refuses `nodes
 where the facility's own options already ask for GPUs. Old terms are said by what the block held
 (`resources.size_words`), and "partition, account or size" follows `rt.switched_size` on a switch back.
 
+**A failure is quoted by its end (2026-10-29, the Perlmutter report, item 5).** A remote step's stderr opens with the
+login shell's startup noise (Lmod's module swaps, a stale `~/.gitconfig.lock`) and ssh's with a site banner, so the
+notice's old cut, a message's first 500 characters, kept the noise and lost the cause. `_explain_provision_error` now
+bounds a failure it shows as text with `_ends`: 500 characters, cut from the MIDDLE and marked (`[hpc-bridge: notice cut
+— N chars from its middle]`), so the head names the step and the end is what the remote said last; the messages
+themselves quote their output's end ([[facility-base]] `said_end`). It classifies the message as before (a denial
+behind a banner is still NO SSH ACCESS, since the end keeps ssh's verdict), and a CANNOT REACH with no verdict line
+quotes the last line, not the first: the cut mark, a stale control socket or a banner come before ssh's verdict.
+
 ## See also
 [[server]] · [[models]] · [[context]] · [[config]] · [[cost]]

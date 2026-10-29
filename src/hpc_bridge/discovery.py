@@ -13,6 +13,7 @@ import shlex
 from typing import Literal
 
 from . import resources
+from .facility.base import said_end
 from .facility.endpoint_venv import (
     DEFAULT_REMOTE_VENV,
     client_gce,
@@ -125,14 +126,14 @@ echo HPCB_PROBE_END
 
 
 def _probe_script() -> str:
-    """`_PROBE` with the keyed venv a bring-up would use (HPC_BRIDGE_REMOTE_VENV, else the convention), checked
-    through its entry point with bytecode writes off, so the proposal can say whether it is reused or repaired."""
+    """`_PROBE` with the keyed venv a bring-up would use (HPC_BRIDGE_REMOTE_VENV, else the default under the login
+    node's own $HOME, which the probe's double quotes expand there), checked through its entry point with bytecode
+    writes off, so the proposal can say whether it is reused or repaired."""
     from . import config
 
     venv = shell_path(config.remote_venv() or DEFAULT_REMOTE_VENV)
     if not safe_base(venv):  # a path the probe could not quote as it is: not checked (the bring-up refuses it too)
         return _PROBE.replace("@@VENV@@", "")
-    venv = venv.replace("{user}", "$(whoami)")
     return _PROBE.replace("@@VENV@@", keyed_venv(venv, python=_client_python(), gce=_gce_version()))
 
 
@@ -145,7 +146,8 @@ async def discover_facility_details(target: SshTarget) -> tuple[FacilityDetails,
     if "HPCB_PROBE_BEGIN" not in out:  # never even ran the script (auth/connect failure)
         if is_interactive_auth_failure(rc, err):  # needs a one-time interactive pre-auth, not broken
             raise NeedsPreauth(target, otp_ok=offers_one_time_code(err))
-        raise RuntimeError(f"discovery probe failed (rc={rc}): {(err or out).strip()[:300]}")
+        # its END: ssh's verdict comes after a site's pre-auth banner and ssh's own warnings, which can run long
+        raise RuntimeError(f"discovery probe failed (rc={rc}): {said_end(err or out)}")
     return parse_probe(out, ssh_host=target.host)
 
 

@@ -1,9 +1,9 @@
 """Perlmutter (NERSC) user report, 2026-10-29: remote setup on the login node — items 4, 5 and 8 (second bullet).
 
-Proofs, not fixes. Each `xfail(strict=True)` fails on main because of the bug its reason names, through the real code
-path with only SSH replaced at the boundary (`ssh_exec`), as the rest of tests/ does; once the bug is fixed the test
-passes, the strict xfail turns the run red, and the marker comes off with the fix. The passing tests pin what is already
-fixed (item 5's texttable half, #210) or by design (8b: the login shell).
+Began as proofs: each was a strict xfail that failed on main because of its bug, through the real code path with only
+SSH replaced at the boundary (`ssh_exec`), as the rest of tests/ does. Items 4 and 5b are fixed (the default venv is
+`$HOME/hpc-bridge/gce-venv`; a failed remote step is quoted by its end) and their markers are off; the rest pin what was
+already fixed (item 5's texttable half, #210) or is by design (8b: the login shell).
 
 The home is Perlmutter's shape, `/global/homes/<initial>/<user>`, never `/home/<user>`; the user is the placeholder
 `alice`.
@@ -18,7 +18,7 @@ import pytest
 from hpc_bridge import binding, config, discovery
 from hpc_bridge.facility import endpoint_venv as ev
 from hpc_bridge.facility import remote
-from hpc_bridge.facility.base import ConfigStepFailed
+from hpc_bridge.facility.base import ConfigStepFailed, said_end
 from hpc_bridge.facility.remote import RemoteEndpointCLI, SshTarget
 from hpc_bridge.notices import _explain_provision_error
 
@@ -68,12 +68,10 @@ def _fake_ssh(monkeypatch, module, answer: tuple[int, str, str], seen: list[str]
     monkeypatch.setattr(module, "ssh_exec", fake)
 
 
-# ---- item 4: the default {venv} is /home/<user>/hpc-bridge/gce-venv, whatever the probe found HOME to be ------------
+# ---- item 4: the default {venv} was /home/<user>/hpc-bridge/gce-venv, whatever the probe found HOME to be -----------
+# FIXED: the default is `$HOME/hpc-bridge/gce-venv` (endpoint_venv.DEFAULT_REMOTE_VENV), expanded on the login node —
+# the build, the probe's check and teardown's search use the same path. On Perlmutter /home/<user> is not writable.
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #4: profile_from_catalog_entry resolves {venv} to DEFAULT_REMOTE_VENV "
-    "(/home/{user}/hpc-bridge/gce-venv, facility/endpoint_venv.py:51, facility/remote.py:380), not the HOME the probe "
-    "learned; on Perlmutter /home/<user> is not writable, so the venv build fails with Permission denied"))
 async def test_report_4_a_probed_facility_puts_its_venv_under_the_home_the_probe_found(monkeypatch):
     # the whole BYO chain: the probe over "SSH" -> the proposal -> details= -> the session entry (the same entry the
     # local cache, facilities.json, rebuilds from) -> the facility a bring-up runs, with its env_setup and worker_init
@@ -92,11 +90,8 @@ async def test_report_4_a_probed_facility_puts_its_venv_under_the_home_the_probe
     assert mv.base.startswith((f"{HOME}/", "$HOME/")), mv.base
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #4: the discovery probe looks for an existing hpc-bridge venv under /home/$(whoami) "
-    "(discovery.py:132, :135, from DEFAULT_REMOTE_VENV), not under the login node's $HOME, so a venv already built "
-    "in a non-/home home is never seen"))
 def test_report_4_the_probe_finds_an_existing_venv_under_the_login_nodes_home(monkeypatch, tmp_path):
+    # FIXED with the default: the probe looked under /home/$(whoami), so a venv in a non-/home home was never seen
     # the real probe script, in a real (local, non-login) bash whose HOME is Perlmutter-shaped and holds the keyed venv
     monkeypatch.delenv("HPC_BRIDGE_REMOTE_VENV", raising=False)
     monkeypatch.setattr(discovery, "_gce_version", lambda: GCE)
@@ -127,8 +122,9 @@ async def test_report_5_a_list_traceback_after_startup_noise_names_the_exception
     assert "texttable<1.7.2" in ev.TEXTTABLE_PIN
 
 
-# The steps that quote the remote's WHOLE output in their message (configure, start, and list when there is no Python
-# traceback), each failing with its own decisive last line after the startup noise.
+# The steps that quoted the remote's WHOLE output in their message (configure, start, and list when there is no Python
+# traceback), each failing with its own decisive last line after the startup noise. FIXED: each quotes its END
+# (`_cli_said` → `base.said_end`), and the notice is cut from its middle, never its end (`notices._ends`).
 _LAST_LINES = {
     "configure": f"bash: line 1: {HOME}/gce/bin/activate: No such file or directory",
     "configure-traceback": "ImportError: cannot import name 'GlobusApp' from 'globus_sdk'",
@@ -137,11 +133,6 @@ _LAST_LINES = {
 }
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #5: a failed configure/start/list (no traceback) puts the remote's whole stderr in its message "
-    "(facility/remote.py:580-583, :738-739; _cli_said :433 keeps non-traceback text whole) and the notice keeps the "
-    "message's FIRST 500 characters (notices.py:102), so the user's startup noise pushes the real error out; "
-    "ConfigStepFailed.said/.tail hold the end but the notice never quotes them"))
 @pytest.mark.parametrize("step", list(_LAST_LINES))
 async def test_report_5_a_failed_step_after_startup_noise_is_reported_by_its_last_line(monkeypatch, step):
     last = _LAST_LINES[step]
@@ -156,6 +147,9 @@ async def test_report_5_a_failed_step_after_startup_noise_is_reported_by_its_las
     assert e.value.said == last  # the step's own last line is known…
     notice = _explain_provision_error(e.value)
     assert last in notice, notice  # …and the agent must be told it
+    assert len(notice) <= 500 and "MODULEPATH" not in notice  # bounded; the noise's head is gone
+    if "traceback" not in step:
+        assert "[hpc-bridge: output cut — " in notice, notice  # …and the cut is marked
 
 
 # A login node's pre-auth banner (sshd `Banner`) and OpenSSH 10's post-quantum warning reach ssh's STDERR ahead of its
@@ -172,11 +166,9 @@ _SSH_PREAMBLE = (
 assert len(_SSH_PREAMBLE) > 300
 
 
-@pytest.mark.xfail(strict=True, reason=(
-    "perlmutter report #5 (probe path): a probe that never ran is reported as the FIRST 300 characters of stderr "
-    "(discovery.py:148, then the 400-char fallback at connect.py:793), so ssh's verdict after a long banner is cut "
-    "and a refused key reads as an unexplained failure instead of NO SSH ACCESS"))
 async def test_report_5_a_refused_probe_behind_a_long_banner_is_still_no_ssh_access(monkeypatch):
+    # FIXED: a probe that never ran was reported as the FIRST 300 characters of stderr (then a 400-char fallback), so
+    # ssh's verdict after a long banner was cut and a refused key read as an unexplained failure
     from hpc_bridge.connect import _propose_or_ask
 
     monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "alice")
@@ -185,6 +177,58 @@ async def test_report_5_a_refused_probe_behind_a_long_banner_is_still_no_ssh_acc
     res = await _propose_or_ask("perlmutter", HOST, "ask")
     assert res.phase == "failed"
     assert res.notice.startswith(f"NO SSH ACCESS to {HOST}"), res.notice
+
+
+async def test_report_5_a_password_otp_denial_behind_a_long_banner_still_hands_off(monkeypatch):
+    # …and NERSC's own denial behind the same banner is the pre-auth handoff, as without one
+    from hpc_bridge.connect import _propose_or_ask
+
+    monkeypatch.setenv("HPC_BRIDGE_SSH_USER", "alice")
+    monkeypatch.setattr(config, "_control_settings", lambda: (None, 60))
+    denial = f"alice@{HOST}: Permission denied (publickey,password,keyboard-interactive).\n"
+    _fake_ssh(monkeypatch, discovery, (255, "", _SSH_PREAMBLE + denial))
+    res = await _propose_or_ask("perlmutter", HOST, "ask")
+    assert res.phase == "needs_preauth", res.notice
+
+
+@pytest.mark.parametrize("where", ["the venv check", "teardown"])
+def test_report_5_ssh_refusals_on_other_steps_are_classified_from_their_end(where):
+    # the endpoint venv's ssh failure (`_transport`) and teardown's (`use_working_venv`, stop) quoted the head too
+    err = _SSH_PREAMBLE + f"alice@{HOST}: Permission denied (publickey).\n"
+    exc = (ev._transport("check", HOST, 255, "", err) if where == "the venv check"
+           else RuntimeError("ssh: " + said_end(err)))
+    notice = _explain_provision_error(exc, host=HOST, user="alice")
+    assert notice.startswith(f"NO SSH ACCESS to {HOST}") and "Permission denied (publickey)" in notice, notice
+
+
+def test_report_5_an_unreachable_host_behind_noise_quotes_ssh_s_last_line():
+    err = ("Control socket connect(/tmp/hpcb/cm-x): Connection refused\n" + _SSH_PREAMBLE
+           + f"ssh: connect to host {HOST} port 22: Operation timed out\n")
+    notice = _explain_provision_error(RuntimeError(f"discovery probe failed (rc=255): {said_end(err)}"),
+                                      host=HOST)
+    assert notice.startswith(f"CANNOT REACH {HOST}: ssh: connect to host {HOST} port 22: Operation timed out"), notice
+
+
+def test_report_5_the_end_kept_and_the_cut_marked():
+    from hpc_bridge.notices import _ends
+
+    assert said_end("a\n\nb\n") == "a\nb" and said_end("") == ""  # nothing dropped: no mark
+    lines = [f"{i:02d} " + "x" * 97 for i in range(10)]  # 100 characters each: the last three fit in 400 with newlines
+    assert said_end("\n".join(lines)) == "[hpc-bridge: output cut — 7 earlier lines dropped]\n" + "\n".join(lines[-3:])
+    assert said_end("y" * 900).endswith("y" * 400) and len(said_end("y" * 900)) == 400  # the last line always, cut
+    assert said_end("z" * 399 + "\n" + "last").startswith("[hpc-bridge: output cut — 1 earlier line dropped]\n")
+    # a message that opens with its cause and ends in help is kept whole when it fits (Lmod's, live on the fake cluster)
+    lmod = ('Lmod has detected the following error: The following module(s) are unknown:\n"gcc/10.2.0"\n\n'
+            'Please check the spelling or version number. Also try "module spider ..."\n'
+            "It is also possible your cache file is out-of-date; it may help to try:\n"
+            '  $ module --ignore_cache load "gcc/10.2.0"\n\n'
+            "Also make sure that all modulefiles written in TCL start with the string\n#%Module\n\n\n")
+    assert said_end(lmod).startswith("Lmod has detected the following error: The following module(s) are unknown:")
+    long = "hpc-bridge error: ConfigStepFailed: remote configure failed: " + "noise " * 200 + "THE CAUSE"
+    cut = _ends(long)
+    assert len(cut) <= 500 and cut.startswith("hpc-bridge error: ConfigStepFailed: remote configure failed: ")
+    assert cut.endswith("THE CAUSE") and "[hpc-bridge: notice cut — " in cut
+    assert _ends("short") == "short"
 
 
 # ---- item 8b: the remote steps run in a LOGIN shell, by design -------------------------------------------------------
