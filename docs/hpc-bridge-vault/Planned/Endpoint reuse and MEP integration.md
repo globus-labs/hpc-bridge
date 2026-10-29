@@ -10,7 +10,7 @@ Three ways to reach a warm compute channel, best-first — each removes more SSH
 | Tier | Mechanism | SSH cost | Status |
 |---|---|---|---|
 | 1. **Facility MEP** | submit a UEP config to a facility's multi-user (identity-mapped) manager UUID | **none, ever** | **Phase 2 M1 — SHIPPED** ([#41](https://github.com/globus-labs/hpc-bridge/issues/41)): `MEPFacility`, catalog-driven; globus1 live |
-| 2. **Our online endpoint** | reattach to an already-running `hpc-bridge-<facility>` by name | none after the first bootstrap | **Phase 1 — SHIPPED** ([#20](https://github.com/globus-labs/hpc-bridge/issues/20)): signal surfaced + inter-agent chain test |
+| 2. **Our online endpoint** | reattach to an already-running `hpc-bridge-<ssh_host>` by name (`hpc-bridge-<id>` for a curated seed) | none after the first bootstrap | **Phase 1 — SHIPPED** ([#20](https://github.com/globus-labs/hpc-bridge/issues/20)): signal surfaced + inter-agent chain test |
 | 3. **SSH bootstrap** | SSH in once, start our own personal manager | one bootstrap (~2 auths) | built — the current default |
 
 ## Two senses of "MEP" — don't conflate them
@@ -21,7 +21,7 @@ A **facility MEP** (Phase 2) is the *other* sense: a manager the **facility** ru
 
 ## Phase 1 — reuse hpc-bridge's own endpoints ✅ SHIPPED ([#20](https://github.com/globus-labs/hpc-bridge/issues/20), PR #26)
 
-**The detection already existed and works cross-session.** `bootstrap()` (`facility/remote.py:544`) asks Globus, *before any SSH*, whether we already own an online endpoint by the stable name `hpc-bridge-<facility>`:
+**The detection already existed and works cross-session.** `bootstrap()` (`facility/remote.py:544`) asks Globus, *before any SSH*, whether we already own an online endpoint by the stable name `hpc-bridge-<ssh_host>` (`binding._session_endpoint_name`, #27: keyed on the SSH host, so two facility ids for one host share it; a curated seed sets `hpc-bridge-<id>`):
 
 ```python
 reused = await self.find_online_endpoint(self.profile.endpoint_name)   # remote.py:559 / :643

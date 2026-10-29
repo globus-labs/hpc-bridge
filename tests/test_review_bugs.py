@@ -336,6 +336,8 @@ async def test_byo_details_cached_only_once_the_login_shape_is_proven_warm(monke
 
 
 async def test_unreachable_pinned_login_node_drops_the_pin(monkeypatch, tmp_path):
+    import contextlib
+    import socket
     from types import SimpleNamespace
 
     from hpc_bridge.state import EndpointRecord, LoginNodeStore
@@ -343,20 +345,32 @@ async def test_unreachable_pinned_login_node_drops_the_pin(monkeypatch, tmp_path
     store = LoginNodeStore(tmp_path / "endpoints.json")
     store.put(EndpointRecord(endpoint_id="e1", login_host="login03.example.edu", alias="anvil", user="u",
                              key_path="/k", name="hpc-bridge-anvil", provisioned_at="2026-09-03T00:00:00Z"))
+    # the target as `rebind` leaves it: the pin, verified against the HostName ssh resolved for the alias
+    target = SimpleNamespace(host="login03.example.edu", user="u", host_key_alias="anvil.example.edu")
     fac = SimpleNamespace(store=store, alias="anvil", profile=SimpleNamespace(endpoint_name="hpc-bridge-anvil", scheduler="slurm"),
-                          cli=SimpleNamespace(target=SimpleNamespace(host="login03.example.edu", user="u")))
+                          cli=SimpleNamespace(target=target))
     monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: fac)
     monkeypatch.setattr(binding, "make_catalog", lambda: FakeCatalog([fake_entry(id="anvil", facility_key="purdue")]))
 
     async def unreachable(app, shape, **kw):
         raise RuntimeError("bootstrap failed: ssh: connect to host login03.example.edu port 22: Connection timed out")
 
+    answering: set[str] = set()   # the client's network: the hosts that take a TCP connection on :22
+
+    def create_connection(address, timeout=None, *a, **kw):
+        if address[0] not in answering:
+            raise TimeoutError("timed out")
+        return contextlib.nullcontext()
+
+    monkeypatch.setattr(socket, "create_connection", create_connection)
     monkeypatch.setattr(warmth, "_provision", unreachable)
-    monkeypatch.setattr(connect, "_ALIAS_PROBE", lambda host: False)  # the alias is down too: a CLIENT outage
     app = AppCtx(facility=FakeFacility(), profile=Profile())
-    res = await _connect_facility(app, "anvil")
+    res = await _connect_facility(app, "anvil")   # nothing answers: a CLIENT outage keeps the pin
     assert res.notice.startswith("CANNOT REACH") and store.get(alias="anvil", name="hpc-bridge-anvil") is not None
-    monkeypatch.setattr(connect, "_ALIAS_PROBE", lambda host: True)  # the alias answers: the PIN is dead
+    answering.add("anvil")   # the bare alias answering proves nothing: ssh connects to its HostName
+    res = await _connect_facility(app, "anvil")
+    assert "pin was dropped" not in res.notice and store.get(alias="anvil", name="hpc-bridge-anvil") is not None
+    answering.add("anvil.example.edu")   # the facility's host answers: the PIN is dead
     res = await _connect_facility(app, "anvil")
     assert res.phase == "failed" and res.notice.startswith("CANNOT REACH") and "pin was dropped" in res.notice
     assert store.get(alias="anvil", name="hpc-bridge-anvil") is None
