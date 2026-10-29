@@ -135,6 +135,11 @@ class ShapeRuntime:
     # still queued or HELD — a held pilot never starts on its own, so it runs no task and never idle-releases. The
     # block's own pilot leaves it once a worker answers on it, and again when that block is found gone (a reap).
     pilots: SeenPilots | None = None
+    # What the last pilot probe past the cold-start grace added to a still-cold block's answer, as (block_epoch, when —
+    # time.monotonic() —, the words; "" when it could not tell): run_shell's cold answer reuses it for a while rather
+    # than probing on every call (server._cold_answer). Good only for the cold spell it was taken in (after
+    # `provisioning_since`) and the terms it was taken on (`block_epoch`).
+    probe_said: tuple[int, float, str] | None = None
     # What a partition or account switch on an SSH endpoint left (warmth._repoint): whether the old terms' block had
     # come up (a worker answered on it: then it idle-releases after its last task), and the pilots last seen for it.
     # Cleared by a confirmation, as `switched_terms` is.

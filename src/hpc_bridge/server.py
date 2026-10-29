@@ -73,7 +73,7 @@ from .cost import (  # noqa: F401 - re-exported
     _total_session_spend,
     _with_spend,
 )
-from .lifecycle import EndpointState
+from .lifecycle import BlockState, EndpointState
 from .login import LoginFlow, LoginMode
 from .login_gate import (  # noqa: F401 - re-exported for imports
     _authenticate,
@@ -369,6 +369,12 @@ async def _ensure_endpoint_up(
         return EndpointStatus(
             status="down", block_state="cold", endpoint_id=app.state.endpoint_id, notice=reject,
         )
+    if partition == "" and shape != "login":
+        # the terms' empty queue sent back: a facility whose details= set partition "" sends none (the scheduler routes
+        # the block, as on NERSC); that is already the session's partition, so it is kept, never refused as invalid
+        uec = app.shapes[shape].user_endpoint_config if shape in app.shapes else warmth._seed_uec(app, shape)
+        if uec.get("compute") and uec.get("partition") == "":
+            partition = None
     if partition is not None and not _VALID_PARTITION.match(partition):
         return EndpointStatus(
             status="down",
@@ -609,26 +615,11 @@ async def _ensure_endpoint_up(
     # the probe lists for this endpoint (the one its verdict names)
     job_id = rt.block_job if status == "up" and billable else None
     if status == "provisioning" and billable and eid and _has_login_shape(app):
-        # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
-        # (and when a worker last answered, so the record can tell one that answered DURING the probe)
-        probe_epoch, answered = rt.block_epoch, rt.warm_confirmed_at
-        # the block request names its user endpoint's log, where the probe may read a refusal's own words (quoted only:
-        # a log read is not conclusive, so nothing is voided on it — the block stays `provisioning`)
-        notice, probe = await scheduler_ops._augment_provisioning(app, eid, notice, provisioning_elapsed,
-                                                                  _login_runner(app), confirmed_at=rt.confirmed_at,
-                                                                  block=rt.user_endpoint_config.get("hpcb_block"),
-                                                                  confirmed_wall=rt.confirmed_wall)
+        found, probe = await _probe_cold_block(app, shape, rt, eid, provisioning_elapsed)
+        if found:
+            notice = f"{notice} {found}"
         if probe is not None and probe.category != "unknown":
             job_id = probe.subject
-            async with app.lock:
-                # what is still queued or HELD, for a switch or a reconnect to say (a held pilot never idle-releases)
-                warmth._record_pilots(app, shape, rt, eid, probe_epoch, probe.live, probe.subject)
-                if probe.dead is not None:
-                    # A pilot that ran and died before any worker answered: the check it was started for is still
-                    # queued, and the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of
-                    # that check, which its own state decides) — on the runtime and terms the probe was for (live
-                    # 2026-10-15, slurm_worker_died).
-                    warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
     return EndpointStatus(
         status=status,
         block_state=block,
@@ -640,6 +631,37 @@ async def _ensure_endpoint_up(
         block=receipt_terms,
         notice=said(notice),
     )
+
+
+async def _probe_cold_block(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str,
+                            elapsed: float) -> tuple[str, scheduler_ops.PilotProbe | None]:
+    """The pilot probe of a billed block still cold after `elapsed` s (scheduler_ops._augment_provisioning), run OFF the
+    lock (its dispatch takes it), and what it found recorded on the runtime and terms it was for. Returns the words it
+    adds to the notice ("" when it could not tell, or inside the grace) and the probe (None: it could not tell)."""
+    # what the probe is for, read before it runs off the lock: a concurrent switch bumps `block_epoch`
+    # (and when a worker last answered, so the record can tell one that answered DURING the probe)
+    probe_epoch, answered = rt.block_epoch, rt.warm_confirmed_at
+    # the block request names its user endpoint's log, where the probe may read a refusal's own words (quoted only:
+    # a log read is not conclusive, so nothing is voided on it — the block stays `provisioning`)
+    found, probe = await scheduler_ops._augment_provisioning(app, eid, "", elapsed, _login_runner(app),
+                                                             confirmed_at=rt.confirmed_at,
+                                                             block=rt.user_endpoint_config.get("hpcb_block"),
+                                                             confirmed_wall=rt.confirmed_wall)
+    found = found.strip()
+    async with app.lock:
+        if (elapsed >= PROVISION_GRACE_S and app.state.endpoint_id == eid and app.shapes.get(shape) is rt
+                and rt.block_epoch == probe_epoch):
+            rt.probe_said = (probe_epoch, time.monotonic(), found)  # for run_shell's cold answer (_cold_answer)
+        if probe is not None and probe.category != "unknown":
+            # what is still queued or HELD, for a switch or a reconnect to say (a held pilot never idle-releases)
+            warmth._record_pilots(app, shape, rt, eid, probe_epoch, probe.live, probe.subject)
+            if probe.dead is not None:
+                # A pilot that ran and died before any worker answered: the check it was started for is still
+                # queued, and the endpoint can submit pilots for it. Recorded to NAME it (a stop says what became of
+                # that check, which its own state decides) — on the runtime and terms the probe was for (live
+                # 2026-10-15, slurm_worker_died).
+                warmth._record_dead_pilot(app, shape, rt, eid, probe_epoch, answered, *probe.dead, probe.jobs)
+    return found, probe
 
 
 def _dropped_term_status(app: AppCtx, shape: str, dropped: str) -> EndpointStatus:
@@ -1885,12 +1907,47 @@ async def _ready_session(
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _with_spend(app, _needs_account_outcome(app, rt))
     if not_warm is not None:
-        return _cold_outcome(not_warm, rt.last_canary, app=app, rt=rt)
+        return await _cold_answer(app, shape, rt, not_warm)
     if busy is not None:  # a live task owns this session's cwd/env -> don't dispatch a second command
         return _busy_session_outcome(busy, shape, session_id, client_cancelled=busy_cancelled,
                                      internal=session_id == _INTERNAL_SESSION)
     assert runner is not None  # _ensure_warm_runner returns None only after binding the runner
     return runner, session, rt, guard
+
+
+# How long run_shell's cold answer reuses the last pilot probe's words on a still-cold block before probing again: the
+# probe is a login-shape round trip (two, with its check), and an agent may poll run_shell every few seconds.
+_COLD_PROBE_REUSE_S = 60.0
+
+
+async def _cold_answer(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockState) -> ShellOutcome:
+    """run_shell's and reset_session's answer on a shape that is not warm (notices._cold_outcome). A billed block still
+    cold past the cold-start grace says what ensure_endpoint_up's answer says of its pilot (#32, #213) — queued, HELD,
+    already FINISHED, or none in the scheduler and likely REJECTED, with the reply its user endpoint logged — so an
+    agent polling run_shell learns it too, not "allocating nodes…" forever (Perlmutter report, 2026-10-29): the last
+    probe of this cold spell on these terms while it is under `_COLD_PROBE_REUSE_S` old (ensure_endpoint_up's or an
+    earlier answer's), else a probe of its own. The phase stays cold_start: nothing is voided on a probe. The grace
+    clock starts here too, as on ensure_endpoint_up's first cold poll."""
+    out = _cold_outcome(block, rt.last_canary, app=app, rt=rt)
+    eid = app.state.endpoint_id
+    if out.phase != "cold_start" or not eid or not _billable(rt) or not rt.spend_confirmed or not _has_login_shape(app):
+        return out
+    async with app.lock:
+        if app.shapes.get(shape) is not rt or app.state.endpoint_id != eid:
+            return out
+        now = time.monotonic()
+        if rt.provisioning_since is None:
+            rt.provisioning_since = now
+        since, elapsed, seen = rt.provisioning_since, now - rt.provisioning_since, rt.probe_said
+    if elapsed < PROVISION_GRACE_S:
+        return out
+    if seen is not None and seen[0] == rt.block_epoch and seen[1] >= since and now - seen[1] < _COLD_PROBE_REUSE_S:
+        found = seen[2]
+    else:
+        found = (await _probe_cold_block(app, shape, rt, eid, elapsed))[0]
+    if found:
+        out.notice = f"{out.notice} {found}" if out.notice else found
+    return out
 
 
 async def _detect_submission(command: str, shape: str) -> Submission | None:
