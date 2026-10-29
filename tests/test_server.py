@@ -3472,7 +3472,8 @@ async def test_make_facility_sources_ssh_user_from_config_when_env_absent(monkey
     assert fac.name == "anvil"
     assert fac.cli.target.user == "cfg-user"  # login name from ssh_config, not an env var
     assert fac.cli.target.key_path is None  # key deferred to ~/.ssh/config IdentityFile
-    assert "/home/cfg-user/hpc-bridge/gce-venv/bin/activate" in fac.profile.env_setup  # templated
+    assert fac.profile.scratch_root == "/anvil/scratch/cfg-user/.hpc-bridge"  # templated
+    assert "$HOME/hpc-bridge/gce-venv/bin/activate" in fac.profile.env_setup  # the default venv: the login's $HOME
 
 
 def test_ssh_config_user_parses_ssh_dash_g(monkeypatch):
@@ -3565,7 +3566,7 @@ async def test_make_facility_builds_from_catalog_when_machine_set(monkeypatch):
     assert fac.cli.target.host == "anvil.rcac.purdue.edu"  # from entry.ssh_host
     assert fac.cli.target.user == "x-u"
     assert "{venv}" not in fac.profile.env_setup  # template resolved
-    assert "/home/x-u/hpc-bridge/gce-venv/bin/activate" in fac.profile.env_setup
+    assert "$HOME/hpc-bridge/gce-venv/bin/activate" in fac.profile.env_setup  # the default venv: the login's $HOME
     assert fac.profile.scratch_root == "/anvil/scratch/x-u/.hpc-bridge"
 
 

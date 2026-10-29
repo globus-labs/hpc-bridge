@@ -28,7 +28,7 @@ from .context import (
     _idle_release_s,
 )
 from .cost import _block_nodes, _with_spend
-from .facility.base import ConfigStepFailed
+from .facility.base import ConfigStepFailed, last_said
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import (
@@ -99,14 +99,16 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         refused = next((ln for ln in exc.tail.splitlines() if _REMOTE_FS_REFUSED.search(ln)), None)
         if refused is not None:
             return _remote_fs_notice(host, refused)
-        return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+        return _ends(fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
-    # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
+    # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line, else its last
     verdict = [ln for ln in ssh_line.splitlines()
                if "permission denied" in ln.lower() or "denied" in ln.lower() or "host key" in ln.lower()]
     if verdict:
         ssh_line = verdict[-1].strip()
+    elif "\n" in ssh_line:  # a banner, a stale control socket or a cut mark ahead of it: ssh's verdict comes last
+        ssh_line = last_said(ssh_line) or ssh_line
     if user is None:
         user = getattr(target, "user", None)
     if _SSH_AUTH_DENIED.search(raw) or "too many authentication failures" in low:
@@ -161,7 +163,28 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     if "controlpath too long" in low:
         return (f"hpc-bridge error: the SSH ControlMaster socket path is too long ({ssh_line[:160]}); set "
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
-    return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+    return _ends(fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")
+
+
+_FAILURE_CAP = 500  # a failure notice that quotes the remote's words
+
+
+def _ends(text: str, cap: int = _FAILURE_CAP) -> str:
+    """A failure notice within `cap` characters, cut from its MIDDLE when longer, marked: its head names what failed,
+    its end is what the remote said last — the cause. Never its first `cap` characters: a login shell's startup noise
+    and a site's banner print first, so that kept the noise and cut the cause (the Perlmutter report, item 5). Each part
+    ends or starts at a whole line when that keeps at least half of it."""
+    if len(text) <= cap:
+        return text
+    head = cap // 3
+    mark = "\n[hpc-bridge: notice cut — {:,} chars from its middle]\n"
+    start = len(text) - (cap - head - len(mark.format(len(text))))  # the count shown is under len(text): it fits
+    if (nl := text.rfind("\n", 0, head)) >= head // 2:
+        head = nl
+    if 0 <= (nl := text.find("\n", start)) <= start + (len(text) - start) // 2:
+        start = nl + 1
+    return text[:head] + mark.format(start - head) + text[start:]
+
 
 def _remote_fs_notice(host: str, line: str) -> str:
     """A write the login node's own filesystem refused (quota, read-only home, permission): the login worked."""

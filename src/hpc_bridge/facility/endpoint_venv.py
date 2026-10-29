@@ -42,13 +42,20 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import NamedTuple
 
-from .base import ConfigStepFailed
+from .base import ConfigStepFailed, said_end
 
 GCE = "globus-compute-endpoint"
 # Where hpc-bridge's venv lives by default, as the login shell expands it: a teardown searches it even when the
 # facility's env_setup is not hpc-bridge's line (emptied or hand-written after the endpoint was started).
 HOME_VENV = "$HOME/hpc-bridge/gce-venv"
-DEFAULT_REMOTE_VENV = "/home/{user}/hpc-bridge/gce-venv"
+# `{venv}` unless HPC_BRIDGE_REMOTE_VENV says otherwise: the same path, so the build, the discovery probe's check and
+# teardown's search agree. Left for the login node's shell to expand (every use sits inside double quotes, and a
+# compute node's batch job expands worker_init the same way): a home is not always /home/<user> (NERSC's
+# /global/homes/<x>/<user>, where /home/<user> is not writable — the Perlmutter report, 2026-10-29).
+DEFAULT_REMOTE_VENV = HOME_VENV
+# …which plugins up to 0.1.25 spelled `/home/<user>/hpc-bridge/gce-venv`: the same directory wherever the home is
+# /home/<user>, so an endpoint they started is not told its env_setup differs (`spelled_as_default`)
+LEGACY_REMOTE_VENV = "/home/{user}/hpc-bridge/gce-venv"
 ARCH_MARKER = ".hpcb-arch"
 
 # texttable 1.7.2 (2026-10-18) dropped the private `Texttable._width` that globus-compute-endpoint's `list` reads
@@ -265,6 +272,17 @@ def migrate_env_setup(env_setup: str, *, python: str | None = None, gce: str | N
             return short_env_setup(old.group("v"), python=py, gce=pin,
                                    prefix=old.group("pre") if kind == "keep" else "")
     return env_setup
+
+
+def spelled_as_default(env_setup: str, *, user: str) -> str:
+    """hpc-bridge's line on the default venv as plugins up to 0.1.25 spelled it (`LEGACY_REMOTE_VENV`, the login
+    user's `/home/<user>/…`), spelled as the default is now (`$HOME/…`); any other text as given. For comparing the line
+    an endpoint was started with to the facility's current one only, never for running: an explicit `/home/<user>` path
+    (details=, HPC_BRIDGE_REMOTE_VENV) stays what it says."""
+    m = _LINE_RE.fullmatch(env_setup or "")
+    if m is None or not user or m.group("base") != LEGACY_REMOTE_VENV.replace("{user}", user):
+        return env_setup
+    return env_setup[:m.start("base")] + HOME_VENV + env_setup[m.end("base"):]
 
 
 # ------------------------------------------------------------------------------------------------- the check
@@ -514,8 +532,9 @@ def _last_line(*texts: str) -> str:
 
 
 def _transport(step: str, host: str, rc: int, out: str, err: str) -> RuntimeError:
-    # an ssh-level failure: the caller's explainer turns the raw text into NO SSH ACCESS / CANNOT REACH / a handoff
-    return RuntimeError(f"endpoint venv {step} on {host} failed: {(err or out).strip()[:600] or f'rc={rc}'}")
+    # an ssh-level failure: the caller's explainer turns the text into NO SSH ACCESS / CANNOT REACH / a handoff, read
+    # from its END (`said_end`): ssh's verdict comes after any banner or warning
+    return RuntimeError(f"endpoint venv {step} on {host} failed: {said_end(err or out) or f'rc={rc}'}")
 
 
 def _method(s: VenvState, python: str, skipped: str = "") -> str:
