@@ -935,7 +935,9 @@ def bounded_calls(cap: int = 60, failed_cap: int = 3):
         """No retry storm: session 2's hpc-bridge calls are bounded, and so are its failed connects and the same call
         failing again."""
         calls = [c for _i, c in _later(t) if c.name in HPC_BRIDGE_TOOL_NAMES]
-        failed = [c for c in calls if c.name == "connect_facility" and _res(c).get("phase") == "failed"]
+        # a failure that asks for the user's part (a CHANGED host key) is the honest stop, not a retry
+        failed = [c for c in calls if c.name == "connect_facility" and _res(c).get("phase") == "failed"
+                  and not host_key_changed_notice(_res(c))]
         seen: dict[str, int] = {}
         for c in calls:
             if _res(c).get("phase") == "failed" or _res(c).get("is_error"):

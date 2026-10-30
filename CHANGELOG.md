@@ -285,6 +285,32 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **Returning users: pairwise two-session cells on the fake `nersc` profile** (`agentic/harness/returning.py`;
+  `agentic/README.md`, "Returning users"). The combinatorial follow-up to the Perlmutter report (plugin 0.1.20,
+  2026-10-29), whose leftovers came stacked where #236's proofs seed one each.
+  - **The cells.** Session 1 is scripted on the cell's origin plugin: this checkout, or the previous release. Between
+    the sessions the world changes: the endpoint left running, stopped, killed hard or torn down; the pinned login
+    node closed; the key revoked; local files deleted or wiped, or a new facility id; the venv or the endpoint's
+    directory deleted; the QOS retired; the token store gone; the host keys changed; another endpoint version; a
+    second id on the same host. Session 2 runs the current code toward hello world on a compute node and does the
+    user's part when asked. 20 scripted cells are pairwise over those 11 factors (`pairwise.py`, the table checked in
+    as `returning_cells.tsv`), plus three agent cells: the report replayed, all well, a new laptop.
+  - **What every cell must hold:** a working compute shell (or an honest notice and success after the user's
+    part), a dead pin met at most once, an explicit `ssh_host` kept, at most one live endpoint (processes on every
+    login node, the cloud's view), `~/.hpc-bridge` in today's format, a bounded number of calls. Each factor level
+    adds its own check. The agent cells also check that the agent never hand-edits `~/.hpc-bridge` or
+    `~/.globus_compute`.
+  - **Harness:**
+    - A `PHASES` entry may name a scripted phase and its server (`current` / `previous`), and a condition.
+    - `INTERPHASE_SETUP` may hold callables.
+    - Such a chain's bundle marks each phase, and `regrade.py` reads each with its operator's reader.
+    - Codex, Pi and Hermes drive a chain that opens with a scripted session.
+    - The image carries the previous release, the newest tag older than this version (`prev_release.py`).
+    - New node actions: `sshd_closed` (a login node closed, its processes kept), and `qos_retire` / `qos_restore`
+      (the nersc submit filter reads `/etc/slurm/retired_qos.conf`).
+    - A mixed chain's INFRA verdict reads only the operator's own phases.
+  - **The sweep:** `returning` is a script-only sweep profile (the nersc cluster, one row per cell); `nersc` runs the
+    three agent cells in every wave, then the report's proofs.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

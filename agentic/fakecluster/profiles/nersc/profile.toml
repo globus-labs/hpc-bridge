@@ -13,7 +13,9 @@
 #   * Slurm with NERSC's routing: partitions `system` (the default), `regular_milan_ss11`, `shared_milan_ss11`,
 #     `realtime_ss11` (AllowQos=realtime) and `gpu_ss11`; QOS debug/regular/shared/realtime; node features cpu (c1, c2)
 #     and gpu (c3); and a submit filter (job_submit.lua) that wants a node type (-C cpu|gpu) and EITHER a QOS or a
-#     "partition" name (never both), takes debug/regular/shared only, and routes the job itself
+#     "partition" name (never both), takes debug/regular/shared only, and routes the job itself; a QOS named in
+#     /etc/slurm/retired_qos.conf on the controller (none by default) is refused too — the returning-user cells retire
+#     `debug` between their sessions (harness/node_actions.py `qos_retire`)
 name = "nersc"
 description = "site shaped like NERSC Perlmutter: homes under /global/homes, key OR password+OTP sshd, a noisy .bashrc, system/*_ss11 partitions behind a QOS/constraint submit filter"
 base = "site"
