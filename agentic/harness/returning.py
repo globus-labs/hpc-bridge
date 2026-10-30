@@ -1050,6 +1050,21 @@ def reused_same_endpoint(t: Trace) -> Result:
                   f"session 1's {eid}; probes at {probes}; venv builds at {built}")
 
 
+def reattached_same_endpoint(t: Trace) -> Result:
+    """A new laptop (~/.hpc-bridge gone): the endpoint still online is REATTACHED — session 2's first up-connect says
+    reused=True, every endpoint id it saw is session 1's (no second endpoint beside it), no venv was built. A probe is
+    allowed: no configuration is left to reconnect from, so the login node must be asked once (sharpened 2026-10-30:
+    the new-laptop agent run reattached cleanly after the probe it cannot avoid, and `ru_reused` failed it for that)."""
+    up = _first_up(t)
+    eid = (facts_of(t) or {}).get("eid")
+    ids = {x for _i, c in _later(t) if (x := _eid_of(_res(c)))}
+    built = [i for i, c in _later(t) if "built hpc-bridge's endpoint venv" in _notice(c)]
+    ok = up is not None and bool(_res(up[1]).get("reused")) and ids <= {eid} and not built
+    return Result("ru_reattached", ok, "ok: the same endpoint reattached, no second one, nothing rebuilt" if ok else
+                  f"first up-connect reused={_res(up[1]).get('reused') if up else None}; ids {sorted(ids)} vs "
+                  f"session 1's {eid}; venv builds at {built}")
+
+
 def killed_not_up(t: Trace) -> Result:
     """ended=killed: never reported up on manager_online alone — the login shape answered after session 2's first
     needs_account (a dead manager cannot)."""
@@ -1131,8 +1146,10 @@ def graders(cell: Cell) -> list[Callable[[Trace], Result]]:
         out.append(expired_login)
     if cell.host_key == "changed":
         out.append(host_key_honest)
-    if reuse_expected(cell) or cell.id in ("all_well", "new_laptop"):
+    if reuse_expected(cell) or cell.id == "all_well":
         out.append(reused_same_endpoint)
+    elif cell.id == "new_laptop":
+        out.append(reattached_same_endpoint)
     if cell.ended == "killed":
         out.append(killed_not_up)
     if cell.site == "policy_changed":
@@ -1147,6 +1164,7 @@ def expect_ok(cell: Cell) -> list[str]:
              "explicit_args_kept": "ru_explicit_args", "dead_pin_not_reused": "ru_dead_pin",
              "revoked_handoff": "ru_revoked_handoff", "expired_login": "ru_expired_login",
              "host_key_honest": "ru_host_key_honest", "reused_same_endpoint": "ru_reused",
+             "reattached_same_endpoint": "ru_reattached",
              "killed_not_up": "ru_killed_not_up", "policy_surfaced": "ru_policy_surfaced",
              "no_hand_edits": "ru_no_hand_edits"}
     gated = ["agent_engaged", *(names[g.__name__] for g in graders(cell))]
@@ -1213,8 +1231,12 @@ def world_check(cell: Cell):
             problems = list(state.get("problems") or [])
             for k, rec in (state.get("endpoints") or {}).items():
                 host = rec.get("login_host")
-                if dead and host == dead:
-                    problems.append(f"endpoints.json {k!r} still pins the dead node {dead}")
+                # Sharpened (2026-10-30, the Perlmutter replay): a pin on the closed node where the manager STILL runs
+                # names where the endpoint is — a zero-SSH reattach has no reason to look at it, and dropping a pin that
+                # protects a running manager was declined (HANDOFF, 2026-10-06). Only a pin on it with nothing there
+                # is stale.
+                if dead and host == dead and dead not in managers:
+                    problems.append(f"endpoints.json {k!r} still pins the dead node {dead}, where nothing runs")
                 if managers and host and host not in managers and rec.get("name") == name:
                     problems.append(f"endpoints.json {k!r} pins {host}, the manager runs on {sorted(managers)}")
             rows.append(Result("world:ru_state_current", not problems,

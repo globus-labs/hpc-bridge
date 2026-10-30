@@ -311,6 +311,15 @@ installed plugin only when that version changes); git tags mark releases.
     - A mixed chain's INFRA verdict reads only the operator's own phases.
   - **The sweep:** `returning` is a script-only sweep profile (the nersc cluster, one row per cell); `nersc` runs the
     three agent cells in every wave, then the report's proofs.
+  - **First run (2026-10-30, every scripted cell once): 15 of 20 OK.** The five failures are two product bugs, not
+    fixed here:
+    - A manager killed hard (`ended=killed`, its endpoint directory kept: c03, c05, c12, c18) is never brought up
+      again. Its `daemon.pid` stays on the shared home; every later `globus-compute-endpoint start` exits 73 with
+      nothing on either stream (the endpoint log: "Another instance of this endpoint is running. (Perhaps on another
+      login node?)"); and the notice quotes the login shell's `.bashrc` noise as the cause.
+    - A running manager whose venv was deleted (c09) is reused over the web, but cannot start a user endpoint ("No
+      module named 'jinja2'", exit 73). The notice says "fix the config/partition", then "likely REJECTED (e.g.
+      inactive allocation, wrong account, or bad queue)"; nothing rebuilds the venv.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

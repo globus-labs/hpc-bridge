@@ -340,7 +340,7 @@ checked in as `harness/returning_cells.tsv`; `python3 agentic/harness/returning.
 - `ru_explicit_args`: an explicit `ssh_host` never overridden by a cached record.
 - `world:ru_one_live_endpoint`: at most one live endpoint, by the manager processes on every login node, with the
   cloud's view reported beside it.
-- `world:ru_state_current`: `~/.hpc-bridge` parses with today's models and pins no dead node.
+- `world:ru_state_current`: `~/.hpc-bridge` parses with today's models, and pins no dead node where nothing runs.
 - `ru_bounded`: a bounded number of calls.
 
 **Per factor:** `ru_revoked_handoff` (`needs_preauth`, never NO SSH ACCESS), `ru_expired_login`,
@@ -361,7 +361,8 @@ HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=nersc ./agentic/run_smoke.sh
 release:
 - `returning_perlmutter_replay`: an endpoint left online, the pinned node dead, the key revoked.
 - `returning_all_well`: nothing changed, so reuse and rebuild nothing.
-- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate.
+- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate (`ru_reattached`: the
+  one probe a new laptop cannot avoid is allowed).
 
 When the agent stops to ask for the user's part, the harness does it and a follow-up turn continues (a phase with a
 `when`). They also grade `ru_no_hand_edits`: the agent never writes to `~/.hpc-bridge` or `~/.globus_compute`.

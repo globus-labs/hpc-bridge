@@ -192,6 +192,10 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     `returning`, which boots the nersc cluster.
   - **A scripted phase's server ending under this process** (the script operator's in-process MCP client) is no
     longer reported as `harness:server_exited`. The script closes each session itself.
+  - **First run (2026-10-30): 15 of 20 scripted cells OK.** Every failure is one of two product bugs. A hard-killed
+    manager's stale `daemon.pid` blocks every restart (gce exits 73 silently; the notice quotes `.bashrc` noise). A
+    reused manager whose venv is gone cannot start user endpoints, and the notice blames the config or the
+    allocation. The CHANGELOG's Unreleased "Testing" entry has the cells.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

@@ -102,7 +102,7 @@ def test_the_agent_cells_are_the_three_hand_picked_stories():
     assert (laptop.origin, laptop.ended, laptop.local) == ("previous", "running", "wiped")
     for c in (replay, well, laptop):
         assert c.agent and "ru_no_hand_edits" in ru.expect_ok(c)
-    assert "ru_reused" in ru.expect_ok(well) and "ru_reused" in ru.expect_ok(laptop)
+    assert "ru_reused" in ru.expect_ok(well) and "ru_reattached" in ru.expect_ok(laptop)
     assert {"ru_dead_pin", "ru_revoked_handoff"} <= set(ru.expect_ok(replay))
 
 
@@ -365,6 +365,19 @@ def test_reuse_means_the_same_endpoint_reattached_with_nothing_rebuilt():
     assert not ru.reused_same_endpoint(_trace([fresh, block, HELLO])).ok
     dup = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
     assert not ru.reused_same_endpoint(_trace([up, dup, HELLO])).ok              # a second endpoint beside it
+
+
+def test_a_new_laptop_reattaches_after_the_probe_it_cannot_avoid():
+    # the new-laptop agent run (2026-10-30): no config left, so the probe ran, then the endpoint was reattached
+    probe = _c("connect_facility", {}, {"phase": "proposed_facility_details"})
+    up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
+    block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
+    assert ru.reattached_same_endpoint(_trace([probe, up, block, HELLO])).ok
+    assert not ru.reused_same_endpoint(_trace([probe, up, block, HELLO])).ok      # where a config was left, it is not
+    dup = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
+    fresh = _c("connect_facility", {}, {"phase": "needs_account", "reused": False})
+    assert not ru.reattached_same_endpoint(_trace([probe, up, dup, HELLO])).ok    # a second endpoint beside it
+    assert not ru.reattached_same_endpoint(_trace([probe, fresh, HELLO])).ok
 
 
 def test_a_killed_manager_is_never_reported_up_on_its_online_flag():
