@@ -20,7 +20,7 @@ from hpc_bridge.facility import endpoint_venv as ev
 from hpc_bridge.facility import remote
 from hpc_bridge.facility.base import ConfigStepFailed, said_end
 from hpc_bridge.facility.remote import RemoteEndpointCLI, SshTarget
-from hpc_bridge.notices import _explain_provision_error
+from hpc_bridge.notices import _FAILURE_CAP, _explain_provision_error
 
 HOME = "/global/homes/a/alice"
 HOST = "perlmutter.nersc.gov"
@@ -147,7 +147,7 @@ async def test_report_5_a_failed_step_after_startup_noise_is_reported_by_its_las
     assert e.value.said == last  # the step's own last line is known…
     notice = _explain_provision_error(e.value)
     assert last in notice, notice  # …and the agent must be told it
-    assert len(notice) <= 500 and "MODULEPATH" not in notice  # bounded; the noise's head is gone
+    assert len(notice) <= _FAILURE_CAP and "MODULEPATH" not in notice  # bounded; the noise's head is gone
     if "traceback" not in step:
         assert "[hpc-bridge: output cut — " in notice, notice  # …and the cut is marked
 
@@ -226,9 +226,39 @@ def test_report_5_the_end_kept_and_the_cut_marked():
     assert said_end(lmod).startswith("Lmod has detected the following error: The following module(s) are unknown:")
     long = "hpc-bridge error: ConfigStepFailed: remote configure failed: " + "noise " * 200 + "THE CAUSE"
     cut = _ends(long)
-    assert len(cut) <= 500 and cut.startswith("hpc-bridge error: ConfigStepFailed: remote configure failed: ")
+    assert len(cut) <= _FAILURE_CAP and cut.startswith("hpc-bridge error: ConfigStepFailed: remote configure failed: ")
     assert cut.endswith("THE CAUSE") and "[hpc-bridge: notice cut — " in cut
     assert _ends("short") == "short"
+
+
+# A step's END that `said_end` cut to its budget on purpose, with the cause in its FIRST kept line: Lmod's unknown module,
+# then its help, then the command the failed `module load` left unfound — behind startup noise (review round 1, 2026-10-29:
+# a message just over the notice's cap lost its middle, and with it that cause).
+_LMOD_CAUSE = 'Lmod has detected the following error: The following module(s) are unknown: "conda/2024.1"'
+_LMOD_AFTER_NOISE = "\n".join(
+    [f"git: fatal: Unable to create '{HOME}/.gitconfig.lock': File exists ({i})" for i in range(6)]
+    + [_LMOD_CAUSE, 'Please check the spelling or version number. Also try "module spider ..."',
+       "It is also possible your cache file is out-of-date; it may help to try:",
+       '$ module --ignore_cache load "conda/2024.1"', "Also make sure modulefiles in TCL start with #%Module",
+       "bash: line 1: globus-compute-endpoint: command not found"])
+
+
+@pytest.mark.parametrize("step", ["configure", "start", "start, `list` failing too", "list"])
+async def test_report_5_the_end_said_end_kept_survives_the_notice(monkeypatch, step):
+    _fake_ssh(monkeypatch, remote, (127, "", _LMOD_AFTER_NOISE))
+    cli = RemoteEndpointCLI(SshTarget(HOST, "alice"), "module load conda/2024.1")
+    call = {"configure": cli.configure, "list": cli.endpoint_id}.get(step, cli.start)
+    if step == "start":
+        async def running(name):  # `list` worked: the start's words are the only ones
+            return None
+        monkeypatch.setattr(cli, "status", running)
+    with pytest.raises(ConfigStepFailed) as e:
+        await call("hpc-bridge-perlmutter")
+    kept = said_end(_LMOD_AFTER_NOISE)
+    assert kept.startswith("[hpc-bridge: output cut — ") and _LMOD_CAUSE in kept  # said_end kept the cause on purpose…
+    notice = _explain_provision_error(e.value)
+    assert kept in notice, notice  # …and the notice never cuts that end again
+    assert len(notice) <= _FAILURE_CAP
 
 
 # ---- item 8b: the remote steps run in a LOGIN shell, by design -------------------------------------------------------

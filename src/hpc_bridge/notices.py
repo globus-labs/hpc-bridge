@@ -28,7 +28,7 @@ from .context import (
     _idle_release_s,
 )
 from .cost import _block_nodes, _with_spend
-from .facility.base import ConfigStepFailed, last_said
+from .facility.base import END_CHARS, ConfigStepFailed, last_said
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import (
@@ -166,22 +166,29 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     return _ends(fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")
 
 
-_FAILURE_CAP = 500  # a failure notice that quotes the remote's words
+# A failure notice that quotes the remote's words. A failed step's message ENDS with its output's end, which `said_end`
+# already cut to its budget (END_CHARS, after a cut mark under 60 characters): those last `_KEPT_END` characters are
+# never cut again, and up to 200 ahead of them (the step's name, a host) fit whole too.
+_KEPT_END = END_CHARS + 60
+_FAILURE_CAP = _KEPT_END + 200
 
 
 def _ends(text: str, cap: int = _FAILURE_CAP) -> str:
     """A failure notice within `cap` characters, cut from its MIDDLE when longer, marked: its head names what failed,
     its end is what the remote said last — the cause. Never its first `cap` characters: a login shell's startup noise
-    and a site's banner print first, so that kept the noise and cut the cause (the Perlmutter report, item 5). Each part
-    ends or starts at a whole line when that keeps at least half of it."""
+    and a site's banner print first, so that kept the noise and cut the cause (the Perlmutter report, item 5). Never
+    into its last `_KEPT_END` either: that is the step's end as `said_end` kept it, whose first line may be the cause
+    (Lmod's unknown module, before its help; review round 1). Each part ends or starts at a whole line when that keeps
+    at least half of it; the room a head that ends earlier frees goes to the end."""
     if len(text) <= cap:
         return text
-    head = cap // 3
     mark = "\n[hpc-bridge: notice cut — {:,} chars from its middle]\n"
-    start = len(text) - (cap - head - len(mark.format(len(text))))  # the count shown is under len(text): it fits
+    room = cap - len(mark.format(len(text)))  # the count shown is under len(text): it fits
+    head = room - _KEPT_END
     if (nl := text.rfind("\n", 0, head)) >= head // 2:
         head = nl
-    if 0 <= (nl := text.find("\n", start)) <= start + (len(text) - start) // 2:
+    start = len(text) - (room - head)
+    if (nl := text.find("\n", start, min(len(text) - _KEPT_END, start + (len(text) - start) // 2))) >= 0:
         start = nl + 1
     return text[:head] + mark.format(start - head) + text[start:]
 
