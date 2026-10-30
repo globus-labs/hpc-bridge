@@ -346,6 +346,22 @@ def test_stop_runs_gce_only_on_the_node_running_the_manager(tmp_path):
     assert (tmp_path / "calls").read_text().splitlines() == [f"stop {_NAME}"]   # one stop, on the manager's node
 
 
+def test_a_manager_with_no_working_cli_left_is_ended_by_its_pids(tmp_path):
+    # c09 (2026-10-30): every venv deleted under a running manager — `gce stop` was ": command not found" and the
+    # manager outlived the teardown into the next cell
+    import subprocess
+
+    from cluster_ops import stop_here_cmd
+    victim = subprocess.Popen(["sleep", "60"])
+    here = f"printf '%s\\n' {shlex.quote(f'{victim.pid} Globus Compute Endpoint *({EID}, {_NAME}) [idle]')}"
+    try:
+        out = _bash(stop_here_cmd(_NAME, listing=here, gce='""'))
+        assert f"rc=0 killed: no working globus-compute-endpoint to stop it (pids {victim.pid})" in out, out
+        assert victim.wait(timeout=10) is not None
+    finally:
+        victim.kill()
+
+
 def test_delete_cannot_wait_on_a_prompt_and_says_what_happened(tmp_path):
     from cluster_ops import delete_registration_cmd
     gce = _fake_gce(tmp_path)

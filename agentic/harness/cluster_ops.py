@@ -150,7 +150,12 @@ def stop_here_cmd(endpoint_name: str, *, listing: str | None = None, gce: str = 
     anchored match in this node's `ps`, _PROC_AWK). Run it on EVERY login node of the target. Prints one line:
     `HPCB_STOP <host> none` (no manager of it here) or `HPCB_STOP <host> rc=<rc> <output>`. Where `ps` is missing or
     fails, the stop runs anyway. stdin is closed, so nothing waits on a prompt. Why: sent to a round-robin alias, a
-    stop could land on the other node, act on the NFS-shared `daemon.pid` there, and leave the manager running."""
+    stop could land on the other node, act on the NFS-shared `daemon.pid` there, and leave the manager running.
+
+    A manager that runs HERE with no working endpoint CLI left to stop it — every venv under ~/hpc-bridge deleted
+    under it (a returning-user cell's `venv_deleted`, c09 2026-10-30: `gce stop` was `: command not found` and the
+    manager outlived the teardown into the next cell) — is ended by its pids, TERM then KILL: `HPCB_STOP <host> rc=0
+    killed …`."""
     filt = _endpoint_proc_filter(endpoint_name)
     ep = shlex.quote(endpoint_name)
     look = listing or _PS_LISTING
@@ -158,8 +163,12 @@ def stop_here_cmd(endpoint_name: str, *, listing: str | None = None, gce: str = 
             f'if command -v ps >/dev/null 2>&1 && {look} >/dev/null 2>&1; then here=$({look} | {filt}); '
             'else here=unknown; fi; '
             'if [ -z "$here" ]; then echo "HPCB_STOP $h none"; '
-            f'else out=$({gce} stop {ep} </dev/null 2>&1); rc=$?; '
-            'echo "HPCB_STOP $h rc=$rc $(printf %s "$out" | tail -n 2 | tr \'\\n\' \' \' | cut -c1-200)"; fi')
+            f'else g={gce}; '
+            'if [ -z "$g" ] && [ "$here" != unknown ]; then pids=$(printf \'%s\\n\' "$here" | awk \'{print $1}\'); '
+            'kill $pids 2>/dev/null; sleep 3; kill -9 $pids 2>/dev/null; '
+            'echo "HPCB_STOP $h rc=0 killed: no working globus-compute-endpoint to stop it (pids $(echo $pids))"; '
+            f'else out=$("$g" stop {ep} </dev/null 2>&1); rc=$?; '
+            'echo "HPCB_STOP $h rc=$rc $(printf %s "$out" | tail -n 2 | tr \'\\n\' \' \' | cut -c1-200)"; fi; fi')
 
 
 def stop_outcome(out: str) -> tuple[str, str]:

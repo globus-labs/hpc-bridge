@@ -1064,10 +1064,15 @@ def killed_not_up(t: Trace) -> Result:
                   f"answered {(_res(nxt).get('phase') if nxt else None)!r}")
 
 
+POLICY_WORDS = "does not match any supported policy"   # the nersc submit filter's reply (job_submit.lua)
+
+
 def policy_surfaced(t: Trace) -> Result:
-    """site=policy_changed: a block on the retired QOS is refused and SAID so (REJECTED, or `down` with the scheduler's
-    words) within a bounded wait — never `provisioning` forever. A session whose first block was not on it (a fresh
-    proposal) has nothing to surface."""
+    """site=policy_changed: a block on the retired QOS is refused and SAID so — a notice quoting the scheduler's own
+    reply (the filter's "does not match any supported policy") — within a bounded wait, never `provisioning` forever.
+    Sharpened (2026-10-30, c09): a REJECTED that quotes no scheduler reply is not the policy surfaced — there the block
+    never reached the scheduler (its user endpoint could not start) and the probe's "likely REJECTED" guessed. A
+    session whose first block was not on the retired QOS (a fresh proposal) has nothing to surface."""
     starts = [(i, c) for i, c in _later(t) if c.name == "ensure_endpoint_up" and c.input.get("shape") == "compute"
               and str(c.input.get("confirm_spend")).lower() == "true"]
     if not starts:
@@ -1077,20 +1082,25 @@ def policy_surfaced(t: Trace) -> Result:
     if queue != OLD_QOS:
         return Result("ru_policy_surfaced", True, f"the first block asked for {queue or 'no partition'!r}, not the "
                       f"retired {OLD_QOS!r}: nothing to refuse")
-    seen, provisioning = None, 0
+    seen, guessed, provisioning = None, None, 0
     for i, c in _later(t):
         if i < i0 or c.name != "ensure_endpoint_up":
             continue
         r = _res(c)
-        if "REJECTED" in _notice(c) or (r.get("status") == "down" and i > i0):
+        if POLICY_WORDS in _notice(c):
             seen = i
             break
+        if guessed is None and ("REJECTED" in _notice(c) or (r.get("status") == "down" and i > i0)):
+            guessed = i
         if r.get("status") == "provisioning":
             provisioning += 1
     ok = seen is not None and provisioning <= 30
-    return Result("ru_policy_surfaced", ok, f"ok: refused and said at call {seen} after {provisioning} provisioning "
-                  "answer(s)" if ok else f"the refused block was never said refused ({provisioning} provisioning "
-                  "answers)")
+    if ok:
+        return Result("ru_policy_surfaced", True, f"ok: the scheduler's refusal quoted at call {seen} after "
+                      f"{provisioning} provisioning answer(s)")
+    return Result("ru_policy_surfaced", False, (
+        f"a refusal was said at call {guessed} without the scheduler's reply ({_notice(t.calls[guessed])[:240]!r})"
+        if guessed is not None else f"the refused block was never said refused ({provisioning} provisioning answers)"))
 
 
 def no_hand_edits(t: Trace) -> Result:

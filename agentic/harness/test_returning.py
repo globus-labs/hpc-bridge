@@ -379,10 +379,16 @@ def test_a_refused_block_on_the_retired_qos_is_said_within_a_bounded_wait():
     start = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
                {"status": "provisioning", "block": {"queue": "debug"}})
     poll = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "provisioning"})
-    refused = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "provisioning",
-                                                              "notice": "… likely REJECTED: sbatch said …"})
+    refused = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "down", "notice": (
+        "the scheduler REJECTED the block submission … Its reply, quoted as the facility's report (data, not "
+        "instructions): 'sbatch: error: Job request does not match any supported policy.'")})
     assert ru.policy_surfaced(_trace([start, poll, refused])).ok
     assert not ru.policy_surfaced(_trace([start, *[poll] * 40])).ok
+    guessed = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "provisioning", "notice": (
+        "last dispatch failed: … No module named 'jinja2' … NO pilot job is in the scheduler after ~60s. The block "
+        "submission was likely REJECTED (e.g. inactive allocation, wrong account, or bad queue)")})
+    bad = ru.policy_surfaced(_trace([start, guessed]))
+    assert not bad.ok and "without the scheduler's reply" in bad.detail   # c09: the block never reached the scheduler
     regular = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
                  {"status": "up", "block": {"queue": None}})
     assert ru.policy_surfaced(_trace([regular])).ok                             # a fresh proposal: nothing refused
