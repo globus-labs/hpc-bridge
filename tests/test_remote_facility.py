@@ -1239,8 +1239,10 @@ async def test_39_start_still_fails_on_a_real_start_error(monkeypatch):
 
     monkeypatch.setattr(remote, "ssh_exec", fake)
     cli = RemoteEndpointCLI(SshTarget("h", "u", "k"), "true")
-    with pytest.raises(RuntimeError, match=r"remote start failed \(rc=1\): ModuleNotFoundError"):
+    with pytest.raises(RuntimeError, match=r"remote start failed \(rc=1\)") as e:
         await cli.start(LONG_NAME)
+    # the start's own words come LAST (after `list`'s, which failed here too): a notice's cut never reaches them
+    assert str(e.value).endswith("): ModuleNotFoundError: No module named 'parsl'"), str(e.value)
 
 
 async def test_39_refused_start_with_no_running_manager_is_a_real_failure(monkeypatch):

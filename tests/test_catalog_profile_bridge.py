@@ -21,8 +21,8 @@ def test_bridge_reconstructs_the_anvil_config():
     assert p.name == "anvil"
     assert p.endpoint_name == "hpc-bridge-anvil" and p.display_name == "HPC-Bridge Anvil"
     assert p.interface == "ib0" and p.partition == "debug" and p.account == "ACCT-CPU"
-    assert p.env_setup == (
-        "module load anaconda/2024.02-py311 && source /home/u1/hpc-bridge/gce-venv/bin/activate"
+    assert p.env_setup == (  # the default venv: under the login node's own $HOME, expanded there
+        "module load anaconda/2024.02-py311 && source $HOME/hpc-bridge/gce-venv/bin/activate"
     )
     assert p.worker_init == p.env_setup
     assert p.scratch_root == "/anvil/scratch/u1/.hpc-bridge"
@@ -44,8 +44,10 @@ def test_bridge_resolves_templates_and_overrides():
 
 
 def test_bridge_defaults_venv_to_convention():
+    # `$HOME/…`, not `/home/<user>/…`: a home is not always under /home (NERSC: /global/homes/<x>/<user>; Perlmutter
+    # report 4, 2026-10-29)
     p = profile_from_catalog_entry(_anvil_entry(), user="alice", account="A")
-    assert "/home/alice/hpc-bridge/gce-venv/bin/activate" in p.env_setup
+    assert "source $HOME/hpc-bridge/gce-venv/bin/activate" in p.env_setup and "/home/alice" not in p.env_setup
 
 
 def test_bridge_resolves_dollar_user_idiom():

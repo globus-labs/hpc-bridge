@@ -30,7 +30,7 @@ def old_discovery_line(python: str, gce: str) -> str:
 
 def main(argv: list[str]) -> int:
     from hpc_bridge import binding, config
-    from hpc_bridge.facility.endpoint_venv import DEFAULT_REMOTE_VENV, client_gce, client_python
+    from hpc_bridge.facility.endpoint_venv import LEGACY_REMOTE_VENV, client_gce, client_python
     from hpc_bridge.facility.remote import profile_from_catalog_entry
     from hpc_bridge.models import FacilityDetails
     from hpc_bridge.profile import Profile
@@ -40,7 +40,7 @@ def main(argv: list[str]) -> int:
     user = config.ssh_user() or binding._ssh_config_user(host)
     entry = binding._entry_from_details("upgrade-phase-1", details)
     prof = profile_from_catalog_entry(entry, user=user, account="", venv=config.remote_venv())
-    venv = config.remote_venv() or DEFAULT_REMOTE_VENV.replace("{user}", user)
+    venv = config.remote_venv() or LEGACY_REMOTE_VENV.replace("{user}", user)  # 0.1.23's `{venv}` default
     old = old_discovery_line(client_python(), client_gce() or "").replace("{venv}", venv)
     prof = replace(prof, env_setup=old, worker_init=old)
     fac = binding._slurm_facility(prof, alias=host, user=user)

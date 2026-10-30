@@ -33,7 +33,7 @@
 # operator drives: --models for the Claude ones, HPCB_ALCF_MODEL for the free ones.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep"
+MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep,slices,nersc"
 OPERATORS=""; PAID_ONLY=""
 while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;;
   --operators) OPERATORS="$2"; shift 2;; --paid-only) PAID_ONLY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
@@ -80,8 +80,14 @@ mep_no_account                the registry tier: the real globus-labs MEP + a se
 needs_login_paste             the registry tier: a logged-out connect to the real registry's globus-labs entry
 saturation                    globus1: holds every node for 25 min (re-homing it to fake is a later change)
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
-slice_request                 new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
-multinode_allocation          new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
+slice_request                 scripted only: a script_cell on `slices` (the script-only pass after the profiles)
+multinode_allocation          scripted only: a script_cell on `slices` (the script-only pass after the profiles)
+stale_login_pin               scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
+kept_entry_after_failure      scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
+cached_password_otp           scripted only: a script_cell on `nersc` (the script-only pass after the profiles)
+home_outside_home             scripted only: a script_cell on `nersc` (the script-only pass after the profiles)
+noisy_failure_tail            scripted only: a script_cell on `nersc` (the script-only pass after the profiles)
+partition_proposal_policy     scripted only: a script_cell on `nersc` (the script-only pass after the profiles)
 EXCLUDED
 }
 
@@ -141,8 +147,27 @@ cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator
   else echo "$2"; fi
 }
 
+script_only() {  # script_only <profile>: the scripted cells of a profile no agent wave runs on, or nothing
+  case "$1" in
+    slices) echo "slice_request multinode_allocation" ;;   # resource requests (2026-10-24)
+    nersc)  echo "cached_password_otp home_outside_home noisy_failure_tail partition_proposal_policy" ;;  # Perlmutter
+  esac
+}
+
 IFS=, read -ra PROFS <<< "$PROFILES"
 for prof in "${PROFS[@]}"; do
+  if [ -n "$(script_only "$prof")" ]; then   # no agent wave: boot it here, run its scripted cells, wipe it
+    [ -z "$PAID_ONLY" ] || continue
+    echo "## $prof (script only) — $(date +%H:%M)" | tee -a "$SUMMARY"
+    if "$HERE/agentic/fakecluster/bin/up.sh" --profile "$prof" > "$HERE/agentic/runs/sweep-$STAMP-$prof-up.log" 2>&1; then
+      for sc in $(script_only "$prof"); do script_cell "$prof" "$sc"; done
+    else
+      echo "    ${TAGGED:+[script] }$prof (script) — RESULT: INFRA (the profile did not boot: sweep-$STAMP-$prof-up.log)" \
+        | tee -a "$SUMMARY"
+    fi
+    "$HERE/agentic/fakecluster/bin/down.sh" --profile "$prof" --wipe > /dev/null 2>&1 || true
+    continue
+  fi
   read -r all conc <<< "$(cells "$prof")"
   [ -n "$all" ] || { echo "sweep: unknown profile $prof"; continue; }
   if { [ "$prof" = mep ] || [ "$prof" = pbs_mep ]; } && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
@@ -191,6 +216,7 @@ for prof in "${PROFS[@]}"; do
     case "$prof" in
       polaris) script_cell polaris polaris_filesystems ;;
       lmod)    script_cell lmod lmod_bootstrap ;;
+      site)    script_cell site stale_login_pin; script_cell site kept_entry_after_failure ;;
     esac
   fi
 done

@@ -28,7 +28,7 @@ from .context import (
     _idle_release_s,
 )
 from .cost import _block_nodes, _with_spend
-from .facility.base import ConfigStepFailed
+from .facility.base import END_CHARS, ConfigStepFailed, last_said
 from .lifecycle import BlockState
 from .login import LOGIN_EXPIRED, LoginExpiredError, LoginStart, login_expired
 from .models import (
@@ -99,14 +99,16 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
         refused = next((ln for ln in exc.tail.splitlines() if _REMOTE_FS_REFUSED.search(ln)), None)
         if refused is not None:
             return _remote_fs_notice(host, refused)
-        return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+        return _ends(fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")
     low = raw.lower()
     ssh_line = raw.rsplit("failed: ", 1)[-1].strip() if "failed: " in raw else raw
-    # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line
+    # ssh prefixes the verdict with warnings ("Identity file … not accessible") — quote the verdict line, else its last
     verdict = [ln for ln in ssh_line.splitlines()
                if "permission denied" in ln.lower() or "denied" in ln.lower() or "host key" in ln.lower()]
     if verdict:
         ssh_line = verdict[-1].strip()
+    elif "\n" in ssh_line:  # a banner, a stale control socket or a cut mark ahead of it: ssh's verdict comes last
+        ssh_line = last_said(ssh_line) or ssh_line
     if user is None:
         user = getattr(target, "user", None)
     if _SSH_AUTH_DENIED.search(raw) or "too many authentication failures" in low:
@@ -161,7 +163,35 @@ def _explain_provision_error(exc: BaseException, fac=None, *, host: str | None =
     if "controlpath too long" in low:
         return (f"hpc-bridge error: the SSH ControlMaster socket path is too long ({ssh_line[:160]}); set "
                 "HPC_BRIDGE_STATE_DIR to a short path (e.g. ~/.hpc-bridge). Nothing was started.")
-    return (fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")[:500]
+    return _ends(fallback or f"hpc-bridge error: {type(exc).__name__}: {raw}")
+
+
+# A failure notice that quotes the remote's words. A failed step's message ENDS with its output's end, which `said_end`
+# already cut to its budget (END_CHARS, after a cut mark under 60 characters): those last `_KEPT_END` characters are
+# never cut again, and up to 200 ahead of them (the step's name, a host) fit whole too.
+_KEPT_END = END_CHARS + 60
+_FAILURE_CAP = _KEPT_END + 200
+
+
+def _ends(text: str, cap: int = _FAILURE_CAP) -> str:
+    """A failure notice within `cap` characters, cut from its MIDDLE when longer, marked: its head names what failed,
+    its end is what the remote said last — the cause. Never its first `cap` characters: a login shell's startup noise
+    and a site's banner print first, so that kept the noise and cut the cause (the Perlmutter report, item 5). Never
+    into its last `_KEPT_END` either: that is the step's end as `said_end` kept it, whose first line may be the cause
+    (Lmod's unknown module, before its help; review round 1). Each part ends or starts at a whole line when that keeps
+    at least half of it; the room a head that ends earlier frees goes to the end."""
+    if len(text) <= cap:
+        return text
+    mark = "\n[hpc-bridge: notice cut — {:,} chars from its middle]\n"
+    room = cap - len(mark.format(len(text)))  # the count shown is under len(text): it fits
+    head = room - _KEPT_END
+    if (nl := text.rfind("\n", 0, head)) >= head // 2:
+        head = nl
+    start = len(text) - (room - head)
+    if (nl := text.find("\n", start, min(len(text) - _KEPT_END, start + (len(text) - start) // 2))) >= 0:
+        start = nl + 1
+    return text[:head] + mark.format(start - head) + text[start:]
+
 
 def _remote_fs_notice(host: str, line: str) -> str:
     """A write the login node's own filesystem refused (quota, read-only home, permission): the login worked."""
@@ -487,6 +517,17 @@ def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: 
     word = _queue_word(app)
     where = (f"{word} '{t.queue}' ({_QUEUE_FROM.get(t.queue_source, t.queue_source)})" if t.queue
              else f"the facility's default {word} (hpc-bridge sends none)")
+    profile = getattr(app.facility, "profile", None)
+    if not t.queue and getattr(profile, "partition", None) == "":
+        # partition "" (a facility brought with details=): no partition is sent and the scheduler routes the block —
+        # by the node type a constraint names, on a site like NERSC, not to the starred default; a GPU type says so
+        opts = getattr(profile, "scheduler_options", None)
+        types = [m.group(1) for ln in (opts if isinstance(opts, str) else "").splitlines() if ln.strip().startswith("#")
+                 for m in re.finditer(r"(?:^|\s)(?:--constraint[= ]|-C\s*)(\S+)", ln.strip())]
+        where = f"no {word}: the scheduler routes the block" + "".join(
+            f" (scheduler_options: --constraint={c}"
+            + (" — a GPU node type" if re.search(r"gpu|[ahv]100|mi\d", c, re.I) else "") + ")"
+            for c in types[-1:])
     if t.account:
         acct = f"account '{t.account}' ({_ACCOUNT_FROM.get(t.account_source, t.account_source)})"
     elif t.account_source == "none_needed":

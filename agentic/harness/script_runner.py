@@ -19,6 +19,7 @@ dependencies may be missing):
     async def SCRIPT(ops) -> str:                         # returns the run's final message
         r = await ops.call("connect_facility", facility=ops.facility, ssh_host=ops.ssh_host)
         ops.say("what the script saw")                    # the trace's texts: the script's own words
+        rc, out = await ops.world("cmd", host=None)       # the harness' world channel (not in the trace)
         ops.abort("why")                                  # a premise unmet: the run ends errored (run_completed fails)
 
 `ops.call` never raises for a tool's failure: an error result, a refused call or a closed channel comes back as
@@ -118,11 +119,15 @@ def _short(obj: Any, n: int = 110) -> str:
     return s if len(s) <= n else s[: n - 1] + "…"
 
 
+World = Callable[..., tuple[int, str]]   # run.py's `_ssh_run(cmd, timeout=…, host=…)`
+
+
 class ScriptOps:
     """What a SCRIPT drives hpc-bridge with. `facility` / `ssh_host`: this run's (run.py: `{facility}`, `{ssh_host}`)."""
 
-    def __init__(self, session: Any, *, facility: str, ssh_host: str) -> None:
+    def __init__(self, session: Any, *, facility: str, ssh_host: str, world: World | None = None) -> None:
         self._session = session
+        self._world = world
         self.facility = facility
         self.ssh_host = ssh_host
         self.steps: list[Step] = []
@@ -152,6 +157,15 @@ class ScriptOps:
         self.texts.append(text)
         self.text_at.append(len(self.steps))
         print(f"  ✎ {text}", flush=True)
+
+    async def world(self, cmd: str, *, host: str | None = None, timeout: int = 60) -> tuple[int, str]:
+        """One command over the harness' WORLD channel (run.py `_ssh_run`: ssh as the pool user, on the harness' own
+        port; `host` = one login node of a pool) — how a script changes the world mid-run, as a SETUP or a mid-run hook
+        would. Not a tool call: nothing of it is in the trace. (rc, stdout+stderr); 255 without a channel."""
+        if self._world is None:
+            return 255, "no world channel (run.py passes one)"
+        print(f"  ⚙ world{f' [{host}]' if host else ''}: {cmd[:100]}", flush=True)
+        return await asyncio.to_thread(self._world, cmd, timeout=timeout, host=host)
 
     def abort(self, reason: str) -> NoReturn:
         raise ScriptAbort(reason)
@@ -191,9 +205,10 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
                        max_turns: int = 40, extra_env: dict[str, str] | None = None,
                        midrun_hooks: list[dict] | None = None, hook_runner=None,
                        script: Script | None = None, facility: str = "", ssh_host: str = "",
-                       session_factory: SessionFactory | None = None):
+                       session_factory: SessionFactory | None = None, world: World | None = None):
     """Drive `script` against a fresh hpc-bridge server and return the RunResult run.py grades. `prompt`, `model`,
-    `effort`, `user_goal` and `max_turns` mean nothing here (run.py passes every operator the same arguments)."""
+    `effort`, `user_goal` and `max_turns` mean nothing here (run.py passes every operator the same arguments).
+    `world`: the harness' world channel the script's `ops.world` uses (run.py's `_ssh_run`)."""
     if script is None:
         raise ValueError("the script operator needs the scenario's SCRIPT")
     if persona or midrun_hooks:   # run.py reports such a cell SKIPPED first; this keeps a direct caller honest too
@@ -216,7 +231,7 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     print(f"  → {OPERATOR}: hpc-bridge over stdio ({' '.join(a if len(a) < 60 else a[:57] + '…' for a in cmd[:6])} …)",
           flush=True)
     t0 = time.monotonic()
-    ops = ScriptOps(None, facility=facility, ssh_host=ssh_host)
+    ops = ScriptOps(None, facility=facility, ssh_host=ssh_host, world=world)
     text, error, tb = "", None, ""
     drove = False
     try:

@@ -39,8 +39,15 @@ from ..state import EndpointRecord, LoginNodeStore
 if TYPE_CHECKING:
     from ..catalog.entry import CatalogEntry
 from . import endpoint_venv
-from .base import EndpointHandle, endpoint_metadata, step_error
-from .endpoint_venv import DEFAULT_REMOTE_VENV, managed_venv, migrate_env_setup, safe_base, shell_path
+from .base import EndpointHandle, endpoint_metadata, said_end, step_error
+from .endpoint_venv import (
+    DEFAULT_REMOTE_VENV,
+    managed_venv,
+    migrate_env_setup,
+    safe_base,
+    shell_path,
+    spelled_as_default,
+)
 
 # A Globus endpoint UUID — scopes the per-UEP pidfile-cleanup glob to one endpoint, and refuses to
 # build a remote glob from anything that isn't a plain UUID.
@@ -365,9 +372,9 @@ def profile_from_catalog_entry(
 
     The catalog stores user-agnostic templates; this resolves them at provision time:
     ``{user}`` is the SSH login user and ``{venv}`` is the remote globus-compute-endpoint venv
-    (defaults to the ``/home/{user}/hpc-bridge/gce-venv`` convention; a leading ``~/`` becomes ``$HOME/``, since
-    hpc-bridge's line quotes it). ``account`` and the derived
-    ``worker_init`` (= the resolved ``env_setup``, replayed on the compute worker) are supplied
+    (defaults to ``$HOME/hpc-bridge/gce-venv``, left for the login node to expand: a home is not always
+    ``/home/{user}``; a leading ``~/`` becomes ``$HOME/``, since hpc-bridge's line quotes it). ``account`` and the
+    derived ``worker_init`` (= the resolved ``env_setup``, replayed on the compute worker) are supplied
     here, never stored in the catalog. ``partition`` overrides the entry's default when given.
     Substitution uses ``str.replace`` (not ``str.format``) so literal shell braces in ``env_setup``
     are left untouched.
@@ -377,7 +384,7 @@ def profile_from_catalog_entry(
     version and Python (`endpoint_venv.migrate_env_setup`). The registry and facilities.json keep their text, so an
     older plugin reading them is unaffected. Hand-written text is used exactly as given.
     """
-    venv = shell_path(venv or DEFAULT_REMOTE_VENV.replace("{user}", user))
+    venv = shell_path(venv or DEFAULT_REMOTE_VENV)
 
     def _resolve(template: str) -> str:
         # Accept the plugin template ({user}/{venv}) AND the natural shell idiom ($USER/${USER}) —
@@ -426,10 +433,11 @@ _FRAME = re.compile(r'File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<fn>\S+)
 
 
 def _cli_said(out: str, err: str) -> str:
-    """What a failed `globus-compute-endpoint` call said, for its error. Short text is kept as it is (the notices read
-    ssh's own verdict from it). A Python traceback becomes its LAST line, the exception, and the frame that raised it:
-    a notice keeps a message's first 500 characters, which of a traceback was only "Traceback (most recent call
-    last): File …, line 12, in" (texttable 1.7.2, live 2026-10-20). That texttable break also says what it is."""
+    """What a failed `globus-compute-endpoint` call (list, configure, start) said, for its error: its END, the last few
+    meaningful lines after a cut mark (`said_end`) — the login shell's startup noise prints first (the Perlmutter
+    report, item 5), and ssh's own verdict, which the notices read, comes last. A Python traceback becomes its LAST
+    line, the exception, and the frame that raised it: its head was only "Traceback (most recent call last): File …,
+    line 12, in" (texttable 1.7.2, live 2026-10-20). That texttable break also says what it is."""
     text = (err or out or "").strip()
     if _TRACEBACK in text:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -439,6 +447,8 @@ def _cli_said(out: str, err: str) -> str:
             f = frames[-1]
             where = f" (at {'/'.join(f['path'].split('/')[-2:])}:{f['line']}, in {f['fn']})"
         text = lines[-1][:300] + where
+    else:
+        text = said_end(text)
     if endpoint_venv.BROKEN_LIST.search(text):
         text = f"{text}. {endpoint_venv.BROKEN_LIST_HINT}"
     return text
@@ -551,7 +561,7 @@ class RemoteEndpointCLI:
             self._prefix_override = undecided
             return True, ""
         if found.rc == 255:
-            return False, "ssh: " + (found.err or "").strip()[:400]
+            return False, "ssh: " + said_end(found.err or "")  # ssh's verdict comes last, after any banner
         if found.cli is None:
             if found.unknown or fallback:  # can't tell, or nothing of hpc-bridge's runs: the stop is tried anyway
                 self._prefix_override = undecided
@@ -580,7 +590,8 @@ class RemoteEndpointCLI:
             msg = (err or out).strip()
             if "already" in msg.lower() or "configexists" in msg.lower():  # dir exists -> fine
                 return
-            raise step_error(rc, f"remote configure failed: {msg}", output=msg)  # ran env_setup: unless ssh's 255
+            # its END in the message; its whole output decides what it was (`ConfigStepFailed.said` / `tail`)
+            raise step_error(rc, f"remote configure failed: {_cli_said(out, err)}", output=msg)  # unless ssh's 255
 
     @staticmethod
     def _list_rows(out: str) -> list[list[str]]:
@@ -734,9 +745,14 @@ class RemoteEndpointCLI:
             else:
                 # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
                 # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
-                listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
+                listed = f"`list` failed too: {self.last_list_error}" if self.last_list_error else ""
                 said = (err or out).strip()  # the start's own words decide, never the `list` note after them
-                raise step_error(rc, f"remote start failed (rc={rc}): {said or 'no output'}{listed}", output=said)
+                own = _cli_said(out, err)
+                # the decisive words LAST, where a notice's cut never reaches (notices._ends): the start's own, else
+                # `list`'s (the start said nothing)
+                msg = (f"remote start failed (rc={rc}) ({listed}): {own}" if own and listed else
+                       f"remote start failed (rc={rc}): {own or 'no output'}" + (f"; {listed}" if listed else ""))
+                raise step_error(rc, msg, output=said)
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
@@ -1294,7 +1310,10 @@ class SlurmFacility:
         if own is None:
             return
         self.endpoint_worker_init = own
-        if own != self.profile.worker_init and migrate_env_setup(own) != self.profile.worker_init:
+        # the default venv spelled `/home/<user>/…` (plugins up to 0.1.25) is the upgrade too, not an edit
+        user = getattr(getattr(self.cli, "target", None), "user", None) or ""
+        same = spelled_as_default(migrate_env_setup(own), user=user)
+        if own != self.profile.worker_init and same != self.profile.worker_init:
             self.worker_init_note = (
                 "this endpoint was started with a different env_setup than this facility's current one, and its "
                 "blocks keep the one it was started with. Only if its blocks fail or you changed env_setup: "
@@ -1596,7 +1615,7 @@ class SlurmFacility:
             rc, err = None, "the stop timed out on the login node"
         if rc == 255:  # ssh itself failed: nothing ran on the login node
             return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
-                    "ssh_failed": True, "error": err[:400]}
+                    "ssh_failed": True, "error": said_end(err)}
         # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check. A
         # re-check that TIMES OUT proves nothing either way — report "unconfirmed" (None), never "still running".
         stopped: bool | None
@@ -1638,7 +1657,7 @@ class SlurmFacility:
         # live 2026-09-04) and tells the user something false about what is left on their machine.
         ssh_closed = bool(await self.cli.close())  # drop the shared SSH master; the endpoint is gone
         return {"stopped": stopped, "deleted": deleted, "credentials_wiped": wiped, "ssh_closed": ssh_closed,
-                "ssh_failed": False, "error": "" if stopped else (err or "")[:400], "delete_error": delete_error}
+                "ssh_failed": False, "error": "" if stopped else said_end(err or ""), "delete_error": delete_error}
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Read-only login-node command for discovery — no block, no allocation (delegates

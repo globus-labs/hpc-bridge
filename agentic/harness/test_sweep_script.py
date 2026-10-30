@@ -161,6 +161,11 @@ printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "pr
 echo "RESULT: OK"
 '''
 
+_STUB_CLUSTER = r'''#!/usr/bin/env bash
+printf '{{"tool": "{name}", "argv": "%s"}}\n' "$*" >> "$STUB_LOG"
+[ -z "${{STUB_BOOT_FAIL:-}}" ] || [ "{name}" != up.sh ]
+'''
+
 
 def _sweep(tmp_path, *args, **env_extra):
     """Run a copy of sweep_profiles.sh whose run_suite.py / run_smoke.sh are stubs that log each call."""
@@ -174,6 +179,11 @@ def _sweep(tmp_path, *args, **env_extra):
     (root / "agentic" / "run_suite.py").write_text(_STUB_SUITE)
     (root / "agentic" / "run_smoke.sh").write_text(_STUB_SMOKE)
     (root / "agentic" / "run_smoke.sh").chmod(0o755)
+    bin_ = root / "agentic" / "fakecluster" / "bin"   # the script-only profiles boot and wipe their own cluster
+    bin_.mkdir(parents=True)
+    for name in ("up.sh", "down.sh"):
+        (bin_ / name).write_text(_STUB_CLUSTER.format(name=name))
+        (bin_ / name).chmod(0o755)
     log = tmp_path / "calls.jsonl"
     env = {k: v for k, v in os.environ.items() if not k.startswith("HPCB_")}
     env.update(STUB_LOG=str(log), HPCB_MEP_EMAIL="ops@example.org", **env_extra)
@@ -292,7 +302,8 @@ def test_the_held_and_failed_details_paths_run_once_per_sweep_under_the_script_o
     r, calls, summary, root = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "polaris,lmod,site")
     assert r.returncode == 0, r.stdout + r.stderr
     scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke" and c["operator"] == "script"]
-    assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod")]
+    assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod"),
+                        ("stale_login_pin", "site"), ("kept_entry_after_failure", "site")]
     assert "    [script] polaris_filesystems (script) — RESULT: OK" in summary
     assert any((root / "agentic" / "runs").glob("sweep-*-polaris-script-polaris_filesystems.log"))
     # --paid-only: none (no paid cell on either profile, so neither is booted)
@@ -374,3 +385,23 @@ def test_a_suite_whose_image_did_not_build_lists_every_cell_as_infra():
             "build (ERROR: 502) — the cell was not run")
     m = sweep_dash.DONE.match(line)
     assert m and m.group(2) == "canary_login_discovery" and sweep_dash._kind(m.group(3)) == "INFRA"
+
+
+def test_the_script_only_profiles_boot_their_own_cluster_and_run_only_their_scripted_cells(tmp_path):
+    # `slices` and `nersc` carry no agent wave: the sweep boots each, runs its scripted cells, and wipes it
+    r, calls, summary, _ = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "nersc,slices")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c["tool"] == "run_suite"]
+    scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke"]
+    assert scripted == [("cached_password_otp", "nersc"), ("home_outside_home", "nersc"),
+                        ("noisy_failure_tail", "nersc"), ("partition_proposal_policy", "nersc"),
+                        ("slice_request", "slices"), ("multinode_allocation", "slices")]
+    assert [(c["tool"], c["argv"]) for c in calls if c["tool"] in ("up.sh", "down.sh")] == [
+        ("up.sh", "--profile nersc"), ("down.sh", "--profile nersc --wipe"),
+        ("up.sh", "--profile slices"), ("down.sh", "--profile slices --wipe")]
+    assert "    [script] partition_proposal_policy (script) — RESULT: OK" in summary
+    # a profile that does not boot is one INFRA row, its cells not run; --paid-only boots neither
+    _, calls, summary, _ = _sweep(tmp_path / "f", "--operators", "pi", "--profiles", "nersc", STUB_BOOT_FAIL="1")
+    assert not [c for c in calls if c["tool"] == "run_smoke"] and "nersc (script) — RESULT: INFRA" in summary
+    _, calls, _, _ = _sweep(tmp_path / "p", "--paid-only", "--profiles", "nersc,slices")
+    assert not [c for c in calls if c["tool"] in ("run_smoke", "up.sh")]
