@@ -745,10 +745,14 @@ class RemoteEndpointCLI:
             else:
                 # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
                 # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
-                listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
+                listed = f"`list` failed too: {self.last_list_error}" if self.last_list_error else ""
                 said = (err or out).strip()  # the start's own words decide, never the `list` note after them
-                raise step_error(rc, f"remote start failed (rc={rc}): {_cli_said(out, err) or 'no output'}{listed}",
-                                 output=said)
+                own = _cli_said(out, err)
+                # the decisive words LAST, where a notice's cut never reaches (notices._ends): the start's own, else
+                # `list`'s (the start said nothing)
+                msg = (f"remote start failed (rc={rc}) ({listed}): {own}" if own and listed else
+                       f"remote start failed (rc={rc}): {own or 'no output'}" + (f"; {listed}" if listed else ""))
+                raise step_error(rc, msg, output=said)
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
