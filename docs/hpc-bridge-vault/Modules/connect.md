@@ -14,6 +14,14 @@ proposal's (`AppCtx.proposed_drafts`, the same host), as one without env_setup t
 keeps what the probe saw. The next block's terms (`_next_block_terms`) carry D3's proposed slice, and the one question
 asks whether it is enough.
 
+## A reattach re-caches the config that worked (2026-10-30, the returning-user cells)
+`_commit_proven_facility` used to skip every reuse of an endpoint from before the session, so a user whose
+`facilities.json` record was gone (deleted by hand, a new laptop) and whose endpoint was still online reattached
+without SSH — and the next session had no record to reconnect from either. It now commits on a reuse when the session
+ran a shell on it and nothing was proposed: no record for the host, the endpoint's worker_init known, and no
+`worker_init_note` (`_reuse_runs`). A config that was only proposed is never saved. `_start_note(fac)` adds what a
+start waited out (a killed manager's pid file, [[facility-remote]]) to the connect's notice.
+
 ## See also
 [[server]] · [[binding]] · [[warmth]] · [[login_gate]] · [[notices]]
 

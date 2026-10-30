@@ -38,5 +38,13 @@ session's choice with no switch. `_provision` reads the size again after `adopt_
 and, when it differs, drops the confirmation before anything starts (`ShapeRuntime.resized`, said by the re-ask).
 `_repoint` records whether a switch moved the size (`switched_size`) for the re-ask's words.
 
+## A broken endpoint environment (2026-10-30, the returning-user cells)
+`_provision`, after `_confirm_worker`: when the block is not warm and the dispatch failure is an import failure
+(`notices.broken_endpoint_env`: `No module named …`, an ImportError), `_repair_broken_env` runs the facility's
+`repair_endpoint_env` once per endpoint id (`AppCtx.env_repairs` holds what it did, or why it failed), marks the
+shape's runners stale and confirms the worker again. It runs on whatever shape asked — the login shape is free — and
+asks nothing about spend: a compute block's confirmation is unchanged. `server` prefixes the repair's words to the next
+warm or provisioning notice (`_env_repair_note`, once).
+
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

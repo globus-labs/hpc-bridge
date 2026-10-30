@@ -953,12 +953,33 @@ def _needs_preauth_result(facility: str, target, *, otp_ok: bool = False) -> Con
     return ConnectFacilityResult(phase="needs_preauth", facility=facility, preauth_command=cmd,
                                  preauth_code_ok=otp_ok, notice=notice)
 
+# A user endpoint that could not even start: its Python could not import what it needs. The manager's answer to a check
+# (delivered by the web service as the task's failure), live on a manager reused over the web whose venv had been
+# deleted (returning-user cell c09, 2026-10-30): "Unable to start user endpoint process for <user> [exit code: 73;
+# (ModuleNotFoundError) No module named 'jinja2']".
+_IMPORT_FAILURE = re.compile(r"No module named '[^']+'|cannot import name '[^']+'(?: from '[^']+')?"
+                             r"|(?:ImportError|ModuleNotFoundError): [^\]\n]{1,200}")
+
+
+def broken_endpoint_env(error: str | None) -> str | None:
+    """The import failure that kept a check's user endpoint from starting (`_IMPORT_FAILURE`), else None: the endpoint's
+    environment — the venv its manager runs from — is broken. Not the config, the partition or the scheduler: no block
+    was ever submitted (the probe's "likely REJECTED" only guesses from the empty queue)."""
+    m = _IMPORT_FAILURE.search(error or "")
+    return m.group(0).strip() if m else None
+
+
 def _dispatch_error_suffix(canary: CanaryResult | None) -> str:
     """A suffix naming a NON-timeout canary failure, else ''. A timeout is the normal cold-start wait
     and stays silent ('allocating nodes…'); anything else means a submit was refused or the dispatch
     path broke — the caller must see WHY rather than keep waiting on a block that will never come."""
     if canary is None or canary.ok or not canary.error or canary.error == "timeout":
         return ""
+    if cause := broken_endpoint_env(canary.error):
+        return (f" — the endpoint could not start a user endpoint ({cause}): the environment it runs from is broken "
+                "(its venv deleted or damaged), not the config, the partition or the queue, and no block was "
+                "submitted. hpc-bridge rebuilds its own venv and restarts the endpoint once when it meets this; if "
+                "that did not help, teardown_endpoint, then connect_facility, starts it again on a checked venv")
     if _transient_dispatch_failure(canary.error):
         return (f" — last dispatch was refused as TRANSIENT: {canary.error}. The endpoint is still processing "
                 "a previous start request — wait ~10 s and call again (not a config problem)")

@@ -149,6 +149,7 @@ from .notices import (  # noqa: F401 - re-exported
     _transient_dispatch_failure,
     _with_submission_notice,
     _worker_notice,
+    broken_endpoint_env,
 )
 from .profile import Profile
 from .runner import GlobusRunner
@@ -522,8 +523,9 @@ async def _ensure_endpoint_up(
         spend = _total_session_spend(app)
         provisioning_elapsed = 0.0
         status: Literal["up", "provisioning"]
+        repaired = _env_repair_note(app)
         if block == "warm":
-            status, notice = "up", _worker_notice(rt.last_canary) or "worker live"
+            status, notice = "up", repaired + (_worker_notice(rt.last_canary) or "worker live")
             rt.provisioning_since = None  # warm -> the cold-start grace clock resets (#32)
             if shape == "login" and app.machine:  # the login shape is PROVEN here too, not only inside connect
                 connect._commit_proven_facility(app, app.machine)
@@ -599,7 +601,7 @@ async def _ensure_endpoint_up(
                     "by the facility (not hpc-bridge), so nothing here restarts it: contact the facility / "
                     "check its status page, then try again."
                 )
-            notice += _dispatch_error_suffix(rt.last_canary)
+            notice = repaired + notice + _dispatch_error_suffix(rt.last_canary)
         if ignored:
             notice = f"{notice or ''} (login shape has no partition; ignored {partition!r})".strip()
         if ignored_size:
@@ -616,7 +618,10 @@ async def _ensure_endpoint_up(
     job_id = rt.block_job if status == "up" and billable else None
     if status == "provisioning" and billable and eid and _has_login_shape(app):
         found, probe = await _probe_cold_block(app, shape, rt, eid, provisioning_elapsed)
-        if found:
+        broken = rt.last_canary is not None and broken_endpoint_env(rt.last_canary.error)
+        if found and not (broken and probe is not None and probe.category == "rejected"):
+            # (an endpoint that could not start its user endpoint submitted nothing: the empty queue is that, not a
+            # rejection the probe could only guess at)
             notice = f"{notice} {found}"
         if probe is not None and probe.category != "unknown":
             job_id = probe.subject
@@ -631,6 +636,15 @@ async def _ensure_endpoint_up(
         block=receipt_terms,
         notice=said(notice),
     )
+
+
+def _env_repair_note(app: AppCtx) -> str:
+    """What a repair of this endpoint's broken environment did (warmth._repair_broken_env), said once."""
+    eid = app.state.endpoint_id
+    if eid is None or eid not in app.env_repairs or eid in app.env_repair_said:
+        return ""
+    app.env_repair_said.add(eid)
+    return app.env_repairs[eid]
 
 
 async def _probe_cold_block(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str,

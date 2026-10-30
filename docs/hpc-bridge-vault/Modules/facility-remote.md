@@ -56,6 +56,34 @@
 > choice. An endpoint configured before this change renders none of it: no default slice there, and a size request is
 > refused (teardown and connect again).
 
+## A pid file a killed manager left (2026-10-30, the returning-user cells)
+A manager killed hard (an OOM kill, a crash) leaves `~/.globus_compute/<name>/daemon.pid` on the shared home.
+globus-compute's own start (`_pidfile_check`) refuses with EX_CANTCREAT (73) while the file's mtime is within three
+heartbeats (`heartbeat_period`, default 30 s: 90 s) and removes a staler one itself; a live instance touches it every
+15 s. Before, `RemoteEndpointCLI.start` reported rc 73 as a failure and its notice quoted the login shell's `.bashrc`
+noise (`could not lock config file …/.gitconfig`), so a killed endpoint was never brought up again (c03, c05, c12, c18
+of the first table).
+
+`start()` now runs `_start_once`; on rc 73 (not "another instance" adopted, not running) `_outwait_pid_file` reads the
+file with one probe (`pid_file(name)`: the node's clock, the file's mtime, `heartbeat_period` from the endpoint's
+`config.yaml`, the endpoint log's last ERROR/CRITICAL line; `PidFile.parse` keeps the markers and sets the noise
+apart). It waits until the file is older than the window plus a margin, polling every 10 s, inside the call when the
+wait is at most `_PID_WAIT_CAP_S` (150 s: a bring-up already takes minutes, and the tool is heartbeated) — else it
+raises "connect_facility again in N s" without waiting. If the mtime ADVANCES while it waits, an instance is alive
+(perhaps on the other login node): it raises saying so and does not retry. Otherwise it starts once more and says so in
+`start_note` (`connect._start_note` puts it in the connect's notice). hpc-bridge never deletes `daemon.pid`: globus-
+compute removes a stale one itself, and one that is not stale belongs to a live instance. `_start_failed` strips the
+shell's noise and, when the start said nothing of its own, quotes the endpoint log's line instead.
+
+## A venv deleted under a running manager (2026-10-30, the returning-user cells)
+`SlurmFacility.repair_endpoint_env(hpc, endpoint_id)` (called by `warmth._repair_broken_env`): the venv this endpoint's
+manager runs from is broken or gone, so its user endpoints cannot import. Over the bring-up's own channel it checks
+hpc-bridge's venv afresh (`venv_ready = None`, `_ensure_venv`: built again when the check fails), then — on the login
+node the endpoint is pinned to — stops the manager through the rebuilt CLI and runs `provision` (configure + start).
+Where no pin names the node (the round-robin alias) it does not stop anything: a stop sent there could reach the other
+node and act on the shared pid file; the rebuilt venv at the same path serves the next user endpoints. Returns (what it
+did, the endpoint id).
+
 ## See also
 [[Standing up the endpoint]] · [[Credential seeding]] · [[MEP & templated endpoints]] · [[facility-base]] · [[facility-mep]] · [[state]] · [[credentials]] · [[MFA and interactive SSH auth]]
 

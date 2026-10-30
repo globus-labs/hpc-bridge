@@ -405,6 +405,11 @@ class AppCtx:
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).
     bootstrapped_facilities: set[str] = field(default_factory=set)
+    # A broken endpoint environment met by a check (notices.broken_endpoint_env), by endpoint id: what the one repair
+    # tried said (warmth._repair_broken_env) — rebuilt and restarted, or why not. `env_repair_said`: the ids whose
+    # repair an answer has already named.
+    env_repairs: dict[str, str] = field(default_factory=dict)
+    env_repair_said: set[str] = field(default_factory=set)
     runner_factory: Callable[..., GlobusRunner] = GlobusRunner
     # The in-terminal Globus login (login.py). None ⇒ no login gating (hermetic tests / unbound dev);
     # lifespan installs the real one, which rides the Compute SDK's own client id + token storage.

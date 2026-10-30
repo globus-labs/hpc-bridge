@@ -33,5 +33,13 @@ it said anything, else `list`'s). It classifies the message as before (a denial
 behind a banner is still NO SSH ACCESS, since the end keeps ssh's verdict), and a CANNOT REACH with no verdict line
 quotes the last line, not the first: the cut mark, a stale control socket or a banner come before ssh's verdict.
 
+## A broken environment is not the config (2026-10-30, the returning-user cells)
+`broken_endpoint_env(error)` reads an import failure in a dispatch error (`_IMPORT_FAILURE`: `No module named …`,
+`ImportError`) and returns its cause; `_dispatch_error_suffix` then says the endpoint could not start a user endpoint
+because the environment it runs from is broken — not the config, the partition or the queue — that hpc-bridge rebuilds
+it, and the user's next step if that fails (`teardown_endpoint`, then `connect_facility`). Before, the same failure read
+"fix the config/partition" and, from the pilot probe, "likely REJECTED (e.g. inactive allocation, wrong account, or bad
+queue)"; `server` now skips the probe's "rejected" words when the cause is a broken environment.
+
 ## See also
 [[server]] · [[models]] · [[context]] · [[config]] · [[cost]]

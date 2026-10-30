@@ -82,6 +82,7 @@ from .notices import (
     _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
+    broken_endpoint_env,
 )
 from .runner import CanaryResult, GlobusRunner, never_sent
 from .shapes import SHAPES, shape_config
@@ -713,6 +714,8 @@ async def _provision(
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)
+            if block != "warm":
+                block = await _repair_broken_env(app, shape, rt, block)
     except Exception:
         _bank_warm_interval(rt, app)  # nothing could be checked: the caller reports `down` / an error — clock stopped
         raise
@@ -765,6 +768,38 @@ async def _provision(
         rt.reap_told = True
         return "needs_confirmation"
     return block
+
+async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockState) -> BlockState:
+    """A check whose user endpoint could not start because its Python could not import (`broken_endpoint_env`): the
+    environment the manager runs from is broken. Found on a manager reused over the web — zero SSH, so nothing checked
+    its venv — after the user deleted ~/hpc-bridge (returning-user cell c09, 2026-10-30: "No module named 'jinja2'",
+    then "fix the config/partition", then "likely REJECTED"). The facility repairs it ONCE per endpoint, here, where the
+    failure is seen, never by an SSH check on the reuse path: its venv checked and rebuilt through the bring-up's own
+    path, the manager restarted (`SlurmFacility.repair_endpoint_env`). Every runner is rebuilt and the check sent again.
+    What it did — or why it could not — is kept for the answer (`AppCtx.env_repairs`). The spend gate is unchanged: this
+    runs only inside a call that may already check this shape."""
+    c = rt.last_canary
+    cause = broken_endpoint_env(c.error) if c is not None and not c.ok else None
+    eid = app.state.endpoint_id
+    repair = getattr(app.facility, "repair_endpoint_env", None)
+    if cause is None or eid is None or not inspect.iscoroutinefunction(repair) or eid in app.env_repairs:
+        return block
+    try:
+        done, new_eid = await repair(app.profile, eid)
+    except Exception as exc:  # noqa: BLE001 - said in the answer; the check's own failure stays the state
+        why = " ".join(str(exc).split())[:300]
+        app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment is broken, "
+                                f"and hpc-bridge's repair failed: {type(exc).__name__}: {why}. ")
+        return block
+    app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment was broken. "
+                            f"hpc-bridge {done}. ")
+    if new_eid and new_eid != eid:
+        app.env_repairs[new_eid] = app.env_repairs[eid]
+        app.state = replace(app.state, endpoint_id=new_eid)
+    for other in app.shapes.values():
+        other.runner_stale = True
+    return await _confirm_worker(app, shape, force=True)
+
 
 class StaleTemplateError(RuntimeError):
     """The session asked for a block size (cores, memory, GPUs, several nodes) that the bound endpoint's template does

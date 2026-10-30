@@ -1561,6 +1561,8 @@ def _gce_answers(monkeypatch, answers: dict[str, tuple[int, str, str]]) -> None:
         for word, answer in answers.items():
             if f"globus-compute-endpoint {word}" in cmd:
                 return answer
+        if "HPCB_PROBE_END" in cmd:   # a start refused with exit 73 reads the pid file (remote.pid_file): none here
+            return 0, "HPCB_NOW=1793376000\nHPCB_HB=\nHPCB_LOG=\nHPCB_PROBE_END\n", ""
         raise AssertionError(cmd)
 
     monkeypatch.setattr(remote, "ssh_exec", fake_ssh)

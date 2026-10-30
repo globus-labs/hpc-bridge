@@ -81,13 +81,30 @@ def _commit_proven_facility(app: AppCtx, facility: str) -> None:
     pending = app.pending_facility_cache.pop(facility, None)
     if pending is None:
         return
-    if app.state.reused and facility not in app.bootstrapped_facilities:
+    if app.state.reused and facility not in app.bootstrapped_facilities and not _reuse_runs(app, pending):
         # The canary ran on an endpoint that was ALREADY online under an earlier config — it proves nothing
         # about these details (review 2: a bogus interface got committed this way). Leave the old proven
         # entry as it is. An endpoint THIS session bootstrapped and then re-found online is ours: the
         # canary did run on these details (live 2026-09-04: a fresh BYO bring-up was never cached).
         return
     binding._facility_store().put(*pending)
+
+
+def _reuse_runs(app: AppCtx, pending: tuple[str, dict]) -> bool:
+    """A configuration confirmed with details= and brought up on a REUSED endpoint is cached only when the cache has no
+    record for its host at all, and the endpoint is known to run what it says: its own worker_init, read from its
+    published template (`adopt_endpoint`), is these details' env_setup — no "started with a different env_setup" note.
+    A returning user whose facilities.json lost the record (deleted by hand, a new laptop) reattached, confirmed the
+    probe's proposal, ran work, and the next session probed again (returning-user cell c14, 2026-10-30). An existing
+    proven record is never replaced from a reuse, and nothing unconfirmed is saved: `pending` holds details= only."""
+    host = pending[0]
+    try:
+        if binding._facility_store().get(host) is not None:
+            return False
+    except Exception:  # noqa: BLE001 - an unreadable cache proves nothing either way: leave it
+        return False
+    fac = app.facility
+    return getattr(fac, "endpoint_worker_init", None) is not None and not getattr(fac, "worker_init_note", "")
 
 
 def _drop_failed_details(app: AppCtx, facility: str, notice: str, entry: CatalogEntry) -> str:
@@ -237,6 +254,13 @@ def _venv_note(fac) -> str:
         return ""
     aside = f"; the broken one was moved to {res.moved_aside}" if getattr(res, "moved_aside", None) else ""
     return f"built hpc-bridge's endpoint venv {res.path} ({res.reason}){aside}. "
+
+
+def _start_note(fac) -> str:
+    """What this bring-up's start did beyond starting: it waited out a dead manager's pid file
+    (`RemoteEndpointCLI.start_note`)."""
+    note = getattr(getattr(fac, "cli", None), "start_note", "")
+    return note if isinstance(note, str) else ""
 
 
 def _master_alive(target) -> bool:
@@ -654,7 +678,7 @@ async def _connect(
     sel_note = getattr(fac, "select_note", "")  # select_options a reused endpoint's older template does not render
     reuse_note = (login_note + presets_note + directive_note + _reuse_note(app, facility, app.state.reused, fac)
                   + (wi_note if isinstance(wi_note, str) else "") + (sel_note if isinstance(sel_note, str) else "")
-                  + _venv_note(fac))
+                  + _venv_note(fac) + _start_note(fac))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities
