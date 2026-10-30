@@ -213,6 +213,11 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     wherever its level changes; world changes checked as they are made; session 1 the premise (SETUP FAILED when it
     fails). The remaining failure, c08, is a product gap: a broken venv under a running manager whose pinned node is
     dead is not repaired (the repair's check runs over the dead pin).
+  - **Second round (2026-10-30): the dead-pin repair, the zero-SSH reattach for a new laptop, and the account test that
+    read a policy refusal as an account error are fixed** ([[facility-remote]], [[connect]], [[discovery]]).
+    - Results: 21 of 22 scripted cells OK, the six #236 proofs OK, the three agent cells OK.
+    - c08 reaches hello world. It still fails `ru_policy_surfaced`: on the previous release's long-lived compute user
+      endpoint the site's refusal arrives as a task traceback, never the scheduler's words — left open.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

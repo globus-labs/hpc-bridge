@@ -372,7 +372,8 @@ bounded wait). **What only a deletion may change:** `ru_same_endpoint` (session 
 wherever the endpoint and its directory survive — stopped and killed managers, a new laptop, a renamed id, a dead pin,
 revoked keys, expired tokens and changed policy included; `ru_no_rebuild` (the venv session 1 left is not rebuilt)
 wherever that venv and its endpoint version are untouched; `ru_reused` (the first connect to reach it says reused,
-after no probe where a record is left, one where it is gone) wherever the endpoint was left running.
+with no SSH before it — a record gone is found over the web and probed through the endpoint) wherever the endpoint
+was left running.
 
 The world check runs before the teardown and then puts the world back: the key, the token store, `known_hosts`, the
 closed node and the retired QOS. The node actions and `CLEANUP` undo the last of these again when a cell dies.
@@ -388,8 +389,8 @@ release:
 - `returning_perlmutter_replay`: an endpoint left online, the pinned node dead, the key revoked — session 1 on
   0.1.20, the report's own plugin, whatever `previous` is.
 - `returning_all_well`: nothing changed, so reuse and rebuild nothing.
-- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate (`ru_reattached`: at most
-  the one probe a new laptop cannot avoid today).
+- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate (`ru_reattached`: no SSH
+  before the reattach — hpc-bridge finds the endpoint over the web and probes through it).
 
 When the agent stops to ask for the user's part, the harness does it and a follow-up turn continues (a phase with a
 `when`). They also grade `ru_no_hand_edits`: the agent never writes to `~/.hpc-bridge` or `~/.globus_compute`.

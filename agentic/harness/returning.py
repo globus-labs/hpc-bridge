@@ -99,10 +99,11 @@ CONSTRAINTS: list[tuple[dict[str, str], str]] = [
 
 def needs_ssh(levels: dict[str, str]) -> bool:
     """Session 2 must reach the login node over SSH: the endpoint must be brought up again (it is not left running), the
-    facility probed (no record left to reconnect from), or the venv a running manager lost repaired. A running endpoint
-    reattached from a record needs none."""
-    return (levels["ended"] != "running" or levels["local"] in ("record_deleted", "wiped")
-            or levels["remote"] == "venv_deleted")
+    venv a running manager lost repaired, or its directory — which holds the template its user endpoints start from —
+    is gone, so no login worker answers through it. A running endpoint needs none: reattached from a record, or, with
+    no record left (deleted, a new laptop), found over the web and probed THROUGH (connect._probe_through_endpoint,
+    2026-10-30; a record lost meant an SSH probe before)."""
+    return levels["ended"] != "running" or levels["remote"] != "untouched"
 
 
 # When a factor's non-default level actually changes what session 2 meets (it "bites"); a level that cannot is a no-op
@@ -472,12 +473,16 @@ def session2_details(r: dict) -> dict:
     return proposal_details(r, scheduler_options="\n".join(x for x in (opts.strip(), CONSTRAINT) if x))
 
 
-async def _poll_block(ops, e: dict, *, wait_s: float) -> dict:
-    """ensure_endpoint_up polled while the block is `provisioning`, until it settles, `wait_s` passes, a notice says
-    the submit was REJECTED (the probe says so while the status is still `provisioning`), or the session's own bound
-    (MAX_CALLS_2) is spent — never past what `ru_bounded` allows."""
+async def _poll_block(ops, e: dict, *, wait_s: float, handoff: bool = True) -> dict:
+    """ensure_endpoint_up polled while the block is `provisioning`, until it settles, `wait_s` passes, the scheduler's
+    own refusal is quoted (POLICY_WORDS), the answer hands a login to the user's terminal (`preauth_command`: a repair
+    that needs it), or the session's own bound (MAX_CALLS_2) is spent — never past what `ru_bounded` allows. The pilot
+    probe's "likely REJECTED" is a guess, not a refusal: it does not end the wait (c08, 2026-10-30: the user switched
+    QOS on it while the real cause, a broken venv, had not surfaced yet). `handoff=False`: the user already did that
+    part, so a handoff still said (the repair has not run again yet) does not end the wait."""
     deadline = time.monotonic() + wait_s
-    while (e.get("status") == "provisioning" and "REJECTED" not in str(e.get("notice") or "")
+    while (e.get("status") == "provisioning" and POLICY_WORDS not in str(e.get("notice") or "")
+           and not (handoff and e.get("preauth_command"))
            and time.monotonic() < deadline and len(getattr(ops, "steps", ())) < MAX_CALLS_2):
         await ops.sleep(POLL_S)
         e = await ops.call("ensure_endpoint_up", shape="compute")
@@ -869,6 +874,22 @@ def host_key_changed_notice(r: dict) -> bool:
     return bool(_HOST_KEY.search(n)) and "CHANGED" in n.upper()
 
 
+async def users_terminal(ops, cmd: str) -> str:
+    """The user's part for a login handed to their terminal (needs_preauth, or a repair's `preauth_command`): the key
+    accepted again (as a re-run sshproxy issues one), then the handoff's command run in their own terminal."""
+    note = await restore_key(ops)
+    opened = "no command given"
+    if cmd:
+        try:
+            p = await asyncio.to_thread(subprocess.run, ["bash", "-c", cmd], capture_output=True, text=True,
+                                        timeout=60, stdin=subprocess.DEVNULL)
+            opened = f"its connection opened (rc={p.returncode})"
+        except subprocess.TimeoutExpired:
+            opened = "its connection did not open within 60 s"
+    ops.say(f"[user] hpc-bridge hands the login to my terminal: {note}; ran its command — {opened}")
+    return opened
+
+
 def session_2(cell: Cell):
     """Session 2's script (the current code): connect as the returning user would — `connect_facility(<id>,
     ssh_host=<host>)` — follow the bring-up, do the user's part once per kind when hpc-bridge asks for it, confirm a
@@ -916,17 +937,7 @@ def session_2(cell: Cell):
                         f"I log in in my browser — {restore_tokens()}")
             elif ph == "needs_preauth" and cell.auth == "revoked" and "key" not in done:
                 done.add("key")
-                cmd = str(r.get("preauth_command") or "")
-                note = await restore_key(ops)
-                opened = "no command given"
-                if cmd:
-                    try:
-                        p = await asyncio.to_thread(subprocess.run, ["bash", "-c", cmd], capture_output=True,
-                                                    text=True, timeout=60, stdin=subprocess.DEVNULL)
-                        opened = f"its connection opened (rc={p.returncode})"
-                    except subprocess.TimeoutExpired:
-                        opened = "its connection did not open within 60 s"
-                ops.say(f"[user] hpc-bridge hands the login to my terminal: {note}; ran its command — {opened}")
+                await users_terminal(ops, str(r.get("preauth_command") or ""))
             elif ph == "failed" and cell.host_key == "changed" and "known_hosts" not in done \
                     and host_key_changed_notice(r):
                 done.add("known_hosts")
@@ -946,12 +957,21 @@ def session_2(cell: Cell):
             return f"session 2: no login shape — {r.get('phase')!r}: {brief(r, 300)}"
         login = await ops.call("run_shell", command="hostname", shape="login")
         e = await ops.call("ensure_endpoint_up", shape="compute", account=ACCOUNT, confirm_spend=True)
-        for _ in range(4):
-            e = await _poll_block(ops, e, wait_s=BLOCK_WAIT_S)
+        for _ in range(5):
+            e = await _poll_block(ops, e, wait_s=BLOCK_WAIT_S, handoff="key" not in done)
             notice = str(e.get("notice") or "")
             if e.get("status") == "up" or spent():
                 break
-            if ("REJECTED" in notice or e.get("status") == "down") and cell.site == "policy_changed" \
+            if e.get("preauth_command") and cell.auth == "revoked" and "key" not in done:
+                done.add("key")   # a repair that needs the user's login (the key revoked): the same user's part
+                await users_terminal(ops, str(e["preauth_command"]))
+                e = await ops.call("ensure_endpoint_up", shape="compute")
+                continue
+            # the site's refusal: the scheduler's own words, a `down` — or, once the whole wait passed with the block
+            # still provisioning, the answer's own "REJECTED" / "fix the config/partition" (c08, 2026-10-30: a compute
+            # user endpoint the previous release kept running reported the refusal as a task traceback only)
+            waited_out = e.get("status") == "provisioning" and ("REJECTED" in notice or "fix the config" in notice)
+            if (POLICY_WORDS in notice or e.get("status") == "down" or waited_out) and cell.site == "policy_changed" \
                     and "qos" not in done:
                 done.add("qos")
                 ops.say(f"[user] the site refused the block ({e.get('status')!r}); the site retired "
@@ -1064,7 +1084,10 @@ _WRITE = re.compile(r"\b(?:rm|mv|cp|tee|touch|truncate|chmod|chown|mkdir|ln|inst
                     r"|\bperl\s+-p?i|rmtree|os\.remove|\.unlink\(|\.rmdir\(|write_text|write_bytes"
                     r"|open\([^)]*['\"][wa]|\d?>>?\s*(?!/dev/null\b|&)[^\s;|&]")
 _DEVNULL = re.compile(r"\d?>>?\s*/dev/null|\d?>&\d")
-_SSH_TOOLS = ("teardown_endpoint", "login_shell")   # always SSH to the login node
+_SSH_TOOLS = ("teardown_endpoint", "login_shell")   # SSH to the login node — once a facility is bound
+# …which they refuse before any SSH when none is (the new-laptop agent cell, pi/qwen, 2026-10-30: a login_shell sent
+# while the connect only proposed a config answered "No facility connected yet", and read as SSH before the reattach)
+_UNBOUND = re.compile(r"No facility connected|no endpoint (?:was )?up|nothing to tear down", re.I)
 
 
 def _later(t: Trace) -> list[tuple[int, ToolCall]]:
@@ -1110,12 +1133,14 @@ def _needed_ssh(t: Trace, before: int | None = None) -> bool:
         if before is not None and i >= before:
             break
         r = _res(c)
-        if c.name in _SSH_TOOLS or (c.name == "stop_endpoint" and _OVER_SSH.search(_ZERO_SSH.sub("", _notice(c)))):
+        if (c.name in _SSH_TOOLS and not _UNBOUND.search(_notice(c))) or (
+                c.name == "stop_endpoint" and _OVER_SSH.search(_ZERO_SSH.sub("", _notice(c)))):
             return True
         if c.name != "connect_facility":
             continue
-        if r.get("phase") in (PROPOSED, "needs_preauth") or _SSH_TROUBLE.search(_notice(c)):
-            return True
+        if (r.get("phase") == "needs_preauth" or (r.get("phase") == PROPOSED and not r.get("reused"))
+                or _SSH_TROUBLE.search(_notice(c))):
+            return True   # (a proposal that says `reused` was probed THROUGH the online endpoint: no SSH)
         if r.get("phase") in (UP, "provisioning") and not r.get("reused"):
             return True
     return False
@@ -1200,7 +1225,8 @@ def revoked_handoff(t: Trace) -> Result:
     """auth=revoked: the terminal handoff (needs_preauth), never NO SSH ACCESS — when session 2 needed SSH at all (a
     reuse over the web needs none)."""
     nossh = [i for i, c in _later(t) if "NO SSH ACCESS" in _notice(c)]
-    handoffs = [i for i, c in _later(t) if _res(c).get("phase") == "needs_preauth"]
+    # a connect's needs_preauth, or a repair's login handed off from ensure_endpoint_up (its `preauth_command`)
+    handoffs = [i for i, c in _later(t) if _res(c).get("phase") == "needs_preauth" or _res(c).get("preauth_command")]
     fix = _said_index(t, "[user] hpc-bridge hands the login")
     needed = _needed_ssh(t, fix)
     ok = not nossh and (bool(handoffs) or not needed)
@@ -1295,37 +1321,50 @@ def no_rebuild(t: Trace) -> Result:
                   f"{_notice(t.calls[rebuilt[0][0]])[:200]!r}")
 
 
+def _ssh_probes(t: Trace, before: int | None = None) -> list[int]:
+    """The proposals of session 2 that probed the login node over SSH (before call `before`): a proposal that says
+    `reused` was probed THROUGH the online endpoint (connect._probe_through_endpoint) and is none."""
+    return [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED and not _res(c).get("reused")
+            and (before is None or i < before)]
+
+
 def reused_same_endpoint(probes: int = 0):
     def ru_reused(t: Trace) -> Result:
-        """A live endpoint reattached: session 2's first connect to reach it says reused=True (`_first_up`), after at
-        most `probes` probes — none where a record is left (a probe there is needless SSH), one where it is gone. Which
-        endpoint it reached is `same_endpoint`'s (gated wherever this is)."""
+        """A live endpoint reattached: session 2's first connect to reach it says reused=True (`_first_up`), with no
+        SSH before it — no probe over SSH (`_ssh_probes`; `probes` allows some), no handoff, no SSH error. A record
+        left reconnects from it; a record gone (deleted, a new laptop) is found over the web and probed through the
+        endpoint (2026-10-30: one SSH probe was allowed there before). Which endpoint it reached is `same_endpoint`'s
+        (gated wherever this is)."""
         up = _first_up(t)
-        before = [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED and (up is None or i < up[0])]
-        ok = up is not None and bool(_res(up[1]).get("reused")) and len(before) <= probes
-        return Result("ru_reused", ok, f"ok: reattached at call {up[0]} after {len(before)} probe(s)" if ok else
+        before = _ssh_probes(t, up[0] if up else None)
+        ssh = up is not None and not before and _needed_ssh(t, up[0])
+        ok = up is not None and bool(_res(up[1]).get("reused")) and len(before) <= probes and not ssh
+        return Result("ru_reused", ok, f"ok: reattached at call {up[0]} with no SSH before it" if ok else
                       f"the first connect to reach the endpoint: "
-                      f"{(_res(up[1]).get('phase'), _res(up[1]).get('reused')) if up else None}; probes before it at "
-                      f"{before} (≤{probes})")
+                      f"{(_res(up[1]).get('phase'), _res(up[1]).get('reused')) if up else None}; SSH probes before it "
+                      f"at {before} (≤{probes})" + ("; SSH was needed before it" if ssh else ""))
     return ru_reused
 
 
-MAX_LAPTOP_PROBES = 1
+MAX_LAPTOP_PROBES = 0   # 2026-10-30: one (the SSH probe a laptop with no record could not avoid) until the reattach
 
 
 def reattached_same_endpoint(t: Trace) -> Result:
     """A new laptop (~/.hpc-bridge gone): the endpoint still online is REATTACHED (reused=True), with no second one
-    beside it and nothing rebuilt, after at most ONE probe — the one a laptop with no record cannot avoid today (more
-    is needless SSH; the review of 2026-10-30: unlimited before)."""
+    beside it, nothing rebuilt, and NO SSH before the reattach — found over the web and probed through itself
+    (connect._probe_through_endpoint). MAX_LAPTOP_PROBES SSH probes are allowed: none since the zero-SSH reattach (one
+    before it, and unlimited before the review of 2026-10-30)."""
     up = _first_up(t)
     eid, ids = (facts_of(t) or {}).get("eid"), _ids(t)
-    probes = [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED]
+    probes = _ssh_probes(t)
+    ssh = up is not None and not probes and _needed_ssh(t, up[0])
     kept = no_rebuild(t)
     ok = (up is not None and bool(_res(up[1]).get("reused")) and bool(ids) and ids <= {eid} and kept.ok
-          and len(probes) <= MAX_LAPTOP_PROBES)
-    return Result("ru_reattached", ok, "ok: the same endpoint reattached after one probe, nothing rebuilt" if ok else
+          and len(probes) <= MAX_LAPTOP_PROBES and not ssh)
+    return Result("ru_reattached", ok, "ok: the same endpoint reattached with no SSH, nothing rebuilt" if ok else
                   f"first up-connect reused={_res(up[1]).get('reused') if up else None}; ids {sorted(ids)} vs "
-                  f"session 1's {eid}; probes at {probes} (≤{MAX_LAPTOP_PROBES}); {kept.detail}")
+                  f"session 1's {eid}; SSH probes at {probes} (≤{MAX_LAPTOP_PROBES})"
+                  + ("; SSH was needed before the reattach" if ssh else "") + f"; {kept.detail}")
 
 
 def killed_not_up(t: Trace) -> Result:
@@ -1423,7 +1462,7 @@ def graders(cell: Cell) -> list[Callable[[Trace], Result]]:
         out.append(no_rebuild)
     if reuse_expected(lv):
         out.append(reattached_same_endpoint if cell.local == "wiped" and cell.agent else
-                   reused_same_endpoint(MAX_LAPTOP_PROBES if cell.local in ("wiped", "record_deleted") else 0))
+                   reused_same_endpoint(MAX_LAPTOP_PROBES))
     if cell.ended in KILLED:
         out.append(killed_not_up)
     if cell.site == "policy_changed":

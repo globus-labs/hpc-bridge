@@ -61,6 +61,39 @@ installed plugin only when that version changes); git tags mark releases.
   only on the first). Not yet run live.
 
 ### Fixed
+- **A new laptop reattaches with zero SSH, a venv repair gets past a dead login node, and a policy refusal is no
+  longer read as an account error (the returning-user cells, second round, 2026-10-30).** Each was proven first by a
+  test that failed on the first round's code.
+  - **A new laptop reattaches with zero SSH.** Before, a connect with no `facilities.json` record and a facility the
+    registry does not know always probed the login node over SSH. On a password + one-time-code site that meant the
+    user's terminal, even with their endpoint online. Now hpc-bridge first asks the Globus web service whether an
+    endpoint it owns is online under the name a bring-up for that host registers (`hpc-bridge-<ssh_host>`, or
+    `HPC_BRIDGE_ENDPOINT_NAME`).
+    - If one is, it waits up to 90 s for that endpoint's login worker to answer. The worker uses the endpoint's own
+      template defaults; nothing of ours is sent.
+    - The same discovery probe then runs THROUGH the endpoint. The proposal says so and carries `reused: true`.
+    - Confirming the proposal reattaches over the web. No SSH happens before the reattach.
+    - A listed endpoint whose worker never answers is treated as a ghost (`manager_online` reads "online" for a dead
+      endpoint, #37). In that case, or when nothing is online, the SSH probe runs as before and the notice says why.
+    - A registry facility, including a facility endpoint, never takes this path. Neither does a registry outage,
+      because the facility could be a catalogued one.
+  - **A venv repair gets past a dead login node.** When the login node a repair is pinned to does not answer at all
+    (connection refused, no route, timed out), hpc-bridge rebuilds the venv through the facility's own host: the
+    home is shared. A refused login is not "does not answer".
+    - Once that host has answered, the dead pin is dropped and the notice says so, as #236 does for a connect.
+    - The manager on the closed node cannot be stopped from here. If its pid file is still being refreshed, it is
+      left running and starts its next user endpoints from the rebuilt venv. If it is gone, the endpoint is started
+      again on the node the facility's host reaches.
+    - If the facility's host asks for the user's own login (the key revoked; a password + one-time code),
+      `ensure_endpoint_up` hands it to the user's terminal: a new `preauth_command` field, a notice, and
+      `complete_preauth` for a code. The repair finishes on the next call, over that connection.
+  - **A policy refusal is no longer read as an account error.** `sbatch --test-only` starts every refusal with
+    "allocation failure:", a site filter's policy refusal included. #236's account test matched the bare word, so a
+    probe whose every shape the site refused said "not verified — the scheduler's test needs an account". It then
+    kept a partition the scheduler had refused, without the node type the site requires. Now only real account
+    errors count: Slurm's "Invalid account or account/partition combination specified", and a site's "You must
+    specify an account" / "No valid account" / "Please specify a project". Such a probe now proposes UNVERIFIED and
+    quotes the scheduler's reply.
 - **A manager killed hard comes up again, a venv deleted under a running manager is rebuilt, and a facility reattached
   over the web is remembered (found by the returning-user cells, 2026-10-30).** Each was proven first by a test that
   failed for the reason the cells met.
@@ -359,6 +392,18 @@ installed plugin only when that version changes); git tags mark releases.
     self-hosted qwen model: all well and the Perlmutter replay (session 1 on 0.1.20) OK; the new laptop's agent
     stopped at the probed configuration for the user to confirm, as the proposal's notice says to, and no follow-up
     turn answered it — the follow-up now runs when a turn ends on a proposal and carries the user's yes (not re-run).
+  - **Second round (2026-10-30, a fresh nersc cluster; the three fixes above): 21 of 22 scripted cells OK, the six
+    #236 proofs OK (four on nersc, two on site), the three agent cells OK (Pi on qwen).** c08 now reaches hello world: the repair rebuilt
+    the venv through `login` past the dead `login01`, after the user's login handed to their terminal. The manager
+    on `login01` was left running, its pid file refreshed. c08 still fails `ru_policy_surfaced`. Its previous-release
+    endpoint keeps one long-lived compute user endpoint, and the site's refusal there comes back as a task traceback
+    (`TaskExecutionFailed … executor.py`) that never quotes the scheduler. That is a product gap left open here.
+    c18 (record deleted, endpoint left running) and the new-laptop agent cell reattached with no SSH, through the
+    endpoint. Harness changes in this round:
+    - the scripted user acts on the probe's "likely REJECTED" only once the whole wait has passed;
+    - the user does their part for a repair's handoff (`preauth_command`);
+    - a login_shell refused before any SSH ("No facility connected yet") no longer counts as SSH;
+    - a probe made through the endpoint (`reused`) is not an SSH probe, and `ru_reattached` allows none.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

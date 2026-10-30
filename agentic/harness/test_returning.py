@@ -603,20 +603,59 @@ def test_the_same_endpoint_and_no_rebuild_of_session_1s_venv():
     assert not ru.no_rebuild(_trace([rebuilt, HELLO])).ok
 
 
-def test_a_new_laptop_reattaches_after_the_probe_it_cannot_avoid():
-    # the new-laptop agent run (2026-10-30): no config left, so the probe ran, then the endpoint was reattached
-    probe = _c("connect_facility", {}, {"phase": "proposed_facility_details"})
+def test_a_new_laptop_reattaches_with_no_ssh():
+    # since 2026-10-30 a laptop with no record finds its online endpoint over the web and probes THROUGH it: the
+    # proposal says `reused`, and no SSH comes before the reattach (one SSH probe was allowed until then)
+    through = _c("connect_facility", {}, {"phase": "proposed_facility_details", "reused": True})
+    probe = _c("connect_facility", {}, {"phase": "proposed_facility_details"})   # over SSH
     up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
     block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
-    assert ru.reattached_same_endpoint(_trace([probe, up, block, HELLO])).ok
-    assert not ru.reused_same_endpoint()(_trace([probe, up, block, HELLO])).ok    # where a config was left, it is not
-    assert ru.reused_same_endpoint(1)(_trace([probe, up, block, HELLO])).ok       # record_deleted: one is unavoidable
+    assert ru.MAX_LAPTOP_PROBES == 0
+    assert ru.reattached_same_endpoint(_trace([through, up, block, HELLO])).ok
+    assert ru.reused_same_endpoint()(_trace([through, up, block, HELLO])).ok      # record_deleted: the same
+    assert not ru.reattached_same_endpoint(_trace([probe, up, block, HELLO])).ok   # an SSH probe: the old way
+    assert not ru.reused_same_endpoint()(_trace([probe, up, block, HELLO])).ok
+    handoff = _c("connect_facility", {}, {"phase": "needs_preauth", "preauth_command": "ssh -fN login"})
+    assert not ru.reattached_same_endpoint(_trace([handoff, through, up, block, HELLO])).ok   # SSH before it
+    # a login_shell refused before any SSH (nothing bound yet: the connect only proposed) is no SSH (pi/qwen, 2026-10-30)
+    refused = _c("login_shell", {"command": "squeue"}, {"exit_code": 1, "notice": "No facility connected yet: "
+                                                        "connect_facility('f') only PROPOSED a config"})
+    assert ru.reattached_same_endpoint(_trace([through, refused, up, block, HELLO])).ok
+    ran = _c("login_shell", {"command": "squeue"}, {"exit_code": 0, "stdout": ""})
+    assert not ru.reattached_same_endpoint(_trace([through, ran, up, block, HELLO])).ok
     dup = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
     fresh = _c("connect_facility", {}, {"phase": "needs_account", "reused": False})
-    assert not ru.reattached_same_endpoint(_trace([probe, up, dup, HELLO])).ok    # a second endpoint beside it
-    assert not ru.reattached_same_endpoint(_trace([probe, fresh, HELLO])).ok
+    assert not ru.reattached_same_endpoint(_trace([through, up, dup, HELLO])).ok    # a second endpoint beside it
+    assert not ru.reattached_same_endpoint(_trace([through, fresh, HELLO])).ok
     # the review of 2026-10-30 (probe_more.py 2): probing again and again, before and after the reattach, passed
     assert not ru.reattached_same_endpoint(_trace([probe, probe, probe, up, probe, probe, block, HELLO])).ok
+    assert not ru.needs_ssh({**{f: v[0] for f, v in ru.FACTORS.items()}, "local": "wiped"})   # a reattach needs none
+
+
+def test_session_2_waits_past_a_guess_and_stops_for_a_handoff_or_the_schedulers_refusal():
+    # c08 (2026-10-30): the user switched QOS on the pilot probe's "likely REJECTED" while the cause, a broken venv, had
+    # not surfaced yet; a repair that needs the user's login hands it off from ensure_endpoint_up (`preauth_command`)
+    guess = {"status": "provisioning", "notice": "… NO pilot job … The block submission was likely REJECTED …"}
+    handoff = {"status": "provisioning", "notice": "repairing it needs an SSH login", "preauth_command": "ssh -fN x"}
+    refused = {"status": "provisioning", "notice": f"… {ru.POLICY_WORDS} …"}
+
+    class Ops:
+        def __init__(self, answers):
+            self.steps, self.answers = [], list(answers)
+
+        async def sleep(self, s):
+            pass
+
+        async def call(self, *a, **k):
+            self.steps.append(a)
+            return self.answers.pop(0)
+    ops = Ops([guess, handoff])
+    assert asyncio.run(ru._poll_block(ops, guess, wait_s=3600)) == handoff and len(ops.steps) == 2
+    assert asyncio.run(ru._poll_block(Ops([]), refused, wait_s=3600)) == refused
+    # the handoff from ensure_endpoint_up is the revoked key's handoff too
+    up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
+    from_ensure = _c("ensure_endpoint_up", {"shape": "compute"}, handoff)
+    assert ru.revoked_handoff(_trace([up, from_ensure, HELLO])).ok
 
 
 def test_a_reuse_is_read_from_the_first_connect_that_reached_the_endpoint():
