@@ -166,6 +166,33 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
   - **The sweep's free wave**: with `HPCB_OPERATOR=codex|pi|hermes21`, `sweep_profiles.sh` leaves out `paid_only()`. Its hermetic test keeps that list equal to what `run.py` would skip.
   - **Hooks and graders skip a blind opening batch (2026-10-15).** hermes21 on gpt-oss opened cells with a parallel batch sent before any facility was connected (`poll_task("PLACEHOLDER")`, a `stop_endpoint` answering "no endpoint was up", …), and "after poll_task #1" fired `orphaned_task`'s kill on the placeholder. A hook now counts only the calls it is about: `when_phase` (`"running"` / `"complete"`), `when_endpoint: True` (the answer names the endpoint it acted on) and `after_hook` (`draining_restop`'s thaw: the first stop after the freeze). Both feeds see them, and a hermetic test replays the batch against every scenario's hooks. `hook_problems` refuses a condition that could never fire. Graders keyed on "the first call of tool X" skip the server's own no-op answers made before any endpoint existed (`invariants.acted_on_nothing`): `teardown_slow_fs`, the MEP stop graders, `spend_gate_enforced` and the account floors; a skipped blind `confirm_spend=True` is still failed by `spend_not_unprompted`. The same rerun added two INFRA reasons for a cleanly ended run whose final answer is a tool call never made: raw harmony tool-call tokens the server left unparsed, or the call written as JSON (possibly the model's own format error) (`harness/infra.py`).
 
+- **Returning users: chains whose phases have different operators (2026-10-30, branch `test/returning-user`).** The
+  combinatorial follow-up to the Perlmutter report (plugin 0.1.20, 2026-10-29), whose leftovers came stacked. Each
+  cell is a two-session chain on the fake `nersc` profile (`agentic/harness/returning.py`; `agentic/README.md`,
+  "Returning users").
+  - **A `PHASES` entry may be a dict** (`run.py._phase_spec`). `{"script": fn, "server": "previous"}` is a scripted
+    session on the named release, whatever the cell's operator. `"when": fn(trace)` runs a phase only when it holds.
+    `INTERPHASE_SETUP` may hold callables that get an `InterphaseContext` (the next phase's index, the trace so far,
+    the world channel, the login nodes).
+  - **The bundle marks each phase** of such a chain (`{"chain_phase": k, "operator": …}`). `regrade.chain_trace`
+    reads each phase with its own operator's reader: a script's or a CLI's steps-and-journal rows, the Claude SDK's
+    stream.
+  - **Codex, Pi and Hermes drive a chain whose first phase is scripted** (`midrun_hooks.seeded_chain`): after it the
+    cell's operator only runs fresh one-shot sessions. A plain prompt chain stays the Claude operator's.
+  - **The previous release is in the image** (`prev_release.py`). It is the newest `v*` tag older than pyproject's
+    version, computed at every build so it moves with each release. `run_smoke.sh` / `run_suite.py` export its tree
+    and the Dockerfile installs it from its own lock at `/opt/hpcb-prev`. It keeps no journal, so a scripted phase on
+    it takes the script's own steps as the record (`script_runner.steps_trace`; `steps_as_record` in the head row).
+  - **New node actions** (`node_actions.py`): `sshd_closed` closes a login node to new logins and keeps its
+    processes, so a manager may still run on a node no one can reach. `qos_retire` / `qos_restore` run on the
+    controller, and the nersc submit filter reads `/etc/slurm/retired_qos.conf`.
+  - **The cells are pairwise** (`pairwise.py`, deterministic, constraints as forbidden pairs) and checked in as
+    `returning_cells.tsv`: 20 scripted cells over 11 factors. Three agent cells (Perlmutter replay, all well, new
+    laptop) run in every wave of the sweep's `nersc` profile. The scripted cells are the script-only sweep profile
+    `returning`, which boots the nersc cluster.
+  - **A scripted phase's server ending under this process** (the script operator's in-process MCP client) is no
+    longer reported as `harness:server_exited`. The script closes each session itself.
+
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.
 - The fake-seams agentic tier (control/cost/fault) — separate harness, shares this trace/invariant core.

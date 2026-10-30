@@ -28,7 +28,7 @@ SCENARIOS_DIR = _HERE.parents[0] / "scenarios"
 sys.path.insert(0, str(_HERE))
 sys.path.insert(0, str(SCENARIOS_DIR))
 
-from infra import PREFLIGHT_ROW, absences, bundle_final, infra_reason, outcome_of  # noqa: E402
+from infra import PREFLIGHT_ROW, absences, agent_part, bundle_final, infra_reason, outcome_of  # noqa: E402
 from invariants import (  # noqa: E402
     FLOOR_NAMES,
     OPERATOR_PREFERENCE_GRADERS,
@@ -212,7 +212,8 @@ def bundle_infra(d: Path, rec: dict, t: Trace, crit_fail_names: list[str], postc
     stored = list(rec.get("failed") or []) + [name for name, _ in world]
     rows = _rows(d)
     operator = (rec.get("config") or {}).get("operator") or "claude"
-    return infra_reason(outcome_of(operator, t, rows, bundle_final(rows, rec.get("final"))), crit_fail_names + stored,
+    return infra_reason(outcome_of(operator, *agent_part(t, rows), bundle_final(rows, rec.get("final"))),
+                        crit_fail_names + stored,
                         absences(world, postchecks))
 
 

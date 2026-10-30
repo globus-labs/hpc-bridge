@@ -841,3 +841,19 @@ def test_run_reports_a_closed_channel_while_the_server_process_lived_on(monkeypa
     assert "stub server: up" in row["detail"]                               # the server's last words, from its log
     assert not [g for g in rec["grading"] if g["name"] in ("harness:server_exited", "harness:server_orphaned")]
     assert "harness:server_channel_closed" not in rec["failed"]
+
+
+def test_a_scripted_phases_server_ending_under_this_process_is_not_an_early_exit(tmp_path):
+    """The script operator's MCP client is run.py itself: a chain's scripted phase (the returning-user cells' session 1)
+    closes its session and its server while this process runs on to the next phase — not a lost server."""
+    import os
+    world = _World()
+    me = os.getpid()
+    w = _watch(tmp_path, world, (500, me), (501, 400))
+    w.poll()
+    del world.alive[500]                       # session 1's server, closed by the script
+    del world.alive[501]                       # another client's server, lost while that client ran on
+    w.poll()
+    world.t += 30
+    w.finish()
+    assert [p.pid for p in w.early()] == [501]

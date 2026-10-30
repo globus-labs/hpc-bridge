@@ -416,7 +416,7 @@ def test_the_script_only_profiles_boot_their_own_cluster_and_run_only_their_scri
 def test_nersc_runs_the_returning_agent_cells_in_every_wave_then_the_perlmutter_proofs(tmp_path):
     # the three returning-user agent cells are chains that open with a scripted session: the free operators drive them
     # (midrun_hooks.seeded_chain), so they stay out of paid_only(); the report's scripted proofs follow, once
-    r, calls, summary, _ = _sweep(tmp_path, "--operators", "pi,codex,hermes21", "--profiles", "nersc")
+    r, calls, _, _ = _sweep(tmp_path, "--operators", "pi,codex,hermes21", "--profiles", "nersc")
     assert r.returncode == 0, r.stdout + r.stderr
     suites = [(_arg(c, "--profile"), c["operator"], _arg(c, "--scenarios")) for c in calls if c["tool"] == "run_suite"]
     agent = "returning_perlmutter_replay,returning_all_well,returning_new_laptop"

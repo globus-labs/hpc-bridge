@@ -50,9 +50,14 @@ agentic/
     infra.py             ← the INFRA verdict: the operator produced nothing to grade because its model endpoint failed
     alcf_probe.py        ← run_smoke.sh's check that the ALCF endpoint answers, before a free operator's cell
     regrade.py           ← replay stored bundles through the CURRENT invariants (offline re-grading)
+    returning.py         ← the RETURNING-USER cells: factors, the two-session chain, the user's part, the invariants
+                           every cell holds (see "Returning users" below); returning_cells.tsv is its checked-in table
+    pairwise.py          ← a deterministic all-pairs generator with pair constraints (the returning-user cells)
+    prev_release.py      ← the PREVIOUS release, exported from its tag before every jail build and installed at
+                           /opt/hpcb-prev (a returning-user cell's first session may run it)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 75 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 79 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -75,6 +80,9 @@ agentic/
                            the Perlmutter report (scripted RED proofs, `site` / `nersc`; fail on main until fixed):
                              stale_login_pin · kept_entry_after_failure · cached_password_otp · home_outside_home ·
                              noisy_failure_tail · partition_proposal_policy
+                           returning users (`nersc`; two sessions, the first on this or the previous release; the first
+                           of them scripted, one pairwise cell a run, the others an agent in session 2):
+                             returning_user · returning_perlmutter_replay · returning_all_well · returning_new_laptop
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
@@ -289,6 +297,87 @@ export `HPC_BRIDGE_SEARCH_INDEX=<index-uuid>` on the host and `run_smoke.sh` for
 (nothing changes when it's unset — the suite stays on BYO discovery). The mounted `storage.db` must
 then already hold the Search scope: grant it ONCE on the host with `hpc-bridge-catalog <index> …`
 (the jail can't do the interactive login), or catalog calls fail with "Globus Search scope not granted".
+
+## Returning users (`harness/returning.py`, the pairwise cells)
+
+A user comes back to a facility with leftover state from an earlier session, possibly written by an older plugin,
+after the world changed under it. The Perlmutter report (plugin 0.1.20, 2026-10-29) was such a user, with the
+leftovers stacked: a dead login-node pin, a proven record whose login had become password + one-time code, a venv
+under `/home`, an endpoint left online and reused under a renamed id, hand-edits to `~/.hpc-bridge`. Every cell is a
+chain on the fake `nersc` profile:
+
+1. **Session 1, scripted, on the cell's `origin` plugin.** `current` is this checkout. `previous` is the newest
+   release tag older than this version (`prev_release.py`: today `v0.1.20-beta.1`); `run_smoke.sh` and `run_suite.py`
+   export it before every build, and the image installs it from its own lock at `/opt/hpcb-prev`. Session 1 brings
+   up a working endpoint, with QOS `debug` and `-C cpu`, and on 0.1.20 the env_setup that version needs on nersc (its
+   `/home` venv default fails there). It runs hello on a compute node and ends as `ended` says.
+2. **Between the sessions** (`INTERPHASE_SETUP`), the other factors are applied:
+   - the endpoint stopped or killed hard (`kill -9` while the cloud still lists it online);
+   - the venv or the endpoint's directory deleted, or another globus-compute-endpoint version installed in the venv;
+   - the QOS retired (the node action `qos_retire`: the submit filter reads `/etc/slurm/retired_qos.conf`);
+   - the key revoked;
+   - the pinned node closed to new logins (`sshd_closed`: its processes run on);
+   - the host keys changed in the jail's `known_hosts`;
+   - the token store gone;
+   - `facilities.json`'s record deleted, `~/.hpc-bridge` wiped, or a new facility id.
+3. **Session 2, the current code**, drives toward hello world on a compute node. When hpc-bridge asks for the user's
+   part, the script does it once per kind and carries on:
+   - `needs_preauth`: the key put back and the handoff's command run, as after a re-run sshproxy;
+   - `needs_login`: the token store put back, as after a browser login;
+   - a CHANGED host key: `known_hosts` fixed, after checking hpc-bridge left it alone;
+   - a refused block: QOS `regular` chosen.
+
+   hpc-bridge never accepts a changed host key on the user's behalf.
+
+The 20 scripted cells are **pairwise** over 11 factors. Every pair of levels is in some cell, and two pairs are
+excluded (`torn_down` × `endpoint_dir_deleted` is redundant, `venv_deleted` × gce `changed` impossible). The table is
+checked in as `harness/returning_cells.tsv`; `python3 agentic/harness/returning.py --write-cells` regenerates it,
+`--list` names each cell's changes, and `test_returning.py` fails while the table is stale or a pair is uncovered.
+
+**Invariants every cell holds** (`ru_*` rows, gated):
+- `ru_hello_world`: a working compute shell at the end.
+- `ru_dead_pin`: a dead pin met at most once, its pin then dropped.
+- `ru_explicit_args`: an explicit `ssh_host` never overridden by a cached record.
+- `world:ru_one_live_endpoint`: at most one live endpoint, by the manager processes on every login node, with the
+  cloud's view reported beside it.
+- `world:ru_state_current`: `~/.hpc-bridge` parses with today's models and pins no dead node.
+- `ru_bounded`: a bounded number of calls.
+
+**Per factor:** `ru_revoked_handoff` (`needs_preauth`, never NO SSH ACCESS), `ru_expired_login`,
+`ru_host_key_honest`, `ru_reused` (running + alive + key + untouched/renamed id, with nothing changed on the login
+node), `ru_killed_not_up` (the login shape answers after the first `needs_account`), `world:ru_venv_under_home`
+(venv deleted) and `ru_policy_surfaced` (a refused block said within a bounded wait).
+
+The world check runs before the teardown and then puts the world back: the key, the token store, `known_hosts`, the
+closed node and the retired QOS. The node actions and `CLEANUP` undo the last of these again when a cell dies.
+
+```bash
+agentic/fakecluster/bin/up.sh --profile nersc
+HPCB_RETURNING_CELL=c07 HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=nersc ./agentic/run_smoke.sh returning_user
+HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=nersc ./agentic/run_smoke.sh returning_new_laptop
+```
+
+**The three agent cells** put the cell's operator in session 2, after the same scripted session 1 on the previous
+release:
+- `returning_perlmutter_replay`: an endpoint left online, the pinned node dead, the key revoked.
+- `returning_all_well`: nothing changed, so reuse and rebuild nothing.
+- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate.
+
+When the agent stops to ask for the user's part, the harness does it and a follow-up turn continues (a phase with a
+`when`). They also grade `ru_no_hand_edits`: the agent never writes to `~/.hpc-bridge` or `~/.globus_compute`.
+
+**A chain whose phases have different operators.** A `PHASES` entry may be a dict:
+`{"script": <async fn(ops)>, "server": "previous"}` is a scripted session on the named release, whatever the cell's
+operator. `"when": fn(trace) -> bool` runs a phase only when it holds. An `INTERPHASE_SETUP` entry may be a callable
+taking an `InterphaseContext`. Such a chain's bundle marks each phase (`{"chain_phase": k, "operator": …}`), and
+`regrade.py` reads each phase with its own operator's reader. Codex, Pi and Hermes drive a chain whose first phase is
+scripted (`midrun_hooks.seeded_chain`); a plain prompt chain stays the Claude operator's. A server that keeps no
+journal (0.1.20) has the script's own steps as its record (`script_runner.steps_trace`).
+
+**In the sweep:**
+- `returning` is a script-only sweep profile. It boots the `nersc` cluster and runs `returning_user` once per cell,
+  each row `returning_user <cell> — RESULT: …`.
+- `nersc` runs the three agent cells in every wave, then the Perlmutter report's scripted proofs.
 
 ## Concurrency & isolation (pool users)
 

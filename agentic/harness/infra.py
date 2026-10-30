@@ -339,6 +339,35 @@ def _cli_head(messages: Iterable[Any]) -> dict | None:
     return None
 
 
+def agent_part(trace: Trace, messages: list[Any]) -> tuple[Trace, list[Any]]:
+    """What the cell's OPERATOR did, in a chain whose phases have different operators (run.py `_combine`'s
+    `chain_phase` markers): only its own phases' calls, texts and messages. A scripted phase (the returning-user cells'
+    session 1, labelled `script…`) is the harness making the world, not the operator acting — counted as the
+    operator's work it would make an outage in the agent's turn read FAILED, and its rows would hide the CLI's own
+    head row. Any other run is returned as given."""
+    rows = list(messages or [])
+    if not rows or not (isinstance(rows[0], dict) and "chain_phase" in rows[0]):
+        return trace, rows
+    keep: set[int] = set()
+    seg: list[Any] = []
+    mine = False
+    for m in rows:
+        if isinstance(m, dict) and "chain_phase" in m:
+            mine = not str(m.get("operator") or "").startswith("script")
+            if mine:
+                keep.add(int(m["chain_phase"]))
+            continue
+        if mine:
+            seg.append(m)
+    # the operator's own words, read from its own rows (a script's words sit at the same places as an agent's first)
+    if _cli_head(seg) is not None:
+        texts = [str(m["text"]) for m in seg if isinstance(m, dict) and "text" in m]
+    else:
+        from trace_adapter import trace_from_rows
+        texts = trace_from_rows(m for m in seg if isinstance(m, dict)).texts
+    return Trace([c for c in trace.calls if c.phase in keep], texts), seg
+
+
 def outcome_of(operator: str, trace: Trace, messages: list[Any], final: Any) -> Outcome:
     """Read an Outcome from a run: live (run.py: the RunResult's trace, messages and final) or from a bundle (regrade.py:
     the rebuilt trace, messages.jsonl's rows and `bundle_final`). The same fields in both."""

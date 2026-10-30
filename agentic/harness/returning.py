@@ -42,12 +42,11 @@ import asyncio
 import json
 import os
 import re
-import shlex
 import shutil
 import subprocess
 import sys
 import time
-from collections.abc import Callable, Mapping
+from collections.abc import Callable
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -213,9 +212,14 @@ def session2_facility(fid: str, cell: Cell) -> str:
 
 def project_python(code: str, *args: str, timeout: int = 90) -> tuple[int, str, str]:
     """Run `code` in the project's own environment (where globus_compute_sdk and hpc_bridge are: the jail's system
-    Python has neither) — as run.py's _deregister_in_project_env does, stdin closed."""
-    argv = ["uv", "run", "--frozen", "--offline", "--directory", str(REPO), "--extra", "integration", "python", "-c",
-            code, *args]
+    Python has neither), stdin closed — through its interpreter directly. `uv run --offline` (run.py's
+    _deregister_in_project_env) first rebuilds the editable project when its sources are newer than the build, which
+    offline it cannot: in a cell whose first session ran the PREVIOUS release, no `uv run` had rebuilt it yet, and the
+    interphase's cloud read failed "Packages were unavailable because the network was disabled" (c03, 2026-10-30)."""
+    venv_py = REPO / ".venv" / "bin" / "python"
+    head = [str(venv_py)] if venv_py.exists() else ["uv", "run", "--directory", str(REPO), "--extra", "integration",
+                                                    "python"]
+    argv = [*head, "-c", code, *args]
     try:
         r = subprocess.run(argv, capture_output=True, text=True, timeout=timeout, stdin=subprocess.DEVNULL)
     except Exception as exc:  # noqa: BLE001 - uv missing, a timeout: the caller reports it
@@ -434,13 +438,13 @@ def session_1(cell: Cell):
         # $HOME/hpc-bridge (the cell's SETUP removed every other), keyed today, unkeyed on 0.1.20
         procs, venv = [], None
         for node in ([pin] if pin else []) + [h for h in KH_NAMES[1:] if h != pin]:
-            rc, got = await ops.world(procs_cmd(name), host=node, timeout=60)
+            _rc, got = await ops.world(procs_cmd(name), host=node, timeout=60)
             lines = read_procs(got) or []
             if manager_lines(lines):
                 procs, venv = manager_lines(lines), venv_of(lines)
                 pin = pin or node
                 break
-        rc, got = await ops.world('ls -d "$HOME"/hpc-bridge/gce-venv* 2>/dev/null', timeout=60)
+        _rc, got = await ops.world('ls -d "$HOME"/hpc-bridge/gce-venv* 2>/dev/null', timeout=60)
         built = [ln.strip() for ln in got.splitlines() if re.search(r"/gce-venv(-endpoint-[\w.]+)?$", ln.strip())]
         keyed = [v for v in built if "-endpoint-" in v]
         venv = (keyed[0] if keyed and not previous else next((v for v in built if "-endpoint-" not in v), None)) \
@@ -473,7 +477,9 @@ def close_masters() -> str:
     would carry session 2 past a revoked key or a closed node."""
     import glob
     import signal
-    socks = [p for d in (state_dir() / "cm", Path(f"/tmp/hpcb-cm-{os.getuid()}")) for p in glob.glob(f"{d}/*")]
+    # the product's ControlPath dirs: ~/.hpc-bridge/cm, else its short fallback (facility.remote._short_control_dir)
+    cm_dirs = (state_dir() / "cm", Path(f"/tmp/hpcb-cm-{os.getuid()}"))  # noqa: S108 - the product's own path
+    socks = [p for d in cm_dirs for p in glob.glob(f"{d}/*")]
     for sock in socks:
         subprocess.run(["ssh", "-S", sock, "-O", "exit", "x"], capture_output=True, timeout=20, check=False)
     killed = 0
@@ -622,9 +628,12 @@ def interphase(cell: Cell):
             notes.append(f"the manager on {pin} killed hard ({len(pids)} process(es)); the cloud says "
                          + (", ".join(f"{v['uuid'][:8]}={v['status']}" for v in view) if view else f"? ({why})"))
         if cell.remote == "venv_deleted":
-            rc, out = await _world(ctx, 'rm -rf "$HOME"/hpc-bridge/gce-venv*; ls -d "$HOME"/hpc-bridge/gce-venv* '
-                                        "2>/dev/null | wc -l")
-            notes.append(f"hpc-bridge's venvs deleted under $HOME/hpc-bridge (left: {out.strip()[-4:]})")
+            _rc, out = await _world(ctx, 'rm -rf "$HOME"/hpc-bridge/gce-venv*; echo "HPCB_LEFT=$(ls -d '
+                                        '"$HOME"/hpc-bridge/gce-venv* 2>/dev/null | wc -l)"')
+            left = next((ln.split("=", 1)[1].strip() for ln in out.splitlines() if ln.startswith("HPCB_LEFT=")), "?")
+            if left != "0":
+                raise RuntimeError(f"hpc-bridge's venvs not deleted (left: {left}): {out[-200:]!r}")
+            notes.append("hpc-bridge's venvs deleted under $HOME/hpc-bridge")
         elif cell.remote == "endpoint_dir_deleted":
             await _world(ctx, f'rm -rf "$HOME/.globus_compute/{name}"')
             notes.append(f"the endpoint's directory ~/.globus_compute/{name} deleted")
@@ -1146,10 +1155,10 @@ async def _put_back(cell: Cell, ctx) -> list[str]:
         done.append(fix_known_hosts())
     nodes = NodeActions.from_env()
     if STATE.get("dead"):
-        rc, out = await asyncio.to_thread(nodes.run, "sshd_on", STATE["dead"])
+        rc, _out = await asyncio.to_thread(nodes.run, "sshd_on", STATE["dead"])
         done.append(f"{STATE['dead']} open again (rc={rc})")
     if cell.site == "policy_changed":
-        rc, out = await asyncio.to_thread(nodes.run, "qos_restore", CONTROLLER)
+        rc, _out = await asyncio.to_thread(nodes.run, "qos_restore", CONTROLLER)
         done.append(f"QOS list restored (rc={rc})")
     return done
 

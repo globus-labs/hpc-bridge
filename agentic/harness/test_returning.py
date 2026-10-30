@@ -76,9 +76,11 @@ def test_the_generator_is_deterministic_and_pairwise_on_a_small_space():
     with pytest.raises(ValueError):
         pairwise.generate(factors, [({"a": "9", "b": "0"}, "no such level")])
     with pytest.raises(ValueError):
-        pairwise.generate({"a": ("0",), "b": ("0",)}, [({"a": "0", "b": "0"}, "every pair")]) \
-            if pairwise.all_pairs({"a": ("0",), "b": ("0",)}, [({"a": "0", "b": "0"}, "x")]) else (_ for _ in ()).throw(
-                ValueError("nothing left to cover"))
+        pairwise.check_constraints(factors, [({"a": "0"}, "a constraint names two factors")])
+    # a factor whose every level is forbidden beside a seed's: no row can be built for what is left
+    with pytest.raises(ValueError):
+        pairwise.generate({"a": ("0", "1"), "b": ("0",), "c": ("0",)},
+                          [({"a": "1", "c": "0"}, "x"), ({"b": "0", "c": "0"}, "y")])
 
 
 def test_a_cell_is_picked_by_its_id_and_an_unknown_one_is_refused(monkeypatch):
@@ -457,3 +459,20 @@ def test_the_interphase_runs_the_users_part_before_the_follow_up_turn(monkeypatc
             return 0, "key-restored"
     note = asyncio.run(ru.interphase(cell)(Ctx()))
     assert "accepted again" in note and any("authorized_keys.hpcb-revoked" in c for c in said)
+
+
+def test_infra_reads_only_the_agents_own_phases_of_a_mixed_chain():
+    # a scripted session 1 made every call; the agent's turn made none and ended on its model's outage: the harness'
+    # calls must not count as the operator's work (it would read FAILED), nor hide the CLI's own head row
+    from infra import agent_part, outcome_of
+    rows = [{"chain_phase": 0, "operator": "script@previous"}, {"harness": "script", "rc": 0},
+            {"native": {"name": "connect_facility", "hpcb": True, "args": {}, "result": {}, "ran": None}},
+            {"chain_phase": 1, "operator": "pi"},
+            {"harness": "pi", "rc": 1, "stdout_tail": "", "stderr_tail": "HTTP 503"}, {"final": ""}]
+    t = Trace([_c("connect_facility", {}, {"phase": "needs_account"}, 0)], [ru._FACTS + "{}"], [1])
+    agent, seg = agent_part(t, rows)
+    assert agent.calls == [] and agent.texts == [] and seg[0]["harness"] == "pi"
+    o = outcome_of("pi", agent, seg, None)
+    assert (o.hpcb_calls, o.tool_calls, o.rc) == (0, 0, 1)
+    plain = [{"harness": "pi", "rc": 0}]
+    assert agent_part(t, plain) == (t, plain)
