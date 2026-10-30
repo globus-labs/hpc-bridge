@@ -355,7 +355,10 @@ installed plugin only when that version changes); git tags mark releases.
     channel also writes (c04), and a stop's "reconnecting is zero-SSH" no longer reads as SSH (c08). The one failure
     is a product gap: c08 (a running manager whose venv was deleted, its pinned node closed, the key revoked) —
     the repair runs its venv check over the dead pin ("ssh: connect to host login01… Connection refused") and gives
-    up, where the shared home could be rebuilt through the other login node.
+    up, where the shared home could be rebuilt through the other login node. The agent cells, once each under Pi on the
+    self-hosted qwen model: all well and the Perlmutter replay (session 1 on 0.1.20) OK; the new laptop's agent
+    stopped at the probed configuration for the user to confirm, as the proposal's notice says to, and no follow-up
+    turn answered it — the follow-up now runs when a turn ends on a proposal and carries the user's yes (not re-run).
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

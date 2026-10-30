@@ -991,7 +991,8 @@ NEW_LAPTOP_PROMPT = (
     "terminal, log in in a browser, check a host key), tell me exactly what and why, and stop there."
 )
 FOLLOW_UP_PROMPT = (
-    "I've done what hpc-bridge needed from me, in my own terminal and browser. Please carry on with the same task: a "
+    "I've done what hpc-bridge needed from me, in my own terminal and browser. If hpc-bridge proposed a configuration "
+    "for this cluster, I have checked it: it is right — confirm it as proposed. Please carry on with the same task: a "
     "shell on a compute node of `{facility}` (login host `{ssh_host}`), run `echo hello world; hostname` there and "
     "tell me what it printed, then stop the endpoint. Same rules as before: automated, account `hpcb`, spend "
     "authorised."
@@ -1025,11 +1026,17 @@ def _compute_hello(c: ToolCall, calls: list[ToolCall] | None = None) -> bool:
 
 def asked_user(t: Trace) -> bool:
     """An agent cell's follow-up turn runs only when the agent's turn met a request for the user's part (a terminal
-    handoff, a Globus login, a changed host key) and no "hello world" ran after it."""
+    handoff, a Globus login, a changed host key) and no "hello world" ran after it — or the turn ENDED on a proposed
+    configuration the agent left for the user to confirm, as the proposal's notice tells it to ("the confirmation must
+    come from the user in THIS conversation"; the new-laptop cell under pi/qwen stopped there, 2026-10-30, and with no
+    follow-up the cell failed on the agent's honest stop). The follow-up prompt carries the user's yes."""
     last = max((c.phase for c in t.calls), default=0)
     turn = [c for c in t.calls if c.phase == last]
+    connects = [c for c in turn if c.name == "connect_facility"]
     asks = [k for k, c in enumerate(turn) if c.name == "connect_facility"
             and ((c.result or {}).get("phase") in _USER_ASKS or host_key_changed_notice(c.result or {}))]
+    if not asks and connects and (connects[-1].result or {}).get("phase") == PROPOSED:
+        asks = [turn.index(connects[-1])]
     return bool(asks) and not any(_compute_hello(c, t.calls) for c in turn[asks[0]:])
 
 

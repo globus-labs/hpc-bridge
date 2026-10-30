@@ -713,6 +713,11 @@ def test_the_follow_up_turn_runs_only_after_a_request_for_the_users_part():
     assert not ru.asked_user(_trace([HELLO]))
     changed = _c("connect_facility", {}, {"phase": "failed", "notice": "UNKNOWN HOST KEY … host key has CHANGED"})
     assert ru.asked_user(_trace([changed]))
+    # a turn that ENDS on a proposal the agent left for the user to confirm (the new-laptop cell, pi/qwen, 2026-10-30)
+    probe = _c("connect_facility", {}, {"phase": "proposed_facility_details"})
+    up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
+    assert ru.asked_user(_trace([probe])) and not ru.asked_user(_trace([probe, up]))
+    assert "confirm it as proposed" in ru.FOLLOW_UP_PROMPT
 
 
 def test_session_1_names_the_venv_its_version_needs_on_nersc():
