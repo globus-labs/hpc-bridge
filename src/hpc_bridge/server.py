@@ -1918,6 +1918,11 @@ async def _ready_session(
 # How long run_shell's cold answer reuses the last pilot probe's words on a still-cold block before probing again: the
 # probe is a login-shape round trip (two, with its check), and an agent may poll run_shell every few seconds.
 _COLD_PROBE_REUSE_S = 60.0
+# ...and how long its own probe may take: the login shape has ONE worker, and a command of the agent's on it would hold
+# the probe for the whole sync-wait. Cut off at this, or skipped while the login shape has work in flight, the answer
+# is the plain cold start and nothing is recorded (the next answer probes again). The probe's internal dispatch is not
+# tracked, so cancelling it leaves nothing behind but the read-only command.
+_COLD_PROBE_WAIT_S = 15.0
 
 
 async def _cold_answer(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockState) -> ShellOutcome:
@@ -1926,8 +1931,9 @@ async def _cold_answer(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockSt
     already FINISHED, or none in the scheduler and likely REJECTED, with the reply its user endpoint logged — so an
     agent polling run_shell learns it too, not "allocating nodes…" forever (Perlmutter report, 2026-10-29): the last
     probe of this cold spell on these terms while it is under `_COLD_PROBE_REUSE_S` old (ensure_endpoint_up's or an
-    earlier answer's), else a probe of its own. The phase stays cold_start: nothing is voided on a probe. The grace
-    clock starts here too, as on ensure_endpoint_up's first cold poll."""
+    earlier answer's), else a probe of its own, bounded by `_COLD_PROBE_WAIT_S` and skipped while the login shape is
+    busy. The phase stays cold_start: nothing is voided on a probe. The grace clock starts here too, as on
+    ensure_endpoint_up's first cold poll."""
     out = _cold_outcome(block, rt.last_canary, app=app, rt=rt)
     eid = app.state.endpoint_id
     if out.phase != "cold_start" or not eid or not _billable(rt) or not rt.spend_confirmed or not _has_login_shape(app):
@@ -1939,12 +1945,19 @@ async def _cold_answer(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockSt
         if rt.provisioning_since is None:
             rt.provisioning_since = now
         since, elapsed, seen = rt.provisioning_since, now - rt.provisioning_since, rt.probe_said
+        login = app.shapes.get("login")
+        busy = login is not None and (login.inflight > 0 or bool(_live_task_handles(app, "login")))
     if elapsed < PROVISION_GRACE_S:
         return out
     if seen is not None and seen[0] == rt.block_epoch and seen[1] >= since and now - seen[1] < _COLD_PROBE_REUSE_S:
         found = seen[2]
+    elif busy:  # its one worker is running a command: a probe would wait behind it
+        found = ""
     else:
-        found = (await _probe_cold_block(app, shape, rt, eid, elapsed))[0]
+        try:
+            found = (await asyncio.wait_for(_probe_cold_block(app, shape, rt, eid, elapsed), _COLD_PROBE_WAIT_S))[0]
+        except TimeoutError:
+            found = ""
     if found:
         out.notice = f"{out.notice} {found}" if out.notice else found
     return out

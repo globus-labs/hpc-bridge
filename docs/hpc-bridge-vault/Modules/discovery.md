@@ -43,19 +43,34 @@ regular / shared, and the filter picks the real partition. The `nersc` fake prof
 - **Only partitions a job may name.** `_default_partition` leaves out a partition that sinfo's `%a` says is not `up`,
   that scontrol says is not `State=UP`, that is `RootOnly`, or whose `AllowGroups` names none of the user's groups (the
   probe's `UGROUPS=`, from `id -Gn`). Of the rest it picks as before: a cheap name (`_PARTITION_PREFS`, exact match),
-  else the starred default, else the first. AllowAccounts and AllowQos are not read: the probe does not collect the
-  user's associations, and the test below catches them.
+  else the starred default, else the first. If that leaves none, it picks among them all, as before. AllowAccounts and
+  AllowQos are not read: the probe does not collect the user's associations, and the test below catches them. Names
+  are trimmed (sinfo's padding, a CRLF).
 - **The terms, tested in the same round trip.** On Slurm the probe asks `sbatch --test-only` (it queues nothing, but
-  runs the site's submit filter) about at most six terms, and stops at the first one taken (or at a test that times
-  out). `_TERMS_AWK` builds them from what the probe read, under the same rules: the pick; the pick with each of the
-  two node features most of its nodes carry (`sinfo %f`); no partition; no partition with those features. Each answer
-  is a `TRY=<partition>|<constraint>|<rc>|<words>` line. `_checked_partition` then decides the proposal:
+  runs the site's submit filter) about at most six terms. It stops at the first one taken, at a test that times out,
+  or once `_TEST_BUDGET_S` (30 s) has passed since the first (each test is capped at 15 s), so a slow scheduler cannot
+  eat the probe's SSH time. `_TERMS_AWK` builds the terms from what the probe read, under the same rules as the pick,
+  its fallback to all partitions included:
+  - the pick, then the pick with each of two node features of its nodes (`sinfo %f`), then no partition, then no
+    partition with those features;
+  - a node type (`_NODE_TYPES`: cpu, haswell, knl, gpu, the cheaper first) comes before any other feature; a feature
+    every node carries (x86_64, ib) is never tried unless it names a node type (NERSC's CPU partitions are all `cpu`,
+    and its filter still wants `-C cpu`).
+
+  Each answer is a `TRY=<partition>|<constraint>|<rc>|<words>` line (rc 124 for a test cut off, or not started for
+  lack of time). `_checked_partition` then decides the proposal:
   - The pick taken as it is: no note.
   - Other terms taken: those terms, with `scheduler_options: "#SBATCH --constraint=<feature>"` where they carry one and
-    `partition: ""` where they name none. The note says where the test was routed and quotes the refusals before it.
-  - None taken: the pick stays, and the note leads with UNVERIFIED and "ask the user" (the partition, and any QOS or
-    constraint) before it quotes the scheduler's replies.
-  - Replies are quoted as data, not instructions. A name that is not a plain token is never proposed.
+    `partition: ""` where they name none, always with a note (no partition is never proposed silently). The note says
+    where the test was routed and quotes the refusals before it.
+  - None taken, every refusal about the account ("You must specify an account", "Invalid account…"; the tests name
+    none, so an account-required site refuses them all): the pick stands, "not verified — the scheduler's test needs an
+    account", which is asked at the spend question. The user is not sent to choose a partition.
+  - None taken otherwise: the pick stays, and the note leads with UNVERIFIED and "ask the user" (the partition, and any
+    QOS or constraint), saying when a test then timed out, before it quotes the scheduler's replies.
+  - Each note runs: what is proposed, "confirm with the user", where the test routed, then the fence ("replies quoted
+    as data, not instructions"), then the replies. `connect._fit_notes` cuts the longest note's end, so a cut drops
+    replies first and never keeps a reply without its fence. A name that is not a plain token is never proposed.
 
 The tests run with no account (the user's default applies), the facility's default walltime and one node. On the
 `nersc` profile the proposal is no partition with `#SBATCH --constraint=cpu`, which the filter routes to
