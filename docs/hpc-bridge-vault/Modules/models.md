@@ -25,5 +25,11 @@ env_setup). `BlockTerms` (`:151`) gains the block's size: `whole_node`, `cores_p
 `this_call` / `earlier_call` / `proposed` — D3's slice — / `partition` — whole nodes because the partition gives only
 those — / `facility`), and where the billing weights are known `max_charge` + `charge_basis` ("8 cores × 0.5 h").
 
+## `EndpointStatus.preauth_command` (2026-10-30)
+Set while a block is `provisioning` and a repair of the endpoint's broken environment needs an SSH login the user
+opens in their own terminal ([[warmth]] `_repair_handoff`). The agent relays it as it relays connect_facility's
+`needs_preauth` command, and never handles the secret; then it calls ensure_endpoint_up again. A proposal's
+`ConnectFacilityResult.reused` is true when the probe ran through the user's online endpoint ([[connect]]).
+
 ## See also
 [[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]]

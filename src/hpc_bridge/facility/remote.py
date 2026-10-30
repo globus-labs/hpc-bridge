@@ -261,6 +261,31 @@ def offers_one_time_code(stderr: str) -> bool:
     return key_accepted_second_factor_pending(stderr)
 
 
+async def online_endpoint_named(name: str, client_factory) -> str | None:
+    """`SlurmFacility.find_online_endpoint` for a caller with no facility yet (a new laptop's first connect: no config,
+    connect._probe_through_endpoint): the id of an endpoint OWNED by this identity named `name` that the web service
+    lists online, else None. NO SSH. "online" is the manager's heartbeat as the service last saw it — a ghost reads
+    online too (#37): the caller's check of a login worker decides. A web error reads as none."""
+    try:
+        client = client_factory()
+        endpoints = await asyncio.to_thread(client.get_endpoints, "owner")
+    except Exception as exc:  # noqa: BLE001 - web/auth failure -> none found: the caller probes over SSH
+        print(f"hpc-bridge: endpoint lookup failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return None
+    for ep in endpoints or []:
+        ep_name = ep.get("name") or ep.get("display_name")
+        ep_id = ep.get("uuid") or ep.get("endpoint_uuid") or ep.get("id")
+        if ep_name != name or not ep_id:
+            continue
+        try:
+            status = await asyncio.to_thread(client.get_endpoint_status, ep_id)
+        except Exception:  # noqa: BLE001 - this one unreadable: the next
+            continue
+        if (status or {}).get("status") == "online":
+            return str(ep_id)
+    return None
+
+
 class NeedsPreauth(Exception):
     """An SSH op needs a one-time interactive pre-auth (password/MFA). Carries the target so a caller can
     surface the user's pre-open command (`preauth_command`), and `otp_ok`: whether a one-time CODE would
@@ -433,6 +458,10 @@ _DEFAULT_HEARTBEAT_S = 30.0
 _PID_WAIT_CAP_S = 150.0  # the longest a bring-up waits out that window inside its own (heartbeated) call
 _PID_POLL_S = 10.0       # how often the wait reads the file again: inside one 15 s touch of a live instance
 _PID_MARGIN_S = 3.0      # past the window, for the two clocks (the login node's, the file server's)
+# ssh's own verdict that a host did not answer at all — never a refused login (which keeps a pin: the host is fine, the
+# access is not). The words notices._explain_provision_error reads as CANNOT REACH.
+_UNREACHABLE = re.compile(r"ssh: connect to host [^\n]*(?:connection refused|no route to host|timed out|"
+                          r"network is unreachable|host is down|network is down)|could not resolve hostname", re.I)
 _sleep = asyncio.sleep  # indirection so tests can run the poll loop without waiting
 _JOBID = re.compile(r"^\d+(_\d+)?$")  # plain or array slurm job id (guards what we scancel)
 _JOBID_PBS = re.compile(r"^\d+(\.\S+)?$")  # PBS: bare or host-qualified (1234567.polaris-pbs-01)
@@ -1377,6 +1406,7 @@ class SlurmFacility:
         self.endpoint_worker_init: str | None = None
         self.worker_init_note = ""  # set when the endpoint's own differs from this facility's env_setup
         self._adopted: str | None = None  # the endpoint id whose worker_init is known (READ, or started here)
+        self._past_dead_pin: str | None = None  # a repair's pinned node that did not answer (repair_endpoint_env)
         # Whether the bound endpoint's template is one that gives each block request its own compute user endpoint and
         # lets it exit when idle (this plugin's: `idle_heartbeats_soft` on the compute branch). Read with the
         # worker_init (adopt_endpoint), set when provision writes it; False until known — a template of an earlier
@@ -1651,12 +1681,14 @@ class SlurmFacility:
         rebuilt venv at the same path serves its next user endpoints. Returns (what it did, the endpoint id)."""
         name = self.profile.endpoint_name
         self.cli.venv_ready = None  # checked earlier in this process, perhaps — and deleted since
-        await self._ensure_venv()
+        dead = await self._ensure_venv_past_a_dead_pin()
         res = getattr(self.cli, "venv_built", None)
         what = (f"rebuilt hpc-bridge's endpoint venv {res.path} ({res.reason})" if res is not None and res.built
                 else "checked hpc-bridge's endpoint venv (it works now)" if self.cli.venv is not None
                 else "ran the facility's env_setup again")
         target = self.cli.target
+        if dead is not None:
+            return await self._restart_past_a_dead_pin(hpc, endpoint_id, dead, what)
         if getattr(target, "host_key_alias", None) in (None, target.host) and target.host == self.alias:
             return f"{what}; the endpoint was not restarted (no pin says which login node runs it)", endpoint_id
         rc, said = await self.cli.stop(name)
@@ -1664,6 +1696,64 @@ class SlurmFacility:
             raise RuntimeError(f"{what}, but could not reach {target.host} to restart the endpoint: {said[-200:]}")
         handle = await self.provision(hpc)
         return f"{what}, and restarted the endpoint on {target.host}", handle.endpoint_id
+
+    async def _ensure_venv_past_a_dead_pin(self) -> str | None:
+        """The repair's venv check, on the pinned login node — and, when that node does not answer at all (connection
+        refused, no route, timed out: never a refused LOGIN, which keeps the pin), through the facility's own host
+        instead: the venv lives on the shared home, so any login node rebuilds it. Found by the returning-user cell c08
+        (2026-10-30): a running manager whose venv was deleted, its pinned node closed to new logins — the check went to
+        the pin, met "Connection refused" and the repair gave up. The pin is dropped only once the facility's host
+        answered (its venv check ran, or asked for the user's login): a host that does not answer either is the
+        client's own network (connect._drop_dead_pin's rule) and keeps the pin. Returns the dead node, or None — and the
+        dead node again on a later repair through the facility's host (`_past_dead_pin`: the first one handed the
+        user's login to their terminal, and this one rides the connection they opened)."""
+        target = self.cli.target
+        pinned = not (getattr(target, "host_key_alias", None) in (None, target.host) and target.host == self.alias)
+        try:
+            await self._ensure_venv()
+            return None if pinned else self._past_dead_pin
+        except Exception as exc:
+            if not pinned or not self.alias or not _UNREACHABLE.search(str(exc)):
+                raise
+            dead = target.host
+        self.cli.target = replace(target, host=self.alias, host_key_alias=None)  # the facility's host, as before a pin
+        self.cli.venv_ready = None
+        self._past_dead_pin = dead
+        try:
+            await self._ensure_venv()
+        except Exception as exc:
+            if _UNREACHABLE.search(str(exc)):   # the facility's host does not answer either: not a dead pin
+                self.cli.target = target
+                raise
+            self._drop_pin()   # it answered (asking for the user's login, perhaps): the pin is what is dead
+            raise
+        self._drop_pin()
+        return dead
+
+    def _drop_pin(self) -> None:
+        if self.store is not None and self.alias:
+            try:
+                self.store.remove(alias=self.alias, name=self.profile.endpoint_name)
+            except Exception:  # noqa: BLE001 - best-effort hygiene, as connect._drop_dead_pin
+                pass
+
+    async def _restart_past_a_dead_pin(self, hpc: Profile, endpoint_id: str, dead: str, what: str) -> tuple[str, str]:
+        """After a rebuild through the facility's host (`_ensure_venv_past_a_dead_pin`): the manager runs on `dead`,
+        which nothing here can reach to stop. If it still runs — its pid file refreshed within globus-compute's stale
+        window, as only a live instance does — it is left running: it starts its next user endpoints from the venv
+        rebuilt at the same path, and a second manager started elsewhere would be refused (`_pidfile_check`) or be a
+        second instance. If it is gone too, the endpoint is started again on the node the facility's host reaches."""
+        name = self.profile.endpoint_name
+        self._past_dead_pin = None   # this repair is done with it
+        head = (f"{what} through {self.alias} (the home is shared): the login node it was pinned to, {dead}, does not "
+                "answer, so its pin was dropped")
+        probe = await self.cli.pid_file(name)
+        if probe is not None and probe.age is not None and probe.age <= probe.window:
+            return (f"{head}. Its manager still runs on {dead} (its pid file was refreshed {probe.age:.0f} s ago) and "
+                    "starts its next user endpoints from the rebuilt venv: it was left running", endpoint_id)
+        handle = await self.provision(hpc)
+        return (f"{head}. Its manager there is gone too: the endpoint was started again on "
+                f"{handle.login_host or self.alias}", handle.endpoint_id)
 
     def _seeded_by_us(self) -> bool:
         """Did hpc-bridge place the remote token store? This process remembers its own bootstrap; across

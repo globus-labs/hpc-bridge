@@ -523,6 +523,8 @@ async def _ensure_endpoint_up(
         spend = _total_session_spend(app)
         provisioning_elapsed = 0.0
         status: Literal["up", "provisioning"]
+        if block == "warm" and app.state.endpoint_id is not None:
+            app.env_repair_handoff.pop(app.state.endpoint_id, None)   # up: nothing waits for the user's login now
         repaired = _env_repair_note(app)
         if block == "warm":
             status, notice = "up", repaired + (_worker_notice(rt.last_canary) or "worker live")
@@ -635,16 +637,26 @@ async def _ensure_endpoint_up(
         block_job_id=job_id,
         block=receipt_terms,
         notice=said(notice),
+        preauth_command=_env_repair_preauth(app) if status == "provisioning" else None,
     )
 
 
 def _env_repair_note(app: AppCtx) -> str:
-    """What a repair of this endpoint's broken environment did (warmth._repair_broken_env), said once."""
+    """What a repair of this endpoint's broken environment did (warmth._repair_broken_env), said once — or, while it
+    waits for the user's login (`AppCtx.env_repair_handoff`), what the user must do, said on every answer until then."""
     eid = app.state.endpoint_id
+    if eid is not None and eid in app.env_repair_handoff:
+        return app.env_repair_handoff[eid][1]
     if eid is None or eid not in app.env_repairs or eid in app.env_repair_said:
         return ""
     app.env_repair_said.add(eid)
     return app.env_repairs[eid]
+
+
+def _env_repair_preauth(app: AppCtx) -> str | None:
+    """The command the user runs in their own terminal so a repair can log in (`_env_repair_note`), or None."""
+    eid = app.state.endpoint_id
+    return app.env_repair_handoff[eid][0] if eid is not None and eid in app.env_repair_handoff else None
 
 
 async def _probe_cold_block(app: AppCtx, shape: str, rt: ShapeRuntime, eid: str,

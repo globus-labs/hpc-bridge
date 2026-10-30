@@ -410,6 +410,11 @@ class AppCtx:
     # repair an answer has already named.
     env_repairs: dict[str, str] = field(default_factory=dict)
     env_repair_said: set[str] = field(default_factory=set)
+    # A repair that needs the USER's login first (the facility's host asks for a password / one-time code — c08's key
+    # was revoked): by endpoint id, (the command the user runs in their own terminal, what the answer says, the
+    # import failure it repairs). Not a
+    # repair done: the next check that meets the broken environment tries again, over the connection the user opened.
+    env_repair_handoff: dict[str, tuple[str, str, str]] = field(default_factory=dict)   # + the import failure
     runner_factory: Callable[..., GlobusRunner] = GlobusRunner
     # The in-terminal Globus login (login.py). None ⇒ no login gating (hermetic tests / unbound dev);
     # lifespan installs the real one, which rides the Compute SDK's own client id + token storage.

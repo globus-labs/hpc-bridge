@@ -263,6 +263,10 @@ class EndpointStatus(BaseModel):
     # that passes confirm_spend=True again on a block already confirmed carries none. None for the login shape (free).
     block: BlockTerms | None = None
     notice: str | None = None
+    # provisioning: a repair of the endpoint's broken environment needs an SSH login the USER opens in their own
+    # terminal (a password / one-time code) — relay this command, as connect_facility's needs_preauth; never handle the
+    # secret. Then call ensure_endpoint_up again: the repair rides that connection.
+    preauth_command: str | None = None
 
 
 class LoginShellResult(BaseModel):

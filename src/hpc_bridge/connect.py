@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 
 from . import binding, config, login_gate, warmth
@@ -538,12 +539,14 @@ async def _connect(
                 "HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app,
                 proposal_lead=lead)
         if entry is None:
+            # the registry answered and knows no such facility, and no record is cached: the reuse ladder's facility
+            # endpoint rung does not apply, so our own endpoint for the host is asked for before any SSH (`reattach`)
             return await _propose_or_ask(
                 facility, ssh_host,
                 f"{facility!r} isn't in the catalog. Give me its SSH host (ssh_host=… or "
                 "HPC_BRIDGE_SSH_HOST) and I'll probe the login node to propose a config, or supply "
                 "details= directly (or list_facilities() if you meant a catalogued one).", app=app,
-                proposal_lead=lead)
+                proposal_lead=lead, reattach=True)
     reason = binding._unsupported_entry_reason(entry)
     if reason is None and entry.allocation is not None and entry.allocation.parser not in PARSERS:
         reason = (
@@ -839,17 +842,31 @@ async def _connect_mep(app: AppCtx, facility: str, fac, *, left: bool = False) -
 
 async def _propose_or_ask(
     facility: str, ssh_host: str | None, ask_notice: str
-, *, app: AppCtx | None = None, proposal_lead: str = "") -> ConnectFacilityResult:
+, *, app: AppCtx | None = None, proposal_lead: str = "", reattach: bool = False) -> ConnectFacilityResult:
     """Index miss + no details: if we have an SSH host, probe the login node and PROPOSE a draft
     config; otherwise ask the agent for the host (SSH access is the one irreducible input). The
     discovery target carries the same ControlMaster socket as the later bootstrap, so probing warms
     the master the bootstrap then rides — no extra authentication. `proposal_lead` opens a proposal's notice, beyond
-    its cap, so no note is cut for it (`_failed_details_lead`; `_connect_facility` opens every other answer with it)."""
+    its cap, so no note is cut for it (`_failed_details_lead`; `_connect_facility` opens every other answer with it).
+
+    `reattach` (the registry answered and knows no such facility, and no record is cached — a new laptop): our own
+    endpoint for the host is asked for first, over the web, and when its login worker answers the same probe runs
+    THROUGH it (`_probe_through_endpoint`) — zero SSH; a ghost or no endpoint falls back to the SSH probe."""
     host = (ssh_host or config.ssh_host() or "").strip()
     if not host:
         return ConnectFacilityResult(
             phase="needs_facility_details", facility=facility, notice=ask_notice
         )
+    fallback = ""
+    if reattach and app is not None:
+        got = await _probe_through_endpoint(app, facility, host)
+        if isinstance(got, tuple):
+            draft, notes, name, eid = got
+            lead = (f"found your endpoint {name} ({eid}) online for {host} and ran the probe THROUGH it — zero "
+                    "SSH, nothing bootstrapped; the config it proposes is what a reconnect brings up on that same "
+                    "endpoint. ")
+            return _proposal(app, facility, draft, notes, lead=proposal_lead + lead, reused=True)
+        fallback = got or ""
 
     try:
         control_dir, persist = config._control_settings()
@@ -868,19 +885,28 @@ async def _propose_or_ask(
             # never a stale "teardown_endpoint()"; and WITH the host: an un-catalogued facility resumed without it
             # resolves to nothing and answers needs_facility_details (review 2026-10-10)
             app.preauth_resume = f"connect_facility({facility!r}, ssh_host={host!r})"
-        return _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
+        handoff = _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
+        handoff.notice = fallback + (handoff.notice or "")   # why the endpoint was not used instead, when one is online
+        return handoff
     except Exception as exc:  # noqa: BLE001 - probe/connect/creds failure -> structured result
         # The same first-contact explanation the bootstrap gives (stranger's walk): a refused SSH is
         # "NO SSH ACCESS to <host> as <user>" with the remedies, not a raw rc=255 dump.
         return ConnectFacilityResult(
             phase="failed",
             facility=facility,
-            notice=_explain_provision_error(
+            notice=fallback + _explain_provision_error(
                 exc, host=host, user=config.ssh_user(),
                 fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}",  # bounded by its ends
             ),
         )
-    notice = proposal_lead + (
+    return _proposal(app, facility, draft, notes, lead=proposal_lead + fallback)
+
+
+def _proposal(app: AppCtx | None, facility: str, draft: FacilityDetails, notes: list[str], *, lead: str = "",
+              reused: bool = False) -> ConnectFacilityResult:
+    """The probe's draft as a proposal for the user to confirm (`lead` opens its notice beyond the cap). `reused`: the
+    probe ran through the user's online endpoint, not over SSH."""
+    notice = lead + (
         "probed the login node and proposed this config — review/correct it WITH THE USER "
         "(confirm the flagged fields, above all `interface`), then call connect_facility(details=…). "
         "Leave env_setup OUT of details= unless the user wants to change it: the server keeps the proposed one. "
@@ -894,9 +920,83 @@ async def _propose_or_ask(
     return ConnectFacilityResult(
         phase="proposed_facility_details",
         facility=facility,
+        reused=reused,
         proposed_details=draft,
-        notice=notice[:_PROPOSAL_CAP + len(proposal_lead)],
+        notice=notice[:_PROPOSAL_CAP + len(lead)],
     )
+
+
+# How long a new laptop's reattach waits for its online endpoint's login worker to answer before taking it for a ghost
+# (`manager_online` reads "online" for a dead endpoint until its heartbeats are missed: #37) and probing over SSH. A
+# login worker of a running manager answers in seconds to tens of seconds; the wait is inside the (heartbeated) connect.
+_REATTACH_WAIT_S = 90.0
+_REATTACH_CANARY_S = 15.0
+
+
+def _endpoint_client():
+    from globus_compute_sdk import Client
+
+    return Client()
+
+
+async def _online_for_host(app: AppCtx, facility: str, host: str) -> tuple[str, str] | None:
+    """(name, id) of our endpoint for `host` that the Globus web service lists ONLINE and owned by this identity — no
+    SSH. Its name is the one a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else `hpc-bridge-<host>`,
+    `binding._session_endpoint_name`). None: none, or the service cannot say (a web error reads as none) — and, with no
+    Globus login gate (a hermetic test, a dev server), it is not asked: the SDK's Client on a store with no login runs
+    its own command-line login on the MCP transport (the catalog read once did, see `_connect`)."""
+    from .facility.remote import online_endpoint_named
+
+    if app.login_flow is None:
+        return None
+    name = (config.endpoint_name() or "") or binding._session_endpoint_name(host)
+    eid = await online_endpoint_named(name, _endpoint_client)
+    return (name, eid) if eid else None
+
+
+async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
+                                  ) -> tuple[FacilityDetails, list[str], str, str] | str | None:
+    """A new laptop's first connect (no record, not in the registry): when our endpoint for `host` is online
+    (`_online_for_host`), wait (`_REATTACH_WAIT_S`) for its login worker to answer a check and run discovery's own probe
+    THROUGH it — the login node's answers without an SSH login, which on a password + one-time-code site (nersc) is
+    the user's terminal (the returning-user review, 2026-10-30). The login worker runs on the template the endpoint was
+    configured with: the check sends no interface or env_setup of ours (`shapes.shape_config("login")` alone), so the
+    template's own defaults — the config that brought it up — apply. Returns (draft, notes, name, id); otherwise None
+    (nothing online) or why the SSH probe runs instead (a ghost, a probe that did not run there)."""
+    import shlex
+
+    from .discovery import _probe_script, parse_probe
+    from .shapes import shape_config
+
+    found = await _online_for_host(app, facility, host)
+    if found is None:
+        return None
+    name, eid = found
+    runner = app.runner_factory(eid, user_endpoint_config=shape_config("login"))
+    try:
+        deadline = time.monotonic() + _REATTACH_WAIT_S
+        while True:
+            check = await runner.canary(timeout=max(1.0, min(_REATTACH_CANARY_S, deadline - time.monotonic())))
+            if check.ok:
+                break
+            if time.monotonic() >= deadline:
+                return (f"your endpoint {name} ({eid}) is listed online, but its login worker did not answer within "
+                        f"{_REATTACH_WAIT_S:.0f} s (a stale registration, or a manager that is gone): probed over SSH "
+                        "instead. ")
+        res = await runner.run(f"bash -lc {shlex.quote(_probe_script())}")
+        out = str(getattr(res, "stdout", "") or "")
+        if "HPCB_PROBE_BEGIN" not in out:
+            return (f"your endpoint {name} ({eid}) answered, but the probe did not run through it "
+                    f"(exit {getattr(res, 'returncode', '?')}): probed over SSH instead. ")
+        draft, notes = parse_probe(out, ssh_host=host)
+        return draft, notes, name, eid
+    except Exception as exc:  # noqa: BLE001 - the SSH probe is the fallback; why is said
+        return (f"your endpoint {name} ({eid}) is listed online, but probing through it failed "
+                f"({type(exc).__name__}: {str(exc)[:160]}): probed over SSH instead. ")
+    finally:
+        close = getattr(runner, "close", None)
+        if callable(close):
+            close()
 
 
 _PROPOSAL_CAP = 1800  # the proposal's notice; its fixed head is under 600 chars

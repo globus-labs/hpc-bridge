@@ -781,16 +781,24 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
     c = rt.last_canary
     cause = broken_endpoint_env(c.error) if c is not None and not c.ok else None
     eid = app.state.endpoint_id
+    if cause is None and eid is not None and eid in app.env_repair_handoff and c is not None and not c.ok:
+        # a repair waiting on the user's login is tried again whatever this check met (c08: the call after the user
+        # opened the connection met a TRANSIENT conflict, and the repair, keyed on the import failure alone, waited on)
+        cause = app.env_repair_handoff[eid][2]
     repair = getattr(app.facility, "repair_endpoint_env", None)
     if cause is None or eid is None or not inspect.iscoroutinefunction(repair) or eid in app.env_repairs:
         return block
     try:
         done, new_eid = await repair(app.profile, eid)
     except Exception as exc:  # noqa: BLE001 - said in the answer; the check's own failure stays the state
+        if _repair_handoff(app, shape, eid, cause, str(exc)):
+            return block   # not a repair done: the next check tries again, over the connection the user opens
         why = " ".join(str(exc).split())[:300]
+        app.env_repair_handoff.pop(eid, None)
         app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment is broken, "
                                 f"and hpc-bridge's repair failed: {type(exc).__name__}: {why}. ")
         return block
+    app.env_repair_handoff.pop(eid, None)
     app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment was broken. "
                             f"hpc-bridge {done}. ")
     if new_eid and new_eid != eid:
@@ -799,6 +807,34 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
     for other in app.shapes.values():
         other.runner_stale = True
     return await _confirm_worker(app, shape, force=True)
+
+
+def _repair_handoff(app: AppCtx, shape: str, eid: str, cause: str, said: str) -> bool:
+    """A repair whose SSH login asks for the USER — the key accepted and a one-time code pending, or a password /
+    keyboard-interactive login on a facility whose endpoint this user already runs (c08, 2026-10-30: the key revoked,
+    nersc's password + one-time code): the same handoff a connect makes (`notices._needs_preauth_result`), resumed by
+    ensure_endpoint_up. The user opens the connection in their own terminal; hpc-bridge never handles the secret.
+    True when it was handed off (kept in `AppCtx.env_repair_handoff`; the repair is tried again on the next check)."""
+    from .facility.remote import is_interactive_auth_failure, key_accepted_second_factor_pending, offers_one_time_code
+
+    target = getattr(getattr(app.facility, "cli", None), "target", None)
+    if target is None or not getattr(target, "control_dir", None) or not (
+            key_accepted_second_factor_pending(said) or is_interactive_auth_failure(255, said)):
+        return False
+    facility = app.machine or "the facility"
+    resume = f"ensure_endpoint_up(shape={shape!r})"
+    app.pending_preauth = (facility, target)
+    app.preauth_resume = resume
+    cmd = target.preauth_command()
+    code = ("If the facility takes a ONE-TIME CODE, ask the user for the current one and call complete_preauth(code); "
+            "otherwise the USER runs" if offers_one_time_code(said) else "The USER runs")
+    app.env_repair_handoff[eid] = (cmd, (
+        f"the endpoint could not start a user endpoint ({cause}): its environment is broken, and repairing it needs an "
+        f"SSH login to {target.host} that asks for the user's own login (a password and/or a one-time code) — "
+        f"hpc-bridge never handles that secret. {code} this in THEIR OWN terminal:\n    {cmd}\n"
+        f"Once that connection is open, call {resume} again: the repair rides it. Nothing was started or billed for "
+        "the block yet. "), cause)
+    return True
 
 
 class StaleTemplateError(RuntimeError):

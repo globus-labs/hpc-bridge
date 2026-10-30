@@ -22,6 +22,28 @@ ran a shell on it and nothing was proposed: no record for the host, the endpoint
 `worker_init_note` (`_reuse_runs`). A config that was only proposed is never saved. `_start_note(fac)` adds what a
 start waited out (a killed manager's pid file, [[facility-remote]]) to the connect's notice.
 
+## A new laptop reattaches with zero SSH (2026-10-30, approved)
+The reuse ladder is: facility endpoint (MEP) > our online endpoint > SSH bootstrap. One rung was missing for a user
+with no record. When the registry answered and knows no such facility, and `facilities.json` has no record for the
+host, `_propose_or_ask(reattach=True)` used to go straight to the SSH probe. Now `_probe_through_endpoint` asks the web
+service first.
+- **Is our endpoint online?** `_online_for_host` uses `facility.remote.online_endpoint_named`: an endpoint OWNED by
+  this identity, under the name a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else
+  `binding._session_endpoint_name` → `hpc-bridge-<host>`). This needs no SSH and no config.
+- **Is it alive?** "Online" is only the heartbeat the service last saw, and a ghost reads online too (#37). So the
+  decision rests on the endpoint's login worker: a runner on `shapes.shape_config("login")` alone (no interface, no
+  worker_init: the endpoint's template defaults, the config that brought it up, apply) must answer a check within
+  `_REATTACH_WAIT_S` (90 s).
+- **Then** the discovery probe (`discovery._probe_script`) runs as a task through that worker, `parse_probe` reads it,
+  and `_proposal` returns it with `reused=True` and a lead naming the endpoint.
+- **Confirming** the proposal binds the session's config and reattaches over the web, as a cached record always did.
+  No SSH happens before the reattach.
+- **Fallbacks.** A ghost, a probe that did not run, or nothing online leaves the SSH probe as before, its notice opened
+  by why. With no Globus login gate (`app.login_flow is None`: hermetic tests, a dev server) the web service is not
+  asked: the SDK's Client on a store with no login runs its own command-line login on the MCP transport.
+- **What never takes this rung.** A registry facility resolves to its entry first, so a facility endpoint wins; on a
+  registry outage the facility may be a catalogued one, so the rung is skipped.
+
 ## See also
 [[server]] · [[binding]] · [[warmth]] · [[login_gate]] · [[notices]]
 

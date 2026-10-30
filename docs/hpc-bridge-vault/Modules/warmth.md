@@ -46,5 +46,17 @@ shape's runners stale and confirms the worker again. It runs on whatever shape a
 asks nothing about spend: a compute block's confirmation is unchanged. `server` prefixes the repair's words to the next
 warm or provisioning notice (`_env_repair_note`, once).
 
+## A repair that needs the user's login (2026-10-30, c08)
+When a repair's SSH login is denied with an interactive method left — the key accepted and a one-time code pending,
+or a password / keyboard-interactive login on a facility this user already runs an endpoint on (the key revoked,
+nersc) — `_repair_handoff` makes the same handoff a connect does:
+- it sets `app.pending_preauth` to the CLI's target, and `app.preauth_resume` to `ensure_endpoint_up(shape=…)`;
+- it keeps the user's command and the words in `AppCtx.env_repair_handoff`;
+- it does not count as a repair done: the next check that meets the broken environment tries again, over the
+  connection the user opened.
+
+`server` puts the command in `EndpointStatus.preauth_command` while the block is `provisioning`, and the words in every
+answer until the shape is warm.
+
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

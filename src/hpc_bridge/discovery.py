@@ -401,9 +401,19 @@ def _default_partition(part_lines: list[str], details: list[str] | None = None, 
 
 _NAME = re.compile(r"^[A-Za-z0-9_.:+-]{1,64}$")  # a partition or node feature the proposal may carry as it is
 _ROUTED = re.compile(r"\bin partition (\S+)")    # where `sbatch --test-only` says the job would run
-# a refusal about the account, not the terms: "You must specify an account", "Invalid account or account/partition
-# combination specified", an allocation or project the site requires
-_NEEDS_ACCOUNT = re.compile(r"\b(account|allocation|project)", re.I)
+# A refusal ABOUT THE ACCOUNT (the tests name none): Slurm's own "Invalid account or account/partition combination
+# specified", and a site filter's "You must specify an account (-A)" / "No valid account" / "Please specify a project".
+# Never the bare words: `sbatch --test-only` prefixes every refusal with "allocation failure:", a site filter's policy
+# refusal included, and "Job violates accounting/QOS policy" is about limits — read as account errors, they kept a pick
+# the scheduler had refused, "not verified — the scheduler's test needs an account", with no node type (the
+# returning-user cells, 2026-10-30, once the site retired the QOS a job with no partition gets).
+_NEEDS_ACCOUNT = re.compile(
+    r"\binvalid (?:account|project)\b"
+    r"|\b(?:must|need to|needs to|please|required to)\s+(?:specify|provide|name|supply|give|set)\b[^.]{0,20}?"
+    r"\b(?:an? )?(?:valid )?(?:account|project|allocation)\b"
+    r"|\bno (?:valid )?(?:account|project)\b"
+    r"|\b(?:account|project)\b[^.]{0,30}?\b(?:is required|required|is missing|not specified|does not exist|"
+    r"not found|unknown|expired|is disabled|has no allocation)\b", re.I)
 
 
 def _tried(p: str, c: str) -> str:

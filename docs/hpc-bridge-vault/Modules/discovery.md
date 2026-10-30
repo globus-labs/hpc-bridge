@@ -77,5 +77,20 @@ The tests run with no account (the user's default applies), the facility's defau
 `regular_milan_ss11`. A partition of `""` reaches parsl as none, so no `--partition` is written; [[server]] keeps it
 when an agent sends the terms' empty queue back.
 
+## The account test reads account errors only (2026-10-30)
+`_NEEDS_ACCOUNT` used to match the bare words account / allocation / project. `sbatch --test-only` starts every
+refusal with "allocation failure:", a site filter's policy refusal included. So once the nersc fake retired the QOS a
+job with no partition gets, every refused shape read as "needs an account": the pick (`-p system`, itself refused)
+stood "not verified", with no node type.
+
+It now matches only account errors:
+- Slurm's "Invalid account or account/partition combination specified";
+- "must / please / need to specify … an account | project | allocation";
+- "No valid account";
+- an account or project that is required, missing, unknown, expired or has no allocation.
+
+"Job violates accounting/QOS policy" is about limits, not the account. A policy refusal proposes UNVERIFIED, quoting
+the scheduler.
+
 ## See also
 [[Globus index discovery channel]] · [[server]] · [[models]] · [[facility-remote]] · [[state]] · [[Discovery channel model]] · [[Facility catalog]] · [[MFA and interactive SSH auth]]

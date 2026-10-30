@@ -84,6 +84,22 @@ Where no pin names the node (the round-robin alias) it does not stop anything: a
 node and act on the shared pid file; the rebuilt venv at the same path serves the next user endpoints. Returns (what it
 did, the endpoint id).
 
+## A repair past a dead pin (2026-10-30, the returning-user cell c08)
+`repair_endpoint_env` used to check the venv on the pinned login node only. With that node closed to new logins
+(sshd off, its processes running on) the check met "Connection refused" and the repair gave up.
+
+`_ensure_venv_past_a_dead_pin` now retries a check that does not reach the pin at all (`_UNREACHABLE`: ssh's
+connect-to-host verdicts, never a refused login) through the facility's own host. It re-targets the CLI to the alias
+with no HostKeyAlias, as before a pin; the venv is on the shared home.
+- The pin is dropped once that host answered: its check ran, or asked for the user's login. A host that does not
+  answer either is the client's network (connect._drop_dead_pin's rule) and the pin is kept.
+- `_restart_past_a_dead_pin` then reads the pid file through that host. Refreshed within the stale window, the manager
+  on the dead node still runs: it is left running and starts its next user endpoints from the venv rebuilt at the same
+  path. A second manager elsewhere would be refused by `_pidfile_check`. Otherwise the endpoint is started again
+  (`provision`) on the node the facility's host reaches.
+- `online_endpoint_named(name, client_factory)`: `find_online_endpoint` for a caller with no facility yet (the new
+  laptop's reattach, [[connect]]).
+
 ## See also
 [[Standing up the endpoint]] · [[Credential seeding]] · [[MEP & templated endpoints]] · [[facility-base]] · [[facility-mep]] · [[state]] · [[credentials]] · [[MFA and interactive SSH auth]]
 

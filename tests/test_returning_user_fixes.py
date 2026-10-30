@@ -136,11 +136,13 @@ class _VenvGoneFacility(FakeFacility):
         self.workers = 1
         self.repaired = 0
         self.repair_fails = repair_fails
+        self.fixed = False
 
     async def repair_endpoint_env(self, profile, endpoint_id):
         self.repaired += 1
         if self.repair_fails:
             raise RuntimeError(self.repair_fails)
+        self.fixed = True
         return ("rebuilt hpc-bridge's endpoint venv $HOME/hpc-bridge/gce-venv-endpoint-4.18.0-py3.11 (it does not "
                 "exist), and restarted the endpoint on login01", endpoint_id)
 
@@ -151,7 +153,7 @@ def _venv_gone_app(fac):
     def factory(eid, user_endpoint_config=None, **kw):
         if not (user_endpoint_config or {}).get("compute"):
             return _FakeRunner(eid, _Res(0, "", ""))
-        ok = fac.repaired and not fac.repair_fails
+        ok = fac.fixed
         return _FakeRunner(eid, _Res(0, "", ""), canary_result=None if ok else CanaryResult(ok=False, error=LIVE_B))
 
     app.runner_factory = factory
@@ -176,6 +178,130 @@ async def test_a_repair_that_fails_says_so_never_a_rejection_or_the_config():
     assert "Permission denied" in res.notice and "jinja2" in res.notice
     assert "fix the config/partition" not in res.notice and "REJECTED" not in res.notice
     assert "teardown_endpoint" in res.notice   # what still rebuilds it
+
+
+# ---- B, through a dead pin (c08, 2026-10-30): the venv repair needs no particular login node ---------------------------
+
+DEAD = "login01.hpcb.test"
+REFUSED = f"endpoint venv check on {DEAD} failed: ssh: connect to host {DEAD} port 22: Connection refused"
+# nersc with the key revoked: password + one-time code only, and the denial still lists publickey
+DENIED = "hpcbridge-test@login: Permission denied (publickey,keyboard-interactive)."
+
+
+class _RepairCli:
+    """hpc-bridge's CLI as the repair drives it: the venv check over `target`, the pid file on the shared home."""
+
+    def __init__(self, *, alias_says=None, pid_age=None):
+        self.target = SshTarget(DEAD, "u", "k", host_key_alias="login")   # pinned: rebound to the node of the record
+        self.venv_ready, self.venv, self.venv_built = None, None, None
+        self.alias_says, self.pid_age = alias_says, pid_age
+        self.checked_on, self.stopped = [], 0
+
+    async def ensure_venv(self):
+        self.checked_on.append(self.target.host)
+        if self.target.host == DEAD:
+            raise RuntimeError(REFUSED)
+        if self.alias_says:
+            raise RuntimeError(self.alias_says)
+        self.venv = "$HOME/hpc-bridge/gce-venv"
+        self.venv_built = remote_venv_result()
+
+    async def pid_file(self, name):
+        mtime = None if self.pid_age is None else 1000.0 - self.pid_age
+        return remote.PidFile(now=1000.0, mtime=mtime, heartbeat_s=30.0, log="", noise=frozenset())
+
+    async def stop(self, name):
+        self.stopped += 1
+        return 255, f"ssh: connect to host {DEAD} port 22: Connection refused"
+
+
+def remote_venv_result():
+    from types import SimpleNamespace
+    return SimpleNamespace(built=True, path="/global/homes/h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.11",
+                           reason="it does not exist", moved_aside=None)
+
+
+def _pinned_facility(tmp_path, cli):
+    from hpc_bridge.facility.remote import MachineProfile, SlurmFacility
+    from hpc_bridge.state import EndpointRecord, LoginNodeStore
+    store = LoginNodeStore(tmp_path / "endpoints.json")
+    store.put(EndpointRecord(endpoint_id=EID, login_host=DEAD, alias="login", user="u", key_path="k", name=NAME,
+                             provisioned_at="2026-10-30T00:00:00Z"))
+    prof = MachineProfile(name="m", endpoint_name=NAME, env_setup="true", interface="eth0", partition="debug",
+                          account="", worker_init="true")
+    return SlurmFacility(prof, cli, store=store, alias="login"), store
+
+
+async def test_a_repair_whose_pinned_node_is_dead_rebuilds_through_the_facilitys_host_and_drops_the_pin(tmp_path):
+    # c08: the manager runs on login01, closed to new logins (its processes run on); the venv check went to the pin,
+    # met "Connection refused" and gave up. The home is shared: the venv is rebuilt through the facility's own host
+    cli = _RepairCli(pid_age=5)   # the manager on the dead node is alive: its pid file was refreshed 5 s ago
+    fac, store = _pinned_facility(tmp_path, cli)
+    done, eid = await fac.repair_endpoint_env(Profile(), EID)
+    assert cli.checked_on == [DEAD, "login"] and eid == EID
+    assert store.get(alias="login", name=NAME) is None                       # #236's dead-pin handling: dropped
+    assert DEAD in done and "pin" in done and "dropped" in done and "rebuilt" in done
+    assert cli.stopped == 0 and "still runs" in done   # a live manager on the closed node is left to the rebuilt venv
+    assert cli.target.host == "login"                  # later SSH (the handoff, a teardown) goes to the facility's host
+
+
+async def test_a_repair_through_a_dead_pin_starts_the_endpoint_again_when_its_manager_is_gone_too(tmp_path):
+    cli = _RepairCli(pid_age=None)   # no pid file: the manager on the dead node is gone too
+    fac, _store = _pinned_facility(tmp_path, cli)
+    started = []
+
+    async def provision(profile):
+        from hpc_bridge.facility.base import EndpointHandle
+        started.append(cli.target.host)
+        return EndpointHandle(endpoint_id=EID, name=NAME, login_host="login02.hpcb.test")
+    fac.provision = provision
+    done, _eid = await fac.repair_endpoint_env(Profile(), EID)
+    assert started == ["login"] and "login02.hpcb.test" in done and "started" in done
+
+
+async def test_a_repair_whose_facility_host_does_not_answer_either_keeps_the_pin(tmp_path):
+    # the client's own network, not a dead pin (connect._drop_dead_pin's rule): nothing is dropped
+    cli = _RepairCli(alias_says="ssh: connect to host login port 22: Network is unreachable")
+    fac, store = _pinned_facility(tmp_path, cli)
+    with pytest.raises(RuntimeError):
+        await fac.repair_endpoint_env(Profile(), EID)
+    assert store.get(alias="login", name=NAME) is not None
+
+
+async def test_a_repair_past_a_dead_pin_that_needed_the_users_login_finishes_on_the_next_call(tmp_path):
+    # c08 again: the facility's host asks for the user's password + one-time code (the key revoked). It answered, so the
+    # pin is what is dead; once the user opened the connection, the repair goes on from there
+    cli = _RepairCli(alias_says=DENIED, pid_age=5)
+    fac, store = _pinned_facility(tmp_path, cli)
+    with pytest.raises(RuntimeError, match="Permission denied"):
+        await fac.repair_endpoint_env(Profile(), EID)
+    assert store.get(alias="login", name=NAME) is None and cli.target.host == "login"
+    cli.alias_says = None
+    done, _eid = await fac.repair_endpoint_env(Profile(), EID)
+    assert DEAD in done and "still runs" in done and cli.stopped == 0
+
+
+async def test_a_repair_that_needs_the_users_login_hands_it_to_their_terminal_then_finishes():
+    # c08 has the key revoked too: the facility's host asks for a password + one-time code. The repair hands the login
+    # to the user's terminal (preauth_command, as a connect does) and finishes on the next call over that connection
+    from types import SimpleNamespace
+    fac = _VenvGoneFacility(repair_fails=DENIED)
+    fac.cli = SimpleNamespace(target=SshTarget("login", "u", "k", control_dir="/tmp/hpcb-cm"))
+    app = _venv_gone_app(fac)
+    app.machine = "f"
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert res.status == "provisioning" and res.preauth_command and "ssh" in res.preauth_command
+    assert "OWN terminal" in res.notice and res.preauth_command in res.notice and "REJECTED" not in res.notice
+    assert "call ensure_endpoint_up(shape='compute') again" in res.notice
+    assert app.pending_preauth is not None and "ensure_endpoint_up" in str(app.preauth_resume)
+    fac.repair_fails = None   # the user opened the connection
+    # …and the next check meets something else (c08: a TRANSIENT conflict): the waiting repair is tried all the same
+    transient = CanaryResult(ok=False, error="ComputeAPIError[RESOURCE_CONFLICT]: Endpoint x is already in use")
+    for rt in app.shapes.values():
+        if rt.runner is not None:
+            rt.runner._canary = transient
+    again = await _ensure_endpoint_up(app, shape="compute")
+    assert fac.repaired == 2 and again.status == "up" and not again.preauth_command, again.notice
 
 
 # ---- C: a confirmed configuration on a reused endpoint is cached when none is -----------------------------------------
@@ -229,3 +355,121 @@ def test_the_connect_answer_says_the_start_waited_out_a_dead_managers_pid_file()
                                                          "up (its pid file was 66 s old …): hpc-bridge waited 27 s"))
     assert "waited 27 s" in connect._start_note(fac)
     assert connect._start_note(SimpleNamespace()) == "" and connect._start_note(SimpleNamespace(cli=None)) == ""
+
+
+# ---- D: a new laptop reattaches to its endpoint with zero SSH (approved 2026-10-30) ------------------------------------
+# A user with no ~/.hpc-bridge (a new laptop) and a facility not in the registry: connect_facility(id, ssh_host=…) used to
+# probe the login node over SSH before anything else — a password + one-time code on nersc — although their endpoint
+# for that host was online. Now the web service is asked first; a login worker that answers runs the same probe THROUGH
+# the endpoint, and the proposal says so (`reused`). A ghost (online, but no worker answers) and no endpoint at all fall
+# back to the SSH probe; a registry facility (a facility endpoint above all) never reaches this.
+
+PROBE_OUT = ("HPCB_PROBE_BEGIN\nUSER=u\nHOME=/global/homes/h/u\nSCRATCH=\nWORK=\nPSCRATCH=\nSCHED=slurm\nGCE=\n"
+             "UV=/usr/bin/uv\nMYBALANCE=\nXDUSAGE=\nPART=debug*|up\nNIC=lo|127.0.0.1/8\nNIC=eth0|10.0.0.5/24\n"
+             "HPCB_PROBE_END\n")
+
+
+class _Shell:
+    def __init__(self, stdout, returncode=0):
+        self.stdout, self.stderr, self.returncode = stdout, "", returncode
+
+
+class _LoginRunner:
+    """The online endpoint's login worker, as connect's reattach probe drives it."""
+
+    def __init__(self, eid, *, answers=True, out=PROBE_OUT):
+        self.eid, self.answers, self.out, self.ran, self.closed = eid, answers, out, [], False
+
+    async def canary(self, timeout=8.0):
+        return CanaryResult(ok=True) if self.answers else CanaryResult(ok=False, error="timeout")
+
+    async def run(self, command):
+        self.ran.append(command)
+        return _Shell(self.out)
+
+    def close(self):
+        self.closed = True
+
+
+class _NewLaptop:
+    """The world of a connect with no record: the registry misses, the web service names (or not) our endpoint, the
+    SSH probe is a tripwire."""
+
+    def __init__(self, monkeypatch, *, online="eid-online", answers=True, catalog=(), registry_down=False):
+        from hpc_bridge import config as _config
+        from tests.fakes import FakeCatalog
+
+        self.ssh_probes, self.asked, self.runners = [], [], []
+
+        class _Cat(FakeCatalog):
+            async def get(self_, facility):
+                if registry_down:
+                    raise RuntimeError("Globus Search: 503 Service Unavailable")
+                return await FakeCatalog.get(self_, facility)
+        monkeypatch.setattr(binding, "make_catalog", lambda: _Cat(list(catalog)))
+        monkeypatch.setattr(_config, "_control_settings", lambda: (None, 60))
+
+        async def ssh_probe(target):
+            self.ssh_probes.append(target.host)
+            return (FacilityDetails(ssh_host=target.host, interface="eth0", env_setup="true",
+                                    scratch_root="/home/{user}/.hpc-bridge", partition="debug"), ["over ssh"])
+        monkeypatch.setattr(connect, "discover_facility_details", ssh_probe)
+
+        async def online_for_host(app, facility, host):
+            self.asked.append(host)
+            return (f"hpc-bridge-{host}", online) if online else None
+        monkeypatch.setattr(connect, "_online_for_host", online_for_host, raising=False)
+        monkeypatch.setattr(connect, "_REATTACH_WAIT_S", 0.0, raising=False)
+        self.answers = answers
+
+    def app(self):
+        app = AppCtx(facility=FakeFacility(), profile=Profile())
+
+        def factory(eid, user_endpoint_config=None, **kw):
+            r = _LoginRunner(eid, answers=self.answers)
+            r.uec = user_endpoint_config
+            self.runners.append(r)
+            return r
+        app.runner_factory = factory
+        return app
+
+
+async def test_a_new_laptop_proposes_through_its_online_endpoint_with_no_ssh(monkeypatch):
+    from hpc_bridge import server
+    w = _NewLaptop(monkeypatch)
+    app = w.app()
+    res = await server._connect_facility(app, "f-new", ssh_host="login")
+    assert w.ssh_probes == [] and w.asked == ["login"]                     # no SSH at all
+    assert res.phase == "proposed_facility_details" and res.reused is True, res.notice
+    assert res.proposed_details.ssh_host == "login" and res.proposed_details.interface == "eth0"
+    assert "zero SSH" in res.notice and "eid-online" in res.notice and "THROUGH" in res.notice
+    (r,) = w.runners
+    assert r.eid == "eid-online" and r.closed and "HPCB_PROBE_BEGIN" in r.ran[0]
+    # the login worker runs on the template the endpoint was configured with: no interface or env_setup of ours
+    assert r.uec.get("compute") is False and "interface" not in r.uec and "worker_init" not in r.uec
+    assert app.proposed_drafts["f-new"].ssh_host == "login"                # a details= without env_setup takes it
+
+
+async def test_a_ghost_or_no_endpoint_falls_back_to_the_ssh_probe(monkeypatch):
+    from hpc_bridge import server
+    w = _NewLaptop(monkeypatch, answers=False)   # online per the web service, but no worker answers: a ghost
+    res = await server._connect_facility(w.app(), "f-new", ssh_host="login")
+    assert w.ssh_probes == ["login"] and res.phase == "proposed_facility_details" and not res.reused
+    assert "did not answer" in res.notice and w.runners[0].closed
+    w = _NewLaptop(monkeypatch, online=None)     # nothing online
+    res = await server._connect_facility(w.app(), "f-new", ssh_host="login")
+    assert w.ssh_probes == ["login"] and w.runners == [] and not res.reused
+
+
+async def test_a_registry_facility_or_a_registry_outage_never_takes_the_reattach_rung(monkeypatch):
+    from hpc_bridge import server
+    from tests.fakes import fake_mep_entry
+    # the ladder: a facility endpoint first — a catalogued MEP attaches as before, our own endpoint never asked for
+    w = _NewLaptop(monkeypatch, catalog=[fake_mep_entry()])
+    entry = fake_mep_entry()
+    await server._connect_facility(w.app(), entry.id, ssh_host="login")
+    assert w.asked == [] and w.ssh_probes == []
+    # the registry down: the facility may be a catalogued one (a MEP above all) — today's answer, no reattach
+    w = _NewLaptop(monkeypatch, registry_down=True)
+    await server._connect_facility(w.app(), "f-new", ssh_host="login")
+    assert w.asked == []
