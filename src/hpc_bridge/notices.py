@@ -517,6 +517,17 @@ def _terms_line(app: AppCtx, t: BlockTerms, *, compute_note: bool = True, lead: 
     word = _queue_word(app)
     where = (f"{word} '{t.queue}' ({_QUEUE_FROM.get(t.queue_source, t.queue_source)})" if t.queue
              else f"the facility's default {word} (hpc-bridge sends none)")
+    profile = getattr(app.facility, "profile", None)
+    if not t.queue and getattr(profile, "partition", None) == "":
+        # partition "" (a facility brought with details=): no partition is sent and the scheduler routes the block —
+        # by the node type a constraint names, on a site like NERSC, not to the starred default; a GPU type says so
+        opts = getattr(profile, "scheduler_options", None)
+        types = [m.group(1) for ln in (opts if isinstance(opts, str) else "").splitlines() if ln.strip().startswith("#")
+                 for m in re.finditer(r"(?:^|\s)(?:--constraint[= ]|-C\s*)(\S+)", ln.strip())]
+        where = f"no {word}: the scheduler routes the block" + "".join(
+            f" (scheduler_options: --constraint={c}"
+            + (" — a GPU node type" if re.search(r"gpu|[ahv]100|mi\d", c, re.I) else "") + ")"
+            for c in types[-1:])
     if t.account:
         acct = f"account '{t.account}' ({_ACCOUNT_FROM.get(t.account_source, t.account_source)})"
     elif t.account_source == "none_needed":
