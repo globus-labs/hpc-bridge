@@ -93,13 +93,18 @@ def _endpoint_name(facility: str) -> str:
     return f"hpc-bridge-{key}"
 
 
-def _combine(results: list[RunResult]) -> RunResult:
+def _combine(results: list[RunResult], labels: list[str] | None = None) -> RunResult:
     """Merge a chain's per-phase RunResults into one for grading: concatenated calls / messages /
     dialogue, and a `final` that surfaces the FIRST errored phase — so an early-phase failure
     can't hide behind a healthy last phase's result. Each call is stamped with its 0-based
     phase index (`ToolCall.phase`) so chain graders can key on "phase 2's first connect" rather
     than infer the boundary from call order (`trace_adapter.trace_from_bundle` recovers the same
-    stamp offline from the per-session `init` messages)."""
+    stamp offline from the per-session `init` messages).
+
+    `labels` (a chain whose phases have different operators — `_phase_spec`): each phase's messages open with a marker
+    row, `{"chain_phase": k, "operator": <label>}`, since each phase's record is its own operator's layout (a script's
+    or a CLI's steps-and-journal rows, the Claude SDK's stream) and no one sniff reads them all; regrade.bundle_trace
+    splits the bundle on the markers and rebuilds each phase with its own reader."""
     calls, text_at = [], []
     for k, r in enumerate(results):
         at = getattr(r.trace, "text_at", None) or []
@@ -111,7 +116,11 @@ def _combine(results: list[RunResult]) -> RunResult:
     texts = [x for r in results for x in getattr(r.trace, "texts", [])]  # the agent's words survive a chain too
     if len(text_at) != len(texts):
         text_at = []   # a phase without positions: unknown for the whole chain
-    messages = [m for r in results for m in r.messages]
+    if labels is not None and len(labels) == len(results):
+        messages = [m for k, r in enumerate(results)
+                    for m in [{"chain_phase": k, "operator": labels[k]}, *r.messages]]
+    else:
+        messages = [m for r in results for m in r.messages]
     # stamps restart per session (each phase is its own agent session); a result without stamps pads with None
     arrivals = [t for r in results for t in ((r.arrivals or []) + [None] * (len(r.messages) - len(r.arrivals or [])))]
     dialogue = [d for r in results for d in (r.dialogue or [])]
@@ -121,34 +130,119 @@ def _combine(results: list[RunResult]) -> RunResult:
                      arrivals=arrivals)
 
 
-async def _run_chain(phase_prompts, scen, *, model, effort, persona, user_goal, no_skill):
+def _phase_spec(phase, fill=lambda x: x) -> dict:
+    """One PHASES entry as a dict. A string is a prompt for the cell's own operator (every chain before 2026-10-30); a
+    dict may also name ANOTHER operator for its phase — `{"operator": "script", "script": <async fn(ops)>, "server":
+    "previous"}` runs a scripted session (script_runner), on the previous hpc-bridge release when `server` says so
+    (prev_release: the returning-user cells' first session, written by the plugin the user had before) — and a
+    condition: `"when": fn(trace so far) -> bool` runs the phase only when it holds (the returning-user agent cells'
+    follow-up turn, after the agent stopped to ask the user to act). `label` names it in the output."""
+    if isinstance(phase, str):
+        return {"prompt": fill(phase)}
+    spec = dict(phase)
+    if spec.get("script") is not None and spec.get("operator", "script") != "script":
+        raise ValueError(f"a phase with a script runs under the script operator, not {spec.get('operator')!r}")
+    if spec.get("script") is not None:
+        spec["operator"] = "script"
+    if spec.get("prompt"):
+        spec["prompt"] = fill(spec["prompt"])
+    if spec.get("server", "current") not in ("current", "previous"):
+        raise ValueError(f"a phase's server is 'current' or 'previous', not {spec.get('server')!r}")
+    return spec
+
+
+@dataclass
+class InterphaseContext:
+    """What an INTERPHASE_SETUP callable is handed: the index of the phase about to run, the chain's trace so far (every
+    phase that ran, stamped), the harness' world channel (`ssh(cmd, timeout, host)`, as the pool user) and the
+    round-robin pool's login nodes."""
+    next_phase: int
+    trace: Trace
+    ssh: Callable[..., tuple[int, str]]
+    login_hosts: list[str]
+
+
+async def _script_phase(spec: dict, *, facility: str, ssh_host: str, extra_env: dict | None) -> RunResult:
+    """A scripted phase of a chain (`_phase_spec`): its script against a fresh server — this checkout's, or the previous
+    release's (prev_release.server_argv), which keeps no journal (its steps are the record)."""
+    from prev_release import installed_tag, server_argv
+    from script_runner import ScriptAbort, ScriptOps
+    from script_runner import run_scenario as _script_run
+
+    argv = None
+    if spec.get("server") == "previous":
+        argv = server_argv()
+        if argv is None:
+            # no previous release in the image (none older than this version, or the export failed): the phase cannot
+            # run as declared — an errored phase, never the current code under the other name
+            async def _refuse(ops: ScriptOps) -> str:
+                raise ScriptAbort("this image carries no previous hpc-bridge release (agentic/.prev-release: "
+                                  "prev_release.py export before the build) — the phase cannot run on it")
+            return await _script_run("", repo_root=REPO_ROOT, script=_refuse, facility=facility, ssh_host=ssh_host,
+                                     world=_ssh_run, extra_env=extra_env)
+        print(f"  (the previous release, {installed_tag()}: {' '.join(argv)})")
+    return await _script_run("", repo_root=REPO_ROOT, script=spec["script"], facility=facility, ssh_host=ssh_host,
+                             world=_ssh_run, extra_env=extra_env, server_cmd=argv, journal_kept=argv is None)
+
+
+def _phase_label(spec: dict, operator: str) -> str:
+    if spec.get("script") is not None:
+        return "script" + ("@previous" if spec.get("server") == "previous" else "")
+    return operator
+
+
+async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skill, run_agent=None, operator="claude",
+                     facility: str = "", ssh_host: str = ""):
     """A cross-restart reuse CHAIN: each phase is a SEPARATE agent session (a fresh MCP server —
     the "restart"), sharing this run's facility id + pool user with NO teardown between. So a
     later phase's cold server must reattach (find_online_endpoint) to the endpoint an earlier
     phase stood up — the inter-agent reuse the intra-agent scenario can't reach. Between phases we
     settle so the just-started endpoint registers 'online' in the web service (else the next phase
-    re-bootstraps over SSH instead of reattaching over the web)."""
+    re-bootstraps over SSH instead of reattaching over the web).
+
+    `phases`: `_phase_spec` dicts. A phase runs under the cell's operator (`run_agent`, the runner run.py picked), or —
+    one with a `script` — under the script operator on the server it names, whatever the cell's operator is: so a
+    returning-user cell scripts the session that leaves the world behind, on the plugin the user had before, and puts
+    the cell's agent in the session after it. A phase whose `when` does not hold on the trace so far is skipped (said,
+    not graded). The INTERPHASE_SETUP world changes run before every phase but the first that runs."""
     delay = max(0, int(getattr(scen, "INTERPHASE_DELAY_S", 25)))
+    run_agent = run_agent or run_scenario
+    mixed = any(spec.get("script") is not None or spec.get("when") is not None for spec in phases)
     results: list[RunResult] = []
-    for i, pp in enumerate(phase_prompts):
-        print(f"\n=== CHAIN PHASE {i + 1}/{len(phase_prompts)} (fresh MCP server) ===")
-        r = await run_scenario(pp, repo_root=REPO_ROOT, model=model, effort=effort,
-                               persona=persona, user_goal=user_goal, ablate_skill=no_skill,
-                               max_turns=getattr(scen, "MAX_TURNS", 40),
-                               extra_env=getattr(scen, "EXTRA_ENV", None) or None,
-                               midrun_hooks=(getattr(scen, "MIDRUN_HOOKS", None) if i == 0 else None), hook_runner=_run_hook)
-        results.append(r)
-        print(f"  phase {i + 1}: {len(r.trace.calls)} calls · is_error={getattr(r.final, 'is_error', None)}")
-        if i + 1 < len(phase_prompts):
-            if not _interphase_setup(scen):
+    labels: list[str] = []
+    agent_ran = False
+    for i, spec in enumerate(phases):
+        name = spec.get("label") or f"phase {i + 1}"
+        when = spec.get("when")
+        if when is not None and not when(_combine(results).trace if results else Trace([])):
+            print(f"\n=== CHAIN PHASE {i + 1}/{len(phases)} ({name}): SKIPPED — its condition does not hold ===")
+            continue
+        if results:
+            if not await _interphase_setup(scen, next_phase=len(results), trace=_combine(results).trace):
                 print("  chain ABORTED: interphase setup failed (later phases would be graded against the wrong world)")
                 break
             if delay:
                 print(f"  … settling {delay}s so the endpoint registers online for the next phase")
                 await asyncio.sleep(delay)
+        label = _phase_label(spec, operator)
+        print(f"\n=== CHAIN PHASE {i + 1}/{len(phases)} ({name}; {label}; fresh MCP server) ===")
+        if spec.get("script") is not None:
+            r = await _script_phase(spec, facility=facility, ssh_host=ssh_host,
+                                    extra_env=getattr(scen, "EXTRA_ENV", None) or None)
+        else:
+            r = await run_agent(spec["prompt"], repo_root=REPO_ROOT, model=model, effort=effort,
+                                persona=persona, user_goal=user_goal, ablate_skill=no_skill,
+                                max_turns=getattr(scen, "MAX_TURNS", 40),
+                                extra_env=getattr(scen, "EXTRA_ENV", None) or None,
+                                midrun_hooks=(getattr(scen, "MIDRUN_HOOKS", None) if not agent_ran else None),
+                                hook_runner=_run_hook)
+            agent_ran = True
+        results.append(r)
+        labels.append(label)
+        print(f"  {name}: {len(r.trace.calls)} calls · is_error={getattr(r.final, 'is_error', None)}")
     total = sum((getattr(r.final, "total_cost_usd", 0) or 0) for r in results)
     print(f"chain total cost ≈ ${total:.4f} across {len(results)} phases")
-    return _combine(results)
+    return _combine(results, labels if mixed else None)
 
 
 def _capabilities() -> dict:
@@ -224,11 +318,32 @@ def _seed_facility_cache(scen) -> None:
         print(f"seeded {fname}: {sorted(seed)} -> {p}", file=sys.stderr, flush=True)
 
 
-def _interphase_setup(scen) -> bool:
+async def _interphase_setup(scen, *, next_phase: int = 1, trace: Trace | None = None) -> bool:
     """World changes BETWEEN chain phases (scenario INTERPHASE_SETUP commands, run as the test user
     through the harness' own channel) — e.g. trust the cluster's host key the way a user does from
-    their own terminal, so phase 2 can succeed where phase 1 was refused (unknown_host_key)."""
+    their own terminal, so phase 2 can succeed where phase 1 was refused (unknown_host_key).
+
+    An entry may instead be a callable `fn(InterphaseContext) -> str | None` (or a coroutine function): the world
+    between two sessions shaped from the jail, where it needs more than one command — the returning-user cells stop or
+    kill the endpoint, take a login node away, revoke the key, delete local files (returning.py). What it returns is
+    printed; an exception is a failed setup (the chain stops: later phases would be graded against the wrong world)."""
+    ctx = InterphaseContext(next_phase=next_phase, trace=trace or Trace([]),
+                            ssh=lambda cmd, timeout=240, host=None: _ssh_run(cmd, timeout=timeout, host=host),
+                            login_hosts=_login_hosts())
     for c in getattr(scen, "INTERPHASE_SETUP", []):
+        if callable(c):
+            print(f"interphase setup: {getattr(c, '__name__', 'callable')} (before phase {next_phase + 1})",
+                  file=sys.stderr, flush=True)
+            try:
+                note = c(ctx)
+                if asyncio.iscoroutine(note):
+                    note = await note
+            except Exception as exc:  # noqa: BLE001 - a failed world change aborts the chain, never crashes the run
+                print(f"interphase setup FAILED: {type(exc).__name__}: {exc}", file=sys.stderr, flush=True)
+                return False
+            if note:
+                print(f"interphase setup: {str(note)[:2000]}", file=sys.stderr, flush=True)
+            continue
         print(f"interphase setup: {c[:100]}", file=sys.stderr, flush=True)
         rc, out = _ssh_run(c, timeout=240)
         if rc != 0:
@@ -684,13 +799,13 @@ async def _postchecks(scen, res=None) -> list[Result]:
 class WorldContext:
     """What a scenario's WORLD_CHECKS are handed: the run's graded trace, its messages (the CLI and script operators'
     journal rows carry the server's own clock), the cell's admin tap (admin_tap.TapReader — the scheduler as its admin
-    saw it; reads nothing when the cell has no tap), the harness' world channel (`ssh(cmd, timeout)`: one command on the
-    login node as the pool user — e.g. the endpoint's own logs, read before the teardown deletes them) and this run's
-    endpoint name."""
+    saw it; reads nothing when the cell has no tap), the harness' world channel (`ssh(cmd, timeout, host=None)`: one
+    command on the login node — or the named one of a round-robin pool — as the pool user, e.g. the endpoint's own logs,
+    read before the teardown deletes them) and this run's endpoint name."""
     trace: Trace
     messages: list
     tap: TapReader
-    ssh: Callable[[str, int], tuple[int, str]]
+    ssh: Callable[..., tuple[int, str]]
     endpoint_name: str
 
 
@@ -703,7 +818,7 @@ async def _world_checks(scen, res) -> list[Result]:
     `world:<its name>` row, never a crashed run."""
     ctx = WorldContext(trace=res.trace, messages=list(res.messages or []),
                        tap=TapReader(os.environ.get(TAP_ENV, "").strip() or None),
-                       ssh=lambda cmd, timeout=120: _ssh_run(cmd, timeout=timeout),
+                       ssh=lambda cmd, timeout=120, host=None: _ssh_run(cmd, timeout=timeout, host=host),
                        endpoint_name=os.environ.get("HPC_BRIDGE_ENDPOINT_NAME", "").strip())
     out: list[Result] = []
     for fn in getattr(scen, "WORLD_CHECKS", None) or []:
@@ -1235,8 +1350,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # Literal {facility} substitution, NOT str.format: a prompt may embed a code block with other
     # braces (e.g. a #21 probe's `f'{x}'`), which str.format would choke on with a KeyError.
     fill = lambda s: fill_prompt(s, facility=facility, ssh_host=ssh_host)  # noqa: E731 - two tokens, one place
-    phases = [fill(p) for p in (getattr(scen, "PHASES", []) or [])]
-    prompt = phases[0] if phases else fill(scen.PROMPT)
+    phases = [_phase_spec(p, fill) for p in (getattr(scen, "PHASES", []) or [])]
+    agent_prompts = [p["prompt"] for p in phases if p.get("script") is None and p.get("prompt")]
+    prompt = agent_prompts[0] if agent_prompts else fill(getattr(scen, "PROMPT", "") or "")
     # Interactive mode: persona from the CLI override, else the scenario's default.
     persona = persona or getattr(scen, "PERSONA", None)
     user_goal = fill(getattr(scen, "USER_GOAL", ""))
@@ -1245,7 +1361,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # What an operator cannot drive yet is SKIPPED, never graded vacuously (midrun_hooks.operator_refusal): the CLI
     # operators are autonomous-only and serve `cmd` hooks through the server's journal; the ACP operators take
     # personas but no PHASES and no hooks.
-    reason = operator_refusal(operator, persona=persona, phases=bool(phases), hooks=getattr(scen, "MIDRUN_HOOKS", None))
+    reason = operator_refusal(operator, persona=persona, phases=getattr(scen, "PHASES", None),
+                              hooks=getattr(scen, "MIDRUN_HOOKS", None))
     if reason:
         print(f"RESULT: SKIPPED — the {operator} operator does not support {reason} yet")
         return 2
@@ -1265,8 +1382,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         if why:
             print(f"RESULT: SETUP FAILED — {why}")
             return 2
-        _run_scenario = functools.partial(_script_run, script=scen.SCRIPT, facility=facility, ssh_host=ssh_host,
-                                          world=_ssh_run)
+        _run_scenario = functools.partial(_script_run, script=getattr(scen, "SCRIPT", None), facility=facility,
+                                          ssh_host=ssh_host, world=_ssh_run)
         model = "script"
     elif operator in ("codex", "pi", "hermes21"):
         # Codex / Pi / Hermes at their LATEST releases, headless, on the ALCF open model, configured as the user docs
@@ -1300,7 +1417,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         "ssh_host": ssh_host,
         "endpoint_name": _endpoint_name(facility),
         "prompt": prompt,
-        "phases": phases or None,
+        "phases": [p.get("prompt") or f"({_phase_label(p, operator)}: {getattr(p.get('script'), '__name__', '?')})"
+                   for p in phases] or None,
         "persona": persona,
         "user_goal": user_goal,
         "model": model,
@@ -1380,8 +1498,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
             return rc
         async with watch.watching():
             if phases:
-                res = await _run_chain(phases, scen, model=model, effort=effort,
-                                       persona=persona, user_goal=user_goal, no_skill=no_skill)
+                res = await _run_chain(phases, scen, model=model, effort=effort, persona=persona,
+                                       user_goal=user_goal, no_skill=no_skill, run_agent=_run_scenario,
+                                       operator=operator, facility=facility, ssh_host=ssh_host)
             else:
                 res = await _run_scenario(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
                                           persona=persona, user_goal=user_goal, ablate_skill=no_skill,
@@ -1480,11 +1599,14 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # The Codex / Pi / Hermes-latest operator merges the harness's own record with hpc-bridge's journal: a journal
         # row no harness event accounts for is a reader blind spot (e.g. a sub-agent the reader cannot see) and the
         # trace's ORDER is then unsound — every order-based grader could pass falsely. Gated.
-        stats = (res.messages[0] if res.messages and isinstance(res.messages[0], dict) else {}).get("trace_stats")
-        if isinstance(stats, dict):
-            unplaced = int(stats.get("journal_unplaced") or 0)
+        # A mixed chain (`_combine`'s markers) has one such record per phase a CLI or the script operator ran: each.
+        msgs = [m for m in (res.messages or []) if isinstance(m, dict)]
+        heads = ([m for m in msgs if isinstance(m.get("trace_stats"), dict)] if msgs and "chain_phase" in msgs[0]
+                 else [m for m in msgs[:1] if isinstance(m.get("trace_stats"), dict)])
+        if heads:
+            unplaced = sum(int(h["trace_stats"].get("journal_unplaced") or 0) for h in heads)
             results.append(Result("harness:trace_complete", unplaced == 0,
-                                  ", ".join(f"{k}={v}" for k, v in stats.items())
+                                  " | ".join(", ".join(f"{k}={v}" for k, v in h["trace_stats"].items()) for h in heads)
                                   + (f" — {unplaced} hpc-bridge call(s) the harness's record does not account for"
                                      if unplaced else "")))
         # ACP operators: does the client's own event log agree with the graded trace on the hpc-bridge calls made?

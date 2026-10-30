@@ -39,3 +39,7 @@ agentic/fakecluster/.totp-secret
 
 # The paper draft is its OWN git repository (Overleaf); never commit it into hpc-bridge
 docs/paper-drafting/
+
+# The previous hpc-bridge release's tree, exported from its tag before each jail build (agentic/harness/prev_release.py)
+agentic/.prev-release/*
+!agentic/.prev-release/.keep

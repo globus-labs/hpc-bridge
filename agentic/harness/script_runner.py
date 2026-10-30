@@ -42,6 +42,8 @@ from pathlib import Path
 from typing import Any, NoReturn
 
 from cli_runner import CliFinal, Native, _bundle_native, _journal_rows, _server_cmd, _server_env_names, build_trace
+from invariants import ToolCall, Trace
+from server_stderr import wrap
 
 OPERATOR = "script"
 # One tool call: Codex's tool_timeout_sec and Hermes's timeout (cli_runner). hpc-bridge bounds its own waits (the
@@ -80,6 +82,9 @@ def script_refusal(scen: Any) -> str | None:
     """Why the script operator cannot drive `scen` (run.py: RESULT: SETUP FAILED), or None when it can."""
     if callable(getattr(scen, "SCRIPT", None)):
         return None
+    phases = getattr(scen, "PHASES", None) or []
+    if phases and all(isinstance(p, dict) and callable(p.get("script")) for p in phases):
+        return None   # a chain of scripted sessions (run.py `_phase_spec`): every phase brings its own
     name = getattr(scen, "__name__", "?")
     return (f"scenario {name!r} defines no SCRIPT — the script operator (HPCB_OPERATOR=script) drives only a scenario "
             "that scripts its own tool calls (`async def SCRIPT(ops)`); run it under an agent operator")
@@ -200,15 +205,29 @@ async def _drive(script: Script, ops: ScriptOps) -> tuple[str, str | None, str]:
         return "", f"script failed: {type(exc).__name__}: {exc}", traceback.format_exc()
 
 
+def steps_trace(steps: list[Step], texts: list[str], text_at: list[int]) -> tuple[Trace, dict[str, Any]]:
+    """The trace of a server that keeps no journal — an hpc-bridge older than HPC_BRIDGE_JOURNAL (0.1.20: the
+    returning-user cells' first session, `server_cmd` = the previous release). The script's own steps are then the
+    record of what each tool got and returned (the MCP client's view of the same answers); nothing is unaccounted for."""
+    calls = [ToolCall.of(f"mcp__hpc-bridge__{s.tool}", s.args, s.result) for s in steps]
+    placed = list(text_at) if len(text_at) == len(texts) else []
+    return Trace(calls, list(texts), placed), {"native": 0, "hpcb_matched": 0, "steps_as_record": len(steps),
+                                               "journal_unplaced": 0}
+
+
 async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, effort: str | None = None,
                        persona: str | None = None, user_goal: str = "", ablate_skill: bool = False,
                        max_turns: int = 40, extra_env: dict[str, str] | None = None,
                        midrun_hooks: list[dict] | None = None, hook_runner=None,
                        script: Script | None = None, facility: str = "", ssh_host: str = "",
-                       session_factory: SessionFactory | None = None, world: World | None = None):
+                       session_factory: SessionFactory | None = None, world: World | None = None,
+                       server_cmd: list[str] | None = None, journal_kept: bool = True):
     """Drive `script` against a fresh hpc-bridge server and return the RunResult run.py grades. `prompt`, `model`,
     `effort`, `user_goal` and `max_turns` mean nothing here (run.py passes every operator the same arguments).
-    `world`: the harness' world channel the script's `ops.world` uses (run.py's `_ssh_run`)."""
+    `world`: the harness' world channel the script's `ops.world` uses (run.py's `_ssh_run`). `server_cmd`: another
+    hpc-bridge server than this checkout's (the previous release, prev_release.server_argv), started behind the same
+    stderr wrapper; `journal_kept=False` says it writes no HPC_BRIDGE_JOURNAL, so the steps are the record
+    (`steps_trace`)."""
     if script is None:
         raise ValueError("the script operator needs the scenario's SCRIPT")
     if persona or midrun_hooks:   # run.py reports such a cell SKIPPED first; this keeps a direct caller honest too
@@ -227,7 +246,7 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
         env["HPC_BRIDGE_OMIT_INSTRUCTIONS"] = "1"
     extra = tuple(k for k, v in (extra_env or {}).items() if v is not None)
     server_env = {k: env[k] for k in _server_env_names(env, extra)}
-    cmd = _server_cmd(str(repo_root), OPERATOR)
+    cmd = wrap(list(server_cmd), OPERATOR) if server_cmd else _server_cmd(str(repo_root), OPERATOR)
     print(f"  → {OPERATOR}: hpc-bridge over stdio ({' '.join(a if len(a) < 60 else a[:57] + '…' for a in cmd[:6])} …)",
           flush=True)
     t0 = time.monotonic()
@@ -253,7 +272,10 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     rows = _journal_rows(journal)
     events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}") for s in ops.steps]
     texts, text_at = (ops.texts, ops.text_at) if ops.texts else (([final_text], [len(events)]) if final_text else ([], []))
-    trace, stats = build_trace(rows, events, texts, text_at)
+    if journal_kept:
+        trace, stats = build_trace(rows, events, texts, text_at)
+    else:
+        trace, stats = steps_trace(ops.steps, texts, text_at)
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # The run dir dies with the jail: the steps (with their timestamps), the script's words and the journal ride in the
     # bundle — the cli_runner layout, which regrade.py and infra.py already read (the head row is `harness` + `rc`).

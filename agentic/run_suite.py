@@ -90,6 +90,17 @@ def _git_describe() -> str:
 BUILD_RETRY_WAITS_S = (30, 90)
 
 
+def _export_previous_release() -> None:
+    """The previous release's tree, installed in the image beside this code (harness/prev_release.py; the returning-user
+    cells' first session runs it). Best-effort: an image without it only refuses the cells that run it."""
+    try:
+        subprocess.run([sys.executable, str(REPO / "agentic" / "harness" / "prev_release.py"), "export", str(REPO)],
+                       capture_output=True, text=True, timeout=300, check=False)
+    except (OSError, subprocess.SubprocessError) as exc:
+        print(f"WARN: the previous release could not be exported ({type(exc).__name__}) — origin=previous cells refuse",
+              flush=True)
+
+
 async def _build_once(waits=BUILD_RETRY_WAITS_S) -> str | None:
     """Build the jail image; None when it built, else the failure's last line (for the cells' INFRA rows)."""
     print("building the jail image once (parallel jobs reuse it)…", flush=True)
@@ -585,6 +596,8 @@ async def _main(args) -> int:
     if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
         print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
         return unrun("the fake cluster did not come up")
+    if not args.no_build:
+        _export_previous_release()
     if not args.no_build and (why := await _build_once()) is not None:
         return unrun(f"the jail image did not build ({why})")
 

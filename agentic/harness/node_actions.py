@@ -20,6 +20,16 @@ ACTIONS (each a root shell command in the node's container; `{user}` = the cell'
   connection to the node is now REFUSED, while the round-robin name still lists it (OpenSSH then tries the next
   address). Undone by `sshd_on`.
 - `sshd_on` — the drop-in removed, SIGHUP: the node answers on port 22 again.
+- `sshd_closed` — `sshd_off`, but only the pool user's SSH SESSIONS there are killed (their `sshd:` processes, so no
+  ssh ControlMaster rides through), never the rest of what it runs: a login node CLOSED to new logins while the
+  processes on it run on — the returning-user cells' dead pin (returning.py), where an endpoint manager may still run
+  on the node no one can reach any more. Undone by `sshd_on`.
+
+CONTROLLER actions run in the controller's container (`slurmctld`), not on a login node, and take an `arg` (a short
+lowercase name):
+- `qos_retire` — the site retires a QOS: `arg` is added to /etc/slurm/retired_qos.conf, which the `nersc` profile's
+  submit filter reads on every submit (job_submit.lua), so a job naming it is refused from then on. Undone by
+  `qos_restore`, which empties the list.
 
 Stdlib only: the host half runs on the host's python3; the jail half is imported by scenarios (which scenario_knobs.py
 imports on the host).
@@ -30,6 +40,7 @@ import argparse
 import contextlib
 import json
 import os
+import re
 import signal
 import subprocess
 import sys
@@ -41,12 +52,21 @@ ENV = "HPCB_NODE_ACTIONS"   # the jail-side path of this cell's request file (ru
 _DROPIN = "/etc/ssh/sshd_config.d/zz-hpcb-node-down.conf"
 _HUP = 'kill -HUP "$(cat /run/sshd.pid)"'
 _LISTEN = "sleep 1; echo \"HPCB_NODE $(hostname) port22=$(ss -Hltn 'sport = :22' | awk '{print $4}' | tr '\\n' ' ')\""
+_RETIRED = "/etc/slurm/retired_qos.conf"
+_QOS_SAID = f"echo \"HPCB_QOS retired: $(tr '\\n' ' ' < {_RETIRED} 2>/dev/null)\""
 ACTIONS: dict[str, str] = {
     "sshd_off": f"printf 'ListenAddress 127.0.0.1\\n' > {_DROPIN} && {_HUP} && {{ pkill -KILL -u {{user}} || true; }} "
                 f"&& {_LISTEN}",
+    "sshd_closed": f"printf 'ListenAddress 127.0.0.1\\n' > {_DROPIN} && {_HUP} && "
+                   f"{{ pkill -KILL -u {{user}} -f '^sshd' || true; }} && {_LISTEN}",
     "sshd_on": f"rm -f {_DROPIN} && {_HUP} && {_LISTEN}",
+    "qos_retire": f"printf '%s\\n' {{arg}} >> {_RETIRED} && chmod 644 {_RETIRED} && {_QOS_SAID}",
+    "qos_restore": f"rm -f {_RETIRED} && {_QOS_SAID}",
 }
-UNDO = {"sshd_off": "sshd_on"}
+UNDO = {"sshd_off": "sshd_on", "sshd_closed": "sshd_on", "qos_retire": "qos_restore"}
+CONTROLLER_ACTIONS = frozenset({"qos_retire", "qos_restore"})
+CONTROLLER = "slurmctld"   # the controller container's hostname (fakecluster/docker-compose.yml)
+_ARG = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 ACTION_TIMEOUT_S = 60
 POLL_S = 0.5
 
@@ -109,15 +129,20 @@ class Server:
         self.answered: set[int] = set()
         self.pending_undo: dict[str, str] = {}   # host -> the action that gives it back
 
-    def act(self, action: str, host: str) -> tuple[int, str]:
+    def act(self, action: str, host: str, arg: str | None = None) -> tuple[int, str]:
         if action not in ACTIONS:
             return 2, f"unknown node action {action!r} (have: {sorted(ACTIONS)})"
-        if host not in self.hosts:
+        if action in CONTROLLER_ACTIONS:
+            if host != CONTROLLER:
+                return 2, f"{action} runs on the controller ({CONTROLLER!r}), not {host!r}"
+        elif host not in self.hosts:
             return 2, f"{host!r} is not one of this cluster's login nodes {self.hosts}"
+        if "{arg}" in ACTIONS[action] and not (isinstance(arg, str) and _ARG.match(arg)):
+            return 2, f"{action} takes a short lowercase name as its arg, not {arg!r}"
         container = self._containers().get(host)
         if not container:
             return 2, f"no running container answers to the hostname {host!r}"
-        rc, out = self._execute(container, ACTIONS[action].replace("{user}", self.user))
+        rc, out = self._execute(container, ACTIONS[action].replace("{user}", self.user).replace("{arg}", arg or ""))
         if rc == 0 and action in UNDO:
             self.pending_undo[host] = UNDO[action]
         elif rc == 0:
@@ -131,7 +156,8 @@ class Server:
             if not isinstance(rid, int) or rid in self.answered:
                 continue
             self.answered.add(rid)
-            rc, out = self.act(str(row.get("action")), str(row.get("host")))
+            arg = row.get("arg")
+            rc, out = self.act(str(row.get("action")), str(row.get("host")), arg if isinstance(arg, str) else None)
             with done_path(self.req).open("a") as fh:
                 fh.write(json.dumps({"id": rid, "rc": rc, "out": out}) + "\n")
             print(f"node action #{rid}: {row.get('action')} on {row.get('host')} -> rc={rc} {out.strip()[-160:]}",
@@ -202,13 +228,16 @@ class NodeActions:
     def from_env(cls) -> NodeActions:
         return cls(os.environ.get(ENV, "").strip() or None)
 
-    def run(self, action: str, host: str, *, timeout_s: float = ACTION_TIMEOUT_S + 30,
+    def run(self, action: str, host: str, *, arg: str | None = None, timeout_s: float = ACTION_TIMEOUT_S + 30,
             sleep: Callable[[float], None] = time.sleep) -> tuple[int, str]:
         if self.req is None:
             return 2, f"no node-action channel (${ENV} unset: the scenario must declare NODE_ACTIONS, on the fake target)"
         rid = len(_lines(self.req)) + 1
+        row: dict[str, object] = {"id": rid, "action": action, "host": host}
+        if arg is not None:
+            row["arg"] = arg
         with self.req.open("a") as fh:
-            fh.write(json.dumps({"id": rid, "action": action, "host": host}) + "\n")
+            fh.write(json.dumps(row) + "\n")
         deadline = time.monotonic() + timeout_s
         while time.monotonic() < deadline:
             for row in _lines(done_path(self.req)):

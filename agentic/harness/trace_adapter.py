@@ -110,45 +110,50 @@ def trace_from_bundle(bundle_dir) -> Trace:
     which must not split a one-phase run in two. Mirrors the live stamp in `_combine`."""
     from pathlib import Path
 
+    with (Path(bundle_dir) / "messages.jsonl").open() as fh:
+        return trace_from_rows(json.loads(line) for line in fh)
+
+
+def trace_from_rows(rows) -> Trace:
+    """`trace_from_bundle` over rows already read — one phase of a mixed chain's bundle (regrade.bundle_trace splits it
+    on run.py's `chain_phase` markers and reads each phase with its operator's reader)."""
     calls: list[ToolCall] = []
     by_id: dict[str, ToolCall] = {}
     texts: list[str] = []
     text_at: list[int] = []
     sessions: list[str] = []   # distinct session ids, in order of first appearance
     phase = 0
-    with (Path(bundle_dir) / "messages.jsonl").open() as fh:
-        for line in fh:
-            m = json.loads(line)
-            t_at = m.get("__t__")   # arrival stamp (provenance writes it; older bundles have none)
-            t_at = float(t_at) if isinstance(t_at, int | float) else None
-            if m.get("__type__") == "SystemMessage" and m.get("subtype") == "init":
-                sid = str((m.get("data") or {}).get("session_id") or "")
-                if sid not in sessions:
-                    sessions.append(sid)
-                    phase = len(sessions) - 1
+    for m in rows:
+        t_at = m.get("__t__")   # arrival stamp (provenance writes it; older bundles have none)
+        t_at = float(t_at) if isinstance(t_at, int | float) else None
+        if m.get("__type__") == "SystemMessage" and m.get("subtype") == "init":
+            sid = str((m.get("data") or {}).get("session_id") or "")
+            if sid not in sessions:
+                sessions.append(sid)
+                phase = len(sessions) - 1
+            continue
+        content = m.get("content")
+        if not isinstance(content, list):
+            continue
+        for b in content:
+            if not isinstance(b, dict):
                 continue
-            content = m.get("content")
-            if not isinstance(content, list):
+            if m.get("__type__") == "AssistantMessage" and b.get("__type__") == "TextBlock":
+                if str(b.get("text") or "").strip():
+                    texts.append(str(b.get("text")))
+                    text_at.append(len(calls))
                 continue
-            for b in content:
-                if not isinstance(b, dict):
-                    continue
-                if m.get("__type__") == "AssistantMessage" and b.get("__type__") == "TextBlock":
-                    if str(b.get("text") or "").strip():
-                        texts.append(str(b.get("text")))
-                        text_at.append(len(calls))
-                    continue
-                if b.get("__type__") == "ToolUseBlock":
-                    tc = ToolCall.of(b.get("name", "") or "", dict(b.get("input") or {}), phase=phase)
-                    tc.t_call = t_at
-                    calls.append(tc)
-                    if b.get("id"):
-                        by_id[b["id"]] = tc
-                elif b.get("__type__") == "ToolResultBlock":
-                    tc = by_id.get(b.get("tool_use_id"))
-                    if tc is not None and tc.result is None:
-                        tc.result = _result_to_dict(b.get("content"))
-                        tc.t_result = t_at
+            if b.get("__type__") == "ToolUseBlock":
+                tc = ToolCall.of(b.get("name", "") or "", dict(b.get("input") or {}), phase=phase)
+                tc.t_call = t_at
+                calls.append(tc)
+                if b.get("id"):
+                    by_id[b["id"]] = tc
+            elif b.get("__type__") == "ToolResultBlock":
+                tc = by_id.get(b.get("tool_use_id"))
+                if tc is not None and tc.result is None:
+                    tc.result = _result_to_dict(b.get("content"))
+                    tc.t_result = t_at
     return Trace(calls, texts, text_at)
 
 

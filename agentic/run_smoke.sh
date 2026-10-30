@@ -166,6 +166,10 @@ if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "p
 fi
 
 if [ -z "${HPCB_SKIP_BUILD:-}" ]; then   # the suite runner builds once, then sets this
+  # the previous release's tree, which the image installs beside this code (harness/prev_release.py; the returning-user
+  # cells' first session runs it): exported from its tag, the newest older than this version
+  python3 "$REPO_ROOT/agentic/harness/prev_release.py" export "$REPO_ROOT" \
+    || echo "WARN: the previous release could not be exported — the image carries none (origin=previous cells refuse)"
   echo "building jail image (hpc-bridge-agentic)…"
   docker build --provenance=false -t hpc-bridge-agentic --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \
     -f "$REPO_ROOT/agentic/Dockerfile" "$REPO_ROOT" >/dev/null
@@ -237,6 +241,8 @@ fi
 for knob in HPCB_RELAUNCH_PHASE HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S HPCB_RELAUNCH_HOLD_S; do
   [ -n "${!knob:-}" ] && ARGS+=( -e "$knob" )
 done
+# returning_user's cell (a row of agentic/harness/returning_cells.tsv, read in the jail by the scenario): default c01
+[ -n "${HPCB_RETURNING_CELL:-}" ] && ARGS+=( -e HPCB_RETURNING_CELL )
 if [ -n "$HPCB_T_NETWORK" ]; then
   ARGS+=( --network "$HPCB_T_NETWORK" )   # the fake cluster's compose network: the jail reaches `login:22` directly
 fi

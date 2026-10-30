@@ -46,9 +46,11 @@ from trace_adapter import insert_interjections, trace_from_bundle  # noqa: E402
 # The per-run environment a scenario module reads WHEN IT IS IMPORTED — so the replay must re-create it per bundle:
 # HPCB_RUNID (canaries.nonce: the canary cells' graders, SETUP and POSTCHECKS), HPC_BRIDGE_SSH_HOST (the login host
 # no_ssh_access's graders name; the f2b cells' no longer do, 2026-10-22), HPC_BRIDGE_ENDPOINT_NAME and HPCB_TARGET_NODES (POSTCHECKS, SETUP),
-# HPCB_RELAUNCH_* (queued_check_relaunch's watch and NEEDS_COMPUTE_NODE). test_regrade holds every scenario to it.
+# HPCB_RELAUNCH_* (queued_check_relaunch's watch and NEEDS_COMPUTE_NODE), HPCB_RETURNING_CELL (returning_user's cell:
+# its levels pick the graders). test_regrade holds every scenario to it.
 RUN_ENV = ("HPCB_RUNID", "HPC_BRIDGE_SSH_HOST", "HPC_BRIDGE_ENDPOINT_NAME", "HPCB_TARGET_NODES",
-           "HPCB_RELAUNCH_PHASE", "HPCB_RELAUNCH_HOLD_S", "HPCB_RELAUNCH_WATCH_S", "HPCB_RELAUNCH_PILOT_WAIT_S")
+           "HPCB_RELAUNCH_PHASE", "HPCB_RELAUNCH_HOLD_S", "HPCB_RELAUNCH_WATCH_S", "HPCB_RELAUNCH_PILOT_WAIT_S",
+           "HPCB_RETURNING_CELL")
 
 
 def run_env(rec: dict) -> dict[str, str | None]:
@@ -122,6 +124,8 @@ def bundle_trace(d: Path, rec: dict) -> Trace:
     the interactive gates replay; a hermes transcript-replay (`-z`) bundle cannot (each turn was its own session
     carrying the whole conversation) and replays trace-only."""
     first = _first_line(d)
+    if "chain_phase" in first:
+        return chain_trace(_rows(d))
     if "__type__" in first:
         return trace_from_bundle(d)
     if "harness" in first and "rc" in first:  # the Codex / Pi / Hermes-latest operator (cli_runner)
@@ -148,6 +152,33 @@ def bundle_trace(d: Path, rec: dict) -> Trace:
             t = stamp_exchanges(t, exchanges_from_messages(rows, replies))
         return t
     return trace_from_bundle(d)
+
+
+def chain_trace(rows: list) -> Trace:
+    """A mixed chain's bundle (run.py `_combine` with labels): each phase's rows open with a `chain_phase` marker and are
+    in their own operator's layout — the script's or a CLI's steps-and-journal rows (cli_runner), the Claude SDK's
+    stream (trace_adapter). Each phase is read with its reader and stamped with its index, the texts' places shifted
+    past the earlier phases' calls, as `_combine` does live."""
+    from cli_runner import trace_from_bundle_messages
+    from trace_adapter import trace_from_rows
+
+    phases: list[tuple[int, list]] = []
+    for m in rows:
+        if isinstance(m, dict) and "chain_phase" in m:
+            phases.append((int(m["chain_phase"]), []))
+        elif phases:
+            phases[-1][1].append(m)
+    calls, texts, text_at = [], [], []
+    for k, seg in phases:
+        head = next((m for m in seg if isinstance(m, dict)), {})
+        t = trace_from_bundle_messages(seg) if "harness" in head and "rc" in head else trace_from_rows(seg)
+        if len(t.text_at) == len(t.texts):
+            text_at += [len(calls) + n for n in t.text_at]
+        for c in t.calls:
+            c.phase = k
+            calls.append(c)
+        texts += t.texts
+    return Trace(calls, texts, text_at if len(text_at) == len(texts) else [])
 
 
 def _rows(d: Path) -> list:
