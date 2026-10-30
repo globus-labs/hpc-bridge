@@ -138,12 +138,16 @@ done
 [ -z "${FREE_WAVE:-}" ] || echo "free wave: HPCB_ALCF_WAIT_S=${HPCB_ALCF_WAIT_S:-0} — each cell probes the ALCF endpoint first; an unhealthy one is recorded INFRA, not run" | tee -a "$SUMMARY"
 [ -z "$PAID_ONLY" ] || echo "paid only: the paid_only() cells, Claude operator" | tee -a "$SUMMARY"
 
+BUILT=""   # set once an image was built in this sweep (by run_suite, or by the first scripted cell's run_smoke)
 script_cell() {  # script_cell <profile> <scenario> [cell]: ONE script-operator cell (no model) on the cluster booted above
   # its row reads "<scenario> (script) — RESULT: …" (two words before the dash, as queued_check_relaunch's: sweep_dash
   # reads a one-word row as the no-skill ablation); with a returning-user cell, "<scenario> <cell> — RESULT: …"
-  local label="$2${3:+ $3}" tag="$2${3:+-$3}" row="$2 ${3:-(script)}"
-  echo "    ${TAGGED:+[script] }$label (script operator):" | tee -a "$SUMMARY"
-  env HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$(cluster_of "$1")" HPCB_SKIP_BUILD=1 \
+  # The first one in a sweep that built nothing yet builds the image (run_smoke.sh, with the older releases' export):
+  # a script-only sweep (--profiles returning) ran on whatever image was there before (the review of 2026-10-30)
+  local label="$2${3:+ $3}" tag="$2${3:+-$3}" row="$2 ${3:-(script)}" skip="${BUILT:+1}"
+  BUILT=1
+  echo "    ${TAGGED:+[script] }$label (script operator)${skip:- — building the image first}:" | tee -a "$SUMMARY"
+  env HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$(cluster_of "$1")" ${skip:+HPCB_SKIP_BUILD=1} \
     ${3:+HPCB_RETURNING_CELL="$3"} "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$tag.log" \
     | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
     | sed "s/^/    ${TAGGED:+[script] }$row — /" | tee -a "$SUMMARY"
@@ -210,6 +214,7 @@ for prof in "${PROFS[@]}"; do
       continue
     fi
     echo "## $prof$tag — $(date +%H:%M) — $scen" | tee -a "$SUMMARY"
+    BUILT=1   # run_suite builds the image (and exports the older releases) once
     HPCB_OPERATOR="$op" python3 "$HERE/agentic/run_suite.py" --target fake --profile "$prof" ${RESET:+"$RESET"} --models "$MODELS" \
         --scenarios "$scen" --concurrency "$conc" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$prof${TAGGED:+-$op}.log" \
         | grep -E "done |skip |SUITE|passed" | sed "s/^/    ${TAGGED:+[$op] }/" | tee -a "$SUMMARY"

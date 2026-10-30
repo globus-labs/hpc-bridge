@@ -19,6 +19,7 @@ changed); `python3 agentic/harness/returning.py --list` names them.
 """
 from returning import (
     ACCOUNT,
+    UV_CUTOFF_CLEAR,
     cell_from_env,
     expect_ok,
     graders,
@@ -51,9 +52,9 @@ INTERPHASE_SETUP = [interphase(CELL)]
 # key accepted (a cell killed before its world check put it back), no QOS retired (ADMIN_*, through the admin channel)
 SETUP = ['rm -rf "$HOME"/hpc-bridge/gce-venv*; '
          "if [ -e ~/.ssh/authorized_keys.hpcb-revoked ]; then mv ~/.ssh/authorized_keys.hpcb-revoked "
-         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]"]
+         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]", UV_CUTOFF_CLEAR]
 CLEANUP = ["if [ -e ~/.ssh/authorized_keys.hpcb-revoked ]; then mv ~/.ssh/authorized_keys.hpcb-revoked "
-           "~/.ssh/authorized_keys; fi; true"]
+           "~/.ssh/authorized_keys; fi; true", UV_CUTOFF_CLEAR]
 ADMIN_SETUP = ["rm -f /etc/slurm/retired_qos.conf"]
 ADMIN_CLEANUP = ["rm -f /etc/slurm/retired_qos.conf"]
 

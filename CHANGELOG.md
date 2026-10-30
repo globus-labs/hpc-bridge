@@ -61,6 +61,23 @@ installed plugin only when that version changes); git tags mark releases.
   only on the first). Not yet run live.
 
 ### Fixed
+- **A manager killed hard comes up again, a venv deleted under a running manager is rebuilt, and a facility reattached
+  over the web is remembered (found by the returning-user cells, 2026-10-30).** Each was proven first by a test that
+  failed for the reason the cells met.
+  - **A start refused for a recent pid file waits it out.** A manager killed hard leaves its `daemon.pid` on the shared
+    home, and `globus-compute-endpoint start` refuses (exit 73) while that file is younger than three heartbeats (90 s
+    by default). hpc-bridge now reads the file's age and the endpoint's `heartbeat_period` and waits, inside the
+    connect when that is at most 150 s, then starts once more; a longer wait answers "connect again in N s". If the
+    file is touched during the wait, another instance is alive, perhaps on the other login node: hpc-bridge says so and
+    does not start a second one. It never deletes the pid file. The failure notice now quotes the endpoint log's own
+    line instead of the login shell's `.bashrc` output.
+  - **A broken endpoint environment is named and repaired.** A user endpoint that cannot start because its Python
+    cannot import (`No module named …`: the venv a running manager uses was deleted) is no longer reported as a config,
+    partition or queue problem, nor as "likely REJECTED". hpc-bridge rebuilds its venv over the bring-up's own channel,
+    restarts the manager on its pinned login node, and says what it did. Repair uses the free login shape; the spend
+    question is unchanged.
+  - **A reattach saves the config that worked.** A facility reached over the web (zero SSH) with no record in
+    `facilities.json` is saved there once a shell has run on it. A config that was only proposed is never saved.
 - **Left-over local state no longer traps a facility (a user's Perlmutter report on 0.1.20, 2026-10-29).** Each of these
   was proven first by a test that failed for the reported reason.
   - A remembered login-node pin that no longer answers is dropped again when the facility is reached through an
@@ -288,29 +305,37 @@ installed plugin only when that version changes); git tags mark releases.
 - **Returning users: pairwise two-session cells on the fake `nersc` profile** (`agentic/harness/returning.py`;
   `agentic/README.md`, "Returning users"). The combinatorial follow-up to the Perlmutter report (plugin 0.1.20,
   2026-10-29), whose leftovers came stacked where #236's proofs seed one each.
-  - **The cells.** Session 1 is scripted on the cell's origin plugin: this checkout, or the previous release. Between
-    the sessions the world changes: the endpoint left running, stopped, killed hard or torn down; the pinned login
-    node closed; the key revoked; local files deleted or wiped, or a new facility id; the venv or the endpoint's
-    directory deleted; the QOS retired; the token store gone; the host keys changed; another endpoint version; a
-    second id on the same host. Session 2 runs the current code toward hello world on a compute node and does the
-    user's part when asked. 20 scripted cells are pairwise over those 11 factors (`pairwise.py`, the table checked in
-    as `returning_cells.tsv`), plus three agent cells: the report replayed, all well, a new laptop.
-  - **What every cell must hold:** a working compute shell (or an honest notice and success after the user's
-    part), a dead pin met at most once, an explicit `ssh_host` kept, at most one live endpoint (processes on every
-    login node, the cloud's view), `~/.hpc-bridge` in today's format, a bounded number of calls. Each factor level
-    adds its own check. The agent cells also check that the agent never hand-edits `~/.hpc-bridge` or
-    `~/.globus_compute`.
+  - **The cells.** Session 1 is scripted on the cell's origin plugin: this checkout, or the release before it
+    (0.1.24 today; the Perlmutter replay pins 0.1.20), in the package index as that release saw it. Between the
+    sessions the world changes: the endpoint left running, stopped, killed hard long ago or just now, or torn down;
+    the pinned login node closed; the key revoked; local files deleted or wiped, or a new facility id; the venv or
+    the endpoint's directory deleted; the QOS retired; the token store gone; the host keys changed; another endpoint
+    version. Session 2 runs the current code toward hello world on a compute node and does the user's part when
+    asked. 22 scripted cells are pairwise over those 10 factors (`pairwise.py`, the table checked in as
+    `returning_cells.tsv`), every changed level one that bites, plus three agent cells: the report replayed, all well,
+    a new laptop.
+  - **What every cell must hold:** hello world on a compute node by the compute shape, a dead pin met at most once,
+    an explicit `ssh_host` kept, at most one live endpoint (processes on every login node, the cloud's view),
+    `~/.hpc-bridge` in today's format, a bounded number of calls. Each factor level adds its own check, gated in every
+    cell that changes it; the same endpoint and no rebuild of session 1's venv are gated wherever nothing deleted them.
+    The agent cells also check that the agent never hand-edits `~/.hpc-bridge` or `~/.globus_compute`.
   - **Harness:**
-    - A `PHASES` entry may name a scripted phase and its server (`current` / `previous`), and a condition.
+    - A `PHASES` entry may name a scripted phase and its server (`current`, `previous` or a pinned release), its
+      server's env, a condition, and whether it is the premise (a premise or a world change between phases that
+      fails stops the chain: SETUP FAILED, `harness:chain` says why).
     - `INTERPHASE_SETUP` may hold callables.
     - Such a chain's bundle marks each phase, and `regrade.py` reads each with its operator's reader.
     - Codex, Pi and Hermes drive a chain that opens with a scripted session.
-    - The image carries the previous release, the newest tag older than this version (`prev_release.py`).
+    - The image carries older releases (`prev_release.py`): `previous`, the newest release commit older than this
+      version in pyproject's history (the tags said 0.1.20, four releases back), and 0.1.20 pinned. A failed export
+      is an ERROR with its reason. `harness:phase_server` gates that a scripted phase ran the release it declared; the
+      head row keeps the server's whole argv.
     - New node actions: `sshd_closed` (a login node closed, its processes kept), and `qos_retire` / `qos_restore`
       (the nersc submit filter reads `/etc/slurm/retired_qos.conf`).
     - A mixed chain's INFRA verdict reads only the operator's own phases.
   - **The sweep:** `returning` is a script-only sweep profile (the nersc cluster, one row per cell); `nersc` runs the
-    three agent cells in every wave, then the report's proofs.
+    three agent cells in every wave, then the report's proofs. A sweep that has built no image yet builds it before its
+    first scripted cell.
   - **First run (2026-10-30, every scripted cell once): 15 of 20 OK.** The five failures are two product bugs, not
     fixed here:
     - A manager killed hard (`ended=killed`, its endpoint directory kept: c03, c05, c12, c18) is never brought up
@@ -320,6 +345,17 @@ installed plugin only when that version changes); git tags mark releases.
     - A running manager whose venv was deleted (c09) is reused over the web, but cannot start a user endpoint ("No
       module named 'jinja2'", exit 73). The notice says "fix the config/partition", then "likely REJECTED (e.g.
       inactive allocation, wrong account, or bad queue)"; nothing rebuilds the venv.
+  - **After the fixes and the review (2026-10-30, the 22 cells of today's table, each once on the fixed code): 21 of
+    22 OK.** Red first: on the unfixed code every cell that restarts a manager killed just now failed (exit 73, the
+    `.bashrc` noise quoted), and the review's probes became tests that fail on the first harness (a login-shape hello,
+    a silently rewritten `known_hosts` on a reuse, probes after a reattach, a read with `2>/dev/null` taken for an
+    edit, a facility id taken for another host's config, the cell's levels lost on a regrade). Three harness faults the
+    new runs found were fixed and their cells re-run: session 2's user now names the node type a fresh proposal
+    dropped (c02, c05, c15), `known_hosts` is compared by the plugin's own names, not the whole file the harness'
+    channel also writes (c04), and a stop's "reconnecting is zero-SSH" no longer reads as SSH (c08). The one failure
+    is a product gap: c08 (a running manager whose venv was deleted, its pinned node closed, the key revoked) —
+    the repair runs its venv check over the dead pin ("ssh: connect to host login01… Connection refused") and gives
+    up, where the shared home could be rebuilt through the other login node.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

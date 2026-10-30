@@ -14,10 +14,15 @@ still-uncovered pairs with what is already chosen (ties: the earlier level), ski
 with a level already chosen; of the candidate rows the one that covers the most new pairs wins (ties: the earlier
 seed). Constraints are pairs, so a pair is coverable exactly when no constraint names it, and a row built this way never
 breaks one. Stdlib only, no randomness: the same factors and constraints always give the same rows.
+
+A row may also have to satisfy a whole-row rule (`valid`: the returning-user cells keep only rows where every changed
+level bites — a changed host key behind a reattach that makes no SSH is a no-op). A greedy row that breaks it is mended
+by changing one, then two, of its non-seed levels (the mend that covers the most new pairs wins); a pair no valid row
+can hold must be named as a constraint, or the generator says which pairs it could not place.
 """
 from __future__ import annotations
 
-from collections.abc import Mapping, Sequence
+from collections.abc import Callable, Mapping, Sequence
 from itertools import combinations
 
 Factors = Mapping[str, Sequence[str]]          # name -> levels, in order (the first level is the "nothing changed" one)
@@ -74,7 +79,11 @@ def _sorted_pairs(factors: Factors, pairs: set[Pair]) -> list[Pair]:
     return sorted(pairs, key=lambda p: (order[p[0][0]], order[p[1][0]], lvl[p[0][0]][p[0][1]], lvl[p[1][0]][p[1][1]]))
 
 
-def _complete(seed: Pair, factors: Factors, uncovered: set[Pair], bad: set[Pair]) -> dict[str, str] | None:
+Valid = Callable[[dict[str, str]], bool]
+
+
+def _complete(seed: Pair, factors: Factors, uncovered: set[Pair], bad: set[Pair],
+              valid: Valid | None = None) -> dict[str, str] | None:
     row = {seed[0][0]: seed[0][1], seed[1][0]: seed[1][1]}
     for f, levels in factors.items():
         if f in row:
@@ -89,19 +98,56 @@ def _complete(seed: Pair, factors: Factors, uncovered: set[Pair], bad: set[Pair]
         if best is None:
             return None   # every level of `f` is forbidden with what is chosen: this seed cannot make a row
         row[f] = best
-    return {f: row[f] for f in factors}
+    out = {f: row[f] for f in factors}
+    if valid is None or valid(out):
+        return out
+    return _mend(out, seed, factors, uncovered, bad, valid)
 
 
-def generate(factors: Factors, forbidden: Forbidden = (), *, seeds: int = 40) -> list[dict[str, str]]:
+def _allowed(row: dict[str, str], factors: Factors, bad: set[Pair]) -> bool:
+    names = list(factors)
+    return not any(_key(factors, (a, row[a]), (b, row[b])) in bad for a, b in combinations(names, 2))
+
+
+def _mend(row: dict[str, str], seed: Pair, factors: Factors, uncovered: set[Pair], bad: set[Pair],
+          valid: Valid) -> dict[str, str] | None:
+    """A row that breaks the whole-row rule, mended by changing one, then two, of its non-seed levels — the mend that
+    keeps the most new pairs (ties: factor, then level, order). None when no such mend is valid."""
+    free = [f for f in factors if f not in (seed[0][0], seed[1][0])]
+    for width in (1, 2):
+        best, best_gain = None, -1
+        for fs in combinations(free, width):
+            options: list[list[tuple[str, str]]] = [[(f, lv) for lv in factors[f] if lv != row[f]] for f in fs]
+            for choice in (options[0] if width == 1 else [(a, b) for a in options[0] for b in options[1]]):
+                cand = dict(row)
+                for f, lv in ([choice] if width == 1 else choice):
+                    cand[f] = lv
+                if not _allowed(cand, factors, bad) or not valid(cand):
+                    continue
+                gain = len(pairs_of(cand, factors) & uncovered)
+                if gain > best_gain:
+                    best, best_gain = cand, gain
+        if best is not None:
+            return best
+    return None
+
+
+def generate(factors: Factors, forbidden: Forbidden = (), *, seeds: int = 40,
+             valid: Valid | None = None) -> list[dict[str, str]]:
     """The rows: each a {factor: level} dict in factor order. `seeds`: how many of the first uncovered pairs each new
-    row is tried from (more can make the table shorter, never different for the same inputs)."""
+    row is tried from (more can make the table shorter, never different for the same inputs). `valid`: a whole-row rule
+    every row must keep (see the module's note)."""
     bad = forbidden_pairs(factors, forbidden)
     uncovered = all_pairs(factors, forbidden)
     rows: list[dict[str, str]] = []
     while uncovered:
         best_row, best_gain = None, 0
-        for seed in _sorted_pairs(factors, uncovered)[:max(1, seeds)]:
-            row = _complete(seed, factors, uncovered, bad)
+        ordered = _sorted_pairs(factors, uncovered)
+        # a seed that cannot make a valid row is passed over; when the first `seeds` all fail, every other is tried
+        for seed in ordered[:max(1, seeds)] + (ordered[max(1, seeds):] if valid is not None else []):
+            if best_row is not None and seed not in ordered[:max(1, seeds)]:
+                break
+            row = _complete(seed, factors, uncovered, bad, valid)
             if row is None:
                 continue
             gain = len(pairs_of(row, factors) & uncovered)

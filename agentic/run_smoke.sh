@@ -166,10 +166,10 @@ if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "p
 fi
 
 if [ -z "${HPCB_SKIP_BUILD:-}" ]; then   # the suite runner builds once, then sets this
-  # the previous release's tree, which the image installs beside this code (harness/prev_release.py; the returning-user
-  # cells' first session runs it): exported from its tag, the newest older than this version
+  # the older releases' trees, which the image installs beside this code (harness/prev_release.py; the returning-user
+  # cells' first session runs one): `previous` (from pyproject's version history) and each pinned version
   python3 "$REPO_ROOT/agentic/harness/prev_release.py" export "$REPO_ROOT" \
-    || echo "WARN: the previous release could not be exported — the image carries none (origin=previous cells refuse)"
+    || echo "ERROR: the older hpc-bridge releases could not be exported (the reason is above) — a cell that runs one is SETUP FAILED" >&2
   echo "building jail image (hpc-bridge-agentic)…"
   docker build --provenance=false -t hpc-bridge-agentic --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \
     -f "$REPO_ROOT/agentic/Dockerfile" "$REPO_ROOT" >/dev/null

@@ -57,17 +57,18 @@ RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
     && /home/agent/.local/bin/hermes --version
 USER root
 
-# The PREVIOUS hpc-bridge release, beside the code under test: the returning-user cells' first session runs it
-# (agentic/harness/prev_release.py). run_smoke.sh and run_suite.py export the newest release tag older than this version
-# into agentic/.prev-release (its tree in src/, its name in TAG) before every build; it is installed from its OWN lock
-# into /opt/hpcb-prev/venv, so its server is /opt/hpcb-prev/venv/bin/hpc-bridge. No tag exported: no venv, and such a
-# cell is refused. Above the code layers: it changes once per release, never with an edit here.
+# OLDER hpc-bridge releases, beside the code under test: the returning-user cells' first session runs one
+# (agentic/harness/prev_release.py). run_smoke.sh and run_suite.py export each SLOT — `previous` (the release before
+# this version, from pyproject's version history) and every pinned version (0.1.20: the Perlmutter replay) — into
+# agentic/.prev-release/<slot> (its tree in src/; VERSION, COMMIT, DATE) before every build; each is installed from its
+# OWN lock into /opt/hpcb-prev/<slot>/venv, so its server is /opt/hpcb-prev/<slot>/venv/bin/hpc-bridge. A slot not
+# exported has no venv, and a cell that needs it is refused. Above the code layers: it changes once per release.
 COPY agentic/.prev-release /opt/hpcb-prev
-RUN if [ -f /opt/hpcb-prev/TAG ]; then \
-        cd /opt/hpcb-prev/src && UV_PROJECT_ENVIRONMENT=/opt/hpcb-prev/venv uv sync -q --frozen --no-editable \
-            --extra integration && /opt/hpcb-prev/venv/bin/python -c "import hpc_bridge.server" \
-        && chown -R 1000:1000 /opt/hpcb-prev; \
-    fi
+RUN for d in /opt/hpcb-prev/*/; do \
+        d="${d%/}"; [ -f "$d/VERSION" ] || continue; \
+        ( cd "$d/src" && UV_PROJECT_ENVIRONMENT="$d/venv" uv sync -q --frozen --no-editable --extra integration ) \
+            && "$d/venv/bin/python" -c "import hpc_bridge.server" || exit 1; \
+    done; chown -R 1000:1000 /opt/hpcb-prev
 
 # The hpc-bridge repo (plugin + MCP server + skill + harness). Build context is the
 # repo root (run_smoke.sh builds from there); .dockerignore trims it.

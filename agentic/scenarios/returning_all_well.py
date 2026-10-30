@@ -7,7 +7,7 @@ endpoint an older plugin stood up, driven by this one.
     agentic/fakecluster/bin/up.sh --profile nersc
     HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=nersc ./agentic/run_smoke.sh returning_all_well
 """
-from returning import agent_cell, expect_ok, graders, interphase, phases, world_check
+from returning import UV_CUTOFF_CLEAR, agent_cell, expect_ok, graders, interphase, phases, world_check
 
 CELL = agent_cell("all_well")
 TARGETS = ("fake",)
@@ -27,7 +27,8 @@ PHASES = phases(CELL)
 INTERPHASE_SETUP = [interphase(CELL)]
 SETUP = ['rm -rf "$HOME"/hpc-bridge/gce-venv*; '
          "if [ -e ~/.ssh/authorized_keys.hpcb-revoked ]; then mv ~/.ssh/authorized_keys.hpcb-revoked "
-         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]"]
+         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]", UV_CUTOFF_CLEAR]
+CLEANUP = [UV_CUTOFF_CLEAR]   # session 1's uv cutoff (returning.uv_cutoff_cmd), should the cell end inside it
 ADMIN_SETUP = ["rm -f /etc/slurm/retired_qos.conf"]
 ADMIN_CLEANUP = ["rm -f /etc/slurm/retired_qos.conf"]
 

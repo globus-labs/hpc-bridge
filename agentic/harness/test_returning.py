@@ -57,11 +57,26 @@ def test_every_valid_pair_is_covered_and_no_cell_breaks_a_constraint():
         assert pairwise.violations(c.levels, ru.FACTORS, ru.CONSTRAINTS) == [], c.id
     assert [c.id for c in cells] == [f"c{n:02d}" for n in range(1, len(cells) + 1)]
     assert cells[0].levels == {f: levels[0] for f, levels in ru.FACTORS.items()}   # the control: nothing changed
-    # far fewer than the full product (6144), never fewer than the two largest factors' pairs
-    assert 16 <= len(cells) <= 24
+    # far fewer than the full product (7680), never fewer than the two largest factors' pairs (ended × local: 20)
+    assert 20 <= len(cells) <= 28
+    assert {c.ended for c in cells} >= {"killed_earlier", "killed_recent"}
     # the constraints are real: neither forbidden pair is in any cell, both are otherwise reachable
     for pair, _why in ru.CONSTRAINTS:
         assert not any(all(c.levels[f] == v for f, v in pair.items()) for c in cells)
+    # every cell's every changed level BITES (the review of 2026-10-30 found no-op cells: a changed host key behind a
+    # reattach that makes no SSH, a dead pin a teardown had removed)
+    assert all(ru.valid_row(c.levels) for c in cells)
+    assert "shared_host" not in ru.FACTORS   # dropped: it did nothing under the run's one endpoint name (returning.py)
+
+
+def test_a_whole_row_rule_is_kept_and_its_rows_mended():
+    factors = {"a": ("0", "1"), "b": ("0", "1"), "c": ("0", "1")}
+
+    def valid(row):   # a=1 only where b=1 or c=1 (the shape of `bites`: a change only where something lets it act)
+        return row["a"] == "0" or row["b"] == "1" or row["c"] == "1"
+    rows = pairwise.generate(factors, [], valid=valid)
+    assert all(valid(r) for r in rows) and pairwise.uncovered_pairs(rows, factors, []) == []
+    assert rows == pairwise.generate(factors, [], valid=valid)
 
 
 def test_the_generator_is_deterministic_and_pairwise_on_a_small_space():
@@ -84,6 +99,7 @@ def test_the_generator_is_deterministic_and_pairwise_on_a_small_space():
 
 
 def test_a_cell_is_picked_by_its_id_and_an_unknown_one_is_refused(monkeypatch):
+    monkeypatch.delenv(ru.LEVELS_ENV, raising=False)
     monkeypatch.setenv(ru.CELL_ENV, "c03")
     assert ru.cell_from_env().id == "c03" and ru.cell_from_env().origin == ru.load_cells()["c03"].levels["origin"]
     monkeypatch.setenv(ru.CELL_ENV, "c99")
@@ -91,6 +107,27 @@ def test_a_cell_is_picked_by_its_id_and_an_unknown_one_is_refused(monkeypatch):
         ru.cell_from_env()
     monkeypatch.delenv(ru.CELL_ENV)
     assert ru.cell_from_env().id == "c01"
+
+
+def test_a_cell_is_graded_under_the_levels_it_ran(monkeypatch):
+    # the bundle's env keeps the levels (regrade replays HPCB_RETURNING_LEVELS): a regrade after the table was
+    # regenerated grades the cell that RAN, not whatever the id names now (the review of 2026-10-30)
+    import regrade
+    assert "HPCB_RETURNING_LEVELS" in regrade.RUN_ENV
+    monkeypatch.delenv(ru.LEVELS_ENV, raising=False)
+    monkeypatch.setenv(ru.CELL_ENV, "c02")
+    picked = ru.cell_from_env()
+    carried = json.loads(__import__("os").environ[ru.LEVELS_ENV])
+    assert carried == {"id": "c02", "levels": picked.levels}
+    ran = {**{f: v[0] for f, v in ru.FACTORS.items()}, "ended": "stopped", "tokens": "expired"}
+    monkeypatch.setenv(ru.LEVELS_ENV, json.dumps({"id": "c02", "levels": ran}))
+    assert ru.cell_from_env().levels == ran                      # its own levels, whatever the table says now
+    monkeypatch.setenv(ru.CELL_ENV, "c03")
+    assert ru.cell_from_env().levels == ru.load_cells()["c03"].levels   # another cell's levels are not carried over
+    monkeypatch.setenv(ru.CELL_ENV, "c02")
+    monkeypatch.setenv(ru.LEVELS_ENV, json.dumps({"id": "c02", "levels": {"origin": "current"}}))
+    with pytest.raises(ValueError):
+        ru.cell_from_env()
 
 
 def test_the_agent_cells_are_the_three_hand_picked_stories():
@@ -104,47 +141,125 @@ def test_the_agent_cells_are_the_three_hand_picked_stories():
         assert c.agent and "ru_no_hand_edits" in ru.expect_ok(c)
     assert "ru_reused" in ru.expect_ok(well) and "ru_reattached" in ru.expect_ok(laptop)
     assert {"ru_dead_pin", "ru_revoked_handoff"} <= set(ru.expect_ok(replay))
+    # the replay runs the report's own plugin (0.1.20) whatever `previous` is; the others the release before this one
+    assert ru.release_slot(replay) == "0.1.20" in prev_release.PINNED
+    assert ru.release_slot(well) == ru.release_slot(laptop) == prev_release.PREVIOUS
+    first = ru.phases(replay)[0]
+    assert first["server"] == "0.1.20" and first["premise"] and first["env"] == {}
+    assert ru.phases(well)[0]["env"] == {"HPC_BRIDGE_REMOTE_VENV": ru.OLD_VENV}   # its /home default fails on nersc
 
 
 def test_each_factor_level_gates_its_own_expectation():
     cells = ru.load_cells()
     for c in cells.values():
         gated = set(ru.expect_ok(c))
-        assert {"ru_session_1", "ru_hello_world", "ru_bounded", "ru_explicit_args"} <= gated
-        assert ("ru_dead_pin" in gated) == (c.pin == "dead")
-        assert ("ru_revoked_handoff" in gated) == (c.auth == "revoked")
-        assert ("ru_expired_login" in gated) == (c.tokens == "expired")
-        assert ("ru_host_key_honest" in gated) == (c.host_key == "changed")
-        assert ("ru_killed_not_up" in gated) == (c.ended == "killed")
-        assert ("ru_policy_surfaced" in gated) == (c.site == "policy_changed")
-        assert ("ru_reused" in gated) == ru.reuse_expected(c)
-    assert ru.reuse_expected(cells["c01"])   # nothing changed: the endpoint must be reused
+        assert {"ru_session_1", "ru_hello_world", "ru_bounded", "ru_explicit_args", "harness:phase_server"} <= gated
+        # each factor with a grader of its own: gated in EVERY cell where its level is not the default, and it bites
+        for factor, grader in ru.FACTOR_GRADERS.items():
+            changed = c.levels[factor] != ru.FACTORS[factor][0]
+            assert (grader in gated) == changed, (c.id, factor)
+            assert not changed or ru.BITES.get(factor, lambda _lv: True)(c.levels), (c.id, factor)
+        assert ("ru_killed_not_up" in gated) == c.ended.startswith("killed_")
+        assert ("ru_reused" in gated) == ru.reuse_expected(c.levels)
+        assert ("ru_same_endpoint" in gated) == ru.same_endpoint_expected(c.levels)
+        assert ("ru_no_rebuild" in gated) == ru.no_rebuild_expected(c.levels)
+    assert ru.reuse_expected(cells["c01"].levels)   # nothing changed: the endpoint must be reused
+
+
+def test_only_a_deletion_forces_another_endpoint_and_only_a_venv_change_a_rebuild():
+    # the review of 2026-10-30: the old `reuse_expected` gated "same endpoint" in one cell; a stopped or killed manager,
+    # a new laptop, a renamed id, a dead pin, a revoked key, expired tokens, a changed host key or policy, an older
+    # origin force neither a second registration nor a rebuild
+    base = {f: v[0] for f, v in ru.FACTORS.items()}
+    harmless = [{"ended": "stopped"}, {"ended": "killed_earlier"}, {"ended": "killed_recent"}, {"local": "wiped"},
+                {"local": "renamed_id"}, {"local": "record_deleted"}, {"pin": "dead"}, {"auth": "revoked"},
+                {"tokens": "expired"}, {"host_key": "changed", "local": "wiped"}, {"site": "policy_changed"},
+                {"origin": "previous"}, {"origin": "previous", "ended": "stopped"}]
+    for change in harmless:
+        lv = {**base, **change}
+        assert ru.same_endpoint_expected(lv) and ru.no_rebuild_expected(lv), change
+    assert not ru.same_endpoint_expected({**base, "ended": "torn_down"})
+    assert not ru.same_endpoint_expected({**base, "remote": "endpoint_dir_deleted"})
+    assert not ru.no_rebuild_expected({**base, "remote": "venv_deleted"})
+    assert not ru.no_rebuild_expected({**base, "gce": "changed"})
+    killed = ru.Cell("x", {**base, "ended": "killed_earlier"})
+    assert {"ru_same_endpoint", "ru_no_rebuild"} <= set(ru.expect_ok(killed))
 
 
 # ---- the previous release -----------------------------------------------------------------------------------------------
 
-def test_the_previous_release_is_the_newest_tag_older_than_this_version():
-    tags = ["v0.1.1-beta.1", "v0.1.13-beta.1", "v0.1.20-beta.1", "not-a-tag", "v0.1.25"]
-    assert prev_release.previous_release(tags, "0.1.25") == "v0.1.20-beta.1"
-    assert prev_release.previous_release(tags, "0.1.26") == "v0.1.25"            # a release moves it forward
-    assert prev_release.previous_release(tags, "0.1.20") == "v0.1.13-beta.1"     # never this version's own tag
-    assert prev_release.previous_release(["v0.1.20-beta.1", "v0.1.20", "v0.1.20-beta.2"], "0.1.21") == "v0.1.20"
-    assert prev_release.previous_release(["v0.1.20-beta.1", "v0.1.20-beta.2"], "0.1.21") == "v0.1.20-beta.2"
-    assert prev_release.previous_release(tags, "0.1.1") is None
-    assert prev_release.previous_release(tags, "garbage") is None
+# This repo's first-parent history of pyproject.toml, as `prev_release.history` reads it (newest first), cut short:
+# the release commits are where the version changed; the commits between carry it on toward the next release
+HISTORY = [("fbe2eb7", "2026-10-20T10:00:00-05:00", "0.1.25"), ("7880898", "2026-10-20T09:00:00-05:00", "0.1.24"),
+           ("85e0c22", "2026-10-16T09:00:00-05:00", "0.1.24"), ("9c75742", "2026-10-13T18:38:54-05:00", "0.1.24"),
+           ("5ce62f6", "2026-10-13T09:00:00-05:00", "0.1.23"), ("b19581d", "2026-10-06T12:30:39-05:00", "0.1.20"),
+           ("743de8c", "2026-10-06T10:00:00-05:00", "0.1.20-beta.1"), ("0000000", "2026-01-01T00:00:00Z", "garbage")]
 
 
-def test_the_image_carries_the_previous_release_or_says_it_does_not(tmp_path):
-    assert prev_release.server_argv(tmp_path) is None and prev_release.installed_tag(tmp_path) is None
-    (tmp_path / "venv" / "bin").mkdir(parents=True)
-    (tmp_path / "venv" / "bin" / "hpc-bridge").write_text("")
-    assert prev_release.server_argv(tmp_path) is None              # no TAG: not an install the build finished
-    (tmp_path / "TAG").write_text("v0.1.20-beta.1\n")
-    assert prev_release.server_argv(tmp_path) == [str(tmp_path / "venv" / "bin" / "hpc-bridge")]
+def test_the_previous_release_is_the_newest_release_commit_older_than_this_version():
+    # the review of 2026-10-30: choosing by TAG made `previous` v0.1.20-beta.1 under 0.1.25 (only three tags exist) —
+    # four releases back; the version history names 0.1.24, at the commit that made it (9c75742)
+    rels = prev_release.releases(HISTORY)
+    assert [(r.version, r.commit) for r in rels] == [("0.1.25", "fbe2eb7"), ("0.1.24", "9c75742"),
+                                                    ("0.1.23", "5ce62f6"), ("0.1.20", "b19581d"),
+                                                    ("0.1.20-beta.1", "743de8c")]
+    prev = prev_release.previous_release(rels, "0.1.25")
+    assert (prev.version, prev.commit, prev.date) == ("0.1.24", "9c75742", "2026-10-13T18:38:54-05:00")
+    assert prev_release.previous_release(rels, "0.1.26").version == "0.1.25"      # a release moves it forward
+    assert prev_release.previous_release(rels, "0.1.24").version == "0.1.23"      # never this version's own
+    assert prev_release.previous_release(rels, "0.1.20").version == "0.1.20-beta.1"   # a pre-release is older
+    assert prev_release.previous_release(rels, "0.1.1") is None
+    assert prev_release.previous_release(rels, "garbage") is None
+    assert prev_release.pinned_release(rels, "0.1.20").commit == "b19581d"
+    assert prev_release.pinned_release(rels, "0.1.19") is None
+
+
+def test_versions_order_numerically_pre_releases_included():
+    k = prev_release.version_key
+    assert k("0.1.20-beta.10") > k("0.1.20-beta.9") > k("0.1.20-beta.1")   # numerically, not as text
+    assert k("0.1.20") > k("0.1.20-beta.10") and k("v0.1.21-beta.1") > k("0.1.20")
+    assert k("0.1.10") > k("0.1.9") and k("0.1.20-rc.1") > k("0.1.20-beta.2")
+    assert k("0.1.20-beta.2") > k("0.1.20-beta")                          # more parts: later (semver)
+    assert k("not-a-version") is None and k("0.1") is None
+
+
+def test_the_image_carries_each_release_slot_or_says_it_does_not(tmp_path):
+    assert prev_release.server_argv("previous", tmp_path) is None and prev_release.installed("previous", tmp_path) is None
+    slot = tmp_path / "previous"
+    (slot / "venv" / "bin").mkdir(parents=True)
+    (slot / "venv" / "bin" / "hpc-bridge").write_text("")
+    assert prev_release.server_argv("previous", tmp_path) is None   # no VERSION/COMMIT/DATE: the export never finished
+    for name, value in (("VERSION", "0.1.24"), ("COMMIT", "9c75742"), ("DATE", "2026-10-13T23:38:54Z")):
+        (slot / name).write_text(value + "\n")
+    assert prev_release.server_argv("previous", tmp_path) == [str(slot / "venv" / "bin" / "hpc-bridge")]
+    assert prev_release.installed("previous", tmp_path) == {"version": "0.1.24", "commit": "9c75742",
+                                                            "date": "2026-10-13T23:38:54Z"}
+    meta = slot / "venv" / "lib" / "python3.11" / "site-packages" / "hpc_bridge-0.1.24.dist-info"
+    meta.mkdir(parents=True)
+    (meta / "METADATA").write_text("Metadata-Version: 2.4\nName: hpc-bridge\nVersion: 0.1.24\n")
+    assert prev_release.installed_version(slot / "venv") == "0.1.24"
+    with pytest.raises(ValueError):
+        prev_release.slot_dir("../etc", tmp_path)
     dockerfile = (HERE.parent / "Dockerfile").read_text()
     assert "COPY agentic/.prev-release /opt/hpcb-prev" in dockerfile and "--frozen --no-editable" in dockerfile
+    assert 'for d in /opt/hpcb-prev/*/' in dockerfile and "|| exit 1" in dockerfile   # every slot, or the build fails
     assert "prev_release.py\" export" in (HERE.parent / "run_smoke.sh").read_text()
     assert "_export_previous_release()" in (HERE.parent / "run_suite.py").read_text()
+
+
+def test_a_failed_export_is_said_loudly(monkeypatch, capsys):
+    # the review of 2026-10-30: run_suite swallowed the export's failure (capture_output, check=False)
+    import subprocess as sp
+    sys.path.insert(0, str(HERE.parent))
+    import run_suite
+
+    def failed(*a, **k):
+        return sp.CompletedProcess(a, 1, "", "prev_release: `git log --first-parent` failed: not a git repository")
+    monkeypatch.setattr(run_suite.subprocess, "run", failed)
+    why = run_suite._export_previous_release()
+    out = capsys.readouterr()
+    assert why and "not a git repository" in why
+    assert "ERROR: the older hpc-bridge releases could not be exported" in out.out and "SETUP FAILED" in out.out
 
 
 # ---- the chain ----------------------------------------------------------------------------------------------------------
@@ -158,10 +273,81 @@ def test_a_phase_names_its_operator_and_server(monkeypatch):
     spec = run._phase_spec({"script": s1, "server": "previous"})
     assert spec["operator"] == "script" and run._phase_label(spec, "pi") == "script@previous"
     assert run._phase_label(run._phase_spec("go"), "pi") == "pi"
+    assert run._phase_label(run._phase_spec({"script": s1, "server": "0.1.20"}), "pi") == "script@0.1.20"
     with pytest.raises(ValueError):
         run._phase_spec({"script": s1, "operator": "pi"})
     with pytest.raises(ValueError):
         run._phase_spec({"script": s1, "server": "nightly"})
+    with pytest.raises(ValueError):
+        run._phase_spec({"script": s1, "server": "0.1.19"})   # a release the image does not pin
+
+
+def test_each_scripted_phase_says_which_server_it_ran_and_the_gate_reads_it(monkeypatch, tmp_path):
+    # the review of 2026-10-30: nothing in a bundle said which version session 1 ran (the head row cut the server's
+    # argv to 8 words); `harness:phase_server` gates that it ran the release it declared, older than this checkout
+    run = _run_module(monkeypatch)
+    slot = tmp_path / "previous"
+    for name, value in (("VERSION", "0.1.24"), ("COMMIT", "9c75742"), ("DATE", "2026-10-13T23:38:54Z")):
+        slot.mkdir(exist_ok=True)
+        (slot / name).write_text(value + "\n")
+    meta = slot / "venv" / "lib" / "python3.11" / "site-packages" / "hpc_bridge-0.1.24.dist-info"
+    meta.mkdir(parents=True)
+    (meta / "METADATA").write_text("Version: 0.1.24\n")
+    rel = run.server_release("previous", tmp_path)
+    assert rel["ok"] and rel["version"] == rel["want"] == "0.1.24" and rel["commit"] == "9c75742"
+    (meta / "METADATA").write_text(f"Version: {rel['current']}\n")       # the current code under the old name
+    assert not run.server_release("previous", tmp_path)["ok"]
+    assert not run.server_release("0.1.20", tmp_path)["ok"]               # not in the image
+    row = run.phase_server_row([{"chain_phase": 0}, {"harness": "script", "server_release": rel}, {"final": ""}])
+    assert row.name == "harness:phase_server" and row.ok and "previous: ran 0.1.24, want 0.1.24" in row.detail
+    bad = run.phase_server_row([{"harness": "script", "server_release": {**rel, "version": "0.1.26", "ok": False}}])
+    assert not bad.ok
+    assert run.phase_server_row([{"harness": "pi"}]) is None
+    import script_runner
+    assert '"server": list(cmd)' in Path(script_runner.__file__).read_text()   # the whole argv, never cut
+
+
+def _agent_phase(final_error: bool, said: str = ""):
+    from runner import RunResult
+
+    class Final:
+        is_error = final_error
+        result = said
+        total_cost_usd = 0
+    return RunResult(trace=Trace([]), final=Final(), messages=[{"harness": "x", "stderr_tail": said}])
+
+
+def test_a_chain_stops_on_a_failed_premise_and_names_a_failed_world_change(monkeypatch):
+    # the review of 2026-10-30: a session 1 that did not finish was graded on session 2's rows (FAILED), and an
+    # interphase that raised printed to stderr only; both now stop the chain, SETUP FAILED, with the reason in a row
+    run = _run_module(monkeypatch)
+    ran = []
+
+    async def agent(prompt, **k):
+        ran.append(prompt)
+        return _agent_phase(prompt == "s1", "script aborted: session 1: the compute block did not come up")
+
+    Scen = types.SimpleNamespace(INTERPHASE_DELAY_S=0, INTERPHASE_SETUP=[])
+    phases = [run._phase_spec({"prompt": "s1", "premise": True}), run._phase_spec("s2")]
+    out = asyncio.run(run._run_chain(phases, Scen, model="m", effort=None, persona=None, user_goal="", no_skill=False,
+                                     run_agent=agent))
+    assert ran == ["s1"] and "premise" in out.chain_failure and "compute block did not come up" in out.chain_failure
+
+    def world(ctx):
+        raise RuntimeError("the endpoint's directory was not deleted")
+    world.__name__ = "returning_world"
+    Scen.INTERPHASE_SETUP = [world]
+    ran.clear()
+    out = asyncio.run(run._run_chain([run._phase_spec("ok"), run._phase_spec("s2")], Scen, model="m", effort=None,
+                                     persona=None, user_goal="", no_skill=False, run_agent=agent))
+    assert ran == ["ok"] and "returning_world: RuntimeError: the endpoint's directory was not deleted" in out.chain_failure
+    ran.clear()
+    Scen.INTERPHASE_SETUP = []
+    out = asyncio.run(run._run_chain([run._phase_spec("ok"), run._phase_spec("s2")], Scen, model="m", effort=None,
+                                     persona=None, user_goal="", no_skill=False, run_agent=agent))
+    assert ran == ["ok", "s2"] and out.chain_failure is None
+    src = Path(run.__file__).read_text()
+    assert 'Result("harness:chain", False' in src and 'result_label = "SETUP FAILED"' in src
 
 
 def test_a_mixed_chain_marks_each_phase_and_regrade_reads_each_with_its_own_reader(monkeypatch):
@@ -312,6 +498,26 @@ def test_hello_world_and_the_premise():
     assert not ru.session_1_ran(Trace([HELLO])).ok
 
 
+def test_hello_world_must_run_on_a_compute_node_by_the_compute_shape():
+    # the review of 2026-10-30 (probe_hello.py): a hello on the LOGIN shape after the block never came up passed, and so
+    # did a line merely containing "hello world" in another command's output
+    down = _c("ensure_endpoint_up", {"shape": "compute", "account": "hpcb", "confirm_spend": True},
+              {"status": "down", "notice": "REJECTED"})
+    on_login = _c("run_shell", {"command": "echo hello world; hostname", "shape": "login"},
+                  {"phase": "complete", "stdout": "hello world\nlogin01.hpcb.test\n"})
+    grep = _c("run_shell", {"command": "grep -r 'hello world' ~/notes"},
+              {"phase": "complete", "stdout": "notes.txt: hello world\n"})
+    no_host = _c("run_shell", {"command": "echo hello world", "shape": "compute"},
+                 {"phase": "complete", "stdout": "hello world\n"})
+    for bad in ([down, on_login], [grep], [no_host]):
+        assert not ru.hello_world(_trace(bad)).ok
+    # a long one polled: the poll_task's shape is its run_shell's
+    started = _c("run_shell", {"command": "sleep 5; echo hello world; hostname", "shape": "compute"},
+                 {"phase": "running", "task_id": "t1"})
+    polled = _c("poll_task", {"task_id": "t1"}, {"phase": "complete", "stdout": "hello world\nc2\n"})
+    assert ru.hello_world(_trace([started, polled])).ok
+
+
 def test_a_dead_pin_may_be_met_once_and_dropped_never_twice():
     once = _c("connect_facility", {"facility": "f"}, {"phase": "failed", "notice": f"CANNOT REACH {PIN}: refused. "
               "(The remembered login-node pin was dropped: the next connect resolves the facility's host afresh.)"})
@@ -333,6 +539,15 @@ def test_a_revoked_key_hands_off_and_is_never_no_ssh_access():
     assert ru.revoked_handoff(_trace([reused, HELLO])).ok                       # zero SSH: nothing to hand off
     assert not ru.revoked_handoff(_trace([nossh])).ok                            # the report's item 2
     assert not ru.revoked_handoff(_trace([probe, HELLO])).ok                     # SSH ran, yet no handoff came
+    # the review of 2026-10-30: tools that always SSH count as needing it (teardown_endpoint, login_shell), and a stop
+    # that says it went over ssh
+    zero = _c("stop_endpoint", {}, {"status": "down", "notice": "compute block released over AMQP (released 74). The "
+                                    "login endpoint stays online for reuse (reconnecting is zero-SSH)."})
+    assert ru.revoked_handoff(_trace([reused, HELLO, zero])).ok                  # every stop says so: no SSH (c08)
+    for ssh_tool in (_c("teardown_endpoint", {}, {"status": "down"}),
+                     _c("login_shell", {"command": "hostname"}, {"phase": "complete"}),
+                     _c("stop_endpoint", {}, {"status": "down", "notice": "stopped the manager over ssh on login01"})):
+        assert not ru.revoked_handoff(_trace([reused, ssh_tool, HELLO])).ok, ssh_tool.name
 
 
 def test_expired_tokens_ask_for_a_login_first():
@@ -354,17 +569,38 @@ def test_a_changed_host_key_is_said_and_never_accepted_for_the_user():
     assert not ru.host_key_honest(_trace([fresh_up, HELLO])).ok                  # came up past the changed key
     reused = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
     assert ru.host_key_honest(_trace([reused, HELLO])).ok                        # zero SSH: nothing to refuse
+    # the review of 2026-10-30 (probe_more.py 1): on a reuse path known_hosts was never compared — a key rewritten by
+    # hpc-bridge passed. The world check's comparison (its `[check]`) is read in every changed cell
+    silent = _trace([reused, HELLO], [f"{ru._KH_CHECK} False"], [3])
+    assert not ru.host_key_honest(silent).ok
 
 
 def test_reuse_means_the_same_endpoint_reattached_with_nothing_rebuilt():
     up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
     block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
-    assert ru.reused_same_endpoint(_trace([up, block, HELLO])).ok
+    assert ru.reused_same_endpoint()(_trace([up, block, HELLO])).ok
     fresh = _c("connect_facility", {}, {"phase": "needs_account", "reused": False,
                                         "notice": "built hpc-bridge's endpoint venv /x (missing). "})
-    assert not ru.reused_same_endpoint(_trace([fresh, block, HELLO])).ok
+    assert not ru.reused_same_endpoint()(_trace([fresh, block, HELLO])).ok
     dup = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
-    assert not ru.reused_same_endpoint(_trace([up, dup, HELLO])).ok              # a second endpoint beside it
+    assert not ru.same_endpoint(_trace([up, dup, HELLO])).ok                     # a second endpoint beside it
+
+
+def test_the_same_endpoint_and_no_rebuild_of_session_1s_venv():
+    left = "/global/homes/h/u/hpc-bridge/gce-venv"   # _session1's venv
+    up = _c("connect_facility", {}, {"phase": "needs_account", "reused": False, "endpoint_id": EID})
+    block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
+    assert ru.same_endpoint(_trace([up, block, HELLO])).ok
+    second = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
+    assert not ru.same_endpoint(_trace([up, second, HELLO])).ok                   # a second registration
+    assert not ru.same_endpoint(_trace([HELLO])).ok                               # no endpoint seen at all
+    keyed = left + "-endpoint-4.18.0-py3.11"
+    first_build = _c("connect_facility", {}, {"phase": "needs_account", "notice": f"built hpc-bridge's endpoint venv "
+                                              f"{keyed} (missing). "})
+    assert ru.no_rebuild(_trace([first_build, HELLO])).ok                         # beside an older release's: a first
+    rebuilt = _c("connect_facility", {}, {"phase": "needs_account", "notice": f"built hpc-bridge's endpoint venv "
+                                          f"{left} (fails its check). "})
+    assert not ru.no_rebuild(_trace([rebuilt, HELLO])).ok
 
 
 def test_a_new_laptop_reattaches_after_the_probe_it_cannot_avoid():
@@ -373,11 +609,22 @@ def test_a_new_laptop_reattaches_after_the_probe_it_cannot_avoid():
     up = _c("connect_facility", {}, {"phase": "needs_account", "reused": True})
     block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
     assert ru.reattached_same_endpoint(_trace([probe, up, block, HELLO])).ok
-    assert not ru.reused_same_endpoint(_trace([probe, up, block, HELLO])).ok      # where a config was left, it is not
+    assert not ru.reused_same_endpoint()(_trace([probe, up, block, HELLO])).ok    # where a config was left, it is not
+    assert ru.reused_same_endpoint(1)(_trace([probe, up, block, HELLO])).ok       # record_deleted: one is unavoidable
     dup = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": OTHER})
     fresh = _c("connect_facility", {}, {"phase": "needs_account", "reused": False})
     assert not ru.reattached_same_endpoint(_trace([probe, up, dup, HELLO])).ok    # a second endpoint beside it
     assert not ru.reattached_same_endpoint(_trace([probe, fresh, HELLO])).ok
+    # the review of 2026-10-30 (probe_more.py 2): probing again and again, before and after the reattach, passed
+    assert not ru.reattached_same_endpoint(_trace([probe, probe, probe, up, probe, probe, block, HELLO])).ok
+
+
+def test_a_reuse_is_read_from_the_first_connect_that_reached_the_endpoint():
+    # an agent may go on to ensure_endpoint_up from a `provisioning` that says reused (the Perlmutter replay), never
+    # polling to needs_account: that connect is the reattach (it read as no reuse before the review of 2026-10-30)
+    early = _c("connect_facility", {}, {"phase": "provisioning", "reused": True})
+    block = _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up", "endpoint_id": EID})
+    assert ru.reused_same_endpoint()(_trace([early, block, HELLO])).ok
 
 
 def test_a_killed_manager_is_never_reported_up_on_its_online_flag():
@@ -386,6 +633,9 @@ def test_a_killed_manager_is_never_reported_up_on_its_online_flag():
     login_dead = _c("run_shell", {"shape": "login", "command": "hostname"}, {"phase": "failed"})
     assert ru.killed_not_up(_trace([up, login_ok])).ok
     assert not ru.killed_not_up(_trace([up, login_dead])).ok
+    cold = _c("run_shell", {"shape": "login", "command": "hostname"}, {"phase": "cold_start"})
+    assert ru.killed_not_up(_trace([up, cold, login_ok])).ok                   # a cold start retried is no failure
+    assert not ru.killed_not_up(_trace([up, cold, login_dead])).ok
 
 
 def test_a_refused_block_on_the_retired_qos_is_said_within_a_bounded_wait():
@@ -402,9 +652,16 @@ def test_a_refused_block_on_the_retired_qos_is_said_within_a_bounded_wait():
         "submission was likely REJECTED (e.g. inactive allocation, wrong account, or bad queue)")})
     bad = ru.policy_surfaced(_trace([start, guessed]))
     assert not bad.ok and "without the scheduler's reply" in bad.detail   # c09: the block never reached the scheduler
-    regular = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
-                 {"status": "up", "block": {"queue": None}})
-    assert ru.policy_surfaced(_trace([regular])).ok                             # a fresh proposal: nothing refused
+    # the review of 2026-10-30: a fresh proposal (no partition: the filter's default, `regular`) was never refused,
+    # so the level did nothing under record_deleted or wiped — the site now retires `regular` too
+    assert "regular" in ru.RETIRED_QOS and ru.NEW_QOS not in ru.RETIRED_QOS
+    fresh = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+               {"status": "provisioning", "block": {"queue": None}})
+    assert ru.policy_surfaced(_trace([fresh, poll, refused])).ok
+    assert not ru.policy_surfaced(_trace([fresh, _c("ensure_endpoint_up", {"shape": "compute"}, {"status": "up"})])).ok
+    kept = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True, "partition": ru.NEW_QOS},
+              {"status": "up"})
+    assert not ru.policy_surfaced(_trace([kept])).ok                           # the premise never met
 
 
 def test_the_agent_never_hand_edits_the_state_dirs():
@@ -417,6 +674,17 @@ def test_the_agent_never_hand_edits_the_state_dirs():
     assert ru.no_hand_edits(_trace([ok_read, HELLO])).ok
     for bad in (edit, remote, writer):
         assert not ru.no_hand_edits(_trace([bad])).ok, bad.name
+    # the review of 2026-10-30 (probe_more.py 3): a read with 2>/dev/null read as a write; a glob and an assembled path
+    # were missed
+    quiet = _c("run_shell", {"command": "ls ~/.globus_compute/ 2>/dev/null; tail -5 ~/.globus_compute/*/endpoint.log",
+                             "shape": "login"}, {"phase": "complete", "stdout": ""})
+    assert ru.no_hand_edits(_trace([quiet, HELLO])).ok
+    for cmd in ("rm -rf ~/.hpc*",
+                "cd ~ && python3 -c \"import pathlib,shutil; shutil.rmtree(pathlib.Path.home()/'.hpc-'+'bridge')\"",
+                "echo '{}' > ~/.hpc-bridge/facilities.json"):
+        c = ToolCall.of("bash", {"command": cmd})
+        c.phase = 1
+        assert not ru.no_hand_edits(_trace([c])).ok, cmd
 
 
 def test_an_explicit_host_is_never_overridden_and_calls_stay_bounded():
@@ -426,6 +694,14 @@ def test_an_explicit_host_is_never_overridden_and_calls_stay_bounded():
     fine = _c("connect_facility", {"ssh_host": "login"},
               {"phase": "proposed_facility_details", "proposed_details": {"ssh_host": "login"}})
     assert ru.explicit_args_kept(_trace([fine])).ok
+    # the review of 2026-10-30 (probe_explicit.py): "the configuration cached for '<facility id>'" names the id, not a
+    # host — it read as another host's config overriding the explicit one
+    fid = "fake-1793368817-24604"
+    cached = _c("connect_facility", {"facility": fid, "ssh_host": "login"}, {
+        "phase": "proposed_facility_details", "proposed_details": {"ssh_host": "login"},
+        "notice": f"the configuration cached for {fid!r} from an earlier session is no longer accepted as it is: its "
+                  "scheduler_options carry lines hpc-bridge no longer sends — x."})
+    assert ru.explicit_args_kept(_trace([cached])).ok
     storm = [_c("connect_facility", {"facility": "f"}, {"phase": "failed", "notice": "x"})] * 5
     assert not ru.bounded_calls()(_trace(storm)).ok and ru.bounded_calls()(_trace([fine, HELLO])).ok
 
@@ -454,6 +730,58 @@ def test_session_1_names_the_venv_its_version_needs_on_nersc():
     assert old["env_setup"] == line and "partitions" not in old
 
 
+def test_session_1_runs_the_release_in_the_index_it_saw(tmp_path):
+    # an older release run today would resolve today's packages (texttable 1.7.2 breaks `list`): uv's exclude-newer at
+    # its release commit's date, in a file only the harness writes and clears — run here through a real shell
+    import subprocess as sp
+    import tomllib
+
+    def sh(cmd):
+        return sp.run(["bash", "-c", cmd], env={"HOME": str(tmp_path), "PATH": "/usr/bin:/bin"}, capture_output=True,
+                      text=True, timeout=30).stdout
+    conf = tmp_path / ".config" / "uv" / "uv.toml"
+    cmd = ru.uv_cutoff_cmd("2026-10-13T23:38:54Z")
+    assert "HPCB_UV_SET" in sh(cmd) and tomllib.loads(conf.read_text()) == {"exclude-newer": "2026-10-13T23:38:54Z"}
+    assert "HPCB_UV_SET" in sh(cmd)                                    # again: its own file replaced
+    assert "HPCB_UV_CLEARED" in sh(ru.UV_CUTOFF_CLEAR) and not conf.exists()
+    conf.write_text('index-url = "https://example.org/simple"\n')    # the user's own uv config: never touched
+    assert "HPCB_UV_TAKEN" in sh(cmd) and "HPCB_UV_CLEARED" in sh(ru.UV_CUTOFF_CLEAR)
+    assert conf.read_text() == 'index-url = "https://example.org/simple"\n'
+    import returning_user
+    assert ru.UV_CUTOFF_CLEAR in returning_user.SETUP and ru.UV_CUTOFF_CLEAR in returning_user.CLEANUP
+    # 0.1.24 proposes a line that only activates the venv it builds: no override; 0.1.20's builds: overridden
+    short = {"phase": "proposed_facility_details", "proposed_details": {
+        "ssh_host": "login", "interface": "eth0", "env_setup": 'export PATH="$HOME/x/bin:$PATH"', "scratch_root": "/s",
+        "partition": "system", "scheduler": "slurm"}}
+    assert "env_setup" not in ru.session1_details(short, previous=True)   # the release's own line, as proposed
+
+
+def test_session_2s_user_names_the_node_type_a_fresh_proposal_dropped():
+    fallback = {"phase": "proposed_facility_details", "proposed_details": {
+        "ssh_host": "login", "interface": "eth0", "partition": "system", "scheduler_options": None}}
+    assert ru.session2_details(fallback)["scheduler_options"] == ru.CONSTRAINT
+    kept = {"phase": "proposed_facility_details", "proposed_details": {
+        "ssh_host": "login", "interface": "eth0", "partition": "", "scheduler_options": "#SBATCH --constraint=cpu"}}
+    assert ru.session2_details(kept)["scheduler_options"] == "#SBATCH --constraint=cpu"
+
+
+def test_known_hosts_is_compared_by_the_plugins_names_only(monkeypatch, tmp_path):
+    kh = tmp_path / "known_hosts"
+    monkeypatch.setattr(ru, "known_hosts_path", lambda: kh)
+    monkeypatch.setattr(ru, "SAVED", tmp_path / "saved")
+    monkeypatch.setitem(ru.STATE, "known_hosts_planted", None)
+    real = "login01.hpcb.test ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIGq0HyGZbHp5o0RkVXwOq9XxVb8b0Gl4Yy7qkCq3pPZ9\n"
+    kh.write_text(real)
+    ru.change_host_keys()
+    assert ru.known_hosts_untouched() is True
+    with kh.open("a") as fh:   # the harness' own channel meets a node for the first time (accept-new)
+        fh.write("[login02.hpcb.test]:2200 ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIHk1lmA5w3r8u2XvG6j6sK0lN8e8cHkQe3eQm2N7bT1x\n")
+    assert ru.known_hosts_untouched() is True
+    with kh.open("a") as fh:   # a key accepted for a name the plugin connects by: hpc-bridge's doing
+        fh.write(real)
+    assert ru.known_hosts_untouched() is False
+
+
 def test_the_world_reads_its_markers():
     assert ru.read_procs("noise\nHPCB_P 12 Globus Compute Endpoint (u, n)\nHPCB_PS_DONE") == [
         "12 Globus Compute Endpoint (u, n)"]
@@ -463,6 +791,41 @@ def test_the_world_reads_its_markers():
     assert ru.venv_of(["7 /global/homes/h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.11/bin/python "
                        "/global/homes/h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.11/bin/globus-compute-endpoint "
                        "start n"]) == "/global/homes/h/u/hpc-bridge/gce-venv-endpoint-4.18.0-py3.11"
+
+
+def test_each_world_change_is_checked_as_it_is_made(monkeypatch):
+    # the review of 2026-10-30: record_deleted, endpoint_dir_deleted and wiped were not verified — a hand edit that did
+    # nothing would run session 2 on the wrong world
+    import byo_script
+    base = {f: v[0] for f, v in ru.FACTORS.items()}
+
+    class Ctx:
+        next_phase = 1
+        trace = _trace([])
+
+        def ssh(self, cmd, timeout=240, host=None):
+            return 0, "HPCB_UV_CLEARED HPCB_LEFT"     # the dir is still there
+    monkeypatch.setattr(ru, "close_masters", lambda: "masters closed")
+    monkeypatch.setattr(byo_script, "forget_cached", lambda host: False)
+    monkeypatch.setattr(byo_script, "cached_hosts", lambda: ["login"])
+    for change, why in (({"local": "record_deleted"}, "no record"), ({"remote": "endpoint_dir_deleted"}, "not deleted")):
+        with pytest.raises(RuntimeError, match=why):
+            asyncio.run(ru.interphase(ru.Cell("x", {**base, **change}))(Ctx()))
+
+
+def test_session_2s_own_polling_stops_at_its_bound():
+    class Ops:
+        steps = [None] * ru.MAX_CALLS_2
+        calls = 0
+
+        async def sleep(self, s):
+            pass
+
+        async def call(self, *a, **k):
+            Ops.calls += 1
+            return {"status": "provisioning"}
+    e = asyncio.run(ru._poll_block(Ops(), {"status": "provisioning"}, wait_s=3600))
+    assert e == {"status": "provisioning"} and Ops.calls == 0
 
 
 def test_the_interphase_runs_the_users_part_before_the_follow_up_turn(monkeypatch):

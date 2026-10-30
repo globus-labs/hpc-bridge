@@ -156,8 +156,9 @@ n_ok = sum(s not in infra | setup | crash for s in scen)
 print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
-printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s", "cell": "%s"}\n' "$*" \
-  "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" "${HPCB_RETURNING_CELL:-}" >> "$STUB_LOG"
+printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s", "cell": "%s", "skip_build": "%s"}\n' \
+  "$*" "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" "${HPCB_RETURNING_CELL:-}" \
+  "${HPCB_SKIP_BUILD:-}" >> "$STUB_LOG"
 echo "RESULT: OK"
 '''
 
@@ -401,6 +402,9 @@ def test_the_script_only_profiles_boot_their_own_cluster_and_run_only_their_scri
     assert scripted == [("returning_user", "nersc", cell) for cell in cells] + [
         ("slice_request", "slices", ""), ("multinode_allocation", "slices", "")]
     assert all(c["operator"] == "script" for c in calls if c["tool"] == "run_smoke")
+    # nothing built the image before them in this sweep: the first scripted cell builds it, the rest reuse it (it ran
+    # on whatever image was there before — the review of 2026-10-30)
+    assert [c["skip_build"] for c in calls if c["tool"] == "run_smoke"] == [""] + ["1"] * (len(scripted) - 1)
     assert [(c["tool"], c["argv"]) for c in calls if c["tool"] in ("up.sh", "down.sh")] == [
         ("up.sh", "--profile nersc"), ("down.sh", "--profile nersc --wipe"),
         ("up.sh", "--profile slices"), ("down.sh", "--profile slices --wipe")]

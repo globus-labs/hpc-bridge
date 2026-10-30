@@ -53,8 +53,9 @@ agentic/
     returning.py         ← the RETURNING-USER cells: factors, the two-session chain, the user's part, the invariants
                            every cell holds (see "Returning users" below); returning_cells.tsv is its checked-in table
     pairwise.py          ← a deterministic all-pairs generator with pair constraints (the returning-user cells)
-    prev_release.py      ← the PREVIOUS release, exported from its tag before every jail build and installed at
-                           /opt/hpcb-prev (a returning-user cell's first session may run it)
+    prev_release.py      ← OLDER releases (`previous`, from pyproject's version history; 0.1.20 pinned), exported
+                           before every jail build and installed at /opt/hpcb-prev/<slot> (a returning-user cell's
+                           first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
   scenarios/             ← 79 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
@@ -306,36 +307,55 @@ leftovers stacked: a dead login-node pin, a proven record whose login had become
 under `/home`, an endpoint left online and reused under a renamed id, hand-edits to `~/.hpc-bridge`. Every cell is a
 chain on the fake `nersc` profile:
 
-1. **Session 1, scripted, on the cell's `origin` plugin.** `current` is this checkout. `previous` is the newest
-   release tag older than this version (`prev_release.py`: today `v0.1.20-beta.1`); `run_smoke.sh` and `run_suite.py`
-   export it before every build, and the image installs it from its own lock at `/opt/hpcb-prev`. Session 1 brings
-   up a working endpoint, with QOS `debug` and `-C cpu`, and on 0.1.20 the env_setup that version needs on nersc (its
-   `/home` venv default fails there). It runs hello on a compute node and ends as `ended` says.
+1. **Session 1, scripted, on the cell's `origin` plugin.** `current` is this checkout. `previous` is the release
+   before this version: the newest release commit (where pyproject's version was bumped, first-parent history) whose
+   version is older (`prev_release.py`: today 0.1.24, at 9c75742 — the three tags would have said 0.1.20). The
+   Perlmutter replay pins 0.1.20, the report's own plugin. `run_smoke.sh` and `run_suite.py` export each slot before
+   every build (a failure is said as an ERROR, with its reason), and the image installs each from its own lock at
+   `/opt/hpcb-prev/<slot>` (both cost ~3 s of a cached build and ~100 MB). Session 1 on an older release runs in the
+   world as that release saw it: uv's `exclude-newer` at its release commit's date, in the pool user's uv config for
+   session 1 only (texttable 1.7.2 would otherwise break `list` under 0.1.24 and 0.1.20). It brings up a working
+   endpoint, with QOS `debug` and `-C cpu`, and what its version needs on nersc from its user (its `/home` venv default
+   fails there: 0.1.20's env_setup names `$HOME`, 0.1.24 is told `HPC_BRIDGE_REMOTE_VENV`). It runs hello on a compute
+   node and ends as `ended` says. It is the chain's **premise**: when it does not finish — or a world change between
+   the sessions fails — the chain stops and the cell is SETUP FAILED (`harness:chain` says why), never graded on
+   session 2's rows. `harness:phase_server` gates that it ran the release it declared, older than this checkout (the
+   head row records the server's whole argv and `server_release`).
 2. **Between the sessions** (`INTERPHASE_SETUP`), the other factors are applied:
-   - the endpoint stopped or killed hard (`kill -9` while the cloud still lists it online);
+   - the endpoint stopped, or killed hard (`kill -9`) long ago (`killed_earlier`: its pid file dated an hour back and
+     the cloud given 5 minutes to list it offline) or just now (`killed_recent`: inside globus-compute's 90 s window);
    - the venv or the endpoint's directory deleted, or another globus-compute-endpoint version installed in the venv;
-   - the QOS retired (the node action `qos_retire`: the submit filter reads `/etc/slurm/retired_qos.conf`);
+   - the QOS retired (the node action `qos_retire`: the submit filter reads `/etc/slurm/retired_qos.conf`): session
+     1's `debug` AND `regular`, the one a fresh proposal gets, so a lost record meets the change too;
    - the key revoked;
    - the pinned node closed to new logins (`sshd_closed`: its processes run on);
    - the host keys changed in the jail's `known_hosts`;
    - the token store gone;
    - `facilities.json`'s record deleted, `~/.hpc-bridge` wiped, or a new facility id.
+
+   Each change is checked as it is made (the directory gone, the record gone, the QOS listed), so a change that did
+   nothing is a failed setup, not a cell run on the wrong world.
 3. **Session 2, the current code**, drives toward hello world on a compute node. When hpc-bridge asks for the user's
    part, the script does it once per kind and carries on:
    - `needs_preauth`: the key put back and the handoff's command run, as after a re-run sshproxy;
    - `needs_login`: the token store put back, as after a browser login;
    - a CHANGED host key: `known_hosts` fixed, after checking hpc-bridge left it alone;
-   - a refused block: QOS `regular` chosen.
+   - a refused block: QOS `shared` chosen.
 
    hpc-bridge never accepts a changed host key on the user's behalf.
 
-The 20 scripted cells are **pairwise** over 11 factors. Every pair of levels is in some cell, and two pairs are
-excluded (`torn_down` × `endpoint_dir_deleted` is redundant, `venv_deleted` × gce `changed` impossible). The table is
-checked in as `harness/returning_cells.tsv`; `python3 agentic/harness/returning.py --write-cells` regenerates it,
-`--list` names each cell's changes, and `test_returning.py` fails while the table is stale or a pair is uncovered.
+The 22 scripted cells are **pairwise** over 10 factors. Every pair of levels is in some cell; four pairs are excluded
+(`torn_down` × `endpoint_dir_deleted` and a dead pin × `torn_down` or `wiped` are redundant, `venv_deleted` × gce
+`changed` impossible), and every cell's every changed level must BITE (`BITES`, `valid_row`: a dead pin, a revoked key
+or a changed host key only where session 2 needs SSH). A whole-row rule like that is kept by mending a greedy row
+(`pairwise.generate(valid=…)`). `shared_host` was dropped: under the run's one endpoint name it did what a renamed id
+does. The table is checked in as `harness/returning_cells.tsv`; `python3 agentic/harness/returning.py --write-cells`
+regenerates it, `--list` names each cell's changes, and `test_returning.py` fails while the table is stale, a pair is
+uncovered, or a changed level has no grader gated. A run's levels ride in its env (`HPCB_RETURNING_LEVELS`), so a
+regrade grades the cell that ran even after the ids moved.
 
 **Invariants every cell holds** (`ru_*` rows, gated):
-- `ru_hello_world`: a working compute shell at the end.
+- `ru_hello_world`: "hello world" printed by a command on the COMPUTE shape, beside a compute node's hostname.
 - `ru_dead_pin`: a dead pin met at most once, its pin then dropped.
 - `ru_explicit_args`: an explicit `ssh_host` never overridden by a cached record.
 - `world:ru_one_live_endpoint`: at most one live endpoint, by the manager processes on every login node, with the
@@ -343,10 +363,16 @@ checked in as `harness/returning_cells.tsv`; `python3 agentic/harness/returning.
 - `world:ru_state_current`: `~/.hpc-bridge` parses with today's models, and pins no dead node where nothing runs.
 - `ru_bounded`: a bounded number of calls.
 
-**Per factor:** `ru_revoked_handoff` (`needs_preauth`, never NO SSH ACCESS), `ru_expired_login`,
-`ru_host_key_honest`, `ru_reused` (running + alive + key + untouched/renamed id, with nothing changed on the login
-node), `ru_killed_not_up` (the login shape answers after the first `needs_account`), `world:ru_venv_under_home`
-(venv deleted) and `ru_policy_surfaced` (a refused block said within a bounded wait).
+**Per factor:** `ru_revoked_handoff` (`needs_preauth`, never NO SSH ACCESS, wherever SSH was needed — a teardown,
+a `login_shell` or a stop over ssh count), `ru_expired_login`, `ru_host_key_honest` (the CHANGED notice where SSH was
+needed; `known_hosts` compared in every such cell, before anything is put back: `world:ru_known_hosts_kept`),
+`ru_killed_not_up` (the login shape answers after the first `needs_account`; a cold start retried is no failure),
+`world:ru_venv_under_home` (venv deleted) and `ru_policy_surfaced` (the scheduler's own refusal quoted within a
+bounded wait). **What only a deletion may change:** `ru_same_endpoint` (session 2 sees only session 1's endpoint id)
+wherever the endpoint and its directory survive — stopped and killed managers, a new laptop, a renamed id, a dead pin,
+revoked keys, expired tokens and changed policy included; `ru_no_rebuild` (the venv session 1 left is not rebuilt)
+wherever that venv and its endpoint version are untouched; `ru_reused` (the first connect to reach it says reused,
+after no probe where a record is left, one where it is gone) wherever the endpoint was left running.
 
 The world check runs before the teardown and then puts the world back: the key, the token store, `known_hosts`, the
 closed node and the retired QOS. The node actions and `CLEANUP` undo the last of these again when a cell dies.
@@ -359,10 +385,11 @@ HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=nersc ./agentic/run_smoke.sh
 
 **The three agent cells** put the cell's operator in session 2, after the same scripted session 1 on the previous
 release:
-- `returning_perlmutter_replay`: an endpoint left online, the pinned node dead, the key revoked.
+- `returning_perlmutter_replay`: an endpoint left online, the pinned node dead, the key revoked — session 1 on
+  0.1.20, the report's own plugin, whatever `previous` is.
 - `returning_all_well`: nothing changed, so reuse and rebuild nothing.
-- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate (`ru_reattached`: the
-  one probe a new laptop cannot avoid is allowed).
+- `returning_new_laptop`: `~/.hpc-bridge` wiped, so reattach and stand up no duplicate (`ru_reattached`: at most
+  the one probe a new laptop cannot avoid today).
 
 When the agent stops to ask for the user's part, the harness does it and a follow-up turn continues (a phase with a
 `when`). They also grade `ru_no_hand_edits`: the agent never writes to `~/.hpc-bridge` or `~/.globus_compute`.
@@ -371,7 +398,9 @@ When the agent stops to ask for the user's part, the harness does it and a follo
 `{"script": <async fn(ops)>, "server": "previous"}` is a scripted session on the named release, whatever the cell's
 operator. `"when": fn(trace) -> bool` runs a phase only when it holds. An `INTERPHASE_SETUP` entry may be a callable
 taking an `InterphaseContext`. Such a chain's bundle marks each phase (`{"chain_phase": k, "operator": …}`), and
-`regrade.py` reads each phase with its own operator's reader. Codex, Pi and Hermes drive a chain whose first phase is
+`regrade.py` reads each phase with its own operator's reader. `"premise": True` stops the chain when the phase does
+not finish (SETUP FAILED); `"env"` is added to that phase's server environment; `"server"` may be `current`,
+`previous` or a version `prev_release.PINNED` carries. Codex, Pi and Hermes drive a chain whose first phase is
 scripted (`midrun_hooks.seeded_chain`); a plain prompt chain stays the Claude operator's. A server that keeps no
 journal (0.1.20) has the script's own steps as its record (`script_runner.steps_trace`).
 

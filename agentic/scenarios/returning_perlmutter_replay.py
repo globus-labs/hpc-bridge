@@ -13,7 +13,7 @@ then the harness does the user's part (the key back, as a re-run sshproxy would 
 carries on. It never uses the dead pin twice, never hand-edits ~/.hpc-bridge or ~/.globus_compute, leaves one live
 endpoint and today's file format (returning.py: the invariants every cell holds).
 """
-from returning import agent_cell, expect_ok, graders, interphase, phases, world_check
+from returning import UV_CUTOFF_CLEAR, agent_cell, expect_ok, graders, interphase, phases, world_check
 
 CELL = agent_cell("perlmutter_replay")
 TARGETS = ("fake",)
@@ -33,9 +33,9 @@ PHASES = phases(CELL)
 INTERPHASE_SETUP = [interphase(CELL)]
 SETUP = ['rm -rf "$HOME"/hpc-bridge/gce-venv*; '
          "if [ -e ~/.ssh/authorized_keys.hpcb-revoked ]; then mv ~/.ssh/authorized_keys.hpcb-revoked "
-         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]"]
+         "~/.ssh/authorized_keys; fi; [ -e ~/.ssh/authorized_keys ]", UV_CUTOFF_CLEAR]
 CLEANUP = ["if [ -e ~/.ssh/authorized_keys.hpcb-revoked ]; then mv ~/.ssh/authorized_keys.hpcb-revoked "
-           "~/.ssh/authorized_keys; fi; true"]
+           "~/.ssh/authorized_keys; fi; true", UV_CUTOFF_CLEAR]
 ADMIN_SETUP = ["rm -f /etc/slurm/retired_qos.conf"]
 ADMIN_CLEANUP = ["rm -f /etc/slurm/retired_qos.conf"]
 

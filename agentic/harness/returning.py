@@ -7,11 +7,14 @@ that had gone dead, a proven facilities.json record whose login had become passw
 format with no agent. Here every cell is a two-session CHAIN on the fake `nersc` profile (two login nodes, key OR
 password + one-time code, homes under /global/homes, a QOS-routing submit filter):
 
-1. SESSION 1 — scripted, on the `origin` plugin (this checkout, or the previous release: prev_release.py): connect
-   from the probe's proposal with the overrides that version needs on nersc (0.1.20's /home venv default fails there,
-   as it did for the user, so its env_setup names $HOME), a login shape, a compute block on QOS `debug` with
-   `-C cpu`, "hello" on the compute node, a stop — and it ENDS as `ended` says (left running, its manager stopped or
-   killed hard, or torn down).
+1. SESSION 1 — scripted, on the `origin` plugin (this checkout, or an older release built into the image,
+   prev_release.py: `previous`, the release before this version — 0.1.24 today — and 0.1.20 for the Perlmutter
+   replay), in the world as that release saw it (`uv_cutoff`: the package index as of its release commit): connect
+   from the probe's proposal with what that version needs on nersc from its user (its /home/<user> venv default fails
+   there, as it did for the user: 0.1.20's env_setup names $HOME, a later one is told HPC_BRIDGE_REMOTE_VENV), a login
+   shape, a compute block on QOS `debug` with `-C cpu`, "hello" on the compute node, a stop — and it ENDS as `ended`
+   says (left running, its manager stopped or killed hard — long enough ago that globus-compute treats its pid file as
+   stale, or just now — or torn down). It is the chain's PREMISE: when it does not finish, the cell is SETUP FAILED.
 2. BETWEEN the sessions (`interphase`) — the world changes the other factors name, through the world channel, the
    node actions (node_actions.py: a login node closed to new logins, a QOS retired) and the jail's own files.
 3. SESSION 2 — the current code, scripted by default (`session_2`): drive toward a working shell and "hello world" on
@@ -52,6 +55,7 @@ from pathlib import Path
 from typing import Any
 
 import pairwise
+import prev_release
 from byo_script import PROPOSED, UP, brief, login_pin, proposal_details, state_dir, until_settled
 from cluster_ops import _endpoint_proc_filter, stop_here_cmd, stop_outcome
 from invariants import HPC_BRIDGE_TOOL_NAMES, Result, ToolCall, Trace
@@ -64,7 +68,7 @@ CELL_ENV = "HPCB_RETURNING_CELL"
 # ---- the factors, their levels (the first: nothing changed) and the pairs that cannot or need not meet -------------
 FACTORS: dict[str, tuple[str, ...]] = {
     "origin": ("current", "previous"),                       # the plugin session 1 ran
-    "ended": ("running", "stopped", "killed", "torn_down"),  # how session 1's endpoint was left
+    "ended": ("running", "stopped", "killed_earlier", "killed_recent", "torn_down"),   # how session 1's endpoint was left
     "pin": ("alive", "dead"),                                # the pinned login node: answers, or closed to logins
     "auth": ("key", "revoked"),                              # the key on port 22, or password + one-time code only
     "local": ("untouched", "record_deleted", "wiped", "renamed_id"),   # ~/.hpc-bridge, and the id the user gives
@@ -73,14 +77,51 @@ FACTORS: dict[str, tuple[str, ...]] = {
     "tokens": ("valid", "expired"),                          # the local Globus token store
     "host_key": ("same", "changed"),                         # the login nodes rebuilt with new host keys
     "gce": ("same", "changed"),                              # the remote endpoint version differs from session 1's
-    "shared_host": ("no", "yes"),                            # session 1 also reached the host under a second id
 }
+# `shared_host` (a second facility id on the same login host in session 1) was a factor until the review of 2026-10-30
+# found it did nothing: the harness gives every run ONE endpoint name (HPC_BRIDGE_ENDPOINT_NAME, binding.py, so that runs
+# under the shared Globus identity stay apart) and facilities.json is keyed by ssh_host, so the second id shared the
+# first's endpoint and record exactly as a renamed id does. What it was meant to probe — two names for one host — needs
+# distinct endpoint names, which the run isolation forbids.
 CONSTRAINTS: list[tuple[dict[str, str], str]] = [
     ({"ended": "torn_down", "remote": "endpoint_dir_deleted"},
      "redundant: a teardown already deletes the endpoint's directory"),
+    ({"ended": "killed_earlier", "remote": "endpoint_dir_deleted"},
+     "redundant: the pid file whose age tells the two kills apart goes with the endpoint's directory"),
     ({"remote": "venv_deleted", "gce": "changed"},
      "impossible: no venv is left to hold another endpoint version"),
+    ({"pin": "dead", "ended": "torn_down"},
+     "redundant: the teardown removed the pin, so no pin is left to be dead"),
+    ({"pin": "dead", "local": "wiped"},
+     "redundant: ~/.hpc-bridge is gone, and the pin with it"),
 ]
+
+
+def needs_ssh(levels: dict[str, str]) -> bool:
+    """Session 2 must reach the login node over SSH: the endpoint must be brought up again (it is not left running), the
+    facility probed (no record left to reconnect from), or the venv a running manager lost repaired. A running endpoint
+    reattached from a record needs none."""
+    return (levels["ended"] != "running" or levels["local"] in ("record_deleted", "wiped")
+            or levels["remote"] == "venv_deleted")
+
+
+# When a factor's non-default level actually changes what session 2 meets (it "bites"); a level that cannot is a no-op
+# cell (the review of 2026-10-30: a changed host key behind a reattach over the web, a dead pin a teardown had removed,
+# a retired QOS a fresh proposal never named). The generator makes only rows where every non-default level bites
+# (`valid_row`), and test_returning.py holds every cell to it.
+BITES: dict[str, Callable[[dict[str, str]], bool]] = {
+    "pin": lambda lv: lv["ended"] != "torn_down" and lv["local"] != "wiped" and needs_ssh(lv),   # a pin left, and SSH
+    "auth": needs_ssh,
+    "host_key": needs_ssh,
+    # `gce` always bites: the venv it changes is the one session 2 checks (the previous release builds the same keyed
+    # venv since 0.1.24) or the one a live manager's user endpoints start from. (Under the previous release 0.1.20, whose
+    # unkeyed venv this plugin never brings an endpoint up from, it did not: a no-op the review of 2026-10-30 found.)
+}
+
+
+def valid_row(levels: dict[str, str]) -> bool:
+    """Every non-default level of the row bites (BITES; the others always do)."""
+    return all(fn(levels) for f, fn in BITES.items() if levels[f] != FACTORS[f][0])
 # The three hand-picked AGENT cells (session 2 an agent): the levels they set, every other factor at its first level.
 AGENT_CELLS: dict[str, dict[str, str]] = {
     # the report itself, replayed: an endpoint left online, the pinned node dead, the key revoked, files as they were
@@ -91,13 +132,23 @@ AGENT_CELLS: dict[str, dict[str, str]] = {
     "new_laptop": {"origin": "previous", "ended": "running", "local": "wiped"},
 }
 
+# The release an agent cell's session 1 runs when it is not `previous` (prev_release.PINNED): the replay is of the
+# report's own plugin, whatever the previous release is by then
+AGENT_RELEASE: dict[str, str] = {"perlmutter_replay": "0.1.20"}
+
 # ---- the world's constants (the fake `nersc` profile) ---------------------------------------------------------------
 ACCOUNT = "hpcb"                     # the pool users' CPU allocation (accounting enforced)
-OLD_QOS, NEW_QOS = "debug", "regular"   # session 1's QOS (named as the partition, as NERSC's filter takes it); the fix
+OLD_QOS, NEW_QOS = "debug", "shared"   # session 1's QOS (named as the partition, as NERSC's filter takes it); the fix
+# site=policy_changed retires session 1's QOS AND the one the filter gives a job that names none — so a cached config
+# (debug) and a fresh proposal (no partition, `-C cpu`: regular) are both refused; the user's fix is `shared`
+RETIRED_QOS = (OLD_QOS, "regular")
 CONSTRAINT = "#SBATCH --constraint=cpu"  # NERSC's filter wants a node type
-OTHER_GCE = "4.17.1"                 # gce=changed: a version neither session installs (0.1.20: 4.16.0, today: 4.18.0)
+OTHER_GCE = "4.17.1"                 # gce=changed: a version no session installs (0.1.20: 4.16.0; 0.1.24, today: 4.18.0)
 TEXTTABLE_PIN = "texttable<1.7.2"    # texttable 1.7.2 breaks `globus-compute-endpoint list` (endpoint_venv.py)
-OLD_VENV = "$HOME/hpc-bridge/gce-venv"   # where session 1 on 0.1.20 builds its venv: the user's override of /home/<user>
+OLD_VENV = "$HOME/hpc-bridge/gce-venv"   # where session 1 on an older release builds its venv: the user's override of
+# its /home/<user> default (0.1.20: named in env_setup; 0.1.21–0.1.24: HPC_BRIDGE_REMOTE_VENV, `release_env`)
+UV_CONFIG = "$HOME/.config/uv/uv.toml"
+UV_MARK = "# hpcb-returning: the package index as an older release saw it"
 REVOKED = "~/.ssh/authorized_keys.hpcb-revoked"
 SAVED = Path.home() / ".hpcb-saved"  # the user's own copies (token store, known_hosts lines) — outside both state dirs
 KH_NAMES = ("login", "login01.hpcb.test", "login02.hpcb.test")   # the names the plugin's ssh looks keys up by
@@ -135,7 +186,7 @@ class Cell:
 
 
 def generated_cells() -> list[Cell]:
-    rows = pairwise.generate(FACTORS, CONSTRAINTS)
+    rows = pairwise.generate(FACTORS, CONSTRAINTS, valid=valid_row)
     return [Cell(f"c{n:02d}", row) for n, row in enumerate(rows, 1)]
 
 
@@ -170,13 +221,25 @@ def agent_cell(name: str) -> Cell:
     return Cell(name, levels)
 
 
+LEVELS_ENV = "HPCB_RETURNING_LEVELS"
+
+
 def cell_from_env(default: str = "c01") -> Cell:
     """The scripted cell this run is for (HPCB_RETURNING_CELL, a row of the checked-in table). An unknown id raises:
-    a cell run under the wrong levels would be graded as another."""
+    a cell run under the wrong levels would be graded as another. Its LEVELS are put in HPCB_RETURNING_LEVELS when it is
+    picked (the bundle's env keeps them), and a run that carries them is graded under them, whatever the table says now:
+    a regrade after the table was regenerated (ids move) grades the cell that ran (the review of 2026-10-30)."""
     cid = os.environ.get(CELL_ENV, "").strip() or default
+    carried = json.loads(os.environ.get(LEVELS_ENV, "").strip() or "{}")
+    if carried.get("id") == cid:   # this cell's own levels, as it ran (a bundle's env, replayed by regrade.py)
+        levels = carried.get("levels") or {}
+        if set(levels) != set(FACTORS) or any(levels[f] not in FACTORS[f] for f in FACTORS):
+            raise ValueError(f"{LEVELS_ENV} does not name a level of every factor: {carried!r}")
+        return Cell(cid, {f: levels[f] for f in FACTORS})
     cells = load_cells()
     if cid not in cells:
         raise ValueError(f"{CELL_ENV}={cid!r} is not a returning-user cell (have {', '.join(sorted(cells))})")
+    os.environ[LEVELS_ENV] = json.dumps({"id": cid, "levels": cells[cid].levels}, sort_keys=True)
     return cells[cid]
 
 
@@ -341,6 +404,37 @@ async def _world(ctx_or_ops, cmd: str, *, host: str | None = None, timeout: int 
 
 # ---- session 1: the origin plugin leaves the world behind ---------------------------------------------------------------
 
+def release_slot(cell: Cell) -> str:
+    """The server session 1 runs: `current`, `previous` or a pinned release (an agent cell's AGENT_RELEASE)."""
+    if cell.origin != "previous":
+        return "current"
+    return AGENT_RELEASE.get(cell.id, prev_release.PREVIOUS)
+
+
+def release_env(slot: str) -> dict[str, str]:
+    """What the user of an older release sets in its server's environment on nersc: the `previous` release (0.1.24
+    today) builds hpc-bridge's venv at /home/<user>/hpc-bridge/gce-venv unless HPC_BRIDGE_REMOTE_VENV names another, and
+    /home/<user> is not writable there (as on Perlmutter). 0.1.20 names its venv in env_setup instead (`old_env_setup`),
+    as the report's user did; a `previous` that already defaults to $HOME takes the same path either way."""
+    return {"HPC_BRIDGE_REMOTE_VENV": OLD_VENV} if slot == prev_release.PREVIOUS else {}
+
+
+def uv_cutoff_cmd(date: str | None) -> str:
+    """The package index as the release saw it: uv's `exclude-newer` at the release commit's date, in the pool user's
+    uv config, for session 1's builds only (written before its first connect, removed after its stop, by the
+    interphase and by the world check — only a file that carries UV_MARK). An older release run today otherwise
+    resolves today's packages: texttable 1.7.2 (2026-10-18) broke `globus-compute-endpoint list`, so 0.1.24 — and 0.1.20's
+    unbounded install — would fail a bring-up their users never failed. None: clear it."""
+    clear = f'f="{UV_CONFIG}"; if [ -f "$f" ] && grep -qF "{UV_MARK}" "$f"; then rm -f "$f"; fi'
+    if not date:
+        return clear + "; echo HPCB_UV_CLEARED"
+    return (f'{clear}; if [ -e "{UV_CONFIG}" ]; then echo HPCB_UV_TAKEN; else mkdir -p "$(dirname "{UV_CONFIG}")" && '
+            f"printf '%s\\nexclude-newer = \"%s\"\\n' \"{UV_MARK}\" \"{date}\" > \"{UV_CONFIG}\" && echo HPCB_UV_SET; fi")
+
+
+UV_CUTOFF_CLEAR = uv_cutoff_cmd(None)   # the scenarios' SETUP and CLEANUP: a cell killed mid-session-1 leaves none behind
+
+
 def old_env_setup(proposed: str | None) -> str:
     """0.1.20's proposed uv line with the venv the user had to name (its /home/<user> default is not writable on nersc,
     as on Perlmutter) and texttable pinned below 1.7.2 (the line's unbounded install now takes 1.7.2, whose `list`
@@ -356,19 +450,35 @@ def old_env_setup(proposed: str | None) -> str:
 
 def session1_details(r: dict, *, previous: bool) -> dict:
     """The details= session 1 confirms: the probe's proposal, QOS `debug` named as the partition (NERSC's filter takes
-    a QOS name there) with `-C cpu`, and — on the previous release — the env_setup that version needs on nersc."""
+    a QOS name there) with `-C cpu`, and — on an older release whose proposed env_setup BUILDS the venv (0.1.20's uv
+    line) — the env_setup that version needs on nersc. A later release proposes a line that only activates the venv
+    hpc-bridge builds itself; its venv path comes from HPC_BRIDGE_REMOTE_VENV (`release_env`)."""
     over: dict[str, Any] = {"partition": OLD_QOS, "scheduler_options": CONSTRAINT}
-    if previous:
-        over["env_setup"] = old_env_setup((r.get("proposed_details") or {}).get("env_setup"))
+    proposed = (r.get("proposed_details") or {}).get("env_setup")
+    if previous and "pip install" in str(proposed or ""):
+        over["env_setup"] = old_env_setup(proposed)
     return proposal_details(r, **over)
 
 
+def session2_details(r: dict) -> dict:
+    """The details= session 2's user confirms on a fresh proposal (its record gone): the proposal as it is, with the node
+    type every job on nersc must name (`-C cpu`, as session 1 confirms it) added when the proposal has none. A user
+    of the site knows that rule; the probe's fallback can drop it — once the site retired `regular`, the probe saw
+    every shape it tried refused and proposed `-p system` with no scheduler_options (c02, 2026-10-30) — and the script
+    then failed on the node type, not on the retired QOS the cell is about."""
+    opts = str((r.get("proposed_details") or {}).get("scheduler_options") or "")
+    if re.search(r"(?:--constraint|-C)[ =]", opts):
+        return proposal_details(r)
+    return proposal_details(r, scheduler_options="\n".join(x for x in (opts.strip(), CONSTRAINT) if x))
+
+
 async def _poll_block(ops, e: dict, *, wait_s: float) -> dict:
-    """ensure_endpoint_up polled while the block is `provisioning`, until it settles, `wait_s` passes, or a notice says
-    the submit was REJECTED (the probe says so while the status is still `provisioning`)."""
+    """ensure_endpoint_up polled while the block is `provisioning`, until it settles, `wait_s` passes, a notice says
+    the submit was REJECTED (the probe says so while the status is still `provisioning`), or the session's own bound
+    (MAX_CALLS_2) is spent — never past what `ru_bounded` allows."""
     deadline = time.monotonic() + wait_s
     while (e.get("status") == "provisioning" and "REJECTED" not in str(e.get("notice") or "")
-           and time.monotonic() < deadline):
+           and time.monotonic() < deadline and len(getattr(ops, "steps", ())) < MAX_CALLS_2):
         await ops.sleep(POLL_S)
         e = await ops.call("ensure_endpoint_up", shape="compute")
     return e
@@ -404,6 +514,13 @@ def session_1(cell: Cell):
     async def session_1_script(ops) -> str:
         fid, host = ops.facility, ops.ssh_host
         previous = cell.origin == "previous"
+        slot = release_slot(cell)
+        if previous:   # the index as the release saw it (prev_release's DATE: its release commit's)
+            date = (prev_release.installed(slot) or {}).get("date")
+            _rc, out = await ops.world(uv_cutoff_cmd(date), timeout=60)
+            if "HPCB_UV_SET" not in out:
+                ops.abort(f"session 1: could not set uv's cutoff for {slot} ({date}): {out.strip()[-200:]!r}")
+            ops.say(f"[world] uv resolves packages as of {date}, as {slot} saw them")
         r = await ops.call("connect_facility", facility=fid, ssh_host=host)
         if r.get("phase") != PROPOSED:
             ops.abort(f"session 1: the probe did not propose details: {r.get('phase')!r} {brief(r)!r}")
@@ -412,15 +529,6 @@ def session_1(cell: Cell):
         r = await until_settled(ops, r, {"facility": fid, "ssh_host": host}, wait_s=UP_WAIT_S)
         if r.get("phase") != UP:
             ops.abort(f"session 1: the login shape did not come up: {r.get('phase')!r} {brief(r, 400)!r}")
-        if cell.shared_host == "yes":   # a second facility id for the same login host, then back to the first
-            twin = f"{fid}-twin"
-            t = await ops.call("connect_facility", facility=twin, ssh_host=host)
-            t = await until_settled(ops, t, {"facility": twin, "ssh_host": host}, wait_s=UP_WAIT_S)
-            if t.get("phase") != UP:
-                ops.abort(f"session 1: the twin id did not come up: {t.get('phase')!r} {brief(t, 300)!r}")
-            await ops.call("run_shell", command="hostname", shape="login")
-            r = await ops.call("connect_facility", facility=fid, ssh_host=host)
-            r = await until_settled(ops, r, {"facility": fid, "ssh_host": host}, wait_s=UP_WAIT_S)
         out = await ops.call("run_shell", command="hostname", shape="login")
         if out.get("phase") != "complete":
             ops.abort(f"session 1: the login shape did not run: {out.get('phase')!r} {brief(out)!r}")
@@ -435,7 +543,7 @@ def session_1(cell: Cell):
         pin = login_pin(host)
         name = _endpoint_name()
         # where its manager runs, read before it is stopped or torn down; and its venv — the one hpc-bridge venv under
-        # $HOME/hpc-bridge (the cell's SETUP removed every other), keyed today, unkeyed on 0.1.20
+        # $HOME/hpc-bridge (the cell's SETUP removed every other), keyed since 0.1.24, unkeyed on 0.1.20
         procs, venv = [], None
         for node in ([pin] if pin else []) + [h for h in KH_NAMES[1:] if h != pin]:
             _rc, got = await ops.world(procs_cmd(name), host=node, timeout=60)
@@ -447,11 +555,13 @@ def session_1(cell: Cell):
         _rc, got = await ops.world('ls -d "$HOME"/hpc-bridge/gce-venv* 2>/dev/null', timeout=60)
         built = [ln.strip() for ln in got.splitlines() if re.search(r"/gce-venv(-endpoint-[\w.]+)?$", ln.strip())]
         keyed = [v for v in built if "-endpoint-" in v]
-        venv = (keyed[0] if keyed and not previous else next((v for v in built if "-endpoint-" not in v), None)) \
+        venv = (keyed[0] if keyed else next((v for v in built if "-endpoint-" not in v), None)) \
             or venv or (built[0] if built else None)
         s = await _stop(ops)
         if s.get("status") not in ("down", "draining"):
             ops.abort(f"session 1: stop_endpoint answered {s.get('status')!r}: {brief(s)!r}")
+        if previous:   # session 2 is today: today's index
+            await ops.world(UV_CUTOFF_CLEAR, timeout=60)
         if cell.ended == "torn_down":
             td = await ops.call("teardown_endpoint")
             for _ in range(30):
@@ -462,7 +572,7 @@ def session_1(cell: Cell):
             if td.get("status") != "down":
                 ops.abort(f"session 1: the teardown did not finish: {td.get('status')!r} {brief(td, 300)!r}")
         facts = {"eid": eid, "pin": pin, "venv": venv, "managers": len(procs), "origin": cell.origin,
-                 "fid": fid, "ended": cell.ended}
+                 "fid": fid, "ended": cell.ended, "release": slot}
         STATE.update(facts)
         ops.say(_FACTS + json.dumps(facts, sort_keys=True))
         return (f"session 1 ({cell.origin}): endpoint {eid} on {pin} from {venv}; ran hello on a compute node; "
@@ -529,19 +639,21 @@ def change_host_keys() -> str:
     with kh.open("a") as fh:
         for n in KH_NAMES:
             fh.write(f"{n} {pub}\n")
-    STATE["known_hosts_planted"] = kh.read_text()
+    STATE["known_hosts_planted"] = {n: _kh_lines(n) for n in KH_NAMES}
     return f"host keys of {', '.join(KH_NAMES)} changed in known_hosts ({sum(map(len, real.values()))} real lines saved)"
 
 
 def known_hosts_untouched() -> bool | None:
-    """Is the jail's known_hosts still exactly as `change_host_keys` left it (no key accepted on the user's behalf)?
-    None when no change was planted."""
+    """Are the jail's known_hosts entries for the names the plugin connects by (KH_NAMES, port 22) still exactly as
+    `change_host_keys` left them — no key accepted on the user's behalf? Only those names: the harness' own channel
+    (`[host]:2200`, StrictHostKeyChecking=accept-new) may add its entries meanwhile, and the whole file compared read
+    that as hpc-bridge's doing (c04 of the first table, 2026-10-30). None when no change was planted."""
     planted = STATE.get("known_hosts_planted")
     if planted is None:
         return None
     try:
-        return known_hosts_path().read_text() == planted
-    except OSError:
+        return {n: _kh_lines(n) for n in KH_NAMES} == planted
+    except (OSError, subprocess.SubprocessError):
         return False
 
 
@@ -606,6 +718,9 @@ def interphase(cell: Cell):
         if ctx.next_phase >= 2:
             return "; ".join(await users_part(cell, ctx))
         notes = [close_masters()]
+        _rc, out = await _world(ctx, UV_CUTOFF_CLEAR)
+        if "HPCB_UV_CLEARED" not in out:
+            raise RuntimeError(f"could not clear session 1's uv cutoff: {out.strip()[-200:]!r}")
         name = _endpoint_name()
         facts = facts_of(ctx.trace) or STATE
         pin, eid, venv = facts.get("pin"), facts.get("eid"), facts.get("venv")
@@ -616,17 +731,9 @@ def interphase(cell: Cell):
             if stop_outcome(out)[0] != "rc=0":
                 raise RuntimeError(f"could not stop the manager on {pin}: {out.strip()[-200:]!r}")
             notes.append(f"the manager on {pin} stopped cleanly")
-        elif cell.ended == "killed":
-            rc, out = await _world(ctx, procs_cmd(name), host=pin)
-            pids = [ln.split()[0] for ln in read_procs(out) or [] if ln.split()]
-            if not pids:
-                raise RuntimeError(f"no process of {name} to kill on {pin}")
-            uep = f'pgrep -u "$(whoami)" -f "uep\\.{eid}" || true' if eid else "true"
-            await _world(ctx, f"kill -9 {' '.join(pids)} $({uep}) 2>/dev/null; true", host=pin)
-            view, why = await asyncio.to_thread(cloud_view, name)
-            STATE["killed_cloud"] = view
-            notes.append(f"the manager on {pin} killed hard ({len(pids)} process(es)); the cloud says "
-                         + (", ".join(f"{v['uuid'][:8]}={v['status']}" for v in view) if view else f"? ({why})"))
+        elif cell.ended == "killed_earlier":   # long ago: first, then aged (killed_recent: last, below)
+            notes.append(await kill_manager(ctx, name, pin, eid))
+            notes.append(await age_killed(ctx, name))
         if cell.remote == "venv_deleted":
             _rc, out = await _world(ctx, 'rm -rf "$HOME"/hpc-bridge/gce-venv*; echo "HPCB_LEFT=$(ls -d '
                                         '"$HOME"/hpc-bridge/gce-venv* 2>/dev/null | wc -l)"')
@@ -635,7 +742,10 @@ def interphase(cell: Cell):
                 raise RuntimeError(f"hpc-bridge's venvs not deleted (left: {left}): {out[-200:]!r}")
             notes.append("hpc-bridge's venvs deleted under $HOME/hpc-bridge")
         elif cell.remote == "endpoint_dir_deleted":
-            await _world(ctx, f'rm -rf "$HOME/.globus_compute/{name}"')
+            _rc, out = await _world(ctx, f'rm -rf "$HOME/.globus_compute/{name}"; '
+                                         f'[ -e "$HOME/.globus_compute/{name}" ] && echo HPCB_LEFT || echo HPCB_GONE')
+            if "HPCB_GONE" not in out:
+                raise RuntimeError(f"the endpoint's directory was not deleted: {out.strip()[-200:]!r}")
             notes.append(f"the endpoint's directory ~/.globus_compute/{name} deleted")
         if cell.gce == "changed":
             v = venv or OLD_VENV
@@ -647,10 +757,11 @@ def interphase(cell: Cell):
             notes.append(f"{v} now holds globus-compute-endpoint {OTHER_GCE}")
         nodes = NodeActions.from_env()
         if cell.site == "policy_changed":
-            rc, out = await asyncio.to_thread(nodes.run, "qos_retire", CONTROLLER, arg=OLD_QOS)
-            if rc != 0:
-                raise RuntimeError(f"could not retire QOS {OLD_QOS}: {out[-200:]!r}")
-            notes.append(f"the site retired QOS {OLD_QOS}")
+            for qos in RETIRED_QOS:
+                rc, out = await asyncio.to_thread(nodes.run, "qos_retire", CONTROLLER, arg=qos)
+                if rc != 0 or qos not in out:
+                    raise RuntimeError(f"could not retire QOS {qos}: {out[-200:]!r}")
+            notes.append(f"the site retired QOS {', '.join(RETIRED_QOS)}")
         if cell.auth == "revoked":
             rc, out = await _world(ctx, f"mv ~/.ssh/authorized_keys {REVOKED} && [ ! -e ~/.ssh/authorized_keys ] && "
                                         "echo revoked")
@@ -668,16 +779,68 @@ def interphase(cell: Cell):
         if cell.tokens == "expired":
             notes.append(expire_tokens())
         if cell.local == "record_deleted":
-            from byo_script import forget_cached
-            notes.append(f"facilities.json's record for {ctx_host()} deleted by hand: {forget_cached(ctx_host())}")
+            from byo_script import cached_hosts, forget_cached
+            if not forget_cached(ctx_host()) or ctx_host() in cached_hosts():
+                raise RuntimeError(f"facilities.json had no record for {ctx_host()} to delete (have {cached_hosts()})")
+            notes.append(f"facilities.json's record for {ctx_host()} deleted by hand")
         elif cell.local == "wiped":
             shutil.rmtree(state_dir(), ignore_errors=True)
+            if state_dir().exists():
+                raise RuntimeError(f"{state_dir()} is still there")
             notes.append(f"{state_dir()} gone (a new laptop)")
         elif cell.local == "renamed_id":
             notes.append("session 2 connects under a new facility id")
+        if cell.ended == "killed_recent":   # just now: the LAST change, so session 2 starts inside the stale window
+            notes.append(await kill_manager(ctx, name, pin, eid))
         STATE["interphase"] = notes
         return "; ".join(notes)
     return returning_world
+
+
+KILLED = ("killed_earlier", "killed_recent")
+PID_AGE_S = 3600          # killed_earlier: the pid file dated an hour back, far past globus-compute's stale window
+OFFLINE_WAIT_S = 300.0    # …and the cloud given this long to list the endpoint offline, as it would hours later
+
+
+async def kill_manager(ctx, name: str, pin: str, eid: str | None) -> str:
+    """The manager killed hard on its node (`kill -9`, with the user endpoints it forked): an OOM kill, a crash. Its
+    pid file stays on the shared home; the cloud keeps listing the endpoint online until its heartbeats are missed."""
+    _rc, out = await _world(ctx, procs_cmd(name), host=pin)
+    pids = [ln.split()[0] for ln in read_procs(out) or [] if ln.split()]
+    if not pids:
+        raise RuntimeError(f"no process of {name} to kill on {pin}")
+    uep = f'pgrep -u "$(whoami)" -f "uep\\.{eid}" || true' if eid else "true"
+    await _world(ctx, f"kill -9 {' '.join(pids)} $({uep}) 2>/dev/null; true", host=pin)
+    STATE["killed_at"] = time.time()
+    view, why = await asyncio.to_thread(cloud_view, name)
+    STATE["killed_cloud"] = view
+    return (f"the manager on {pin} killed hard ({len(pids)} process(es)); the cloud says "
+            + (", ".join(f"{v['uuid'][:8]}={v['status']}" for v in view) if view else f"? ({why})"))
+
+
+async def age_killed(ctx, name: str) -> str:
+    """`killed_earlier`: the user comes back long after the manager died. globus-compute's start treats a pid file whose
+    mtime is older than three heartbeats (90 s by default) as left by a dead instance and removes it itself; a live
+    instance touches it every 15 s. So the pid file is dated an hour back (`touch -d @…`), and the cloud is given up to
+    OFFLINE_WAIT_S to stop listing the endpoint online, as it would have long before the user returned. What this does
+    not age: anything else time moves on — the NFS attribute caches, the scheduler's accounting, the web service's own
+    records of the dead endpoint beyond its status, the login token store's access token."""
+    pid = f'"$HOME/.globus_compute/{name}/daemon.pid"'
+    _rc, out = await _world(ctx, f'[ -e {pid} ] && touch -d "@$(( $(date +%s) - {PID_AGE_S} ))" {pid} && '
+                                f'echo "HPCB_AGED=$(( $(date +%s) - $(stat -c %Y {pid}) ))"')
+    aged = next((ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("HPCB_AGED=")), None)
+    if aged is None:
+        raise RuntimeError(f"no pid file of {name} to age: {out.strip()[-200:]!r}")
+    deadline = time.monotonic() + OFFLINE_WAIT_S
+    view: list[dict] | None = None
+    while time.monotonic() < deadline:
+        view, _why = await asyncio.to_thread(cloud_view, name)
+        if view is not None and not any(v.get("status") == "online" for v in view):
+            break
+        await asyncio.sleep(15)
+    online = [v["uuid"][:8] for v in view or [] if v.get("status") == "online"]
+    return (f"its pid file dated {aged} s back; the cloud " + (f"STILL lists {online} online after {OFFLINE_WAIT_S:.0f} s"
+                                                               if online else "lists it offline"))
 
 
 def ctx_host() -> str:
@@ -770,7 +933,7 @@ def session_2(cell: Cell):
                 ops.say(f"[check] known_hosts untouched by hpc-bridge: {known_hosts_untouched()}")
                 ops.say(f"[user] hpc-bridge says the host key CHANGED: I check the fingerprint — {fix_known_hosts()}")
             elif ph == PROPOSED:
-                r = await ops.call("connect_facility", facility=fid, ssh_host=host, details=proposal_details(r))
+                r = await ops.call("connect_facility", facility=fid, ssh_host=host, details=session2_details(r))
                 continue
             elif ph == "failed" and retries:
                 retries -= 1
@@ -791,8 +954,8 @@ def session_2(cell: Cell):
             if ("REJECTED" in notice or e.get("status") == "down") and cell.site == "policy_changed" \
                     and "qos" not in done:
                 done.add("qos")
-                ops.say(f"[user] the site refused the block ({e.get('status')!r}); our QOS {OLD_QOS} was retired, "
-                        f"so I choose {NEW_QOS}")
+                ops.say(f"[user] the site refused the block ({e.get('status')!r}); the site retired "
+                        f"{', '.join(RETIRED_QOS)}, so I choose {NEW_QOS}")
                 e = await ops.call("ensure_endpoint_up", shape="compute", partition=NEW_QOS, account=ACCOUNT,
                                    confirm_spend=True)
                 continue
@@ -836,9 +999,28 @@ FOLLOW_UP_PROMPT = (
 _USER_ASKS = ("needs_preauth", "needs_login")
 
 
-def _compute_hello(c: ToolCall) -> bool:
-    return (c.name in ("run_shell", "poll_task") and (c.result or {}).get("phase") == "complete"
-            and "hello world" in str((c.result or {}).get("stdout") or ""))
+# The fake nersc cluster's compute nodes (c1, c2, c3); its login nodes are login01/login02.hpcb.test
+COMPUTE_HOST = re.compile(r"^c\d+$")
+
+
+def _shape_of(c: ToolCall, calls: list[ToolCall] | None = None) -> str:
+    """The shape a run_shell ran on (an omitted shape is the billed compute one, as the server defaults it); a
+    poll_task's, the shape of the run_shell whose handle it polls."""
+    if c.name == "poll_task":
+        tid = (c.input or {}).get("task_id")
+        src = next((x for x in calls or [] if x.name == "run_shell" and (x.result or {}).get("task_id") == tid), None)
+        return _shape_of(src) if src is not None else "unknown"
+    return str((c.input or {}).get("shape") or "compute")
+
+
+def _compute_hello(c: ToolCall, calls: list[ToolCall] | None = None) -> bool:
+    """A completed command on the COMPUTE shape that printed a line `hello world` and a compute node's hostname — not a
+    login-shape hello, nor compute work that ran on a login node (the review of 2026-10-30: either passed before)."""
+    if c.name not in ("run_shell", "poll_task") or (c.result or {}).get("phase") != "complete":
+        return False
+    lines = [ln.strip() for ln in str((c.result or {}).get("stdout") or "").splitlines()]
+    return (_shape_of(c, calls) == "compute" and "hello world" in lines
+            and any(COMPUTE_HOST.match(ln) for ln in lines) and not any(ln.startswith("login") for ln in lines))
 
 
 def asked_user(t: Trace) -> bool:
@@ -848,14 +1030,15 @@ def asked_user(t: Trace) -> bool:
     turn = [c for c in t.calls if c.phase == last]
     asks = [k for k, c in enumerate(turn) if c.name == "connect_facility"
             and ((c.result or {}).get("phase") in _USER_ASKS or host_key_changed_notice(c.result or {}))]
-    return bool(asks) and not any(_compute_hello(c) for c in turn[asks[0]:])
+    return bool(asks) and not any(_compute_hello(c, t.calls) for c in turn[asks[0]:])
 
 
 def phases(cell: Cell) -> list[dict | str]:
     """The cell's chain: session 1 scripted on its origin plugin, then session 2 — scripted (a pairwise cell) or the
     cell's agent with a conditional follow-up turn (an agent cell)."""
-    first = {"script": session_1(cell), "server": "previous" if cell.origin == "previous" else "current",
-             "label": f"session 1 ({cell.origin})"}
+    slot = release_slot(cell)
+    first = {"script": session_1(cell), "server": slot, "env": release_env(slot), "premise": True,
+             "label": f"session 1 ({cell.origin}{'' if slot in ('current', 'previous') else ' ' + slot})"}
     if not cell.agent:
         return [first, {"script": session_2(cell), "label": "session 2 (current)"}]
     prompt = NEW_LAPTOP_PROMPT if cell.local == "wiped" else AGENT_PROMPT
@@ -866,9 +1049,15 @@ def phases(cell: Cell) -> list[dict | str]:
 # ---- graders ------------------------------------------------------------------------------------------------------------
 
 _SSH_TROUBLE = re.compile(r"CANNOT REACH|UNKNOWN HOST KEY|NO SSH ACCESS|REVOKED HOST KEY|Permission denied", re.I)
-_WRITE = re.compile(r"\b(?:rm|mv|cp|tee|touch|truncate|chmod|chown|mkdir|ln|install|rsync|unlink)\b|\bsed\s+-i|"
-                    r"\bperl\s+-p?i|>|\.write_text|open\([^)]*['\"][wa]")
-_STATE_PATHS = re.compile(r"\.hpc-bridge|\.globus_compute|/home/agent/run/")
+# A hand edit of hpc-bridge's state (agent cells): a path that names it, spelled out or assembled (`~/.hpc*`,
+# `'.hpc-' + 'bridge'`), and a WRITE — a writing command, a write in Python, a redirection to a file. A redirection to
+# /dev/null or to another stream is not a write (`2>/dev/null` read as one before the review of 2026-10-30).
+_STATE_PATHS = re.compile(r"\.hpc(?:-?bridge|[*?\[]|-?['\"])|\.globus(?:_compute|[_*?\[]|['\"])|/home/agent/run/")
+_WRITE = re.compile(r"\b(?:rm|mv|cp|tee|touch|truncate|chmod|chown|mkdir|ln|install|rsync|unlink|rmdir)\b|\bsed\s+-i"
+                    r"|\bperl\s+-p?i|rmtree|os\.remove|\.unlink\(|\.rmdir\(|write_text|write_bytes"
+                    r"|open\([^)]*['\"][wa]|\d?>>?\s*(?!/dev/null\b|&)[^\s;|&]")
+_DEVNULL = re.compile(r"\d?>>?\s*/dev/null|\d?>&\d")
+_SSH_TOOLS = ("teardown_endpoint", "login_shell")   # always SSH to the login node
 
 
 def _later(t: Trace) -> list[tuple[int, ToolCall]]:
@@ -894,17 +1083,30 @@ def _said_index(t: Trace, prefix: str) -> int | None:
 
 
 def _first_up(t: Trace) -> tuple[int, ToolCall] | None:
-    return next(((i, c) for i, c in _later(t) if c.name == "connect_facility" and _res(c).get("phase") == UP), None)
+    """Session 2's first connect that reached the endpoint: `needs_account`, or a `provisioning` that names whether it
+    reused one — an agent may go on to ensure_endpoint_up without polling to needs_account (the Perlmutter replay)."""
+    return next(((i, c) for i, c in _later(t) if c.name == "connect_facility"
+                 and (_res(c).get("phase") == UP or (_res(c).get("phase") == "provisioning" and "reused" in _res(c)))),
+                None)
+
+
+# Every stop says "reconnecting is zero-SSH": that is not a stop over ssh (it read as one in c08, 2026-10-30, and failed
+# ru_revoked_handoff on a reuse that made no SSH at all)
+_ZERO_SSH = re.compile(r"zero-ssh", re.I)
+_OVER_SSH = re.compile(r"\bssh\b", re.I)
 
 
 def _needed_ssh(t: Trace, before: int | None = None) -> bool:
-    """Did session 2 need SSH before call `before`: a probe, a handoff, a bring-up that was not a reuse, an SSH error?"""
+    """Did session 2 need SSH before call `before`: a probe, a handoff, a bring-up that was not a reuse, an SSH error, a
+    tool that always SSHes (teardown_endpoint, login_shell), or a stop that says it used ssh?"""
     for i, c in _later(t):
         if before is not None and i >= before:
             break
+        r = _res(c)
+        if c.name in _SSH_TOOLS or (c.name == "stop_endpoint" and _OVER_SSH.search(_ZERO_SSH.sub("", _notice(c)))):
+            return True
         if c.name != "connect_facility":
             continue
-        r = _res(c)
         if r.get("phase") in (PROPOSED, "needs_preauth") or _SSH_TROUBLE.search(_notice(c)):
             return True
         if r.get("phase") in (UP, "provisioning") and not r.get("reused"):
@@ -913,10 +1115,16 @@ def _needed_ssh(t: Trace, before: int | None = None) -> bool:
 
 
 def hello_world(t: Trace) -> Result:
-    """Every cell: session 2 ends with a working compute shell — "hello world" printed on a compute node."""
-    hits = [i for i, c in _later(t) if _compute_hello(c)]
+    """Every cell: session 2 ends with a working compute shell — "hello world" printed on a compute node, by a command on
+    the compute shape (`_compute_hello`)."""
+    hits = [i for i, c in _later(t) if _compute_hello(c, t.calls)]
     if hits:
         return Result("ru_hello_world", True, f"ok: hello world on a compute node (call {hits[0]})")
+    near = next((c for _i, c in reversed(_later(t)) if c.name in ("run_shell", "poll_task")
+                 and "hello world" in str(_res(c).get("stdout") or "")), None)
+    if near is not None:
+        return Result("ru_hello_world", False, f"hello world was printed, but not on a compute node by the compute "
+                      f"shape: shape {_shape_of(near, t.calls)!r}, output {str(_res(near).get('stdout'))[:120]!r}")
     last = next((c for _i, c in reversed(_later(t)) if c.name in HPC_BRIDGE_TOOL_NAMES), None)
     return Result("ru_hello_world", False, "no hello world on a compute node in session 2; the last answer: "
                   + (f"{last.name} {_res(last).get('phase') or _res(last).get('status')!r} {_notice(last)[:300]!r}"
@@ -968,7 +1176,8 @@ def dead_pin_not_reused(t: Trace) -> Result:
 
 def explicit_args_kept(t: Trace) -> Result:
     """Every cell: no stale cached record overrides an explicit argument — a connect naming ssh_host=H is proposed for
-    H, and never answers with another host's cached configuration."""
+    H. (A notice about "the configuration cached for <id>" names the facility id, not a host: it was read as another
+    host's config before the review of 2026-10-30.)"""
     bad = []
     for i, c in _later(t):
         if c.name != "connect_facility" or not c.input.get("ssh_host"):
@@ -977,9 +1186,6 @@ def explicit_args_kept(t: Trace) -> Result:
         proposed = (r.get("proposed_details") or {}).get("ssh_host")
         if r.get("phase") == PROPOSED and proposed and proposed != h:
             bad.append(f"call {i}: proposed for {proposed!r}, asked {h!r}")
-        m = re.search(r"configuration cached for '?([\w.-]+)", _notice(c))
-        if m and m.group(1) != h:
-            bad.append(f"call {i}: the configuration cached for {m.group(1)!r} answered for {h!r}")
     return Result("ru_explicit_args", not bad, "ok" if not bad else "; ".join(bad))
 
 
@@ -1008,95 +1214,144 @@ def expired_login(t: Trace) -> Result:
                   f"the first answer was {r.get('phase')!r} {_notice(c)[:300]!r}")
 
 
+_KH_CHECK = "[check] known_hosts untouched by hpc-bridge:"
+
+
 def host_key_honest(t: Trace) -> Result:
     """host_key=changed: when session 2 needed SSH, an honest notice that the host key CHANGED came before the user's
-    fix, and hpc-bridge accepted no key itself (known_hosts as the change left it, checked before the fix)."""
+    fix, and hpc-bridge accepted no key itself. known_hosts is compared in EVERY such cell (the review of 2026-10-30:
+    only the notice's branch looked): before the user's fix (the script's `[check]`), and — when no fix came — at the
+    end, before anything is put back (the world check's `[check]`, `world_check`)."""
     fix = _said_index(t, "[user] hpc-bridge says the host key CHANGED")
     notices = [i for i, c in _later(t) if host_key_changed_notice(_res(c))]
-    untouched = next((x for x in t.texts if x.startswith("[check] known_hosts untouched by hpc-bridge:")), None)
-    needed = _needed_ssh(t, fix)
-    if untouched is not None and not untouched.endswith("True"):
-        return Result("ru_host_key_honest", False, f"known_hosts changed before the user's fix: {untouched!r}")
+    checks = [x for x in t.texts if x.startswith(_KH_CHECK)]
+    if any(not x.endswith("True") for x in checks):
+        return Result("ru_host_key_honest", False, f"known_hosts was changed by hpc-bridge: {checks!r}")
     accepted_up = [i for i, c in _later(t) if (fix is None or i < fix) and c.name == "connect_facility"
                    and _res(c).get("phase") == UP and not _res(c).get("reused")]
     if accepted_up:
         return Result("ru_host_key_honest", False, f"a fresh bring-up came up past the changed key at {accepted_up}")
+    needed = _needed_ssh(t, fix)
     ok = bool(notices) or not needed
-    return Result("ru_host_key_honest", ok, "ok: " + (f"CHANGED notice at call {notices[0]}" if notices else
-                                                      "no SSH was needed") if ok
-                  else "SSH was needed but no answer said the host key changed")
+    return Result("ru_host_key_honest", ok, ("ok: " + (f"CHANGED notice at call {notices[0]}" if notices else
+                                                       "no SSH was needed") + (f"; {len(checks)} known_hosts check(s)")
+                                             if ok else "SSH was needed but no answer said the host key changed"))
 
 
-def reuse_expected(cell: Cell) -> bool:
-    """running + alive + key + an untouched or renamed id → reuse. Sharpened (2026-10-30): only when nothing on the
-    login node changed under the running manager either (remote untouched, gce same) — a deleted venv or endpoint
-    directory, or a swapped endpoint version, can break a manager that still answers, and the venv rule then wants a
-    rebuild."""
-    return (cell.ended == "running" and cell.pin == "alive" and cell.auth == "key"
-            and cell.local in ("untouched", "renamed_id") and cell.remote == "untouched" and cell.gce == "same")
+# What legitimately makes session 2 meet another endpoint registration, or rebuild a venv (the review of 2026-10-30
+# inverted the old six-way `reuse_expected`, which pairwise gated in one cell):
+# - a NEW REGISTRATION: the endpoint deleted (`torn_down`) or its directory, which holds its id, gone
+#   (`endpoint_dir_deleted`). A stopped or killed manager is restarted IN PLACE under the same id; a new laptop, a
+#   renamed id, a dead pin, a revoked key, expired tokens, a changed host key or site policy change nothing of that.
+# - a REBUILD of the venv session 1 left: that venv deleted (`venv_deleted`: rebuilt, or repaired under a live manager)
+#   or its endpoint version changed under it (`gce`: the check finds another version and rebuilds). Nothing else — not
+#   an older origin: a venv this plugin keys differently (0.1.20's unkeyed one) is left alone and its own built beside it,
+#   a first build that `no_rebuild` does not count.
+def same_endpoint_expected(levels: dict[str, str]) -> bool:
+    return levels["ended"] != "torn_down" and levels["remote"] != "endpoint_dir_deleted"
 
 
-def reused_same_endpoint(t: Trace) -> Result:
-    """Reuse: session 2's first up-connect reattached (reused=True), every endpoint id it saw is session 1's, no probe
-    ran and no venv was built."""
-    up = _first_up(t)
-    eid = (facts_of(t) or {}).get("eid")
-    ids = {x for _i, c in _later(t) if (x := _eid_of(_res(c)))}
-    probes = [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED]
-    built = [i for i, c in _later(t) if "built hpc-bridge's endpoint venv" in _notice(c)]
-    ok = up is not None and bool(_res(up[1]).get("reused")) and ids <= {eid} and not probes and not built
-    return Result("ru_reused", ok, "ok: the same endpoint, reattached, nothing rebuilt" if ok else
-                  f"first up-connect reused={_res(up[1]).get('reused') if up else None}; ids {sorted(ids)} vs "
-                  f"session 1's {eid}; probes at {probes}; venv builds at {built}")
+def no_rebuild_expected(levels: dict[str, str]) -> bool:
+    return levels["remote"] != "venv_deleted" and levels["gce"] == "same"
+
+
+def reuse_expected(levels: dict[str, str]) -> bool:
+    """A live endpoint (left running, its directory there) is REATTACHED: session 2's first connect to reach it says
+    reused=True."""
+    return levels["ended"] == "running" and levels["remote"] != "endpoint_dir_deleted"
+
+
+def _ids(t: Trace) -> set[str]:
+    return {x for _i, c in _later(t) if (x := _eid_of(_res(c)))}
+
+
+def same_endpoint(t: Trace) -> Result:
+    """The endpoint session 1 left is the one session 2 runs on: every endpoint id session 2 saw is session 1's — no
+    second registration beside it (a restart in place keeps the id)."""
+    eid, ids = (facts_of(t) or {}).get("eid"), _ids(t)
+    ok = bool(ids) and ids <= {eid}
+    return Result("ru_same_endpoint", ok, f"ok: {eid}" if ok else
+                  f"session 2 saw {sorted(ids) or 'no endpoint id'}, session 1 left {eid}")
+
+
+_BUILT = re.compile(r"(?:re)?built hpc-bridge's endpoint venv (\S+)")
+
+
+def no_rebuild(t: Trace) -> Result:
+    """Nothing forced a rebuild, and none was made: no answer of session 2 says it built hpc-bridge's venv at the path
+    session 1 left it (a build elsewhere — this plugin's own key beside an older release's venv — is a first build)."""
+    left = os.path.normpath(str((facts_of(t) or {}).get("venv") or "")).rstrip("/")
+    rebuilt = [(i, m.group(1)) for i, c in _later(t) for m in _BUILT.finditer(_notice(c))
+               if not left or os.path.normpath(m.group(1).rstrip(".,;)")) == left]
+    return Result("ru_no_rebuild", not rebuilt, f"ok: {left or '?'} kept" if not rebuilt else
+                  f"session 1's venv {left or '(unknown)'} was rebuilt at calls {[i for i, _ in rebuilt]}: "
+                  f"{_notice(t.calls[rebuilt[0][0]])[:200]!r}")
+
+
+def reused_same_endpoint(probes: int = 0):
+    def ru_reused(t: Trace) -> Result:
+        """A live endpoint reattached: session 2's first connect to reach it says reused=True (`_first_up`), after at
+        most `probes` probes — none where a record is left (a probe there is needless SSH), one where it is gone. Which
+        endpoint it reached is `same_endpoint`'s (gated wherever this is)."""
+        up = _first_up(t)
+        before = [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED and (up is None or i < up[0])]
+        ok = up is not None and bool(_res(up[1]).get("reused")) and len(before) <= probes
+        return Result("ru_reused", ok, f"ok: reattached at call {up[0]} after {len(before)} probe(s)" if ok else
+                      f"the first connect to reach the endpoint: "
+                      f"{(_res(up[1]).get('phase'), _res(up[1]).get('reused')) if up else None}; probes before it at "
+                      f"{before} (≤{probes})")
+    return ru_reused
+
+
+MAX_LAPTOP_PROBES = 1
 
 
 def reattached_same_endpoint(t: Trace) -> Result:
-    """A new laptop (~/.hpc-bridge gone): the endpoint still online is REATTACHED — session 2's first up-connect says
-    reused=True, every endpoint id it saw is session 1's (no second endpoint beside it), no venv was built. A probe is
-    allowed: no configuration is left to reconnect from, so the login node must be asked once (sharpened 2026-10-30:
-    the new-laptop agent run reattached cleanly after the probe it cannot avoid, and `ru_reused` failed it for that)."""
+    """A new laptop (~/.hpc-bridge gone): the endpoint still online is REATTACHED (reused=True), with no second one
+    beside it and nothing rebuilt, after at most ONE probe — the one a laptop with no record cannot avoid today (more
+    is needless SSH; the review of 2026-10-30: unlimited before)."""
     up = _first_up(t)
-    eid = (facts_of(t) or {}).get("eid")
-    ids = {x for _i, c in _later(t) if (x := _eid_of(_res(c)))}
-    built = [i for i, c in _later(t) if "built hpc-bridge's endpoint venv" in _notice(c)]
-    ok = up is not None and bool(_res(up[1]).get("reused")) and ids <= {eid} and not built
-    return Result("ru_reattached", ok, "ok: the same endpoint reattached, no second one, nothing rebuilt" if ok else
+    eid, ids = (facts_of(t) or {}).get("eid"), _ids(t)
+    probes = [i for i, c in _later(t) if _res(c).get("phase") == PROPOSED]
+    kept = no_rebuild(t)
+    ok = (up is not None and bool(_res(up[1]).get("reused")) and bool(ids) and ids <= {eid} and kept.ok
+          and len(probes) <= MAX_LAPTOP_PROBES)
+    return Result("ru_reattached", ok, "ok: the same endpoint reattached after one probe, nothing rebuilt" if ok else
                   f"first up-connect reused={_res(up[1]).get('reused') if up else None}; ids {sorted(ids)} vs "
-                  f"session 1's {eid}; venv builds at {built}")
+                  f"session 1's {eid}; probes at {probes} (≤{MAX_LAPTOP_PROBES}); {kept.detail}")
 
 
 def killed_not_up(t: Trace) -> Result:
-    """ended=killed: never reported up on manager_online alone — the login shape answered after session 2's first
-    needs_account (a dead manager cannot)."""
-    up = _first_up(t)
+    """ended=killed: never reported up on manager_online alone — after session 2's first needs_account, the login shape
+    answers (a cold start retried is not a failure; a dead manager never answers)."""
+    up = next(((i, c) for i, c in _later(t) if c.name == "connect_facility" and _res(c).get("phase") == UP), None)
     if up is None:
         return Result("ru_killed_not_up", True, "no needs_account in session 2 (nothing reported up)")
-    nxt = next((c for i, c in _later(t) if i > up[0] and c.name == "run_shell" and c.input.get("shape") == "login"),
-               None)
-    ok = nxt is not None and _res(nxt).get("phase") == "complete"
+    after = [c for i, c in _later(t) if i > up[0] and c.name == "run_shell" and _shape_of(c) == "login"]
+    first_settled = next((c for c in after if _res(c).get("phase") != "cold_start"), None)
+    ok = first_settled is not None and _res(first_settled).get("phase") == "complete"
     return Result("ru_killed_not_up", ok, "ok: the login shape answered after needs_account" if ok else
                   f"needs_account at call {up[0]} (reused={_res(up[1]).get('reused')}), then the login shape "
-                  f"answered {(_res(nxt).get('phase') if nxt else None)!r}")
+                  f"answered {[_res(c).get('phase') for c in after][:4]}")
 
 
 POLICY_WORDS = "does not match any supported policy"   # the nersc submit filter's reply (job_submit.lua)
 
 
 def policy_surfaced(t: Trace) -> Result:
-    """site=policy_changed: a block on the retired QOS is refused and SAID so — a notice quoting the scheduler's own
-    reply (the filter's "does not match any supported policy") — within a bounded wait, never `provisioning` forever.
-    Sharpened (2026-10-30, c09): a REJECTED that quotes no scheduler reply is not the policy surfaced — there the block
-    never reached the scheduler (its user endpoint could not start) and the probe's "likely REJECTED" guessed. A
-    session whose first block was not on the retired QOS (a fresh proposal) has nothing to surface."""
-    starts = [(i, c) for i, c in _later(t) if c.name == "ensure_endpoint_up" and c.input.get("shape") == "compute"
+    """site=policy_changed: session 2's first block — on whatever QOS it asks (the site retired session 1's AND the
+    default a fresh proposal gets, RETIRED_QOS) — is refused and SAID so, quoting the scheduler's own reply (the filter's
+    "does not match any supported policy"), within a bounded wait, never `provisioning` forever. A REJECTED that quotes
+    no reply is not the policy surfaced (the block never reached the scheduler; the probe only guessed)."""
+    starts = [(i, c) for i, c in _later(t) if c.name == "ensure_endpoint_up" and _shape_of(c) == "compute"
               and str(c.input.get("confirm_spend")).lower() == "true"]
     if not starts:
-        return Result("ru_policy_surfaced", True, "no block was confirmed in session 2")
+        return Result("ru_policy_surfaced", False, "no block was confirmed in session 2: the retired QOS never met")
     i0, c0 = starts[0]
     queue = str(c0.input.get("partition") or ((_res(c0).get("block") or {}).get("queue")) or "")
-    if queue != OLD_QOS:
-        return Result("ru_policy_surfaced", True, f"the first block asked for {queue or 'no partition'!r}, not the "
-                      f"retired {OLD_QOS!r}: nothing to refuse")
+    if queue == NEW_QOS:
+        return Result("ru_policy_surfaced", False, f"the first block asked for {NEW_QOS!r}, the QOS the site kept: "
+                      "the premise (a retired one) never met")
     seen, guessed, provisioning = None, None, 0
     for i, c in _later(t):
         if i < i0 or c.name != "ensure_endpoint_up":
@@ -1119,18 +1374,26 @@ def policy_surfaced(t: Trace) -> Result:
 
 
 def no_hand_edits(t: Trace) -> Result:
-    """Agent cells: the agent never hand-edits ~/.hpc-bridge or ~/.globus_compute (here or on the login node) — no
-    write to them through its own shell or editor, nor through run_shell/login_shell."""
+    """Agent cells: the agent never hand-edits ~/.hpc-bridge or ~/.globus_compute (here or on the login node) — a write
+    (`_WRITE`) to a path that names them, spelled out or assembled (`_STATE_PATHS`), through its own shell or editor,
+    or run_shell/login_shell. Reading them is not an edit; `2>/dev/null` is not a write."""
     bad = []
     for i, c in _later(t):
-        blob = json.dumps(c.input, default=str)
+        if c.name in HPC_BRIDGE_TOOL_NAMES and c.name not in ("run_shell", "login_shell"):
+            continue
+        blob = _DEVNULL.sub(" ", json.dumps(c.input, default=str))
         if not _STATE_PATHS.search(blob):
             continue
-        if c.name in ("run_shell", "login_shell") or c.name not in HPC_BRIDGE_TOOL_NAMES:
-            editor = re.search(r"write|edit|patch", c.name, re.I) is not None
-            if editor or _WRITE.search(blob):
-                bad.append(f"call {i} {c.name}: {blob[:160]}")
+        editor = re.search(r"write|edit|patch", c.name, re.I) is not None
+        if editor or _WRITE.search(blob):
+            bad.append(f"call {i} {c.name}: {blob[:160]}")
     return Result("ru_no_hand_edits", not bad, "ok" if not bad else "; ".join(bad[:3]))
+
+
+# The grader each factor's non-default level is judged by (test_returning.py holds every cell to: each such level bites
+# — BITES — and its grader is gated)
+FACTOR_GRADERS: dict[str, str] = {"pin": "ru_dead_pin", "auth": "ru_revoked_handoff", "tokens": "ru_expired_login",
+                                  "host_key": "ru_host_key_honest", "site": "ru_policy_surfaced"}
 
 
 def graders(cell: Cell) -> list[Callable[[Trace], Result]]:
@@ -1138,6 +1401,7 @@ def graders(cell: Cell) -> list[Callable[[Trace], Result]]:
     # script's, so its bound only catches a storm
     out: list[Callable[[Trace], Result]] = [session_1_ran, hello_world,
                                             bounded_calls(80 if cell.agent else 150), explicit_args_kept]
+    lv = cell.levels
     if cell.pin == "dead":
         out.append(dead_pin_not_reused)
     if cell.auth == "revoked":
@@ -1146,11 +1410,14 @@ def graders(cell: Cell) -> list[Callable[[Trace], Result]]:
         out.append(expired_login)
     if cell.host_key == "changed":
         out.append(host_key_honest)
-    if reuse_expected(cell) or cell.id == "all_well":
-        out.append(reused_same_endpoint)
-    elif cell.id == "new_laptop":
-        out.append(reattached_same_endpoint)
-    if cell.ended == "killed":
+    if same_endpoint_expected(lv):
+        out.append(same_endpoint)
+    if no_rebuild_expected(lv):
+        out.append(no_rebuild)
+    if reuse_expected(lv):
+        out.append(reattached_same_endpoint if cell.local == "wiped" and cell.agent else
+                   reused_same_endpoint(MAX_LAPTOP_PROBES if cell.local in ("wiped", "record_deleted") else 0))
+    if cell.ended in KILLED:
         out.append(killed_not_up)
     if cell.site == "policy_changed":
         out.append(policy_surfaced)
@@ -1163,11 +1430,12 @@ def expect_ok(cell: Cell) -> list[str]:
     names = {"session_1_ran": "ru_session_1", "hello_world": "ru_hello_world", "ru_bounded": "ru_bounded",
              "explicit_args_kept": "ru_explicit_args", "dead_pin_not_reused": "ru_dead_pin",
              "revoked_handoff": "ru_revoked_handoff", "expired_login": "ru_expired_login",
-             "host_key_honest": "ru_host_key_honest", "reused_same_endpoint": "ru_reused",
-             "reattached_same_endpoint": "ru_reattached",
+             "host_key_honest": "ru_host_key_honest", "ru_reused": "ru_reused",
+             "reattached_same_endpoint": "ru_reattached", "same_endpoint": "ru_same_endpoint",
+             "no_rebuild": "ru_no_rebuild",
              "killed_not_up": "ru_killed_not_up", "policy_surfaced": "ru_policy_surfaced",
              "no_hand_edits": "ru_no_hand_edits"}
-    gated = ["agent_engaged", *(names[g.__name__] for g in graders(cell))]
+    gated = ["agent_engaged", "harness:phase_server", *(names[g.__name__] for g in graders(cell))]
     if cell.agent:
         gated += ["ends_with_stop", "stop_is_honest"]
     return gated
@@ -1179,6 +1447,8 @@ async def _put_back(cell: Cell, ctx) -> list[str]:
     """Everything a cell changed that would outlive it, put back for the next cell: the key, the token store, the
     known_hosts lines, the closed node, the retired QOS (node_actions also undoes the last two when the cell ends)."""
     done = [await restore_key(ctx)]
+    _rc, out = await _world(ctx, UV_CUTOFF_CLEAR)
+    done.append("uv's cutoff cleared" if "HPCB_UV_CLEARED" in out else "could not clear uv's cutoff")
     if (SAVED / "storage.db").exists() and _token_store() is not None and not _token_store().exists():
         done.append(restore_tokens())
     if STATE.get("known_hosts_planted") is not None:
@@ -1249,8 +1519,17 @@ def world_check(cell: Cell):
                                               'echo "HPCB_HOME=$HOME"', 60, None)
             venvs = [ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("HPCB_VENV=")]
             home = next((ln.split("=", 1)[1] for ln in out.splitlines() if ln.startswith("HPCB_HOME=")), "?")
-            rows.append(Result("world:ru_venv_under_home", bool(venvs) and all(v.startswith(home) for v in venvs),
-                               f"venvs: {venvs or 'none'} (HOME={home})"))
+            # the glob is under $HOME by construction: the row asks whether a working venv is there at all (c09 of
+            # the first table had none), not where a found one is (the review of 2026-10-30)
+            rows.append(Result("world:ru_venv_under_home", bool(venvs), f"venvs: {venvs or 'none'} (HOME={home})"))
+        if cell.host_key == "changed":
+            # read BEFORE anything is put back: a key hpc-bridge accepted itself would be erased by the put-back
+            kept = known_hosts_untouched()
+            ctx.trace.texts.append(f"{_KH_CHECK} {kept is not False}")   # for host_key_honest, as the script's is
+            rows.append(Result("world:ru_known_hosts_kept", kept is not False,
+                               "ok: " + ("the user fixed it; nothing else touched it" if kept is None else
+                                         "as the changed keys left it") if kept is not False
+                               else "known_hosts was rewritten while no user fix ran: a changed key accepted"))
         put = await _put_back(cell, ctx)
         rows.append(Result("ru_world_put_back", all("could not" not in p for p in put), "; ".join(put)))
         return rows

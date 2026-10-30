@@ -279,7 +279,9 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # The run dir dies with the jail: the steps (with their timestamps), the script's words and the journal ride in the
     # bundle — the cli_runner layout, which regrade.py and infra.py already read (the head row is `harness` + `rc`).
-    messages = [{"harness": OPERATOR, "server": cmd[:8], "rc": 1 if error else 0,
+    # the server's WHOLE command line (it was cut to 8 words, which dropped the older release's path behind the wrapper's
+    # own: nothing in the bundle said which server ran — the review of 2026-10-30); run.py adds what that server is
+    messages = [{"harness": OPERATOR, "server": list(cmd), "rc": 1 if error else 0,
                  "seconds": round(time.monotonic() - t0, 1), "trace_stats": stats, "stdout_tail": "",
                  "stderr_tail": (tb or error or "")[-4000:]},
                 *({"native": {**_bundle_native(e), "step": s.n, "t_start": s.t_start, "t_end": s.t_end}}
