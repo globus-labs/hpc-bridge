@@ -330,6 +330,17 @@ No new spend semantics. A block that ends pauses the batch at `needs_confirmatio
 
 **Harness work:** `ops.restart_server()`; two servers on one state directory; the polling hook; journal entries for the new tools; `_billed_start_idxs` learns `run_batch`; a `world:ledger_matches_sacct` check.
 
+#### Phase 1 as it is being built (stage A, 2026-10-31; the surface awaits the maintainer's review)
+
+Failing first on branch `feat/batch-phase1`: `tests/test_batch_phase1.py` (strict xfails), `agentic/harness/batch_checks.py` with `test_batch_scenarios.py`, and the seven scenarios. Where §2 left a choice open:
+- **`run_batch(command, rows, task_walltime_s, results_dir=None, session_id="default", shape="compute", idempotent=False, confirm_spend=False, batch_id=None)`.** `confirm_spend` is the same floor as `ensure_endpoint_up`'s (one block, the same terms); `batch_id` with `confirm_spend=True` resumes a batch that asked again. No `script` (a `command` may be multi-line) and no `campaign_id` (phase 3). Only `{name}` for a row's own keys, `{index}`, and `{row}` for a scalar row are substituted, shell-quoted; any other brace stays (`${HOME}`, `awk '{print $1}'`).
+- **`status(id, detail="summary"|"failed"|"page", offset=0, limit=50, wait_s=0)`** and **`cancel(id, mode="drain"|"abort")`**, `batch-` ids only for now. Phases: `admitting`, `waiting`, `needs_confirmation` (every resumable pause, with a `reason`: the walltime gate, a reap, a stop, a restart, a drain), `needs_account`, `done`, `cancelled`, `refused`.
+- **The window** is the block's workers less one kept for interactive work (two or more), an unknown count counting 1; chunk 1. On the fake `default` profile's two workers the window is 1.
+- **`cancel`**: `drain` keeps the backlog (resumable); `abort` cancels it, and a queued attempt meets a `CANCELLED` marker and exits. `down` means nothing of the batch is in flight; `blocks_left` names the session's block and how it ends. Any process may cancel; only the lease holder admits.
+- **The ledger** (`<state_dir>/ledger.sqlite3`): tables `batch`, `task`, `retired`, `event`; a lease per batch, stale after a missed heartbeat and taken over only from a dead pid on this host; a retirement keyed on the endpoint and the dispatch config's hash, lifted by a new confirmation.
+- **The scenarios' sizes**: `batch_crosses_walltime` takes 9 rows, not 30 (window 1); `batch_restart_resume` is one scripted session with a SIGKILL, not a PHASES chain; `batch_block_reaped_midrun` is scripted.
+- **On main**, a scenario's script falls back to the rows as concurrent `run_shell` calls writing the same result files, so each cell fails on its own graders: no window, no walltime gate (a second pilot with no re-ask), nothing durable after a restart, the result limit met.
+
 ### Phase 2: the envelope, Jobs mode on SSH, the loam handoff
 
 **Scope:**
