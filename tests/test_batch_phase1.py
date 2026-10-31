@@ -560,6 +560,21 @@ async def test_poll_task_resolves_a_globus_uuid_from_the_ledger():
     assert got.phase == "complete" and got.exit_code == 3
 
 
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_interactive_tasks_leave_rc_and_tail_in_the_session_dir(tmp_path):
+    """(Phase-1 scope: `poll_task` by UUID, with session-dir results.) An interactive command also writes its rc and the
+    tail of its output to the session directory, keyed by the dispatch, so its result survives a gap longer than the
+    service's 30-minute window (S2) and a restart that lost the handle."""
+    from hpc_bridge import session_shell
+
+    s = session_shell.Session("default", str(tmp_path / "root"))
+    script = session_shell.wrap("echo out; echo err >&2; exit 5", s, result_key="k1")
+    subprocess.run([_BASH, "-c", script], capture_output=True, text=True, timeout=30)
+    res = tmp_path / "root" / "sessions" / "default" / "results" / "k1"
+    assert (res / "rc").read_text().strip() == "5"
+    assert "out" in (res / "tail").read_text()
+
+
 def test_ledger_schema_is_sqlite_wal(tmp_path, monkeypatch):
     """(The schema the checkpoint names.) Tables batch, task, retired, event; rows and the command are stored (a
     replay record needs them — unlike sent-checks, which never hold a command's text)."""
