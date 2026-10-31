@@ -470,6 +470,10 @@ class _Run:
     old_uep: str | None = None
     old_uep_until: float = 0.0
     last_release: float = 0.0
+    # one pass at a time (the background loop's and a status call's), and no admission while the next block is
+    # being confirmed (`_maybe_switch` drops the shape, then awaits the new block's start)
+    passing: asyncio.Lock = field(default_factory=asyncio.Lock)
+    switching: bool = False
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -994,6 +998,11 @@ async def tick(app: AppCtx, bid: str) -> int:
     run = app.batches.get(bid)
     if run is None:
         return 0
+    async with run.passing:
+        return await _tick(app, bid, run)
+
+
+async def _tick(app: AppCtx, bid: str, run: _Run) -> int:
     led = ledger_of(app)
     if not led.heartbeat(bid, owner_of(app)):
         app.batches.pop(bid, None)   # another process took the lease: this one reads, never admits
@@ -1023,7 +1032,7 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     led = ledger_of(app)
     bid = run.batch_id
     b = led.batch(bid)
-    if b["state"] != "admitting":
+    if b["state"] != "admitting" or run.switching:
         return 0
     rt = app.shapes.get("compute")
     if rt is None or (run.rt is not None and rt is not run.rt):
@@ -1142,7 +1151,11 @@ async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
         if app.shapes.get("compute") is not rt:
             return None
         warmth._drop_compute_shape_locked(app)
-    st: EndpointStatus = await run.ensure_up(app, True)
+        run.switching = True
+    try:
+        st: EndpointStatus = await run.ensure_up(app, True)
+    finally:
+        run.switching = False
     if st.status in ("needs_confirmation", "needs_account", "down"):
         pause(app, run.batch_id, f"the next block could not be confirmed ({st.status}): {st.notice or ''}".strip())
         return st
