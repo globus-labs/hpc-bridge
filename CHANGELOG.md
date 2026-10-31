@@ -27,7 +27,12 @@ installed plugin only when that version changes); git tags mark releases.
   - **Settling:** a result wins; `lost` needs evidence (ManagerLost, or sacct saying the block's job ended). On a
     facility MEP a task is `presumed_lost` only past a clock that starts at evidence a block started; it keeps its
     slot and is never retried. A submit error leaves `submit_unknown`, reconciled against the batch's own task group;
-    only an `idempotent` row is ever sent again.
+    only an `idempotent` row is ever sent again. After a reap on an SSH endpoint, parsl starts a pilot for the task
+    that was out on the dead block, and nobody confirmed it: for five minutes the batch cancels the reaped block's
+    user endpoint's pilots by that endpoint's own marker.
+  - **Crossing a block's walltime:** the user's yes at the pause covers the next block. Once the tasks out on the old
+    block finish, a fresh block is confirmed on an endpoint hpc-bridge stood up (a new user endpoint). With nothing
+    left in the backlog, no block is asked for.
   - **`cancel`:** `drain` keeps the backlog. `abort` cancels the backlog and ends the tasks in flight: their wrappers
     see the marker and kill their commands. It never touches the session's block. `stop_endpoint` pauses every batch
     under the lock first, and refuses while batch tasks are out, naming `cancel(id, 'abort')`.
