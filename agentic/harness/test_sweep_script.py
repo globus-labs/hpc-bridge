@@ -7,6 +7,9 @@ import sys
 from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
+# batch phase 1's scripted cells on `default`, once per sweep with no model (sweep_profiles.sh batch_cells)
+BATCH_DEFAULT = ["batch_crosses_walltime", "batch_restart_resume", "batch_two_servers_one_ledger",
+                 "batch_block_reaped_midrun", "batch_big_output", "batch_abort_midrun"]
 sys.path.insert(0, str(HERE))
 import targets  # noqa: E402
 
@@ -35,7 +38,9 @@ def _swept() -> set[str]:
     """Every scenario the sweep runs: the cells() map plus the cells run_smoke.sh'd on their own (the no-skill
     spend_gate_enforced ablation on `default`)."""
     names = {n for ns in _cells().values() for n in ns}
-    return names | set(re.findall(r'run_smoke\.sh" (\w+)', SWEEP.read_text()))
+    m = re.search(r"^batch_cells\(\) \{.*?\n\}", SWEEP.read_text(), re.S | re.M)   # batch phase 1's scripted cells
+    batch = {n for line in re.findall(r'echo "([\w ]+)" ;;', m.group(0)) for n in line.split()} if m else set()
+    return names | batch | set(re.findall(r'run_smoke\.sh" (\w+)', SWEEP.read_text()))
 
 
 def test_every_fake_runnable_scenario_is_swept_or_excluded_with_a_reason():
@@ -222,13 +227,13 @@ def test_operators_boot_each_profile_once_and_run_its_free_cells_per_operator(tm
     assert [(c["argv"], c["operator"], c["phase"]) for c in smokes] == [
         ("spend_gate_enforced", op, "") for op in ("pi", "codex", "hermes21")] + [
         ("queued_check_relaunch", "script", "second"), ("queued_check_relaunch", "script", "first"),
-        ("lmod_bootstrap", "script", "")]
+        *((b, "script", "") for b in BATCH_DEFAULT), ("lmod_bootstrap", "script", ""), ("mep_batch_fanout", "script", "")]
     assert [c["profile"] for c in smokes if c["argv"] == "lmod_bootstrap"] == ["lmod"]
     # every summary row names its operator; INFRA counted apart, per operator
     rows = [ln for ln in summary.splitlines() if "RESULT:" in ln]
     assert rows and all(ln.lstrip().startswith(("[pi] ", "[codex] ", "[hermes21] ", "[script] ")) for ln in rows)
     assert "    [script] lmod_bootstrap (script) — RESULT: OK" in summary
-    assert "## totals [script] — OK 3 · FAILED 0 · INFRA 0 " in summary
+    assert f"## totals [script] — OK {4 + len(BATCH_DEFAULT)} · FAILED 0 · INFRA 0 " in summary
     assert {p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*-default-qcr-*.log")} == {
         "default-qcr-second.log", "default-qcr-first.log"}
     for op in ("pi", "codex", "hermes21"):
@@ -274,9 +279,9 @@ def test_without_the_flags_the_sweep_runs_as_before_and_counts_infra_apart(tmp_p
     assert "## default — " in summary and "free wave" not in summary
     n_ok = sum("RESULT: OK" in ln for ln in rows)
     assert f"## totals — OK {n_ok} · FAILED 0 · INFRA 1 " in summary
-    assert sorted(p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*.log")) == [
+    assert sorted(p.name.split("-", 3)[-1] for p in (root / "agentic" / "runs").glob("sweep-*.log")) == sorted([
         "default-qcr-first.log", "default-qcr-second.log", "default-spend_gate.log", "default.log",
-        "lmod-script-lmod_bootstrap.log", "lmod.log"]
+        *(f"default-script-{b}.log" for b in BATCH_DEFAULT), "lmod-script-lmod_bootstrap.log", "lmod.log"])
 
 
 def test_the_cells_env_keeps_the_alcf_wait(monkeypatch):
@@ -294,7 +299,8 @@ def test_the_totals_count_setup_failed_and_crashed_rows(tmp_path):
     r, _, summary, _ = _sweep(tmp_path, "--profiles", "default", STUB_INFRA="happy_path",
                               STUB_SETUP="gated_provision,spend_refusal", STUB_CRASH="endpoint_reuse")
     assert r.returncode == 0, r.stdout + r.stderr
-    n = len(_cells()["default"]) + 3   # + spend_gate_enforced and queued_check_relaunch's two phases (stub: OK)
+    # + spend_gate_enforced, queued_check_relaunch's two phases and the batch cells (stub: OK)
+    n = len(_cells()["default"]) + 3 + len(BATCH_DEFAULT)
     assert (f"## totals — OK {n - 4} · FAILED 0 · INFRA 1 (the model endpoint failed: not graded) · SETUP FAILED 2 · "
             f"CRASHED 1 (no RESULT line) · other 0") in summary
 

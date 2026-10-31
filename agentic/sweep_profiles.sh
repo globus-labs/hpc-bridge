@@ -54,7 +54,7 @@ echo "# profile sweep $STAMP — target fake, $MODEL_WORDS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs 2" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs,batch_fanout_collect 2" ;;
     site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job,ssh_account_floor 3" ;;
     totp)     echo "otp_preauth,password_pusher 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
@@ -95,14 +95,6 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
-batch_fanout_collect          batch phase 1 (feat/batch-phase1): red until the batch tools land; run on its own (default)
-batch_crosses_walltime        batch phase 1: scripted, ~12 min of 4-minute blocks on `default`; run on its own
-batch_restart_resume          batch phase 1: scripted (a server SIGKILL mid-batch) on `default`; run on its own
-batch_two_servers_one_ledger  batch phase 1: scripted (two servers on one state dir) on `default`; run on its own
-batch_block_reaped_midrun     batch phase 1: scripted (a polling hook scancels the block) on `default`; run on its own
-batch_big_output              batch phase 1: scripted (a 12 MB row) on `default`; run on its own
-batch_abort_midrun            batch phase 1: scripted (cancel abort ends the task in flight) on `default`; run on its own
-mep_batch_fanout              batch phase 1: scripted on `mep` (needs HPCB_MEP_EMAIL); run on its own
 EXCLUDED
 }
 
@@ -173,6 +165,13 @@ cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator
   if [ -n "$PAID_ONLY" ]; then tr ',' '\n' <<< "$2" | grep -xF -f <(paid_only) | paste -sd, -
   elif free_op "$1"; then tr ',' '\n' <<< "$2" | grep -vxF -f <(paid_only) | paste -sd, -
   else echo "$2"; fi
+}
+
+batch_cells() {  # batch_cells <profile>: batch phase 1's scripted cells, once per sweep with no model
+  case "$1" in
+    default) echo "batch_crosses_walltime batch_restart_resume batch_two_servers_one_ledger batch_block_reaped_midrun batch_big_output batch_abort_midrun" ;;
+    mep)     echo "mep_batch_fanout" ;;
+  esac
 }
 
 script_only() {  # script_only <profile>: the scripted cells of a profile no agent wave runs on, or nothing
@@ -249,6 +248,7 @@ for prof in "${PROFS[@]}"; do
   if [ -z "$PAID_ONLY" ] && [ -z "$RESET" ]; then   # RESET empty: a run_suite above booted this profile
     # The paths a model may never take, once per sweep with no model (the review of the 2026-10-22 sweep): polaris's
     # HELD pilot → the directive → the block up, and lmod's failed details= → the proposal that loads its modules.
+    for sc in $(batch_cells "$prof"); do script_cell "$prof" "$sc"; done   # batch phase 1 (2026-10-31)
     case "$prof" in
       polaris) script_cell polaris polaris_filesystems ;;
       lmod)    script_cell lmod lmod_bootstrap ;;
