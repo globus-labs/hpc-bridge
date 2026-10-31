@@ -161,10 +161,13 @@ class _Server:
 
         class Session:
             async def call_tool(self, name, args, read_timeout_seconds=None):
+                started = time.time()   # the real journal's `ts`: when the call STARTED (it writes the row at its end)
                 server.calls.append((n, name, dict(args)))
+                if isinstance(args.get("delay"), int | float):
+                    await asyncio.sleep(args["delay"])
                 fn = server.answers.get(name)
                 got = fn(dict(args)) if fn else {}
-                row = {"ts": time.time(), "ms": 5, "seq": len(server.calls), "pid": server.pid_of(n), "tool": name,
+                row = {"ts": started, "ms": 5, "seq": len(server.calls), "pid": server.pid_of(n), "tool": name,
                        "args": args, "result": got}
                 with journal.open("a") as fh:
                     fh.write(json.dumps(row) + "\n")
@@ -504,6 +507,23 @@ def test_the_fanout_script_drives_run_batch_status_and_stop(monkeypatch, tmp_pat
     assert not res.final.is_error, res.final.result
     assert mod.failures_have_rc(res.trace).ok and mod.agent_reports_failures(res.trace).ok
     assert mod.batch_used(res.trace).ok and bc.stop_down(res.trace).ok
+
+
+def test_concurrent_calls_that_end_out_of_order_all_align_with_the_journal(monkeypatch, tmp_path):
+    # live 2026-10-31 (batch_fanout_collect's main fallback): 40 concurrent run_shell calls ended out of order, the steps
+    # were kept in END order and the journal in START order, and 5 calls fell out of the alignment (trace_complete)
+    _stub_sdk(monkeypatch, tmp_path)
+    server = _Server({"run_shell": lambda a: {"phase": "complete", "exit_code": 0}})
+
+    async def script(ops):
+        await asyncio.gather(*(ops.call("run_shell", command=f"r{i}", delay=0.05 * (8 - i)) for i in range(8)))
+        await ops.call("stop_endpoint")
+        return "done"
+
+    res = _drive(script, server)
+    stats = next(m for m in res.messages if "harness" in m)["trace_stats"]
+    assert stats["journal_unplaced"] == 0 and stats["hpcb_not_reaching_server"] == 0, stats
+    assert [c.name for c in res.trace.calls][-1] == "stop_endpoint"
 
 
 def test_a_server_that_dies_under_the_script_never_cancels_the_script(monkeypatch, tmp_path):

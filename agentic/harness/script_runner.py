@@ -440,16 +440,19 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     print(f"  ← {OPERATOR}: {len(ops.steps)} step(s) in {time.monotonic() - t0:.0f}s; "
           f"{'ERROR: ' + error if error else 'final: ' + repr(final_text[:240])}", flush=True)
     rows = _journal_rows(journal)
-    several = len({s.server for s in ops.steps}) > 1
+    # in the order the calls STARTED, as the journal orders its rows (`ts`): concurrent calls (main's fallback fan-out,
+    # batch phase 1) end out of order, and an order-preserving alignment of the two lists then lost some of them
+    steps = sorted(ops.steps, key=lambda s: (s.t_start, s.n))
+    several = len({s.server for s in steps}) > 1
     events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}", server=s.server if several else "")
-              for s in ops.steps]
+              for s in steps]
     texts, text_at = (ops.texts, ops.text_at) if ops.texts else (([final_text], [len(events)]) if final_text else ([], []))
     if journal_kept:
         trace, stats = build_trace(rows, events, texts, text_at)
         if several:
             label_servers(trace, events)
     else:
-        trace, stats = steps_trace(ops.steps, texts, text_at)
+        trace, stats = steps_trace(steps, texts, text_at)
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # The run dir dies with the jail: the steps (with their timestamps), the script's words and the journal ride in the
     # bundle — the cli_runner layout, which regrade.py and infra.py already read (the head row is `harness` + `rc`).
@@ -462,7 +465,7 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
                     else {}),
                  **({"servers": [o.label for o in ops.servers]} if len(ops.servers) > 1 else {})},
                 *({"native": {**_bundle_native(e), "step": s.n, "t_start": s.t_start, "t_end": s.t_end}}
-                  for s, e in zip(ops.steps, events, strict=True)),
+                  for s, e in zip(steps, events, strict=True)),
                 *({"text": t, "at": a} for t, a in zip(ops.texts, ops.text_at, strict=True)), {"final": final_text},
                 *({"journal": r} for r in rows)]
     return RunResult(trace=trace, final=CliFinal(result=final_text, is_error=error is not None), messages=messages,
