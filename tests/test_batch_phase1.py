@@ -724,3 +724,26 @@ async def test_a_results_dir_under_home_is_warned_of_in_run_batch_and_status():
     st = await server._status(app, out.batch_id)
     assert "under $HOME" in (st.notice or "")
 
+
+
+async def test_a_resume_at_the_walltime_gate_asks_for_the_next_block_once_the_tasks_out_finish():
+    """Live 2026-10-31 (batch_crosses_walltime): the user's yes at a walltime pause came while a row still ran on the
+    block in front, which had too little left for another — and the batch asked again at once, over and over. The yes
+    covers the NEXT block: the batch waits for its tasks out on this one, then confirms a fresh block (a new user
+    endpoint) and admits there."""
+    from hpc_bridge import batch, server
+
+    app, rt, runner = await _batch_app(remaining_s=150.0, workers=3)   # capacity 2
+    app.facility.fresh_ueps = True
+    out = await _start(app, n=6)
+    runner.futures[0].finish(_ok_report(0, remaining_s=80.0))
+    await batch.tick(app, out.batch_id)
+    assert (await server._status(app, out.batch_id)).phase == "needs_confirmation"
+    res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
+    assert res.phase in ("admitting", "waiting") and len(runner.futures) == 2   # no re-ask; row 1 still out
+    await batch.tick(app, out.batch_id)
+    assert (await server._status(app, out.batch_id)).phase != "needs_confirmation"
+    runner.futures[1].finish(_ok_report(1, remaining_s=70.0))
+    await batch.tick(app, out.batch_id)
+    assert app.shapes["compute"] is not rt and app.shapes["compute"].spend_confirmed   # the next block, confirmed
+    assert len(runner.futures) > 2                                                     # admitted on it

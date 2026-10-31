@@ -453,6 +453,11 @@ class _Run:
     last_evidence: float = 0.0
     last_rest: float = 0.0
     adopted: bool = False
+    # The user's yes (a resume with confirm_spend) covers the NEXT block while the one in front cannot take a row: on an
+    # endpoint hpc-bridge stood up, once nothing of ours runs on it, the batch asks for a fresh block (`_maybe_switch`)
+    next_block: bool = False
+    ensure_up: Any = None
+    last_warm: float = 0.0
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -673,7 +678,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
         return _refused(f"the default results directory {rd!r} cannot be used; pass results_dir=")
     led = ledger_of(app)
     owner = owner_of(app)
-    run = _Run(bid, rt, runner=_batch_runner(app, rt))
+    run = _Run(bid, rt, runner=_batch_runner(app, rt), ensure_up=ensure_up)
     _note_block_from_canary(app, run, rt)
     cap = capacity_for(run.workers_seen or workers_of(rt))
     led.add_batch(bid, command=command, rows=rows, task_walltime_s=wall, capacity=cap, results_dir=rd,
@@ -734,11 +739,19 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         if old is not None:   # results of tasks sent on the old block still settle through their own futures
             run.futures, run.guards, run.sent_on = old.futures, old.guards, old.sent_on
         app.batches[bid] = run
-    _note_block_from_canary(app, run, rt)
+    run.ensure_up = ensure_up
+    if run.block_end_at is None:   # never over what a result said since: a check can be older than that
+        _note_block_from_canary(app, run, rt)
     led.update_batch(bid, state="admitting", pause_reason=None, uec_hash=h, endpoint_id=app.state.endpoint_id,
                      cancel_requested=None)
     led.event(bid, "batch.resume", {"by": str(owner)})
     _journal({"event": "batch.resume", "batch_id": bid})
+    wall = float(led.batch(bid)["task_walltime_s"])
+    if confirm_spend and run.remaining() is not None and not admit_ok(run.remaining(), wall):
+        run.next_block = True   # the block in front cannot take a row: the yes is for the next one
+        receipt = await _maybe_switch(app, run)
+        if receipt is not None:
+            st = receipt
     async with app.lock:
         admitted = _admit_locked(app, run)
     _start_loop(app, run)
@@ -938,6 +951,8 @@ async def tick(app: AppCtx, bid: str) -> int:
     await _reconcile(app, run)
     _presume(app, run)
     await _evidence(app, run)
+    await _maybe_switch(app, run)
+    await _maybe_warm(app, run)
     async with app.lock:
         n = _admit_locked(app, run)
     _maybe_done(app, run)
@@ -975,6 +990,11 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
                        "it): nothing is admitted until it is")
         return 0
     run.waiting = None
+    if not admit_ok(remaining, float(b["task_walltime_s"])) and run.next_block:
+        run.waiting = (f"the block in front (job {run.block_job or '?'}) has ~{max(0, int(remaining))} s of walltime "
+                       "left, too little for a row; the next block, which the user confirmed, is asked for once the "
+                       "tasks on this one finish" + ("" if _fresh_ok(app) else " and this one ends"))
+        return 0
     if not admit_ok(remaining, float(b["task_walltime_s"])):
         job = f" (job {run.block_job})" if run.block_job else ""
         pause(app, bid, f"the block{job} has ~{max(0, int(remaining))} s of walltime left, under task_walltime_s + "
@@ -1038,6 +1058,61 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
               "in_flight": _held(c), "capacity": int(led.batch(bid)["capacity"] or 1),
               "remaining_s": round(remaining, 1), "need_s": round(need, 1), "job_id": run.block_job})
     return True
+
+
+def _fresh_ok(app: AppCtx) -> bool:
+    """A new block can be asked for beside the one in front: an endpoint hpc-bridge stood up, whose each confirmation
+    gets its own compute user endpoint (`fresh_ueps`); a facility MEP keeps one user endpoint, max_blocks 1."""
+    return _has_login_shape(app) and getattr(app.facility, "fresh_ueps", False) is True
+
+
+async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
+    """The confirmed next block, once nothing of ours runs on the one in front: drop that shape (its block runs out its
+    last minutes on its own — no task of ours left on it) and confirm a fresh one (a new user endpoint, a new block).
+    Returns the confirming answer (its receipt), or None when nothing was switched."""
+    rt = app.shapes.get("compute")
+    led = ledger_of(app)
+    b = led.batch(run.batch_id)
+    rem = run.remaining()
+    if (not run.next_block or run.ensure_up is None or rt is None or rt is not run.rt or not _fresh_ok(app)
+            or rem is None or admit_ok(rem, float(b["task_walltime_s"])) or run.futures or rt.inflight
+            or rt.batch_inflight or warmth._live_task_handles(app, "compute")):
+        return None
+    old_job = run.block_job
+    async with app.lock:
+        if app.shapes.get("compute") is not rt:
+            return None
+        warmth._drop_compute_shape_locked(app)
+    st: EndpointStatus = await run.ensure_up(app, True)
+    if st.status in ("needs_confirmation", "needs_account", "down"):
+        pause(app, run.batch_id, f"the next block could not be confirmed ({st.status}): {st.notice or ''}".strip())
+        return st
+    new = app.shapes.get("compute")
+    run.rt, run.runner = new, (_batch_runner(app, new) if new is not None else None)
+    run.block_end_at = run.block_job = run.block_seen_at = None
+    run.workers_seen, run.next_block = None, False
+    if new is not None:
+        _note_block_from_canary(app, run, new)
+        led.update_batch(run.batch_id, uec_hash=uec_hash(new))
+    led.event(run.batch_id, "batch.next_block", {"after": old_job})
+    _journal({"event": "batch.resume", "batch_id": run.batch_id, "reason": f"the next block, after job {old_job}"})
+    return st
+
+
+async def _maybe_warm(app: AppCtx, run: _Run) -> None:
+    """Nothing known of the block yet (it is still starting, or a new one was just asked for) and nothing of the batch
+    out: check it, as a run_shell would, at most every 10 s, so the batch learns when it answers."""
+    if run.futures or run.remaining() is not None or _now() - run.last_warm < 10.0:
+        return
+    rt = app.shapes.get("compute")
+    if rt is None or not rt.spend_confirmed or ledger_of(app).batch(run.batch_id)["state"] != "admitting":
+        return
+    run.last_warm = _now()
+    async with app.lock:
+        if app.shapes.get("compute") is rt:
+            await warmth._ensure_warm_runner(app, "compute")
+    if app.shapes.get("compute") is rt:
+        _note_block_from_canary(app, run, rt)
 
 
 def _drop(run: _Run, key: tuple[int, int]) -> None:

@@ -839,13 +839,14 @@ async def one_block_job(ctx) -> Result:
 
 
 def _confirm_times(t: Trace) -> list[float]:
-    """When each NEW block was confirmed (epoch): the billed starts (ensure_endpoint_up / run_batch with
-    confirm_spend) whose answer carries the receipt."""
+    """When each NEW block was consented to (epoch): the billed starts whose answer carries the receipt
+    (ensure_endpoint_up's, a new run_batch's), and every resume — run_batch(batch_id=…, confirm_spend=True), the user's
+    yes to the next block, which the batch may ask for only once its tasks on the block in front have finished."""
     out = []
     for k in _billed_start_idxs(t):
         c = t.calls[k]
         at = epoch(t, c.t_call)
-        if (c.result or {}).get("block") and at is not None:
+        if at is not None and ((c.result or {}).get("block") or (c.name == "run_batch" and c.input.get("batch_id"))):
             out.append(at)
     return sorted(out)
 

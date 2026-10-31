@@ -23,13 +23,13 @@ This vault has two halves:
 - [[Facility catalog]] — the public registry (a Globus Search index, read anonymously) → `MachineProfile` or `MEPFacility`; `list_facilities` / `connect_facility`; the resolution precedence
 
 ## Modules — `src/hpc_bridge/`
-**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]]
+**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]] · [[batch]]
 **Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-endpoint_venv]] · [[facility-mep]]
-**Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]]
+**Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]] · [[ledger]]
 *(The `catalog/` package — `entry` · `search` · `bundled` · `ingest` · `parsers` — is documented in [[Facility catalog]].)*
 
 ## Reference
-- [[The MCP tools]] — the agent-facing surface (eleven tools)
+- [[The MCP tools]] — the agent-facing surface (fifteen tools, three of them the phase-1 batch tools)
 - [[Plugin packaging]] — `.mcp.json` · `plugin.json` · the `driving-hpc` skill · `hpc-connect` · the fresh-user script
 - [[Configuration]] — environment variables
 - [[Batch spikes 2026-10-30]] · [[Batch design review 2026-10-30]] — the evidence behind [[Batch and swarm execution]]: the phase-0 spike results (S1, S2, S4, S5, S7, S8; fake cluster, S7 read-only on Delta and Anvil) and the adversarial review the design answered

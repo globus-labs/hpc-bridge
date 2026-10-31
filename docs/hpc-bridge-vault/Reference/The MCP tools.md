@@ -1,7 +1,7 @@
 # The MCP tools
 
 > [!abstract] Role
-> The agent-facing surface — **eleven** tools, all declared in [[server]], all returning structured [[models|Pydantic results]] (failures come back as outcomes, never raw crashes).
+> The agent-facing surface — **fifteen** tools, all declared in [[server]], all returning structured [[models|Pydantic results]] (failures come back as outcomes, never raw crashes).
 
 ## Stand up & run
 
@@ -16,6 +16,16 @@
 | `login_shell(command)` | `LoginShellResult` | Read-only command on the login node over a **fresh SSH** connection — the cold-start discovery escape hatch. Prefer `run_shell(shape="login")` once an endpoint is up ([[Discovery today]]). Requires a connected SSH facility; refused with a notice on a compute-only MEP (no SSH, no login node). Long output keeps its marked end, like `run_shell`'s. A job the command submits is billed like a block; the notice says so. |
 | `authenticate(force=False, mode=None)` | `LoginStatus` | The Globus login gate as a tool: `logged_in` (also when the browser flow lands during the call's wait), or `needs_login` with a `login_url` — browser loopback flow (opens the browser, waits up to 90 s; the URL is returned to show only if no browser opened; single-use) or Globus's paste-back auth-code page when headless / `mode="paste"`. 10-min TTL; `force=True` re-consents. Minimum consent = the Compute SDK's endpoint floor; Search is not requested (registry reads are anonymous). |
 | `complete_login(code)` | `LoginStatus` | Paste-back completion: exchanges the one-time auth code the user pasted from Globus's auth-code page and stores the tokens in the Compute SDK's `storage.db` under the SDK's own client id (the one the remote endpoint refreshes with). Refused once the attempt expired. Never a password. |
+
+## Batches (phase 1: [[batch]], [[ledger]])
+
+| Tool | Returns | What it does |
+|---|---|---|
+| `run_batch(command=None, rows=None, task_walltime_s=None, results_dir=None, session_id="default", shape="compute", idempotent=False, confirm_spend=False, batch_id=None)` | `BatchStatus` | One command over many rows on the session's confirmed compute block: `{name}` for a row's fields (shell-quoted), `{row}`, `{index}`. At most `capacity` tasks out at once (the block's workers less one kept for interactive work); a row is sent only while the block has `task_walltime_s` + 30 s of walltime left, read from inside the block (unknown admits nothing); a `task_walltime_s` the block's walltime cannot fit is refused. The spend floor is `ensure_endpoint_up`'s (`needs_confirmation` with `block`, nothing recorded; `confirm_spend=True` confirms one block). A batch whose block ends (its walltime, a reap, a stop, a restart, a drain) pauses at `needs_confirmation` with a `reason`; `run_batch(batch_id=…, confirm_spend=True)` resumes it, refused when another live server holds the batch. |
+| `status(id, detail="summary", offset=0, limit=50, wait_s=0.0)` | `BatchStatus` | Counts by state (`backlog`, `in_flight`, `done`, `failed`, `lost`, `presumed_lost`, `submit_unknown`, `cancelled`), and the rows themselves with `detail="failed"` or `"page"`: exit code, `tail`, `stdout_path` (capped output on the facility), `job_id`, `started_at`, `settled_by`. `wait_s` (≤ 60) waits for a change. Collects results and keeps a running batch admitting; never resumes a paused one. From another server it reads the ledger (`owner`); for a batch whose server is gone it takes the lease over, pulls by REST and asks again. Ids other than `batch-…` are refused (phase 2+). |
+| `cancel(id, mode="drain")` | `CancelResult` | `drain`: admit nothing more, keep the backlog (resumable). `abort`: cancel the backlog and end what is in flight — the `CANCELLED` marker, which each task's wrapper watches and kills its command on (rc 143); never the block. `draining` while a task is out, `down` once none is; `blocks_left` names the session's block, which bills until `stop_endpoint`. Any server may cancel (recorded in the ledger for the holder). |
+
+`stop_endpoint` pauses every batch under the lock before anything is released and refuses (`up`) while a batch's tasks are out, naming `cancel(id, 'abort')`. `poll_task` also takes a task's Globus id (`globus_task_id` on a `running` answer), answered from the ledger after a restart.
 
 ## Catalog selection (the agentic discovery front)
 

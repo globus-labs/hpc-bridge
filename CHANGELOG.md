@@ -6,6 +6,42 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Added
+- **Batches (phase 1): one command over many rows on the confirmed block, with a durable ledger.** Three tools:
+  `run_batch`, `status`, `cancel`. Instead of a `run_shell` per input, `run_batch(command, rows, task_walltime_s)` keeps
+  the backlog in the server and sends at most `capacity` tasks at a time (the block's workers less one kept for
+  interactive commands). It rides the block the user confirmed; no new spend semantics (vault
+  `Planned/Batch and swarm execution.md`).
+  - **The admission gate:** a row is sent only while the block's remaining walltime, read from inside the block
+    (`SLURM_JOB_END_TIME`, `squeue %L`, PBS stime + walltime; the canary reports it too), covers `task_walltime_s`
+    + 30 s. Past that, or when the block is reaped, stopped or the server restarts, the batch pauses at
+    `needs_confirmation`; only `run_batch(batch_id=…, confirm_spend=True)` resumes it, and `status` never does. So
+    no task waits at the interchange as a block ends, and parsl starts no block nobody confirmed (#204's pattern).
+  - **The wrapper** around each task claims `<results_dir>/tasks/<i>/attempt-<n>/` atomically (a retried POST that
+    ran a task twice exits early), checks free space, and caps each stream at 1 MB at the source. The result carries
+    a tail of the stream's real end and a pointer to the file, so a big output is no MaxResultSizeExceeded. The
+    wrapper also runs the command under its own timeout (rc 124) and kills it on the `CANCELLED` marker (rc 143).
+  - **The ledger** (`<state_dir>/ledger.sqlite3`, WAL, 0600, refused on a network filesystem) holds every row,
+    attempt and Globus task id. It holds the lease that makes one server the only admitter and collector (a takeover
+    needs a stale heartbeat and a dead pid on this host), and the configs a stop or a reap retired. A restarted server
+    pulls what finished meanwhile by REST, with the raw `v2.get_task_batch` (`get_batch_result` drops failed tasks).
+  - **Settling:** a result wins; `lost` needs evidence (ManagerLost, or sacct saying the block's job ended). On a
+    facility MEP a task is `presumed_lost` only past a clock that starts at evidence a block started; it keeps its
+    slot and is never retried. A submit error leaves `submit_unknown`, reconciled against the batch's own task group;
+    only an `idempotent` row is ever sent again.
+  - **`cancel`:** `drain` keeps the backlog. `abort` cancels the backlog and ends the tasks in flight: their wrappers
+    see the marker and kill their commands. It never touches the session's block. `stop_endpoint` pauses every batch
+    under the lock first, and refuses while batch tasks are out, naming `cancel(id, 'abort')`.
+  - **`poll_task` takes a Globus task id:** a running answer carries `globus_task_id`, and an agent's command leaves
+    its rc and output tail in the session directory, so a result outlives the service's 30-minute window and a
+    restart.
+  - **Every Executor's task group is now the service's.** A new Executor no longer inherits the one an earlier
+    Executor of the process adopted; two Executors on one group swallow each other's results (spike S1).
+  - **Harness:** run_batch counts as a billed start, and the journal's event rows become `Trace.events`. A polling
+    mid-run hook (`poll` / `until`) lets the world decide when a hook acts. The script operator can now restart its
+    server (SIGKILL) and open a second server on the same state dir, and it serves `cmd` hooks. There is a
+    `world:ledger_matches_sacct` check, and eight scenarios: `batch_fanout_collect`, `batch_crosses_walltime`,
+    `batch_restart_resume`, `batch_two_servers_one_ledger`, `batch_block_reaped_midrun`, `batch_big_output`,
+    `batch_abort_midrun` and `mep_batch_fanout`.
 - **A block asks for what the work needs: a slice of a node, and N nodes are one shell over the allocation.** On the
   live Anvil run of 2026-10-24 a bring-your-own block on the per-core `shared` partition asked for an exclusive whole
   node (parsl's default), queued for more than a day waiting for an idle one, and would have billed all 128 cores.
