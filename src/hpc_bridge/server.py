@@ -552,7 +552,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=said(f"the endpoint refused to start for this identity {rt.transient_conflicts} times in a row "  # noqa: E501
+                    notice=said(repaired + f"the endpoint refused to start for this identity {rt.transient_conflicts} times in a row "  # noqa: E501
                             f"(RESOURCE_CONFLICT: 'already in use … concurrent requests'). This is NO LONGER transient: "  # noqa: E501
                             "another session with the SAME Globus identity is starting or holding a user endpoint here "
                             "(a concurrent hpc-bridge run?), or the facility's manager is wedged. Stop retrying: end the "  # noqa: E501
@@ -566,7 +566,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="provisioning", block_state=block, endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account, block=receipt_terms,  # what it confirmed
-                    notice=said(_login_expired_notice(rt.last_canary.error)),
+                    notice=said(repaired + _login_expired_notice(rt.last_canary.error)),
                 )
             if rt.last_canary is not None and _no_account_failure(rt.last_canary.error):
                 # The manager refused to start a user endpoint for THIS identity: no local account. Not
@@ -578,7 +578,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=said(_no_account_notice(app, rt.last_canary.error, identity)),
+                    notice=said(repaired + _no_account_notice(app, rt.last_canary.error, identity)),
                 )
             if rt.last_canary is not None and _submit_rejected(rt.last_canary.error):
                 # The scheduler refused the submission (bad account/partition/QOS, missing resource request): a
@@ -590,7 +590,7 @@ async def _ensure_endpoint_up(
                 return EndpointStatus(
                     status="down", block_state="cold", endpoint_id=eid, session_spend=spend,
                     partition=active_partition, account=active_account,
-                    notice=said(_rejected_notice(app, rt, rt.last_canary)),
+                    notice=said(repaired + _rejected_notice(app, rt, rt.last_canary)),
                 )
             if not _has_login_shape(app) and rt.last_canary is None:
                 # On a MEP a canary runs on EVERY poll whose manager gate passes (and is recorded even
@@ -642,15 +642,23 @@ async def _ensure_endpoint_up(
 
 
 def _env_repair_note(app: AppCtx) -> str:
-    """What a repair of this endpoint's broken environment did (warmth._repair_broken_env), said once — or, while it
-    waits for the user's login (`AppCtx.env_repair_handoff`), what the user must do, said on every answer until then."""
+    """What a repair of this endpoint's broken environment did (warmth._repair_broken_env), said once per note — or,
+    while it waits for the user's login (`AppCtx.env_repair_handoff`) or for work on the endpoint to end
+    (`env_repair_deferred`), what it waits for, said on every answer until then. Read only where every answer that
+    follows carries it — the `down` ones included (review round 1, 2026-10-31: a refused block's answer dropped a note
+    already marked said, and the repair went unsaid)."""
     eid = app.state.endpoint_id
-    if eid is not None and eid in app.env_repair_handoff:
-        return app.env_repair_handoff[eid][1]
-    if eid is None or eid not in app.env_repairs or eid in app.env_repair_said:
+    if eid is None:
         return ""
-    app.env_repair_said.add(eid)
-    return app.env_repairs[eid]
+    if eid in app.env_repair_handoff:
+        return app.env_repair_handoff[eid][1]
+    if eid in app.env_repair_deferred:
+        return app.env_repair_deferred[eid]
+    note = app.env_repairs.get(eid)
+    if not note or app.env_repair_said.get(eid) == note:
+        return ""
+    app.env_repair_said[eid] = note
+    return note
 
 
 def _env_repair_preauth(app: AppCtx) -> str | None:

@@ -100,6 +100,21 @@ with no HostKeyAlias, as before a pin; the venv is on the shared home.
 - `online_endpoint_named(name, client_factory)`: `find_online_endpoint` for a caller with no facility yet (the new
   laptop's reattach, [[connect]]).
 
+**Review round 1 (2026-10-31).**
+- **The pinned restart** (`repair_endpoint_env` → `_manager_exited`) no longer runs `provision` right after `stop`.
+  `stop` asks, and the daemon exits later (Expanse); provision would have taken its reuse branch, started nothing and
+  still claimed a restart. Now it waits for the exit: the pid file gone, or `list` not running and the file no longer
+  moving. It gives up after `_STOP_EXIT_WAIT_S` (60 s) and raises.
+- **`_start_again`** claims a restart only when provision did not reuse and `list` shows the manager running, and
+  then records the node it started on (`_record_start`). The repair is done only then; otherwise it raises and is
+  tried once more (warmth `_REPAIR_TRIES`).
+- **"Still runs on the dead node"** is `watch_pid_file`'s verdict: the mtime watched across `_PID_TOUCH_WATCH_S`
+  (20 s, one 15 s touch interval and a margin), "alive" only when it moves. One read of its age called a manager
+  killed seconds ago "running".
+- **`_drop_pin`** clears `login_host` and keeps the record, so `seeded_credentials` survives.
+- **`pid_file`** maps an ssh timeout (`ssh_exec` raises a bare `TimeoutError()`) or an OSError to None ("unknown"),
+  as it maps rc 255.
+
 ## See also
 [[Standing up the endpoint]] · [[Credential seeding]] · [[MEP & templated endpoints]] · [[facility-base]] · [[facility-mep]] · [[state]] · [[credentials]] · [[MFA and interactive SSH auth]]
 

@@ -254,6 +254,26 @@ async def discover_facility_details(target: SshTarget) -> tuple[FacilityDetails,
     return parse_probe(out, ssh_host=target.host)
 
 
+def _managed_install(gce: str | None, home: str | None) -> str | None:
+    """The venv of a globus-compute-endpoint the probe found on PATH when it is hpc-bridge's own managed one — keyed
+    (`<base>-endpoint-<gce>-py<X.Y>`, `keyed_venv`) beside the configured base (HPC_BRIDGE_REMOTE_VENV, else
+    `$HOME/hpc-bridge/gce-venv`, with the probe's $HOME) — else None. Only hpc-bridge's line puts a keyed venv on PATH;
+    the unkeyed base may be one a user or an older plugin made, an install like any other (as an SSH probe reads it)."""
+    from . import config
+
+    tail = "/bin/globus-compute-endpoint"
+    if not gce or not gce.endswith(tail):
+        return None
+    venv = gce[: -len(tail)]
+    base = shell_path(config.remote_venv() or DEFAULT_REMOTE_VENV)
+    if base.startswith("$HOME/"):
+        if not home:
+            return None
+        base = home.rstrip("/") + base[len("$HOME"):]
+    keyed = re.compile(re.escape(base) + r"-endpoint-(?:[\w.+!-]+-)?py\d+\.\d+")
+    return venv if keyed.fullmatch(venv) else None
+
+
 def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[str]]:
     """Pure parse of the probe stdout into a proposed FacilityDetails + low-confidence notes."""
     f = _collect(stdout)
@@ -289,10 +309,24 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
     interface, nic_note = _interface(f.get("NIC", []))
     notes.append(nic_note)  # interface is always flagged — it's the field the canary most often fails on
 
-    env_setup, env_note = _env_setup(f.get("GCE"), f.get("UV"), user,
+    gce, gce_state = f.get("GCE"), f.get("GCE_STATE")
+    venv, venv_state = f.get("VENV"), f.get("VENV_STATE")
+    ours = _managed_install(gce, f.get("HOME"))
+    if ours and not venv:
+        venv, venv_state = ours, gce_state   # what the found install's check said is that venv's state
+    if ours:
+        # the probe ran through the endpoint's own login worker (connect._probe_through_endpoint), whose env_setup —
+        # hpc-bridge's line — put hpc-bridge's venv on PATH: that is the venv hpc-bridge builds and checks, not an
+        # install of the site's to activate by hand (review round 1, 2026-10-31: it proposed `source …/activate`, so
+        # the confirmed config named no managed venv and nothing built, checked or repaired it)
+        gce, gce_state = None, None
+    env_setup, env_note = _env_setup(gce, f.get("UV"), user,
                                      modules=f.get("MODULE", []), lmod_init=f.get("LMOD_INIT"),
-                                     gce_state=f.get("GCE_STATE"), gce_activate=f.get("GCE_ACTIVATE"),
-                                     venv=f.get("VENV"), venv_state=f.get("VENV_STATE"))
+                                     gce_state=gce_state, gce_activate=f.get("GCE_ACTIVATE"),
+                                     venv=venv, venv_state=venv_state)
+    if ours:
+        env_note += (f" (The globus-compute-endpoint on PATH, {ours}, is hpc-bridge's own venv — the endpoint's worker "
+                     "ran with it — so hpc-bridge's line is proposed for it.)")
     notes.append(env_note)
 
     alloc_cmd, alloc_parser, alloc_note = _allocation(f)

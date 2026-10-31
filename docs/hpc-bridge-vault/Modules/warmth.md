@@ -58,5 +58,20 @@ nersc) — `_repair_handoff` makes the same handoff a connect does:
 `server` puts the command in `EndpointStatus.preauth_command` while the block is `provisioning`, and the words in every
 answer until the shape is warm.
 
+**Review round 1 (2026-10-31).** `_repair_broken_env` changed in four ways:
+- **It runs in its own task** (`AppCtx.env_repair_tasks`, awaited through `asyncio.shield`). A call cancelled between
+  the manager's stop and its start no longer takes the restart with it. The next check reads how it ended, even when
+  that check passes (`_provision` calls in whenever a task is pending).
+- **It is done only when the facility verified it** (`env_repaired`). A repair that raised is tried once more
+  (`_REPAIR_TRIES` = 2); a login handed to the user is not an attempt.
+- **It waits while work runs** on the endpoint it would restart (`_work_on_the_endpoint`: a live task handle on any
+  shape, or a command in its sync-wait). Restarting the manager ends every user endpoint it runs.
+  `env_repair_deferred` says so on every answer until the work ends.
+- **Its note** (`server._env_repair_note`) is read only where every answer that follows carries it — the `down`
+  answers too. `env_repair_said` keeps the note said per id, so a later attempt's new note is said again.
+- **After a repair**, every shape's conflict streak starts at 0, and `ShapeRuntime.conflict_grace_until`
+  (`_REPAIR_CONFLICT_GRACE_S`, 120 s) keeps RESOURCE_CONFLICT answers from counting while the user endpoints start
+  again. In c08, re-run, three such answers in twelve seconds read "NO LONGER transient" and took the block down.
+
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

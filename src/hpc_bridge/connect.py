@@ -564,6 +564,8 @@ async def _connect(
     try:
         # off the loop: it may run `ssh -G` (a subprocess with a 10 s timeout) to read ~/.ssh/config
         fac = await asyncio.to_thread(binding._facility_from_entry, entry, account=(preset or ""))
+        if isinstance(getattr(fac, "ghosts", None), set):   # a ghost the reattach found is not re-adopted
+            setattr(fac, "ghosts", app.ghost_endpoints)  # noqa: B010 - an SSH facility's attribute, not the protocol's
     except Exception as exc:  # noqa: BLE001 - a facility that cannot be built (bad entry, store I/O) is a structured failure
         return ConnectFacilityResult(
             phase="failed",
@@ -926,11 +928,21 @@ def _proposal(app: AppCtx | None, facility: str, draft: FacilityDetails, notes: 
     )
 
 
-# How long a new laptop's reattach waits for its online endpoint's login worker to answer before taking it for a ghost
-# (`manager_online` reads "online" for a dead endpoint until its heartbeats are missed: #37) and probing over SSH. A
-# login worker of a running manager answers in seconds to tens of seconds; the wait is inside the (heartbeated) connect.
-_REATTACH_WAIT_S = 90.0
+# How a new laptop's reattach waits for its online endpoint's login worker (`_probe_through_endpoint`). The whole of
+# it — the wait, then the probe through the worker — stays within `_REATTACH_BUDGET_S`, so the SSH probe it may fall
+# back to (`discover_facility_details`: its own 120 s ssh bound) still ends inside the ~300 s a tool call may run in the
+# clients that drive hpc-bridge (config.STOP_CALL_BUDGET_S's reasoning). A check that is still queued is waited on (the
+# runner never resubmits one in flight); a refused one (the web service's transient 409 conflict) is sent again after
+# a back-off that grows from `_REATTACH_BACKOFF_S`; any other answer ends the wait — the manager answered (review round
+# 1, 2026-10-31: the loop resent a check on every pass, 433 tasks in 0.5 s against a manager that failed fast, without
+# yielding the event loop when the failure came back at once).
+_REATTACH_WAIT_S = 60.0
+_REATTACH_BUDGET_S = 120.0
 _REATTACH_CANARY_S = 15.0
+_REATTACH_BACKOFF_S = 2.0
+_REATTACH_BACKOFF_MAX_S = 10.0
+_monotonic = time.monotonic   # indirections, so a test drives the real loop on a fake clock
+_sleep = asyncio.sleep
 
 
 def _endpoint_client():
@@ -939,51 +951,104 @@ def _endpoint_client():
     return Client()
 
 
-async def _online_for_host(app: AppCtx, facility: str, host: str) -> tuple[str, str] | None:
-    """(name, id) of our endpoint for `host` that the Globus web service lists ONLINE and owned by this identity — no
-    SSH. Its name is the one a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else `hpc-bridge-<host>`,
-    `binding._session_endpoint_name`). None: none, or the service cannot say (a web error reads as none) — and, with no
-    Globus login gate (a hermetic test, a dev server), it is not asked: the SDK's Client on a store with no login runs
-    its own command-line login on the MCP transport (the catalog read once did, see `_connect`)."""
+async def _online_for_host(app: AppCtx, facility: str, host: str) -> tuple[str, str | None, str] | None:
+    """(name, id, why) for our endpoint for `host`: the id when the Globus web service lists it ONLINE and owned by this
+    identity — no SSH — else None, with `why` it is not used (none online under that name, or the service could not be
+    asked: its error). Its name is the one a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else
+    `hpc-bridge-<host>`, `binding._session_endpoint_name`). An id this session found to be a ghost is not used again
+    (`AppCtx.ghost_endpoints`). None: not asked — with no Globus login gate (a hermetic test, a dev server) the SDK's
+    Client on a store with no login runs its own command-line login on the MCP transport (the catalog read once did)."""
     from .facility.remote import online_endpoint_named
 
     if app.login_flow is None:
         return None
     name = (config.endpoint_name() or "") or binding._session_endpoint_name(host)
-    eid = await online_endpoint_named(name, _endpoint_client)
-    return (name, eid) if eid else None
+    eid, error = await online_endpoint_named(name, _endpoint_client)
+    if error is not None:
+        return name, None, (f"the Globus web service could not say whether your endpoint {name} is online ({error}): "
+                            "probed over SSH instead. ")
+    if eid is None:
+        return name, None, f"no endpoint of yours named {name} is online: probed over SSH. "
+    if eid in app.ghost_endpoints:
+        return name, None, (f"your endpoint {name} ({eid}) is listed online, but this session found its login worker "
+                            "does not answer (a stale registration): probed over SSH instead. ")
+    return name, eid, ""
+
+
+def _answered(error: str) -> str:
+    """What an online endpoint's manager answered a check with — a failure it returned, not a silence."""
+    from .notices import broken_endpoint_env
+
+    cause = broken_endpoint_env(error)
+    if cause:
+        return (f"its manager answered, but could not start a login worker ({cause}): the environment it runs from is "
+                "broken. Probed over SSH instead; once the config is confirmed, hpc-bridge reconnects to that same "
+                "endpoint and repairs its environment (the repair needs SSH anyway). ")
+    return (f"its manager answered the check with an error ({' '.join(error.split())[:240]}): probed over SSH "
+            "instead. ")
 
 
 async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
                                   ) -> tuple[FacilityDetails, list[str], str, str] | str | None:
     """A new laptop's first connect (no record, not in the registry): when our endpoint for `host` is online
-    (`_online_for_host`), wait (`_REATTACH_WAIT_S`) for its login worker to answer a check and run discovery's own probe
-    THROUGH it — the login node's answers without an SSH login, which on a password + one-time-code site (nersc) is
-    the user's terminal (the returning-user review, 2026-10-30). The login worker runs on the template the endpoint was
-    configured with: the check sends no interface or env_setup of ours (`shapes.shape_config("login")` alone), so the
-    template's own defaults — the config that brought it up — apply. Returns (draft, notes, name, id); otherwise None
-    (nothing online) or why the SSH probe runs instead (a ghost, a probe that did not run there)."""
+    (`_online_for_host`), wait for its login worker to answer a check and run discovery's own probe THROUGH it — the
+    login node's answers without an SSH login, which on a password + one-time-code site (nersc) is the user's terminal
+    (the returning-user review, 2026-10-30). The login worker runs on the template the endpoint was configured with: the
+    check sends no interface or env_setup of ours (`shapes.shape_config("login")` alone), so the template's own defaults
+    — the config that brought it up — apply.
+
+    The wait: a check still queued is waited on, a transient refusal sent again after a growing back-off, any other
+    answer ends it (said: the manager is alive — a broken environment is the repair's, after the confirm). No answer
+    within `_REATTACH_WAIT_S` is a ghost (#37: "online" is the heartbeat the service last saw): recorded in
+    `AppCtx.ghost_endpoints`, so the confirm that follows does not wait on it again. Everything is bounded by
+    `_REATTACH_BUDGET_S`. Returns (draft, notes, name, id); otherwise None (not asked) or why the SSH probe runs."""
     import shlex
 
     from .discovery import _probe_script, parse_probe
+    from .notices import _transient_dispatch_failure
     from .shapes import shape_config
 
     found = await _online_for_host(app, facility, host)
     if found is None:
         return None
-    name, eid = found
+    name, eid, why = found
+    if eid is None:
+        return why
+    t0 = _monotonic()
+    deadline = t0 + _REATTACH_WAIT_S
     runner = app.runner_factory(eid, user_endpoint_config=shape_config("login"))
     try:
-        deadline = time.monotonic() + _REATTACH_WAIT_S
+        backoff, busy = _REATTACH_BACKOFF_S, ""
         while True:
-            check = await runner.canary(timeout=max(1.0, min(_REATTACH_CANARY_S, deadline - time.monotonic())))
+            left = deadline - _monotonic()
+            check = await runner.canary(timeout=max(1.0, min(_REATTACH_CANARY_S, left)))
             if check.ok:
                 break
-            if time.monotonic() >= deadline:
+            error = str(check.error or "")
+            if error != "timeout" and not _transient_dispatch_failure(error):
+                return f"your endpoint {name} ({eid}) is listed online and {_answered(error)}"
+            busy = busy or (error if error != "timeout" else "")
+            if _monotonic() >= deadline:
+                if busy:   # it answered, every time, that it is busy: alive — not a ghost
+                    return (f"your endpoint {name} ({eid}) is listed online, but its manager kept answering that it "
+                            f"is busy for {_REATTACH_WAIT_S:.0f} s ({' '.join(busy.split())[:160]}): probed over SSH "
+                            "instead. ")
+                app.ghost_endpoints.add(eid)
                 return (f"your endpoint {name} ({eid}) is listed online, but its login worker did not answer within "
                         f"{_REATTACH_WAIT_S:.0f} s (a stale registration, or a manager that is gone): probed over SSH "
                         "instead. ")
-        res = await runner.run(f"bash -lc {shlex.quote(_probe_script())}")
+            # a still-queued check is waited on by the next canary itself; a refused one is sent again only after a
+            # back-off — and either way the loop yields (a fake or a fast failure must not starve the heartbeat)
+            pause = 0.5 if error == "timeout" else backoff
+            if error != "timeout":
+                backoff = min(backoff * 2, _REATTACH_BACKOFF_MAX_S)
+            await _sleep(min(pause, max(0.0, deadline - _monotonic())))
+        left = _REATTACH_BUDGET_S - (_monotonic() - t0)
+        try:
+            res = await asyncio.wait_for(runner.run(f"bash -lc {shlex.quote(_probe_script())}"), max(1.0, left))
+        except TimeoutError:
+            return (f"your endpoint {name} ({eid}) answered, but the probe through it did not finish within "
+                    f"{max(1.0, left):.0f} s: probed over SSH instead. ")
         out = str(getattr(res, "stdout", "") or "")
         if "HPCB_PROBE_BEGIN" not in out:
             return (f"your endpoint {name} ({eid}) answered, but the probe did not run through it "

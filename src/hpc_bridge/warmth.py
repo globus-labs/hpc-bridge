@@ -324,7 +324,12 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         rt.runner_stale = True
         if _no_account_failure(result.error):
             rt.no_account = result.error
-        rt.transient_conflicts = rt.transient_conflicts + 1 if _transient_dispatch_failure(result.error) else 0
+        if not _transient_dispatch_failure(result.error):
+            rt.transient_conflicts = 0
+        elif rt.conflict_grace_until is None or time.monotonic() >= rt.conflict_grace_until:
+            rt.transient_conflicts += 1
+        # (inside the grace after a repair restarted the endpoint's user endpoints, a conflict is that start in
+        # progress, not a streak: c08, 2026-10-31, read "NO LONGER transient" twelve seconds after the repair)
     return "provisioning"
 
 def _retain_inflight(app: AppCtx, rt: ShapeRuntime | None) -> None:
@@ -714,7 +719,9 @@ async def _provision(
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)
-            if block != "warm":
+            if block != "warm" or app.state.endpoint_id in app.env_repair_tasks:
+                # (a repair a cancelled call left running is read here even when the check now passes: its outcome is
+                # said, and the done-mark set, only once it is read)
                 block = await _repair_broken_env(app, shape, rt, block)
     except Exception:
         _bank_warm_interval(rt, app)  # nothing could be checked: the caller reports `down` / an error — clock stopped
@@ -786,27 +793,81 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
         # opened the connection met a TRANSIENT conflict, and the repair, keyed on the import failure alone, waited on)
         cause = app.env_repair_handoff[eid][2]
     repair = getattr(app.facility, "repair_endpoint_env", None)
-    if cause is None or eid is None or not inspect.iscoroutinefunction(repair) or eid in app.env_repairs:
+    if eid is None:
         return block
+    task = app.env_repair_tasks.get(eid)   # one a cancelled call left running: read here
+    if task is None:
+        if (cause is None or not inspect.iscoroutinefunction(repair) or eid in app.env_repaired
+                or app.env_repair_tries.get(eid, 0) >= _REPAIR_TRIES):
+            return block
+        held = _work_on_the_endpoint(app)
+        if held:
+            # a repair that restarts the manager ends every user endpoint it runs — a task on the compute block with
+            # them (review round 1, 2026-10-31: a login-shape check met the broken venv while a compute task ran)
+            app.env_repair_deferred[eid] = (
+                f"the endpoint could not start a user endpoint ({cause}): its environment is broken. Repairing it "
+                f"restarts the endpoint's manager, which would end {held}: the repair waits until that work is done "
+                "(poll_task), and runs at the next check after it. ")
+            return block
+        app.env_repair_deferred.pop(eid, None)
+        app.env_repair_tries[eid] = app.env_repair_tries.get(eid, 0) + 1
+        # its own task, so a call cancelled between the manager's stop and its start does not cancel the repair with
+        # it: the restart runs on, and the next check reads how it ended (review round 1)
+        task = asyncio.ensure_future(repair(app.profile, eid))
+        app.env_repair_tasks[eid] = task
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())   # read, so an unread failure is not logged
+    cause = cause or app.env_repair_causes.get(eid, "")
+    app.env_repair_causes[eid] = cause
     try:
-        done, new_eid = await repair(app.profile, eid)
+        done, new_eid = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled():
+            app.env_repair_tasks.pop(eid, None)
+        raise   # this call is cancelled; the repair runs on, and the next check reads it
     except Exception as exc:  # noqa: BLE001 - said in the answer; the check's own failure stays the state
+        app.env_repair_tasks.pop(eid, None)
         if _repair_handoff(app, shape, eid, cause, str(exc)):
-            return block   # not a repair done: the next check tries again, over the connection the user opens
+            app.env_repair_tries[eid] -= 1   # not an attempt: the next check tries, over the connection the user opens
+            return block
         why = " ".join(str(exc).split())[:300]
         app.env_repair_handoff.pop(eid, None)
+        again = (" hpc-bridge tries it once more at the next check." if app.env_repair_tries[eid] < _REPAIR_TRIES
+                 else "")
         app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment is broken, "
-                                f"and hpc-bridge's repair failed: {type(exc).__name__}: {why}. ")
+                                f"and hpc-bridge's repair failed: {type(exc).__name__}: {why}.{again} ")
         return block
+    app.env_repair_tasks.pop(eid, None)
     app.env_repair_handoff.pop(eid, None)
+    app.env_repaired.add(eid)   # done only once the facility verified it (a restart it claims is one that happened)
     app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment was broken. "
                             f"hpc-bridge {done}. ")
     if new_eid and new_eid != eid:
         app.env_repairs[new_eid] = app.env_repairs[eid]
+        app.env_repaired.add(new_eid)
         app.state = replace(app.state, endpoint_id=new_eid)
+    grace = time.monotonic() + _REPAIR_CONFLICT_GRACE_S
     for other in app.shapes.values():
         other.runner_stale = True
+        other.transient_conflicts, other.conflict_grace_until = 0, grace
     return await _confirm_worker(app, shape, force=True)
+
+
+_REPAIR_CONFLICT_GRACE_S = 120.0   # after a repair, the service's "already in use" is the user endpoints starting again
+_REPAIR_TRIES = 2   # repairs started per endpoint: one that did not finish (a manager that had not exited, a restart
+# `list` did not show) is tried once more at the next check; a login handed to the user's terminal is not an attempt
+
+
+def _work_on_the_endpoint(app: AppCtx) -> str:
+    """What of the session's work runs on the bound endpoint's user endpoints right now — a task behind a poll handle, a
+    command inside its sync-wait — in words, or "" when none does."""
+    live = [tid for tid, h in app.tasks.items() if not h.future.done()]   # any shape: all run under that manager
+    waiting = sum(rt.inflight for rt in app.shapes.values())
+    held = []
+    if live:
+        held.append(f"task(s) {', '.join(live[:4])}{' …' if len(live) > 4 else ''} still running")
+    if waiting:
+        held.append(f"{waiting} command(s) still waiting for their result")
+    return " and ".join(held)
 
 
 def _repair_handoff(app: AppCtx, shape: str, eid: str, cause: str, said: str) -> bool:

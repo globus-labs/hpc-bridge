@@ -53,6 +53,9 @@ class ShapeRuntime:
     # another session with the same Globus identity holds/starts this endpoint, or the manager is
     # wedged — the 'call again' hint must stop (a model sweep showed Sonnet retrying 7× on it).
     transient_conflicts: int = 0
+    # Until when (monotonic) a conflict is not counted: a repair just made the endpoint start its user endpoints again,
+    # and the service answers RESOURCE_CONFLICT while that start runs (warmth._repair_broken_env).
+    conflict_grace_until: float | None = None
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
     # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
     # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
@@ -405,16 +408,29 @@ class AppCtx:
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).
     bootstrapped_facilities: set[str] = field(default_factory=set)
-    # A broken endpoint environment met by a check (notices.broken_endpoint_env), by endpoint id: what the one repair
-    # tried said (warmth._repair_broken_env) — rebuilt and restarted, or why not. `env_repair_said`: the ids whose
-    # repair an answer has already named.
+    # A broken endpoint environment met by a check (notices.broken_endpoint_env), by endpoint id: what the latest repair
+    # said (warmth._repair_broken_env) — rebuilt and restarted, or why not. `env_repair_said`: the note an answer has
+    # already carried, per id (a later attempt's new note is said again). `env_repaired`: the ids whose repair the
+    # facility verified done; `env_repair_tries`: repairs started per id (warmth._REPAIR_TRIES); `env_repair_tasks`: one
+    # still running — its own task, so a cancelled call does not stop it between the manager's stop and its start;
+    # `env_repair_causes`: the import failure each is for; `env_repair_deferred`: why one waits (work runs on the
+    # endpoint the repair would restart), said on every answer until it runs.
     env_repairs: dict[str, str] = field(default_factory=dict)
-    env_repair_said: set[str] = field(default_factory=set)
+    env_repair_said: dict[str, str] = field(default_factory=dict)
+    env_repaired: set[str] = field(default_factory=set)
+    env_repair_tries: dict[str, int] = field(default_factory=dict)
+    env_repair_tasks: dict[str, asyncio.Future] = field(default_factory=dict)
+    env_repair_causes: dict[str, str] = field(default_factory=dict)
+    env_repair_deferred: dict[str, str] = field(default_factory=dict)
     # A repair that needs the USER's login first (the facility's host asks for a password / one-time code — c08's key
     # was revoked): by endpoint id, (the command the user runs in their own terminal, what the answer says, the
     # import failure it repairs). Not a
     # repair done: the next check that meets the broken environment tries again, over the connection the user opened.
     env_repair_handoff: dict[str, tuple[str, str, str]] = field(default_factory=dict)   # + the import failure
+    # Endpoint ids a new laptop's reattach found listed online but whose login worker never answered (ghosts, #37):
+    # not used again this session — neither by that reattach nor by the bring-up the confirm that follows it starts
+    # (connect._probe_through_endpoint; SlurmFacility.find_online_endpoint skips them: `ghosts`).
+    ghost_endpoints: set[str] = field(default_factory=set)
     runner_factory: Callable[..., GlobusRunner] = GlobusRunner
     # The in-terminal Globus login (login.py). None ⇒ no login gating (hermetic tests / unbound dev);
     # lifespan installs the real one, which rides the Compute SDK's own client id + token storage.

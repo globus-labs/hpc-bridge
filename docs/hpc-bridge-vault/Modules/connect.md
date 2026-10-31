@@ -33,7 +33,7 @@ service first.
 - **Is it alive?** "Online" is only the heartbeat the service last saw, and a ghost reads online too (#37). So the
   decision rests on the endpoint's login worker: a runner on `shapes.shape_config("login")` alone (no interface, no
   worker_init: the endpoint's template defaults, the config that brought it up, apply) must answer a check within
-  `_REATTACH_WAIT_S` (90 s).
+  `_REATTACH_WAIT_S` (60 s since review round 1).
 - **Then** the discovery probe (`discovery._probe_script`) runs as a task through that worker, `parse_probe` reads it,
   and `_proposal` returns it with `reused=True` and a lead naming the endpoint.
 - **Confirming** the proposal binds the session's config and reattaches over the web, as a cached record always did.
@@ -43,6 +43,24 @@ service first.
   asked: the SDK's Client on a store with no login runs its own command-line login on the MCP transport.
 - **What never takes this rung.** A registry facility resolves to its entry first, so a facility endpoint wins; on a
   registry outage the facility may be a catalogued one, so the rung is skipped.
+
+**Review round 1 (2026-10-31).** The first wait loop sent a new check on every pass — 433 tasks in 0.5 s against a
+manager that failed fast — never yielded when a check failed at once, and called a manager that answered with an error
+a ghost. Now:
+- **A still-queued check** (`timeout`) is waited on: the runner never resubmits one in flight.
+- **A transient 409** is sent again after a back-off that grows from `_REATTACH_BACKOFF_S` (2 s) to 10 s. A manager
+  that answers "busy" until the deadline is alive, not a ghost.
+- **Any other answer** ends the wait and says what it was (`_answered`). A broken environment is repaired after the
+  confirm, over SSH: the repair needs it anyway.
+- **Every pass sleeps**, so the event loop and the MCP heartbeat run. `_monotonic` and `_sleep` are indirections a
+  test drives.
+- **The whole path is bounded:** the wait (`_REATTACH_WAIT_S`, 60 s) and the probe's run (`asyncio.wait_for`) fit
+  `_REATTACH_BUDGET_S` (120 s), so the SSH fallback still ends inside a client's ~300 s tool call.
+- **Every fallback is said.** `_online_for_host` returns (name, id, why): nothing online, or the web service's own
+  error (`remote.online_endpoint_named` returns it instead of swallowing it).
+- **A ghost is remembered.** It goes in `AppCtx.ghost_endpoints`. connect hands that set to every SSH facility it
+  builds (`SlurmFacility.ghosts`), so the bring-up of the confirm that follows does not adopt the same ghost through
+  `find_online_endpoint`.
 
 ## See also
 [[server]] · [[binding]] · [[warmth]] · [[login_gate]] · [[notices]]

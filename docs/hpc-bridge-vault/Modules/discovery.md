@@ -92,5 +92,15 @@ It now matches only account errors:
 "Job violates accounting/QOS policy" is about limits, not the account. A policy refusal proposes UNVERIFIED, quoting
 the scheduler.
 
+## A probe through the endpoint meets hpc-bridge's own venv (2026-10-31, review round 1)
+A probe run through the endpoint's own login worker ([[connect]] `_probe_through_endpoint`) runs after that
+worker's env_setup, hpc-bridge's line, which put hpc-bridge's KEYED venv on PATH. `_env_setup` read that as an
+install of the site's and proposed `source …/activate`, a hand-written line. Nothing then built, checked or repaired
+the venv (`managed_venv` None), `adopt_endpoint` warned, and the reuse never cached the config.
+
+`_managed_install` now recognises a keyed venv beside the configured base and passes it over. The proposal is
+hpc-bridge's line, and the note names the venv as hpc-bridge's own. The unkeyed base stays an install like any other,
+as an SSH probe reads it: a user or an older plugin may have made it.
+
 ## See also
 [[Globus index discovery channel]] · [[server]] · [[models]] · [[facility-remote]] · [[state]] · [[Discovery channel model]] · [[Facility catalog]] · [[MFA and interactive SSH auth]]

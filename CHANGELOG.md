@@ -69,7 +69,7 @@ installed plugin only when that version changes); git tags mark releases.
     user's terminal, even with their endpoint online. Now hpc-bridge first asks the Globus web service whether an
     endpoint it owns is online under the name a bring-up for that host registers (`hpc-bridge-<ssh_host>`, or
     `HPC_BRIDGE_ENDPOINT_NAME`).
-    - If one is, it waits up to 90 s for that endpoint's login worker to answer. The worker uses the endpoint's own
+    - If one is, it waits up to 60 s for that endpoint's login worker to answer. The worker uses the endpoint's own
       template defaults; nothing of ours is sent.
     - The same discovery probe then runs THROUGH the endpoint. The proposal says so and carries `reused: true`.
     - Confirming the proposal reattaches over the web. No SSH happens before the reattach.
@@ -94,6 +94,32 @@ installed plugin only when that version changes); git tags mark releases.
     errors count: Slurm's "Invalid account or account/partition combination specified", and a site's "You must
     specify an account" / "No valid account" / "Please specify a project". Such a probe now proposes UNVERIFIED and
     quotes the scheduler's reply.
+  - **Review round 1 (2026-10-31): nine defects in the above, each proven first by a test that fails on the
+    first version.**
+    - The reattach's wait sent a new check on every pass (433 in 0.5 s against a manager that failed fast). It
+      starved the event loop when a check failed at once, and called a manager that answered with an error a ghost.
+      Now a queued check is waited on, and a "busy" refusal is retried after a growing back-off. Any other answer
+      ends the wait and says what it was; a broken environment is repaired after the confirm. Every pass yields, and
+      the wait plus the probe stay within 120 s.
+    - Nothing online, and a web or login error, are said before the SSH probe. A ghost found by the reattach is not
+      adopted again by the bring-up of the confirm that follows.
+    - A probe through the endpoint's own login worker met hpc-bridge's keyed venv on PATH and proposed
+      `source …/activate`, a hand-written line. Nothing then built, checked or repaired that venv. Now it proposes
+      hpc-bridge's own line.
+    - A pinned repair waits for the stopped manager to exit, by its pid file, before starting it again. It claims a
+      restart only when `list` shows one, and is done only then; a repair that did not finish is tried once more.
+    - "Still runs on the dead node" is decided by watching the pid file move across a touch interval, never by one
+      read of its age.
+    - A dead pin is cleared from the endpoint record, not the record deleted. `seeded_credentials` is kept, and a
+      restart is pinned to the node it started on.
+    - The repair waits while a task runs on the endpoint it would restart, and says so. It runs in its own task, so a
+      cancelled call does not leave the manager stopped.
+    - A pid-file read that times out is "unknown", never a bare `TimeoutError`.
+    - The repair's note is said on every answer that follows, a refused block's `down` included.
+    - The re-run of c08 found a tenth: right after the repair, the service answered RESOURCE_CONFLICT while the user
+      endpoints started again. Counted with one from before the repair, three read as "NO LONGER transient" and the
+      block went down. Now the conflict streak starts afresh at a repair, and conflicts within 120 s of it are not
+      counted.
 - **A manager killed hard comes up again, a venv deleted under a running manager is rebuilt, and a facility reattached
   over the web is remembered (found by the returning-user cells, 2026-10-30).** Each was proven first by a test that
   failed for the reason the cells met.
@@ -404,6 +430,15 @@ installed plugin only when that version changes); git tags mark releases.
     - the user does their part for a repair's handoff (`preauth_command`);
     - a login_shell refused before any SSH ("No facility connected yet") no longer counts as SSH;
     - a probe made through the endpoint (`reused`) is not an SSH probe, and `ru_reattached` allows none.
+  - **After review round 1 (2026-10-31; the affected cells re-run on a fresh nersc cluster).**
+    - c18, c03, c05, c12, c13 and the new-laptop agent cell (Pi on qwen) are OK. The new-laptop cell found the
+      endpoint over the web with no SSH.
+    - c08 reaches hello world. The repair left the manager running on the closed `login01`; the pid file was seen
+      moving. It still fails `ru_policy_surfaced` (above).
+    - Its second run also failed `world:stop_honesty_no_pilot_left`: a pending pilot was left behind. It came from
+      the previous release's long-lived compute user endpoint, which starts another block for a queued check after a
+      cancel. The stop said so (`draining`: "only teardown_endpoint ends it").
+    - That run's first try went `down` on RESOURCE_CONFLICT right after the repair: the tenth defect, fixed above.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses
