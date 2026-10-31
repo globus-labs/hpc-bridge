@@ -38,5 +38,54 @@ session's choice with no switch. `_provision` reads the size again after `adopt_
 and, when it differs, drops the confirmation before anything starts (`ShapeRuntime.resized`, said by the re-ask).
 `_repoint` records whether a switch moved the size (`switched_size`) for the re-ask's words.
 
+## A broken endpoint environment (2026-10-30, the returning-user cells)
+`_provision`, after `_confirm_worker`: when the block is not warm and the dispatch failure is an import failure
+(`notices.broken_endpoint_env`: `No module named …`, an ImportError), `_repair_broken_env` runs the facility's
+`repair_endpoint_env` once per endpoint id (`AppCtx.env_repairs` holds what it did, or why it failed), marks the
+shape's runners stale and confirms the worker again. It runs on whatever shape asked — the login shape is free — and
+asks nothing about spend: a compute block's confirmation is unchanged. `server` prefixes the repair's words to the next
+warm or provisioning notice (`_env_repair_note`, once).
+
+## A repair that needs the user's login (2026-10-30, c08)
+When a repair's SSH login is denied with an interactive method left — the key accepted and a one-time code pending,
+or a password / keyboard-interactive login on a facility this user already runs an endpoint on (the key revoked,
+nersc) — `_repair_handoff` makes the same handoff a connect does:
+- it sets `app.pending_preauth` to the CLI's target, and `app.preauth_resume` to `ensure_endpoint_up(shape=…)`;
+- it keeps the user's command and the words in `AppCtx.env_repair_handoff`;
+- it does not count as a repair done: the next check that meets the broken environment tries again, over the
+  connection the user opened.
+
+`server` puts the command in `EndpointStatus.preauth_command` while the block is `provisioning`, and the words in every
+answer until the shape is warm.
+
+**Review round 1 (2026-10-31).** `_repair_broken_env` changed in four ways:
+- **It runs in its own task** (`AppCtx.env_repair_tasks`, awaited through `asyncio.shield`). A call cancelled between
+  the manager's stop and its start no longer takes the restart with it. The next check reads how it ended, even when
+  that check passes (`_provision` calls in whenever a task is pending).
+- **It is done only when the facility verified it** (`env_repaired`). A repair that raised is tried once more
+  (`_REPAIR_TRIES` = 2); a login handed to the user is not an attempt.
+- **It waits while work runs** on the endpoint it would restart (`_work_on_the_endpoint`: a live task handle on any
+  shape, or a command in its sync-wait). Restarting the manager ends every user endpoint it runs.
+  `env_repair_deferred` says so on every answer until the work ends.
+- **Its note** (`server._env_repair_note`) is read only where every answer that follows carries it — the `down`
+  answers too. `env_repair_said` keeps the note said per id, so a later attempt's new note is said again.
+- **After a repair**, every shape's conflict streak starts at 0, and `ShapeRuntime.conflict_grace_until`
+  (`_REPAIR_CONFLICT_GRACE_S`, 120 s) keeps RESOURCE_CONFLICT answers from counting while the user endpoints start
+  again. In c08, re-run, three such answers in twelve seconds read "NO LONGER transient" and took the block down.
+
+**Review round 2 (2026-10-31).**
+- **The repair task does not outlive its binding.** A task left running by a cancelled call reached its start after a
+  teardown had answered `down`, and registered the endpoint again. `_abandon_env_repairs` cancels every repair task and
+  gives its try back. It runs from `_drop_all_shapes` (a re-bind, a detach) and from the teardown's claim, where it
+  only cancels, so the claim has no await. The cancelled tasks wait in `AppCtx.env_repair_settling` until
+  `_settle_env_repairs` has seen them unwind; it is bounded at 10 s, and `ssh_exec` kills its ssh child on the way
+  out. The teardown task and connect both wait on it before they touch the login node.
+- **The repair asks first.** It is started with `wanted=_still_bound(app, eid)`. The facility asks that before it
+  stops or starts a manager: the same facility, the endpoint still bound, no teardown of it running.
+- **Released work counts as busy.** `_work_on_the_endpoint` counts `_released_waiting`: commands still in their
+  sync-wait on a runtime a release retired, on the bound endpoint. `server._block_work` uses the same helper.
+- **A passing check clears a ghost.** `_confirm_worker` removes the endpoint from `AppCtx.ghost_endpoints` (see
+  [[connect]]).
+
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

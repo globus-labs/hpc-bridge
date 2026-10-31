@@ -1,0 +1,26 @@
+# The returning-user cells (agentic/harness/returning.py): pairwise over its FACTORS, its CONSTRAINTS
+# excluded. Generated — `python3 agentic/harness/returning.py --write-cells`; test_returning.py fails
+# while this file differs from what the generator makes. A cell is run by its id: HPCB_RETURNING_CELL=c07.
+id	origin	ended	pin	auth	local	remote	site	tokens	host_key	gce
+c01	current	running	alive	key	untouched	untouched	unchanged	valid	same	same
+c02	current	stopped	dead	revoked	record_deleted	endpoint_dir_deleted	policy_changed	expired	changed	changed
+c03	previous	killed_earlier	alive	revoked	wiped	venv_deleted	unchanged	expired	same	same
+c04	previous	killed_recent	dead	key	renamed_id	untouched	policy_changed	valid	changed	changed
+c05	current	torn_down	alive	key	wiped	venv_deleted	policy_changed	valid	changed	same
+c06	previous	stopped	alive	key	record_deleted	endpoint_dir_deleted	unchanged	valid	same	same
+c07	current	torn_down	alive	revoked	renamed_id	untouched	unchanged	expired	same	changed
+c08	previous	running	dead	revoked	untouched	venv_deleted	policy_changed	expired	same	same
+c09	current	killed_earlier	dead	key	untouched	untouched	unchanged	valid	changed	changed
+c10	current	killed_recent	alive	revoked	untouched	endpoint_dir_deleted	unchanged	valid	same	same
+c11	current	running	alive	key	wiped	endpoint_dir_deleted	unchanged	expired	changed	changed
+c12	current	stopped	alive	key	renamed_id	venv_deleted	unchanged	valid	same	same
+c13	current	killed_recent	alive	key	record_deleted	venv_deleted	unchanged	expired	same	same
+c14	current	stopped	alive	key	wiped	untouched	unchanged	valid	same	same
+c15	current	killed_earlier	alive	key	record_deleted	untouched	policy_changed	valid	same	same
+c16	previous	torn_down	alive	key	untouched	untouched	unchanged	valid	same	same
+c17	current	running	alive	key	renamed_id	endpoint_dir_deleted	unchanged	valid	same	same
+c18	current	running	alive	key	record_deleted	untouched	unchanged	valid	same	same
+c19	current	stopped	alive	key	untouched	untouched	unchanged	valid	same	same
+c20	current	killed_earlier	alive	key	renamed_id	untouched	unchanged	valid	same	same
+c21	current	killed_recent	alive	key	wiped	untouched	unchanged	valid	same	same
+c22	current	torn_down	alive	key	record_deleted	untouched	unchanged	valid	same	same

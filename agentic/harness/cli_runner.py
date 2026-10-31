@@ -428,6 +428,12 @@ def trace_from_bundle_messages(messages: list[dict]) -> Trace:
     final = next((m["final"] for m in messages if "final" in m), "")
     if not texts and final:
         texts, at = [final], [len(events)]
+    head = next((m for m in messages if "harness" in m and "rc" in m), {})
+    if (head.get("trace_stats") or {}).get("steps_as_record"):
+        # a server that keeps no journal (the previous release under the script operator: script_runner.steps_trace) —
+        # its steps' own results are the record, as they were live
+        calls = [ToolCall.of(f"mcp__hpc-bridge__{e.name}", e.args, e.result) for e in events]
+        return Trace(calls, texts, at if len(at) == len(texts) else [])
     return build_trace([m["journal"] for m in messages if "journal" in m], events, texts, at)[0]
 
 

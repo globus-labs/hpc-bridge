@@ -7,7 +7,8 @@ switch of shapes/state to the bound facility, the attach (`_connect_mep`, identi
 bootstrap, and the allocation listing over the login shape. `_commit_proven_facility` writes a BYO
 config to the local cache only once the login-shape canary has answered; `_drop_failed_details` drops one whose
 bring-up failed on the login node before that, so a connect without details resolves the facility afresh instead of
-running it again; `_drop_dead_pin` forgets a login-node pin whose host is unreachable.
+running it again; `_drop_cached_config` drops a config read from the cache whose bring-up failed or handed off, so the
+next connect reads it afresh; `_drop_dead_pin` forgets a login-node pin whose host is unreachable.
 
 The login-shape channel is INJECTED (`run_login`), as in scheduler_ops: `server._connect_facility` is a
 thin wrapper that supplies `server._login_runner(app)`, so tests that call `server._connect_facility` and
@@ -18,6 +19,7 @@ from __future__ import annotations
 
 import asyncio
 import os
+import time
 from dataclasses import dataclass
 
 from . import binding, config, login_gate, warmth
@@ -35,7 +37,13 @@ from .context import (
 )
 from .discovery import discover_facility_details
 from .dispatch import for_agent
-from .facility.remote import NeedsPreauth, SshTarget, key_accepted_second_factor_pending
+from .facility.remote import (
+    NeedsPreauth,
+    SshTarget,
+    is_interactive_auth_failure,
+    key_accepted_second_factor_pending,
+    offers_one_time_code,
+)
 from .lifecycle import EndpointState, ensure_warm
 from .models import BlockTerms, ConnectFacilityResult, FacilityDetails, validate_host
 from .notices import (
@@ -74,13 +82,30 @@ def _commit_proven_facility(app: AppCtx, facility: str) -> None:
     pending = app.pending_facility_cache.pop(facility, None)
     if pending is None:
         return
-    if app.state.reused and facility not in app.bootstrapped_facilities:
+    if app.state.reused and facility not in app.bootstrapped_facilities and not _reuse_runs(app, pending):
         # The canary ran on an endpoint that was ALREADY online under an earlier config — it proves nothing
         # about these details (review 2: a bogus interface got committed this way). Leave the old proven
         # entry as it is. An endpoint THIS session bootstrapped and then re-found online is ours: the
         # canary did run on these details (live 2026-09-04: a fresh BYO bring-up was never cached).
         return
     binding._facility_store().put(*pending)
+
+
+def _reuse_runs(app: AppCtx, pending: tuple[str, dict]) -> bool:
+    """A configuration confirmed with details= and brought up on a REUSED endpoint is cached only when the cache has no
+    record for its host at all, and the endpoint is known to run what it says: its own worker_init, read from its
+    published template (`adopt_endpoint`), is these details' env_setup — no "started with a different env_setup" note.
+    A returning user whose facilities.json lost the record (deleted by hand, a new laptop) reattached, confirmed the
+    probe's proposal, ran work, and the next session probed again (returning-user cell c14, 2026-10-30). An existing
+    proven record is never replaced from a reuse, and nothing unconfirmed is saved: `pending` holds details= only."""
+    host = pending[0]
+    try:
+        if binding._facility_store().get(host) is not None:
+            return False
+    except Exception:  # noqa: BLE001 - an unreadable cache proves nothing either way: leave it
+        return False
+    fac = app.facility
+    return getattr(fac, "endpoint_worker_init", None) is not None and not getattr(fac, "worker_init_note", "")
 
 
 def _drop_failed_details(app: AppCtx, facility: str, notice: str, entry: CatalogEntry) -> str:
@@ -148,17 +173,56 @@ def _afresh(facility: str, host: str) -> str:
 
 def _without_details(app: AppCtx, facility: str, host: str) -> str:
     """What a connect_facility without details= for `facility` does next, said as it will happen (advice that sends the
-    agent there must come true): while this session keeps a configuration for it, that one wins over every other rung,
-    whatever ssh_host the call names — so a proposal for another `host` comes under another facility id."""
+    agent there must come true): while this session keeps a configuration for it, that one wins over every other rung
+    — unless the call names another ssh_host, which is resolved afresh (the kept one is not run for it)."""
     kept = app.session_facilities.get(facility)
     if kept is None:
         return _afresh(facility, host)
     said = (f"connect_facility({facility!r}) without details reconnects with the configuration this session keeps for "
             f"it (for {kept.ssh_host!r}) and proposes nothing while that one is kept")
     if host != kept.ssh_host:
-        said += (f"; for {host!r}, connect another facility id: connect_facility('<new id>', ssh_host={host!r}) "
-                 "resolves that one afresh")
+        said += f"; {_afresh(facility, host)}, and does not run the kept one"
     return said
+
+
+def _forget_kept_config(app: AppCtx, facility: str) -> None:
+    """The configuration this session keeps for `facility` is replaced by one resolved for another host the call named:
+    what was kept of it goes with it — its pending cache write (never committed as PROVEN on another config's canary),
+    its `details_started` mark, its directive note."""
+    app.session_facilities.pop(facility, None)
+    app.pending_facility_cache.pop(facility, None)
+    app.details_started.discard(facility)
+    app.directive_notes.pop(facility, None)
+
+
+def _drop_cached_config(app: AppCtx, facility: str, entry: CatalogEntry) -> None:
+    """A configuration this session READ from facilities.json (`AppCtx.from_cache`) whose bring-up failed or handed off
+    (needs_preauth) leaves the session, so the next connect resolves the facility afresh — that host's record again, or
+    a probe if the user deleted it — instead of running the kept copy (Perlmutter report 2026-10-29, items 1b and 3: a
+    retry naming the facility's own host, and one after the record was deleted, both ran it again). Free: the record is
+    still on disk. A details= config keeps its own rule (`_drop_failed_details`). Only this connect's own `entry`.
+    Callers hold app.lock."""
+    if facility in app.from_cache and app.session_facilities.get(facility) is entry:
+        del app.session_facilities[facility]
+        app.directive_notes.pop(facility, None)  # the re-read says its rewrite again
+
+
+def _access_proven(entry: CatalogEntry) -> bool:
+    """Has this user's SSH access to `entry`'s login host been PROVEN — a facilities.json record for that host, which is
+    written only once the login canary answered there (`_commit_proven_facility`)? A stranger has none."""
+    try:
+        return bool(entry.ssh_host) and binding._facility_store().get(entry.ssh_host) is not None
+    except Exception:  # noqa: BLE001 - an unreadable cache proves nothing
+        return False
+
+
+def _preauth_handoff(app: AppCtx, facility: str, target, entry: CatalogEntry, *, otp_ok: bool) -> ConnectFacilityResult:
+    """The bring-up was denied in a way an interactive login completes: hand it to the user (`_needs_preauth_result`),
+    resumed by `connect_facility(<id>)`. A config read from facilities.json is re-read then (`_drop_cached_config`)."""
+    _drop_cached_config(app, facility, entry)
+    app.pending_preauth = (facility, target)
+    app.preauth_resume = f"connect_facility({facility!r})"
+    return _needs_preauth_result(facility, target, otp_ok=otp_ok)
 
 
 _LEAD_ERROR_CAP = 300  # of the dropped config's failure, in the next answer's opening
@@ -193,6 +257,13 @@ def _venv_note(fac) -> str:
     return f"built hpc-bridge's endpoint venv {res.path} ({res.reason}){aside}. "
 
 
+def _start_note(fac) -> str:
+    """What this bring-up's start did beyond starting: it waited out a dead manager's pid file
+    (`RemoteEndpointCLI.start_note`)."""
+    note = getattr(getattr(fac, "cli", None), "start_note", "")
+    return note if isinstance(note, str) else ""
+
+
 def _master_alive(target) -> bool:
     """Is a shared SSH connection (ControlMaster) already open for `target`? `ssh -O check` against its socket."""
     import subprocess
@@ -217,9 +288,6 @@ def _tcp_answers(host: str, port: int = 22, timeout_s: float = 3.0) -> bool:
         return False
 
 
-_ALIAS_PROBE = _tcp_answers  # injectable: tests replace it; production probes the alias's sshd port
-
-
 async def _online_endpoint(fac) -> str | None:
     """UUID of an online endpoint of ours at `fac`, asked of the Globus web service only — NO SSH. None when
     there is none, or the facility cannot say (no finder, no profile, a web error: `find_online_endpoint`
@@ -238,13 +306,17 @@ def _drop_dead_pin(fac) -> bool:
     """A login-node PIN (endpoints.json) that no longer answers is dropped, so the next connect goes
     back to the facility's canonical host — pins used to be permanent (vault audit 2026-09-03). Only
     an UNREACHABLE host qualifies: a refused login keeps the pin (the host is fine; the access isn't).
-    True when a pin was in use and got dropped."""
+    True when a pin was in use and got dropped.
+
+    The facility's host is probed where ssh connects for it: the HostName `rebind` resolved for the alias (`ssh -G`,
+    kept on the target as its HostKeyAlias). An ssh-config Host such as `perlmutter` is no name a resolver knows, so a
+    probe of the alias itself read as a client-side outage and kept the dead pin (Perlmutter report 2026-10-29, #1)."""
     store, alias = getattr(fac, "store", None), getattr(fac, "alias", None)
     target = getattr(getattr(fac, "cli", None), "target", None)
     name = getattr(getattr(fac, "profile", None), "endpoint_name", None)
     if store is None or not alias or target is None or not name or getattr(target, "host", alias) == alias:
         return False
-    if not _ALIAS_PROBE(alias):
+    if not _tcp_answers(getattr(target, "host_key_alias", None) or alias):
         # The facility's canonical host doesn't answer either: a CLIENT-side outage (VPN off, no network),
         # not a dead pin. Dropping it would send teardown/login_shell to the round-robin alias later
         # and orphan the endpoint the pin protects (review 2). Keep the pin.
@@ -399,6 +471,7 @@ async def _connect(
         # this session's config, kept from here so a connect while it comes up keeps polling it (and a one-time-code
         # handoff resumes it); on disk only once PROVEN (below); dropped if it fails on the login node first
         app.session_facilities[facility] = entry
+        app.from_cache.pop(facility, None)       # the session's config is this one, not the cache's
         app.failed_details.pop(facility, None)  # a new config replaces the one that failed
         app.details_started.discard(facility)   # …and has not started yet
         if details.ssh_host:  # persist for LOCAL DISCOVERY — but only once the login shape is PROVEN warm
@@ -407,6 +480,13 @@ async def _connect(
         if failed is not None and not ssh_host:
             ssh_host = failed.ssh_host  # the host the dropped details= named: the facility is resolved afresh for it
         entry = app.session_facilities.get(facility)  # never the dropped config: _drop_failed_details took it out
+        if entry is not None and ssh_host and ssh_host != entry.ssh_host:
+            # the call names another host than the config this session keeps: resolved afresh for that host, never the
+            # kept config silently (Perlmutter report 2026-10-29, #1: a retry naming the facility's own host went to the
+            # kept config's dead login node again)
+            entry = None
+        if entry is None and not ssh_host:
+            ssh_host = app.from_cache.get(facility)  # a config read from facilities.json and dropped: that record again
         session_scoped = entry is not None  # read before the lock: checked again once it is held (below)
         # the rewrite of the session's own config, said until a result carries it — never a dropped config's (its note
         # went with it: _drop_failed_details)
@@ -434,7 +514,9 @@ async def _connect(
                 try:
                     cached_details, rewrites = binding._directive_details(FacilityDetails(**cached))
                     entry = binding._entry_from_details(facility, cached_details)
+                    _forget_kept_config(app, facility)  # one kept for another host (the call named this one)
                     app.session_facilities[facility] = entry
+                    app.from_cache[facility] = ssh_host
                     session_scoped = True
                     directive_note = _directive_note(rewrites)  # a bare option cached by an earlier plugin
                     if directive_note:
@@ -457,12 +539,14 @@ async def _connect(
                 "HPC_BRIDGE_SSH_HOST) to probe it, or supply details= directly.", app=app,
                 proposal_lead=lead)
         if entry is None:
+            # the registry answered and knows no such facility, and no record is cached: the reuse ladder's facility
+            # endpoint rung does not apply, so our own endpoint for the host is asked for before any SSH (`reattach`)
             return await _propose_or_ask(
                 facility, ssh_host,
                 f"{facility!r} isn't in the catalog. Give me its SSH host (ssh_host=… or "
                 "HPC_BRIDGE_SSH_HOST) and I'll probe the login node to propose a config, or supply "
                 "details= directly (or list_facilities() if you meant a catalogued one).", app=app,
-                proposal_lead=lead)
+                proposal_lead=lead, reattach=True)
     reason = binding._unsupported_entry_reason(entry)
     if reason is None and entry.allocation is not None and entry.allocation.parser not in PARSERS:
         reason = (
@@ -480,6 +564,8 @@ async def _connect(
     try:
         # off the loop: it may run `ssh -G` (a subprocess with a 10 s timeout) to read ~/.ssh/config
         fac = await asyncio.to_thread(binding._facility_from_entry, entry, account=(preset or ""))
+        if isinstance(getattr(fac, "ghosts", None), set):   # a ghost the reattach found is not re-adopted
+            setattr(fac, "ghosts", app.ghost_endpoints)  # noqa: B010 - an SSH facility's attribute, not the protocol's
     except Exception as exc:  # noqa: BLE001 - a facility that cannot be built (bad entry, store I/O) is a structured failure
         return ConnectFacilityResult(
             phase="failed",
@@ -519,6 +605,8 @@ async def _connect(
         if ssh_left is not None and old_eid is not None:  # until a confirmation or a stop there (warmth, server)
             app.ssh_left[old_eid] = ssh_left
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's runners and handles are gone
+        # …and a repair of it, cancelled there: unwound before this binding brings anything up (review round 2)
+        await warmth._settle_env_repairs(app)
         # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
         queued_left = 0 if old_mep or old_eid is None else warmth._unresolved_count(
             app, old_eid, await warmth._read_checks(old_eid, 2.0))
@@ -574,14 +662,20 @@ async def _connect(
             # discovery probe knew this; the registry/cached bootstrap path did not (Expanse, live 2026-09-04 —
             # a curated MFA entry came back NO SSH ACCESS and the agent went hunting in ~/.ssh/config).
             if target is not None and key_accepted_second_factor_pending(str(exc)):
-                app.pending_preauth = (facility, target)
-                app.preauth_resume = f"connect_facility({facility!r})"
-                return _needs_preauth_result(facility, target, otp_ok=True)
+                return _preauth_handoff(app, facility, target, entry, otp_ok=True)
             notice = _explain_provision_error(exc, fac)
+            # So is any denial that offers a password or keyboard-interactive on a host this user has PROVEN access to
+            # (a facilities.json record): NERSC is password + one-time code, and its denial still lists publickey
+            # (Perlmutter report 2026-10-29, #2). A stranger whose key is refused on a 2FA site (Anvil) has no such
+            # record: still NO SSH ACCESS.
+            if (target is not None and notice.startswith("NO SSH ACCESS") and is_interactive_auth_failure(255, str(exc))
+                    and _access_proven(entry)):
+                return _preauth_handoff(app, facility, target, entry, otp_ok=offers_one_time_code(str(exc)))
             if notice.startswith(("CANNOT REACH", "UNKNOWN HOST KEY")) and await asyncio.to_thread(_drop_dead_pin, fac):
                 notice += " (The remembered login-node pin was dropped: the next connect resolves the facility's host afresh.)"  # noqa: E501
             if _failure_of_the_config(exc):  # the login node ran the config and refused it: not run again unasked
                 notice += _drop_failed_details(app, facility, notice, entry)
+            _drop_cached_config(app, facility, entry)
             return ConnectFacilityResult(phase="failed", facility=facility, notice=notice)
         if block == "warm" and _session_is_ours(app, facility, entry):  # never another connect's waiting config
             _commit_proven_facility(app, facility)
@@ -591,7 +685,7 @@ async def _connect(
     sel_note = getattr(fac, "select_note", "")  # select_options a reused endpoint's older template does not render
     reuse_note = (login_note + presets_note + directive_note + _reuse_note(app, facility, app.state.reused, fac)
                   + (wi_note if isinstance(wi_note, str) else "") + (sel_note if isinstance(sel_note, str) else "")
-                  + _venv_note(fac))
+                  + _venv_note(fac) + _start_note(fac))
     # `reused` in the RESULT means "reattached to an endpoint from before this session" — our own
     # just-started endpoint re-found online is not a reuse the agent should report as one
     reused = app.state.reused and facility not in app.bootstrapped_facilities
@@ -752,17 +846,31 @@ async def _connect_mep(app: AppCtx, facility: str, fac, *, left: bool = False) -
 
 async def _propose_or_ask(
     facility: str, ssh_host: str | None, ask_notice: str
-, *, app: AppCtx | None = None, proposal_lead: str = "") -> ConnectFacilityResult:
+, *, app: AppCtx | None = None, proposal_lead: str = "", reattach: bool = False) -> ConnectFacilityResult:
     """Index miss + no details: if we have an SSH host, probe the login node and PROPOSE a draft
     config; otherwise ask the agent for the host (SSH access is the one irreducible input). The
     discovery target carries the same ControlMaster socket as the later bootstrap, so probing warms
     the master the bootstrap then rides — no extra authentication. `proposal_lead` opens a proposal's notice, beyond
-    its cap, so no note is cut for it (`_failed_details_lead`; `_connect_facility` opens every other answer with it)."""
+    its cap, so no note is cut for it (`_failed_details_lead`; `_connect_facility` opens every other answer with it).
+
+    `reattach` (the registry answered and knows no such facility, and no record is cached — a new laptop): our own
+    endpoint for the host is asked for first, over the web, and when its login worker answers the same probe runs
+    THROUGH it (`_probe_through_endpoint`) — zero SSH; a ghost or no endpoint falls back to the SSH probe."""
     host = (ssh_host or config.ssh_host() or "").strip()
     if not host:
         return ConnectFacilityResult(
             phase="needs_facility_details", facility=facility, notice=ask_notice
         )
+    fallback = ""
+    if reattach and app is not None:
+        got = await _probe_through_endpoint(app, facility, host)
+        if isinstance(got, tuple):
+            draft, notes, name, eid = got
+            lead = (f"found your endpoint {name} ({eid}) online for {host} and ran the probe THROUGH it — zero "
+                    "SSH, nothing bootstrapped; the config it proposes is what a reconnect brings up on that same "
+                    "endpoint. ")
+            return _proposal(app, facility, draft, notes, lead=proposal_lead + lead, reused=True)
+        fallback = got or ""
 
     try:
         control_dir, persist = config._control_settings()
@@ -781,19 +889,28 @@ async def _propose_or_ask(
             # never a stale "teardown_endpoint()"; and WITH the host: an un-catalogued facility resumed without it
             # resolves to nothing and answers needs_facility_details (review 2026-10-10)
             app.preauth_resume = f"connect_facility({facility!r}, ssh_host={host!r})"
-        return _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
+        handoff = _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
+        handoff.notice = fallback + (handoff.notice or "")   # why the endpoint was not used instead, when one is online
+        return handoff
     except Exception as exc:  # noqa: BLE001 - probe/connect/creds failure -> structured result
         # The same first-contact explanation the bootstrap gives (stranger's walk): a refused SSH is
         # "NO SSH ACCESS to <host> as <user>" with the remedies, not a raw rc=255 dump.
         return ConnectFacilityResult(
             phase="failed",
             facility=facility,
-            notice=_explain_provision_error(
+            notice=fallback + _explain_provision_error(
                 exc, host=host, user=config.ssh_user(),
-                fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}"[:400],
+                fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}",  # bounded by its ends
             ),
         )
-    notice = proposal_lead + (
+    return _proposal(app, facility, draft, notes, lead=proposal_lead + fallback)
+
+
+def _proposal(app: AppCtx | None, facility: str, draft: FacilityDetails, notes: list[str], *, lead: str = "",
+              reused: bool = False) -> ConnectFacilityResult:
+    """The probe's draft as a proposal for the user to confirm (`lead` opens its notice beyond the cap). `reused`: the
+    probe ran through the user's online endpoint, not over SSH."""
+    notice = lead + (
         "probed the login node and proposed this config — review/correct it WITH THE USER "
         "(confirm the flagged fields, above all `interface`), then call connect_facility(details=…). "
         "Leave env_setup OUT of details= unless the user wants to change it: the server keeps the proposed one. "
@@ -807,9 +924,151 @@ async def _propose_or_ask(
     return ConnectFacilityResult(
         phase="proposed_facility_details",
         facility=facility,
+        reused=reused,
         proposed_details=draft,
-        notice=notice[:_PROPOSAL_CAP + len(proposal_lead)],
+        notice=notice[:_PROPOSAL_CAP + len(lead)],
     )
+
+
+# How a new laptop's reattach waits for its online endpoint's login worker (`_probe_through_endpoint`). The whole of
+# it — the wait, then the probe through the worker — stays within `_REATTACH_BUDGET_S`, so the SSH probe it may fall
+# back to (`discover_facility_details`: its own 120 s ssh bound) still ends inside the ~300 s a tool call may run in the
+# clients that drive hpc-bridge (config.STOP_CALL_BUDGET_S's reasoning). A check that is still queued is waited on (the
+# runner never resubmits one in flight); a refused one (the web service's transient 409 conflict) is sent again after
+# a back-off that grows from `_REATTACH_BACKOFF_S`; any other answer ends the wait — the manager answered (review round
+# 1, 2026-10-31: the loop resent a check on every pass, 433 tasks in 0.5 s against a manager that failed fast, without
+# yielding the event loop when the failure came back at once).
+_REATTACH_WAIT_S = 60.0
+_REATTACH_BUDGET_S = 120.0
+_REATTACH_CANARY_S = 15.0
+_REATTACH_BACKOFF_S = 2.0
+_REATTACH_BACKOFF_MAX_S = 10.0
+_monotonic = time.monotonic   # indirections, so a test drives the real loop on a fake clock
+_sleep = asyncio.sleep
+
+
+def _endpoint_client():
+    from globus_compute_sdk import Client
+
+    return Client()
+
+
+async def _online_for_host(app: AppCtx, facility: str, host: str) -> tuple[str, str | None, str] | None:
+    """(name, id, why) for our endpoint for `host`: the id when the Globus web service lists it ONLINE and owned by this
+    identity — no SSH — else None, with `why` it is not used (none online under that name, or the service could not be
+    asked: its error). Its name is the one a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else
+    `hpc-bridge-<host>`, `binding._session_endpoint_name`). An id this session found to be a ghost is not used again
+    (`AppCtx.ghost_endpoints`). None: not asked — with no Globus login gate (a hermetic test, a dev server) the SDK's
+    Client on a store with no login runs its own command-line login on the MCP transport (the catalog read once did)."""
+    from .facility.remote import online_endpoint_named
+
+    if app.login_flow is None:
+        return None
+    name = (config.endpoint_name() or "") or binding._session_endpoint_name(host)
+    eid, error = await online_endpoint_named(name, _endpoint_client)
+    if error is not None:
+        return name, None, (f"the Globus web service could not say whether your endpoint {name} is online ({error}): "
+                            "probed over SSH instead. ")
+    if eid is None:
+        return name, None, f"no endpoint of yours named {name} is online: probed over SSH. "
+    if eid in app.ghost_endpoints:
+        return name, None, (f"your endpoint {name} ({eid}) is listed online, but this session found its login worker "
+                            "does not answer (a stale registration): probed over SSH instead. ")
+    return name, eid, ""
+
+
+def _answered(error: str) -> str:
+    """What an online endpoint's manager answered a check with — a failure it returned, not a silence."""
+    from .notices import broken_endpoint_env
+
+    cause = broken_endpoint_env(error)
+    if cause:
+        return (f"its manager answered, but could not start a login worker ({cause}): the environment it runs from is "
+                "broken. Probed over SSH instead; once the config is confirmed, hpc-bridge reconnects to that same "
+                "endpoint and repairs its environment (the repair needs SSH anyway). ")
+    return (f"its manager answered the check with an error ({' '.join(error.split())[:240]}): probed over SSH "
+            "instead. ")
+
+
+async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
+                                  ) -> tuple[FacilityDetails, list[str], str, str] | str | None:
+    """A new laptop's first connect (no record, not in the registry): when our endpoint for `host` is online
+    (`_online_for_host`), wait for its login worker to answer a check and run discovery's own probe THROUGH it — the
+    login node's answers without an SSH login, which on a password + one-time-code site (nersc) is the user's terminal
+    (the returning-user review, 2026-10-30). The login worker runs on the template the endpoint was configured with: the
+    check sends no interface or env_setup of ours (`shapes.shape_config("login")` alone), so the template's own defaults
+    — the config that brought it up — apply.
+
+    The wait: a check still queued is waited on, a transient refusal sent again after a growing back-off, any other
+    answer ends it (said: the manager is alive — a broken environment is the repair's, after the confirm). No passing
+    check within `_REATTACH_WAIT_S` — silence, or the service's "busy" (a 409 is not the manager's answer) — is a ghost
+    (#37: "online" is the heartbeat the service last saw): recorded in `AppCtx.ghost_endpoints`, so the confirm that
+    follows does not adopt it again without SSH; a later check that passes clears it. Everything is bounded by
+    `_REATTACH_BUDGET_S`. Returns (draft, notes, name, id); otherwise None (not asked) or why the SSH probe runs."""
+    import shlex
+
+    from .discovery import _probe_script, parse_probe
+    from .notices import _transient_dispatch_failure
+    from .shapes import shape_config
+
+    found = await _online_for_host(app, facility, host)
+    if found is None:
+        return None
+    name, eid, why = found
+    if eid is None:
+        return why
+    t0 = _monotonic()
+    deadline = t0 + _REATTACH_WAIT_S
+    runner = app.runner_factory(eid, user_endpoint_config=shape_config("login"))
+    try:
+        backoff, busy, silent = _REATTACH_BACKOFF_S, "", False
+        while True:
+            left = deadline - _monotonic()
+            check = await runner.canary(timeout=max(1.0, min(_REATTACH_CANARY_S, left)))
+            if check.ok:
+                break
+            error = str(check.error or "")
+            if error != "timeout" and not _transient_dispatch_failure(error):
+                return f"your endpoint {name} ({eid}) is listed online and {_answered(error)}"
+            busy = busy or (error if error != "timeout" else "")
+            silent = silent or error == "timeout"
+            if _monotonic() >= deadline:
+                # No check passed: not adopted again without SSH, whatever "busy" answers came — a 409 is the web
+                # service's, not proof the manager lives (review round 2). A later check that passes clears it.
+                app.ghost_endpoints.add(eid)
+                said = f" ({' '.join(busy.split())[:160]})" if busy else ""
+                if busy and not silent:
+                    return (f"your endpoint {name} ({eid}) is listed online, but the service kept answering that it is "
+                            f"busy for {_REATTACH_WAIT_S:.0f} s{said} and no check passed: probed over SSH instead. ")
+                also = f"; the service also answered that it is busy{said}" if busy else ""
+                return (f"your endpoint {name} ({eid}) is listed online, but its login worker did not answer within "
+                        f"{_REATTACH_WAIT_S:.0f} s (a stale registration, or a manager that is gone{also}): probed "
+                        "over SSH instead. ")
+            # a still-queued check is waited on by the next canary itself; a refused one is sent again only after a
+            # back-off — and either way the loop yields (a fake or a fast failure must not starve the heartbeat)
+            pause = 0.5 if error == "timeout" else backoff
+            if error != "timeout":
+                backoff = min(backoff * 2, _REATTACH_BACKOFF_MAX_S)
+            await _sleep(min(pause, max(0.0, deadline - _monotonic())))
+        left = _REATTACH_BUDGET_S - (_monotonic() - t0)
+        try:
+            res = await asyncio.wait_for(runner.run(f"bash -lc {shlex.quote(_probe_script())}"), max(1.0, left))
+        except TimeoutError:
+            return (f"your endpoint {name} ({eid}) answered, but the probe through it did not finish within "
+                    f"{max(1.0, left):.0f} s: probed over SSH instead. ")
+        out = str(getattr(res, "stdout", "") or "")
+        if "HPCB_PROBE_BEGIN" not in out:
+            return (f"your endpoint {name} ({eid}) answered, but the probe did not run through it "
+                    f"(exit {getattr(res, 'returncode', '?')}): probed over SSH instead. ")
+        draft, notes = parse_probe(out, ssh_host=host)
+        return draft, notes, name, eid
+    except Exception as exc:  # noqa: BLE001 - the SSH probe is the fallback; why is said
+        return (f"your endpoint {name} ({eid}) is listed online, but probing through it failed "
+                f"({type(exc).__name__}: {str(exc)[:160]}): probed over SSH instead. ")
+    finally:
+        close = getattr(runner, "close", None)
+        if callable(close):
+            close()
 
 
 _PROPOSAL_CAP = 1800  # the proposal's notice; its fixed head is under 600 chars

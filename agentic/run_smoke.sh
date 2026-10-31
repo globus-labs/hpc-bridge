@@ -166,6 +166,10 @@ if [ "$OPERATOR" = "hermes" ] || [ "$OPERATOR" = "codex" ] || [ "$OPERATOR" = "p
 fi
 
 if [ -z "${HPCB_SKIP_BUILD:-}" ]; then   # the suite runner builds once, then sets this
+  # the older releases' trees, which the image installs beside this code (harness/prev_release.py; the returning-user
+  # cells' first session runs one): `previous` (from pyproject's version history) and each pinned version
+  python3 "$REPO_ROOT/agentic/harness/prev_release.py" export "$REPO_ROOT" \
+    || echo "ERROR: the older hpc-bridge releases could not be exported (the reason is above) — a cell that runs one is SETUP FAILED" >&2
   echo "building jail image (hpc-bridge-agentic)…"
   docker build --provenance=false -t hpc-bridge-agentic --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \
     -f "$REPO_ROOT/agentic/Dockerfile" "$REPO_ROOT" >/dev/null
@@ -237,6 +241,8 @@ fi
 for knob in HPCB_RELAUNCH_PHASE HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S HPCB_RELAUNCH_HOLD_S; do
   [ -n "${!knob:-}" ] && ARGS+=( -e "$knob" )
 done
+# returning_user's cell (a row of agentic/harness/returning_cells.tsv, read in the jail by the scenario): default c01
+[ -n "${HPCB_RETURNING_CELL:-}" ] && ARGS+=( -e HPCB_RETURNING_CELL )
 if [ -n "$HPCB_T_NETWORK" ]; then
   ARGS+=( --network "$HPCB_T_NETWORK" )   # the fake cluster's compose network: the jail reaches `login:22` directly
 fi
@@ -281,6 +287,28 @@ if [ -n "${HPCB_T_CATALOG_CMD:-}" ]; then
   ARGS+=( -v "$CATALOG_FILE":/run/hpcb/catalog.yaml:ro -e HPC_BRIDGE_CATALOG_FILE=/run/hpcb/catalog.yaml )
 fi
 
+# ---- NODE ACTIONS (scenario NODE_ACTIONS; harness/node_actions.py) ----
+# A scripted cell may take one login node away mid-run (its sshd stops answering on the network) and give it back:
+# the host side answers the jail's requests through the runs volume, as root in that node's container (`docker exec`),
+# and undoes what it did when it is stopped — by the EXIT trap below — so no later cell meets a node left off.
+NODE_PID=""; NODE_REQ=""
+stop_nodes() {
+  if [ -n "$NODE_PID" ]; then kill "$NODE_PID" 2>/dev/null; wait "$NODE_PID" 2>/dev/null || true; fi
+  NODE_PID=""
+  [ -z "$NODE_REQ" ] || rm -f "$NODE_REQ" "$NODE_REQ.done" "$NODE_REQ.pid"
+}
+if [ -n "${HPCB_KNOB_NODE_ACTIONS:-}" ]; then
+  [ "$HPCB_T_NAME" = fake ] || { echo "ERROR: scenario '$SCENARIO' declares NODE_ACTIONS: the fake target only"; exit 2; }
+  NODE_REQ="$RUNS_HOST/.node-actions-$RUNID"
+  NODE_HOSTS="$(python3 -c 'import json, sys; print(",".join(json.loads(sys.argv[1]).get("login_hosts") or ["login"]))' "$HPCB_T_CAPS_JSON")"
+  trap 'stop_nodes' EXIT   # replaced below by the full trap; covers an exit between here and there
+  python3 "$REPO_ROOT/agentic/harness/node_actions.py" --req "$NODE_REQ" --user "$SSH_USER" --hosts "$NODE_HOSTS" \
+    --parent-pid "$$" &
+  NODE_PID=$!
+  ARGS+=( -e HPCB_NODE_ACTIONS="/work/hpc-bridge/agentic/runs/.node-actions-$RUNID" )
+  echo "node actions: served on the host for login nodes $NODE_HOSTS (pid $NODE_PID)"
+fi
+
 # ---- the ADMIN TAP (scenario ADMIN_TAP; harness/admin_tap.py) ----
 # The scheduler as its admin sees it, sampled every few seconds for the whole cell through the target's admin channel
 # (fake: docker exec into the controller, as root) into the runs volume, where the scenario's WORLD_CHECKS read it in
@@ -298,7 +326,7 @@ if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   eval "TAP_ARGV=($HPCB_T_ADMIN_ARGV)"
   TAP_FILE="$RUNS_HOST/.admin-tap-$RUNID.jsonl"
   : > "$TAP_FILE"
-  trap 'stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
+  trap 'stop_nodes; stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
   # --parent-pid: a run_smoke.sh killed outright never runs its EXIT trap; the tap then ends itself and removes its files
   python3 "$REPO_ROOT/agentic/harness/admin_tap.py" --out "$TAP_FILE" --user "$SSH_USER" --knob "$HPCB_KNOB_ADMIN_TAP" \
     --parent-pid "$$" -- "${TAP_ARGV[@]}" &
@@ -332,13 +360,13 @@ if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}${HPCB_KNOB_ADMIN_CLEANUP:-}" ]; then
     [ -z "${HPCB_KNOB_ADMIN_CLEANUP:-}" ] || admin_run cleanup "$HPCB_KNOB_ADMIN_CLEANUP" || echo "WARN: admin cleanup incomplete — check the cluster's accounting for $SSH_USER"
   }
   if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}" ]; then
-    trap 'stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
     admin_run setup "$HPCB_KNOB_ADMIN_SETUP" || { echo "ERROR: admin setup failed — not launching the cell"; exit 1; }
   else
-    trap 'stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
   fi
 else
-  trap 'stop_tap; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+  trap 'stop_nodes; stop_tap; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
 fi
 
 # The cell runs as a CHILD so a SIGTERM/SIGINT to this script reaches it (docker run proxies the signal into the

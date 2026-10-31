@@ -61,6 +61,127 @@ installed plugin only when that version changes); git tags mark releases.
   only on the first). Not yet run live.
 
 ### Fixed
+- **A new laptop reattaches with zero SSH, a venv repair gets past a dead login node, and a policy refusal is no
+  longer read as an account error (the returning-user cells, second round, 2026-10-30).** Each was proven first by a
+  test that failed on the first round's code.
+  - **A new laptop reattaches with zero SSH.** Before, a connect with no `facilities.json` record and a facility the
+    registry does not know always probed the login node over SSH. On a password + one-time-code site that meant the
+    user's terminal, even with their endpoint online. Now hpc-bridge first asks the Globus web service whether an
+    endpoint it owns is online under the name a bring-up for that host registers (`hpc-bridge-<ssh_host>`, or
+    `HPC_BRIDGE_ENDPOINT_NAME`).
+    - If one is, it waits up to 60 s for that endpoint's login worker to answer. The worker uses the endpoint's own
+      template defaults; nothing of ours is sent.
+    - The same discovery probe then runs THROUGH the endpoint. The proposal says so and carries `reused: true`.
+    - Confirming the proposal reattaches over the web. No SSH happens before the reattach.
+    - A listed endpoint whose worker never answers is treated as a ghost (`manager_online` reads "online" for a dead
+      endpoint, #37). In that case, or when nothing is online, the SSH probe runs as before and the notice says why.
+    - A registry facility, including a facility endpoint, never takes this path. Neither does a registry outage,
+      because the facility could be a catalogued one.
+  - **A venv repair gets past a dead login node.** When the login node a repair is pinned to does not answer at all
+    (connection refused, no route, timed out), hpc-bridge rebuilds the venv through the facility's own host: the
+    home is shared. A refused login is not "does not answer".
+    - Once that host has answered, the dead pin is dropped and the notice says so, as #236 does for a connect.
+    - The manager on the closed node cannot be stopped from here. If its pid file is still being refreshed, it is
+      left running and starts its next user endpoints from the rebuilt venv. If it is gone, the endpoint is started
+      again on the node the facility's host reaches.
+    - If the facility's host asks for the user's own login (the key revoked; a password + one-time code),
+      `ensure_endpoint_up` hands it to the user's terminal: a new `preauth_command` field, a notice, and
+      `complete_preauth` for a code. The repair finishes on the next call, over that connection.
+  - **A policy refusal is no longer read as an account error.** `sbatch --test-only` starts every refusal with
+    "allocation failure:", a site filter's policy refusal included. #236's account test matched the bare word, so a
+    probe whose every shape the site refused said "not verified — the scheduler's test needs an account". It then
+    kept a partition the scheduler had refused, without the node type the site requires. Now only real account
+    errors count: Slurm's "Invalid account or account/partition combination specified", and a site's "You must
+    specify an account" / "No valid account" / "Please specify a project". Such a probe now proposes UNVERIFIED and
+    quotes the scheduler's reply.
+  - **Review round 1 (2026-10-31): nine defects in the above, each proven first by a test that fails on the
+    first version.**
+    - The reattach's wait sent a new check on every pass (433 in 0.5 s against a manager that failed fast). It
+      starved the event loop when a check failed at once, and called a manager that answered with an error a ghost.
+      Now a queued check is waited on, and a "busy" refusal is retried after a growing back-off. Any other answer
+      ends the wait and says what it was; a broken environment is repaired after the confirm. Every pass yields, and
+      the wait plus the probe stay within 120 s.
+    - Nothing online, and a web or login error, are said before the SSH probe. A ghost found by the reattach is not
+      adopted again by the bring-up of the confirm that follows.
+    - A probe through the endpoint's own login worker met hpc-bridge's keyed venv on PATH and proposed
+      `source …/activate`, a hand-written line. Nothing then built, checked or repaired that venv. Now it proposes
+      hpc-bridge's own line.
+    - A pinned repair waits for the stopped manager to exit, by its pid file, before starting it again. It claims a
+      restart only when `list` shows one, and is done only then; a repair that did not finish is tried once more.
+    - "Still runs on the dead node" is decided by watching the pid file move across a touch interval, never by one
+      read of its age.
+    - A dead pin is cleared from the endpoint record, not the record deleted. `seeded_credentials` is kept, and a
+      restart is pinned to the node it started on.
+    - The repair waits while a task runs on the endpoint it would restart, and says so. It runs in its own task, so a
+      cancelled call does not leave the manager stopped.
+    - A pid-file read that times out is "unknown", never a bare `TimeoutError`.
+    - The repair's note is said on every answer that follows, a refused block's `down` included.
+    - The re-run of c08 found a tenth: right after the repair, the service answered RESOURCE_CONFLICT while the user
+      endpoints started again. Counted with one from before the repair, three read as "NO LONGER transient" and the
+      block went down. Now the conflict streak starts afresh at a repair, and conflicts within 120 s of it are not
+      counted.
+  - **Review round 2 (2026-10-31): six more, each proven first by a test that fails on round 1's version.**
+    - A repair left running by a cancelled call outlived a teardown. After the teardown answered `down`, the repair
+      reached its start and registered the endpoint again. A teardown, a re-bind and a detach now cancel the repair
+      first, and the teardown waits for it to unwind before the login-node ops. The repair also asks, before it stops
+      or starts a manager, whether the session still holds that endpoint. A cancelled repair does not count as an
+      attempt.
+    - A restart past a dead pin forgot the dead node before it started the manager. When the start failed, the retry
+      answered "not restarted (no pin says which login node runs it)" as a success, and the endpoint was marked
+      repaired. The dead node is now kept until the restart has happened.
+    - A ghost mark is cleared when a check on that endpoint passes. Before, a slow cold start called a ghost was
+      skipped for the rest of the session, and every later connect bootstrapped over SSH.
+    - A reattach that ends with no passing check marks a ghost even when the service answered "busy". That 409 comes
+      from the web service and does not prove the manager is alive.
+    - The repair's busy check now counts a command still in its sync-wait on a runtime that a release retired, as the
+      stop already did.
+    - The web lookup reads every registration of the endpoint's name, and reports an error only when none is online.
+- **A manager killed hard comes up again, a venv deleted under a running manager is rebuilt, and a facility reattached
+  over the web is remembered (found by the returning-user cells, 2026-10-30).** Each was proven first by a test that
+  failed for the reason the cells met.
+  - **A start refused for a recent pid file waits it out.** A manager killed hard leaves its `daemon.pid` on the shared
+    home, and `globus-compute-endpoint start` refuses (exit 73) while that file is younger than three heartbeats (90 s
+    by default). hpc-bridge now reads the file's age and the endpoint's `heartbeat_period` and waits, inside the
+    connect when that is at most 150 s, then starts once more; a longer wait answers "connect again in N s". If the
+    file is touched during the wait, another instance is alive, perhaps on the other login node: hpc-bridge says so and
+    does not start a second one. It never deletes the pid file. The failure notice now quotes the endpoint log's own
+    line instead of the login shell's `.bashrc` output.
+  - **A broken endpoint environment is named and repaired.** A user endpoint that cannot start because its Python
+    cannot import (`No module named …`: the venv a running manager uses was deleted) is no longer reported as a config,
+    partition or queue problem, nor as "likely REJECTED". hpc-bridge rebuilds its venv over the bring-up's own channel,
+    restarts the manager on its pinned login node, and says what it did. Repair uses the free login shape; the spend
+    question is unchanged.
+  - **A reattach saves the config that worked.** A facility reached over the web (zero SSH) with no record in
+    `facilities.json` is saved there once a shell has run on it. A config that was only proposed is never saved.
+- **Left-over local state no longer traps a facility (a user's Perlmutter report on 0.1.20, 2026-10-29).** Each of these
+  was proven first by a test that failed for the reported reason.
+  - A remembered login-node pin that no longer answers is dropped again when the facility is reached through an
+    ssh-config `Host` alias. The check tested the alias as a DNS name, failed, read that as the client's own outage, and
+    kept the pin (`CANNOT REACH login22…` on every connect). It now tests the HostName ssh resolves.
+  - A cached facility whose bring-up fails is taken out of the session, so the next connect reads `facilities.json`
+    again (or runs discovery if the record was removed). An explicit `ssh_host` that differs from the kept config's host
+    is used, instead of the kept config running again. A config given with `details=` is still kept: it is the only copy.
+  - A cached facility at a password+OTP site (NERSC) refused for want of a key now hands off to the user's terminal
+    (`needs_preauth`), as first contact already did, instead of NO SSH ACCESS. This applies only where this user's
+    access was proven before (the cached record); a registry entry the user never reached keeps NO SSH ACCESS.
+- **The endpoint venv lives under the login node's own `$HOME`.** The default was `/home/<user>/hpc-bridge/gce-venv`,
+  which is not the home on NERSC (`/global/homes/…`) and is not writable there. The build, the probe's existing-venv
+  check and teardown now agree on `$HOME/hpc-bridge/gce-venv`. Where `$HOME` is `/home/<user>` nothing changes, and an
+  endpoint started on the old path gets no "different env_setup" note.
+- **A failure on the login node is quoted by its end.** `configure`, `start`, `list`, the discovery probe, the venv
+  transport and teardown kept the head of stderr, where a user's shell startup noise (Lmod, a `.gitconfig` lock)
+  pushed the real error out of the notice. They now quote the last lines that fit, marked as cut. A refusal behind a
+  long login banner is still read as NO SSH ACCESS, or as the handoff where one applies.
+- **`run_shell` says why a block has not come.** When the scheduler refused the block and the check's result was lost,
+  `ensure_endpoint_up` already quoted the refusal ("likely REJECTED", #213), but `run_shell(shape="compute")` kept
+  answering "allocating nodes…". Past a 45 s grace, its cold answer now carries the same probe evidence (likely
+  REJECTED, queued, HELD or finished), reusing a probe for up to a minute.
+- **Discovery proposes terms the scheduler takes.** The probe proposed Perlmutter's starred default partition `system`,
+  which NERSC's submit policy refuses. It now drops partitions that are down, root-only or closed to the user's groups,
+  and checks its pick with `sbatch --test-only` (free; nothing is submitted) in the same SSH round trip. When the pick
+  is refused, it tries a few terms built from what it found (the nodes' features as `--constraint`, no partition so the
+  scheduler routes the block) and proposes the first that is taken. When none is, the proposal is marked UNVERIFIED,
+  quotes the scheduler's reply and asks the user. `ensure_endpoint_up(partition="")` keeps a session's "no partition".
 - **A registry outage is said as one.** While Globus Search was down for maintenance (2026-10-24), `connect_facility("polaris")`
   answered "registry unavailable (SearchAPIError); give me this facility's SSH host" and `list_facilities` returned `[]`: the
   agent had to query the index itself to learn it was an outage, and was steered to SSH for a facility reached through
@@ -256,6 +377,98 @@ installed plugin only when that version changes); git tags mark releases.
   its release was confirmed.
 
 ### Testing
+- **Returning users: pairwise two-session cells on the fake `nersc` profile** (`agentic/harness/returning.py`;
+  `agentic/README.md`, "Returning users"). The combinatorial follow-up to the Perlmutter report (plugin 0.1.20,
+  2026-10-29), whose leftovers came stacked where #236's proofs seed one each.
+  - **The cells.** Session 1 is scripted on the cell's origin plugin: this checkout, or the release before it
+    (0.1.24 today; the Perlmutter replay pins 0.1.20), in the package index as that release saw it. Between the
+    sessions the world changes: the endpoint left running, stopped, killed hard long ago or just now, or torn down;
+    the pinned login node closed; the key revoked; local files deleted or wiped, or a new facility id; the venv or
+    the endpoint's directory deleted; the QOS retired; the token store gone; the host keys changed; another endpoint
+    version. Session 2 runs the current code toward hello world on a compute node and does the user's part when
+    asked. 22 scripted cells are pairwise over those 10 factors (`pairwise.py`, the table checked in as
+    `returning_cells.tsv`), every changed level one that bites, plus three agent cells: the report replayed, all well,
+    a new laptop.
+  - **What every cell must hold:** hello world on a compute node by the compute shape, a dead pin met at most once,
+    an explicit `ssh_host` kept, at most one live endpoint (processes on every login node, the cloud's view),
+    `~/.hpc-bridge` in today's format, a bounded number of calls. Each factor level adds its own check, gated in every
+    cell that changes it; the same endpoint and no rebuild of session 1's venv are gated wherever nothing deleted them.
+    The agent cells also check that the agent never hand-edits `~/.hpc-bridge` or `~/.globus_compute`.
+  - **Harness:**
+    - A `PHASES` entry may name a scripted phase and its server (`current`, `previous` or a pinned release), its
+      server's env, a condition, and whether it is the premise (a premise or a world change between phases that
+      fails stops the chain: SETUP FAILED, `harness:chain` says why).
+    - `INTERPHASE_SETUP` may hold callables.
+    - Such a chain's bundle marks each phase, and `regrade.py` reads each with its operator's reader.
+    - Codex, Pi and Hermes drive a chain that opens with a scripted session.
+    - The image carries older releases (`prev_release.py`): `previous`, the newest release commit older than this
+      version in pyproject's history (the tags said 0.1.20, four releases back), and 0.1.20 pinned. A failed export
+      is an ERROR with its reason. `harness:phase_server` gates that a scripted phase ran the release it declared; the
+      head row keeps the server's whole argv.
+    - New node actions: `sshd_closed` (a login node closed, its processes kept), and `qos_retire` / `qos_restore`
+      (the nersc submit filter reads `/etc/slurm/retired_qos.conf`).
+    - A mixed chain's INFRA verdict reads only the operator's own phases.
+  - **The sweep:** `returning` is a script-only sweep profile (the nersc cluster, one row per cell); `nersc` runs the
+    three agent cells in every wave, then the report's proofs. A sweep that has built no image yet builds it before its
+    first scripted cell.
+  - **First run (2026-10-30, every scripted cell once): 15 of 20 OK.** The five failures are two product bugs, not
+    fixed here:
+    - A manager killed hard (`ended=killed`, its endpoint directory kept: c03, c05, c12, c18) is never brought up
+      again. Its `daemon.pid` stays on the shared home; every later `globus-compute-endpoint start` exits 73 with
+      nothing on either stream (the endpoint log: "Another instance of this endpoint is running. (Perhaps on another
+      login node?)"); and the notice quotes the login shell's `.bashrc` noise as the cause.
+    - A running manager whose venv was deleted (c09) is reused over the web, but cannot start a user endpoint ("No
+      module named 'jinja2'", exit 73). The notice says "fix the config/partition", then "likely REJECTED (e.g.
+      inactive allocation, wrong account, or bad queue)"; nothing rebuilds the venv.
+  - **After the fixes and the review (2026-10-30, the 22 cells of today's table, each once on the fixed code): 21 of
+    22 OK.** Red first: on the unfixed code every cell that restarts a manager killed just now failed (exit 73, the
+    `.bashrc` noise quoted), and the review's probes became tests that fail on the first harness (a login-shape hello,
+    a silently rewritten `known_hosts` on a reuse, probes after a reattach, a read with `2>/dev/null` taken for an
+    edit, a facility id taken for another host's config, the cell's levels lost on a regrade). Three harness faults the
+    new runs found were fixed and their cells re-run: session 2's user now names the node type a fresh proposal
+    dropped (c02, c05, c15), `known_hosts` is compared by the plugin's own names, not the whole file the harness'
+    channel also writes (c04), and a stop's "reconnecting is zero-SSH" no longer reads as SSH (c08). The one failure
+    is a product gap: c08 (a running manager whose venv was deleted, its pinned node closed, the key revoked) —
+    the repair runs its venv check over the dead pin ("ssh: connect to host login01… Connection refused") and gives
+    up, where the shared home could be rebuilt through the other login node. The agent cells, once each under Pi on the
+    self-hosted qwen model: all well and the Perlmutter replay (session 1 on 0.1.20) OK; the new laptop's agent
+    stopped at the probed configuration for the user to confirm, as the proposal's notice says to, and no follow-up
+    turn answered it — the follow-up now runs when a turn ends on a proposal and carries the user's yes (not re-run).
+  - **Second round (2026-10-30, a fresh nersc cluster; the three fixes above): 21 of 22 scripted cells OK, the six
+    #236 proofs OK (four on nersc, two on site), the three agent cells OK (Pi on qwen).** c08 now reaches hello world: the repair rebuilt
+    the venv through `login` past the dead `login01`, after the user's login handed to their terminal. The manager
+    on `login01` was left running, its pid file refreshed. c08 still fails `ru_policy_surfaced`. Its previous-release
+    endpoint keeps one long-lived compute user endpoint, and the site's refusal there comes back as a task traceback
+    (`TaskExecutionFailed … executor.py`) that never quotes the scheduler. That is a product gap left open here.
+    c18 (record deleted, endpoint left running) and the new-laptop agent cell reattached with no SSH, through the
+    endpoint. Harness changes in this round:
+    - the scripted user acts on the probe's "likely REJECTED" only once the whole wait has passed;
+    - the user does their part for a repair's handoff (`preauth_command`);
+    - a login_shell refused before any SSH ("No facility connected yet") no longer counts as SSH;
+    - a probe made through the endpoint (`reused`) is not an SSH probe, and `ru_reattached` allows none.
+  - **After review round 1 (2026-10-31; the affected cells re-run on a fresh nersc cluster).**
+    - c18, c03, c05, c12, c13 and the new-laptop agent cell (Pi on qwen) are OK. The new-laptop cell found the
+      endpoint over the web with no SSH.
+    - c08 reaches hello world. The repair left the manager running on the closed `login01`; the pid file was seen
+      moving. It still fails `ru_policy_surfaced` (above).
+    - Its second run also failed `world:stop_honesty_no_pilot_left`: a pending pilot was left behind. It came from
+      the previous release's long-lived compute user endpoint, which starts another block for a queued check after a
+      cancel. The stop said so (`draining`: "only teardown_endpoint ends it").
+    - That run's first try went `down` on RESOURCE_CONFLICT right after the repair: the tenth defect, fixed above.
+  - **After review round 2 (2026-10-31; c08, c18 and the new-laptop agent cell on a fresh nersc cluster).**
+    - c18 and the new-laptop cell (Pi on qwen) are OK; `ru_reattached` passes with no SSH.
+    - c08 reaches hello world. The repair went past the dead pin and left the manager running. It fails only
+      `ru_policy_surfaced` (above); `stop_honesty_no_pilot_left` passes this run.
+- **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
+  - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
+    suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses
+    `-q` with `-p`.
+  - **The scenarios** (each failed on main for its bug's own reason before the fix): `stale_login_pin` and
+    `kept_entry_after_failure` on `site`; `cached_password_otp`, `home_outside_home`, `noisy_failure_tail` and
+    `partition_proposal_policy` on `nersc`.
+  - **New harness support:** scripts can take one login node's sshd off the network and back (`NODE_ACTIONS`), run
+    commands on the cluster mid-run (`ops.world`), and seed a login-node pin (`SEED_LOGIN_PINS`).
+  - The fake login node now takes each pool user's home from passwd instead of assuming `/home/<user>`.
 - **From the Claude paid pass (2026-10-24).** Three graders failed correct agents.
   - `esc_mid_call` counts the agent's own read of the node after the Esc (the marker written, or its `sleep` still live).
   - `fake_mep_username_not_account` reads the account a call used, so a poll repeating `confirm_spend=True` (whose

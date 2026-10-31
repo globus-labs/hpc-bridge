@@ -31,9 +31,13 @@
 # queued_check_relaunch on `default`, polaris_filesystems on `polaris` (the HELD pilot → the directive) and lmod_bootstrap
 # on `lmod` (a failed details= → the proposal) — paths a model may never take. The summary header names the model each
 # operator drives: --models for the Claude ones, HPCB_ALCF_MODEL for the free ones.
+# `returning` is a SWEEP profile, not a cluster one: it boots the `nersc` cluster and runs returning_user once per cell of
+# agentic/harness/returning_cells.tsv (the pairwise returning-user cells: HPCB_RETURNING_CELL), under the script
+# operator; `nersc` itself runs the three returning-user AGENT cells in its agent wave (any operator: each chain opens
+# with a scripted session), then the Perlmutter report's scripted proofs.
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep"
+MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep,slices,nersc,returning"
 OPERATORS=""; PAID_ONLY=""
 while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;;
   --operators) OPERATORS="$2"; shift 2;; --paid-only) PAID_ONLY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
@@ -62,6 +66,8 @@ cells() {  # cells <profile> -> the scenario list (and concurrency) for that pro
     hostile)  echo "canary_login_discovery,canary_compute_output 1" ;;  # per-node canary channels are shared → SERIAL, one at a time
     mep)      echo "fake_mep_compute,fake_mep_stop_names_block,fake_mep_no_account,fake_mep_username_not_account,term_switch_reasks,preset_account_scoped,terms_prestated,terms_wanted,fake_mep_stop_while_provisioning,mep_hand_batch_job,mep_hand_batch_job_ask 1" ;;
     pbs_mep)  echo "fake_pbs_mep_compute 1" ;;
+    nersc)    echo "returning_perlmutter_replay,returning_all_well,returning_new_laptop 1" ;;  # one at a time: a cell
+              # closes a login node, revokes the key and retires a QOS for the whole cluster
     *) echo "" ;;
   esac
 }
@@ -80,8 +86,15 @@ mep_no_account                the registry tier: the real globus-labs MEP + a se
 needs_login_paste             the registry tier: a logged-out connect to the real registry's globus-labs entry
 saturation                    globus1: holds every node for 25 min (re-homing it to fake is a later change)
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
-slice_request                 new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
-multinode_allocation          new 2026-10-24 (resource requests), scripted on `slices`: by hand until its first live pass, then a script_cell
+slice_request                 scripted only: a script_cell on `slices` (the script-only pass after the profiles)
+multinode_allocation          scripted only: a script_cell on `slices` (the script-only pass after the profiles)
+stale_login_pin               scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
+kept_entry_after_failure      scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
+cached_password_otp           scripted only: a script_cell on `nersc` (after its agent wave)
+home_outside_home             scripted only: a script_cell on `nersc` (after its agent wave)
+noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
+partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
+returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
 EXCLUDED
 }
 
@@ -125,14 +138,27 @@ done
 [ -z "${FREE_WAVE:-}" ] || echo "free wave: HPCB_ALCF_WAIT_S=${HPCB_ALCF_WAIT_S:-0} — each cell probes the ALCF endpoint first; an unhealthy one is recorded INFRA, not run" | tee -a "$SUMMARY"
 [ -z "$PAID_ONLY" ] || echo "paid only: the paid_only() cells, Claude operator" | tee -a "$SUMMARY"
 
-script_cell() {  # script_cell <profile> <scenario>: ONE script-operator cell (no model) on the cluster booted above
+BUILT=""   # set once an image was built in this sweep (by run_suite, or by the first scripted cell's run_smoke)
+script_cell() {  # script_cell <profile> <scenario> [cell]: ONE script-operator cell (no model) on the cluster booted above
   # its row reads "<scenario> (script) — RESULT: …" (two words before the dash, as queued_check_relaunch's: sweep_dash
-  # reads a one-word row as the no-skill ablation)
-  echo "    ${TAGGED:+[script] }$2 (script operator):" | tee -a "$SUMMARY"
-  HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$1" HPCB_SKIP_BUILD=1 \
-    "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$2.log" \
+  # reads a one-word row as the no-skill ablation); with a returning-user cell, "<scenario> <cell> — RESULT: …"
+  # The first one in a sweep that built nothing yet builds the image (run_smoke.sh, with the older releases' export):
+  # a script-only sweep (--profiles returning) ran on whatever image was there before (the review of 2026-10-30)
+  local label="$2${3:+ $3}" tag="$2${3:+-$3}" row="$2 ${3:-(script)}" skip="${BUILT:+1}"
+  BUILT=1
+  echo "    ${TAGGED:+[script] }$label (script operator)${skip:- — building the image first}:" | tee -a "$SUMMARY"
+  env HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$(cluster_of "$1")" ${skip:+HPCB_SKIP_BUILD=1} \
+    ${3:+HPCB_RETURNING_CELL="$3"} "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$tag.log" \
     | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
-    | sed "s/^/    ${TAGGED:+[script] }$2 (script) — /" | tee -a "$SUMMARY"
+    | sed "s/^/    ${TAGGED:+[script] }$row — /" | tee -a "$SUMMARY"
+}
+
+cluster_of() {  # cluster_of <sweep profile>: the fake-cluster profile it boots (a sweep profile may share a cluster)
+  case "$1" in returning) echo nersc ;; *) echo "$1" ;; esac
+}
+
+returning_cells() {  # the returning-user cells' ids, in the table's order (agentic/harness/returning_cells.tsv)
+  awk -F'\t' '!/^#/ && $1 != "id" && $1 != "" {print $1}' "$HERE/agentic/harness/returning_cells.tsv"
 }
 
 cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator runs here (order kept)
@@ -141,8 +167,34 @@ cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator
   else echo "$2"; fi
 }
 
+script_only() {  # script_only <profile>: the scripted cells of a profile no agent wave runs on, or nothing
+  case "$1" in
+    slices) echo "slice_request multinode_allocation" ;;   # resource requests (2026-10-24)
+    returning) echo "returning_user" ;;   # once per returning-user cell (returning_cells), on the nersc cluster
+  esac
+}
+
 IFS=, read -ra PROFS <<< "$PROFILES"
 for prof in "${PROFS[@]}"; do
+  if [ -n "$(script_only "$prof")" ]; then   # no agent wave: boot it here, run its scripted cells, wipe it
+    [ -z "$PAID_ONLY" ] || continue
+    echo "## $prof (script only) — $(date +%H:%M)" | tee -a "$SUMMARY"
+    if "$HERE/agentic/fakecluster/bin/up.sh" --profile "$(cluster_of "$prof")" \
+        > "$HERE/agentic/runs/sweep-$STAMP-$prof-up.log" 2>&1; then
+      for sc in $(script_only "$prof"); do
+        if [ "$sc" = returning_user ]; then
+          for cell in $(returning_cells); do script_cell "$prof" "$sc" "$cell"; done
+        else
+          script_cell "$prof" "$sc"
+        fi
+      done
+    else
+      echo "    ${TAGGED:+[script] }$prof (script) — RESULT: INFRA (the profile did not boot: sweep-$STAMP-$prof-up.log)" \
+        | tee -a "$SUMMARY"
+    fi
+    "$HERE/agentic/fakecluster/bin/down.sh" --profile "$(cluster_of "$prof")" --wipe > /dev/null 2>&1 || true
+    continue
+  fi
   read -r all conc <<< "$(cells "$prof")"
   [ -n "$all" ] || { echo "sweep: unknown profile $prof"; continue; }
   if { [ "$prof" = mep ] || [ "$prof" = pbs_mep ]; } && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
@@ -162,6 +214,7 @@ for prof in "${PROFS[@]}"; do
       continue
     fi
     echo "## $prof$tag — $(date +%H:%M) — $scen" | tee -a "$SUMMARY"
+    BUILT=1   # run_suite builds the image (and exports the older releases) once
     HPCB_OPERATOR="$op" python3 "$HERE/agentic/run_suite.py" --target fake --profile "$prof" ${RESET:+"$RESET"} --models "$MODELS" \
         --scenarios "$scen" --concurrency "$conc" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$prof${TAGGED:+-$op}.log" \
         | grep -E "done |skip |SUITE|passed" | sed "s/^/    ${TAGGED:+[$op] }/" | tee -a "$SUMMARY"
@@ -191,6 +244,9 @@ for prof in "${PROFS[@]}"; do
     case "$prof" in
       polaris) script_cell polaris polaris_filesystems ;;
       lmod)    script_cell lmod lmod_bootstrap ;;
+      site)    script_cell site stale_login_pin; script_cell site kept_entry_after_failure ;;
+      nersc)   for sc in cached_password_otp home_outside_home noisy_failure_tail partition_proposal_policy; do
+                 script_cell nersc "$sc"; done ;;   # the Perlmutter report's proofs (2026-10-29)
     esac
   fi
 done

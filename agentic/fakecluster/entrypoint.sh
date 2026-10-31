@@ -21,6 +21,9 @@ apply_profile() {
     [ -s "$PROFILE_DIR/$f" ] && cp "$PROFILE_DIR/$f" "/etc/slurm/$f"
   done
   log "profile: $(sed -n 's/^name *= *"\(.*\)"/\1/p' "$PROFILE_DIR/profile.toml" 2>/dev/null || echo unknown)"
+  # setup.d/early.sh (+ early-*.sh), every role, BEFORE the role's own work: what must hold before homes are made or
+  # daemons start — e.g. `nersc` moves the pool users' homes out of /home (usermod), on login AND compute nodes
+  run_setup early
 }
 run_setup() {  # run_setup <role> — setup.d/<role>.sh, then setup.d/<role>-*.sh (a layered profile's additions), sorted
   local f
@@ -101,7 +104,8 @@ role_login() {
   # Homes live on the shared /home volume; create on first boot. The host's freshly generated test
   # public key is bind-mounted at /run/hpcb/authorized_keys and installed for every pool user.
   for u in "${POOL_USERS[@]}"; do
-    h="/home/$u"
+    # the passwd home: /home/<u>, unless a profile's early setup moved it (nersc: /global/homes/<initial>/<u>)
+    h="$(getent passwd "$u" | cut -d: -f6)"; h="${h:-/home/$u}"
     if [ ! -d "$h" ]; then
       mkdir -p "$h" && cp -rTn /etc/skel "$h" && chown -R "$u:hpcb" "$h"
     fi

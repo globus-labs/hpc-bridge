@@ -370,12 +370,24 @@ def unsupported_hook_needs(operator: str, hooks: Iterable[dict] | None) -> set[s
     return hook_needs(hooks) - OPERATOR_HOOK_ACTIONS.get(operator, frozenset())
 
 
-def operator_refusal(operator: str, *, persona: str | None, phases: bool, hooks: Iterable[dict] | None) -> str | None:
-    """Why `operator` cannot drive a scenario (a SKIPPED cell, not a vacuous grade) — None when it can."""
+def seeded_chain(phases: Any) -> bool:
+    """A chain whose FIRST phase is scripted (`{"script": …}`: run.py `_phase_spec`) — the world before the agent made by
+    a script, on the plugin the user had before (the returning-user cells). The cell's own operator then runs only
+    fresh one-shot sessions after it, which every CLI operator can (run.py's `_run_chain` runs each phase with the
+    cell's runner); a plain prompt chain stays the Claude operator's, the only one its cells were proven under."""
+    if not isinstance(phases, list | tuple) or not phases:
+        return False
+    first = phases[0]
+    return isinstance(first, dict) and first.get("script") is not None
+
+
+def operator_refusal(operator: str, *, persona: str | None, phases: Any, hooks: Iterable[dict] | None) -> str | None:
+    """Why `operator` cannot drive a scenario (a SKIPPED cell, not a vacuous grade) — None when it can. `phases`: the
+    scenario's PHASES (or a bool, as before: a plain chain)."""
     hooks = list(hooks or [])
     if operator in NO_USER_OPERATORS and persona:
         return "an interactive persona"
-    if operator != "claude" and phases:
+    if operator != "claude" and phases and not (operator in NO_USER_OPERATORS and seeded_chain(phases)):
         return "cross-restart chains (PHASES)"
     missing = unsupported_hook_needs(operator, hooks)
     if missing:

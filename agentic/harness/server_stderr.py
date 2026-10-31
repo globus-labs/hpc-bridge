@@ -269,8 +269,13 @@ class ServerWatch:
     def early(self) -> list[ServerProcess]:
         """The servers that went away while their client ran on for more than `grace_s` — the client lost its server
         mid-session. A client that ends its session takes its server with it (a turn-per-process operator, a chain's
-        phase, every normal end), so their ends nearly coincide."""
-        return [p for p in self._procs.values() if (s := p.outlived_s(self.run_ended)) is not None and s > self.grace_s]
+        phase, every normal end), so their ends nearly coincide. A server whose client is THIS process — the script
+        operator's in-process MCP client (script_runner) — is not one: the script closes each session itself, and a
+        chain's scripted phase ends its server while this process runs on to the next phase (the returning-user cells);
+        a server lost under a call shows as that call's closed channel (`harness:server_channel_closed`)."""
+        me = os.getpid()
+        return [p for p in self._procs.values()
+                if p.client != me and (s := p.outlived_s(self.run_ended)) is not None and s > self.grace_s]
 
     def orphans(self) -> list[ServerProcess]:
         """The servers that ran on for more than `grace_s` after their client went: nobody speaks to them, and one

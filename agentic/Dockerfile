@@ -57,6 +57,19 @@ RUN curl -fsSL https://hermes-agent.nousresearch.com/install.sh \
     && /home/agent/.local/bin/hermes --version
 USER root
 
+# OLDER hpc-bridge releases, beside the code under test: the returning-user cells' first session runs one
+# (agentic/harness/prev_release.py). run_smoke.sh and run_suite.py export each SLOT — `previous` (the release before
+# this version, from pyproject's version history) and every pinned version (0.1.20: the Perlmutter replay) — into
+# agentic/.prev-release/<slot> (its tree in src/; VERSION, COMMIT, DATE) before every build; each is installed from its
+# OWN lock into /opt/hpcb-prev/<slot>/venv, so its server is /opt/hpcb-prev/<slot>/venv/bin/hpc-bridge. A slot not
+# exported has no venv, and a cell that needs it is refused. Above the code layers: it changes once per release.
+COPY agentic/.prev-release /opt/hpcb-prev
+RUN for d in /opt/hpcb-prev/*/; do \
+        d="${d%/}"; [ -f "$d/VERSION" ] || continue; \
+        ( cd "$d/src" && UV_PROJECT_ENVIRONMENT="$d/venv" uv sync -q --frozen --no-editable --extra integration ) \
+            && "$d/venv/bin/python" -c "import hpc_bridge.server" || exit 1; \
+    done; chown -R 1000:1000 /opt/hpcb-prev
+
 # The hpc-bridge repo (plugin + MCP server + skill + harness). Build context is the
 # repo root (run_smoke.sh builds from there); .dockerignore trims it.
 WORKDIR /work/hpc-bridge

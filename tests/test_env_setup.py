@@ -378,8 +378,15 @@ def test_the_expanse_seed_keeps_its_text_and_is_read_as_the_short_line():
 
     prof = profile_from_catalog_entry(entry, user="alice", account="chi152")
     mv = ev.managed_venv(prof.env_setup)
-    assert mv is not None and mv.base == "/home/alice/hpc-bridge/gce-venv" and prof.worker_init == prof.env_setup
+    # the default venv is `$HOME/…`, expanded on the login node (Perlmutter report 4: a home is not always /home/<user>)
+    assert mv is not None and mv.base == "$HOME/hpc-bridge/gce-venv" and prof.worker_init == prof.env_setup
     assert mv.gce == ev.client_gce() and mv.python == ev.client_python()
+    # …and Expanse's home is /home/<user>: the same venv as the /home/alice/… plugins up to 0.1.25 resolved it to
+    import subprocess
+
+    r = subprocess.run(["bash", "--noprofile", "--norc", "-c", f'echo "{mv.key}"'], env={"HOME": "/home/alice"},
+                       capture_output=True, text=True, check=True)
+    assert r.stdout.strip() == ev.keyed_venv("/home/alice/hpc-bridge/gce-venv", python=mv.python, gce=mv.gce)
 
 
 @pytest.mark.parametrize("hand", [
@@ -415,7 +422,7 @@ def test_a_cached_facility_gets_the_upgraded_line():
     entry = binding._entry_from_details("globus1", d)
     assert entry.compute.env_setup == _OLD_LINES["uv pinned"]  # the cached text stays as it is
     prof = profile_from_catalog_entry(entry, user="u", account="")
-    assert prof.env_setup == ev.short_env_setup("/home/u/hpc-bridge/gce-venv")  # read as the short line
+    assert prof.env_setup == ev.short_env_setup("$HOME/hpc-bridge/gce-venv")  # read as the short line, default venv
 
 
 def test_an_unsafe_remote_venv_is_refused_for_our_line():
@@ -662,6 +669,30 @@ async def test_an_upgraded_line_is_not_reported_as_an_edit():
     fac = _facility(ev.migrate_env_setup(older), client=lambda: _Client(_old_template(older)))
     await fac.adopt_endpoint("eid-2")
     assert fac.endpoint_worker_init == older and fac.worker_init_note == ""
+
+
+@pytest.mark.parametrize("started", ["old line", "short line"])
+async def test_the_default_venv_spelled_under_slash_home_is_the_upgrade_not_an_edit(started):
+    # plugins up to 0.1.25 resolved `{venv}` to /home/<user>/hpc-bridge/gce-venv; this one leaves `$HOME/…` to the
+    # login node (Perlmutter report 4). Where the home IS /home/<user> that is the same venv: no note.
+    from types import SimpleNamespace
+
+    legacy = "/home/u/hpc-bridge/gce-venv"
+    own = (_OLD_UV.replace("{venv}", legacy) if started == "old line"
+           else ev.short_env_setup(legacy, python=ev.client_python(), gce="4.0.0"))
+    current = ev.short_env_setup(ev.HOME_VENV)
+    fac = _facility(current, client=lambda: _Client(_old_template(own)))
+    fac.cli = SimpleNamespace(target=SimpleNamespace(user="u"))
+    await fac.adopt_endpoint("eid-1")
+    assert fac.endpoint_worker_init == own and fac.worker_init_note == ""
+    # …the login user's /home only: another user's, or an explicit path elsewhere, is a different venv
+    for user in ("someone-else", None):
+        fac = _facility(current, client=lambda: _Client(_old_template(own)))
+        fac.cli = SimpleNamespace(target=SimpleNamespace(user=user))
+        await fac.adopt_endpoint("eid-1")
+        assert "Only if its blocks fail" in fac.worker_init_note
+    assert ev.spelled_as_default(ev.short_env_setup("/scratch/u/gce"), user="u") == ev.short_env_setup("/scratch/u/gce")
+    assert ev.spelled_as_default("source /home/u/hpc-bridge/gce-venv/bin/activate", user="u").startswith("source /home")
 
 
 async def test_an_endpoint_whose_template_matches_gets_no_note_and_an_unreadable_one_the_profiles():

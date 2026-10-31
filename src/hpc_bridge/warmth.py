@@ -25,6 +25,7 @@ import secrets
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
@@ -82,6 +83,7 @@ from .notices import (
     _terms_line,
     _transient_dispatch_failure,
     _with_submission_notice,
+    broken_endpoint_env,
 )
 from .runner import CanaryResult, GlobusRunner, never_sent
 from .shapes import SHAPES, shape_config
@@ -267,6 +269,10 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     if result.ok:  # its job is up: the first proof dates it (for its walltime), on whatever terms it is met again
         _saw_job(app, result.worker_job, min(now, result.answered_at) if result.answered_at else now)
         _check_resolved(app, rt)  # a worker ran our check: no pilot is dying before it any more, none waits to land
+        # a ghost no more (a reattach's verdict: a slow cold start, or a manager the bring-up started again under the
+        # same id) — a later connect may reuse it over the web again (review round 2, 2026-10-31)
+        if app.state.endpoint_id is not None:
+            app.ghost_endpoints.discard(app.state.endpoint_id)
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
@@ -323,7 +329,12 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
         rt.runner_stale = True
         if _no_account_failure(result.error):
             rt.no_account = result.error
-        rt.transient_conflicts = rt.transient_conflicts + 1 if _transient_dispatch_failure(result.error) else 0
+        if not _transient_dispatch_failure(result.error):
+            rt.transient_conflicts = 0
+        elif rt.conflict_grace_until is None or time.monotonic() >= rt.conflict_grace_until:
+            rt.transient_conflicts += 1
+        # (inside the grace after a repair restarted the endpoint's user endpoints, a conflict is that start in
+        # progress, not a streak: c08, 2026-10-31, read "NO LONGER transient" twelve seconds after the repair)
     return "provisioning"
 
 def _retain_inflight(app: AppCtx, rt: ShapeRuntime | None) -> None:
@@ -341,6 +352,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     warm block's interval (found in review). A block the clock presumes released is banked to that time, not to
     now. Callers hold app.lock."""
     untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
+    _abandon_env_repairs(app)   # the binding ends: a repair of its endpoint never starts a manager after it
     app.tasks.clear()
     _retain_inflight(app, app.shapes.get(DEFAULT_SHAPE))  # counted only if the same endpoint is bound again
     for name, rt in app.shapes.items():
@@ -713,6 +725,10 @@ async def _provision(
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)
+            if block != "warm" or app.state.endpoint_id in app.env_repair_tasks:
+                # (a repair a cancelled call left running is read here even when the check now passes: its outcome is
+                # said, and the done-mark set, only once it is read)
+                block = await _repair_broken_env(app, shape, rt, block)
     except Exception:
         _bank_warm_interval(rt, app)  # nothing could be checked: the caller reports `down` / an error — clock stopped
         raise
@@ -765,6 +781,181 @@ async def _provision(
         rt.reap_told = True
         return "needs_confirmation"
     return block
+
+async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: BlockState) -> BlockState:
+    """A check whose user endpoint could not start because its Python could not import (`broken_endpoint_env`): the
+    environment the manager runs from is broken. Found on a manager reused over the web — zero SSH, so nothing checked
+    its venv — after the user deleted ~/hpc-bridge (returning-user cell c09, 2026-10-30: "No module named 'jinja2'",
+    then "fix the config/partition", then "likely REJECTED"). The facility repairs it ONCE per endpoint, here, where the
+    failure is seen, never by an SSH check on the reuse path: its venv checked and rebuilt through the bring-up's own
+    path, the manager restarted (`SlurmFacility.repair_endpoint_env`). Every runner is rebuilt and the check sent again.
+    What it did — or why it could not — is kept for the answer (`AppCtx.env_repairs`). The spend gate is unchanged: this
+    runs only inside a call that may already check this shape."""
+    c = rt.last_canary
+    cause = broken_endpoint_env(c.error) if c is not None and not c.ok else None
+    eid = app.state.endpoint_id
+    if cause is None and eid is not None and eid in app.env_repair_handoff and c is not None and not c.ok:
+        # a repair waiting on the user's login is tried again whatever this check met (c08: the call after the user
+        # opened the connection met a TRANSIENT conflict, and the repair, keyed on the import failure alone, waited on)
+        cause = app.env_repair_handoff[eid][2]
+    repair = getattr(app.facility, "repair_endpoint_env", None)
+    if eid is None:
+        return block
+    task = app.env_repair_tasks.get(eid)   # one a cancelled call left running: read here
+    if task is None:
+        if (cause is None or not inspect.iscoroutinefunction(repair) or eid in app.env_repaired
+                or app.env_repair_tries.get(eid, 0) >= _REPAIR_TRIES):
+            return block
+        held = _work_on_the_endpoint(app)
+        if held:
+            # a repair that restarts the manager ends every user endpoint it runs — a task on the compute block with
+            # them (review round 1, 2026-10-31: a login-shape check met the broken venv while a compute task ran)
+            app.env_repair_deferred[eid] = (
+                f"the endpoint could not start a user endpoint ({cause}): its environment is broken. Repairing it "
+                f"restarts the endpoint's manager, which would end {held}: the repair waits until that work is done "
+                "(poll_task), and runs at the next check after it. ")
+            return block
+        app.env_repair_deferred.pop(eid, None)
+        app.env_repair_tries[eid] = app.env_repair_tries.get(eid, 0) + 1
+        # its own task, so a call cancelled between the manager's stop and its start does not cancel the repair with
+        # it: the restart runs on, and the next check reads how it ended (review round 1). What ends or replaces the
+        # endpoint cancels it first (`_abandon_env_repairs`), and it asks before it stops or starts anything
+        # (`wanted`: review round 2 — one left running restarted the endpoint after a teardown said it was gone)
+        task = asyncio.ensure_future(repair(app.profile, eid, wanted=_still_bound(app, eid)))
+        app.env_repair_tasks[eid] = task
+        task.add_done_callback(lambda t: t.cancelled() or t.exception())   # read, so an unread failure is not logged
+    cause = cause or app.env_repair_causes.get(eid, "")
+    app.env_repair_causes[eid] = cause
+    try:
+        done, new_eid = await asyncio.shield(task)
+    except asyncio.CancelledError:
+        if task.cancelled():
+            app.env_repair_tasks.pop(eid, None)
+            me = asyncio.current_task()
+            if me is not None and not me.cancelling():
+                return block   # the repair was abandoned (a teardown, a re-bind) — not this call: its check stands
+        raise   # this call is cancelled; the repair runs on, and the next check reads it
+    except Exception as exc:  # noqa: BLE001 - said in the answer; the check's own failure stays the state
+        app.env_repair_tasks.pop(eid, None)
+        if _repair_handoff(app, shape, eid, cause, str(exc)):
+            app.env_repair_tries[eid] -= 1   # not an attempt: the next check tries, over the connection the user opens
+            return block
+        why = " ".join(str(exc).split())[:300]
+        app.env_repair_handoff.pop(eid, None)
+        again = (" hpc-bridge tries it once more at the next check." if app.env_repair_tries[eid] < _REPAIR_TRIES
+                 else "")
+        app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment is broken, "
+                                f"and hpc-bridge's repair failed: {type(exc).__name__}: {why}.{again} ")
+        return block
+    app.env_repair_tasks.pop(eid, None)
+    app.env_repair_handoff.pop(eid, None)
+    app.env_repaired.add(eid)   # done only once the facility verified it (a restart it claims is one that happened)
+    app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment was broken. "
+                            f"hpc-bridge {done}. ")
+    if new_eid and new_eid != eid:
+        app.env_repairs[new_eid] = app.env_repairs[eid]
+        app.env_repaired.add(new_eid)
+        app.state = replace(app.state, endpoint_id=new_eid)
+    grace = time.monotonic() + _REPAIR_CONFLICT_GRACE_S
+    for other in app.shapes.values():
+        other.runner_stale = True
+        other.transient_conflicts, other.conflict_grace_until = 0, grace
+    return await _confirm_worker(app, shape, force=True)
+
+
+_REPAIR_CONFLICT_GRACE_S = 120.0   # after a repair, the service's "already in use" is the user endpoints starting again
+_REPAIR_TRIES = 2   # repairs started per endpoint: one that did not finish (a manager that had not exited, a restart
+# `list` did not show) is tried once more at the next check; a login handed to the user's terminal is not an attempt
+
+
+def _still_bound(app: AppCtx, eid: str) -> Callable[[], bool]:
+    """A repair's `wanted`: does the session still hold `eid` — the same facility, the endpoint still bound, and no
+    teardown of it running? Asked by the facility before it stops or starts a manager."""
+    fac = app.facility
+
+    def wanted() -> bool:
+        tearing = app.teardown_task is not None and not app.teardown_task.done() and app.teardown_eid == eid
+        return app.facility is fac and app.state.endpoint_id == eid and not tearing
+    return wanted
+
+
+def _abandon_env_repairs(app: AppCtx) -> None:
+    """What ends or replaces the endpoint (a teardown's claim, `_drop_all_shapes`: a re-bind, a detach) settles its
+    repair first: every repair task is cancelled — never awaited here (a teardown claims with no await before it) — and
+    kept in `AppCtx.env_repair_settling` until it has unwound (`_settle_env_repairs`). A cancelled repair is not an
+    attempt (its try is given back), and a wait for work to end belongs to the binding that ends (review round 2)."""
+    for eid, task in list(app.env_repair_tasks.items()):
+        if not task.done():
+            task.cancel()
+            app.env_repair_tries[eid] = max(0, app.env_repair_tries.get(eid, 0) - 1)
+            app.env_repair_settling.append(task)
+    app.env_repair_tasks.clear()
+    app.env_repair_deferred.clear()
+
+
+_SETTLE_REPAIR_S = 10.0   # a cancelled repair unwinds at its next await (ssh_exec kills its ssh child on the way out)
+
+
+async def _settle_env_repairs(app: AppCtx, timeout: float = _SETTLE_REPAIR_S) -> None:
+    """Wait, bounded, for the repairs `_abandon_env_repairs` cancelled to unwind before the login node is touched again
+    (a teardown's stop and delete, a new binding's bring-up). One that has not by then still starts nothing: it asks
+    `wanted` first."""
+    pending = [t for t in app.env_repair_settling if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+    app.env_repair_settling = [t for t in app.env_repair_settling if not t.done()]
+
+
+def _released_waiting(app: AppCtx) -> list[ShapeRuntime]:
+    """Runtimes a release or a re-bind retired while a call was still inside its sync-wait on them, sent to the bound
+    endpoint (`AppCtx.released_inflight`): that command runs there still. After a teardown or a re-bind elsewhere it
+    is abandoned, as its tasks are. Counted by server._block_work and by the repair's busy check."""
+    eid = app.state.endpoint_id
+    return [r for r in app.released_inflight
+            if r.inflight and r.runner is not None and r.runner.endpoint_id == eid]
+
+
+def _work_on_the_endpoint(app: AppCtx) -> str:
+    """What of the session's work runs on the bound endpoint's user endpoints right now — a task behind a poll handle, a
+    command inside its sync-wait (on a shape's runtime, or on one a release retired under it) — in words, or "" when
+    none does."""
+    live = [tid for tid, h in app.tasks.items() if not h.future.done()]   # any shape: all run under that manager
+    waiting = sum(rt.inflight for rt in app.shapes.values()) + sum(r.inflight for r in _released_waiting(app))
+    held = []
+    if live:
+        held.append(f"task(s) {', '.join(live[:4])}{' …' if len(live) > 4 else ''} still running")
+    if waiting:
+        held.append(f"{waiting} command(s) still waiting for their result")
+    return " and ".join(held)
+
+
+def _repair_handoff(app: AppCtx, shape: str, eid: str, cause: str, said: str) -> bool:
+    """A repair whose SSH login asks for the USER — the key accepted and a one-time code pending, or a password /
+    keyboard-interactive login on a facility whose endpoint this user already runs (c08, 2026-10-30: the key revoked,
+    nersc's password + one-time code): the same handoff a connect makes (`notices._needs_preauth_result`), resumed by
+    ensure_endpoint_up. The user opens the connection in their own terminal; hpc-bridge never handles the secret.
+    True when it was handed off (kept in `AppCtx.env_repair_handoff`; the repair is tried again on the next check)."""
+    from .facility.remote import is_interactive_auth_failure, key_accepted_second_factor_pending, offers_one_time_code
+
+    target = getattr(getattr(app.facility, "cli", None), "target", None)
+    if target is None or not getattr(target, "control_dir", None) or not (
+            key_accepted_second_factor_pending(said) or is_interactive_auth_failure(255, said)):
+        return False
+    facility = app.machine or "the facility"
+    resume = f"ensure_endpoint_up(shape={shape!r})"
+    app.pending_preauth = (facility, target)
+    app.preauth_resume = resume
+    cmd = target.preauth_command()
+    code = ("If the facility takes a ONE-TIME CODE, ask the user for the current one and call complete_preauth(code); "
+            "otherwise the USER runs" if offers_one_time_code(said) else "The USER runs")
+    app.env_repair_handoff[eid] = (cmd, (
+        f"the endpoint could not start a user endpoint ({cause}): its environment is broken, and repairing it needs an "
+        f"SSH login to {target.host} that asks for the user's own login (a password and/or a one-time code) — "
+        f"hpc-bridge never handles that secret. {code} this in THEIR OWN terminal:\n    {cmd}\n"
+        f"Once that connection is open, call {resume} again: the repair rides it. Nothing was started or billed for "
+        "the block yet. "), cause)
+    return True
+
 
 class StaleTemplateError(RuntimeError):
     """The session asked for a block size (cores, memory, GPUs, several nodes) that the bound endpoint's template does

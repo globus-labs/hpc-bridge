@@ -94,6 +94,7 @@ class RunResult:
     interjections: list[dict] = None  # `interject` hooks: what the USER said mid-run, and after which call (stamped into the trace)
     acp_events: list[dict] = None     # ACP operators: the client's event log (persisted as acp-updates.jsonl; cross-checked)
     arrivals: list[float | None] = None  # parallel to `messages`: seconds since the session started (turn latency; bundle `__t__`)
+    chain_failure: str | None = None  # a chain stopped on its premise or interphase (run.py `_run_chain`): SETUP FAILED
 
 
 @dataclass

@@ -57,7 +57,7 @@ def test_sweep_names_existing_scenarios_that_their_profile_can_run():
     sys.path.insert(0, str(HERE.parent / "scenarios"))
     cells = _cells()
     assert set(cells) == {"default", "site", "totp", "pbs", "lmod", "f2b", "totp_f2b", "polaris", "internal", "hostile",
-                          "mep", "pbs_mep"}
+                          "mep", "pbs_mep", "nersc"}
     for prof, names in cells.items():
         caps = targets.load_profile(prof)["capabilities"]
         for n in names:
@@ -110,7 +110,7 @@ def test_the_free_wave_leaves_out_exactly_what_the_free_operators_cannot_drive()
         refused = set()
         for n in _swept():
             mod = importlib.import_module(n)
-            if operator_refusal(op, persona=getattr(mod, "PERSONA", None), phases=bool(getattr(mod, "PHASES", None)),
+            if operator_refusal(op, persona=getattr(mod, "PERSONA", None), phases=getattr(mod, "PHASES", None),
                                 hooks=getattr(mod, "MIDRUN_HOOKS", None)):
                 refused.add(n)
         assert set(paid) == refused, {"paid_only but drivable": sorted(set(paid) - refused),
@@ -156,9 +156,15 @@ n_ok = sum(s not in infra | setup | crash for s in scen)
 print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
-printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s"}\n' "$*" \
-  "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" >> "$STUB_LOG"
+printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s", "cell": "%s", "skip_build": "%s"}\n' \
+  "$*" "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" "${HPCB_RETURNING_CELL:-}" \
+  "${HPCB_SKIP_BUILD:-}" >> "$STUB_LOG"
 echo "RESULT: OK"
+'''
+
+_STUB_CLUSTER = r'''#!/usr/bin/env bash
+printf '{{"tool": "{name}", "argv": "%s"}}\n' "$*" >> "$STUB_LOG"
+[ -z "${{STUB_BOOT_FAIL:-}}" ] || [ "{name}" != up.sh ]
 '''
 
 
@@ -174,6 +180,13 @@ def _sweep(tmp_path, *args, **env_extra):
     (root / "agentic" / "run_suite.py").write_text(_STUB_SUITE)
     (root / "agentic" / "run_smoke.sh").write_text(_STUB_SMOKE)
     (root / "agentic" / "run_smoke.sh").chmod(0o755)
+    bin_ = root / "agentic" / "fakecluster" / "bin"   # the script-only profiles boot and wipe their own cluster
+    (root / "agentic" / "harness").mkdir(parents=True)  # the returning-user cells' table (the `returning` profile)
+    (root / "agentic" / "harness" / "returning_cells.tsv").write_text((HERE / "returning_cells.tsv").read_text())
+    bin_.mkdir(parents=True)
+    for name in ("up.sh", "down.sh"):
+        (bin_ / name).write_text(_STUB_CLUSTER.format(name=name))
+        (bin_ / name).chmod(0o755)
     log = tmp_path / "calls.jsonl"
     env = {k: v for k, v in os.environ.items() if not k.startswith("HPCB_")}
     env.update(STUB_LOG=str(log), HPCB_MEP_EMAIL="ops@example.org", **env_extra)
@@ -292,7 +305,8 @@ def test_the_held_and_failed_details_paths_run_once_per_sweep_under_the_script_o
     r, calls, summary, root = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "polaris,lmod,site")
     assert r.returncode == 0, r.stdout + r.stderr
     scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke" and c["operator"] == "script"]
-    assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod")]
+    assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod"),
+                        ("stale_login_pin", "site"), ("kept_entry_after_failure", "site")]
     assert "    [script] polaris_filesystems (script) — RESULT: OK" in summary
     assert any((root / "agentic" / "runs").glob("sweep-*-polaris-script-polaris_filesystems.log"))
     # --paid-only: none (no paid cell on either profile, so neither is booted)
@@ -374,3 +388,44 @@ def test_a_suite_whose_image_did_not_build_lists_every_cell_as_infra():
             "build (ERROR: 502) — the cell was not run")
     m = sweep_dash.DONE.match(line)
     assert m and m.group(2) == "canary_login_discovery" and sweep_dash._kind(m.group(3)) == "INFRA"
+
+
+def test_the_script_only_profiles_boot_their_own_cluster_and_run_only_their_scripted_cells(tmp_path):
+    # `slices` and `returning` carry no agent wave: the sweep boots each one's cluster (`returning` boots `nersc`), runs
+    # its scripted cells — returning_user once per cell of the checked-in table — and wipes it
+    import returning
+    cells = list(returning.load_cells())
+    r, calls, summary, _ = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "returning,slices")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c["tool"] == "run_suite"]
+    scripted = [(c["argv"], c["profile"], c["cell"]) for c in calls if c["tool"] == "run_smoke"]
+    assert scripted == [("returning_user", "nersc", cell) for cell in cells] + [
+        ("slice_request", "slices", ""), ("multinode_allocation", "slices", "")]
+    assert all(c["operator"] == "script" for c in calls if c["tool"] == "run_smoke")
+    # nothing built the image before them in this sweep: the first scripted cell builds it, the rest reuse it (it ran
+    # on whatever image was there before — the review of 2026-10-30)
+    assert [c["skip_build"] for c in calls if c["tool"] == "run_smoke"] == [""] + ["1"] * (len(scripted) - 1)
+    assert [(c["tool"], c["argv"]) for c in calls if c["tool"] in ("up.sh", "down.sh")] == [
+        ("up.sh", "--profile nersc"), ("down.sh", "--profile nersc --wipe"),
+        ("up.sh", "--profile slices"), ("down.sh", "--profile slices --wipe")]
+    assert f"    [script] returning_user {cells[0]} — RESULT: OK" in summary
+    assert "    [script] slice_request (script) — RESULT: OK" in summary
+    # a profile that does not boot is one INFRA row, its cells not run; --paid-only boots neither
+    _, calls, summary, _ = _sweep(tmp_path / "f", "--operators", "pi", "--profiles", "returning", STUB_BOOT_FAIL="1")
+    assert not [c for c in calls if c["tool"] == "run_smoke"] and "returning (script) — RESULT: INFRA" in summary
+    _, calls, _, _ = _sweep(tmp_path / "p", "--paid-only", "--profiles", "returning,slices")
+    assert not [c for c in calls if c["tool"] in ("run_smoke", "up.sh")]
+
+
+def test_nersc_runs_the_returning_agent_cells_in_every_wave_then_the_perlmutter_proofs(tmp_path):
+    # the three returning-user agent cells are chains that open with a scripted session: the free operators drive them
+    # (midrun_hooks.seeded_chain), so they stay out of paid_only(); the report's scripted proofs follow, once
+    r, calls, _, _ = _sweep(tmp_path, "--operators", "pi,codex,hermes21", "--profiles", "nersc")
+    assert r.returncode == 0, r.stdout + r.stderr
+    suites = [(_arg(c, "--profile"), c["operator"], _arg(c, "--scenarios")) for c in calls if c["tool"] == "run_suite"]
+    agent = "returning_perlmutter_replay,returning_all_well,returning_new_laptop"
+    assert suites == [("nersc", op, agent) for op in ("pi", "codex", "hermes21")]
+    scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke"]
+    assert scripted == [(n, "nersc") for n in ("cached_password_otp", "home_outside_home", "noisy_failure_tail",
+                                               "partition_proposal_policy")]
+    assert not set(agent.split(",")) & set(_paid_only())

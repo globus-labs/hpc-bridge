@@ -53,6 +53,9 @@ class ShapeRuntime:
     # another session with the same Globus identity holds/starts this endpoint, or the manager is
     # wedged — the 'call again' hint must stop (a model sweep showed Sonnet retrying 7× on it).
     transient_conflicts: int = 0
+    # Until when (monotonic) a conflict is not counted: a repair just made the endpoint start its user endpoints again,
+    # and the service answers RESOURCE_CONFLICT while that start runs (warmth._repair_broken_env).
+    conflict_grace_until: float | None = None
     # Deterministic spend floor: a scheduler compute shape may not start a block until spend is
     # explicitly acknowledged via ensure_endpoint_up(confirm_spend=True). It covers ONE block: it persists
     # while that block lives, is cleared on stop/reset when the shape state is dropped, and is cleared when
@@ -135,6 +138,11 @@ class ShapeRuntime:
     # still queued or HELD — a held pilot never starts on its own, so it runs no task and never idle-releases. The
     # block's own pilot leaves it once a worker answers on it, and again when that block is found gone (a reap).
     pilots: SeenPilots | None = None
+    # What the last pilot probe past the cold-start grace added to a still-cold block's answer, as (block_epoch, when —
+    # time.monotonic() —, the words; "" when it could not tell): run_shell's cold answer reuses it for a while rather
+    # than probing on every call (server._cold_answer). Good only for the cold spell it was taken in (after
+    # `provisioning_since`) and the terms it was taken on (`block_epoch`).
+    probe_said: tuple[int, float, str] | None = None
     # What a partition or account switch on an SSH endpoint left (warmth._repoint): whether the old terms' block had
     # come up (a worker answered on it: then it idle-releases after its last task), and the pilots last seen for it.
     # Cleared by a confirmation, as `switched_terms` is.
@@ -349,6 +357,12 @@ class AppCtx:
     # BYO configs supplied this session but not yet PROVEN (login-shape canary answered) — written to
     # facilities.json only then (decision 2026-09-03: "proven", not "accepted"): facility id -> (ssh_host, details)
     pending_facility_cache: dict[str, tuple[str, dict]] = field(default_factory=dict)
+    # Facility ids whose session config was READ from facilities.json (connect's cache rung), not given with details=:
+    # id -> the ssh_host the call named for it (None: found under the id). One whose bring-up fails or hands off is
+    # dropped from `session_facilities` (connect._drop_cached_config) — free, its record is still on disk — so the next
+    # connect resolves it afresh: that host's record again, or a probe of it if the record is gone (Perlmutter report
+    # 2026-10-29, items 1b and 3). Left when dropped (the host for that re-read); a details= for the id removes it.
+    from_cache: dict[str, str | None] = field(default_factory=dict)
     # BYO configs dropped from both of the above because their bring-up FAILED on the login node before they were
     # proven (connect._drop_failed_details): a connect without details= then resolves the facility afresh — the
     # registry, a config proven for that host, else a probe that proposes one — instead of running them again (live
@@ -394,6 +408,32 @@ class AppCtx:
     # re-finds that endpoint online and reads as `reused` — which used to (a) skip the proven-cache commit
     # forever and (b) tell the agent it 'reused an already-online endpoint' (live, 2026-09-04).
     bootstrapped_facilities: set[str] = field(default_factory=set)
+    # A broken endpoint environment met by a check (notices.broken_endpoint_env), by endpoint id: what the latest repair
+    # said (warmth._repair_broken_env) — rebuilt and restarted, or why not. `env_repair_said`: the note an answer has
+    # already carried, per id (a later attempt's new note is said again). `env_repaired`: the ids whose repair the
+    # facility verified done; `env_repair_tries`: repairs started per id (warmth._REPAIR_TRIES); `env_repair_tasks`: one
+    # still running — its own task, so a cancelled call does not stop it between the manager's stop and its start;
+    # `env_repair_causes`: the import failure each is for; `env_repair_deferred`: why one waits (work runs on the
+    # endpoint the repair would restart), said on every answer until it runs. `env_repair_settling`: repair tasks a
+    # teardown or a re-bind cancelled (warmth._abandon_env_repairs), until they have unwound (_settle_env_repairs).
+    env_repairs: dict[str, str] = field(default_factory=dict)
+    env_repair_said: dict[str, str] = field(default_factory=dict)
+    env_repaired: set[str] = field(default_factory=set)
+    env_repair_tries: dict[str, int] = field(default_factory=dict)
+    env_repair_tasks: dict[str, asyncio.Future] = field(default_factory=dict)
+    env_repair_settling: list[asyncio.Future] = field(default_factory=list)
+    env_repair_causes: dict[str, str] = field(default_factory=dict)
+    env_repair_deferred: dict[str, str] = field(default_factory=dict)
+    # A repair that needs the USER's login first (the facility's host asks for a password / one-time code — c08's key
+    # was revoked): by endpoint id, (the command the user runs in their own terminal, what the answer says, the
+    # import failure it repairs). Not a
+    # repair done: the next check that meets the broken environment tries again, over the connection the user opened.
+    env_repair_handoff: dict[str, tuple[str, str, str]] = field(default_factory=dict)   # + the import failure
+    # Endpoint ids a new laptop's reattach found listed online but whose login worker never answered (ghosts, #37):
+    # not used again this session — neither by that reattach nor by the bring-up the confirm that follows it starts
+    # (connect._probe_through_endpoint; SlurmFacility.find_online_endpoint skips them: `ghosts`). A check that passes on
+    # one clears it (warmth._confirm_worker): a slow cold start, or a manager the bring-up started again under that id.
+    ghost_endpoints: set[str] = field(default_factory=set)
     runner_factory: Callable[..., GlobusRunner] = GlobusRunner
     # The in-terminal Globus login (login.py). None ⇒ no login gating (hermetic tests / unbound dev);
     # lifespan installs the real one, which rides the Compute SDK's own client id + token storage.

@@ -1,7 +1,7 @@
 # connect
 
 > [!abstract] Role
-> The connect flow the agent drives: the Globus login gate FIRST, the resolution ladder (explicit details this session → the registry → the local BYO cache → the SSH probe that proposes a config), the switch of shapes/state to the bound facility, the identity-blind MEP attach or the SSH bootstrap, the allocation listing over the free login shape. Also `_commit_proven_facility` (a BYO config is cached only once the login-shape canary answered), `_drop_failed_details` (a BYO config whose bring-up failed on the login node before that is dropped, not run again — below) and `_drop_dead_pin` (an unreachable login-node pin is forgotten).
+> The connect flow the agent drives: the Globus login gate FIRST, the resolution ladder (explicit details this session → the registry → the local BYO cache → the SSH probe that proposes a config), the switch of shapes/state to the bound facility, the identity-blind MEP attach or the SSH bootstrap, the allocation listing over the free login shape. Also `_commit_proven_facility` (a BYO config is cached only once the login-shape canary answered), `_drop_failed_details` (a BYO config whose bring-up failed on the login node before that is dropped, not run again — below), `_drop_cached_config` (a config read from `facilities.json` whose bring-up failed or handed off leaves the session, to be read again — below, 2026-10-29) and `_drop_dead_pin` (an unreachable login-node pin is forgotten).
 
 The login gate is [[login_gate]] `_stored_login`, the same as `authenticate`'s: a missing login and a stored one Globus refuses to renew (revoked or expired) both answer `needs_login` before ANY route runs — registry, local cache, a session's own entry, details=, the MEP attach, the bootstrap — so nothing copies the token store to a login node on a dead login (it did, live 2026-10-14's failure mode on an SSH facility); a check that cannot reach Globus carries on. A login that lands during the gate's wait calls `warmth._forget_identity_verdicts` first, as `authenticate` does — the cached identity label and the runners built on the old token are dropped — so "Globus login landed as …" names the NEW identity. `_connect_mep`'s attach error names a dead login (`_hpc_bridge_error`, [[notices]]).
 
@@ -13,6 +13,66 @@ Split step 10 (2026-09-03) — the last. The login-shape channel is injected (`r
 proposal's (`AppCtx.proposed_drafts`, the same host), as one without env_setup takes its env_setup, so the bound entry
 keeps what the probe saw. The next block's terms (`_next_block_terms`) carry D3's proposed slice, and the one question
 asks whether it is enough.
+
+## A reattach re-caches the config that worked (2026-10-30, the returning-user cells)
+`_commit_proven_facility` used to skip every reuse of an endpoint from before the session, so a user whose
+`facilities.json` record was gone (deleted by hand, a new laptop) and whose endpoint was still online reattached
+without SSH — and the next session had no record to reconnect from either. It now commits on a reuse when the session
+ran a shell on it and nothing was proposed: no record for the host, the endpoint's worker_init known, and no
+`worker_init_note` (`_reuse_runs`). A config that was only proposed is never saved. `_start_note(fac)` adds what a
+start waited out (a killed manager's pid file, [[facility-remote]]) to the connect's notice.
+
+## A new laptop reattaches with zero SSH (2026-10-30, approved)
+The reuse ladder is: facility endpoint (MEP) > our online endpoint > SSH bootstrap. One rung was missing for a user
+with no record. When the registry answered and knows no such facility, and `facilities.json` has no record for the
+host, `_propose_or_ask(reattach=True)` used to go straight to the SSH probe. Now `_probe_through_endpoint` asks the web
+service first.
+- **Is our endpoint online?** `_online_for_host` uses `facility.remote.online_endpoint_named`: an endpoint OWNED by
+  this identity, under the name a bring-up for the host registers (HPC_BRIDGE_ENDPOINT_NAME, else
+  `binding._session_endpoint_name` → `hpc-bridge-<host>`). This needs no SSH and no config.
+- **Is it alive?** "Online" is only the heartbeat the service last saw, and a ghost reads online too (#37). So the
+  decision rests on the endpoint's login worker: a runner on `shapes.shape_config("login")` alone (no interface, no
+  worker_init: the endpoint's template defaults, the config that brought it up, apply) must answer a check within
+  `_REATTACH_WAIT_S` (60 s since review round 1).
+- **Then** the discovery probe (`discovery._probe_script`) runs as a task through that worker, `parse_probe` reads it,
+  and `_proposal` returns it with `reused=True` and a lead naming the endpoint.
+- **Confirming** the proposal binds the session's config and reattaches over the web, as a cached record always did.
+  No SSH happens before the reattach.
+- **Fallbacks.** A ghost, a probe that did not run, or nothing online leaves the SSH probe as before, its notice opened
+  by why. With no Globus login gate (`app.login_flow is None`: hermetic tests, a dev server) the web service is not
+  asked: the SDK's Client on a store with no login runs its own command-line login on the MCP transport.
+- **What never takes this rung.** A registry facility resolves to its entry first, so a facility endpoint wins; on a
+  registry outage the facility may be a catalogued one, so the rung is skipped.
+
+**Review round 1 (2026-10-31).** The first wait loop sent a new check on every pass — 433 tasks in 0.5 s against a
+manager that failed fast — never yielded when a check failed at once, and called a manager that answered with an error
+a ghost. Now:
+- **A still-queued check** (`timeout`) is waited on: the runner never resubmits one in flight.
+- **A transient 409** is sent again after a back-off that grows from `_REATTACH_BACKOFF_S` (2 s) to 10 s. A manager
+  that answers "busy" until the deadline is alive, not a ghost.
+- **Any other answer** ends the wait and says what it was (`_answered`). A broken environment is repaired after the
+  confirm, over SSH: the repair needs it anyway.
+- **Every pass sleeps**, so the event loop and the MCP heartbeat run. `_monotonic` and `_sleep` are indirections a
+  test drives.
+- **The whole path is bounded:** the wait (`_REATTACH_WAIT_S`, 60 s) and the probe's run (`asyncio.wait_for`) fit
+  `_REATTACH_BUDGET_S` (120 s), so the SSH fallback still ends inside a client's ~300 s tool call.
+- **Every fallback is said.** `_online_for_host` returns (name, id, why): nothing online, or the web service's own
+  error (`remote.online_endpoint_named` returns it instead of swallowing it).
+- **A ghost is remembered.** It goes in `AppCtx.ghost_endpoints`. connect hands that set to every SSH facility it
+  builds (`SlurmFacility.ghosts`), so the bring-up of the confirm that follows does not adopt the same ghost through
+  `find_online_endpoint`.
+
+**Review round 2 (2026-10-31).**
+- **No passing check means a ghost.** A deadline with no passing check marks the endpoint a ghost even when every
+  answer was "busy". A 409 comes from the web service and does not prove the manager is alive. So the item above
+  that called a manager answering "busy" alive no longer holds. The notice still says what the service answered.
+- **The mark is not for good.** A check that passes on that endpoint (`warmth._confirm_worker`) clears it. A slow
+  cold start, or a manager the bring-up started again under the same id, can then be reused over the web at the next
+  connect.
+- **Every registration is read.** `online_endpoint_named` reads the status of every registration with the name. An
+  error is reported only when none of them is online.
+- **A re-bind settles the repair.** connect's `_drop_all_shapes` cancels a repair of the endpoint being replaced, and
+  connect waits for it to unwind (`warmth._settle_env_repairs`) before the new binding brings anything up.
 
 ## See also
 [[server]] · [[binding]] · [[warmth]] · [[login_gate]] · [[notices]]
@@ -34,7 +94,7 @@ The states of a facility's `details=` config, and what a connect without details
 | one-time-code handoff (`needs_preauth`) | yes / yes | the resume runs it (unchanged) |
 | **refused on the login node on its first bring-up** (`_failure_of_the_config`) | **no / no** (`_drop_failed_details`) | **resolves the facility afresh**: the registry if it lists the id, else a config already proven for that host, else a probe that proposes one (the host the dropped config named, when the call names none); never the dropped config |
 
-Dropped rather than marked: every reader of `session_facilities` (the no-details rung, `_without_details`, [[scheduler_ops]]' pilot probe) keeps one meaning — a config the session keeps is coming up or proven — and none has to learn to skip a mark. What failed is kept apart, in `AppCtx.failed_details` (the host and the failure's notice), so the error stays visible. The failure's own answer ends with what a connect does next, in one piece with any "connect_facility again" before it ("This configuration (details=) is not kept[. So, to connect_facility again as above]: connect_facility(<id>, ssh_host=<host>) without details resolves the facility afresh — … — and does not run this one; with details= it runs the configuration given — this one again, or a corrected one (an env_setup left out of details= comes from the latest proposal for this facility)"). Every answer to a connect without details opens with it ("The details= given earlier for <id> failed to come up (<the failure, one line, ≤300 chars>) and is not kept: this connect did not run it."; a proposal carries it beyond its 1800-char cap, so no probe note is cut for it; a login gate, which resolved nothing yet, does not). A new `details=` for the id clears it the moment it is stored; so does a connect of the id that comes up (login shape warm, or a facility endpoint attached). A registry or cached entry is never in `pending_facility_cache`, so it is never dropped. Popping the pending entry with the session one keeps the proven-only rule: a later warm bring-up on another config (the registry's, the cache's) can never commit the failed one to `facilities.json`.
+Dropped rather than marked: every reader of `session_facilities` (the no-details rung, `_without_details`, [[scheduler_ops]]' pilot probe) keeps one meaning — a config the session keeps is coming up or proven — and none has to learn to skip a mark. What failed is kept apart, in `AppCtx.failed_details` (the host and the failure's notice), so the error stays visible. The failure's own answer ends with what a connect does next, in one piece with any "connect_facility again" before it ("This configuration (details=) is not kept[. So, to connect_facility again as above]: connect_facility(<id>, ssh_host=<host>) without details resolves the facility afresh — … — and does not run this one; with details= it runs the configuration given — this one again, or a corrected one (an env_setup left out of details= comes from the latest proposal for this facility)"). Every answer to a connect without details opens with it ("The details= given earlier for <id> failed to come up (<the failure, one line, ≤300 chars>) and is not kept: this connect did not run it."; a proposal carries it beyond its 1800-char cap, so no probe note is cut for it; a login gate, which resolved nothing yet, does not). A new `details=` for the id clears it the moment it is stored; so does a connect of the id that comes up (login shape warm, or a facility endpoint attached). A registry or cached entry is never in `pending_facility_cache`, so this rule never drops it (a cached one has its own, below: left-over local state, 2026-10-29). Popping the pending entry with the session one keeps the proven-only rule: a later warm bring-up on another config (the registry's, the cache's) can never commit the failed one to `facilities.json`.
 
 **The binding stays; no tool brings the dropped config up.** The bind precedes the bring-up, so a failed connect leaves the facility bound (a mark, not an unbind: the smaller change). `_drop_failed_details` marks that facility object (`AppCtx.dropped_binding`: the object and the refusal), and `warmth._provision` refuses first, before any spend or state change, while no endpoint is up: `ensure_endpoint_up` answers `down` and `run_shell` `failed`, with the failure, the afresh route and "or give details= again" (`DroppedConfigError`, shown as it is by `notices._hpc_bridge_error`). The next bind (a new facility object) ends it; connect also clears it there.
 
@@ -42,11 +102,20 @@ Dropped rather than marked: every reader of `session_facilities` (the no-details
 
 **A connect queued behind the failing one.** A connect without details resolves its config before it waits for `app.lock`. If the session's config for the id changed meanwhile (the call holding the lock dropped it, or a `details=` replaced it), `_connect` answers `_Again` once it holds the lock and `_connect_facility` resolves again (at most twice), so it never binds what the other call just dropped; its answer opens with the failure and still names a Globus login that landed in the first pass (`_Again.login_note`). The other way round, a failing bring-up drops only its OWN config (`_drop_failed_details` gets the connect's `entry`): a `details=` that replaced it while it held the lock is kept, polled and, once up, cached. A config equal to the one `facilities.json` holds as proven is compared through the model, so one an older plugin cached (without a newer field) counts. And a bring-up that comes up while another connect's `details=` waits commits only the config its binding was built from (`AppCtx.bound_entry`, `_session_is_ours`, in connect and in ensure_endpoint_up's warm login shape): the waiting one stays pending, never cached as PROVEN without having run.
 
-The two refusals of a `details=` without `env_setup` (no proposal for the id; a proposal for another host) say what a connect without details does from where the session stands (`_without_details`): it resolves the facility afresh, or, while the session keeps a config for the id, it reconnects with that one, whatever `ssh_host` the call names, and proposes nothing — a proposal for another host then comes under another facility id, which the other-host refusal names. They used to promise a proposal in every case.
+The two refusals of a `details=` without `env_setup` (no proposal for the id; a proposal for another host) say what a connect without details does from where the session stands (`_without_details`): it resolves the facility afresh, or, while the session keeps a config for the id, it reconnects with that one and proposes nothing — unless the call names another `ssh_host`, which is resolved afresh under the same id and does not run the kept one (the other-host refusal names that call). They used to promise a proposal in every case; until 2026-10-29 the kept config won whatever `ssh_host` the call named, and a proposal for another host needed another facility id.
 
 **With the scheduler_options rewrite (2026-10-20, #220 with #221).** A dropped config takes its directive note (`AppCtx.directive_notes`) with it, so no later answer — the cache's config coming up, say — reports a rewrite of the dropped one; given again, the config carries its note again. The comparison with the config proven for the host reads the stored one as the cache rung serves it (`binding._directive_details`): one an older plugin cached with a bare option, re-sent as it was, is that proven config, and is kept. A cached config whose `scheduler_options` now hold a refused line is offered back as a proposal (`_cached_refusal_proposal`): after a dropped details= it opens with the failure itself (`_connect_facility` opens no proposal with it), and confirming it with details= that fail drops it like any other (a stored record with a refused line is never served as it is, so it never counts as proven). In a bound answer the failure comes first, then what a re-bind left (`_left_checks_note`), the spend, the login, the presets and the directive note; on a facility endpoint's attach too, where `needs_account` also clears the failure. Pinned in `tests/test_integration_220_221.py`.
 
 Not changed: a facility that cannot be built at all (`binding._facility_from_entry` raising) is not a login-node failure and keeps its entry.
+
+## Left-over local state (Perlmutter report, 2026-10-29)
+
+A user came back to Perlmutter weeks after connecting it: its config PROVEN and cached in `facilities.json`, its endpoint pinned to `login22` in `endpoints.json`. login22 no longer answered and their key no longer worked (NERSC: a key OR a password + one-time code). Each piece of local state stood in the way. Proofs: `tests/test_perlmutter_report_state.py`; fake-cluster cells `stale_login_pin`, `kept_entry_after_failure`, `cached_password_otp`.
+
+- **The dead pin is probed where ssh connects (1a).** `_drop_dead_pin` checks that the facility's own host still answers before it drops a pin (else it is a client-side outage, and the pin is kept). It used to open a TCP connection to the ALIAS, and the user's alias was an ssh-config `Host perlmutter`, which no resolver knows. So the check always read as an outage and the pin was never dropped. It now probes the HostName `rebind` resolved for the alias (`ssh -G`, kept on the target as its HostKeyAlias). The old test stubbed the probe wholesale, which hid this. It now fakes `socket.create_connection` at the boundary. Still kept: a HostName the client cannot reach directly (a ProxyJump), as before.
+- **A config read from the cache does not outlive its failure (1b, 3).** The cache rung puts the config it reads in `session_facilities`, and it used to stay there for the session. Neither a failed bring-up nor the user deleting its record from `facilities.json` removed it, so it won over every later connect. That included one naming another `ssh_host`. Now `AppCtx.from_cache` marks such configs (facility id → the `ssh_host` the call named). `_drop_cached_config` takes one out of the session when its bring-up fails or hands off (`needs_preauth`). This costs nothing, because the record is still on disk. The next connect resolves the facility afresh: the record again, or a probe if the record is gone. A connect that names no host re-reads the record for the host it was read under (`from_cache` keeps it), so the handoff's resume `connect_facility(<id>)` and a poll without `ssh_host` still find the record when the facility id is not its key. A `details=` config keeps its own rule (`_drop_failed_details`, above). It is the only copy, so it is not dropped for a failure outside the config.
+- **An explicit other `ssh_host` wins (1b).** When a connect without `details=` names an `ssh_host` that differs from the host of the config the session keeps (cached or `details=`), that host is resolved afresh under the same id, and the kept config is not run for it. If a config proven for that host replaces the kept one, `_forget_kept_config` also clears the kept one's pending cache write, `details_started` mark and directive note. Otherwise the replacement's canary would commit the kept one as PROVEN. A proposal for the other host leaves the kept config in place for connects that name no other host. This replaces the review-2026-10-20 (7c) rule "another facility id".
+- **A password + one-time-code denial on a proven host is the terminal handoff (2).** The bring-up path handed off only on `key_accepted_second_factor_pending`: key accepted, `keyboard-interactive` pending (Expanse, #87). NERSC's denial still lists `publickey` (`(publickey,password,keyboard-interactive,hostbased)`), so it read NO SSH ACCESS. Now a denial that would read NO SSH ACCESS, offers a password or keyboard-interactive (`is_interactive_auth_failure`), AND lands on a host this user has PROVEN access to is `needs_preauth` instead (`_preauth_handoff`). The proof of access is a `facilities.json` record for the entry's `ssh_host` (`_access_proven`), written only after the login canary answered there. `otp_ok` comes from `offers_one_time_code`, so this is the terminal command, not a code prompt. A stranger whose key is refused on a 2FA site (Anvil, a registry entry with no record) still gets NO SSH ACCESS. The discovery probe already handed off on first contact; only the cached/registry bring-up path lacked this.
 
 ## Consent is per conversation; a fresh bootstrap is proven (live findings, 2026-09-04)
 

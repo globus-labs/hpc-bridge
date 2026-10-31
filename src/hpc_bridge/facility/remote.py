@@ -37,10 +37,19 @@ from ..profile import Profile
 from ..state import EndpointRecord, LoginNodeStore
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..catalog.entry import CatalogEntry
 from . import endpoint_venv
-from .base import EndpointHandle, endpoint_metadata, step_error
-from .endpoint_venv import DEFAULT_REMOTE_VENV, managed_venv, migrate_env_setup, safe_base, shell_path
+from .base import EndpointHandle, endpoint_metadata, said_end, step_error
+from .endpoint_venv import (
+    DEFAULT_REMOTE_VENV,
+    managed_venv,
+    migrate_env_setup,
+    safe_base,
+    shell_path,
+    spelled_as_default,
+)
 
 # A Globus endpoint UUID — scopes the per-UEP pidfile-cleanup glob to one endpoint, and refuses to
 # build a remote glob from anything that isn't a plain UUID.
@@ -254,6 +263,35 @@ def offers_one_time_code(stderr: str) -> bool:
     return key_accepted_second_factor_pending(stderr)
 
 
+async def online_endpoint_named(name: str, client_factory) -> tuple[str | None, str | None]:
+    """`SlurmFacility.find_online_endpoint` for a caller with no facility yet (a new laptop's first connect: no config,
+    connect._probe_through_endpoint): (the id of an endpoint OWNED by this identity named `name` that the web service
+    lists online, else None; the web or login error that kept the service from saying, else None). NO SSH. "online" is
+    the manager's heartbeat as the service last saw it — a ghost reads online too (#37): the caller's check of a login
+    worker decides. The error is returned, never swallowed: the caller says why it probes over SSH (review round 1) —
+    but only when no registration of the name is online: one whose status could not be read does not hide the next
+    (review round 2)."""
+    try:
+        client = client_factory()
+        endpoints = await asyncio.to_thread(client.get_endpoints, "owner")
+    except Exception as exc:  # noqa: BLE001 - web/auth failure -> said by the caller, which probes over SSH
+        return None, f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+    error = None
+    for ep in endpoints or []:
+        ep_name = ep.get("name") or ep.get("display_name")
+        ep_id = ep.get("uuid") or ep.get("endpoint_uuid") or ep.get("id")
+        if ep_name != name or not ep_id:
+            continue
+        try:
+            status = await asyncio.to_thread(client.get_endpoint_status, ep_id)
+        except Exception as exc:  # noqa: BLE001 - this one unreadable: the others are read; said if none is online
+            error = error or f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+            continue
+        if (status or {}).get("status") == "online":
+            return str(ep_id), None
+    return None, error
+
+
 class NeedsPreauth(Exception):
     """An SSH op needs a one-time interactive pre-auth (password/MFA). Carries the target so a caller can
     surface the user's pre-open command (`preauth_command`), and `otp_ok`: whether a one-time CODE would
@@ -365,9 +403,9 @@ def profile_from_catalog_entry(
 
     The catalog stores user-agnostic templates; this resolves them at provision time:
     ``{user}`` is the SSH login user and ``{venv}`` is the remote globus-compute-endpoint venv
-    (defaults to the ``/home/{user}/hpc-bridge/gce-venv`` convention; a leading ``~/`` becomes ``$HOME/``, since
-    hpc-bridge's line quotes it). ``account`` and the derived
-    ``worker_init`` (= the resolved ``env_setup``, replayed on the compute worker) are supplied
+    (defaults to ``$HOME/hpc-bridge/gce-venv``, left for the login node to expand: a home is not always
+    ``/home/{user}``; a leading ``~/`` becomes ``$HOME/``, since hpc-bridge's line quotes it). ``account`` and the
+    derived ``worker_init`` (= the resolved ``env_setup``, replayed on the compute worker) are supplied
     here, never stored in the catalog. ``partition`` overrides the entry's default when given.
     Substitution uses ``str.replace`` (not ``str.format``) so literal shell braces in ``env_setup``
     are left untouched.
@@ -377,7 +415,7 @@ def profile_from_catalog_entry(
     version and Python (`endpoint_venv.migrate_env_setup`). The registry and facilities.json keep their text, so an
     older plugin reading them is unaffected. Hand-written text is used exactly as given.
     """
-    venv = shell_path(venv or DEFAULT_REMOTE_VENV.replace("{user}", user))
+    venv = shell_path(venv or DEFAULT_REMOTE_VENV)
 
     def _resolve(template: str) -> str:
         # Accept the plugin template ({user}/{venv}) AND the natural shell idiom ($USER/${USER}) —
@@ -418,18 +456,87 @@ _GCE_COLUMNS = 400
 _START_REGISTER_WAIT_S = 30.0
 _START_REGISTER_POLL_S = 1.5
 _ANOTHER_INSTANCE = "another instance"
+# globus-compute's start refuses with os.EX_CANTCREAT (73) while the endpoint's daemon.pid is younger than three
+# heartbeats (`_pidfile_check`); a live instance touches the file every 15 s (`_touch_pid`)
+_EX_CANTCREAT = 73
+_PID_STALE_HEARTBEATS = 3
+_DEFAULT_HEARTBEAT_S = 30.0
+_PID_WAIT_CAP_S = 150.0  # the longest a bring-up waits out that window inside its own (heartbeated) call
+_PID_POLL_S = 10.0       # how often the wait reads the file again: inside one 15 s touch of a live instance
+_PID_MARGIN_S = 3.0      # past the window, for the two clocks (the login node's, the file server's)
+_PID_TOUCH_WATCH_S = 20.0  # one touch interval of a live instance (15 s) and a margin: long enough to see it move
+_STOP_EXIT_WAIT_S = 60.0   # how long a repair waits for a stopped manager to exit before it gives the restart up
+# ssh's own verdict that a host did not answer at all — never a refused login (which keeps a pin: the host is fine, the
+# access is not). The words notices._explain_provision_error reads as CANNOT REACH.
+_UNREACHABLE = re.compile(r"ssh: connect to host [^\n]*(?:connection refused|no route to host|timed out|"
+                          r"network is unreachable|host is down|network is down)|could not resolve hostname", re.I)
 _sleep = asyncio.sleep  # indirection so tests can run the poll loop without waiting
+
+
+def _still_wanted(wanted: Callable[[], bool] | None, what: str, undone: str) -> None:
+    """A repair about to stop or start a manager: raises when the session no longer holds the endpoint (`wanted`
+    False: a teardown claimed it, a connect re-bound) — nothing is then `undone` (review round 2, 2026-10-31)."""
+    if wanted is not None and not wanted():
+        raise RuntimeError(f"{what}; the endpoint was torn down or replaced meanwhile, so it was not {undone}")
+
+
 _JOBID = re.compile(r"^\d+(_\d+)?$")  # plain or array slurm job id (guards what we scancel)
 _JOBID_PBS = re.compile(r"^\d+(\.\S+)?$")  # PBS: bare or host-qualified (1234567.polaris-pbs-01)
 _TRACEBACK = "Traceback (most recent call last)"
 _FRAME = re.compile(r'File "(?P<path>[^"]+)", line (?P<line>\d+), in (?P<fn>\S+)')
 
 
+@dataclass(frozen=True)
+class PidFile:
+    """An endpoint's daemon.pid as `RemoteEndpointCLI.pid_file` read it: the login node's clock (`now`), the file's
+    mtime (None: no file), the endpoint's heartbeat, the endpoint log's last error line (globus-compute's own words),
+    and the startup lines the login shell printed before the probe's markers."""
+    now: float
+    mtime: float | None
+    heartbeat_s: float
+    log: str
+    noise: frozenset[str]
+
+    @property
+    def age(self) -> float | None:
+        return None if self.mtime is None else self.now - self.mtime
+
+    @property
+    def window(self) -> float:
+        return self.heartbeat_s * _PID_STALE_HEARTBEATS
+
+    @classmethod
+    def parse(cls, out: str, err: str) -> PidFile | None:
+        got: dict[str, str] = {}
+        noise = set()
+        for ln in (out or "").splitlines():
+            if ln.startswith("HPCB_") and "=" in ln:
+                k, _, v = ln.partition("=")
+                got[k] = v.strip()
+            elif ln.strip() and ln.strip() != "HPCB_PROBE_END":
+                noise.add(ln.strip())
+        noise |= {ln.strip() for ln in (err or "").splitlines() if ln.strip()}
+        if "HPCB_NOW" not in got or "HPCB_PROBE_END" not in (out or ""):
+            return None
+        try:
+            now = float(got["HPCB_NOW"])
+            mtime = float(got["HPCB_PID_MTIME"]) if got.get("HPCB_PID_MTIME") else None
+            hb = float(got["HPCB_HB"]) if got.get("HPCB_HB") else _DEFAULT_HEARTBEAT_S
+        except ValueError:
+            return None
+        log = got.get("HPCB_LOG", "")
+        # globus-compute's message, without its timestamp, level and process/thread prefix
+        m = re.search(r"\b(?:ERROR|CRITICAL)\s+\S+\s+\S+\s+\S+\s+\S+\s+(.*)$", log)
+        return cls(now=now, mtime=mtime, heartbeat_s=hb if hb > 0 else _DEFAULT_HEARTBEAT_S,
+                   log=" ".join((m.group(1) if m else log).split())[:400], noise=frozenset(noise))
+
+
 def _cli_said(out: str, err: str) -> str:
-    """What a failed `globus-compute-endpoint` call said, for its error. Short text is kept as it is (the notices read
-    ssh's own verdict from it). A Python traceback becomes its LAST line, the exception, and the frame that raised it:
-    a notice keeps a message's first 500 characters, which of a traceback was only "Traceback (most recent call
-    last): File …, line 12, in" (texttable 1.7.2, live 2026-10-20). That texttable break also says what it is."""
+    """What a failed `globus-compute-endpoint` call (list, configure, start) said, for its error: its END, the last few
+    meaningful lines after a cut mark (`said_end`) — the login shell's startup noise prints first (the Perlmutter
+    report, item 5), and ssh's own verdict, which the notices read, comes last. A Python traceback becomes its LAST
+    line, the exception, and the frame that raised it: its head was only "Traceback (most recent call last): File …,
+    line 12, in" (texttable 1.7.2, live 2026-10-20). That texttable break also says what it is."""
     text = (err or out or "").strip()
     if _TRACEBACK in text:
         lines = [ln.strip() for ln in text.splitlines() if ln.strip()]
@@ -439,6 +546,8 @@ def _cli_said(out: str, err: str) -> str:
             f = frames[-1]
             where = f" (at {'/'.join(f['path'].split('/')[-2:])}:{f['line']}, in {f['fn']})"
         text = lines[-1][:300] + where
+    else:
+        text = said_end(text)
     if endpoint_venv.BROKEN_LIST.search(text):
         text = f"{text}. {endpoint_venv.BROKEN_LIST_HINT}"
     return text
@@ -462,6 +571,7 @@ class RemoteEndpointCLI:
         self.venv = managed_venv(env_setup)
         self.venv_ready: str | None = None  # the venv this process checked or built: it works
         self.venv_built: endpoint_venv.EnsureResult | None = None  # what the last bring-up's ensure did
+        self.start_note = ""  # what the last start did beyond starting (it waited out a dead instance's pid file)
         # teardown: run the CLI in this environment instead of env_setup's (`use_working_venv`): the one the endpoint
         # was started with, or a working venv of hpc-bridge's
         self._prefix_override: str | None = None
@@ -551,7 +661,7 @@ class RemoteEndpointCLI:
             self._prefix_override = undecided
             return True, ""
         if found.rc == 255:
-            return False, "ssh: " + (found.err or "").strip()[:400]
+            return False, "ssh: " + said_end(found.err or "")  # ssh's verdict comes last, after any banner
         if found.cli is None:
             if found.unknown or fallback:  # can't tell, or nothing of hpc-bridge's runs: the stop is tried anyway
                 self._prefix_override = undecided
@@ -580,7 +690,8 @@ class RemoteEndpointCLI:
             msg = (err or out).strip()
             if "already" in msg.lower() or "configexists" in msg.lower():  # dir exists -> fine
                 return
-            raise step_error(rc, f"remote configure failed: {msg}", output=msg)  # ran env_setup: unless ssh's 255
+            # its END in the message; its whole output decides what it was (`ConfigStepFailed.said` / `tail`)
+            raise step_error(rc, f"remote configure failed: {_cli_said(out, err)}", output=msg)  # unless ssh's 255
 
     @staticmethod
     def _list_rows(out: str) -> list[list[str]]:
@@ -719,24 +830,18 @@ class RemoteEndpointCLI:
         # isolates the FQDN from gce's own stdout.
         # …and the ADDRESS this connection reached ($SSH_CONNECTION's server field): routable by construction, it is
         # the pin when the node's own name is not (internal names — Midway's *.rcc.local, a `.int.` domain).
-        inner = (
-            f"{self._env_prefix()}globus-compute-endpoint start {shlex.quote(name)} "
-            "--detach && echo HPCB_HOST=$(hostname -f) "
-            "&& echo \"HPCB_ADDR=$(echo \"$SSH_CONNECTION\" | awk '{print $3}')\""
-        )
-        rc, out, err = await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=_BOOTSTRAP_SSH_S)
+        self.start_note = ""
+        rc, out, err = await self._start_once(name)
         if rc != 0:
             # A refused start whose manager is ALREADY running (its pidfile blocks a second start; gce 4.13
             # exits 73 and prints nothing at all — the "Another instance is running" text is not reliable)
             # is the endpoint we want: adopt it instead of failing (#39's second symptom).
             if _ANOTHER_INSTANCE in (err + out).lower() or await self.status(name) == "running":
                 out = ""
+            elif rc == _EX_CANTCREAT:
+                out = await self._outwait_pid_file(name, rc, out, err)
             else:
-                # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
-                # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
-                listed = f"; `list` failed too: {self.last_list_error}" if self.last_list_error else ""
-                said = (err or out).strip()  # the start's own words decide, never the `list` note after them
-                raise step_error(rc, f"remote start failed (rc={rc}): {said or 'no output'}{listed}", output=said)
+                raise self._start_failed(rc, out, err)
         host = addr = None
         for line in out.splitlines():
             if line.startswith("HPCB_HOST="):
@@ -744,6 +849,130 @@ class RemoteEndpointCLI:
             elif line.startswith("HPCB_ADDR="):
                 addr = line[len("HPCB_ADDR=") :].strip() or None
         return await self._await_endpoint_id(name), host, addr
+
+    async def _start_once(self, name: str) -> tuple[int, str, str]:
+        inner = (
+            f"{self._env_prefix()}globus-compute-endpoint start {shlex.quote(name)} "
+            "--detach && echo HPCB_HOST=$(hostname -f) "
+            "&& echo \"HPCB_ADDR=$(echo \"$SSH_CONNECTION\" | awk '{print $3}')\""
+        )
+        return await ssh_exec(self.target, f"bash -lc {shlex.quote(inner)}", timeout=_BOOTSTRAP_SSH_S)
+
+    def _start_failed(self, rc: int, out: str, err: str, probe: PidFile | None = None) -> RuntimeError:
+        """The error for a start that failed for good. Its own words, LAST — never the login shell's startup lines
+        (`probe.noise`: what that shell printed before the probe's own markers), which on a site with a noisy .bashrc
+        are all a start that printed nothing leaves (exit 73, the stale pid file of a manager killed hard: the notice
+        quoted Lmod's module swaps as the cause — returning-user cells c03 c05 c12 c18, 2026-10-30). Then the endpoint
+        log's last error, globus-compute's own words, when the start said nothing of its own."""
+        # gce 4.13 refuses a second start with exit 73 and NOTHING on either stream: when `list` failed too,
+        # whether it is already running is unknown, and `list`'s words are the only cause there is to quote
+        listed = f"`list` failed too: {self.last_list_error}" if self.last_list_error else ""
+        noise = probe.noise if probe is not None else frozenset()
+        mine = "\n".join(ln for ln in (err or out).splitlines() if ln.strip() and ln.strip() not in noise)
+        said = mine.strip()  # the start's own words decide, never the `list` note after them
+        own = _cli_said(mine, "") if said else ""
+        if not own:
+            own = "no output of its own" if (err or out).strip() else "no output"
+            if probe is not None and probe.log:
+                own += f" (the endpoint's log: {probe.log!r})"
+        # the decisive words LAST, where a notice's cut never reaches (notices._ends): the start's own, else `list`'s
+        msg = (f"remote start failed (rc={rc}) ({listed}): {own}" if said and listed else
+               f"remote start failed (rc={rc}): {own}" + (f"; {listed}" if listed else ""))
+        return step_error(rc, msg, output=said)
+
+    async def pid_file(self, name: str) -> PidFile | None:
+        """The endpoint's pid file as globus-compute's start judges it: its mtime, the login node's clock, the
+        endpoint's heartbeat (config.yaml's `heartbeat_period`, else the default), and the endpoint log's last error.
+        None when the probe did not report: ssh failed (rc 255), or its bound ran out — `ssh_exec` raises a bare
+        `TimeoutError()` then, which escaped every wait built on this (review round 1, 2026-10-31); the callers read
+        None as "unknown". One `bash -lc`, as every step: what that login shell prints before the markers is its
+        startup noise (`PidFile.noise`)."""
+        if not _SAFE_NAME.match(name):
+            raise ValueError(f"unsafe endpoint name {name!r}")
+        d = f"{self.remote_dir}/{name}"
+        script = (
+            f'd="{d}"; echo "HPCB_NOW=$(date +%s)"; '
+            '[ -e "$d/daemon.pid" ] && echo "HPCB_PID_MTIME=$(stat -c %Y "$d/daemon.pid")"; '
+            "echo \"HPCB_HB=$(sed -n 's/^heartbeat_period:[[:space:]]*\\([0-9][0-9.]*\\).*/\\1/p' "
+            '"$d/config.yaml" 2>/dev/null | head -n 1)"; '
+            "echo \"HPCB_LOG=$(grep -E ' (ERROR|CRITICAL) ' \"$d/endpoint.log\" 2>/dev/null | tail -n 1 | "
+            "cut -c1-600)\"; echo HPCB_PROBE_END"
+        )
+        try:
+            rc, out, err = await ssh_exec(self.target, f"bash -lc {shlex.quote(script)}", timeout=_TEARDOWN_SSH_S)
+        except (TimeoutError, OSError):
+            return None
+        return PidFile.parse(out, err) if rc != 255 else None
+
+    async def watch_pid_file(self, name: str, first: PidFile, up_to: float) -> tuple[str, float]:
+        """Watch the pid file `first` read for at most `up_to` seconds, read again every `_PID_POLL_S`, the way
+        `_outwait_pid_file` judges it (globus-compute's own test): "alive" the moment its mtime ADVANCES — only a live
+        instance touches it (every 15 s) —, "gone" when it is removed (an instance that exited cleanly removes it),
+        "quiet" when it was read and had not moved, "unknown" when no read answered. Returns (verdict, seconds waited).
+        Never one read: an age alone cannot tell a live manager from one killed seconds ago (review round 1)."""
+        waited, seen = 0.0, False
+        while waited < up_to:
+            step = min(_PID_POLL_S, up_to - waited)
+            await _sleep(step)
+            waited += step
+            now = await self.pid_file(name)
+            if now is None:
+                continue
+            seen = True
+            if now.mtime is None:
+                return "gone", waited
+            if first.mtime is not None and now.mtime > first.mtime:
+                return "alive", waited
+        return ("quiet" if seen else "unknown"), waited
+
+    async def _outwait_pid_file(self, name: str, rc: int, out: str, err: str) -> str:
+        """A start refused with exit 73 (os.EX_CANTCREAT) and no running manager listed here: globus-compute's own
+        rule (`globus_compute_endpoint/cli.py` `_pidfile_check`) refuses while the endpoint's daemon.pid is no older
+        than three heartbeats (90 s at the default 30 s) and removes it itself past that; a live instance touches it
+        every 15 s. A manager killed hard (an OOM kill, a crashed login node) leaves its file behind, and an immediate
+        restart met it (c18 2026-10-30: 66 s after its last touch, three tries in ~10 s, then given up).
+
+        So: wait until the file is older than the window, watching it. If its mtime ADVANCES meanwhile, an instance is
+        alive somewhere (another login node, which this node's `list` cannot see) — said, nothing retried, the same
+        test globus-compute applies. Otherwise start once more. The file is never deleted here. The wait runs inside
+        the bring-up's call when it fits `_PID_WAIT_CAP_S` (a bring-up already takes minutes, the call is heartbeated);
+        a longer window (a raised heartbeat_period) is said as "connect again in N s". Returns the start's output."""
+        probe = await self.pid_file(name)
+        if probe is None or probe.age is None:
+            raise self._start_failed(rc, out, err, probe)   # no pid file (or no answer): not this refusal
+        first, age0, window = probe.mtime, probe.age, probe.window
+        said = f" globus-compute: {probe.log!r}." if probe.log else ""
+        left = window - age0
+        if left + _PID_MARGIN_S > _PID_WAIT_CAP_S:
+            raise RuntimeError(
+                f"remote start refused (rc={rc}): this endpoint's pid file is {age0:.0f} s old, and globus-compute "
+                f"starts it only once that file is older than {window:.0f} s (three heartbeats: a live instance "
+                f"refreshes it every 15 s), then removes it itself. Call connect_facility again in {left:.0f} s. "
+                f"Nothing was started.{said}")
+        waited = 0.0
+        while waited < left + _PID_MARGIN_S:
+            step = min(_PID_POLL_S, left + _PID_MARGIN_S - waited)
+            await _sleep(step)
+            waited += step
+            now = await self.pid_file(name)
+            if now is None:
+                continue
+            if now.mtime is None:   # gone: the instance stopped and cleaned up, or globus-compute removed it
+                break
+            if first is not None and now.mtime > first:
+                raise RuntimeError(
+                    f"remote start refused (rc={rc}): another instance of this endpoint is running — its pid file "
+                    f"was refreshed while hpc-bridge waited ({waited:.0f} s), as only a live instance does, perhaps "
+                    "on another login node, which this node's `list` cannot see. Nothing was started and the start "
+                    f"was not retried.{said}")
+        rc2, out2, err2 = await self._start_once(name)
+        if rc2 != 0:
+            raise self._start_failed(rc2, out2, err2, await self.pid_file(name))
+        self.start_note = (
+            f"the endpoint's previous manager had died without cleaning up (its pid file was {age0:.0f} s old, and "
+            f"globus-compute refuses a start until it is older than {window:.0f} s — three heartbeats): hpc-bridge "
+            f"waited {waited:.0f} s, saw no live instance refresh it, and started the endpoint again. ")
+        return out2
 
     async def _await_endpoint_id(self, name: str) -> str:
         """`endpoint_id`, polled for up to `_START_REGISTER_WAIT_S` after a fresh start: the detached
@@ -1220,6 +1449,10 @@ class SlurmFacility:
         self.endpoint_worker_init: str | None = None
         self.worker_init_note = ""  # set when the endpoint's own differs from this facility's env_setup
         self._adopted: str | None = None  # the endpoint id whose worker_init is known (READ, or started here)
+        self._past_dead_pin: str | None = None  # a repair's pinned node that did not answer (repair_endpoint_env)
+        # endpoint ids a new laptop's reattach found online but whose login worker never answered (connect: the
+        # session's AppCtx.ghost_endpoints): `find_online_endpoint` never re-adopts them
+        self.ghosts: set[str] = set()
         # Whether the bound endpoint's template is one that gives each block request its own compute user endpoint and
         # lets it exit when idle (this plugin's: `idle_heartbeats_soft` on the compute branch). Read with the
         # worker_init (adopt_endpoint), set when provision writes it; False until known — a template of an earlier
@@ -1294,7 +1527,10 @@ class SlurmFacility:
         if own is None:
             return
         self.endpoint_worker_init = own
-        if own != self.profile.worker_init and migrate_env_setup(own) != self.profile.worker_init:
+        # the default venv spelled `/home/<user>/…` (plugins up to 0.1.25) is the upgrade too, not an edit
+        user = getattr(getattr(self.cli, "target", None), "user", None) or ""
+        same = spelled_as_default(migrate_env_setup(own), user=user)
+        if own != self.profile.worker_init and same != self.profile.worker_init:
             self.worker_init_note = (
                 "this endpoint was started with a different env_setup than this facility's current one, and its "
                 "blocks keep the one it was started with. Only if its blocks fail or you changed env_setup: "
@@ -1481,6 +1717,173 @@ class SlurmFacility:
         if ensure is not None:
             await ensure()
 
+    async def repair_endpoint_env(self, hpc: Profile, endpoint_id: str, *,
+                                  wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
+        """A check met a user endpoint that could not import (warmth._repair_broken_env): the venv this endpoint's
+        manager runs from is broken or gone. Over the bring-up's own channel, the bring-up's own path: hpc-bridge's
+        venv checked and, when the check fails, built again (`ensure_venv`, as `venv_broken_repair` exercises), then —
+        on the login node the endpoint is pinned to — the manager stopped through the rebuilt CLI and the endpoint
+        configured and started again (`provision`). Where no pin says which node runs the manager (the round-robin
+        alias), it is not stopped: a stop sent there could reach the other node and act on the shared pid file; the
+        rebuilt venv at the same path serves its next user endpoints. Returns (what it did, the endpoint id).
+
+        `wanted`: asked before anything is stopped or started — False once the session no longer holds this endpoint
+        (a teardown claimed it, a connect re-bound): the repair then starts nothing (review round 2, 2026-10-31: a
+        repair left running by a cancelled call registered and started the endpoint again after a teardown)."""
+        name = self.profile.endpoint_name
+        self.cli.venv_ready = None  # checked earlier in this process, perhaps — and deleted since
+        dead = await self._ensure_venv_past_a_dead_pin()
+        res = getattr(self.cli, "venv_built", None)
+        what = (f"rebuilt hpc-bridge's endpoint venv {res.path} ({res.reason})" if res is not None and res.built
+                else "checked hpc-bridge's endpoint venv (it works now)" if self.cli.venv is not None
+                else "ran the facility's env_setup again")
+        target = self.cli.target
+        if dead is not None:
+            return await self._restart_past_a_dead_pin(hpc, endpoint_id, dead, what, wanted)
+        if getattr(target, "host_key_alias", None) in (None, target.host) and target.host == self.alias:
+            return f"{what}; the endpoint was not restarted (no pin says which login node runs it)", endpoint_id
+        _still_wanted(wanted, what, "stopped or started again")
+        rc, said = await self.cli.stop(name)
+        if rc == 255:
+            raise RuntimeError(f"{what}, but could not reach {target.host} to restart the endpoint: {said[-200:]}")
+        # `stop` asks; the daemon exits when it is done (a slow filesystem: Expanse, live 2026-09-04). Started while it
+        # still runs, provision would take its reuse branch and start nothing, and the answer would claim a restart
+        # (review round 1, 2026-10-31): wait for the exit, by the pid file, first.
+        if not await self._manager_exited(name):
+            raise RuntimeError(
+                f"{what}; the endpoint's manager on {target.host} was asked to stop but had not exited after "
+                f"{_STOP_EXIT_WAIT_S:.0f} s, so it was not restarted (hpc-bridge tries again at the next check)")
+        return await self._start_again(hpc, what, target.host, wanted)
+
+    async def _manager_exited(self, name: str) -> bool:
+        """After a `stop`: has the manager exited? Its pid file gone — an instance that exits cleanly removes it — or
+        `list` no longer showing it running while the file has stopped moving (`watch_pid_file`). Polled for at most
+        `_STOP_EXIT_WAIT_S`; an unreadable file is waited on."""
+        waited = 0.0
+        while True:
+            first = await self.cli.pid_file(name)
+            if first is not None and first.mtime is None:
+                return True
+            if first is not None and await self.cli.status(name) != "running":
+                verdict, w = await self.cli.watch_pid_file(name, first, min(_PID_TOUCH_WATCH_S,
+                                                                             max(0.0, _STOP_EXIT_WAIT_S - waited)))
+                waited += w
+                if verdict in ("gone", "quiet"):
+                    return True
+            elif waited < _STOP_EXIT_WAIT_S:
+                step = min(_PID_POLL_S, _STOP_EXIT_WAIT_S - waited)
+                await _sleep(step)
+                waited += step
+            if waited >= _STOP_EXIT_WAIT_S:
+                return False
+
+    async def _start_again(self, hpc: Profile, what: str, where: str,
+                           wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
+        """`provision` after a manager is known gone, claimed as a restart only when it started one — not its reuse
+        branch (a manager running after all) — and only once `list` shows it running; the node it started on is
+        recorded (`_record_start`). Raises otherwise: the repair is then not done, and is tried again. Nothing is
+        started for an endpoint the session no longer holds (`wanted`)."""
+        _still_wanted(wanted, what, "started again")
+        handle = await self.provision(hpc)
+        if handle.reused:
+            raise RuntimeError(f"{what}, but the endpoint's manager was still running when it was to be started again "
+                               "(another instance, or one that had not exited): nothing was restarted")
+        if await self.cli.status(self.profile.endpoint_name) != "running":
+            raise RuntimeError(f"{what}, and started the endpoint again, but `list` does not show it running yet")
+        self._record_start(handle)
+        return f"{what} — the endpoint restarted on {handle.login_host or where}", handle.endpoint_id
+
+    def _record_start(self, handle: EndpointHandle) -> None:
+        """The endpoint record after a repair started the manager again: pinned to the node it started on, the token
+        store's owner kept (`seeded_credentials`: teardown wipes only a store we placed). A restart past a dead pin
+        wrote none, so the next session's stop and teardown went to the round-robin alias (review round 1)."""
+        if self.store is None or not self.alias:
+            return
+        prior = self.store.get(alias=self.alias, name=self.profile.endpoint_name)
+        same = prior is not None and prior.endpoint_id == handle.endpoint_id
+        self.store.put(EndpointRecord(
+            endpoint_id=handle.endpoint_id,
+            login_host=handle.login_host or (prior.login_host if prior is not None and same else None),
+            alias=self.alias, user=self.cli.target.user, key_path=self.cli.target.key_path, name=handle.name,
+            provisioned_at=datetime.now(UTC).isoformat(),
+            seeded_credentials=bool(prior is not None and prior.seeded_credentials) or self._seeded_by_us(),
+        ))
+
+    async def _ensure_venv_past_a_dead_pin(self) -> str | None:
+        """The repair's venv check, on the pinned login node — and, when that node does not answer at all (connection
+        refused, no route, timed out: never a refused LOGIN, which keeps the pin), through the facility's own host
+        instead: the venv lives on the shared home, so any login node rebuilds it. Found by the returning-user cell c08
+        (2026-10-30): a running manager whose venv was deleted, its pinned node closed to new logins — the check went to
+        the pin, met "Connection refused" and the repair gave up. The pin is dropped only once the facility's host
+        answered (its venv check ran, or asked for the user's login): a host that does not answer either is the
+        client's own network (connect._drop_dead_pin's rule) and keeps the pin. Returns the dead node, or None — and the
+        dead node again on a later repair through the facility's host (`_past_dead_pin`: the first one handed the
+        user's login to their terminal, and this one rides the connection they opened)."""
+        target = self.cli.target
+        pinned = not (getattr(target, "host_key_alias", None) in (None, target.host) and target.host == self.alias)
+        try:
+            await self._ensure_venv()
+            return None if pinned else self._past_dead_pin
+        except Exception as exc:
+            if not pinned or not self.alias or not _UNREACHABLE.search(str(exc)):
+                raise
+            dead = target.host
+        self.cli.target = replace(target, host=self.alias, host_key_alias=None)  # the facility's host, as before a pin
+        self.cli.venv_ready = None
+        self._past_dead_pin = dead
+        try:
+            await self._ensure_venv()
+        except Exception as exc:
+            if _UNREACHABLE.search(str(exc)):   # the facility's host does not answer either: not a dead pin
+                self.cli.target = target
+                raise
+            self._drop_pin()   # it answered (asking for the user's login, perhaps): the pin is what is dead
+            raise
+        self._drop_pin()
+        return dead
+
+    def _drop_pin(self) -> None:
+        """The dead node's pin cleared from the endpoint record — the record itself kept: it also says who placed the
+        remote token store (`seeded_credentials`), which teardown needs (review round 1: the whole record went)."""
+        if self.store is not None and self.alias:
+            try:
+                rec = self.store.get(alias=self.alias, name=self.profile.endpoint_name)
+                if rec is not None and rec.login_host is not None:
+                    self.store.put(replace(rec, login_host=None))
+            except Exception:  # noqa: BLE001 - best-effort hygiene, as connect._drop_dead_pin
+                pass
+
+    async def _restart_past_a_dead_pin(self, hpc: Profile, endpoint_id: str, dead: str, what: str,
+                                       wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
+        """After a rebuild through the facility's host (`_ensure_venv_past_a_dead_pin`): the manager runs on `dead`,
+        which nothing here can reach to stop. If it still runs — its pid file refreshed within globus-compute's stale
+        window, as only a live instance does — it is left running: it starts its next user endpoints from the venv
+        rebuilt at the same path, and a second manager started elsewhere would be refused (`_pidfile_check`) or be a
+        second instance. If it is gone too, the endpoint is started again on the node the facility's host reaches."""
+        name = self.profile.endpoint_name
+        head = (f"{what} through {self.alias} (the home is shared): the login node it was pinned to, {dead}, does not "
+                "answer, so its pin was dropped")
+        # Running or not is decided as globus-compute decides it: by the pid file MOVING, watched across one touch
+        # interval — never one read of its age (review round 1: a manager killed under 90 s ago reads as fresh)
+        first = await self.cli.pid_file(name)
+        verdict = "unknown" if first is None else "gone" if first.mtime is None else (
+            await self.cli.watch_pid_file(name, first, _PID_TOUCH_WATCH_S))[0]
+        if verdict == "alive":
+            self._past_dead_pin = None   # this repair is done with it
+            return (f"{head}. Its manager still runs on {dead} (its pid file was refreshed while hpc-bridge watched) "
+                    "and starts its next user endpoints from the rebuilt venv: it was left running", endpoint_id)
+        if verdict == "unknown":
+            raise RuntimeError(f"{head}, but its pid file could not be read through {self.alias}, so whether its "
+                               f"manager on {dead} still runs is not known: nothing was restarted (hpc-bridge tries "
+                               "again at the next check)")
+        gone = "its pid file removed" if verdict == "gone" else "its pid file no longer refreshed"
+        done = await self._start_again(hpc, f"{head}; its manager there was gone too ({gone})", self.alias or dead,
+                                       wanted)
+        # forgotten only once the restart happened: a start that failed is tried again past the same dead node — never
+        # by the unpinned path, which would answer "not restarted" as a repair done (review round 2, 2026-10-31)
+        self._past_dead_pin = None
+        return done
+
     def _seeded_by_us(self) -> bool:
         """Did hpc-bridge place the remote token store? This process remembers its own bootstrap; across
         sessions the endpoint record does. Unknown ⇒ False: never delete a credential we did not create."""
@@ -1596,7 +1999,7 @@ class SlurmFacility:
             rc, err = None, "the stop timed out on the login node"
         if rc == 255:  # ssh itself failed: nothing ran on the login node
             return {"stopped": False, "deleted": False, "credentials_wiped": False, "ssh_closed": False,
-                    "ssh_failed": True, "error": err[:400]}
+                    "ssh_failed": True, "error": said_end(err)}
         # a non-zero gce rc can be a psutil traceback on the way out with the daemon in fact gone: re-check. A
         # re-check that TIMES OUT proves nothing either way — report "unconfirmed" (None), never "still running".
         stopped: bool | None
@@ -1638,7 +2041,7 @@ class SlurmFacility:
         # live 2026-09-04) and tells the user something false about what is left on their machine.
         ssh_closed = bool(await self.cli.close())  # drop the shared SSH master; the endpoint is gone
         return {"stopped": stopped, "deleted": deleted, "credentials_wiped": wiped, "ssh_closed": ssh_closed,
-                "ssh_failed": False, "error": "" if stopped else (err or "")[:400], "delete_error": delete_error}
+                "ssh_failed": False, "error": "" if stopped else said_end(err or ""), "delete_error": delete_error}
 
     async def login_exec(self, command: str) -> tuple[int, str, str]:
         """Read-only login-node command for discovery — no block, no allocation (delegates
@@ -1677,7 +2080,7 @@ class SlurmFacility:
         for ep in endpoints or []:
             ep_name = ep.get("name") or ep.get("display_name")
             ep_id = ep.get("uuid") or ep.get("endpoint_uuid") or ep.get("id")
-            if ep_name != name or not ep_id:
+            if ep_name != name or not ep_id or ep_id in self.ghosts:   # a ghost this session found: never re-adopted
                 continue
             if await self.manager_online(ep_id):  # our endpoint, reported online -> reuse over AMQP
                 return ep_id

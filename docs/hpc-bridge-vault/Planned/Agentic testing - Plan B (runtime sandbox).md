@@ -166,6 +166,59 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
   - **The sweep's free wave**: with `HPCB_OPERATOR=codex|pi|hermes21`, `sweep_profiles.sh` leaves out `paid_only()`. Its hermetic test keeps that list equal to what `run.py` would skip.
   - **Hooks and graders skip a blind opening batch (2026-10-15).** hermes21 on gpt-oss opened cells with a parallel batch sent before any facility was connected (`poll_task("PLACEHOLDER")`, a `stop_endpoint` answering "no endpoint was up", …), and "after poll_task #1" fired `orphaned_task`'s kill on the placeholder. A hook now counts only the calls it is about: `when_phase` (`"running"` / `"complete"`), `when_endpoint: True` (the answer names the endpoint it acted on) and `after_hook` (`draining_restop`'s thaw: the first stop after the freeze). Both feeds see them, and a hermetic test replays the batch against every scenario's hooks. `hook_problems` refuses a condition that could never fire. Graders keyed on "the first call of tool X" skip the server's own no-op answers made before any endpoint existed (`invariants.acted_on_nothing`): `teardown_slow_fs`, the MEP stop graders, `spend_gate_enforced` and the account floors; a skipped blind `confirm_spend=True` is still failed by `spend_not_unprompted`. The same rerun added two INFRA reasons for a cleanly ended run whose final answer is a tool call never made: raw harmony tool-call tokens the server left unparsed, or the call written as JSON (possibly the model's own format error) (`harness/infra.py`).
 
+- **Returning users: chains whose phases have different operators (2026-10-30, branch `test/returning-user`).** The
+  combinatorial follow-up to the Perlmutter report (plugin 0.1.20, 2026-10-29), whose leftovers came stacked. Each
+  cell is a two-session chain on the fake `nersc` profile (`agentic/harness/returning.py`; `agentic/README.md`,
+  "Returning users").
+  - **A `PHASES` entry may be a dict** (`run.py._phase_spec`). `{"script": fn, "server": "previous"}` is a scripted
+    session on the named release (`current`, `previous` or a pinned version, with `"env"` for its server), whatever the
+    cell's operator. `"when": fn(trace)` runs a phase only when it holds. `"premise": True` stops the chain when the
+    phase does not finish, and a failed interphase stops it too: the cell is SETUP FAILED, `harness:chain` names the
+    cause (review of 2026-10-30: a failed session 1 was graded FAILED on session 2's rows).
+    `INTERPHASE_SETUP` may hold callables that get an `InterphaseContext` (the next phase's index, the trace so far,
+    the world channel, the login nodes).
+  - **The bundle marks each phase** of such a chain (`{"chain_phase": k, "operator": …}`). `regrade.chain_trace`
+    reads each phase with its own operator's reader: a script's or a CLI's steps-and-journal rows, the Claude SDK's
+    stream.
+  - **Codex, Pi and Hermes drive a chain whose first phase is scripted** (`midrun_hooks.seeded_chain`): after it the
+    cell's operator only runs fresh one-shot sessions. A plain prompt chain stays the Claude operator's.
+  - **Older releases are in the image** (`prev_release.py`), one slot each at `/opt/hpcb-prev/<slot>`: `previous`,
+    the newest RELEASE COMMIT (pyproject's version bumped, first-parent history) older than this version — 0.1.24
+    today; the three `v*` tags would have said 0.1.20 — and each pinned version (0.1.20, for the Perlmutter replay).
+    Versions order numerically, pre-releases included. `run_smoke.sh` / `run_suite.py` export each slot (VERSION,
+    COMMIT, DATE beside its tree; a failure is an ERROR with its reason) and the Dockerfile installs each from its own
+    lock (~3 s of a cached build, ~100 MB). Session 1 on one runs in the index its release saw (uv `exclude-newer` at
+    the commit's date, in the pool user's uv config for session 1 only). `harness:phase_server` gates the version a
+    scripted phase ran; the head row keeps the server's whole argv and `server_release`. A release that keeps no
+    journal (0.1.20) has the script's own steps as the record (`script_runner.steps_trace`).
+  - **New node actions** (`node_actions.py`): `sshd_closed` closes a login node to new logins and keeps its
+    processes, so a manager may still run on a node no one can reach. `qos_retire` / `qos_restore` run on the
+    controller, and the nersc submit filter reads `/etc/slurm/retired_qos.conf`.
+  - **The cells are pairwise** (`pairwise.py`, deterministic, constraints as forbidden pairs, and a whole-row rule
+    kept by mending: every changed level must bite) and checked in as `returning_cells.tsv`: 22 scripted cells over
+    10 factors (`shared_host` dropped: under the run's one endpoint name it was a renamed id). A run's levels ride in
+    its env (`HPCB_RETURNING_LEVELS`), so a regrade grades the cell that ran. Three agent cells (Perlmutter replay, all well, new
+    laptop) run in every wave of the sweep's `nersc` profile. The scripted cells are the script-only sweep profile
+    `returning`, which boots the nersc cluster.
+  - **A scripted phase's server ending under this process** (the script operator's in-process MCP client) is no
+    longer reported as `harness:server_exited`. The script closes each session itself.
+  - **First run (2026-10-30): 15 of 20 scripted cells OK.** Every failure is one of two product bugs. A hard-killed
+    manager's stale `daemon.pid` blocks every restart (gce exits 73 silently; the notice quotes `.bashrc` noise). A
+    reused manager whose venv is gone cannot start user endpoints, and the notice blames the config or the
+    allocation. The CHANGELOG's Unreleased "Testing" entry has the cells.
+  - **After the fixes and the review (2026-10-30): 21 of 22 scripted cells OK.** The review of the same day turned its
+    probes into tests that fail on the first harness and changed what the cells judge: hello world on a compute node by
+    the compute shape; the same endpoint and no rebuild of session 1's venv wherever nothing deleted them (13 and 12
+    cells, where one cell gated reuse before); every changed level one that bites (`BITES`), each factor's grader gated
+    wherever its level changes; world changes checked as they are made; session 1 the premise (SETUP FAILED when it
+    fails). The remaining failure, c08, is a product gap: a broken venv under a running manager whose pinned node is
+    dead is not repaired (the repair's check runs over the dead pin).
+  - **Second round (2026-10-30): the dead-pin repair, the zero-SSH reattach for a new laptop, and the account test that
+    read a policy refusal as an account error are fixed** ([[facility-remote]], [[connect]], [[discovery]]).
+    - Results: 21 of 22 scripted cells OK, the six #236 proofs OK, the three agent cells OK.
+    - c08 reaches hello world. It still fails `ru_policy_surfaced`: on the previous release's long-lived compute user
+      endpoint the site's refusal arrives as a task traceback, never the scheduler's words — left open.
+
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.
 - The fake-seams agentic tier (control/cost/fault) — separate harness, shares this trace/invariant core.

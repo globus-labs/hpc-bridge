@@ -20,5 +20,26 @@ facility's options, its template's default); `_size_refusal` also refuses `nodes
 where the facility's own options already ask for GPUs. Old terms are said by what the block held
 (`resources.size_words`), and "partition, account or size" follows `rt.switched_size` on a switch back.
 
+**A failure is quoted by its end (2026-10-29, the Perlmutter report, item 5).** A remote step's stderr opens with the
+login shell's startup noise (Lmod's module swaps, a stale `~/.gitconfig.lock`) and ssh's with a site banner, so the
+notice's old cut, a message's first 500 characters, kept the noise and lost the cause. `_explain_provision_error` now
+bounds a failure it shows as text with `_ends`: 660 characters (`_FAILURE_CAP`), cut from the MIDDLE and marked
+(`[hpc-bridge: notice cut — N chars from its middle]`), so the head names the step and the end is what the remote said
+last; the messages themselves quote their output's end ([[facility-base]] `said_end`). The last `_KEPT_END` (460)
+characters are never cut: that is a step's end as `said_end` already kept it, whose first line may be the cause (Lmod's
+unknown module, before its help — review round 1 found a message 3 characters over a 500 cap losing it), so a message
+of one quote is never cut at all, and a refused `start` puts its own words last, after `list`'s (the start's own when
+it said anything, else `list`'s). It classifies the message as before (a denial
+behind a banner is still NO SSH ACCESS, since the end keeps ssh's verdict), and a CANNOT REACH with no verdict line
+quotes the last line, not the first: the cut mark, a stale control socket or a banner come before ssh's verdict.
+
+## A broken environment is not the config (2026-10-30, the returning-user cells)
+`broken_endpoint_env(error)` reads an import failure in a dispatch error (`_IMPORT_FAILURE`: `No module named …`,
+`ImportError`) and returns its cause; `_dispatch_error_suffix` then says the endpoint could not start a user endpoint
+because the environment it runs from is broken — not the config, the partition or the queue — that hpc-bridge rebuilds
+it, and the user's next step if that fails (`teardown_endpoint`, then `connect_facility`). Before, the same failure read
+"fix the config/partition" and, from the pilot probe, "likely REJECTED (e.g. inactive allocation, wrong account, or bad
+queue)"; `server` now skips the probe's "rejected" words when the cause is a broken environment.
+
 ## See also
 [[server]] · [[models]] · [[context]] · [[config]] · [[cost]]

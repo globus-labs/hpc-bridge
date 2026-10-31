@@ -90,6 +90,24 @@ def _git_describe() -> str:
 BUILD_RETRY_WAITS_S = (30, 90)
 
 
+def _export_previous_release() -> str | None:
+    """The older releases' trees, installed in the image beside this code (harness/prev_release.py; the returning-user
+    cells' first session runs one). A failed export is said LOUDLY, with its reason — it was swallowed (capture_output,
+    check=False) before the review of 2026-10-30, so a stale or missing release went unnoticed — and returned; the suite
+    still runs (an image without a release refuses only the cells that need it, SETUP FAILED)."""
+    try:
+        r = subprocess.run([sys.executable, str(REPO / "agentic" / "harness" / "prev_release.py"), "export", str(REPO)],
+                           capture_output=True, text=True, timeout=300, check=False)
+        why = None if r.returncode == 0 else f"rc={r.returncode}: {(r.stderr or r.stdout).strip()[-600:]}"
+    except (OSError, subprocess.SubprocessError) as exc:
+        why = f"{type(exc).__name__}: {exc}"
+    if why:
+        print(f"ERROR: the older hpc-bridge releases could not be exported ({why}) — every cell that runs one "
+              "(origin=previous, the Perlmutter replay) will be SETUP FAILED", flush=True)
+        print(f"ERROR: prev_release export failed: {why}", file=sys.stderr, flush=True)
+    return why
+
+
 async def _build_once(waits=BUILD_RETRY_WAITS_S) -> str | None:
     """Build the jail image; None when it built, else the failure's last line (for the cells' INFRA rows)."""
     print("building the jail image once (parallel jobs reuse it)…", flush=True)
@@ -585,6 +603,8 @@ async def _main(args) -> int:
     if _TARGET.name == "fake" and not args.no_cluster_up and not await _fake_cluster_up(args.reset_cluster, args.profile):
         print("fake cluster did not come up — see agentic/fakecluster/README.md", file=sys.stderr)
         return unrun("the fake cluster did not come up")
+    if not args.no_build:
+        _export_previous_release()
     if not args.no_build and (why := await _build_once()) is not None:
         return unrun(f"the jail image did not build ({why})")
 
