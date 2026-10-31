@@ -1500,11 +1500,19 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     else:
         phase = "admitting"
     owner = None
+    gone = None
     if run is None and state not in ("done", "cancelled"):
         beat = int(_now() - float(b["heartbeat"] or 0))
         owner = f"pid {b['owner_pid']} on {b['owner_host']} (heartbeat {beat} s ago)"
-    reason = b.get("pause_reason") if phase in ("needs_confirmation", "cancelled") else (
-        run.waiting if run is not None and phase == "waiting" else None)
+        if str(b["owner_host"] or "") == owner_of(app).host and not led.pid_alive(int(b["owner_pid"] or 0)):
+            # its server is gone (that pid is dead here): nothing admits for it, whatever its last state said; this
+            # server takes the lease over once the heartbeat is stale, and then asks again before sending more
+            phase = "needs_confirmation"
+            gone = (f"the hpc-bridge server that ran this batch is gone ({owner}); this server takes it over once "
+                    f"its heartbeat is {int(led.lease_stale_s)} s old, collects what finished, and sends nothing more "
+                    "before the user's yes")
+    reason = gone or (b.get("pause_reason") if phase in ("needs_confirmation", "cancelled") else (
+        run.waiting if run is not None and phase == "waiting" else None))
     parts = [f"{bid}: {c.get('done', 0)} done, {c.get('failed', 0)} failed, {_held(c)} out "
              f"({c.get('in_flight', 0)} in flight), {c.get('backlog', 0)} in the backlog of {total}"]
     for k in ("lost", "presumed_lost", "submit_unknown", "cancelled"):

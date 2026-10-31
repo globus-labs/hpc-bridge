@@ -780,6 +780,24 @@ async def test_after_a_restart_a_row_sent_without_its_id_is_found_in_the_task_gr
     assert states[1] == "done" and states[2] == "backlog", states   # found in the group; never sent
 
 
+async def test_a_batch_whose_server_died_reads_paused_before_its_lease_goes_stale():
+    """Live 2026-10-31 (batch_restart_resume): the new server's first status, seconds after the kill, read the ledger's
+    `admitting` — but nothing can admit for a batch whose server is dead. It answers needs_confirmation, saying the
+    lease is taken over once the heartbeat is stale."""
+    from hpc_bridge import server
+    from hpc_bridge.ledger import Ledger, Owner
+
+    app, _rt, _runner = await _batch_app()
+    out = await _start(app, n=3)
+    app.ledger.close()
+    app2, _rt2, runner2 = await _batch_app()
+    app2.batch_owner = _owner(pid=os.getpid() + 100_000, host=Owner.here().host)
+    app2.ledger = Ledger.open()
+    app2.ledger.pid_alive = lambda pid: pid != os.getpid()            # dead, but its heartbeat is fresh
+    st = await server._status(app2, out.batch_id)
+    assert st.owner and st.phase == "needs_confirmation" and "gone" in (st.reason or "") and not runner2.futures
+
+
 async def test_a_reap_the_batch_reported_is_answered_by_one_yes():
     """A batch task that reached another block than the confirmed one refused to run (the wrong-block guard): the block
     was reaped. The batch's own pause names the reap, so the user's yes on the resume is for the new block — it is not
