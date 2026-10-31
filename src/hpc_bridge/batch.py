@@ -570,16 +570,29 @@ def retire_all(app: AppCtx, rt: ShapeRuntime | None, why: str) -> None:
 
 def in_flight_note(app: AppCtx) -> str | None:
     """What of the batches this process runs holds the compute block, and how to end it — for stop_endpoint's busy
-    refusal. None when nothing does."""
+    refusal. None when nothing does. The ledger's batches on this endpoint count too, not only this process's: tasks
+    a killed server sent run on (status(id) collects them here), and releasing the block under them would have the
+    endpoint relaunch one for them."""
     parts = []
-    for bid, run in app.batches.items():
+    ids = list(app.batches)
+    if app.state.endpoint_id is not None:
+        try:
+            ids += [b["id"] for b in ledger_of(app).batches(endpoint_id=app.state.endpoint_id,
+                                                            states=("admitting", "needs_confirmation", "cancelled"))
+                    if b["id"] not in app.batches]
+        except LedgerError:
+            pass
+    for bid in ids:
+        run = app.batches.get(bid)
         try:
             c = _counts(ledger_of(app), bid)
         except LedgerError:
             continue
-        out = _out_now(c)
-        if out or run.futures:
-            parts.append(f"{bid} has {max(out, len(run.futures))} task(s) in flight on the block (admission is now "
+        out = c.get("in_flight", 0)
+        futures = len(run.futures) if run is not None else 0
+        if out or futures:
+            mine = "" if run is not None else " (sent by an earlier hpc-bridge server: status first collects them here)"
+            parts.append(f"{bid} has {max(out, futures)} task(s) in flight on the block{mine} (admission is now "
                          f"paused; {c.get('backlog', 0)} row(s) wait in its backlog) — end them with "
                          f"cancel('{bid}', 'abort'), or wait for them (status('{bid}', wait_s=60)) and then call "
                          "stop_endpoint again")
