@@ -853,3 +853,31 @@ async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_i
     await batch.tick(app, out.batch_id)                                # the reaped user endpoint's relaunch, released
     assert any("scancel" in c and uep in c for c in cmds) and not any("uep.fake-eid" in c for c in cmds)
     assert "14" in app.ledger.batch(out.batch_id)["blocks_seen"]
+
+
+async def test_a_new_confirmations_config_gets_a_batch_runner_of_its_own():
+    """Live 2026-10-31 (batch_block_reaped_midrun): after the reap and the yes, the shape's config had a fresh
+    `hpcb_block` (a new user endpoint), but the batch kept sending with its first runner's config — to the reaped block's
+    user endpoint. A changed config gets a new runner; the old one's config is a copy, never the shape's own dict."""
+    from hpc_bridge import batch
+
+    app, rt, runner = await _batch_app()                               # capacity 2
+    made: list[_BatchRunner] = []
+
+    def factory(eid, user_endpoint_config=None, **_kw):
+        r = _BatchRunner(canary=runner._canary)
+        r.uec = user_endpoint_config
+        made.append(r)
+        return r
+
+    app.runner_factory = factory
+    rt.runner = None
+    out = await _start(app, n=4)
+    first = app.batches[out.batch_id].runner
+    rt.user_endpoint_config["hpcb_block"] = 42                        # a new confirmation's fresh token
+    assert first.uec.get("hpcb_block") != 42                           # the runner's config is a copy
+    for i, f in enumerate(list(first.futures)):
+        f.finish(_ok_report(i))
+    await batch.tick(app, out.batch_id)
+    run = app.batches[out.batch_id]
+    assert run.runner is not first and run.runner.uec.get("hpcb_block") == 42 and run.runner.futures

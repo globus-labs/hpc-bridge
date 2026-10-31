@@ -27,6 +27,7 @@ from __future__ import annotations
 
 import asyncio
 import base64
+import copy
 import hashlib
 import json
 import os
@@ -440,6 +441,8 @@ class _Run:
     batch_id: str
     rt: ShapeRuntime | None
     runner: Any = None
+    runner_hash: str | None = None     # the block config `runner` sends with (uec_hash at its build)
+    old_runners: list[Any] = field(default_factory=list)   # earlier configs' runners, closed once nothing is out
     futures: dict[tuple[int, int], Any] = field(default_factory=dict)
     guards: dict[tuple[int, int], Any] = field(default_factory=dict)
     sent_on: dict[tuple[int, int], ShapeRuntime] = field(default_factory=dict)
@@ -536,11 +539,34 @@ def _sync_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
 def _batch_runner(app: AppCtx, rt: ShapeRuntime) -> Any:
     """The batch's own runner: the compute shape's config (the same user endpoint, so the same confirmed block) on an
     Executor of its own, whose task group the service mints at its first submit and whose results nobody else
-    consumes (S1)."""
+    consumes (S1). A COPY of the config: the shape's own changes with the next confirmation (a fresh `hpcb_block`)."""
     eid = app.state.endpoint_id
     ceiling = _task_ceiling_s(rt.user_endpoint_config)
-    return app.runner_factory(eid, user_endpoint_config=getattr(app.facility, "dispatch_uec", lambda d: d)(
-        rt.user_endpoint_config), walltime=ceiling, timeout=5.0)
+    uec = copy.deepcopy(getattr(app.facility, "dispatch_uec", lambda d: d)(rt.user_endpoint_config))
+    return app.runner_factory(eid, user_endpoint_config=uec, walltime=ceiling, timeout=5.0)
+
+
+def _runner_for_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> Any:
+    """The batch's runner for the block the shape is confirmed for NOW: a new one when the shape's config changed (a
+    new confirmation's fresh `hpcb_block` is a new user endpoint — tasks sent with the old config would go to the
+    reaped block's user endpoint, live 2026-10-31). The old one is kept until its tasks out have settled."""
+    h = uec_hash(rt)
+    if run.runner is None or run.runner_hash != h:
+        if run.runner is not None:
+            run.old_runners.append(run.runner)
+        run.runner, run.runner_hash = _batch_runner(app, rt), h
+    return run.runner
+
+
+def _close_old_runners(run: _Run) -> None:
+    if run.futures or not run.old_runners:
+        return
+    for r in run.old_runners:
+        try:
+            r.close()
+        except Exception:  # noqa: BLE001
+            pass
+    run.old_runners.clear()
 
 
 def _counts(led: Ledger, bid: str) -> dict[str, int]:
@@ -700,7 +726,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
         return _refused(f"the default results directory {rd!r} cannot be used; pass results_dir=")
     led = ledger_of(app)
     owner = owner_of(app)
-    run = _Run(bid, rt, runner=_batch_runner(app, rt), ensure_up=ensure_up)
+    run = _Run(bid, rt, runner=_batch_runner(app, rt), runner_hash=uec_hash(rt), ensure_up=ensure_up)
     _note_block_from_canary(app, run, rt)
     cap = capacity_for(run.workers_seen or workers_of(rt))
     led.add_batch(bid, command=command, rows=rows, task_walltime_s=wall, capacity=cap, results_dir=rd,
@@ -763,7 +789,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
     run = app.batches.get(bid)
     if run is None or run.rt is not rt:
         old = run
-        run = _Run(bid, rt, runner=_batch_runner(app, rt))
+        run = _Run(bid, rt, runner=_batch_runner(app, rt), runner_hash=uec_hash(rt))
         if old is not None:   # results of tasks sent on the old block still settle through their own futures
             run.futures, run.guards, run.sent_on = old.futures, old.guards, old.sent_on
             run.adopted = old.adopted   # rows a dead server queued are still reconciled after the resume
@@ -987,6 +1013,7 @@ async def tick(app: AppCtx, bid: str) -> int:
     async with app.lock:
         n = _admit_locked(app, run)
     _maybe_done(app, run)
+    _close_old_runners(run)
     run.wake.set()
     return n
 
@@ -1010,8 +1037,7 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     if not rt.spend_confirmed:
         pause(app, bid, "the block's spend is no longer confirmed")
         return 0
-    if run.runner is None:
-        run.runner = _batch_runner(app, rt)
+    _runner_for_block(app, run, rt)
     _sync_block(app, run, rt)
     if run.block_end_at is None:
         _note_block_from_canary(app, run, rt)
@@ -1121,7 +1147,9 @@ async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
         pause(app, run.batch_id, f"the next block could not be confirmed ({st.status}): {st.notice or ''}".strip())
         return st
     new = app.shapes.get("compute")
-    run.rt, run.runner = new, (_batch_runner(app, new) if new is not None else None)
+    run.rt = new
+    if new is not None:
+        _runner_for_block(app, run, new)
     run.block_end_at = run.block_job = run.block_seen_at = None
     run.workers_seen, run.next_block = None, False
     if new is not None:
