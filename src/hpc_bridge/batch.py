@@ -525,6 +525,10 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
         run.block_job = c.worker_job
         if run.block_seen_at is None:
             run.block_seen_at = _now() - age
+        try:   # a block the batch runs on (or was confirmed for): on the record, as a result naming it would put it
+            ledger_of(app).add_block_seen(run.batch_id, c.worker_job)
+        except LedgerError:
+            pass
     if c.worker_count:
         run.workers_seen = c.worker_count
 
@@ -1050,6 +1054,8 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     _sync_block(app, run, rt)
     if run.block_end_at is None:
         _note_block_from_canary(app, run, rt)
+    if not led.counts(bid).get("backlog", 0):
+        return 0   # nothing left to admit: the gate has nothing to hold back, and asks for no block
     remaining = run.remaining()
     need = float(b["task_walltime_s"]) + MARGIN_S
     if remaining is None:
@@ -1142,6 +1148,9 @@ async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
     led = ledger_of(app)
     b = led.batch(run.batch_id)
     rem = run.remaining()
+    if not led.counts(run.batch_id).get("backlog", 0):
+        run.next_block = False   # nothing left for a next block to run
+        return None
     if (not run.next_block or run.ensure_up is None or rt is None or rt is not run.rt or not _fresh_ok(app)
             or rem is None or admit_ok(rem, float(b["task_walltime_s"])) or run.futures or rt.inflight
             or rt.batch_inflight or warmth._live_task_handles(app, "compute")):

@@ -881,3 +881,16 @@ async def test_a_new_confirmations_config_gets_a_batch_runner_of_its_own():
     await batch.tick(app, out.batch_id)
     run = app.batches[out.batch_id]
     assert run.runner is not first and run.runner.uec.get("hpcb_block") == 42 and run.runner.futures
+
+
+async def test_the_gate_asks_for_no_block_when_nothing_is_left_to_admit():
+    """Live 2026-10-31 (batch_crosses_walltime): the gate closed while the LAST row ran, the batch asked again, and the
+    yes started a block nothing ran on. With the backlog empty the gate holds nothing back and asks for nothing."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(remaining_s=150.0, workers=3)   # capacity 2
+    out = await _start(app, n=2)
+    runner.futures[0].finish(_ok_report(0, remaining_s=80.0))
+    await batch.tick(app, out.batch_id)
+    st = await server._status(app, out.batch_id)
+    assert st.phase == "admitting" and st.counts.in_flight == 1 and st.counts.backlog == 0
