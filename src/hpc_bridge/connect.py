@@ -605,6 +605,8 @@ async def _connect(
         if ssh_left is not None and old_eid is not None:  # until a confirmation or a stop there (warmth, server)
             app.ssh_left[old_eid] = ssh_left
         prior_spend = _drop_all_shapes(app, bank=True)  # the old endpoint's runners and handles are gone
+        # …and a repair of it, cancelled there: unwound before this binding brings anything up (review round 2)
+        await warmth._settle_env_repairs(app)
         # tasks of ours the old SSH endpoint may still hold (#24): they can start a block there after this connect
         queued_left = 0 if old_mep or old_eid is None else warmth._unresolved_count(
             app, old_eid, await warmth._read_checks(old_eid, 2.0))
@@ -998,9 +1000,10 @@ async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
     — the config that brought it up — apply.
 
     The wait: a check still queued is waited on, a transient refusal sent again after a growing back-off, any other
-    answer ends it (said: the manager is alive — a broken environment is the repair's, after the confirm). No answer
-    within `_REATTACH_WAIT_S` is a ghost (#37: "online" is the heartbeat the service last saw): recorded in
-    `AppCtx.ghost_endpoints`, so the confirm that follows does not wait on it again. Everything is bounded by
+    answer ends it (said: the manager is alive — a broken environment is the repair's, after the confirm). No passing
+    check within `_REATTACH_WAIT_S` — silence, or the service's "busy" (a 409 is not the manager's answer) — is a ghost
+    (#37: "online" is the heartbeat the service last saw): recorded in `AppCtx.ghost_endpoints`, so the confirm that
+    follows does not adopt it again without SSH; a later check that passes clears it. Everything is bounded by
     `_REATTACH_BUDGET_S`. Returns (draft, notes, name, id); otherwise None (not asked) or why the SSH probe runs."""
     import shlex
 
@@ -1018,7 +1021,7 @@ async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
     deadline = t0 + _REATTACH_WAIT_S
     runner = app.runner_factory(eid, user_endpoint_config=shape_config("login"))
     try:
-        backoff, busy = _REATTACH_BACKOFF_S, ""
+        backoff, busy, silent = _REATTACH_BACKOFF_S, "", False
         while True:
             left = deadline - _monotonic()
             check = await runner.canary(timeout=max(1.0, min(_REATTACH_CANARY_S, left)))
@@ -1028,15 +1031,19 @@ async def _probe_through_endpoint(app: AppCtx, facility: str, host: str
             if error != "timeout" and not _transient_dispatch_failure(error):
                 return f"your endpoint {name} ({eid}) is listed online and {_answered(error)}"
             busy = busy or (error if error != "timeout" else "")
+            silent = silent or error == "timeout"
             if _monotonic() >= deadline:
-                if busy:   # it answered, every time, that it is busy: alive — not a ghost
-                    return (f"your endpoint {name} ({eid}) is listed online, but its manager kept answering that it "
-                            f"is busy for {_REATTACH_WAIT_S:.0f} s ({' '.join(busy.split())[:160]}): probed over SSH "
-                            "instead. ")
+                # No check passed: not adopted again without SSH, whatever "busy" answers came — a 409 is the web
+                # service's, not proof the manager lives (review round 2). A later check that passes clears it.
                 app.ghost_endpoints.add(eid)
+                said = f" ({' '.join(busy.split())[:160]})" if busy else ""
+                if busy and not silent:
+                    return (f"your endpoint {name} ({eid}) is listed online, but the service kept answering that it is "
+                            f"busy for {_REATTACH_WAIT_S:.0f} s{said} and no check passed: probed over SSH instead. ")
+                also = f"; the service also answered that it is busy{said}" if busy else ""
                 return (f"your endpoint {name} ({eid}) is listed online, but its login worker did not answer within "
-                        f"{_REATTACH_WAIT_S:.0f} s (a stale registration, or a manager that is gone): probed over SSH "
-                        "instead. ")
+                        f"{_REATTACH_WAIT_S:.0f} s (a stale registration, or a manager that is gone{also}): probed "
+                        "over SSH instead. ")
             # a still-queued check is waited on by the next canary itself; a refused one is sent again only after a
             # back-off — and either way the loop yields (a fake or a fast failure must not starve the heartbeat)
             pause = 0.5 if error == "timeout" else backoff

@@ -37,6 +37,8 @@ from ..profile import Profile
 from ..state import EndpointRecord, LoginNodeStore
 
 if TYPE_CHECKING:
+    from collections.abc import Callable
+
     from ..catalog.entry import CatalogEntry
 from . import endpoint_venv
 from .base import EndpointHandle, endpoint_metadata, said_end, step_error
@@ -266,12 +268,15 @@ async def online_endpoint_named(name: str, client_factory) -> tuple[str | None, 
     connect._probe_through_endpoint): (the id of an endpoint OWNED by this identity named `name` that the web service
     lists online, else None; the web or login error that kept the service from saying, else None). NO SSH. "online" is
     the manager's heartbeat as the service last saw it — a ghost reads online too (#37): the caller's check of a login
-    worker decides. The error is returned, never swallowed: the caller says why it probes over SSH (review round 1)."""
+    worker decides. The error is returned, never swallowed: the caller says why it probes over SSH (review round 1) —
+    but only when no registration of the name is online: one whose status could not be read does not hide the next
+    (review round 2)."""
     try:
         client = client_factory()
         endpoints = await asyncio.to_thread(client.get_endpoints, "owner")
     except Exception as exc:  # noqa: BLE001 - web/auth failure -> said by the caller, which probes over SSH
         return None, f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+    error = None
     for ep in endpoints or []:
         ep_name = ep.get("name") or ep.get("display_name")
         ep_id = ep.get("uuid") or ep.get("endpoint_uuid") or ep.get("id")
@@ -279,11 +284,12 @@ async def online_endpoint_named(name: str, client_factory) -> tuple[str | None, 
             continue
         try:
             status = await asyncio.to_thread(client.get_endpoint_status, ep_id)
-        except Exception as exc:  # noqa: BLE001 - this one unreadable: said by the caller
-            return None, f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+        except Exception as exc:  # noqa: BLE001 - this one unreadable: the others are read; said if none is online
+            error = error or f"{type(exc).__name__}: {' '.join(str(exc).split())[:200]}"
+            continue
         if (status or {}).get("status") == "online":
             return str(ep_id), None
-    return None, None
+    return None, error
 
 
 class NeedsPreauth(Exception):
@@ -465,6 +471,15 @@ _STOP_EXIT_WAIT_S = 60.0   # how long a repair waits for a stopped manager to ex
 _UNREACHABLE = re.compile(r"ssh: connect to host [^\n]*(?:connection refused|no route to host|timed out|"
                           r"network is unreachable|host is down|network is down)|could not resolve hostname", re.I)
 _sleep = asyncio.sleep  # indirection so tests can run the poll loop without waiting
+
+
+def _still_wanted(wanted: Callable[[], bool] | None, what: str, undone: str) -> None:
+    """A repair about to stop or start a manager: raises when the session no longer holds the endpoint (`wanted`
+    False: a teardown claimed it, a connect re-bound) — nothing is then `undone` (review round 2, 2026-10-31)."""
+    if wanted is not None and not wanted():
+        raise RuntimeError(f"{what}; the endpoint was torn down or replaced meanwhile, so it was not {undone}")
+
+
 _JOBID = re.compile(r"^\d+(_\d+)?$")  # plain or array slurm job id (guards what we scancel)
 _JOBID_PBS = re.compile(r"^\d+(\.\S+)?$")  # PBS: bare or host-qualified (1234567.polaris-pbs-01)
 _TRACEBACK = "Traceback (most recent call last)"
@@ -1702,14 +1717,19 @@ class SlurmFacility:
         if ensure is not None:
             await ensure()
 
-    async def repair_endpoint_env(self, hpc: Profile, endpoint_id: str) -> tuple[str, str]:
+    async def repair_endpoint_env(self, hpc: Profile, endpoint_id: str, *,
+                                  wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
         """A check met a user endpoint that could not import (warmth._repair_broken_env): the venv this endpoint's
         manager runs from is broken or gone. Over the bring-up's own channel, the bring-up's own path: hpc-bridge's
         venv checked and, when the check fails, built again (`ensure_venv`, as `venv_broken_repair` exercises), then —
         on the login node the endpoint is pinned to — the manager stopped through the rebuilt CLI and the endpoint
         configured and started again (`provision`). Where no pin says which node runs the manager (the round-robin
         alias), it is not stopped: a stop sent there could reach the other node and act on the shared pid file; the
-        rebuilt venv at the same path serves its next user endpoints. Returns (what it did, the endpoint id)."""
+        rebuilt venv at the same path serves its next user endpoints. Returns (what it did, the endpoint id).
+
+        `wanted`: asked before anything is stopped or started — False once the session no longer holds this endpoint
+        (a teardown claimed it, a connect re-bound): the repair then starts nothing (review round 2, 2026-10-31: a
+        repair left running by a cancelled call registered and started the endpoint again after a teardown)."""
         name = self.profile.endpoint_name
         self.cli.venv_ready = None  # checked earlier in this process, perhaps — and deleted since
         dead = await self._ensure_venv_past_a_dead_pin()
@@ -1719,9 +1739,10 @@ class SlurmFacility:
                 else "ran the facility's env_setup again")
         target = self.cli.target
         if dead is not None:
-            return await self._restart_past_a_dead_pin(hpc, endpoint_id, dead, what)
+            return await self._restart_past_a_dead_pin(hpc, endpoint_id, dead, what, wanted)
         if getattr(target, "host_key_alias", None) in (None, target.host) and target.host == self.alias:
             return f"{what}; the endpoint was not restarted (no pin says which login node runs it)", endpoint_id
+        _still_wanted(wanted, what, "stopped or started again")
         rc, said = await self.cli.stop(name)
         if rc == 255:
             raise RuntimeError(f"{what}, but could not reach {target.host} to restart the endpoint: {said[-200:]}")
@@ -1732,7 +1753,7 @@ class SlurmFacility:
             raise RuntimeError(
                 f"{what}; the endpoint's manager on {target.host} was asked to stop but had not exited after "
                 f"{_STOP_EXIT_WAIT_S:.0f} s, so it was not restarted (hpc-bridge tries again at the next check)")
-        return await self._start_again(hpc, what, target.host)
+        return await self._start_again(hpc, what, target.host, wanted)
 
     async def _manager_exited(self, name: str) -> bool:
         """After a `stop`: has the manager exited? Its pid file gone — an instance that exits cleanly removes it — or
@@ -1756,10 +1777,13 @@ class SlurmFacility:
             if waited >= _STOP_EXIT_WAIT_S:
                 return False
 
-    async def _start_again(self, hpc: Profile, what: str, where: str) -> tuple[str, str]:
+    async def _start_again(self, hpc: Profile, what: str, where: str,
+                           wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
         """`provision` after a manager is known gone, claimed as a restart only when it started one — not its reuse
         branch (a manager running after all) — and only once `list` shows it running; the node it started on is
-        recorded (`_record_start`). Raises otherwise: the repair is then not done, and is tried again."""
+        recorded (`_record_start`). Raises otherwise: the repair is then not done, and is tried again. Nothing is
+        started for an endpoint the session no longer holds (`wanted`)."""
+        _still_wanted(wanted, what, "started again")
         handle = await self.provision(hpc)
         if handle.reused:
             raise RuntimeError(f"{what}, but the endpoint's manager was still running when it was to be started again "
@@ -1829,7 +1853,8 @@ class SlurmFacility:
             except Exception:  # noqa: BLE001 - best-effort hygiene, as connect._drop_dead_pin
                 pass
 
-    async def _restart_past_a_dead_pin(self, hpc: Profile, endpoint_id: str, dead: str, what: str) -> tuple[str, str]:
+    async def _restart_past_a_dead_pin(self, hpc: Profile, endpoint_id: str, dead: str, what: str,
+                                       wanted: Callable[[], bool] | None = None) -> tuple[str, str]:
         """After a rebuild through the facility's host (`_ensure_venv_past_a_dead_pin`): the manager runs on `dead`,
         which nothing here can reach to stop. If it still runs — its pid file refreshed within globus-compute's stale
         window, as only a live instance does — it is left running: it starts its next user endpoints from the venv
@@ -1851,9 +1876,13 @@ class SlurmFacility:
             raise RuntimeError(f"{head}, but its pid file could not be read through {self.alias}, so whether its "
                                f"manager on {dead} still runs is not known: nothing was restarted (hpc-bridge tries "
                                "again at the next check)")
-        self._past_dead_pin = None
         gone = "its pid file removed" if verdict == "gone" else "its pid file no longer refreshed"
-        return await self._start_again(hpc, f"{head}; its manager there was gone too ({gone})", self.alias or dead)
+        done = await self._start_again(hpc, f"{head}; its manager there was gone too ({gone})", self.alias or dead,
+                                       wanted)
+        # forgotten only once the restart happened: a start that failed is tried again past the same dead node — never
+        # by the unpinned path, which would answer "not restarted" as a repair done (review round 2, 2026-10-31)
+        self._past_dead_pin = None
+        return done
 
     def _seeded_by_us(self) -> bool:
         """Did hpc-bridge place the remote token store? This process remembers its own bootstrap; across

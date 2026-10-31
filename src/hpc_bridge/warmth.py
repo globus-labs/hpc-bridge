@@ -25,6 +25,7 @@ import secrets
 import sys
 import threading
 import time
+from collections.abc import Callable
 from concurrent.futures import Future
 from dataclasses import replace
 from pathlib import Path
@@ -268,6 +269,10 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     if result.ok:  # its job is up: the first proof dates it (for its walltime), on whatever terms it is met again
         _saw_job(app, result.worker_job, min(now, result.answered_at) if result.answered_at else now)
         _check_resolved(app, rt)  # a worker ran our check: no pilot is dying before it any more, none waits to land
+        # a ghost no more (a reattach's verdict: a slow cold start, or a manager the bring-up started again under the
+        # same id) — a later connect may reuse it over the web again (review round 2, 2026-10-31)
+        if app.state.endpoint_id is not None:
+            app.ghost_endpoints.discard(app.state.endpoint_id)
     # A canary can land on any of the shape's blocks; only with one block at most (max_blocks 1: every template and
     # registry entry we know, and a facility template's own default when its schema drops the key) does a different
     # scheduler job mean the confirmed block was replaced.
@@ -347,6 +352,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     warm block's interval (found in review). A block the clock presumes released is banked to that time, not to
     now. Callers hold app.lock."""
     untils = {name: _presumed_release_at(app, name, rt) for name, rt in app.shapes.items()} if bank else {}
+    _abandon_env_repairs(app)   # the binding ends: a repair of its endpoint never starts a manager after it
     app.tasks.clear()
     _retain_inflight(app, app.shapes.get(DEFAULT_SHAPE))  # counted only if the same endpoint is bound again
     for name, rt in app.shapes.items():
@@ -812,8 +818,10 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
         app.env_repair_deferred.pop(eid, None)
         app.env_repair_tries[eid] = app.env_repair_tries.get(eid, 0) + 1
         # its own task, so a call cancelled between the manager's stop and its start does not cancel the repair with
-        # it: the restart runs on, and the next check reads how it ended (review round 1)
-        task = asyncio.ensure_future(repair(app.profile, eid))
+        # it: the restart runs on, and the next check reads how it ended (review round 1). What ends or replaces the
+        # endpoint cancels it first (`_abandon_env_repairs`), and it asks before it stops or starts anything
+        # (`wanted`: review round 2 — one left running restarted the endpoint after a teardown said it was gone)
+        task = asyncio.ensure_future(repair(app.profile, eid, wanted=_still_bound(app, eid)))
         app.env_repair_tasks[eid] = task
         task.add_done_callback(lambda t: t.cancelled() or t.exception())   # read, so an unread failure is not logged
     cause = cause or app.env_repair_causes.get(eid, "")
@@ -823,6 +831,9 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
     except asyncio.CancelledError:
         if task.cancelled():
             app.env_repair_tasks.pop(eid, None)
+            me = asyncio.current_task()
+            if me is not None and not me.cancelling():
+                return block   # the repair was abandoned (a teardown, a re-bind) — not this call: its check stands
         raise   # this call is cancelled; the repair runs on, and the next check reads it
     except Exception as exc:  # noqa: BLE001 - said in the answer; the check's own failure stays the state
         app.env_repair_tasks.pop(eid, None)
@@ -857,11 +868,59 @@ _REPAIR_TRIES = 2   # repairs started per endpoint: one that did not finish (a m
 # `list` did not show) is tried once more at the next check; a login handed to the user's terminal is not an attempt
 
 
+def _still_bound(app: AppCtx, eid: str) -> Callable[[], bool]:
+    """A repair's `wanted`: does the session still hold `eid` — the same facility, the endpoint still bound, and no
+    teardown of it running? Asked by the facility before it stops or starts a manager."""
+    fac = app.facility
+
+    def wanted() -> bool:
+        tearing = app.teardown_task is not None and not app.teardown_task.done() and app.teardown_eid == eid
+        return app.facility is fac and app.state.endpoint_id == eid and not tearing
+    return wanted
+
+
+def _abandon_env_repairs(app: AppCtx) -> None:
+    """What ends or replaces the endpoint (a teardown's claim, `_drop_all_shapes`: a re-bind, a detach) settles its
+    repair first: every repair task is cancelled — never awaited here (a teardown claims with no await before it) — and
+    kept in `AppCtx.env_repair_settling` until it has unwound (`_settle_env_repairs`). A cancelled repair is not an
+    attempt (its try is given back), and a wait for work to end belongs to the binding that ends (review round 2)."""
+    for eid, task in list(app.env_repair_tasks.items()):
+        if not task.done():
+            task.cancel()
+            app.env_repair_tries[eid] = max(0, app.env_repair_tries.get(eid, 0) - 1)
+            app.env_repair_settling.append(task)
+    app.env_repair_tasks.clear()
+    app.env_repair_deferred.clear()
+
+
+_SETTLE_REPAIR_S = 10.0   # a cancelled repair unwinds at its next await (ssh_exec kills its ssh child on the way out)
+
+
+async def _settle_env_repairs(app: AppCtx, timeout: float = _SETTLE_REPAIR_S) -> None:
+    """Wait, bounded, for the repairs `_abandon_env_repairs` cancelled to unwind before the login node is touched again
+    (a teardown's stop and delete, a new binding's bring-up). One that has not by then still starts nothing: it asks
+    `wanted` first."""
+    pending = [t for t in app.env_repair_settling if not t.done()]
+    if pending:
+        await asyncio.wait(pending, timeout=timeout)
+    app.env_repair_settling = [t for t in app.env_repair_settling if not t.done()]
+
+
+def _released_waiting(app: AppCtx) -> list[ShapeRuntime]:
+    """Runtimes a release or a re-bind retired while a call was still inside its sync-wait on them, sent to the bound
+    endpoint (`AppCtx.released_inflight`): that command runs there still. After a teardown or a re-bind elsewhere it
+    is abandoned, as its tasks are. Counted by server._block_work and by the repair's busy check."""
+    eid = app.state.endpoint_id
+    return [r for r in app.released_inflight
+            if r.inflight and r.runner is not None and r.runner.endpoint_id == eid]
+
+
 def _work_on_the_endpoint(app: AppCtx) -> str:
     """What of the session's work runs on the bound endpoint's user endpoints right now — a task behind a poll handle, a
-    command inside its sync-wait — in words, or "" when none does."""
+    command inside its sync-wait (on a shape's runtime, or on one a release retired under it) — in words, or "" when
+    none does."""
     live = [tid for tid, h in app.tasks.items() if not h.future.done()]   # any shape: all run under that manager
-    waiting = sum(rt.inflight for rt in app.shapes.values())
+    waiting = sum(rt.inflight for rt in app.shapes.values()) + sum(r.inflight for r in _released_waiting(app))
     held = []
     if live:
         held.append(f"task(s) {', '.join(live[:4])}{' …' if len(live) > 4 else ''} still running")

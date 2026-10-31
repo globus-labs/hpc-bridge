@@ -73,5 +73,19 @@ answer until the shape is warm.
   (`_REPAIR_CONFLICT_GRACE_S`, 120 s) keeps RESOURCE_CONFLICT answers from counting while the user endpoints start
   again. In c08, re-run, three such answers in twelve seconds read "NO LONGER transient" and took the block down.
 
+**Review round 2 (2026-10-31).**
+- **The repair task does not outlive its binding.** A task left running by a cancelled call reached its start after a
+  teardown had answered `down`, and registered the endpoint again. `_abandon_env_repairs` cancels every repair task and
+  gives its try back. It runs from `_drop_all_shapes` (a re-bind, a detach) and from the teardown's claim, where it
+  only cancels, so the claim has no await. The cancelled tasks wait in `AppCtx.env_repair_settling` until
+  `_settle_env_repairs` has seen them unwind; it is bounded at 10 s, and `ssh_exec` kills its ssh child on the way
+  out. The teardown task and connect both wait on it before they touch the login node.
+- **The repair asks first.** It is started with `wanted=_still_bound(app, eid)`. The facility asks that before it
+  stops or starts a manager: the same facility, the endpoint still bound, no teardown of it running.
+- **Released work counts as busy.** `_work_on_the_endpoint` counts `_released_waiting`: commands still in their
+  sync-wait on a runtime a release retired, on the bound endpoint. `server._block_work` uses the same helper.
+- **A passing check clears a ghost.** `_confirm_worker` removes the endpoint from `AppCtx.ghost_endpoints` (see
+  [[connect]]).
+
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

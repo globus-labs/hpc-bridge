@@ -981,9 +981,7 @@ def _block_work(app: AppCtx, *, then: str) -> tuple[str, str] | None:
     live = [(tid, h) for tid, h in _live_task_handles(app, DEFAULT_SHAPE) if not (mep and warmth._overdue(h, now))]
     # calls in their sync-wait: on the shape's runtime, or on one dropped under them (a teardown's release, a re-bind)
     # whose endpoint is still the bound one — after a teardown or a re-bind elsewhere that work is abandoned
-    eid = app.state.endpoint_id
-    released = [r for r in app.released_inflight if r.runner is not None and r.runner.endpoint_id == eid]
-    waiting = [r for r in ([rt] if rt is not None else []) + released if r.inflight]
+    waiting = [r for r in ([rt] if rt is not None else []) if r.inflight] + warmth._released_waiting(app)
     inflight = sum(r.inflight for r in waiting)
     if not live and not inflight:
         return None
@@ -1630,6 +1628,9 @@ async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
         if task is None:
             assert eid is not None  # the no-endpoint case returned above
             app.teardown_eid, app.teardown_release = eid, None
+            # a repair a cancelled call left running is cancelled here (no await: the claim stays one step) and the
+            # teardown task waits for it to unwind before the login-node ops (review round 2, 2026-10-31)
+            warmth._abandon_env_repairs(app)
             task = app.teardown_task = asyncio.create_task(_run_teardown(app, app.facility, app.machine, eid))
     return await _await_teardown(app, task)
 
@@ -1655,6 +1656,7 @@ async def _run_teardown(app: AppCtx, fac, machine: str | None, eid: str) -> Endp
     release the block, stop its spend clock, gate on a one-time code if needed, then the login-node ops. Never
     raises — _await_teardown returns its result to whichever call is waiting."""
     try:
+        await warmth._settle_env_repairs(app)   # the repair the claim cancelled: unwound before anything here runs
         # halt spend first (a confirmed stop is stop_endpoint's job); what the release achieved is reported
         confirmed, _detail = await scheduler_ops._release_blocks_over_login(app, eid, _login_runner(app))
         app.teardown_release = bool(confirmed)

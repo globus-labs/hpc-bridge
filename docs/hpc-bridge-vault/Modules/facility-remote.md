@@ -115,6 +115,16 @@ with no HostKeyAlias, as before a pin; the venv is on the shared home.
 - **`pid_file`** maps an ssh timeout (`ssh_exec` raises a bare `TimeoutError()`) or an OSError to None ("unknown"),
   as it maps rc 255.
 
+**Review round 2 (2026-10-31).**
+- **`wanted`.** `repair_endpoint_env(..., wanted=)` asks it (`_still_wanted`) before the pinned `stop` and before
+  `_start_again`'s `provision`. When the session no longer holds the endpoint (a teardown claimed it, a connect
+  re-bound), it raises "torn down or replaced meanwhile", and nothing is stopped or started.
+- **`_past_dead_pin`** is cleared only after `_start_again` returns. Before, it was cleared first, so a failed start
+  left the retry with no pin. The retry then took the unpinned path, answered "not restarted (no pin says which
+  login node runs it)", and warmth counted that as a repair done.
+- **`online_endpoint_named`** reads the status of every registration with the name. An error is returned only when
+  none of them is online.
+
 ## See also
 [[Standing up the endpoint]] · [[Credential seeding]] · [[MEP & templated endpoints]] · [[facility-base]] · [[facility-mep]] · [[state]] · [[credentials]] · [[MFA and interactive SSH auth]]
 

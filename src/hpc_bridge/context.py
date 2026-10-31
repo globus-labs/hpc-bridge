@@ -414,12 +414,14 @@ class AppCtx:
     # facility verified done; `env_repair_tries`: repairs started per id (warmth._REPAIR_TRIES); `env_repair_tasks`: one
     # still running — its own task, so a cancelled call does not stop it between the manager's stop and its start;
     # `env_repair_causes`: the import failure each is for; `env_repair_deferred`: why one waits (work runs on the
-    # endpoint the repair would restart), said on every answer until it runs.
+    # endpoint the repair would restart), said on every answer until it runs. `env_repair_settling`: repair tasks a
+    # teardown or a re-bind cancelled (warmth._abandon_env_repairs), until they have unwound (_settle_env_repairs).
     env_repairs: dict[str, str] = field(default_factory=dict)
     env_repair_said: dict[str, str] = field(default_factory=dict)
     env_repaired: set[str] = field(default_factory=set)
     env_repair_tries: dict[str, int] = field(default_factory=dict)
     env_repair_tasks: dict[str, asyncio.Future] = field(default_factory=dict)
+    env_repair_settling: list[asyncio.Future] = field(default_factory=list)
     env_repair_causes: dict[str, str] = field(default_factory=dict)
     env_repair_deferred: dict[str, str] = field(default_factory=dict)
     # A repair that needs the USER's login first (the facility's host asks for a password / one-time code — c08's key
@@ -429,7 +431,8 @@ class AppCtx:
     env_repair_handoff: dict[str, tuple[str, str, str]] = field(default_factory=dict)   # + the import failure
     # Endpoint ids a new laptop's reattach found listed online but whose login worker never answered (ghosts, #37):
     # not used again this session — neither by that reattach nor by the bring-up the confirm that follows it starts
-    # (connect._probe_through_endpoint; SlurmFacility.find_online_endpoint skips them: `ghosts`).
+    # (connect._probe_through_endpoint; SlurmFacility.find_online_endpoint skips them: `ghosts`). A check that passes on
+    # one clears it (warmth._confirm_worker): a slow cold start, or a manager the bring-up started again under that id.
     ghost_endpoints: set[str] = field(default_factory=set)
     runner_factory: Callable[..., GlobusRunner] = GlobusRunner
     # The in-terminal Globus login (login.py). None ⇒ no login gating (hermetic tests / unbound dev);

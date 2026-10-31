@@ -120,6 +120,22 @@ installed plugin only when that version changes); git tags mark releases.
       endpoints started again. Counted with one from before the repair, three read as "NO LONGER transient" and the
       block went down. Now the conflict streak starts afresh at a repair, and conflicts within 120 s of it are not
       counted.
+  - **Review round 2 (2026-10-31): six more, each proven first by a test that fails on round 1's version.**
+    - A repair left running by a cancelled call outlived a teardown. After the teardown answered `down`, the repair
+      reached its start and registered the endpoint again. A teardown, a re-bind and a detach now cancel the repair
+      first, and the teardown waits for it to unwind before the login-node ops. The repair also asks, before it stops
+      or starts a manager, whether the session still holds that endpoint. A cancelled repair does not count as an
+      attempt.
+    - A restart past a dead pin forgot the dead node before it started the manager. When the start failed, the retry
+      answered "not restarted (no pin says which login node runs it)" as a success, and the endpoint was marked
+      repaired. The dead node is now kept until the restart has happened.
+    - A ghost mark is cleared when a check on that endpoint passes. Before, a slow cold start called a ghost was
+      skipped for the rest of the session, and every later connect bootstrapped over SSH.
+    - A reattach that ends with no passing check marks a ghost even when the service answered "busy". That 409 comes
+      from the web service and does not prove the manager is alive.
+    - The repair's busy check now counts a command still in its sync-wait on a runtime that a release retired, as the
+      stop already did.
+    - The web lookup reads every registration of the endpoint's name, and reports an error only when none is online.
 - **A manager killed hard comes up again, a venv deleted under a running manager is rebuilt, and a facility reattached
   over the web is remembered (found by the returning-user cells, 2026-10-30).** Each was proven first by a test that
   failed for the reason the cells met.
@@ -439,6 +455,10 @@ installed plugin only when that version changes); git tags mark releases.
       the previous release's long-lived compute user endpoint, which starts another block for a queued check after a
       cancel. The stop said so (`draining`: "only teardown_endpoint ends it").
     - That run's first try went `down` on RESOURCE_CONFLICT right after the repair: the tenth defect, fixed above.
+  - **After review round 2 (2026-10-31; c08, c18 and the new-laptop agent cell on a fresh nersc cluster).**
+    - c18 and the new-laptop cell (Pi on qwen) are OK; `ru_reattached` passes with no SSH.
+    - c08 reaches hello world. The repair went past the dead pin and left the manager running. It fails only
+      `ru_policy_surfaced` (above); `stop_honesty_no_pilot_left` passes this run.
 - **A `nersc` fake-cluster profile and six scripted scenarios from the Perlmutter report.**
   - **The profile:** homes under `/global/homes` with `/home` unwritable; key OR password+OTP login; a noisy `.bashrc`;
     suffixed partitions with `system` as the default; and a `job_submit.lua` that requires `--constraint` and refuses

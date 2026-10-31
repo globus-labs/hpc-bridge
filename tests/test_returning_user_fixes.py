@@ -140,7 +140,7 @@ class _VenvGoneFacility(FakeFacility):
         self.repair_fails = repair_fails
         self.fixed = False
 
-    async def repair_endpoint_env(self, profile, endpoint_id):
+    async def repair_endpoint_env(self, profile, endpoint_id, *, wanted=None):
         self.repaired += 1
         if self.repair_fails:
             raise RuntimeError(self.repair_fails)
@@ -436,7 +436,7 @@ async def test_a_cancelled_call_does_not_leave_the_repair_half_done():
     gate = asyncio.Event()
 
     class _Slow(_VenvGoneFacility):
-        async def repair_endpoint_env(self, profile, endpoint_id):
+        async def repair_endpoint_env(self, profile, endpoint_id, **kw):
             self.repaired += 1
             await gate.wait()   # stopped, not yet started again
             self.fixed = True
@@ -709,7 +709,10 @@ async def test_a_busy_manager_is_asked_again_only_after_a_growing_back_off(monke
     got = await connect._probe_through_endpoint(app, "f-new", "login")
     (r,) = w.runners
     assert 3 <= r.checks <= 10 and w.slept[:3] == [2.0, 4.0, 8.0] and max(w.slept) <= connect._REATTACH_BACKOFF_MAX_S
-    assert "kept answering that it is busy" in got and "eid-online" not in app.ghost_endpoints
+    assert "kept answering that it is busy" in got
+    # a 409 is the web service's, not the manager's: no passing check by the deadline — not adopted again without SSH
+    # (review round 2); a later check that passes clears it
+    assert "eid-online" in app.ghost_endpoints
 
 
 async def test_the_reattach_wait_yields_to_the_event_loop_while_it_waits(monkeypatch):
@@ -814,3 +817,197 @@ async def test_a_registry_facility_or_a_registry_outage_never_takes_the_reattach
     w = _NewLaptop(monkeypatch, registry_down=True)
     await server._connect_facility(w.app(), "f-new", ssh_host="login")
     assert w.asked == []
+
+
+# ---- review round 2 (2026-10-31) ---------------------------------------------------------------------------------------
+
+async def test_a_repair_left_running_by_a_cancelled_call_is_settled_before_a_teardown_and_starts_nothing():
+    # a shielded repair outlived the call the client cancelled, and the teardown that followed: the teardown answered
+    # `down`, then the repair reached its start and registered and started the endpoint again, recorded for nobody
+    from hpc_bridge import server
+    gate = asyncio.Event()
+    events = []
+
+    class _Slow(_VenvGoneFacility):
+        async def repair_endpoint_env(self, profile, endpoint_id, **kw):
+            self.repaired += 1
+            self.manager_up = False   # its `stop` ran: the web service lists the manager offline once it is gone
+            await gate.wait()   # waiting for the stopped manager to exit / its venv rebuild
+            events.append("restart")   # _start_again -> provision: a manager started on the login node
+            self.fixed, self.manager_up = True, None
+            return "rebuilt … — the endpoint restarted on login01", endpoint_id
+
+        async def teardown(self, endpoint_id, *, wipe_credentials=False):
+            events.append("teardown")
+            return {"stopped": True, "deleted": True, "credentials_wiped": False, "ssh_closed": False}
+
+    fac = _Slow()
+    app = _venv_gone_app(fac)
+    call = asyncio.ensure_future(_ensure_endpoint_up(app, shape="compute", confirm_spend=True))
+    for _ in range(50):
+        await asyncio.sleep(0)
+        if fac.repaired:
+            break
+    call.cancel()   # the client's tool timeout during a long venv rebuild
+    with pytest.raises(asyncio.CancelledError):
+        await call
+    td = asyncio.ensure_future(server._teardown_endpoint(app))   # the agent tears down to start over
+    for _ in range(400):
+        await asyncio.sleep(0.05)
+        if "teardown" in events:
+            break
+    assert "teardown" in events, "teardown never reached the login-node ops"
+    gate.set()
+    res = await td
+    for _ in range(20):
+        await asyncio.sleep(0)
+    assert res.status == "down", res.notice
+    assert "restart" not in events, events   # nothing of the torn-down endpoint is started after (or during) it
+    assert not app.env_repair_tasks
+
+
+async def test_a_repair_whose_endpoint_was_torn_down_meanwhile_starts_nothing(tmp_path, monkeypatch):
+    # …and the repair itself asks before it starts anything: its endpoint still the session's, and not being torn down
+    cli = _RepairCli(pid_age=5, touching=True, pinned_answers=True, exits_after=10)
+    fac, _store = _pinned_facility(tmp_path, cli, monkeypatch)
+    wanted = [True]
+    stop = cli.stop
+
+    async def stop_then_torn_down(name):
+        got = await stop(name)
+        wanted[0] = False   # a teardown claimed the endpoint while its manager exited
+        return got
+    cli.stop = stop_then_torn_down
+    with pytest.raises(RuntimeError, match="torn down or replaced"):
+        await fac.repair_endpoint_env(Profile(), EID, wanted=lambda: wanted[0])
+    assert cli.stopped == 1 and cli.starts == []
+    with pytest.raises(RuntimeError, match="torn down or replaced"):   # asked before the stop too: nothing stopped
+        await fac.repair_endpoint_env(Profile(), EID, wanted=lambda: False)
+    assert cli.stopped == 1 and cli.starts == []
+
+
+async def test_a_connect_that_replaces_the_endpoint_settles_its_repair_first(monkeypatch):
+    from hpc_bridge import config as _config
+    from hpc_bridge import server, warmth
+    from hpc_bridge.lifecycle import EndpointState
+    gate, events = asyncio.Event(), []
+
+    async def repair():
+        try:
+            await gate.wait()
+            events.append("restart")
+        except asyncio.CancelledError:
+            events.append("cancelled")
+            raise
+        return "restarted", "old-eid"
+    app = AppCtx(facility=FakeFacility(), profile=Profile())
+    app.state = EndpointState(endpoint_id="old-eid")
+    app.env_repair_tasks["old-eid"] = asyncio.ensure_future(repair())
+    app.env_repair_tries["old-eid"] = 1
+    await asyncio.sleep(0)
+
+    async def provision(app_, shape, **kw):
+        assert events == ["cancelled"], events   # settled before the new binding brings anything up
+        return "warm"
+    monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: FakeFacility())
+    monkeypatch.setattr(warmth, "_provision", provision)
+    monkeypatch.setattr(_config, "_control_settings", lambda: (None, 60))
+    await server._connect_facility(app, "f-new", ssh_host="login", details=FacilityDetails(
+        ssh_host="login", interface="eth0", env_setup="true", scratch_root="/s/{user}", partition="debug"))
+    gate.set()
+    await asyncio.sleep(0)
+    assert events == ["cancelled"] and not app.env_repair_tasks
+    assert app.env_repair_tries.get("old-eid", 0) == 0   # abandoned, not an attempt that failed
+
+
+async def test_a_restart_past_a_dead_pin_that_failed_is_tried_again_never_called_done(tmp_path, monkeypatch):
+    # the dead node was forgotten before the start: when the start failed, the promised retry had no pin and answered
+    # "not restarted (no pin says which login node runs it)" — as a success, so the endpoint was marked repaired for good
+    cli = _RepairCli(pid_age=None)   # the manager on the dead node is gone: the repair must start it again
+    fac, _store = _pinned_facility(tmp_path, cli, monkeypatch)
+    real_start = cli.start
+    fails = ["globus-compute-endpoint start refused (exit 73): the pid file window is longer than the call can wait"]
+
+    async def start(name):
+        if fails:
+            cli.starts.append(cli.target.host)
+            raise RuntimeError(fails.pop())
+        return await real_start(name)
+    cli.start = start
+    with pytest.raises(RuntimeError, match="exit 73"):
+        await fac.repair_endpoint_env(Profile(), EID)
+    # warmth: "hpc-bridge tries it once more at the next check" — the second attempt
+    done, _eid = await fac.repair_endpoint_env(Profile(), EID)
+    assert len(cli.starts) == 2, (cli.starts, done)   # the restart it promised is tried again
+    assert "not restarted" not in done and "restarted on" in done, done
+
+
+async def test_an_endpoint_whose_worker_answered_is_no_longer_a_ghost():
+    # the reattach called it a ghost (60 s with no login worker: a slow cold start, or a manager the confirm's SSH
+    # bring-up then restarted under the SAME id — endpoint.json keeps it). Its worker has now answered a check
+    fac = FakeFacility()
+    fac.workers = 1
+    app = AppCtx(facility=fac, profile=Profile())
+    app.ghost_endpoints.add("fake-eid")
+    app.runner_factory = lambda eid, user_endpoint_config=None, **kw: _FakeRunner(eid, _Res(0, "", ""))
+    res = await _ensure_endpoint_up(app, shape="login")
+    assert res.status == "up" and res.endpoint_id == "fake-eid", res.notice
+    # a later connect_facility in this session must be able to reuse it over the web (zero SSH), and must not say
+    # "this session found its login worker does not answer"
+    assert "fake-eid" not in app.ghost_endpoints
+
+
+async def test_a_manager_whose_only_answer_was_one_busy_is_not_adopted_again_without_ssh(monkeypatch):
+    # a 409 comes from the web service, not the manager: one, then silence to the deadline, is no proof it is alive
+    busy = "ComputeAPIError[RESOURCE_CONFLICT]: Endpoint eid-online is already in use: possibly due to concurrent requests"
+    w = _NewLaptop(monkeypatch, answers=False, fake_clock=True)
+    app = w.app()
+    answers = [busy]
+
+    class _OnceBusy(_LoginRunner):
+        async def canary(self, timeout=8.0):
+            self.checks += 1
+            return CanaryResult(ok=False, error=answers.pop(0) if answers else "timeout")
+    app.runner_factory = lambda eid, user_endpoint_config=None, **kw: _OnceBusy(eid)
+    got = await connect._probe_through_endpoint(app, "f-new", "login")
+    assert isinstance(got, str) and "did not answer within 60 s" in got and "busy" in got, got
+    assert "eid-online" in app.ghost_endpoints
+
+
+async def test_a_repair_waits_while_a_command_sent_before_a_release_still_waits_for_its_result():
+    # a run_shell still in its sync-wait on a runtime a release retired (`released_inflight`) runs on the endpoint too:
+    # server._block_work counts it; the repair's busy check did not
+    from hpc_bridge.context import ShapeRuntime
+    fac = _VenvGoneFacility()
+    app = _venv_gone_app(fac)
+    held = ShapeRuntime(user_endpoint_config={"compute": True}, runner=_FakeRunner("fake-eid", _Res(0, "", "")))
+    held.inflight = 1
+    app.released_inflight = [held]
+    res = await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert fac.repaired == 0 and res.status == "provisioning", res.notice
+    assert "1 command(s) still waiting for their result" in res.notice and "waits until" in res.notice
+    held.inflight = 0   # its result came back: the next check repairs
+    again = await _ensure_endpoint_up(app, shape="compute")
+    assert fac.repaired == 1 and again.status == "up" and "rebuilt" in again.notice
+
+
+async def test_a_web_lookup_reads_every_registration_of_the_name_before_it_reports_an_error():
+    calls = []
+
+    class _Client:
+        def __init__(self, listed, failing):
+            self.listed, self.failing = listed, failing
+
+        def get_endpoints(self, role):
+            return [{"name": "hpc-bridge-login", "uuid": e} for e in self.listed]
+
+        def get_endpoint_status(self, eid):
+            calls.append(eid)
+            if eid in self.failing:
+                raise RuntimeError("502 Bad Gateway")
+            return {"status": "online" if eid == "eid-live" else "offline"}
+    got = await remote.online_endpoint_named("hpc-bridge-login", lambda: _Client(["eid-old", "eid-live"], {"eid-old"}))
+    assert got == ("eid-live", None) and calls == ["eid-old", "eid-live"]
+    eid, error = await remote.online_endpoint_named(
+        "hpc-bridge-login", lambda: _Client(["eid-old", "eid-off"], {"eid-old"}))
+    assert eid is None and error is not None and "502 Bad Gateway" in error   # none online: the error is said

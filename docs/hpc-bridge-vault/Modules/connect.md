@@ -62,6 +62,18 @@ a ghost. Now:
   builds (`SlurmFacility.ghosts`), so the bring-up of the confirm that follows does not adopt the same ghost through
   `find_online_endpoint`.
 
+**Review round 2 (2026-10-31).**
+- **No passing check means a ghost.** A deadline with no passing check marks the endpoint a ghost even when every
+  answer was "busy". A 409 comes from the web service and does not prove the manager is alive. So the item above
+  that called a manager answering "busy" alive no longer holds. The notice still says what the service answered.
+- **The mark is not for good.** A check that passes on that endpoint (`warmth._confirm_worker`) clears it. A slow
+  cold start, or a manager the bring-up started again under the same id, can then be reused over the web at the next
+  connect.
+- **Every registration is read.** `online_endpoint_named` reads the status of every registration with the name. An
+  error is reported only when none of them is online.
+- **A re-bind settles the repair.** connect's `_drop_all_shapes` cancels a repair of the endpoint being replaced, and
+  connect waits for it to unwind (`warmth._settle_env_repairs`) before the new binding brings anything up.
+
 ## See also
 [[server]] · [[binding]] · [[warmth]] · [[login_gate]] · [[notices]]
 
