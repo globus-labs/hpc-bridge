@@ -719,6 +719,12 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         out.notice = (f"{bid} is paused ({b['pause_reason']}); it resumes only on the user's yes: "
                       f"run_batch(batch_id='{bid}', confirm_spend=True). " + (out.notice or "")).strip()
         return out
+    pre = app.shapes.get("compute")
+    if (confirm_spend and pre is not None and pre.reaped and b["state"] == "needs_confirmation"
+            and "reaped" in str(b["pause_reason"] or "")):
+        # the batch's own pause already told the user the block was reaped (its reason names it): this yes is for
+        # the new block, given knowing the old one is gone — the first call to find the reap was the batch's
+        pre.reap_told = True
     st = await ensure_up(app, confirm_spend)
     if st.status in ("needs_confirmation", "needs_account"):
         out = _status_of(app, bid)

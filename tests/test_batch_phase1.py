@@ -778,3 +778,24 @@ async def test_after_a_restart_a_row_sent_without_its_id_is_found_in_the_task_gr
     st = await server._status(app2, out.batch_id, detail="page")
     states = {r.index: r.state for r in st.results}
     assert states[1] == "done" and states[2] == "backlog", states   # found in the group; never sent
+
+
+async def test_a_reap_the_batch_reported_is_answered_by_one_yes():
+    """A batch task that reached another block than the confirmed one refused to run (the wrong-block guard): the block
+    was reaped. The batch's own pause names the reap, so the user's yes on the resume is for the new block — it is not
+    met with a second question."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app()
+    out = await _start(app, n=4)
+    run = app.batches[out.batch_id]
+    guard = run.guards[(0, 1)]
+    runner.futures[0].finish(_Res(86, "", f"HPCB_WRONG_BLOCK {guard.nonce} 999\n"))
+    await batch.tick(app, out.batch_id)
+    st = await server._status(app, out.batch_id, detail="page")
+    assert st.phase == "needs_confirmation" and "reaped" in (st.reason or "")
+    assert {r.index: r.state for r in st.results}[0] == "backlog"          # it ran nothing: back in the backlog
+    sent = len(runner.futures)
+    res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
+    assert res.phase in ("admitting", "waiting"), (res.phase, res.notice)
+    assert len(runner.futures) > sent or res.phase == "waiting"
