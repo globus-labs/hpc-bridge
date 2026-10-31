@@ -247,12 +247,15 @@ ACTIONS = ("cmd", "interrupt", "interject")
 # EndpointStatus tools, a `status` and an `endpoint_id` and no phase.
 _SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running")
 _LOGIN_PHASES = ("logged_in", "needs_login", "failed")
+_BATCH_PHASES = ("admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused")
 ANSWER_PHASES: dict[str, tuple[str, ...]] = {
     "run_shell": _SHELL_PHASES, "poll_task": _SHELL_PHASES, "reset_session": _SHELL_PHASES,
     "connect_facility": ("needs_account", "provisioning", "needs_facility_details", "proposed_facility_details",
                          "needs_preauth", "needs_login", "unsupported", "failed"),
     "authenticate": _LOGIN_PHASES, "complete_login": _LOGIN_PHASES,
     "complete_preauth": ("opened", "failed", "needs_terminal"),
+    # batch phase 1: run_batch's and status's BatchStatus
+    "run_batch": _BATCH_PHASES, "status": _BATCH_PHASES,
 }
 ENDPOINT_ANSWERS = ("ensure_endpoint_up", "stop_endpoint", "teardown_endpoint")
 WORLD_ACTIONS = ("stop_manager",)   # `world` hooks: the harness builds the command (run.py _run_hook); they count as cmd

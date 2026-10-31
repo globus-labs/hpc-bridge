@@ -5,6 +5,7 @@ import inspect
 import itertools
 import json
 import os
+import secrets
 import sys
 import time
 from collections.abc import AsyncIterator, Awaitable, Callable
@@ -15,7 +16,19 @@ from typing import Any, Literal, NamedTuple, TypeVar
 from mcp.server.fastmcp import Context, FastMCP
 from mcp.types import ToolAnnotations
 
-from . import binding, config, connect, dispatch, login_gate, notices, resources, scheduler_ops, session_shell, warmth
+from . import (
+    batch,
+    binding,
+    config,
+    connect,
+    dispatch,
+    login_gate,
+    notices,
+    resources,
+    scheduler_ops,
+    session_shell,
+    warmth,
+)
 from .binding import (  # noqa: F401 - re-exported for imports; PATCH binding.<name>, not server.<name>
     _catalog_facility,
     _entry_from_details,
@@ -81,6 +94,8 @@ from .login_gate import (  # noqa: F401 - re-exported for imports
     _start_login_and_wait,
 )
 from .models import (
+    BatchStatus,
+    CancelResult,
     ConnectFacilityResult,
     EndpointStatus,
     FacilityDetails,
@@ -230,6 +245,13 @@ async def _shutdown(app: AppCtx) -> None:
     for rt in app.shapes.values():
         if rt.runner is not None:
             rt.runner.close()
+    for run in list(app.batches.values()):   # sent batch tasks run on; the next server collects them from the ledger
+        if run.loop is not None:
+            run.loop.cancel()
+        if run.runner is not None:
+            run.runner.close()
+    if app.ledger is not None:
+        app.ledger.close()
 
 
 # --- operational guidance over MCP (cross-harness) --------------------------------------------------------------
@@ -1043,6 +1065,14 @@ def _busy_block_refusal(app: AppCtx, eid: str, *, op: Literal["stop", "detach"] 
     it (fake-cluster chaos `stop_while_running`, 2026-09-05); on a MEP nothing here can end it. Either way, dropping the
     shape would lose the result and leave the block billing behind a 'down'/'draining'. Callers hold app.lock, so a
     dispatch holding it (provisioning, its canary) has been counted before the look. None = nothing holds the block."""
+    rt = app.shapes.get(DEFAULT_SHAPE)
+    if (held := batch.in_flight_note(app)) is not None:
+        return EndpointStatus(
+            status="up", block_state="warm" if rt is not None else "cold", endpoint_id=eid,
+            session_spend=_total_session_spend(app), block_job_id=rt.block_job if rt is not None else None,
+            spend_stopped=False,
+            notice=(f"can't {op} yet: {held}. Releasing the block now would not end that work"
+                    + ("" if not _has_login_shape(app) else " — the endpoint would relaunch a block to run it") + "."))
     work = _block_work(app, then="stop_endpoint" if op == "stop" else "teardown_endpoint")
     if work is None:
         return None
@@ -1050,7 +1080,6 @@ def _busy_block_refusal(app: AppCtx, eid: str, *, op: Literal["stop", "detach"] 
     why = ("" if not _has_login_shape(app) else
            ". Releasing the block now would not end that work — the endpoint would relaunch a block to run it and "
            "spend would continue after a false 'down'")
-    rt = app.shapes.get(DEFAULT_SHAPE)
     return EndpointStatus(  # "cold" when the shape holding the work was already released under it
         status="up", block_state="warm" if rt is not None else "cold", endpoint_id=eid,
         session_spend=_total_session_spend(app), block_job_id=rt.block_job if rt is not None else None,
@@ -1074,9 +1103,11 @@ async def _stop_mep(app: AppCtx, eid: str | None) -> EndpointStatus:
     more (a detach), but blocks it left may still bill."""
     async with app.lock:  # look and drop in ONE step: no dispatch can be counted in between
         lost, current = "", None
+        batch.pause_all(app, "stop_endpoint was called: admission stops before anything is released")
         if eid is not None:
             if busy := _busy_block_refusal(app, eid):  # our work holds the block, and nothing here can end it
                 return busy
+            batch.retire_all(app, app.shapes.get(DEFAULT_SHAPE), "stop_endpoint left this block to drain")
             lost = _lost_note(app, op="stop")
             rt = app.shapes.get(DEFAULT_SHAPE)
             current = warmth._leave_block(app, DEFAULT_SHAPE, rt, how="stop") if rt is not None else None
@@ -1148,8 +1179,11 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
     if not await _acquire_within(app, call_deadline):
         return _lock_busy_status(app, eid, released=None)
     try:
+        # admission stops FIRST, under the lock, before anything is looked at or released (batch phase 1, design §5)
+        batch.pause_all(app, "stop_endpoint was called: admission stops before anything is released")
         if busy := _busy_block_refusal(app, eid):
             return busy
+        batch.retire_all(app, app.shapes.get(DEFAULT_SHAPE), "stop_endpoint released this block")
     finally:
         app.lock.release()
     # the record of our tasks on disk, read off the loop (a hung home directory must not freeze the server) — after this
@@ -2013,7 +2047,7 @@ async def _detect_submission(command: str, shape: str) -> Submission | None:
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
     payload: Callable[[], str], *, agent_call: bool, reset: bool = False, submission: Submission | None = None,
-    guard: session_shell.Guard | None = None,
+    guard: session_shell.Guard | None = None, result_key: str | None = None,
 ) -> ShellOutcome:
     """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
     lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
@@ -2077,6 +2111,11 @@ async def _dispatch_counted(
                     out = _with_submission_notice(
                         _running_outcome(app, task_id, runner.walltime, reset=reset,
                                          block_state="cold" if released else "warm"), sub, shape)
+                    gid = getattr(fut, "task_id", None)
+                    if isinstance(gid, str) and batch.is_task_uuid(gid):
+                        out.globus_task_id = gid
+                        batch.record_interactive(app, gid, shape=shape, session_id=session_id,
+                                                 result_key=result_key, handle=task_id)
                     if released:  # released under the call: tracked, but don't revive the shape
                         return _released_under_outcome(app, out, runner.walltime)
                     _note_dispatch(rt, out)  # the worker took our task -> it's alive
@@ -2128,9 +2167,16 @@ async def _run_shell(
     if isinstance(ready, ShellOutcome):
         return ready
     runner, session, rt, guard = ready
-    return await _dispatch_counted(app, rt, runner, shape, session_id, command,
-                                   lambda: session_shell.wrap(command, session, guard=guard),
-                                   agent_call=agent_call, submission=sub, guard=guard)
+    # an agent's command also leaves its rc and output tail in the session dir (poll_task by Globus task id outlives
+    # the service's 30-minute window and a restart that lost the handle: batch phase 1)
+    key = secrets.token_hex(8) if agent_call else None
+    shared = batch.shared_worker_note(app, rt) if agent_call and shape == DEFAULT_SHAPE else None
+    out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
+                                  lambda: session_shell.wrap(command, session, guard=guard, result_key=key),
+                                  agent_call=agent_call, submission=sub, guard=guard, result_key=key)
+    if shared:
+        out.notice = f"{out.notice} {shared}" if out.notice else shared
+    return out
 
 
 async def _reset_session(
@@ -2163,6 +2209,14 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
     submit) is still `running` — it may be queued behind another task or a relaunching block, or lost — and the
     notice says so and what, for its shape, can abandon it."""
     wait = max(0.0, min(wait, 600.0))  # a bounded courtesy wait; never an unbounded tool hang
+    if task_id not in app.tasks and batch.is_task_uuid(task_id):
+        # a Globus task id: the live handle that carries it, else a batch row or an interactive task in the ledger —
+        # which a new server answers too (batch phase 1)
+        handle_id = next((tid for tid, h in app.tasks.items() if getattr(h.future, "task_id", None) == task_id), None)
+        if handle_id is not None:
+            task_id = handle_id
+        elif (by_uuid := await batch.poll_uuid(app, task_id)) is not None:
+            return by_uuid
     async with app.lock:
         resolved = _resolve_task(app, task_id)
         if resolved is not None:
@@ -2268,6 +2322,95 @@ async def reset_session(
         ), "reset_session"))
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured failure
         return _error_outcome(exc)
+
+
+# ---- batch phase 1: run_batch / status / cancel (hpc_bridge.batch; vault `Planned/Batch and swarm execution.md`) ---
+
+batch.login_runner = _login_runner   # the free login-shape channel the batch engine's markers and job looks ride
+
+
+async def _batch_ensure_up(app: AppCtx, confirm_spend: bool) -> EndpointStatus:
+    return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend)
+
+
+async def _run_batch(
+    app: AppCtx, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
+    results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
+    confirm_spend: bool = False, batch_id: str | None = None,
+) -> BatchStatus:
+    if _no_facility_bound(app) and batch_id is None:
+        return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
+    return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
+                                 task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
+                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id)
+
+
+async def _status(app: AppCtx, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
+                  wait_s: float = 0.0) -> BatchStatus:
+    return await batch.status(app, id, detail=detail, offset=offset, limit=limit, wait_s=wait_s)
+
+
+async def _cancel(app: AppCtx, id: str, mode: str = "drain") -> CancelResult:  # noqa: A002 - the tool's own name
+    return await batch.cancel(app, id, mode=mode)
+
+
+@mcp.tool()
+async def run_batch(
+    ctx: Context, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
+    results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
+    confirm_spend: bool = False, batch_id: str | None = None,
+) -> BatchStatus:
+    """Run ONE command once per row, many rows, on the session's confirmed compute block — instead of a run_shell
+    per row. hpc-bridge keeps the backlog and sends at most `capacity` tasks at a time (the block's workers, less one
+    kept for your interactive commands); a durable ledger records every row, so the batch survives this server.
+
+    `command`: shell, with `{name}` for each field of a row (substituted shell-quoted; other braces such as ${HOME}
+    stay as written) and `{index}` for the row's number. `rows`: a list of objects with identifier keys, e.g.
+    [{"n": 1}, {"n": 2}], or of plain values, bound as `{row}`. `task_walltime_s` (required): the most seconds one row
+    may run — it is killed then (rc 124), and a row is admitted only while the block has task_walltime_s + 30 s of
+    walltime left. Each row's stdout/stderr are kept (capped) under `results_dir` (default: a dir under the facility's
+    scratch root); a result carries the exit code, the output's tail and a pointer to the file.
+
+    Spend: the same floor as ensure_endpoint_up — an unconfirmed block answers phase="needs_confirmation" with `block`
+    (nothing recorded); confirm_spend=True confirms ONE block, as there. When the block ends (its walltime, a reap, a
+    stop, a server restart) the batch pauses at needs_confirmation with a `reason`; resume it only after the user's yes
+    with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again.
+    Follow it with status(id, wait_s=60); stop it with cancel(id)."""
+    try:
+        return await _heartbeat(ctx, _run_batch(
+            ctx.request_context.lifespan_context, command, rows, task_walltime_s, results_dir, session_id, shape,
+            idempotent, confirm_spend, batch_id), "run_batch")
+    except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
+        return BatchStatus(phase="refused", reason=f"{type(exc).__name__}: {exc}",
+                           notice=f"run_batch failed: {type(exc).__name__}: {exc}")
+
+
+@mcp.tool(name="status")
+async def status_tool(ctx: Context, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
+                      wait_s: float = 0.0) -> BatchStatus:
+    """How a batch (a `batch-…` id from run_batch) stands: counts by state, and the rows themselves with
+    detail="failed" (failed / lost ones, with exit codes) or detail="page" (every row, `offset`/`limit`). `wait_s` (at
+    most 60) waits for something to change first. It collects results and keeps a running batch going; it never
+    resumes a paused one (phase="needs_confirmation": see `reason`). From another hpc-bridge server it reads the
+    ledger (`owner` names the server that runs the batch)."""
+    try:
+        return await _heartbeat(ctx, _status(ctx.request_context.lifespan_context, id, detail, offset, limit, wait_s),
+                                "status")
+    except Exception as exc:  # noqa: BLE001
+        return BatchStatus(batch_id=id, phase="refused", reason=f"{type(exc).__name__}: {exc}",
+                           notice=f"status failed: {type(exc).__name__}: {exc}")
+
+
+@mcp.tool(name="cancel")
+async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResult:  # noqa: A002
+    """Stop a batch. mode="drain": admit nothing more, let the tasks in flight finish, keep the backlog (resumable with
+    run_batch(batch_id=…, confirm_spend=True)). mode="abort": cancel the backlog and end the tasks in flight (each is
+    killed within a few seconds, rc 143). status="draining" while any task is still in flight — call again — and
+    "down" once none is; `blocks_left` names the compute block that still bills (stop_endpoint ends it)."""
+    try:
+        return await _cancel(ctx.request_context.lifespan_context, id, mode)
+    except Exception as exc:  # noqa: BLE001
+        return CancelResult(id=str(id), status="refused", notice=f"cancel failed: {type(exc).__name__}: {exc}")
 
 
 def main() -> None:

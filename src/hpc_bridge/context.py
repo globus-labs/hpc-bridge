@@ -105,6 +105,9 @@ class ShapeRuntime:
     # Synchronous dispatches in flight on this shape (run_shell / reset_session inside their sync-wait). They hold
     # no poll handle, yet they ARE the worker's work: a canary queued behind one is not evidence the block is gone.
     inflight: int = 0
+    # Batch tasks of ours on this shape's block, admitted and not settled (batch phase 1, hpc_bridge.batch): work on the
+    # block like a running task — warmth, the idle presumption and the stop's busy refusal count it.
+    batch_inflight: int = 0
     # The scheduler REJECTED this shape's block submission (one block): (the cause, the partition and account it was
     # on). Set with the confirmation it voids (warmth._void_rejected), cleared by the next confirmation. The re-ask says
     # why (notices._reask_prefix), and a stop expects no pilot from it (server._stop_endpoint).
@@ -520,6 +523,13 @@ class AppCtx:
     id_watchers: dict[str, asyncio.Task] = field(default_factory=dict)
     # serializes provision / runner-swap / teardown so concurrent tool calls can't race AppCtx state
     lock: asyncio.Lock = field(default_factory=asyncio.Lock)
+    # Batch phase 1 (hpc_bridge.batch): this process's live part of each batch it holds the lease of (by id), the
+    # durable ledger (opened on first use), this process's lease identity, and whether each batch gets a background
+    # admission/collection loop (tests drive `batch.tick` themselves).
+    batches: dict[str, Any] = field(default_factory=dict)
+    ledger: Any = None
+    batch_owner: Any = None
+    batch_autoloop: bool = True
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

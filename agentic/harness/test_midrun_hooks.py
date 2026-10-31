@@ -512,9 +512,10 @@ def test_the_answer_tables_are_the_products():
 
     from hpc_bridge import models, server
     phases = {m: typing.get_args(m.model_fields["phase"].annotation)
-              for m in (models.ShellOutcome, models.ConnectFacilityResult, models.LoginStatus, models.PreauthStatus)}
+              for m in (models.ShellOutcome, models.ConnectFacilityResult, models.LoginStatus, models.PreauthStatus,
+                        models.BatchStatus)}
     for tool, values in hooks.ANSWER_PHASES.items():
-        ret = typing.get_type_hints(getattr(server, tool))["return"]
+        ret = typing.get_type_hints(getattr(server, {"status": "status_tool"}.get(tool, tool)))["return"]
         assert "phase" in ret.model_fields and "endpoint_id" not in ret.model_fields, tool
         assert set(values) == set(phases[ret]), tool
     for tool in hooks.ENDPOINT_ANSWERS:

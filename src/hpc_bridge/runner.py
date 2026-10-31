@@ -7,7 +7,7 @@ from dataclasses import dataclass
 from typing import Any, NamedTuple
 
 from .login import login_expired
-from .session_shell import JOB_ID_EXPR
+from .session_shell import JOB_ID_EXPR, REMAINING_SH
 
 
 class SubmitAnswer(NamedTuple):
@@ -60,6 +60,12 @@ class CanaryResult:
     # Globus Auth refused to refresh the stored login (login.login_expired): nothing can be sent until the user logs
     # in again — not a queue wait, not the config.
     login_expired: bool = False
+    # The block's remaining walltime as the worker read it from inside the block (session_shell.REMAINING_SH: Slurm's
+    # SLURM_JOB_END_TIME, `squeue %L`, PBS stime + walltime), in seconds at `answered_at`; None: unknown (no job id —
+    # the login shape — or nothing answered). A batch admits nothing on unknown (batch phase 1, the admission gate).
+    worker_remaining_s: float | None = None
+    # PARSL_WORKER_COUNT on the worker: how many workers its block runs (a batch's window); None when not set.
+    worker_count: int | None = None
 
 
 # A worker that runs this proves the compute block is live (manager_online cannot). A result
@@ -76,6 +82,8 @@ _CANARY_PARSL = "HPCB_PARSL"
 _CANARY_GCE = "HPCB_GCE"
 _CANARY_JOB = "HPCB_JOB"
 _CANARY_USER = "HPCB_USER"
+_CANARY_REMAINING = "HPCB_REMAINING"
+_CANARY_WORKERS = "HPCB_WORKERS"
 _CANARY_CMD = (
     f"echo {_CANARY_SENTINEL}; "
     'python -c "import platform,dill,socket;'
@@ -92,7 +100,10 @@ _CANARY_CMD = (
     # new one starts its own (warmth._provision). The wrong-block guard compares the SAME expression with the confirmed
     # block's job before every command it wraps (session_shell). ShellFunction runs this through str.format, then
     # /bin/bash.
-    f'echo "{_CANARY_JOB} {JOB_ID_EXPR}"'
+    f'echo "{_CANARY_JOB} {JOB_ID_EXPR}"; '
+    # The block's remaining walltime and worker count, from inside it (batch phase 1: the admission gate, the window)
+    + REMAINING_SH + "; "
+    f'echo "{_CANARY_REMAINING} ${{__hb_rem:-}}"; echo "{_CANARY_WORKERS} ${{PARSL_WORKER_COUNT:-}}"'
 )
 
 
@@ -289,7 +300,23 @@ def _canary_result(res: object, answered_at: float) -> CanaryResult:
                         worker_parsl=_parse_canary_parsl(stdout),
                         worker_gce=_parse_canary_tagged(stdout, _CANARY_GCE),
                         worker_job=_parse_canary_tagged(stdout, _CANARY_JOB),
-                        worker_user=_parse_canary_user(stdout), answered_at=answered_at)
+                        worker_user=_parse_canary_user(stdout), answered_at=answered_at,
+                        worker_remaining_s=_float_or_none(_parse_canary_tagged(stdout, _CANARY_REMAINING)),
+                        worker_count=_int_or_none(_parse_canary_tagged(stdout, _CANARY_WORKERS)))
+
+
+def _float_or_none(v: str | None) -> float | None:
+    try:
+        return float(v) if v is not None else None
+    except ValueError:
+        return None
+
+
+def _int_or_none(v: str | None) -> int | None:
+    try:
+        return int(v) if v is not None else None
+    except ValueError:
+        return None
 
 
 class GlobusRunner:
@@ -345,10 +372,22 @@ class GlobusRunner:
     def _default_factory(self):
         from globus_compute_sdk import Executor
 
-        return Executor(
+        ex = Executor(
             endpoint_id=self.endpoint_id,
             user_endpoint_config=self.user_endpoint_config,
         )
+        # Its task group is the SERVICE's, minted at its first submit (a client-made id 404s and shuts the Executor
+        # down: spike S8) — never one an earlier Executor of this process adopted: the SDK's setter writes that into
+        # the class-wide default (`Executor._default_task_group_id`), and SDK 4.18's result watcher acks every message
+        # on its group's queue, so two Executors on one group swallow each other's results (S1). Set past the setter,
+        # which would write the class default again.
+        ex._task_group_id = None
+        return ex
+
+    @property
+    def task_group_id(self) -> Any:
+        """The service-minted task group of this runner's Executor (None before its first submit)."""
+        return getattr(self._ex, "task_group_id", None) if self._ex is not None else None
 
     def executor(self):
         if self._ex is None:

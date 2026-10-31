@@ -23,6 +23,36 @@ _VOLATILE_NAME_GLOBS = "SLURM*|HOSTNAME|PBS_*|PMI_*|OMPI_*|FLUX_*"
 # PBS site starts on a SISTER node (mpiexec / pbsdsh) may not inherit PBS_JOBID: there the expression is empty and a
 # command runs unguarded, as on a block with no job — the canary, which can land on any worker, says the same.
 JOB_ID_EXPR = "${SLURM_JOB_ID:-${PBS_JOBID:-}}"
+# The block's remaining walltime, read from inside it (batch phase 1, spike S8): sets `__hb_rem` to whole seconds, or
+# leaves it empty (unknown). Slurm: SLURM_JOB_END_TIME, exact with no RPC; else `squeue -h -j <job> -o %L` (+1 s: it
+# rounds down). PBS: `qstat -f` stime + Resource_List.walltime (never resources_used.walltime, which lags). The block's
+# END time is cached once per block on node-local ${TMPDIR:-/tmp}, so the next task there asks nothing. No job id (the
+# login shape) is unknown — `squeue -j ""` answers rc 0 and nothing. POSIX sh plus bash's $(…); bash 3.2 runs it too.
+REMAINING_SH = (
+    '__hb_rem=""; __hb_j="${SLURM_JOB_ID:-${PBS_JOBID:-}}"; '
+    'if [ -n "$__hb_j" ]; then '
+    '__hb_now=$(date +%s); '
+    '__hb_c="${TMPDIR:-/tmp}/hpcb-end-$(printf %s "$__hb_j" | tr -c "A-Za-z0-9._-" _)"; '
+    '__hb_end="${SLURM_JOB_END_TIME:-}"; '
+    'case "$__hb_end" in ""|*[!0-9]*) __hb_end=$(cat "$__hb_c" 2>/dev/null);; esac; '
+    'case "$__hb_end" in ""|*[!0-9]*) __hb_end="";; esac; '
+    'if [ -z "$__hb_end" ] && [ -n "${SLURM_JOB_ID:-}" ]; then '
+    '__hb_s=$(squeue -h -j "$SLURM_JOB_ID" -o %L 2>/dev/null | head -n 1 | awk \'{ s=$1; d=0; '
+    'if (index(s,"-")) { d=substr(s,1,index(s,"-")-1); s=substr(s,index(s,"-")+1) } '
+    'if (s !~ /^[0-9:]+$/ || d !~ /^[0-9]*$/) exit 1; n=split(s,a,":"); t=0; for (i=1;i<=n;i++) t=t*60+a[i]; '
+    'print d*86400+t }\'); '
+    'case "$__hb_s" in ""|*[!0-9]*) ;; *) __hb_end=$((__hb_now + __hb_s + 1));; esac; fi; '
+    'if [ -z "$__hb_end" ] && [ -n "${PBS_JOBID:-}" ]; then '
+    '__hb_q=$(qstat -f "$PBS_JOBID" 2>/dev/null); '
+    '__hb_st=$(printf "%s\\n" "$__hb_q" | sed -n "s/^ *stime = //p" | head -n 1); '
+    '__hb_w=$(printf "%s\\n" "$__hb_q" | sed -n "s/^ *Resource_List.walltime = //p" | head -n 1 | '
+    'awk -F: \'NF==3{print $1*3600+$2*60+$3}\'); '
+    '__hb_t0=$(date -d "$__hb_st" +%s 2>/dev/null); '
+    'case "$__hb_t0$__hb_w" in ""|*[!0-9]*) ;; *) __hb_end=$((__hb_t0 + __hb_w));; esac; fi; '
+    'case "$__hb_end" in ""|*[!0-9]*) ;; *) printf %s "$__hb_end" > "$__hb_c" 2>/dev/null; '
+    '__hb_rem=$((__hb_end - __hb_now));; esac; '
+    'fi'
+)
 # A command sent for one block must not run on another. The block the user confirmed spend for can be replaced
 # (released, cancelled, preempted) between two commands, and a command sent while its last proof of life is fresh
 # (CANARY_TTL_S) is not checked first, so it would run on the replacement unasked (live 2026-10-13: job 112 scancel'd,
@@ -80,6 +110,11 @@ def _guard(guard: Guard | None) -> str:
     if guard is None:
         return ""
     return _GUARD_TEMPLATE.replace("@@EXPECT@@", shlex.quote(guard.job)).replace("@@NONCE@@", guard.nonce)
+
+
+def guard_prefix(guard: Guard | None) -> str:
+    """The wrong-block guard as a script's first lines (a batch task's wrapper carries it too)."""
+    return _guard(guard)
 
 
 def refusal(exit_code: int | None, stderr: str, guard: Guard) -> Refusal | None:
@@ -161,9 +196,9 @@ __hb_snap() {
 __hb_base=@@SD@@/.env.base.$$
 __hb_snap > "$__hb_base"
 [ -f @@SD@@/.env ] && . @@SD@@/.env 2>/dev/null
-eval "$(printf %s @@B64@@ | base64 -d)"
+eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
-pwd > @@SD@@/.cwd
+@@RESULT@@pwd > @@SD@@/.cwd
 # Persist only vars the command added/changed vs the ambient baseline, dropping scheduler
 # runtime vars (@@VOLATILE@@). `printf %q` keeps each record single-line and re-sourceable
 # even for multi-line values, so the persisted .env can never corrupt the next source.
@@ -180,7 +215,17 @@ exit $__hb_rc
 """
 
 
-def wrap(command: str, session: Session, *, guard: Guard | None = None) -> str:
+# The interactive result kept in the session dir (batch phase 1: poll_task by Globus task id, spike S2): the command's
+# stdout passes through `tee` as it always did, its last 4 kB also go to `results/<key>/tail`, and its exit status to
+# `results/<key>/rc` — readable after the service's 30-minute window and after a restart that lost the handle.
+_RESULT_TEE = ' > >(tee >(tail -c 4096 > @@SD@@/results/@@KEY@@/tail 2>/dev/null))'
+# An EXIT trap, so a command that calls `exit` itself (it runs in this shell) still leaves its status
+_RESULT_RC = ("__hb_rcf=@@SD@@/results/@@KEY@@/rc\n"
+              "trap 'printf \"%s\\n\" \"$?\" > \"$__hb_rcf\" 2>/dev/null' EXIT\n")
+_RESULT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
+
+
+def wrap(command: str, session: Session, *, guard: Guard | None = None, result_key: str | None = None) -> str:
     """Wrap a command so cwd and env persist across calls (invisible to the model).
 
     ``guard``: the scheduler job the command must run in (the confirmed block's) and this dispatch's nonce. On any
@@ -201,8 +246,16 @@ def wrap(command: str, session: Session, *, guard: Guard | None = None) -> str:
     """
     sd = session.quoted_state_dir()
     b64 = shlex.quote(base64.b64encode(command.encode()).decode())
-    return _guard(guard) + (
-        _WRAP_TEMPLATE.replace("@@SD@@", sd)
+    tee = rc = ""
+    if result_key is not None:
+        if not _RESULT_KEY.match(result_key):
+            raise ValueError(f"invalid result key {result_key!r}")
+        tee = _RESULT_TEE.replace("@@KEY@@", result_key)
+        rc = _RESULT_RC.replace("@@KEY@@", result_key)
+    head = f"mkdir -p {sd}/results/{result_key}\n{rc}" if result_key is not None else ""
+    return _guard(guard) + head.replace("@@SD@@", sd) + (
+        _WRAP_TEMPLATE.replace("@@TEE@@", tee).replace("@@RESULT@@", "")
+        .replace("@@SD@@", sd)
         .replace("@@B64@@", b64)
         .replace("@@VOLATILE@@", _VOLATILE_NAME_GLOBS)
     )

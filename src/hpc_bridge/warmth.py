@@ -247,7 +247,7 @@ async def _confirm_worker(app: AppCtx, shape: str, *, force: bool) -> BlockState
     # Trust it and skip the canary, which would otherwise queue behind the sole worker and (on timeout)
     # flip us to 'not warm', banking the spend clock while the block is still burning (#21). A synchronous
     # dispatch still inside its sync-wait holds no handle but counts the same (rt.inflight).
-    if _live_task_handles(app, shape) or rt.inflight:
+    if _live_task_handles(app, shape) or rt.inflight or rt.batch_inflight:   # a batch task is our work there too
         rt.warm_confirmed_at = now
         rt.provisioning_since = None
         return "warm"
@@ -417,7 +417,7 @@ def _last_activity(app: AppCtx, shape: str, rt: ShapeRuntime) -> float | None:
 def _no_idle_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> bool:
     """No confirmed block to presume about, or work may be on it: a task still running (or its end not yet stamped),
     or a synchronous dispatch in flight."""
-    return (rt.block_since is None or bool(rt.inflight)
+    return (rt.block_since is None or bool(rt.inflight) or bool(rt.batch_inflight)
             or any(h.done_at is None for h in app.tasks.values() if h.shape == shape))
 
 def _presumed_idle_released(app: AppCtx, shape: str, rt: ShapeRuntime) -> tuple[str, float] | None:
