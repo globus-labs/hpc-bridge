@@ -101,6 +101,7 @@ batch_restart_resume          batch phase 1: scripted (a server SIGKILL mid-batc
 batch_two_servers_one_ledger  batch phase 1: scripted (two servers on one state dir) on `default`; run on its own
 batch_block_reaped_midrun     batch phase 1: scripted (a polling hook scancels the block) on `default`; run on its own
 batch_big_output              batch phase 1: scripted (a 12 MB row) on `default`; run on its own
+batch_abort_midrun            batch phase 1: scripted (cancel abort ends the task in flight) on `default`; run on its own
 mep_batch_fanout              batch phase 1: scripted on `mep` (needs HPCB_MEP_EMAIL); run on its own
 EXCLUDED
 }

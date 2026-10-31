@@ -27,7 +27,8 @@ import script_runner  # noqa: E402
 from invariants import Result, ToolCall, Trace, _billed_start_idxs  # noqa: E402
 
 BATCH_SCENARIOS = ["batch_fanout_collect", "batch_crosses_walltime", "batch_restart_resume",
-                   "batch_two_servers_one_ledger", "batch_block_reaped_midrun", "mep_batch_fanout", "batch_big_output"]
+                   "batch_two_servers_one_ledger", "batch_block_reaped_midrun", "mep_batch_fanout", "batch_big_output",
+                   "batch_abort_midrun"]
 BID = "batch-0123456789ab"
 
 

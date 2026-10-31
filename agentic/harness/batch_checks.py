@@ -651,6 +651,35 @@ def mep_stop_names_jobs(t: Trace) -> Result:
                   f"block jobs seen {sorted(jobs) or 'none'}, named {named or 'none'}")
 
 
+def abort_ends_in_flight(t: Trace, *, rows: int, within_s: float = 60.0) -> Result:
+    """cancel(abort) ends what is in flight (design §5): the first abort cancels the backlog and answers `draining` while
+    a task is out; a later cancel answers `down` within `within_s`; every row that was out settled `cancelled` on the
+    CANCELLED marker's evidence — never done (its command was killed, not let run on)."""
+    aborts = [(i, c) for i, c in t.named("cancel") if str(c.input.get("mode")) == "abort" and c.result]
+    if not aborts:
+        why = "no cancel(abort) call"
+        if any(unknown_tool(c.result) for _i, c in t.named("cancel")):
+            why += " was answered (cancel is not a tool on this server)"
+        return Result("abort_ends_in_flight", False, why)
+    i0, first = aborts[0]
+    r0 = first.result or {}
+    downs = [(i, c) for i, c in aborts if (c.result or {}).get("status") == "down"]
+    when = None
+    if downs and first.t_result is not None and downs[0][1].t_result is not None:
+        when = downs[0][1].t_result - first.t_result
+    rowsd = rows_seen(t)
+    out = [r for r in rowsd.values() if str(r.get("settled_by") or "").find("CANCELLED") >= 0]
+    done_after = [r for r in rowsd.values() if r.get("state") == "done" and r.get("index") in {x.get("index") for x in out}]
+    ok = (r0.get("status") == "draining" and int(r0.get("in_flight") or 0) > 0 and int(r0.get("backlog_dropped") or 0) > 0
+          and bool(downs) and when is not None and when <= within_s and bool(out) and not done_after
+          and sum(1 for r in rowsd.values() if r.get("state") == "cancelled") == rows)
+    return Result("abort_ends_in_flight", ok,
+                  f"first abort (call {i0}): {r0.get('status')!r}, {r0.get('in_flight')} in flight, "
+                  f"{r0.get('backlog_dropped')} dropped; down {f'after {when:.0f}s' if when is not None else 'never'}; "
+                  f"{len(out)} row(s) settled on the marker; "
+                  f"{sum(1 for r in rowsd.values() if r.get('state') == 'cancelled')}/{rows} cancelled")
+
+
 def big_output_truncated(t: Trace, *, index: int, full: int) -> Result:
     """The big row's stdout (`full` bytes) came back cut — truncated, stored at less than its full size, with a
     pointer to the file and a tail — and nothing anywhere met Globus Compute's result limit."""
