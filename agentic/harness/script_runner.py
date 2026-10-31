@@ -163,7 +163,8 @@ class ScriptOps:
         self.label = label
         self._opener = opener
         self._journal = journal
-        self._stack: contextlib.AsyncExitStack | None = None
+        self._stack: asyncio.Task[BaseException | None] | None = None   # the server's host task (`_open`)
+        self._closing = asyncio.Event()
         self.server_pid: int | None = None   # learnt from the journal rows this server wrote (its `pid`)
         self.restarts: list[dict] = []
         root = parent if parent is not None else self
@@ -226,19 +227,52 @@ class ScriptOps:
                 return
 
     async def _open(self) -> None:
+        """Start the server in a task of its own, which enters the stdio session's context and later leaves it. anyio
+        cancel scopes must be left in the task that entered them (the script runs in another task: `_drive`'s
+        wait_for), and a server that dies makes the stdio client cancel the scope it was entered in — its host task
+        here, never the script (live 2026-10-31: the first restart's SIGKILL cancelled the script and run.py read the
+        cell as INTERRUPTED)."""
         if self._opener is None:
             raise RuntimeError("this ScriptOps cannot start a server (no opener)")
-        self._stack = contextlib.AsyncExitStack()
-        self._session = await self._stack.enter_async_context(self._opener())
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[Any] = loop.create_future()
+        closing = asyncio.Event()
+        opener = self._opener
+
+        async def host() -> BaseException | None:
+            try:
+                async with opener() as session:
+                    if not ready.done():
+                        ready.set_result(session)
+                    await closing.wait()
+            except BaseException as exc:  # noqa: BLE001 - a dead server's teardown is this task's, reported to the closer
+                if not ready.done():
+                    ready.set_exception(exc if isinstance(exc, Exception) else RuntimeError(f"the server ended: {exc!r}"))
+                return exc
+            return None
+
+        self._closing = closing
+        self._stack = asyncio.create_task(host())
+        self._session = await ready
 
     async def _close(self) -> None:
         with contextlib.suppress(Exception):
             await self._close_raising()
 
     async def _close_raising(self) -> None:
-        stack, self._stack = self._stack, None
-        if stack is not None:
-            await stack.aclose()
+        """End the server's host task (it leaves the session's context itself); a server that already died returns its
+        ending, which is evidence, not this close's failure — only a close that could not run raises."""
+        host, self._stack = self._stack, None
+        if host is None:
+            return
+        self._closing.set()
+        try:
+            ended = await asyncio.wait_for(asyncio.shield(host), timeout=60)
+        except TimeoutError:
+            host.cancel()
+            raise RuntimeError(f"server {self.label} did not close within 60 s") from None
+        if ended is not None:   # it died before this close (a restart's kill): its session's ending, for the log
+            print(f"  ⚠ server {self.label} had ended: {type(ended).__name__}: {str(ended)[:160]}", flush=True)
 
     async def restart_server(self, *, kill: bool = True, wait_s: float = 10.0) -> dict:
         """Kill this server (SIGKILL by default: a crash, nothing flushed) and start a new one on the same state

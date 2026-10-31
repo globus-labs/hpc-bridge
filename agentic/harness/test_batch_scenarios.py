@@ -504,3 +504,49 @@ def test_the_fanout_script_drives_run_batch_status_and_stop(monkeypatch, tmp_pat
     assert not res.final.is_error, res.final.result
     assert mod.failures_have_rc(res.trace).ok and mod.agent_reports_failures(res.trace).ok
     assert mod.batch_used(res.trace).ok and bc.stop_down(res.trace).ok
+
+
+def test_a_server_that_dies_under_the_script_never_cancels_the_script(monkeypatch, tmp_path):
+    # live 2026-10-31 (batch_restart_resume on main): the SIGKILL made the stdio client's task group cancel the scope it
+    # was entered in — the script's — and run.py read the cell as INTERRUPTED; each server now lives in a host task
+    _stub_sdk(monkeypatch, tmp_path)
+    import anyio
+
+    opened: list[int] = []
+
+    def factory(cmd, env, cwd):
+        @contextlib.asynccontextmanager
+        async def cm():
+            opened.append(1)
+            async with anyio.create_task_group() as tg:
+                dead = anyio.Event()
+
+                async def reader():
+                    await dead.wait()
+                    raise ConnectionError("the server closed its stdout")
+
+                tg.start_soon(reader)
+
+                class Session:
+                    async def call_tool(self, name, args, read_timeout_seconds=None):
+                        if name == "die":
+                            dead.set()
+                            await anyio.sleep(0.2)
+                            raise ConnectionError("closed")
+                        return types.SimpleNamespace(isError=False, structuredContent={"ok": len(opened)}, content=[])
+
+                yield Session()
+                tg.cancel_scope.cancel()
+
+        return cm()
+
+    async def script(ops):
+        await ops.call("die")
+        await ops.sleep(0.3)
+        await ops.restart_server(kill=False)
+        return json.dumps(await ops.call("status"))
+
+    res = asyncio.run(script_runner.run_scenario("p", repo_root=HERE.parents[1], script=script, facility="f",
+                                                  ssh_host="h", session_factory=factory))
+    assert not res.final.is_error, res.final.result
+    assert json.loads(res.final.result) == {"ok": 2} and len(opened) == 2
