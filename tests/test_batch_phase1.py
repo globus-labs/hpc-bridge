@@ -838,7 +838,7 @@ async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_i
         return run
 
     monkeypatch.setattr(batch, "login_runner", runner_for)
-    app, _rt, runner = await _batch_app(workers=4)                    # capacity 3
+    app, _rt, _runner = await _batch_app(workers=4)                   # capacity 3
     out = await _start(app, n=6)
     run = app.batches[out.batch_id]
     keys = list(run.futures)
