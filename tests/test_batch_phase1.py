@@ -338,6 +338,7 @@ def test_wrapper_caps_output_and_times_out_itself(tmp_path):
     assert r is not None and r.rc == 0 and r.truncated and r.stdout_bytes == 1_000_000
     assert (rd / "tasks" / "0" / "attempt-1" / "stdout").stat().st_size == 1_000_000
     assert r.stdout_path.endswith("tasks/0/attempt-1/stdout") and len(r.tail) <= batch.TAIL_BYTES
+    assert r.tail.endswith("the-end\n")          # the tail is the stream's real end, past the cap
     slow = batch.task_script("sleep 30", results_dir=str(rd), index=1, attempt=1, task_walltime_s=2)
     t0 = time.monotonic()
     r = batch.parse_result(_run_wrapper(slow, {"SLURM_JOB_ID": "5"}, tmp_path).stdout)

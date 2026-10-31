@@ -213,8 +213,10 @@ __hb_start=$(date +%s)
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
-rm -f "$__hb_f.o" "$__hb_f.e"; mkfifo "$__hb_f.o" "$__hb_f.e"
-{ head -c @@CAP@@ > "$__hb_a/stdout"; wc -c | tr -d ' ' > "$__hb_a/.stdout.dropped"; } < "$__hb_f.o" &
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"; mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"
+tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" &
+{ tee "$__hb_f.t" | { head -c @@CAP@@ > "$__hb_a/stdout"; wc -c | tr -d ' ' > "$__hb_a/.stdout.dropped"; }
+} < "$__hb_f.o" &
 { head -c @@CAP@@ > "$__hb_a/stderr"; wc -c | tr -d ' ' > "$__hb_a/.stderr.dropped"; } < "$__hb_f.e" &
 set -m
 (
@@ -242,7 +244,7 @@ wait "$__hb_c"
 __hb_rc=$?
 kill "$__hb_w"
 wait
-rm -f "$__hb_f.o" "$__hb_f.e"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"
 __hb_why=$(cat "$__hb_a/.why")
 case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
@@ -251,7 +253,7 @@ __hb_ob=$(wc -c < "$__hb_a/stdout" | tr -d ' ')
 __hb_od=$(cat "$__hb_a/.stdout.dropped")
 case "$__hb_od" in ''|*[!0-9]*) __hb_od=0;; esac
 __hb_tr=false; [ "$__hb_od" -gt 0 ] && __hb_tr=true
-__hb_tl=$(tail -c @@TAIL@@ "$__hb_a/stdout" | base64 | tr -d '\n')
+__hb_tl=$(base64 < "$__hb_a/.stdout.tail" | tr -d '\n')
 __hb_el=$(tail -c @@ETAIL@@ "$__hb_a/stderr" | base64 | tr -d '\n')
 __hb_r=", \"rc\": $__hb_rc, \"started\": $__hb_start, \"ended\": $(date +%s)"
 __hb_r="$__hb_r, \"stdout_path\": \"$__hb_a/stdout\", \"stdout_bytes\": ${__hb_ob:-0}"
