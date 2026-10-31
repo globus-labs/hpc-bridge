@@ -637,12 +637,13 @@ def nothing_admitted_after_stop(t: Trace) -> Result:
 
 def mep_stop_names_jobs(t: Trace) -> Result:
     """On a MEP the stop is draining and FINAL, spend not claimed stopped, and it names the block job(s) the results
-    reported."""
+    reported — the rows a page listed, or the `blocks_seen` every batch answer carries (a summary status lists no rows)."""
     stops = t.named("stop_endpoint")
     if not stops:
         return Result("mep_stop_names_jobs", False, "no stop_endpoint call")
     r = stops[-1][1].result or {}
     jobs = {str(x.get("job_id")) for x in rows_seen(t).values() if x.get("job_id")}
+    jobs |= {str(j) for _i, c in batch_answers(t) for j in (c.result or {}).get("blocks_seen") or [] if j}
     jobs |= {j for _ts, j, _rem in started_lines(t).values() if j}
     text = f"{r.get('notice') or ''} {r.get('block_job_id') or ''}"
     named = sorted(j for j in jobs if j and j in text)

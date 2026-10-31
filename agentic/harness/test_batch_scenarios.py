@@ -355,6 +355,9 @@ def test_lost_on_evidence_backlog_kept_and_the_mep_stop():
     assert bc.mep_stop_names_jobs(Trace([_c("status", {}, _status(results=rows)), stop])).ok
     assert not bc.mep_stop_names_jobs(Trace([_c("status", {}, _status(results=rows)),
                                              _c("stop_endpoint", {}, {"status": "down"})])).ok
+    summary = _c("status", {"id": BID}, {**_status(), "blocks_seen": ["12"]})   # a summary lists no rows
+    assert bc.mep_stop_names_jobs(Trace([summary, stop])).ok
+    assert not bc.mep_stop_names_jobs(Trace([_c("status", {"id": BID}, _status()), stop])).ok
 
 
 def test_nothing_admitted_after_the_stop():
