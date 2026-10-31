@@ -58,8 +58,11 @@ def endpoint_ids(t: Trace) -> list[str]:
 
 
 def unknown_tool(r: dict | None) -> bool:
-    """The tool does not exist on this server (main): an error result naming an unknown tool."""
-    return bool(r and r.get("is_error") and _UNKNOWN_TOOL.search(str(r.get("text") or "")))
+    """The tool does not exist on this server (main): an answer that is only text naming an unknown tool. FastMCP 1.30
+    answers an unknown tool with a plain text result, not an error one (live 2026-10-31: `{"text": "Unknown tool:
+    run_batch"}`), so the text decides, on an answer that carries no batch."""
+    return bool(r and not r.get("batch_id") and not r.get("phase")
+                and _UNKNOWN_TOOL.search(str(r.get("text") or "")))
 
 
 def batch_answers(t: Trace, bid: str | None = None) -> list[tuple[int, ToolCall]]:

@@ -3,9 +3,10 @@ phase 1, design §5 "the admission gate", review finding 3). Fake cluster, `defa
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh batch_crosses_walltime
 
-A 4-minute block (details walltime 00:04:00), tasks of task_walltime_s = 60 (each `sleep 50`), 7 rows. The design's
+A 4-minute block (details walltime 00:04:00), tasks of task_walltime_s = 60 (each `sleep 50`), 9 rows. The design's
 cell has 30 rows; on the default profile's 2 workers the window is 1 (one worker kept for interactive work), so 30 rows
-would cross ten blocks — 7 cross two block ends (three tasks fit a 4-minute block above the 60 s + margin gate).
+would cross ten blocks — 9 cross two block ends (three tasks fit a 4-minute block above the 60 s + margin gate), and on
+main's 2 workers the ninth row starts with 40 s left.
 
 THE SCRIPT: connect from the probe's proposal with the 4-minute walltime, confirm ONE block (ensure_endpoint_up), then
 run_batch. Each time the batch pauses at needs_confirmation naming the walltime, the script — the user — says yes:
@@ -41,14 +42,14 @@ EXTRA_ENV = {"HPC_BRIDGE_SYNC_WAIT_S": "10"}   # main's fallback: run_shell hand
 
 WALLTIME = "00:04:00"
 TASK_WALLTIME_S = 60
-N_ROWS = 7
+N_ROWS = 9
 COMMAND = "sleep 50; echo row {n}"
 ROWS = [{"n": i} for i in range(N_ROWS)]
 MAX_ASKS = 6
 
 PROMPT = (
     "(Scripted — no agent reads this.) On the HPC facility with login host `{ssh_host}` — facility id `{facility}` — "
-    "bring up the login shape with a 4-minute block walltime, confirm one block, run 7 rows of 50 s each through "
+    "bring up the login shape with a 4-minute block walltime, confirm one block, run 9 rows of 50 s each through "
     "run_batch, say yes each time the batch asks again at a block's end, collect every row and stop."
 )
 

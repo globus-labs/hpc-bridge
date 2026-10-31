@@ -476,7 +476,7 @@ def test_the_fanout_script_takes_mains_fallback_when_run_batch_is_no_tool(monkey
     server = _Server({
         "connect_facility": _connect_answers(),
         "ensure_endpoint_up": lambda a: {"status": "up", "endpoint_id": EID, "block": {"queue": "main"}},
-        "run_batch": lambda a: {"is_error": True, "text": "Unknown tool: run_batch"},
+        "run_batch": lambda a: {"text": "Unknown tool: run_batch"},   # FastMCP's answer: plain text, no error
         "run_shell": lambda a: {"phase": "complete", "exit_code": 3 if "case 7 in" in a["command"] else 0,
                                 "stdout": "row\n"},
         "stop_endpoint": lambda a: {"status": "down", "endpoint_id": EID},
