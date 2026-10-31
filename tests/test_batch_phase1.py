@@ -817,3 +817,39 @@ async def test_a_reap_the_batch_reported_is_answered_by_one_yes():
     res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
     assert res.phase in ("admitting", "waiting"), (res.phase, res.notice)
     assert len(runner.futures) > sent or res.phase == "waiting"
+
+
+async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_its_user_endpoints_relaunch(monkeypatch):
+    """Live 2026-10-31 (batch_block_reaped_midrun): after a reap and the user's yes, a row sent to the NEW block was
+    settled lost on the OLD block's evidence (sacct: job 13 CANCELLED), and the reaped block's user endpoint had parsl
+    start a pilot for the task that was out on it, which nobody confirmed. Evidence about a job settles only the tasks
+    sent to it; that user endpoint's pilots are cancelled by its own marker, never the endpoint-wide one."""
+    from hpc_bridge import batch
+
+    uep = "uep." + "1" * 8 + "-1111-1111-1111-" + "1" * 12 + "." + "2" * 8 + "-2222-2222-2222-" + "2" * 12
+    cmds: list[str] = []
+
+    def runner_for(_app):
+        async def run(cmd):
+            cmds.append(cmd)
+            if "HPCB_JOB_STATE" in cmd:
+                return SimpleNamespace(stdout=f"HPCB_JOB_STATE squeue= sacct=CANCELLED pbs= uep={uep}\n")
+            return SimpleNamespace(stdout="HPCB_RELEASED 14\n")
+        return run
+
+    monkeypatch.setattr(batch, "login_runner", runner_for)
+    app, _rt, runner = await _batch_app(workers=4)                    # capacity 3
+    out = await _start(app, n=6)
+    run = app.batches[out.batch_id]
+    keys = list(run.futures)
+    run.sent_job[keys[0]], run.sent_job[keys[1]], run.sent_job[keys[2]] = "13", "13", "15"
+    run.block_job = "13"
+    app.ledger._con.execute("update task set admitted_at = admitted_at - 600 where batch_id = ?", (out.batch_id,))
+    await batch.tick(app, out.batch_id)
+    st = await batch.status(app, out.batch_id, detail="page")
+    states = {r.index: r.state for r in st.results}
+    assert states[keys[0][0]] == "lost" and states[keys[1][0]] == "lost" and states[keys[2][0]] == "in_flight"
+    assert run.old_uep == uep
+    await batch.tick(app, out.batch_id)                                # the reaped user endpoint's relaunch, released
+    assert any("scancel" in c and uep in c for c in cmds) and not any("uep.fake-eid" in c for c in cmds)
+    assert "14" in app.ledger.batch(out.batch_id)["blocks_seen"]

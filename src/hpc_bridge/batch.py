@@ -459,6 +459,14 @@ class _Run:
     next_block: bool = False
     ensure_up: Any = None
     last_warm: float = 0.0
+    # what the block knowledge above is about: the confirmation it was learnt under (a new one forgets it)
+    confirmed_at: float | None = None
+    sent_job: dict[tuple[int, int], str | None] = field(default_factory=dict)
+    # after a reap on SSH: the reaped block's user endpoint (`uep.<eid>.<uep id>`), whose relaunched pilots — parsl's,
+    # for the task that was out on the dead block — this batch cancels for a while (no one confirmed them)
+    old_uep: str | None = None
+    old_uep_until: float = 0.0
+    last_release: float = 0.0
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -501,6 +509,8 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
         return
     if rt.block_job is not None and c.worker_job is not None and c.worker_job != rt.block_job:
         return
+    if rt.confirmed_at is not None and c.answered_at is not None and c.answered_at < rt.confirmed_at:
+        return   # an answer from before this block's confirmation: another block's
     age = max(0.0, time.monotonic() - c.answered_at) if c.answered_at else 0.0
     if c.worker_remaining_s is not None:
         run.block_end_at = _now() - age + c.worker_remaining_s
@@ -510,6 +520,17 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
             run.block_seen_at = _now() - age
     if c.worker_count:
         run.workers_seen = c.worker_count
+
+
+def _sync_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
+    """A new confirmation (a resume after a reap, a switch) is a new block: forget what was known of the old one."""
+    if rt.confirmed_at == run.confirmed_at:
+        return
+    if run.confirmed_at is not None or run.block_job is not None:
+        run.block_end_at = run.block_job = run.block_seen_at = None
+        run.workers_seen = None
+    run.confirmed_at = rt.confirmed_at
+    _note_block_from_canary(app, run, rt)
 
 
 def _batch_runner(app: AppCtx, rt: ShapeRuntime) -> Any:
@@ -960,6 +981,7 @@ async def tick(app: AppCtx, bid: str) -> int:
     await _reconcile(app, run)
     _presume(app, run)
     await _evidence(app, run)
+    await _release_old_uep(app, run)
     await _maybe_switch(app, run)
     await _maybe_warm(app, run)
     async with app.lock:
@@ -990,6 +1012,7 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         return 0
     if run.runner is None:
         run.runner = _batch_runner(app, rt)
+    _sync_block(app, run, rt)
     if run.block_end_at is None:
         _note_block_from_canary(app, run, rt)
     remaining = run.remaining()
@@ -1053,6 +1076,7 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     run.futures[key] = fut
     run.guards[key] = guard
     run.sent_on[key] = rt
+    run.sent_job[key] = run.block_job
     rt.batch_inflight += 1
     tid = getattr(fut, "task_id", None)
     if tid:
@@ -1127,6 +1151,7 @@ async def _maybe_warm(app: AppCtx, run: _Run) -> None:
 def _drop(run: _Run, key: tuple[int, int]) -> None:
     run.futures.pop(key, None)
     run.guards.pop(key, None)
+    run.sent_job.pop(key, None)
     rt = run.sent_on.pop(key, None)
     if rt is not None and rt.batch_inflight > 0:
         rt.batch_inflight -= 1
@@ -1410,6 +1435,36 @@ def _presume(app: AppCtx, run: _Run) -> None:
             _event(run.batch_id, "batch.settle", int(t["idx"]), int(t["attempt"]), "presumed_lost")
 
 
+RELEASE_OLD_UEP_S = 300.0   # how long the reaped block's user endpoint is watched for a relaunched pilot
+RELEASE_EVERY_S = 15.0
+
+
+async def _release_old_uep(app: AppCtx, run: _Run) -> None:
+    """After a reap on SSH: parsl starts a block for the task that was out on the dead one (it stays outstanding until
+    the interchange declares its manager lost, ~105 s: S8) — a block nobody confirmed (#204's pattern). That user
+    endpoint's config is retired and nothing of ours runs there any more (the batch and the interactive shape wait for
+    the user's yes, which asks for a fresh one), so its pilots are cancelled, by its own `uep.<eid>.<uep id>` marker —
+    never the endpoint-wide one, which would take the new block too."""
+    if (not run.old_uep or _now() > run.old_uep_until or login_runner is None or not _has_login_shape(app)
+            or _now() - run.last_release < RELEASE_EVERY_S):
+        return
+    run.last_release = _now()
+    mark = shlex.quote(run.old_uep)
+    cmd = (f"ids=$(squeue -h -u \"$USER\" -o '%i|%o' 2>/dev/null | awk -F'|' -v m={mark} 'index($2,m){{print $1}}'); "
+           '[ -n "$ids" ] && scancel $ids 2>/dev/null; echo "HPCB_RELEASED $ids"')
+    try:
+        res = await login_runner(app)(cmd)
+    except Exception:  # noqa: BLE001 - try again next pass
+        return
+    m = re.search(r"HPCB_RELEASED ?(.*)", res.stdout or "")
+    jobs = [j for j in (m.group(1).split() if m else []) if session_shell._JOB_ID.fullmatch(j)]
+    led = ledger_of(app)
+    for j in jobs:
+        led.add_block_seen(run.batch_id, j)
+        led.event(run.batch_id, "batch.release", {"job": j, "uep": run.old_uep})
+        _journal({"event": "batch.release", "batch_id": run.batch_id, "job_id": j, "uep": run.old_uep})
+
+
 _ENDED = ("CANCELLED", "TIMEOUT", "FAILED", "COMPLETED", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY", "BOOT_FAIL",
           "DEADLINE", "F")
 
@@ -1430,13 +1485,14 @@ async def _evidence(app: AppCtx, run: _Run) -> None:
     q = shlex.quote(job)
     cmd = (f"s=$(squeue -h -j {q} -o %T 2>/dev/null | head -n 1); "
            f"a=$(sacct -X -n -P -j {q} -o State 2>/dev/null | head -n 1 | awk '{{print $1}}'); "
+           f"u=$(sacct -X -n -P -j {q} -o SubmitLine%800 2>/dev/null | grep -o 'uep\\.[0-9a-f.-]*' | head -n 1); "
            f"p=$(qstat -x -f {q} 2>/dev/null | sed -n 's/^ *job_state = //p' | head -n 1); "
-           'echo "HPCB_JOB_STATE squeue=$s sacct=$a pbs=$p"')
+           'echo "HPCB_JOB_STATE squeue=$s sacct=$a pbs=$p uep=$u"')
     try:
         res = await login_runner(app)(cmd)
     except Exception:  # noqa: BLE001 - no evidence this pass
         return
-    m = re.search(r"HPCB_JOB_STATE squeue=(\S*) sacct=(\S*) pbs=(\S*)", res.stdout or "")
+    m = re.search(r"HPCB_JOB_STATE squeue=(\S*) sacct=(\S*) pbs=(\S*) uep=(\S*)", res.stdout or "")
     if not m:
         return
     sq, sa, pb = m.group(1), m.group(2), m.group(3)
@@ -1446,7 +1502,9 @@ async def _evidence(app: AppCtx, run: _Run) -> None:
     if not state:
         return
     why = f"sacct says the block's job {job} is {state}" if state != "F" else f"PBS says the block's job {job} finished"
-    for key in [k for k, _f in list(run.futures.items())]:
+    if re.fullmatch(r"uep\.[0-9a-f-]{36}\.[0-9a-f-]{36}", m.group(4) or ""):
+        run.old_uep, run.old_uep_until = m.group(4), now + RELEASE_OLD_UEP_S
+    for key in [k for k in list(run.futures) if run.sent_job.get(k) in (job, None)]:   # those on THAT block
         index, attempt = key
         _drop(run, key)
         if led.batch(run.batch_id)["idempotent"]:
