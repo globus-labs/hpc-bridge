@@ -55,6 +55,7 @@ from cli_runner import (
     _bundle_native,
     _journal_call,
     _journal_rows,
+    _same_args,
     _server_cmd,
     _server_env_names,
     build_trace,
@@ -351,6 +352,28 @@ def steps_trace(steps: list[Step], texts: list[str], text_at: list[int]) -> tupl
                                                "journal_unplaced": 0}
 
 
+def journal_order(steps: list[Step], rows: list[dict]) -> list[Step]:
+    """The steps in the order the server STARTED them, as the journal orders its rows (`ts`, then `seq`): each step
+    takes the first unused row of its tool with its own arguments (a script's arguments are exact), and a step with no
+    row keeps its own start. Concurrent calls (main's fallback fan-out, batch phase 1) end out of order and reach the
+    server in an order of its own; kept in end order, or even in the client's start order, an order-preserving
+    alignment with the journal lost some of them (live 2026-10-31: 5, then 2 of batch_fanout_collect's 40)."""
+    calls = sorted((r for r in rows if "tool" in r),
+                   key=lambda r: (r.get("ts") is None, r.get("ts") or 0, r.get("seq") or 0))
+    base = sorted(steps, key=lambda x: (x.t_start, x.n))
+    used: set[int] = set()
+    key: dict[int, int] = {}
+    for st in base:
+        for j, r in enumerate(calls):
+            if j not in used and r.get("tool") == st.tool and _same_args(st.args, r):
+                used.add(j)
+                key[st.n] = j
+                break
+    # the matched steps take the journal's order among the places they hold; an unmatched one stays where it was
+    matched = iter(sorted((st for st in base if st.n in key), key=lambda x: key[x.n]))
+    return [next(matched) if st.n in key else st for st in base]
+
+
 async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, effort: str | None = None,
                        persona: str | None = None, user_goal: str = "", ablate_skill: bool = False,
                        max_turns: int = 40, extra_env: dict[str, str] | None = None,
@@ -440,9 +463,7 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     print(f"  ← {OPERATOR}: {len(ops.steps)} step(s) in {time.monotonic() - t0:.0f}s; "
           f"{'ERROR: ' + error if error else 'final: ' + repr(final_text[:240])}", flush=True)
     rows = _journal_rows(journal)
-    # in the order the calls STARTED, as the journal orders its rows (`ts`): concurrent calls (main's fallback fan-out,
-    # batch phase 1) end out of order, and an order-preserving alignment of the two lists then lost some of them
-    steps = sorted(ops.steps, key=lambda s: (s.t_start, s.n))
+    steps = journal_order(ops.steps, rows)
     several = len({s.server for s in steps}) > 1
     events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}", server=s.server if several else "")
               for s in steps]

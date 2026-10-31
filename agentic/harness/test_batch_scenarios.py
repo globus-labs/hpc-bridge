@@ -526,6 +526,19 @@ def test_concurrent_calls_that_end_out_of_order_all_align_with_the_journal(monke
     assert [c.name for c in res.trace.calls][-1] == "stop_endpoint"
 
 
+def test_journal_order_follows_the_server_not_the_client():
+    # live 2026-10-31: 2 of 40 concurrent calls reached the server in another order than the client sent them
+    steps = [script_runner.Step(n, "run_shell", {"command": f"r{i}"}, {}, 100.0 + 0.001 * i, 120.0 - i)
+             for n, i in enumerate(range(4))]
+    rows = [{"tool": "run_shell", "args": {"command": f"r{i}"}, "ts": 100.0 + 0.01 * k, "seq": k}
+            for k, i in enumerate([1, 0, 3, 2])]
+    got = script_runner.journal_order(steps, rows)
+    assert [s.args["command"] for s in got] == ["r1", "r0", "r3", "r2"]
+    events = [cli_runner.Native(s.tool, s.args, {}, True) for s in got]
+    _trace, stats = cli_runner.build_trace(rows, events, [])
+    assert stats["journal_unplaced"] == 0 and stats["hpcb_not_reaching_server"] == 0
+
+
 def test_a_server_that_dies_under_the_script_never_cancels_the_script(monkeypatch, tmp_path):
     # live 2026-10-31 (batch_restart_resume on main): the SIGKILL made the stdio client's task group cancel the scope it
     # was entered in — the script's — and run.py read the cell as INTERRUPTED; each server now lives in a host task
