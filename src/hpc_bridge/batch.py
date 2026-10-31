@@ -452,6 +452,7 @@ class _Run:
     loop: asyncio.Task[None] | None = None
     last_evidence: float = 0.0
     last_rest: float = 0.0
+    last_unsent: float = 0.0
     adopted: bool = False
     # The user's yes (a resume with confirm_spend) covers the NEXT block while the one in front cannot take a row: on an
     # endpoint hpc-bridge stood up, once nothing of ours runs on it, the batch asks for a fresh block (`_maybe_switch`)
@@ -738,6 +739,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         run = _Run(bid, rt, runner=_batch_runner(app, rt))
         if old is not None:   # results of tasks sent on the old block still settle through their own futures
             run.futures, run.guards, run.sent_on = old.futures, old.guards, old.sent_on
+            run.adopted = old.adopted   # rows a dead server queued are still reconciled after the resume
         app.batches[bid] = run
     run.ensure_up = ensure_up
     if run.block_end_at is None:   # never over what a result said since: a check can be older than that
@@ -948,6 +950,7 @@ async def tick(app: AppCtx, bid: str) -> int:
         await _apply_cancel(app, run, str(b["cancel_requested"]))
     _collect(app, run)
     await _rest_pull(app, run)
+    await _reconcile_unsent(app, run)
     await _reconcile(app, run)
     _presume(app, run)
     await _evidence(app, run)
@@ -1125,6 +1128,10 @@ def _drop(run: _Run, key: tuple[int, int]) -> None:
 
 def _collect(app: AppCtx, run: _Run) -> None:
     led = ledger_of(app)
+    tg = getattr(run.runner, "task_group_id", None) if run.runner is not None else None
+    if tg and str(tg) != (led.batch(run.batch_id).get("task_group_id") or ""):
+        # on the record as soon as the service minted it: a server that restarts reconciles against it
+        led.update_batch(run.batch_id, task_group_id=str(tg))
     for key, fut in list(run.futures.items()):
         index, attempt = key
         tid = getattr(fut, "task_id", None)
@@ -1285,6 +1292,54 @@ async def _rest_pull(app: AppCtx, run: _Run) -> None:
             _settle_failure(app, run, int(t["idx"]), int(t["attempt"]), r.error, sent=True)
         else:
             _settle_result(app, run, int(t["idx"]), int(t["attempt"]), r.result, None)
+
+
+async def _reconcile_unsent(app: AppCtx, run: _Run) -> None:
+    """After a restart: a row the dead server admitted whose task id it never recorded (it died between its queueing and
+    the service's answer). The batch's task group says what was sent: a task in it the ledger does not know, once it
+    answers, settles the row its HPCB_RESULT names; while one is still pending nothing is decided; once every task of
+    the group is accounted for, a row still without one was never sent — the server that queued it is dead, so it never
+    will be — and it goes back to the backlog (no attempt of it ever ran)."""
+    if not run.adopted:
+        return
+    led = ledger_of(app)
+    mine = set(run.futures)   # this process's own sends: their ids come with the service's answer
+    unsent = [t for t in led.tasks(run.batch_id, states=("in_flight",))
+              if not t.get("task_id") and (int(t["idx"]), int(t["attempt"])) not in mine]
+    tg = led.batch(run.batch_id).get("task_group_id")
+    client = _lookup_client(app, run)
+    if not unsent or not tg or client is None or (run.last_unsent and _now() - run.last_unsent < REST_EVERY_S):
+        return
+    run.last_unsent = _now()
+    try:
+        r = await asyncio.to_thread(client._compute_web_client.v2.get_task_group, tg)
+        ids = [str(x.get("id")) for x in (r.get("tasks") or []) if x.get("id")]
+    except Exception as exc:  # noqa: BLE001 - try again next pass
+        print(f"hpc-bridge: batch {run.batch_id}: task-group read failed ({exc})", file=sys.stderr)
+        return
+    known = {str(t["task_id"]) for t in led.tasks(run.batch_id) if t.get("task_id")}
+    strays = [i for i in ids if i not in known]
+    got = await asyncio.to_thread(collect_rest, client, strays) if strays else {}
+    pending = False
+    for tid, res in got.items():
+        if res.state == "pending":
+            pending = True
+            continue
+        rep = parse_result(_shell_fields(res.result)[1]) if res.state == "success" else None
+        if rep is None or rep.duplicate:
+            continue
+        row = led.task(run.batch_id, rep.index)
+        if row is not None and row["state"] == "in_flight" and int(row["attempt"]) == rep.attempt:
+            led.set_task_id(run.batch_id, rep.index, rep.attempt, tid)
+            _settle_result(app, run, rep.index, rep.attempt, res.result, None)
+    if pending:
+        return
+    for t in led.tasks(run.batch_id, states=("in_flight",)):
+        if not t.get("task_id") and (int(t["idx"]), int(t["attempt"])) not in mine:
+            led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "backlog", only_from=("in_flight",),
+                       evidence="never sent: the server that queued it died first, and its task group lists nothing "
+                                "for it")
+            _event(run.batch_id, "batch.settle", int(t["idx"]), int(t["attempt"]), "never_sent")
 
 
 async def _reconcile(app: AppCtx, run: _Run) -> None:

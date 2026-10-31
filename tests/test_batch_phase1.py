@@ -747,3 +747,34 @@ async def test_a_resume_at_the_walltime_gate_asks_for_the_next_block_once_the_ta
     await batch.tick(app, out.batch_id)
     assert app.shapes["compute"] is not rt and app.shapes["compute"].spend_confirmed   # the next block, confirmed
     assert len(runner.futures) > 2                                                     # admitted on it
+
+
+async def test_after_a_restart_a_row_sent_without_its_id_is_found_in_the_task_group_or_requeued():
+    """Live 2026-10-31 (batch_restart_resume): the server was killed right after admitting a row, before the service's
+    answer gave it a task id — the new server listed it in flight for good. The batch's task group (recorded once the
+    service minted it) says what was sent: a task in it the ledger does not know settles the row its result names; a row
+    with no task in the group was never sent, and goes back to the backlog."""
+    from hpc_bridge import batch, server
+    from hpc_bridge.ledger import Ledger, Owner
+
+    app, _rt, runner = await _batch_app(workers=4)                    # capacity 3
+    out = await _start(app, n=6)
+    runner.futures[0].finish(_ok_report(0))
+    await batch.tick(app, out.batch_id)                                # the group id is on the record now
+    hidden = runner.futures[1].task_id                                 # row 1 was sent; its id never reached the ledger
+    for i in (1, 2):
+        app.ledger._con.execute("update task set task_id = null where batch_id = ? and idx = ?", (out.batch_id, i))
+    runner.group_tasks.remove(runner.futures[2].task_id)               # row 2 never reached the service at all
+    app.ledger.close()
+    app2, rt2, runner2 = await _batch_app(workers=4)
+    runner2.group_tasks = list(runner.group_tasks)
+    runner2.task_group_id = runner.task_group_id
+    runner2.rest = {hidden: ("success", _ok_report(1))}
+    app2.batch_owner = _owner(pid=os.getpid() + 100_000, host=Owner.here().host)
+    app2.ledger = Ledger.open()
+    app2.ledger.pid_alive = lambda pid: pid != os.getpid()
+    app2.ledger.lease_stale_s = 0.0
+    rt2.runner = runner2
+    st = await server._status(app2, out.batch_id, detail="page")
+    states = {r.index: r.state for r in st.results}
+    assert states[1] == "done" and states[2] == "backlog", states   # found in the group; never sent
