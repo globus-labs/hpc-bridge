@@ -584,6 +584,13 @@ _GOOD = {
         ("run_shell", {"shape": "login", "command": "sinfo"}, {"phase": "complete"}),
         ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
         ("stop_endpoint", {}, {"status": "down", **_E})], {"user_revokes_spend": 3}),
+    # synthetic until its first live OK run (batch phase 1): the polling hook is armed by the run_batch answer
+    "batch_block_reaped_midrun": ("synthetic (batch phase 1, no live bundle yet)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
+        ("run_batch", {"command": "sleep 15; echo row {n}", "rows": [{"n": 0}], "task_walltime_s": 60},
+         {"phase": "admitting", "batch_id": "batch-000000000001"}),
+        ("status", {"id": "batch-000000000001"}, {"phase": "needs_confirmation"})], {"reap_after_5_results": 3}),
 }
 
 

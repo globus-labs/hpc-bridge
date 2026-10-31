@@ -95,6 +95,13 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
+batch_fanout_collect          batch phase 1 (feat/batch-phase1): red until the batch tools land; run on its own (default)
+batch_crosses_walltime        batch phase 1: scripted, ~12 min of 4-minute blocks on `default`; run on its own
+batch_restart_resume          batch phase 1: scripted (a server SIGKILL mid-batch) on `default`; run on its own
+batch_two_servers_one_ledger  batch phase 1: scripted (two servers on one state dir) on `default`; run on its own
+batch_block_reaped_midrun     batch phase 1: scripted (a polling hook scancels the block) on `default`; run on its own
+batch_big_output              batch phase 1: scripted (a 12 MB row) on `default`; run on its own
+mep_batch_fanout              batch phase 1: scripted on `mep` (needs HPCB_MEP_EMAIL); run on its own
 EXCLUDED
 }
 

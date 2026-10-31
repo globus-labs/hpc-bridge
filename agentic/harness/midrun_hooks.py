@@ -44,6 +44,13 @@ could never fire is refused by `hook_problems`, review of e126f41).
 And one or more ACTIONS — what the hook carries:
 - `cmd` — a shell command run on the cluster as the pool user (run.py `_run_hook`; `"on": "each_login"` fans it out).
   `expect_any_host` (a substring) makes it report its REAL outcome: the hook fails unless some node printed it.
+- `poll` (with a `cmd`) — a POLLING hook: once its trigger fires, run.py runs the `poll` command on the cluster every
+  `every_s` seconds (default 5) until its output matches the regex `until`, then runs the `cmd`; past `poll_timeout_s`
+  (default 900) the hook fails with the last output, and the `cmd` never runs. Mid-run hooks fire only on tool results,
+  and an agent may sit in one long call (`status(wait_s=60)`) while the world it waits on changes — the poll is what
+  times a hook by the world ("after 5 results": count the result files), not by the next call (batch phase 1,
+  `batch_block_reaped_midrun`). `poll`, `cmd` and `until` may name the trigger call's result fields as
+  `{result:<key>}` (e.g. `{result:results_dir}`), beside `{eid}` and `{endpoint_name}`.
 - `world` — a world action the harness builds itself. `"stop_manager"`: stop THIS run's endpoint manager where it runs
   (cluster_ops.stop_here_cmd on every login node, each acting only if the manager is in its own `ps`); it fails unless
   some node actually stopped it. A plain `cmd` sent to a round-robin alias can land on the other node, act on the
@@ -62,8 +69,9 @@ Which operator can do what (`OPERATOR_HOOK_ACTIONS`; run.py reports a cell SKIPP
   nothing can see a call in flight (no DURING hook), and a one-shot CLI turn cannot take a user message mid-turn (no
   `interject`, no `interrupt`).
 - `hermes`, `claude-acp` (ACP) — none yet.
-- `script` (no model: the scenario's own SCRIPT makes the calls, script_runner) — none, and no persona: a script that
-  needs the world changed mid-run changes it itself.
+- `script` (no model: the scenario's own SCRIPT makes the calls, script_runner) — `cmd` after a tool result (polling
+  ones too), fed from hpc-bridge's journal as for the CLI operators, so one scenario's hook serves a scripted and an
+  agent cell alike; no persona, no DURING hook, no interject.
 
 Pure and SDK-free (cli_runner and the hermetic tests import it; runner.py re-exports HookWatcher).
 """
@@ -258,7 +266,7 @@ OPERATOR_HOOK_ACTIONS: dict[str, frozenset[str]] = {
     "hermes21": frozenset({"cmd"}),
     "hermes": frozenset(),
     "claude-acp": frozenset(),
-    "script": frozenset(),
+    "script": frozenset({"cmd"}),
 }
 CLI_OPERATORS = ("codex", "pi", "hermes21")
 NO_USER_OPERATORS = (*CLI_OPERATORS, "script")   # nobody to answer a persona's questions: one-shot turns, or no model
@@ -327,6 +335,10 @@ def hook_problems(hooks: Iterable[dict] | None) -> list[str]:
             out.append(f"{who}: unknown world action {h['world']!r} (known: {list(WORLD_ACTIONS)})")
         if "world" in h and "cmd" in h:
             out.append(f"{who}: carries both a cmd and a world action — one command per hook")
+        if "poll" in h:
+            out += _poll_problems(who, h)
+        elif any(key in h for key in ("until", "every_s", "poll_timeout_s")):
+            out.append(f"{who}: until / every_s / poll_timeout_s belong to a polling hook (poll)")
         if "expect_any_host" in h and (not str(h["expect_any_host"] or "").strip() or "cmd" not in h):
             out.append(f"{who}: expect_any_host is a non-empty substring, for a cmd hook")
         if is_during(h):
@@ -364,6 +376,51 @@ def hook_problems(hooks: Iterable[dict] | None) -> list[str]:
         elif want is not None and not isinstance(want, dict):
             out.append(f"{who}: when_input must be a dict or a regex string")
     return out
+
+
+def _poll_problems(who: str, h: dict) -> list[str]:
+    out: list[str] = []
+    if not str(h.get("poll") or "").strip():
+        out.append(f"{who}: poll is the command to repeat (non-empty)")
+    if "cmd" not in h:
+        out.append(f"{who}: a polling hook acts with a cmd once its poll matches")
+    if is_during(h):
+        out.append(f"{who}: a polling hook is armed by a tool result (after_tool), not during a call")
+    until = h.get("until")
+    if not isinstance(until, str) or not until:
+        out.append(f"{who}: a polling hook needs `until`, the regex its poll's output must match")
+    else:
+        try:
+            re.compile(until)
+        except re.error as exc:
+            out.append(f"{who}: until is not a regex ({exc})")
+    for key, low in (("every_s", 0.5), ("poll_timeout_s", 1.0)):
+        if key in h:
+            try:
+                ok = math.isfinite(float(h[key])) and float(h[key]) >= low
+            except (TypeError, ValueError):
+                ok = False
+            if not ok:
+                out.append(f"{who}: {key} must be a number >= {low:g}")
+    return out
+
+
+_RESULT_FIELD = re.compile(r"\{result:([A-Za-z_][A-Za-z0-9_]*)\}")
+
+
+def hook_text(hook: dict, text: str, *, endpoint_name: str = "") -> str:
+    """A hook's command (`cmd` or `poll`, or its `until`) with this run's values in: `{endpoint_name}`, `{eid}` (the
+    latest endpoint uuid the tool results showed) and `{result:<key>}`, the trigger call's result field (empty when the
+    result lacks it — the command then sees an empty word, and a poll simply never matches)."""
+    eids = hook.get("endpoint_ids") or []
+    out = str(text).replace("{endpoint_name}", endpoint_name).replace("{eid}", eids[-1] if eids else "")
+    result = hook.get("result") or {}
+
+    def field(m: re.Match) -> str:
+        v = result.get(m.group(1))
+        return "" if v is None else str(v)
+
+    return _RESULT_FIELD.sub(field, out)
 
 
 def unsupported_hook_needs(operator: str, hooks: Iterable[dict] | None) -> set[str]:
@@ -572,6 +629,8 @@ async def follow_journal(path: Path, watcher: HookWatcher, act: Callable[[dict],
 
     async def feed() -> None:
         for row in tail.read_new():
+            if "tool" not in row:   # hpc-bridge's own event rows (the batch engine's): no call, no hook trigger
+                continue
             for hook in watcher.observe_call(to_call(row)):
                 try:
                     await act(hook)

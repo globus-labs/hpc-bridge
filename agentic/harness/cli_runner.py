@@ -261,6 +261,7 @@ class Native:
     hpcb: bool = False
     ran: bool | None = None   # False: the harness says the tool never ran (refused before dispatch); None: unknown
     call_id: str | None = None
+    server: str = ""     # the script operator's server label ("A", "B"…) when a run drives several; "" otherwise
 
 
 def _hpcb_name(name: str) -> str | None:
@@ -378,6 +379,10 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str],
     it). Every event becomes exactly one call, in order, before any unplaced row, so it is the number of calls before
     the text too — the Trace's `text_at`, which lets a grader read only what the agent said AFTER a result
     (invariants.said_after). Kept only when it is one position per text; else the texts stay unplaced."""
+    # hpc-bridge's own event rows (`event`, no `tool`: the batch engine's admissions and settlements) are no call: they
+    # go to the trace's `events`, in the order written, and never count as rows the harness cannot account for
+    happened = [r for r in rows if "event" in r and "tool" not in r]
+    rows = [r for r in rows if not ("event" in r and "tool" not in r)]
     ordered = sorted(rows, key=lambda r: (r.get("ts") is None, r.get("ts") or 0, r.get("seq") or 0))
     t0 = min((float(r["ts"]) for r in ordered if isinstance(r.get("ts"), int | float)), default=None)
     hp = [k for k, e in enumerate(events) if e.hpcb]
@@ -404,7 +409,9 @@ def build_trace(rows: list[dict], events: list[Native], texts: list[str],
     calls.extend(_stamped(_journal_call(r), r, t0) for r in left)
     stats["journal_unplaced"] = len(left)
     placed = list(text_at or []) if len(text_at or []) == len(texts) else []
-    return Trace(calls, texts, placed), stats
+    if happened:
+        stats["events"] = len(happened)
+    return Trace(calls, texts, placed, events=happened, t0=t0), stats
 
 
 def trace_from_journal(path: Path, texts: list[str]) -> Trace:
@@ -413,14 +420,24 @@ def trace_from_journal(path: Path, texts: list[str]) -> Trace:
 
 
 def _bundle_native(n: Native) -> dict:
-    return {"name": n.name, "hpcb": n.hpcb, "args": n.args, "result": n.result, "ran": n.ran, "call_id": n.call_id}
+    out = {"name": n.name, "hpcb": n.hpcb, "args": n.args, "result": n.result, "ran": n.ran, "call_id": n.call_id}
+    if n.server:
+        out["server"] = n.server
+    return out
+
+
+def label_servers(trace: Trace, events: list[Native]) -> None:
+    """Give each call the server its native event names (build_trace makes events[k] the trace's call k)."""
+    for call, ev in zip(trace.calls, events, strict=False):
+        call.server = ev.server
 
 
 def trace_from_bundle_messages(messages: list[dict]) -> Trace:
     """Rebuild the graded Trace from a bundle this operator wrote (regrade.py): the `native`, `text`, `final` and
     `journal` entries are exactly what build_trace was given live."""
     events = [Native(m["native"]["name"], m["native"].get("args") or {}, m["native"].get("result"),
-                     bool(m["native"].get("hpcb")), m["native"].get("ran"), m["native"].get("call_id"))
+                     bool(m["native"].get("hpcb")), m["native"].get("ran"), m["native"].get("call_id"),
+                     str(m["native"].get("server") or ""))
               for m in messages if "native" in m]
     said = [m for m in messages if "text" in m]
     texts = [m["text"] for m in said]
@@ -434,7 +451,10 @@ def trace_from_bundle_messages(messages: list[dict]) -> Trace:
         # its steps' own results are the record, as they were live
         calls = [ToolCall.of(f"mcp__hpc-bridge__{e.name}", e.args, e.result) for e in events]
         return Trace(calls, texts, at if len(at) == len(texts) else [])
-    return build_trace([m["journal"] for m in messages if "journal" in m], events, texts, at)[0]
+    trace = build_trace([m["journal"] for m in messages if "journal" in m], events, texts, at)[0]
+    if any(e.server for e in events):
+        label_servers(trace, events)
+    return trace
 
 
 def _journal_rows(path: Path) -> list[dict]:

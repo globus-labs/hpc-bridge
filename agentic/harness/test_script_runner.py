@@ -106,11 +106,15 @@ def test_a_script_only_scenario_skips_an_agent_operator(harness_run, capsys):
         in capsys.readouterr().out
 
 
-def test_the_script_operator_takes_no_persona_and_no_hook():
+def test_the_script_operator_takes_no_persona_and_only_cmd_hooks():
     assert operator_refusal("script", persona="cooperative", phases=False, hooks=None) == "an interactive persona"
     assert operator_refusal("script", persona=None, phases=True, hooks=None) == "cross-restart chains (PHASES)"
+    # a cmd after a tool result is served from the journal (batch phase 1: a polling hook in a scripted cell)
     assert operator_refusal("script", persona=None, phases=False,
-                            hooks=[{"after_tool": "run_shell", "cmd": "scancel"}]) == "mid-run hooks that need cmd"
+                            hooks=[{"after_tool": "run_shell", "cmd": "scancel"}]) is None
+    assert operator_refusal("script", persona=None, phases=False,
+                            hooks=[{"on_tool": "run_shell", "after_s": 3, "action": "interrupt"}]) \
+        == "mid-run hooks that need during_tool, interrupt"
     assert operator_refusal("script", persona=None, phases=False, hooks=None) is None
 
 
@@ -237,7 +241,7 @@ def test_tool_results_read_as_the_journal_reads_them():
     assert script_runner.tool_result(plain) == {"a": 1}
 
 
-def test_a_persona_or_a_hook_is_refused_by_a_direct_caller_too(tmp_path, monkeypatch):
+def test_a_persona_is_refused_by_a_direct_caller_too(tmp_path, monkeypatch):
     _stub_sdk(monkeypatch, tmp_path)
     with pytest.raises(NotImplementedError):
         asyncio.run(script_runner.run_scenario("p", repo_root=HERE, script=lambda ops: None, persona="cooperative"))
