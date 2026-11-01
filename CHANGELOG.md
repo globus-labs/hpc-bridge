@@ -12,9 +12,13 @@ installed plugin only when that version changes); git tags mark releases.
   interactive commands). It rides the block the user confirmed; no new spend semantics (vault
   `Planned/Batch and swarm execution.md`).
   - **The template:** `{name}` for a row's field, written bare. Each value reaches the command as one word, as data:
-    it is passed in an environment variable (`HPCB_F_<name>`) and the placeholder becomes a reference to it, so
-    nothing in a value is ever read as shell. A placeholder inside quotes or a here-document is refused, saying how to
-    write it.
+    it is passed in an environment variable (`HPCB_F_<name>`) and the placeholder becomes a reference to it. A
+    placeholder is substituted only where a conservative reading of bash's grammar is certain it is a bare word of the
+    outer shell, and refused elsewhere, saying how to write it: inside quotes, a here-document, arithmetic, `[[ ]]`,
+    `${…}` or backticks; as a shell's `-c` code, an interpreter's code flag, awk's or sed's program; in `ssh`,
+    `watch`, `eval`, `trap`, `read`, `declare` and the like. `"$(basename {x})"` is fine. The limit, as the docs say:
+    never hand a value to `eval`, `sh -c` or an inner interpreter as code; pass it as an argument, or read it from the
+    environment in a here-document with a quoted delimiter.
   - **The admission gate:** a row is sent only while the block's remaining walltime, read from inside the block
     (`SLURM_JOB_END_TIME`, `squeue %L`, PBS stime + walltime; the canary reports it too), covers `task_walltime_s`
     + 30 s. Past that, or when the block is reaped, stopped or the server restarts, the batch pauses at
@@ -26,11 +30,12 @@ installed plugin only when that version changes); git tags mark releases.
     stream at 1 MB at the source; the result carries a tail of each stream's real end and a pointer to the file, so a
     big output is no MaxResultSizeExceeded. The wrapper runs the command under its own timeout (rc 124), kills its
     process group on the batch's `CANCELLED` marker (rc 143), and ends what is left of that group when the command
-    exits, so a background child cannot hold the task past its walltime.
+    exits, so a background child cannot hold the task past its walltime — the output's tails kept, even when a child
+    ignores TERM or left the group.
   - **The ledger** (`<state_dir>/ledger.sqlite3`, WAL, 0600, refused on a network filesystem) holds every row,
     attempt, Globus task id and task group. It holds the lease that makes one server the only admitter and collector
     (a takeover needs a stale heartbeat and a holder that is gone: its pid dead, or handed on to a process started at
-    another time; the hostname is not trusted for it), and the configs a stop or a reap retired. A restarted server
+    another time, read in one canonical form whatever the reader's TZ or locale; the hostname is not trusted for it), and the configs a stop or a reap retired. A restarted server
     pulls what finished meanwhile by REST, with the raw `v2.get_task_batch` (`get_batch_result` drops failed tasks).
     Taking a batch over, by `status` or by `run_batch(batch_id=…)`, pauses one that was admitting: only the user's yes
     resumes it.
@@ -38,8 +43,9 @@ installed plugin only when that version changes); git tags mark releases.
     facility MEP a task is `presumed_lost` only past a clock that starts at evidence a block started; it keeps its
     slot and is never retried; a dead server's rows in flight are presumed the same way, so a stop is never refused
     for good. A submit error leaves `submit_unknown`, reconciled against every task group the batch's runners were
-    minted; only an `idempotent` row is ever sent again, and a row the service never received is `lost` on that
-    evidence. The SDK's own result channel failing ("SDK thread quit unexpectedly.") is no task result: the rows keep
+    minted; only an `idempotent` row is ever sent again, and none is ever called lost on the service's silence (a
+    failed POST may have queued its task in a group nobody learnt): it holds the stop until its result, or on an SSH
+    endpoint until its config is retired and its user endpoint has exited with nothing queued. The SDK's own result channel failing ("SDK thread quit unexpectedly.") is no task result: the rows keep
     their slots and are recovered by REST. After a reap on an SSH endpoint, parsl starts a pilot for the task that
     was out on the dead block, and nobody confirmed it: for five minutes the background loop cancels the reaped
     block's user endpoint's pilots by that endpoint's own marker — unless the user's yes went to that same user
@@ -54,7 +60,8 @@ installed plugin only when that version changes); git tags mark releases.
     could not be written, and that the tasks out then run to their end. `blocks_left` names every block of ours that
     can still bill. `stop_endpoint` pauses every batch under the lock first, refuses while batch tasks are out (naming
     `cancel(id, 'abort')`), and answers `draining`, naming the batch, while a submit of unknown fate may be queued.
-    `status(wait_s)` waits for a row to settle or the phase to change.
+    `status(wait_s)` waits for a row to settle or the phase to change. A `status` or `cancel` never waits past its
+    budget for the background loop's pass (it answers from the ledger and says so) and never starts a block itself.
   - **`poll_task` takes a Globus task id:** a running answer carries `globus_task_id`, and an agent's command leaves
     its rc and output tail in the session directory. Once the service cannot answer for it, `poll_task` reads them
     there over the login shape, so a result outlives the service's 30-minute window and a restart.
