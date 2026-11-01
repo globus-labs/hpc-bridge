@@ -2145,3 +2145,97 @@ async def test_a_switched_left_block_of_unknown_job_is_still_named_in_blocks_lef
     run.switched_left.append((None, batch._now() + 300))
     left = batch._blocks_left(app, run)
     assert len(left) == 2, [b.how_to_end[:60] for b in left]
+
+
+# ---- review round 3 (afd3981) ---------------------------------------------------------------------------------------
+# Each of these failed on afd3981 (red log: scratchpad bp1/red_batch_r3.txt): the coordinator's probes, adapted.
+
+_STDIN_REFUSED = [
+    "echo {x} | sh", "echo {x} | bash", "echo {x} | python3", "echo {x} | xargs -0 sh -c", "echo {x} | xargs -0 bash",
+    "echo {x} | xargs mytool", "echo {x} | parallel", ". /dev/stdin <<< {x}", "source /dev/stdin <<< {x}",
+    "sh <<< {x}", "python3 - <<< {x}", "{ echo {x}; } | sh", "(echo {x}) | bash",
+    "for v in {x}; do echo $v; done | sh", "echo $(echo {x}) | sh", "sh <(echo {x})", "echo {x} > >(sh)",
+    "echo {x} | env sh", "echo {x} | timeout 5 python3", "echo {x} | perl", "echo {x} | node", "echo {x} | dc",
+    "echo {x} | at now", "echo {x} | ssh host", "echo {x} | awk -f -", "echo {x} | sed -f /dev/stdin f",
+    "echo {x} | python3 -W ignore", "echo {x} |& bash", "echo {x} 2>&1 | sh", "echo {x} | bash -s",
+    "bash &>/dev/null -c {x}",
+]
+
+
+@pytest.mark.parametrize("template", _STDIN_REFUSED)
+def test_a_value_fed_to_a_program_that_reads_code_from_stdin_is_refused(template):
+    """Round 3 (1). A placeholder in a pipeline stage, a here-string or a process substitution that feeds a program
+    reading CODE from its standard input — a shell or interpreter with no script file, `xargs` running one (or a command
+    this reader cannot vouch for), `parallel`, `source /dev/stdin`, `dc`/`at`/`ssh`… — is refused, with advice."""
+    from hpc_bridge import batch
+
+    with pytest.raises(batch.BatchRefusal) as e:
+        batch.validate(template, [{"x": "1"}], 10)
+    assert "file" in str(e.value) or "process substitution" in str(e.value) or "-c" in str(e.value), str(e.value)
+
+
+@pytest.mark.parametrize("template", [
+    "echo {x} | grep a", "echo {x} | python3 script.py", "echo {x} | bash script.sh", "echo {x} | xargs echo",
+    "echo {x} | xargs -n 1 rm -f --", "cat <<< {x}", "grep a <<< {x}", "echo {x} | python3 -m json.tool",
+    "env A=1 ./sim {x}", "timeout 5 ./sim {x}", "nice -n 5 ./sim {x}", "echo {x} || sh fallback.sh",
+    "echo {x} && bash job.sh", "printf '%s\\n' {x} | sort | uniq -c", "sudo -u u ./sim {x}",
+])
+def test_a_value_fed_only_to_data_readers_is_allowed(template):
+    from hpc_bridge import batch
+
+    batch.validate(template, [{"x": "1"}], 10)
+
+
+@pytest.mark.parametrize("template", ["env {x}", "env -i {x}", "env A=1 {x}", "sudo {x}", "timeout 5 {x}",
+                                      "nice -n 5 {x}", "xargs {x}", "exec {x}", "command {x}", "printf {x}",
+                                      "printf {x} >/dev/null", "stdbuf -o0 {x}"])
+def test_a_value_in_a_wrappers_option_or_command_slot_is_refused(template):
+    """Round 3 (2). `env {x}` with `-S touch …` ran the command: a placeholder where a wrapper (env, sudo, timeout,
+    xargs…) reads its options and the command it runs is refused, as is printf's format (`-v` assigns)."""
+    from hpc_bridge import batch
+
+    with pytest.raises(batch.BatchRefusal):
+        batch.validate(template, [{"x": "1"}], 10)
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_the_coordinators_probes_run_nothing(tmp_path):
+    """Round 3: the probes that ran the value — piped into sh / bash / python3 / xargs sh -c, and `env -S` — are
+    refused; every allowed one keeps it data."""
+    from hpc_bridge.batch import BatchRefusal, substitute
+
+    pwn = tmp_path / "PWNED"
+    cases = [("env {x}", f"-S touch {pwn}"), ("echo {x} | bash", f"touch {pwn}"),
+             ("echo {x} | python3", f"import os; os.system('touch {pwn}')"), ("echo {x} | xargs -0 sh -c", f"touch {pwn}"),
+             ("echo {x} | sh", f"$(touch {pwn})"), ("printf {x} >/dev/null", f"-va[$(touch {pwn})]"),
+             ("find . -maxdepth 0 {x}", "-fprint")]
+    for tpl, val in cases:
+        try:
+            s = substitute(tpl, {"x": val}, 0, {"x", "index"})
+        except BatchRefusal:
+            continue
+        subprocess.run([_BASH, "-c", s], env=dict(os.environ, HPCB_F_x=val), capture_output=True, cwd=tmp_path,
+                       timeout=30)
+        assert not pwn.exists(), (tpl, val)
+
+
+async def test_run_batch_names_rows_whose_value_starts_with_a_dash():
+    """Round 3 (2). A row value starting with `-` may be read as an option: run_batch names those rows and says to put
+    `--` before the placeholder (or `./` before a path) — a warning, not a refusal (`-5` may be an option's argument);
+    none when `--` already comes before it, or when the placeholder does not start a word."""
+    from hpc_bridge import server
+
+    app, _rt, _runner = await _batch_app()
+    out = await server._run_batch(app, command="rm {f}", rows=[{"f": "a"}, {"f": "-rf"}, {"f": "-x"}],
+                                  task_walltime_s=10)
+    assert out.phase != "refused" and "Row(s) 1, 2" in (out.notice or "") and "--" in (out.notice or ""), out.notice
+    for command in ("rm -- {f}", "./sim --opt={f}"):
+        ok = await server._run_batch(app, command=command, rows=[{"f": "-rf"}], task_walltime_s=10)
+        assert "starting with '-'" not in (ok.notice or ""), (command, ok.notice)
+
+
+def test_a_here_string_is_read_as_one():
+    """`<<<` is a here-string, not a here-document followed by `<` (the template was refused for the wrong reason)."""
+    from hpc_bridge import batch
+
+    batch.validate("grep -c a <<< {x}; echo done", [{"x": "1"}], 10)
