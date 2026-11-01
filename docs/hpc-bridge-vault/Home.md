@@ -23,15 +23,16 @@ This vault has two halves:
 - [[Facility catalog]] — the public registry (a Globus Search index, read anonymously) → `MachineProfile` or `MEPFacility`; `list_facilities` / `connect_facility`; the resolution precedence
 
 ## Modules — `src/hpc_bridge/`
-**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]]
+**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]] · [[batch]]
 **Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-endpoint_venv]] · [[facility-mep]]
-**Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]]
+**Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]] · [[ledger]]
 *(The `catalog/` package — `entry` · `search` · `bundled` · `ingest` · `parsers` — is documented in [[Facility catalog]].)*
 
 ## Reference
-- [[The MCP tools]] — the agent-facing surface (eleven tools)
+- [[The MCP tools]] — the agent-facing surface (fifteen tools, three of them the phase-1 batch tools)
 - [[Plugin packaging]] — `.mcp.json` · `plugin.json` · the `driving-hpc` skill · `hpc-connect` · the fresh-user script
 - [[Configuration]] — environment variables
+- [[Batch spikes 2026-10-30]] · [[Batch design review 2026-10-30]] — the evidence behind [[Batch and swarm execution]]: the phase-0 spike results (S1, S2, S4, S5, S7, S8; fake cluster, S7 read-only on Delta and Anvil) and the adversarial review the design answered
 - [[Scenario itinerary 2026-10-13]] — **every agentic scenario at 0.1.23**: what each guards, its last verdict per operator, the behaviours with no scenario, ranked proposals for new ones, and a free-first sweep plan
 - [[Hackathon readiness 2026-10-09]] — **is it ready for the hackathon**: the registry checked against its facilities, the install and simulated jobs under the latest Codex / Pi / Hermes (15/18, failures all the open model's), how the grading stays honest
 - [[Using hpc-bridge with hermes-agent]] — drive hpc-bridge from hermes-agent on ALCF (or any model); the 2026-09 recipe + config gotchas (current recipes: `docs/user/other-hosts.md`)
@@ -45,6 +46,7 @@ This vault has two halves:
 - Code reviews 2026-09-03 — round 1: [[Review 2026-09-03 — bugs]], [[Review 2026-09-03 — code quality]], [[Review 2026-09-03 — dependencies]]; round 2: [[Review 2 2026-09-03 — bugs]], [[Review 2 2026-09-03 — static analysis]], [[Review 2 2026-09-03 — code quality]]
 
 ## Planned — design notes (core built; deferred extras remain)
+- [[Batch and swarm execution]] — **designed 2026-10-30; phase 1 BUILT 2026-10-31** ([[batch]], [[ledger]]) (branch `feat/batch-phase1`: the durable ledger and `run_batch` / `status` / `cancel` on the session's confirmed block); phases 2–4 (envelope and Jobs mode, campaign pools, shared service) designed, not built; spikes in [[Batch spikes 2026-10-30]], review in [[Batch design review 2026-10-30]]
 - [[Resource requests]] — **built 2026-10-24, live checks pending**: a block asks for a slice of a node (cores, memory, GPUs per node) or whole nodes, the spend question proposes a slice on a per-core partition (D3), N nodes are one shell on the first node (D2); discovery classifies partitions per-core / whole-node; module [[resources]]
 - [[Next priorities 2026-10]] — **the ordered work list after the hackathon push**: 18 items for UX, stability and usefulness, cheapest-for-the-value first (strategy tick, output truncation, honest Esc/stop, walltime …), each with effort, usefulness and the code evidence
 - [[Per-architecture endpoint venvs]] — designed, not built: a venv per CPU architecture, so a compute partition unlike the login node can run an endpoint hpc-bridge stands up over SSH (today it fails at once with a message naming both; a facility's own multi-user endpoint is not affected)

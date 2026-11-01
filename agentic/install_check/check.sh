@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # The install-experience check, run inside the clean container (see Dockerfile). It follows docs/user/other-hosts.md
-# for each harness, step for step, and reports whether each harness ends up with hpc-bridge's 12 tools.
+# for each harness, step for step, and reports whether each harness ends up with hpc-bridge's 15 tools.
 #   REF   the hpc-bridge git ref to install (default main)
 set -uo pipefail
 REF="${REF:-main}"

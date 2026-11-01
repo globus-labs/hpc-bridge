@@ -69,7 +69,7 @@ pi mcp add hpc-bridge --exposure direct -- uvx --python 3.13 --from git+https://
 ```
 
 Then add `"timeout": 300` to the `hpc-bridge` entry in `~/.pi/agent/mcp.json` (Pi's default is 60 s, and the first
-start takes about a minute). `pi mcp list` should show `hpc-bridge: connected, 12 tools`.
+start takes about a minute). `pi mcp list` should show `hpc-bridge: connected, 15 tools`.
 
 - **`--exposure direct` matters.** Pi's default exposure (`codemode`) keeps MCP tools away from the model.
 - Long calls stay alive: hpc-bridge reports progress every 15 s, and Pi shows it.

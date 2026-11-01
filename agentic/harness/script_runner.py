@@ -24,7 +24,14 @@ dependencies may be missing):
 
 `ops.call` never raises for a tool's failure: an error result, a refused call or a closed channel comes back as
 {"is_error": True, "text": …} for the script to judge. run.py refuses a scenario without a SCRIPT (SETUP FAILED), and
-this operator takes no persona, PHASES or MIDRUN_HOOKS (midrun_hooks.operator_refusal: SKIPPED).
+this operator takes no persona; PHASES only when every phase is scripted; and MIDRUN_HOOKS that run a `cmd` after a tool
+result (polling ones too), fed from the journal as for the CLI operators (midrun_hooks.follow_journal).
+
+Batch phase 1 adds two server-lifecycle steps (design §10's harness work):
+- `await ops.restart_server()` KILLS the server (SIGKILL: no shutdown, no flush — a crash) and starts a new one on the
+  same state directory and journal; the script's steps go on against the new process.
+- `b = await ops.open_server("B")` starts a SECOND server on the same state directory and journal, beside the first;
+  `b.call(...)` is a step of the same run, labelled with its server (`ToolCall.server`: "A", "B").
 """
 from __future__ import annotations
 
@@ -32,6 +39,7 @@ import asyncio
 import contextlib
 import json
 import os
+import signal
 import tempfile
 import time
 import traceback
@@ -41,8 +49,20 @@ from datetime import timedelta
 from pathlib import Path
 from typing import Any, NoReturn
 
-from cli_runner import CliFinal, Native, _bundle_native, _journal_rows, _server_cmd, _server_env_names, build_trace
+from cli_runner import (
+    CliFinal,
+    Native,
+    _bundle_native,
+    _journal_call,
+    _journal_rows,
+    _same_args,
+    _server_cmd,
+    _server_env_names,
+    build_trace,
+    label_servers,
+)
 from invariants import ToolCall, Trace
+from midrun_hooks import HookWatcher, fired_record, follow_journal, hook_label, trigger_text
 from server_stderr import wrap
 
 OPERATOR = "script"
@@ -117,6 +137,7 @@ class Step:
     result: dict[str, Any]
     t_start: float      # epoch seconds — the jail's clock, the server journal's too
     t_end: float
+    server: str = "A"   # which server process answered (open_server labels a second one)
 
 
 def _short(obj: Any, n: int = 110) -> str:
@@ -127,17 +148,35 @@ def _short(obj: Any, n: int = 110) -> str:
 World = Callable[..., tuple[int, str]]   # run.py's `_ssh_run(cmd, timeout=…, host=…)`
 
 
-class ScriptOps:
-    """What a SCRIPT drives hpc-bridge with. `facility` / `ssh_host`: this run's (run.py: `{facility}`, `{ssh_host}`)."""
+Opener = Callable[[], contextlib.AbstractAsyncContextManager[Any]]
 
-    def __init__(self, session: Any, *, facility: str, ssh_host: str, world: World | None = None) -> None:
+
+class ScriptOps:
+    """What a SCRIPT drives hpc-bridge with. `facility` / `ssh_host`: this run's (run.py: `{facility}`, `{ssh_host}`).
+    `label`: the server this handle talks to ("A"; `open_server` makes "B"…), whose steps share one record."""
+
+    def __init__(self, session: Any, *, facility: str, ssh_host: str, world: World | None = None, label: str = "A",
+                 opener: Opener | None = None, journal: Path | None = None, parent: ScriptOps | None = None) -> None:
         self._session = session
         self._world = world
         self.facility = facility
         self.ssh_host = ssh_host
-        self.steps: list[Step] = []
-        self.texts: list[str] = []
-        self.text_at: list[int] = []   # how many steps came before each text (the Trace's text_at: cli_runner)
+        self.label = label
+        self._opener = opener
+        self._journal = journal
+        self._stack: asyncio.Task[BaseException | None] | None = None   # the server's host task (`_open`)
+        self._closing = asyncio.Event()
+        self.server_pid: int | None = None   # learnt from the journal rows this server wrote (its `pid`)
+        self.restarts: list[dict] = []
+        root = parent if parent is not None else self
+        self._root = root
+        if parent is None:
+            self.steps: list[Step] = []
+            self.texts: list[str] = []
+            self.text_at: list[int] = []   # how many steps came before each text (the Trace's text_at: cli_runner)
+            self.servers: list[ScriptOps] = [self]
+        else:
+            self.steps, self.texts, self.text_at, self.servers = root.steps, root.texts, root.text_at, root.servers
 
     async def call(self, tool: str, **args: Any) -> dict:
         """One hpc-bridge tool call, recorded as a step. Never raises for the tool's failure (see the module doc)."""
@@ -150,8 +189,9 @@ class ScriptOps:
             raise
         except Exception as exc:  # noqa: BLE001 - a closed channel or a timeout is the script's to judge, as a result
             out = {"text": f"{type(exc).__name__}: {exc}", "is_error": True}
-        step = Step(len(self.steps), tool, dict(args), out, round(t_start, 3), round(time.time(), 3))
+        step = Step(len(self.steps), tool, dict(args), out, round(t_start, 3), round(time.time(), 3), self.label)
         self.steps.append(step)
+        self._learn_pid(tool, t_start)
         said = out.get("status") or out.get("phase") or ("ERROR" if out.get("is_error") else "")
         print(f"  ← {tool}: {said} ({step.t_end - step.t_start:.1f}s) {_short(out.get('notice') or out.get('text') or '', 120)}",
               flush=True)
@@ -174,6 +214,103 @@ class ScriptOps:
 
     def abort(self, reason: str) -> NoReturn:
         raise ScriptAbort(reason)
+
+    # -- the server's lifecycle (batch phase 1) ------------------------------------------------------------------------
+    def _learn_pid(self, tool: str, t_start: float) -> None:
+        """This server's pid: the journal row of the call just made (the server writes `pid` on every row)."""
+        if self._journal is None:
+            return
+        for row in reversed(_journal_rows(self._journal)):
+            if row.get("tool") == tool and isinstance(row.get("ts"), int | float) and row["ts"] >= t_start - 1.0:
+                if isinstance(row.get("pid"), int) and row["pid"] not in {o.server_pid for o in self.servers
+                                                                          if o is not self}:
+                    self.server_pid = row["pid"]
+                return
+
+    async def _open(self) -> None:
+        """Start the server in a task of its own, which enters the stdio session's context and later leaves it. anyio
+        cancel scopes must be left in the task that entered them (the script runs in another task: `_drive`'s
+        wait_for), and a server that dies makes the stdio client cancel the scope it was entered in — its host task
+        here, never the script (live 2026-10-31: the first restart's SIGKILL cancelled the script and run.py read the
+        cell as INTERRUPTED)."""
+        if self._opener is None:
+            raise RuntimeError("this ScriptOps cannot start a server (no opener)")
+        loop = asyncio.get_running_loop()
+        ready: asyncio.Future[Any] = loop.create_future()
+        closing = asyncio.Event()
+        opener = self._opener
+
+        async def host() -> BaseException | None:
+            try:
+                async with opener() as session:
+                    if not ready.done():
+                        ready.set_result(session)
+                    await closing.wait()
+            except BaseException as exc:  # noqa: BLE001 - a dead server's teardown is this task's, reported to the closer
+                if not ready.done():
+                    ready.set_exception(exc if isinstance(exc, Exception) else RuntimeError(f"the server ended: {exc!r}"))
+                return exc
+            return None
+
+        self._closing = closing
+        self._stack = asyncio.create_task(host())
+        self._session = await ready
+
+    async def _close(self) -> None:
+        with contextlib.suppress(Exception):
+            await self._close_raising()
+
+    async def _close_raising(self) -> None:
+        """End the server's host task (it leaves the session's context itself); a server that already died returns its
+        ending, which is evidence, not this close's failure — only a close that could not run raises."""
+        host, self._stack = self._stack, None
+        if host is None:
+            return
+        self._closing.set()
+        try:
+            ended = await asyncio.wait_for(asyncio.shield(host), timeout=60)
+        except TimeoutError:
+            host.cancel()
+            raise RuntimeError(f"server {self.label} did not close within 60 s") from None
+        if ended is not None:   # it died before this close (a restart's kill): its session's ending, for the log
+            print(f"  ⚠ server {self.label} had ended: {type(ended).__name__}: {str(ended)[:160]}", flush=True)
+
+    async def restart_server(self, *, kill: bool = True, wait_s: float = 10.0) -> dict:
+        """Kill this server (SIGKILL by default: a crash, nothing flushed) and start a new one on the same state
+        directory and journal. Returns what was done; the script's own words record it too."""
+        pid = self.server_pid
+        killed = False
+        if kill and pid:
+            with contextlib.suppress(ProcessLookupError, PermissionError):
+                os.kill(pid, signal.SIGKILL)
+                killed = True
+            deadline = time.monotonic() + wait_s
+            while killed and time.monotonic() < deadline:
+                try:
+                    os.kill(pid, 0)
+                except ProcessLookupError:
+                    break
+                except PermissionError:
+                    break
+                await asyncio.sleep(0.1)
+        await self._close()
+        await self._open()
+        self.server_pid = None
+        rec = {"server": self.label, "killed_pid": pid if killed else None, "at": round(time.time(), 3),
+               "after_step": len(self.steps)}
+        self.restarts.append(rec)
+        self.say(f"server {self.label} {'killed (SIGKILL, pid ' + str(pid) + ')' if killed else 'closed'} and "
+                 "started again on the same state directory")
+        return rec
+
+    async def open_server(self, label: str = "B") -> ScriptOps:
+        """A second server process on the same state directory and journal, beside this one."""
+        other = ScriptOps(None, facility=self.facility, ssh_host=self.ssh_host, world=self._world, label=label,
+                          opener=self._opener, journal=self._journal, parent=self._root)
+        await other._open()
+        self.servers.append(other)
+        self.say(f"server {label} started beside {self.label} on the same state directory")
+        return other
 
     async def sleep(self, seconds: float) -> None:
         await asyncio.sleep(seconds)
@@ -215,6 +352,28 @@ def steps_trace(steps: list[Step], texts: list[str], text_at: list[int]) -> tupl
                                                "journal_unplaced": 0}
 
 
+def journal_order(steps: list[Step], rows: list[dict]) -> list[Step]:
+    """The steps in the order the server STARTED them, as the journal orders its rows (`ts`, then `seq`): each step
+    takes the first unused row of its tool with its own arguments (a script's arguments are exact), and a step with no
+    row keeps its own start. Concurrent calls (main's fallback fan-out, batch phase 1) end out of order and reach the
+    server in an order of its own; kept in end order, or even in the client's start order, an order-preserving
+    alignment with the journal lost some of them (live 2026-10-31: 5, then 2 of batch_fanout_collect's 40)."""
+    calls = sorted((r for r in rows if "tool" in r),
+                   key=lambda r: (r.get("ts") is None, r.get("ts") or 0, r.get("seq") or 0))
+    base = sorted(steps, key=lambda x: (x.t_start, x.n))
+    used: set[int] = set()
+    key: dict[int, int] = {}
+    for st in base:
+        for j, r in enumerate(calls):
+            if j not in used and r.get("tool") == st.tool and _same_args(st.args, r):
+                used.add(j)
+                key[st.n] = j
+                break
+    # the matched steps take the journal's order among the places they hold; an unmatched one stays where it was
+    matched = iter(sorted((st for st in base if st.n in key), key=lambda x: key[x.n]))
+    return [next(matched) if st.n in key else st for st in base]
+
+
 async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, effort: str | None = None,
                        persona: str | None = None, user_goal: str = "", ablate_skill: bool = False,
                        max_turns: int = 40, extra_env: dict[str, str] | None = None,
@@ -230,8 +389,8 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     (`steps_trace`)."""
     if script is None:
         raise ValueError("the script operator needs the scenario's SCRIPT")
-    if persona or midrun_hooks:   # run.py reports such a cell SKIPPED first; this keeps a direct caller honest too
-        raise NotImplementedError("the script operator takes no persona and no mid-run hooks")
+    if persona:   # run.py reports such a cell SKIPPED first; this keeps a direct caller honest too
+        raise NotImplementedError("the script operator takes no persona")
     from runner import RunResult  # jail-only import chain (the Claude Agent SDK), as cli_runner keeps it
 
     runs = Path.home() / ".hpcb-cli-runs"
@@ -250,32 +409,71 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     print(f"  → {OPERATOR}: hpc-bridge over stdio ({' '.join(a if len(a) < 60 else a[:57] + '…' for a in cmd[:6])} …)",
           flush=True)
     t0 = time.monotonic()
-    ops = ScriptOps(None, facility=facility, ssh_host=ssh_host, world=world)
+    factory = session_factory or stdio_session
+    ops = ScriptOps(None, facility=facility, ssh_host=ssh_host, world=world,
+                    opener=lambda: factory(cmd, server_env, str(ws)), journal=journal)
+    # MIDRUN_HOOKS (`cmd` after a tool result, polling ones too): fed from the server's journal while the script runs,
+    # as cli_runner does for the CLI operators
+    watcher = HookWatcher(midrun_hooks)
+    fired: list[dict] = []
+    stop = asyncio.Event()
+
+    async def act(hook: dict) -> None:
+        print(f"  💥 hook: {hook_label(hook)} {trigger_text(hook)} (journal row {hook['call_index']})", flush=True)
+        try:
+            outcome = (await hook_runner(hook) if hook_runner else None) or {"rc": None, "out": "(no hook runner)"}
+        except Exception as exc:  # noqa: BLE001 - recorded as a failed hook (harness:midrun_hooks gates it), never lost
+            outcome = {"rc": 1, "out": f"the hook failed: {type(exc).__name__}: {exc}"}
+        fired.append(fired_record(hook, outcome))
+
+    follower = (asyncio.create_task(follow_journal(journal, watcher, act, stop=stop, to_call=_journal_call,
+                                                   record=fired)) if midrun_hooks else None)
     text, error, tb = "", None, ""
     drove = False
     try:
-        async with (session_factory or stdio_session)(cmd, server_env, str(ws)) as session:
-            ops._session = session
+        try:
+            await ops._open()
             text, error, tb = await _drive(script, ops)
             drove = True
+        finally:
+            closing = [o for o in ops.servers if o._stack is not None]
+            for o in closing:
+                try:
+                    await o._close_raising()
+                except Exception as exc:
+                    if drove:   # the script ran to its end; only a server's shutdown complained — evidence
+                        tb = (tb + "\n" if tb else "") + f"closing server {o.label}: {type(exc).__name__}: {exc}"
+                    else:
+                        raise
     except asyncio.CancelledError:
+        if follower is not None:
+            follower.cancel()
         raise
-    except Exception as exc:  # noqa: BLE001 - the server never started (graded: agent_engaged), or closing it failed
+    except Exception as exc:  # noqa: BLE001 - the server never started (graded: agent_engaged)
         if not drove:
             error = f"the hpc-bridge MCP server failed: {type(exc).__name__}: {exc}"
             tb = traceback.format_exc()
-        else:   # the script ran to its end; only the server's shutdown complained — evidence, not the run's verdict
-            tb = (tb + "\n" if tb else "") + f"closing the server: {type(exc).__name__}: {exc}"
+    if follower is not None:
+        stop.set()   # a hook acting now finishes first; the follower reads the journal once more, then returns
+        try:
+            await follower
+        except Exception as exc:  # noqa: BLE001 - the hooks it never acted on read NEVER FIRED, which gates the cell
+            print(f"  ⚠ journal hooks stopped: {type(exc).__name__}: {exc}", flush=True)
     final_text = text or error or ""
     print(f"  ← {OPERATOR}: {len(ops.steps)} step(s) in {time.monotonic() - t0:.0f}s; "
           f"{'ERROR: ' + error if error else 'final: ' + repr(final_text[:240])}", flush=True)
     rows = _journal_rows(journal)
-    events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}") for s in ops.steps]
+    steps = journal_order(ops.steps, rows)
+    several = len({s.server for s in steps}) > 1
+    events = [Native(s.tool, s.args, s.result, hpcb=True, call_id=f"step-{s.n}", server=s.server if several else "")
+              for s in steps]
     texts, text_at = (ops.texts, ops.text_at) if ops.texts else (([final_text], [len(events)]) if final_text else ([], []))
     if journal_kept:
         trace, stats = build_trace(rows, events, texts, text_at)
+        if several:
+            label_servers(trace, events)
     else:
-        trace, stats = steps_trace(ops.steps, texts, text_at)
+        trace, stats = steps_trace(steps, texts, text_at)
     print(f"  trace: {len(trace.calls)} calls {stats}", flush=True)
     # The run dir dies with the jail: the steps (with their timestamps), the script's words and the journal ride in the
     # bundle — the cli_runner layout, which regrade.py and infra.py already read (the head row is `harness` + `rc`).
@@ -283,9 +481,13 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = OPERATOR, e
     # own: nothing in the bundle said which server ran — the review of 2026-10-30); run.py adds what that server is
     messages = [{"harness": OPERATOR, "server": list(cmd), "rc": 1 if error else 0,
                  "seconds": round(time.monotonic() - t0, 1), "trace_stats": stats, "stdout_tail": "",
-                 "stderr_tail": (tb or error or "")[-4000:]},
+                 "stderr_tail": (tb or error or "")[-4000:],
+                 **({"restarts": [r for o in ops.servers for r in o.restarts]} if any(o.restarts for o in ops.servers)
+                    else {}),
+                 **({"servers": [o.label for o in ops.servers]} if len(ops.servers) > 1 else {})},
                 *({"native": {**_bundle_native(e), "step": s.n, "t_start": s.t_start, "t_end": s.t_end}}
-                  for s, e in zip(ops.steps, events, strict=True)),
+                  for s, e in zip(steps, events, strict=True)),
                 *({"text": t, "at": a} for t, a in zip(ops.texts, ops.text_at, strict=True)), {"final": final_text},
                 *({"journal": r} for r in rows)]
-    return RunResult(trace=trace, final=CliFinal(result=final_text, is_error=error is not None), messages=messages)
+    return RunResult(trace=trace, final=CliFinal(result=final_text, is_error=error is not None), messages=messages,
+                     hooks_fired=(fired + watcher.unfired_records()) if midrun_hooks else None)

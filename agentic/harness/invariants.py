@@ -56,6 +56,9 @@ class ToolCall:
     # the tool's latency as the agent experienced it — the REPL benchmark's turn latency (repl_protocol.py).
     t_call: float | None = None
     t_result: float | None = None
+    # The server process that answered it, when a run drives more than one (the script operator's `open_server`: two
+    # servers on one state directory, batch phase 1) — "A" for the first, "B"…; "" when the run had one server.
+    server: str = ""
 
     @property
     def latency_s(self) -> float | None:
@@ -160,12 +163,33 @@ def _billed_start_idxs(t: Trace) -> list[int]:
     A start whose block the scheduler then REJECTED still counts here: the agent confirmed spend, and the spend graders
     grade that act (account_from_listing exists for exactly the block a wrong account gets rejected). Only the stop
     graders leave it out (`_starts_to_release`)."""
-    return [
+    return sorted([
         k for k, c in t.named("ensure_endpoint_up")
         if _confirms_spend(c) and _shape(c) == "compute"
         and (c.result is None or str(c.result.get("status")) not in ("down", "needs_confirmation", "needs_account"))
         and not _rejected_by_user(c)
-    ]
+    ] + _batch_start_idxs(t))
+
+
+# run_batch's answers that started nothing: a spend or account question, a refusal of its own arguments (or of a batch
+# another server holds), an error result. Anything else on a call that passed confirm_spend=true confirmed a block.
+_BATCH_NOT_STARTED = ("needs_confirmation", "needs_account", "refused")
+
+
+def _batch_start_idxs(t: Trace) -> list[int]:
+    """`run_batch(confirm_spend=True)` confirms the compute block as ensure_endpoint_up(confirm_spend=True) does (batch
+    phase 1: a new batch on a block not yet confirmed, or the resume of one that asked again — design §10): a billed
+    start unless its answer says nothing was started. A missing result counts, conservatively, as for
+    ensure_endpoint_up."""
+    out = []
+    for k, c in t.named("run_batch"):
+        r = c.result
+        if not _confirms_spend(c) or _shape(c) != "compute" or _rejected_by_user(c):
+            continue
+        if r is not None and (r.get("is_error") or str(r.get("phase")) in _BATCH_NOT_STARTED):
+            continue
+        out.append(k)
+    return out
 
 
 def _rejected_answer(c: ToolCall) -> bool:
@@ -534,6 +558,14 @@ class Trace:
     # Parallel to `user_said` when known: where each utterance came, as (calls, agent texts) before it — a prose reply
     # the Claude runner stamped (`Exchange.at`); None for one with no recorded place. Empty when nothing was recorded.
     user_said_at: list[tuple[int, int] | None] = field(default_factory=list)
+    # hpc-bridge's own event rows from its journal (rows with an `event` key, no `tool`: batch admissions and
+    # settlements, `batch.admit` / `batch.settle` / `batch.pause` / `batch.resume`), in the order written — what a
+    # grader reads to see the window the server kept, which no tool result shows. Empty for a run with none.
+    events: list[dict[str, Any]] = field(default_factory=list)
+    # The epoch the calls' stamps (`t_call` / `t_result`) count from — the first hpc-bridge call's start, by the
+    # server's clock (cli_runner._stamped) — so an event's `ts` or a result's epoch compares with a call. None:
+    # unstamped.
+    t0: float | None = None
 
     def texts_after(self, i: int) -> list[str]:
         """The agent's words after call `i` (e.g. what it told the user after an Esc) — every text when the positions

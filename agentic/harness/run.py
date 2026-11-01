@@ -65,7 +65,7 @@ from invariants import (
     regrade_staged,
     staged_connects,
 )
-from midrun_hooks import hook_label, operator_refusal
+from midrun_hooks import hook_label, hook_text, operator_refusal
 from proctree import become_subreaper, stop_tree
 from provenance import write_run_record
 from runner import RunResult, run_scenario
@@ -938,9 +938,11 @@ async def _run_hook(hook: dict) -> dict:
             return {"rc": 1, "out": f"no endpoint of this run to stop ({exc})", "cmd": "", "hosts": []}
         hosts = _login_hosts() or [None]
     else:
-        cmd = str(hook["cmd"]).replace("{endpoint_name}", name)
-        eids = hook.get("endpoint_ids") or []
-        cmd = cmd.replace("{eid}", eids[-1] if eids else "")
+        cmd = hook_text(hook, hook["cmd"], endpoint_name=name)
+        if "poll" in hook:   # a POLLING hook: its trigger armed it; the world decides when its cmd runs
+            polled = await _poll_until(hook, name)
+            if polled is not None:
+                return polled
         # With `"on": "each_login"` the hook runs on EVERY login node of a round-robin pool — the default host is the
         # alias, which may resolve to the node the endpoint is NOT on (the freeze hook of draining_restop hit the wrong
         # node on the 2026-09-06 sweep's rerun and the chaos never happened). Manager-hosting node unknown ⇒ hit them all.
@@ -967,6 +969,30 @@ async def _run_hook(hook: dict) -> dict:
         out += f" — expected {expect!r} on some node: none printed it"
     print(f"  💥 hook {hook_label(hook)}: rc={rc} — {out[:160]}", file=sys.stderr, flush=True)
     return {"rc": rc, "out": out[:400], "cmd": cmd[:300], "hosts": [h for h in hosts if h]}
+
+
+async def _poll_until(hook: dict, name: str) -> dict | None:
+    """A polling hook's wait (midrun_hooks: `poll`, `until`, `every_s`, `poll_timeout_s`): run the poll on the login
+    node until its output matches `until`; None when it did (the hook's cmd runs next), else the failed outcome — the
+    hook did not act, and `harness:midrun_hooks` gates on its rc."""
+    poll = hook_text(hook, hook["poll"], endpoint_name=name)
+    until = re.compile(hook_text(hook, hook["until"], endpoint_name=name))
+    every = max(0.5, float(hook.get("every_s", 5)))
+    deadline = time.monotonic() + max(1.0, float(hook.get("poll_timeout_s", 900)))
+    t0, n, out = time.monotonic(), 0, ""
+    while True:
+        rc, out = await asyncio.to_thread(_ssh_run, poll, timeout=int(hook.get("timeout", 120)))
+        n += 1
+        if until.search(out or ""):
+            print(f"  ⏱ hook {hook_label(hook)}: poll matched after {n} read(s), {time.monotonic() - t0:.0f}s",
+                  file=sys.stderr, flush=True)
+            return None
+        if time.monotonic() + every > deadline:
+            why = (f"poll never matched {hook['until']!r} in {n} read(s) over {time.monotonic() - t0:.0f}s "
+                   f"(last rc={rc}: {(out or '').strip()[-160:]!r}); the cmd did not run")
+            print(f"  💥 hook {hook_label(hook)}: {why}", file=sys.stderr, flush=True)
+            return {"rc": 1, "out": why[:400], "cmd": poll[:300], "hosts": []}
+        await asyncio.sleep(every)
 
 
 def _cleanup(scen, budget_s: float | None = None) -> None:

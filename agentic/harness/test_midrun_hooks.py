@@ -512,9 +512,10 @@ def test_the_answer_tables_are_the_products():
 
     from hpc_bridge import models, server
     phases = {m: typing.get_args(m.model_fields["phase"].annotation)
-              for m in (models.ShellOutcome, models.ConnectFacilityResult, models.LoginStatus, models.PreauthStatus)}
+              for m in (models.ShellOutcome, models.ConnectFacilityResult, models.LoginStatus, models.PreauthStatus,
+                        models.BatchStatus)}
     for tool, values in hooks.ANSWER_PHASES.items():
-        ret = typing.get_type_hints(getattr(server, tool))["return"]
+        ret = typing.get_type_hints(getattr(server, {"status": "status_tool"}.get(tool, tool)))["return"]
         assert "phase" in ret.model_fields and "endpoint_id" not in ret.model_fields, tool
         assert set(values) == set(phases[ret]), tool
     for tool in hooks.ENDPOINT_ANSWERS:
@@ -584,6 +585,13 @@ _GOOD = {
         ("run_shell", {"shape": "login", "command": "sinfo"}, {"phase": "complete"}),
         ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "provisioning", **_E}),
         ("stop_endpoint", {}, {"status": "down", **_E})], {"user_revokes_spend": 3}),
+    # synthetic until its first live OK run (batch phase 1): the polling hook is armed by the run_batch answer
+    "batch_block_reaped_midrun": ("synthetic (batch phase 1, no live bundle yet)", [
+        ("connect_facility", {}, {"phase": "proposed_facility_details"}), ("connect_facility", {}, {"phase": "needs_account"}),
+        ("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up", **_E}),
+        ("run_batch", {"command": "sleep 15; echo row {n}", "rows": [{"n": 0}], "task_walltime_s": 60},
+         {"phase": "admitting", "batch_id": "batch-000000000001"}),
+        ("status", {"id": "batch-000000000001"}, {"phase": "needs_confirmation"})], {"reap_after_5_results": 3}),
 }
 
 

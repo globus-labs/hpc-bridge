@@ -54,7 +54,7 @@ echo "# profile sweep $STAMP — target fake, $MODEL_WORDS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs 2" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs,batch_fanout_collect 2" ;;
     site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job,ssh_account_floor 3" ;;
     totp)     echo "otp_preauth,password_pusher 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
@@ -167,6 +167,13 @@ cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator
   else echo "$2"; fi
 }
 
+batch_cells() {  # batch_cells <profile>: batch phase 1's scripted cells, once per sweep with no model
+  case "$1" in
+    default) echo "batch_crosses_walltime batch_restart_resume batch_two_servers_one_ledger batch_block_reaped_midrun batch_big_output batch_abort_midrun" ;;
+    mep)     echo "mep_batch_fanout" ;;
+  esac
+}
+
 script_only() {  # script_only <profile>: the scripted cells of a profile no agent wave runs on, or nothing
   case "$1" in
     slices) echo "slice_request multinode_allocation" ;;   # resource requests (2026-10-24)
@@ -241,6 +248,7 @@ for prof in "${PROFS[@]}"; do
   if [ -z "$PAID_ONLY" ] && [ -z "$RESET" ]; then   # RESET empty: a run_suite above booted this profile
     # The paths a model may never take, once per sweep with no model (the review of the 2026-10-22 sweep): polaris's
     # HELD pilot → the directive → the block up, and lmod's failed details= → the proposal that loads its modules.
+    for sc in $(batch_cells "$prof"); do script_cell "$prof" "$sc"; done   # batch phase 1 (2026-10-31)
     case "$prof" in
       polaris) script_cell polaris polaris_filesystems ;;
       lmod)    script_cell lmod lmod_bootstrap ;;

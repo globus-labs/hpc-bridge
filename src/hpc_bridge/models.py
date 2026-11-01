@@ -206,6 +206,9 @@ class ShellOutcome(BaseModel):
     est_wait_s: int | None = None
     # phase="running": poll for this task's result with poll_task(task_id). None for every other phase.
     task_id: str | None = None
+    # phase="running": the task's Globus Compute task id, when the service has assigned it. poll_task takes it too, and
+    # it outlives this server: a new process answers it from the ledger (batch phase 1). None otherwise.
+    globus_task_id: str | None = None
     # needs_confirmation / needs_account: the block the spend question is about (its queue, account, size), so the
     # question to the user names it. None for every other phase.
     block: BlockTerms | None = None
@@ -267,6 +270,99 @@ class EndpointStatus(BaseModel):
     # terminal (a password / one-time code) — relay this command, as connect_facility's needs_preauth; never handle the
     # secret. Then call ensure_endpoint_up again: the repair rides that connection.
     preauth_command: str | None = None
+
+
+# ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------
+
+BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused"]
+TaskState = Literal["backlog", "in_flight", "submit_unknown", "presumed_lost", "done", "failed", "lost", "cancelled"]
+
+
+class BatchCounts(BaseModel):
+    """How many rows are in each state. `in_flight`, `submit_unknown` and `presumed_lost` hold a window slot."""
+
+    backlog: int = 0
+    in_flight: int = 0
+    done: int = 0
+    failed: int = 0
+    lost: int = 0
+    presumed_lost: int = 0
+    submit_unknown: int = 0
+    cancelled: int = 0
+
+
+class BatchTaskResult(BaseModel):
+    """One row as the ledger has it. `tail` / `stderr_tail`: the last few kB of the attempt's streams; the whole
+    (capped) stream is at `stdout_path` on the facility. `started_at`: when the attempt started on the block (epoch).
+    `settled_by`: what settled it — `result`, `evidence: …`, `presumption`, `cancel`."""
+
+    index: int
+    state: TaskState
+    attempt: int = 0
+    row: Any = None
+    exit_code: int | None = None
+    tail: str = ""
+    stderr_tail: str = ""
+    stdout_path: str | None = None
+    stdout_bytes: int | None = None
+    truncated: bool = False
+    job_id: str | None = None
+    host: str | None = None
+    started_at: float | None = None
+    settled_by: str | None = None
+    task_id: str | None = None
+
+
+class BatchStatus(BaseModel):
+    """run_batch's and status's answer.
+
+    phase: `admitting` — rows go to the confirmed block as window slots free; `waiting` — accepted, nothing admitted
+    yet (the block is still starting, or its remaining walltime is not known); `needs_confirmation` — admission is
+    paused and resumes only with run_batch(batch_id=…, confirm_spend=True) (`reason` says why: the block's walltime, a
+    reap, a stop, a server restart, a drain); `needs_account` — as run_shell; `done` — every row settled; `cancelled`;
+    `refused` — this call was refused (`reason`), nothing was recorded or admitted."""
+
+    batch_id: str | None = None
+    phase: BatchPhase
+    tasks: int = 0
+    chunk: int = 1
+    capacity: int = 0
+    admitted: int = 0
+    counts: BatchCounts = Field(default_factory=BatchCounts)
+    results: list[BatchTaskResult] = Field(default_factory=list)
+    offset: int = 0
+    next_offset: int | None = None
+    results_dir: str | None = None
+    blocks_seen: list[str] = Field(default_factory=list)
+    # another server holds this batch's lease: this answer is a read of the ledger, and this server admits nothing
+    owner: str | None = None
+    reason: str | None = None
+    # needs_confirmation / needs_account: the block the spend question is about; on the call that newly confirmed
+    # spend (a run_batch with confirm_spend=True): the block it confirmed (a receipt), as ensure_endpoint_up's
+    block: BlockTerms | None = None
+    session_spend: NodeHours = 0.0
+    notice: str | None = None
+
+
+class BlockLeft(BaseModel):
+    """A block that can still bill after a cancel: its job, the latest it can bill to (ISO, UTC) and how it ends."""
+
+    job_id: str | None = None
+    bill_until: str | None = None
+    how_to_end: str
+
+
+class CancelResult(BaseModel):
+    """cancel's answer. status: `down` — nothing of the batch is in flight (the session's block may still bill: see
+    `blocks_left`); `draining` — tasks are still in flight (an abort ends them; a drain lets them finish); `refused`."""
+
+    id: str
+    status: Literal["down", "draining", "refused"]
+    mode: Literal["drain", "abort"] = "drain"
+    backlog_dropped: int = 0
+    in_flight: int = 0
+    blocks_left: list[BlockLeft] = Field(default_factory=list)
+    notice: str | None = None
 
 
 class LoginShellResult(BaseModel):
