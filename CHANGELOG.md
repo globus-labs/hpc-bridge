@@ -16,7 +16,10 @@ installed plugin only when that version changes); git tags mark releases.
     placeholder is substituted only where a conservative reading of bash's grammar is certain it is a bare word of the
     outer shell, and refused elsewhere, saying how to write it: inside quotes, a here-document, arithmetic, `[[ ]]`,
     `${…}` or backticks; as a shell's `-c` code, an interpreter's code flag, awk's or sed's program; in `ssh`,
-    `watch`, `eval`, `trap`, `read`, `declare` and the like. `"$(basename {x})"` is fine. The limit, as the docs say:
+    `watch`, `eval`, `trap`, `read`, `declare` and the like; before a pipe, here-string or `>(…)` into a program that
+    reads code from stdin (`echo {x} | sh`); where `env`/`sudo`/`timeout`/`xargs` read their options or command.
+    `"$(basename {x})"` is fine. `run_batch` names rows whose value starts with `-` (put `--` before the
+    placeholder). The limit, as the docs say:
     never hand a value to `eval`, `sh -c` or an inner interpreter as code; pass it as an argument, or read it from the
     environment in a here-document with a quoted delimiter.
   - **The admission gate:** a row is sent only while the block's remaining walltime, read from inside the block
