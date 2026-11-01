@@ -1,7 +1,6 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-31. `main` carries **plugin 0.1.26**: blocks sized to the work (a slice of a node, N nodes; #234, merged in #235), the Perlmutter report's fixes, and returning users — a zero-SSH reattach on a new laptop, venv repairs past a killed manager or a dead login node, discovery terms the scheduler takes (#236). The latest tag is
-**`v0.1.20-beta.1`** (2026-10-06, pre-release). The repository is **`globus-labs/hpc-bridge`**. Design rationale
+_Snapshot: 2026-11-01. `main` carries **plugin 0.1.26** plus, unreleased, **batch phase 1** (#238: `run_batch`, `status`, `cancel` and a durable ledger, live-checked on Anvil). 0.1.26 holds blocks sized to the work (#234, merged in #235), the Perlmutter report's fixes, and returning users (#236). Releases are tagged: **`v0.1.21`–`v0.1.26`** (annotated, on each release commit), after `v0.1.20-beta.1`. The repository is **`globus-labs/hpc-bridge`**. Design rationale
 lives in `docs/hpc-bridge-vault/`; this file is the live state + how-to-run + gotchas on top._
 
 ## TL;DR
