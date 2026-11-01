@@ -60,6 +60,10 @@ def _add(led, bid: str = "batch-000000000001", *, n: int = 6, capacity: int = 2,
     return bid
 
 
+# The service's task groups, by id: a client reads ANY group by its id (get_task_group), whichever runner minted it.
+_GROUPS: dict[str, list[str]] = {}
+
+
 class _BatchRunner(_FakeRunner):
     """A runner whose submits stay in flight until the test resolves them; each future gets a Globus-like task id
     once 'sent' (as the SDK's ComputeFuture does), and the runner's executor has a service-minted task group."""
@@ -69,6 +73,7 @@ class _BatchRunner(_FakeRunner):
         self.task_group_id = str(uuid.uuid4())
         self.fail_submit_of = fail_submit_of or set()
         self.group_tasks: list[str] = []
+        _GROUPS[self.task_group_id] = self.group_tasks
         self.rest: dict[str, tuple[str, object]] = {}   # what the service answers by REST: tid -> (status, result)
 
     def submit(self, command):
@@ -94,9 +99,11 @@ class _BatchRunner(_FakeRunner):
                               {"task_id": i, "status": "failed", "exception": res})
             return {"results": out}
 
-        v2 = SimpleNamespace(get_task_group=lambda tg: {"taskgroup_id": str(tg),
-                                                       "tasks": [{"id": t} for t in self.group_tasks]},
-                             get_task_batch=batch)
+        def group(tg):
+            tasks = self.group_tasks if str(tg) == str(self.task_group_id) else _GROUPS.get(str(tg), [])
+            return {"taskgroup_id": str(tg), "tasks": [{"id": t} for t in tasks]}
+
+        v2 = SimpleNamespace(get_task_group=group, get_task_batch=batch)
         return SimpleNamespace(_compute_web_client=SimpleNamespace(v2=v2), get_task=lambda tid: {"pending": True},
                                fx_serializer=SimpleNamespace(deserialize=lambda r: r))
 
@@ -256,6 +263,16 @@ async def test_retired_token_pauses_every_engine_path(monkeypatch):
     st = await server._status(app, out.batch_id)
     assert len(runner.futures) == sent
     assert st.phase == "needs_confirmation" and "reaped" in (st.reason or "")
+    # the resume path: a batch still admitting whose block's config was retired meanwhile — run_batch(batch_id=…)
+    # without the yes sends nothing with it, and pauses naming the retirement
+    app2, rt2, runner2 = await _batch_app()
+    out2 = await _start(app2, n=6)
+    sent2 = len(runner2.futures)
+    runner2.futures[0].finish(_ok_report(0))
+    app2.ledger.retire("fake-eid", batch.uec_hash(rt2), why="stop_endpoint released this block")
+    res = await server._run_batch(app2, batch_id=out2.batch_id)
+    assert len(runner2.futures) == sent2, runner2.commands[sent2:]
+    assert res.phase == "needs_confirmation" and "retired" in (res.reason or ""), res
 
 
 # ---- the wrapper (run locally under bash: the worker's side) ----------------------------------------------------------
@@ -558,6 +575,9 @@ async def test_restart_resumes_only_with_confirm_spend(tmp_path):
     assert states[2] == "done" and states[3] == "in_flight"            # pulled by REST; row 3 still out
     assert st.phase == "needs_confirmation" and "restart" in (st.reason or "")
     assert len(runner2.futures) == 0
+    nocf = await server._run_batch(app2, batch_id=out.batch_id)       # a resume without the user's yes
+    await batch.tick(app2, out.batch_id)
+    assert nocf.phase == "needs_confirmation" and len(runner2.futures) == 0, nocf
     res = await server._run_batch(app2, batch_id=out.batch_id, confirm_spend=True)
     assert res.phase in ("admitting", "waiting") and len(runner2.futures) == 1   # row 3 still holds its slot
     assert "/tasks/4/attempt-1" in runner2.commands[-1]
@@ -595,6 +615,31 @@ def test_interactive_tasks_leave_rc_and_tail_in_the_session_dir(tmp_path):
     assert "out" in (res / "tail").read_text()
 
 
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+async def test_poll_task_by_uuid_falls_back_to_the_session_dir_once_rest_cannot_answer(tmp_path, monkeypatch):
+    """What reads those files: poll_task with the task's Globus id, once the service cannot answer for it (a result past
+    its window, the service unreachable, a restart that lost the handle), returns the rc and tail the session dir kept —
+    read over the free login shape."""
+    from hpc_bridge import batch, server, session_shell
+
+    root = tmp_path / "root"
+    s = session_shell.Session("default", str(root))
+    subprocess.run([_BASH, "-c", session_shell.wrap("echo out; exit 5", s, result_key="k1")], capture_output=True,
+                   text=True, timeout=30)
+    for _ in range(40):
+        if (root / "sessions/default/results/k1/tail").exists():
+            break
+        time.sleep(0.05)
+    monkeypatch.setattr(batch, "login_runner", _local_login(tmp_path))
+    app, _rt, _runner = await _batch_app()
+    tid = str(uuid.uuid4())
+    batch.ledger_of(app).record_itask(tid, endpoint_id="fake-eid", shape="compute", session_id="default",
+                                      result_key="k1", state_dir=str(root), handle=None)
+    got = await server._poll_task(app, tid, 0)                         # the service lists it as nothing it knows
+    assert got.phase == "complete" and got.exit_code == 5 and "out" in (got.stdout or ""), got
+    assert "session dir" in (got.notice or ""), got.notice
+
+
 def test_ledger_schema_is_sqlite_wal(tmp_path, monkeypatch):
     """(The schema the checkpoint names.) Tables batch, task, retired, event; rows and the command are stored (a
     replay record needs them — unlike sent-checks, which never hold a command's text)."""
@@ -615,54 +660,85 @@ def test_ledger_schema_is_sqlite_wal(tmp_path, monkeypatch):
 @pytest.mark.skipif(_BASH is None, reason="needs bash")
 def test_the_wrapper_ends_its_command_on_the_cancel_marker(tmp_path):
     """An abort ends what is in flight (design §5): the wrapper watches the CANCELLED marker while its command runs,
-    kills the command's process group, writes rc 143 and reports the attempt cancelled. The block itself is never
-    touched (it is the session's: interactive work runs there too)."""
+    kills the command's process group — a background child it started too — writes rc 143 and reports the attempt
+    cancelled. The block itself is never touched (it is the session's: interactive work runs there too)."""
     from hpc_bridge import batch
 
     rd = tmp_path / "rd"
-    child = tmp_path / "child-alive"
-    script = batch.task_script(f"(sleep 60; echo late > {child}) & sleep 60", results_dir=str(rd), index=0, attempt=1,
-                               task_walltime_s=120)
-    t0 = time.monotonic()
+    pidf = tmp_path / "child.pid"
+    script = batch.task_script(f"sleep 300 & echo $! > {pidf}; sleep 300", results_dir=str(rd), index=0, attempt=1,
+                               task_walltime_s=600)
     proc = subprocess.Popen([_BASH, "-c", script], stdout=subprocess.PIPE, text=True,
                             env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "TMPDIR": str(tmp_path)})
-    time.sleep(2.0)
+    for _ in range(100):
+        if pidf.exists() and pidf.read_text().strip():
+            break
+        time.sleep(0.05)
+    child = int(pidf.read_text())
+    os.kill(child, 0)                                                   # the background child runs
+    t0 = time.monotonic()
     (rd / batch.CANCEL_MARKER).touch()
     out, _ = proc.communicate(timeout=30)
     r = batch.parse_result(out)
-    assert r is not None and r.cancelled and r.rc == batch.CANCEL_RC and time.monotonic() - t0 < 20
+    assert r is not None and r.cancelled and r.rc == batch.CANCEL_RC and time.monotonic() - t0 < 15
     assert (rd / "tasks" / "0" / "attempt-1" / "rc").read_text().strip() == "143"
-    time.sleep(1.0)
-    assert not child.exists()                     # the whole process group went, the command's own children too
+    for _ in range(60):
+        try:
+            os.kill(child, 0)
+        except ProcessLookupError:
+            break
+        time.sleep(0.05)
+    else:
+        pytest.fail("the command's background child outlived the cancel: its process group was not killed")
 
 
-async def test_cancel_abort_ends_what_is_in_flight(monkeypatch):
-    """cancel(abort): the backlog is cancelled at once, the marker is written for the tasks out, the answer is
-    `draining` while any wrapper has not settled and `down` once none is in flight; those rows settle `cancelled`
-    with the marker as their evidence."""
+def _local_login(tmp: Path):
+    """batch.login_runner for a test: the free login shape, as this machine's bash (the results dir is local)."""
+    def runner_for(_app):
+        async def run(cmd):
+            p = subprocess.run([_BASH, "-c", cmd], capture_output=True, text=True, timeout=30,
+                               env={"PATH": os.environ["PATH"], "HOME": str(tmp), "TMPDIR": str(tmp)})
+            return SimpleNamespace(stdout=p.stdout)
+        return run
+    return runner_for
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+async def test_cancel_abort_ends_what_is_in_flight(tmp_path, monkeypatch):
+    """cancel(abort), end to end: the backlog is cancelled at once, the marker is written in the batch's results
+    directory over the login shape, each running wrapper sees it and kills its command (rc 143) — the answer is
+    `draining` while any wrapper has not settled and `down` once none is in flight, long before the commands' own end;
+    those rows settle `cancelled` with the marker as their evidence."""
+    import asyncio
+
     from hpc_bridge import batch, server
 
-    marked: list[str] = []
-
-    async def mark(app_, run, results_dir):
-        marked.append(results_dir)
-        return True
-
-    monkeypatch.setattr(batch, "write_cancel_marker", mark)
-    app, _rt, runner = await _batch_app()                             # capacity 2
-    out = await _start(app, n=6)
+    monkeypatch.setattr(batch, "login_runner", _local_login(tmp_path))
+    runner = _BashRunner(tmp_path, live=True, canary=_canary())
+    app, _rt, _ = await _batch_app(runner=runner)                      # capacity 2
+    out = await server._run_batch(app, command="sleep 60; echo late {x}", rows=[{"x": i} for i in range(6)],
+                                  task_walltime_s=120, results_dir=str(tmp_path / "rd"))
+    bd = Path(out.results_dir)
+    for _ in range(100):
+        if len(list(bd.glob("tasks/*/attempt-1/meta.json"))) == 2:
+            break
+        await asyncio.sleep(0.1)
+    t0 = time.monotonic()
     first = await server._cancel(app, out.batch_id, "abort")
-    assert first.status == "draining" and first.backlog_dropped == 4 and first.in_flight == 2 and marked
+    assert first.status == "draining" and first.backlog_dropped == 4 and first.in_flight == 2, first
+    assert (bd / batch.CANCEL_MARKER).exists() and "kills its command" in (first.notice or ""), first.notice
     assert len(runner.futures) == 2                                   # nothing admitted after the abort
-    for i, f in enumerate(list(runner.futures)):
-        rep = json.loads(_ok_report(i).stdout.split(" ", 1)[1])
-        rep.update(rc=batch.CANCEL_RC, why="cancelled")
-        f.finish(_Res(0, "HPCB_RESULT " + json.dumps(rep) + "\n", ""))
-    again = await server._cancel(app, out.batch_id, "abort")
-    assert again.status == "down" and again.in_flight == 0
+    again = first
+    for _ in range(150):
+        again = await server._cancel(app, out.batch_id, "abort")
+        if again.status == "down":
+            break
+        await asyncio.sleep(0.1)
+    assert again.status == "down" and again.in_flight == 0 and time.monotonic() - t0 < 20, again
     st = await server._status(app, out.batch_id, detail="page")
     assert st.phase == "cancelled" and st.counts.cancelled == 6
-    assert all("CANCELLED" in (r.settled_by or "") for r in st.results if r.index < 2)
+    ran = [r for r in st.results if r.index < 2]
+    assert all("CANCELLED" in (r.settled_by or "") and r.exit_code == batch.CANCEL_RC for r in ran), ran
 
 
 async def test_a_one_worker_block_still_admits_and_interactive_work_names_the_batch():
@@ -693,16 +769,20 @@ async def test_unknown_remaining_walltime_admits_nothing_and_a_task_that_cannot_
 
 @pytest.mark.skipif(_BASH is None, reason="needs bash")
 def test_rows_are_substituted_then_brace_escaped_for_shellfunction(tmp_path):
-    """ShellFunction runs `cmd.format(**kwargs)`: after the row's fields are in, the command must survive that pass —
-    `${HOME}`, an awk program's braces and a value with braces in it all come out as written."""
+    """ShellFunction runs `cmd.format(**kwargs)`: after the row's fields are in, the task's script must survive that
+    pass — `${HOME}`, an awk program's braces and a value with braces in it all come out as written."""
     from hpc_bridge import batch
     from hpc_bridge.runner import _escape_for_shellfunction
 
-    cmd = batch.substitute("echo ${HOME} {v}; echo a b | awk '{print $1}'", {"v": "x{y}z"}, 0, {"v", "index"})
-    assert _escape_for_shellfunction(cmd).format() == cmd
-    out = subprocess.run([_BASH, "-c", _escape_for_shellfunction(cmd).format()], capture_output=True, text=True,
-                         env={"PATH": os.environ["PATH"], "HOME": "/h"}).stdout
-    assert out == "/h x{y}z\na\n"
+    names = {"v", "index"}
+    cmd = batch.substitute("echo ${HOME} {v}; echo a b | awk '{print $1}'", {"v": "x{y}z"}, 0, names)
+    script = batch.task_script(cmd, results_dir=str(tmp_path / "rd"), index=0, attempt=1, task_walltime_s=30,
+                               fields=batch.row_values({"v": "x{y}z"}, 0, names))
+    assert _escape_for_shellfunction(script).format() == script
+    r = batch.parse_result(subprocess.run(
+        [_BASH, "-c", _escape_for_shellfunction(script).format()], capture_output=True, text=True,
+        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path), "TMPDIR": str(tmp_path)}).stdout)
+    assert r is not None and r.tail == f"{tmp_path} x{{y}}z\na\n", r and r.tail
     with pytest.raises(batch.BatchRefusal, match="not an identifier"):
         batch.validate("echo {a-b}", [{"a-b": 1}], 10)
 
@@ -816,7 +896,13 @@ async def test_a_reap_the_batch_reported_is_answered_by_one_yes():
     sent = len(runner.futures)
     res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
     assert res.phase in ("admitting", "waiting"), (res.phase, res.notice)
-    assert len(runner.futures) > sent or res.phase == "waiting"
+    for _ in range(3):                                                  # the new block's first check, if not yet in
+        if len(runner.futures) > sent:
+            break
+        app.batches[out.batch_id].last_warm = 0.0
+        await batch.tick(app, out.batch_id)
+    assert len(runner.futures) > sent, (res.phase, res.notice)
+    assert (await server._status(app, out.batch_id)).phase == "admitting"
 
 
 async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_its_user_endpoints_relaunch(monkeypatch):
@@ -851,7 +937,8 @@ async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_i
     assert states[keys[0][0]] == "lost" and states[keys[1][0]] == "lost" and states[keys[2][0]] == "in_flight"
     assert run.old_uep == uep
     await batch.tick(app, out.batch_id)                                # the reaped user endpoint's relaunch, released
-    assert any("scancel" in c and uep in c for c in cmds) and not any("uep.fake-eid" in c for c in cmds)
+    released = [c for c in cmds if "scancel" in c]
+    assert released and all(f"-v m={uep} " in c and "scancel -u" not in c for c in released), released
     assert "14" in app.ledger.batch(out.batch_id)["blocks_seen"]
 
 
@@ -894,3 +981,763 @@ async def test_the_gate_asks_for_no_block_when_nothing_is_left_to_admit():
     await batch.tick(app, out.batch_id)
     st = await server._status(app, out.batch_id)
     assert st.phase == "admitting" and st.counts.in_flight == 1 and st.counts.backlog == 0
+
+
+# ---- review round 1 (651c5bc): spend and stop -----------------------------------------------------------------------
+# Each of these failed on 651c5bc (red log: scratchpad bp1/red_batch_r1.txt). The reviewers' reproductions, adapted.
+
+_UEP = "uep." + "1" * 8 + "-1111-1111-1111-" + "1" * 12 + "." + "2" * 8 + "-2222-2222-2222-" + "2" * 12
+
+
+def _login_fake(cmds: list[str], *, sacct: str = "CANCELLED", uep: str = _UEP, released: str = "14"):
+    """batch.login_runner for a test: the block's job state (`sacct`), a release of the reaped user endpoint's pilots
+    (`released`), and the cancel marker — every command recorded."""
+    def runner_for(_app):
+        async def run(cmd):
+            cmds.append(cmd)
+            if "HPCB_JOB_STATE" in cmd:
+                return SimpleNamespace(stdout=f"HPCB_JOB_STATE squeue= sacct={sacct} pbs= uep={uep}\n")
+            if "HPCB_MARKED" in cmd:
+                return SimpleNamespace(stdout="HPCB_MARKED\n")
+            return SimpleNamespace(stdout=f"HPCB_RELEASED {released}\n")
+        return run
+    return runner_for
+
+
+def _count_switches(run):
+    calls: list[bool] = []
+    real = run.ensure_up
+
+    async def spy(app_, confirm):
+        calls.append(confirm)
+        return await real(app_, confirm)
+
+    run.ensure_up = spy
+    return calls
+
+
+async def _at_next_block(app):
+    """A batch resumed at the walltime gate (the user's yes covers the NEXT block) while row 1 still runs."""
+    from hpc_bridge import batch, server
+
+    app.facility.fresh_ueps = True
+    out = await _start(app, n=6)
+    runner = app.batches[out.batch_id].runner
+    runner.futures[0].finish(_ok_report(0, remaining_s=80.0))
+    await batch.tick(app, out.batch_id)
+    res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
+    assert res.phase in ("admitting", "waiting")
+    run = app.batches[out.batch_id]
+    assert run.next_block
+    return out, run, runner
+
+
+async def _restart(app, *, mep: bool = False, workers: int = 3, runner=None):
+    """The server is killed: a new process on the same state dir (its own pid; the old one dead), a block confirmed for
+    interactive work in the new session, its runner built on the reconnect."""
+    from hpc_bridge.ledger import Ledger, Owner
+
+    app.ledger.close()
+    app2, rt2, runner2 = await _batch_app(mep=mep, workers=workers, runner=runner)
+    app2.batch_owner = _owner(pid=os.getpid() + 100_000, host=Owner.here().host)
+    app2.ledger = Ledger.open()
+    app2.ledger.pid_alive = lambda pid: pid != os.getpid()
+    app2.ledger.lease_stale_s = 0.0
+    rt2.runner = runner2
+    return app2, rt2, runner2
+
+
+async def test_a_drain_withdraws_the_next_block():
+    """S1. cancel(drain) admits nothing more: a drained batch must not go on to confirm (and start) the next block."""
+    from hpc_bridge import batch, server
+
+    app, rt, _runner = await _batch_app(remaining_s=150.0, workers=3)
+    out, run, runner = await _at_next_block(app)
+    calls = _count_switches(run)
+    c = await server._cancel(app, out.batch_id, "drain")
+    assert c.status == "draining" and not run.next_block
+    runner.futures[1].finish(_ok_report(1, remaining_s=70.0))      # the last row out on the old block finishes
+    await batch.tick(app, out.batch_id)
+    assert calls == [], "a drained batch asked for (and started) a new billed block"
+    assert app.shapes["compute"] is rt
+
+
+async def test_a_refused_stop_withdraws_the_next_block():
+    """S1. stop_endpoint refused (a row holds the block): the user asked to STOP spending. When that row finishes, the
+    batch must not drop the shape and confirm a fresh block by itself."""
+    from hpc_bridge import batch, server
+
+    app, rt, _runner = await _batch_app(remaining_s=150.0, workers=3)
+    out, run, runner = await _at_next_block(app)
+    calls = _count_switches(run)
+    st = await server._stop_endpoint(app)
+    assert st.status == "up" and out.batch_id in (st.notice or "")   # refused: the row holds the block
+    runner.futures[1].finish(_ok_report(1, remaining_s=70.0))
+    await batch.tick(app, out.batch_id)
+    assert calls == [] and app.shapes["compute"] is rt, "after a stop the batch confirmed a new billed block by itself"
+
+
+async def test_a_mep_abort_marker_is_never_a_submit_to_an_unconfirmed_block():
+    """S2. On a MEP the CANCELLED marker is a TASK. Once the block's spend is no longer confirmed (it idled out, was
+    reaped), that task would revive the user endpoint and start a block nobody confirmed (#204's pattern): it is never
+    sent, and the answer says the tasks out were not reached."""
+    from hpc_bridge import batch, server, warmth
+
+    app, rt, runner = await _batch_app(mep=True, workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=1)
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.counts(out.batch_id)["submit_unknown"] == 1
+    warmth._mark_reaped(app, rt, "the facility idle-released the block", None)
+    sent = len(runner.commands)
+    c = await server._cancel(app, out.batch_id, "abort")
+    assert len(runner.commands) == sent, f"abort submitted {runner.commands[sent:]!r} to an unconfirmed MEP block"
+    assert "not written" in (c.notice or "") and "kills its command" not in (c.notice or ""), c.notice
+
+
+async def test_a_mep_abort_sends_one_marker_task_at_most():
+    """S2. On a live, confirmed MEP block with a worker to spare the marker is one small task — and only one: an abort
+    called again while it is out sends no other."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(mep=True, workers=3)          # capacity 2: a worker kept free
+    out = await _start(app, n=4)
+    await server._cancel(app, out.batch_id, "abort")
+    await server._cancel(app, out.batch_id, "abort")
+    markers = [c for c in runner.commands if batch.CANCEL_MARKER in c and "HPCB_MARKED" in c]
+    assert len(markers) == 1, markers
+
+
+async def test_a_stop_with_an_unknown_submit_is_draining_and_names_it(monkeypatch):
+    """S3. A submit error leaves the row submit_unknown: the POST may have reached the service (S4), so the task may be
+    queued, and the endpoint can start a block for it. The stop is never `down` while one exists: `draining`, naming
+    the batch and what settles it."""
+    from hpc_bridge import batch, server
+    from hpc_bridge.models import ShellOutcome
+
+    app, _rt, runner = await _batch_app(workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=1)
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.counts(out.batch_id)["submit_unknown"] == 1
+    note = batch.unknown_note(app)
+    assert note is not None and out.batch_id in note
+
+    async def fake_run_shell(a, command, session_id="default", shape="compute", **_kw):
+        return ShellOutcome(phase="complete", exit_code=0, stdout="released 101\n", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", fake_run_shell)
+    st = await server._stop_endpoint(app)
+    assert st.status == "draining" and out.batch_id in (st.notice or "") and not st.spend_stopped, st
+
+
+async def test_a_mep_stop_names_an_unknown_submit():
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(mep=True, workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=1)
+    await batch.tick(app, out.batch_id)
+    st = await server._stop_endpoint(app)
+    assert st.status == "draining" and out.batch_id in (st.notice or "") and "unknown" in (st.notice or ""), st
+
+
+async def test_an_unknown_submit_its_task_groups_never_listed_settles_lost_and_is_never_resent(monkeypatch):
+    """S3 / L4: a non-idempotent submit_unknown row has a path to settle — once the batch's task groups, read well after
+    the failed submit, list no task of ours the ledger does not know, the POST never reached the service: the row is
+    `lost` on that evidence (never sent again: it is not idempotent)."""
+    from hpc_bridge import batch
+
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, runner = await _batch_app(workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=2)
+    runner.futures[1].finish(_ok_report(1))
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["state"] == "submit_unknown"
+    clock[0] += batch.UNKNOWN_SETTLE_S + 1
+    await batch.tick(app, out.batch_id)
+    t = app.ledger.task(out.batch_id, 0)
+    assert t["state"] == "lost" and "never reached" in (t["settled_by"] or ""), t
+    assert sum("/tasks/0/attempt-" in c for c in runner.commands) == 1
+
+
+async def test_reap_release_never_cancels_the_new_confirmed_block_on_the_same_user_endpoint(monkeypatch):
+    """S4. On an SSH endpoint without fresh user endpoints, the block confirmed after a reap goes to the SAME user
+    endpoint (the same config): its pilot carries the same uep.<eid>.<uep id> marker. The release must not scancel the
+    block the user just confirmed."""
+    from hpc_bridge import batch, server
+
+    cmds: list[str] = []
+    monkeypatch.setattr(batch, "login_runner", _login_fake(cmds, released="20"))
+    clock = [10_000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, rt, _runner = await _batch_app(workers=3)
+    app.facility.fresh_ueps = False
+    out = await _start(app, n=4)
+    h0 = batch.uec_hash(rt)
+    run = app.batches[out.batch_id]
+    clock[0] += 60
+    await batch.tick(app, out.batch_id)                      # sacct: CANCELLED -> reap, old_uep recorded
+    assert run.old_uep == _UEP
+    res = await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
+    assert batch.uec_hash(app.shapes["compute"]) == h0       # the same config: the same user endpoint
+    cmds.clear()
+    clock[0] += 20
+    await batch.tick(app, out.batch_id)
+    assert not any("scancel" in c and _UEP in c for c in cmds), (
+        f"the release scancels the user endpoint the user's yes just asked a block of ({res.phase})")
+
+
+async def test_the_reaped_user_endpoint_is_released_without_a_status_call(monkeypatch):
+    """S5. Between the reap and the user's yes (when the relaunched, unconfirmed pilot bills), the background loop
+    keeps releasing the reaped user endpoint's pilots for its window — no status or cancel call needed."""
+    import asyncio
+
+    from hpc_bridge import batch
+
+    cmds: list[str] = []
+    monkeypatch.setattr(batch, "login_runner", _login_fake(cmds))
+    monkeypatch.setattr(batch, "TICK_S", 0.01)
+    monkeypatch.setattr(batch, "IDLE_TICK_S", 0.01)
+    monkeypatch.setattr(batch, "RELEASE_EVERY_S", 0.0)
+    app, _rt, _runner = await _batch_app(workers=3)
+    out = await _start(app, n=4)
+    run = app.batches[out.batch_id]
+    app.ledger._con.execute("update task set admitted_at = admitted_at - 600 where batch_id = ?", (out.batch_id,))
+    app.batch_autoloop = True
+    batch._start_loop(app, run)
+    try:
+        for _ in range(100):
+            await asyncio.sleep(0.02)
+            if run.loop.done():
+                break
+        assert run.old_uep == _UEP
+        assert not (run.loop.done() and batch._now() < run.old_uep_until), (
+            "the loop exited at the reap pause: the old user endpoint's relaunched pilot is released only if someone "
+            "happens to call status/cancel")
+        assert sum("scancel" in c and _UEP in c for c in cmds) >= 2
+    finally:
+        run.loop.cancel()
+
+
+async def test_abort_after_a_restart_does_not_claim_a_marker_it_never_wrote():
+    """S6. After a restart on a MEP the batch has no runner on a confirmed block of its own: the marker cannot be
+    written, and the answer says so — never that the wrappers see it."""
+    from hpc_bridge import server
+
+    app, _rt, _runner = await _batch_app(mep=True, workers=3)
+    out = await _start(app, n=4)
+    app2, _rt2, runner2 = await _restart(app, mep=True)
+    c = await server._cancel(app2, out.batch_id, "abort")
+    wrote = any("CANCELLED" in cmd for cmd in runner2.commands)
+    assert c.in_flight == 2 and not wrote
+    assert "sees the CANCELLED marker" not in (c.notice or "") and "not written" in (c.notice or ""), c.notice
+
+
+async def test_a_one_worker_mep_block_gets_no_marker_task_and_says_so():
+    """S6. On a one-worker MEP block the batch's task holds the only worker: a marker task would wait behind the very
+    row it is meant to end. None is sent; the answer says the row runs to its end."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(mep=True, workers=1)
+    out = await _start(app, n=3)
+    c = await server._cancel(app, out.batch_id, "abort")
+    assert not any(batch.CANCEL_MARKER in cmd and "HPCB_MARKED" in cmd for cmd in runner.commands)
+    assert c.status == "draining" and "one worker" in (c.notice or "") and "not written" in (c.notice or ""), c.notice
+
+
+async def test_restart_does_not_resume_without_confirm_spend():
+    """S7 (rule 4). A batch whose server died while admitting: run_batch(batch_id=…) WITHOUT confirm_spend must not
+    resume it, even when the new session has a confirmed block for interactive work."""
+    from hpc_bridge import batch, server
+
+    app, _rt, first = await _batch_app()
+    out = await _start(app, n=6)
+    app2, _rt2, runner2 = await _restart(app)
+    runner2.rest = {f.task_id: ("success", _ok_report(i)) for i, f in enumerate(first.futures)}  # rows 0, 1 finished
+    res = await server._run_batch(app2, batch_id=out.batch_id)   # no confirm_spend
+    await batch.tick(app2, out.batch_id)
+    assert not runner2.futures, f"resumed after a restart without the user's yes ({res.phase}: {res.notice})"
+    assert res.phase == "needs_confirmation" and "restart" in (res.reason or ""), res
+
+
+async def test_mep_cancel_after_a_stop_still_names_the_draining_block():
+    """S8. On a MEP the stop leaves the block draining (no cancel channel): a cancel after it must still name it in
+    blocks_left — never `down` with nothing left billing."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(mep=True, workers=3)
+    out = await _start(app, n=6)
+    await server._cancel(app, out.batch_id, "drain")
+    for i, f in enumerate(list(runner.futures)):
+        f.finish(_ok_report(i))
+    await batch.tick(app, out.batch_id)
+    st = await server._stop_endpoint(app)
+    assert st.status == "draining", st
+    c = await server._cancel(app, out.batch_id, "drain")
+    assert c.blocks_left and any(b.job_id == "101" for b in c.blocks_left), c
+
+
+async def test_a_block_a_switch_left_is_named_in_blocks_left_and_banked_to_its_end():
+    """S8. The next-block switch drops the old block's shape; that block runs out its last minutes on its own. A cancel
+    names it in blocks_left, and its spend is banked to its end, not only to the switch."""
+    from hpc_bridge import batch, server
+
+    app, rt, _runner = await _batch_app(remaining_s=150.0, workers=3)
+    out, run, runner = await _at_next_block(app)
+    runner.futures[1].finish(_ok_report(1, remaining_s=70.0))
+    await batch.tick(app, out.batch_id)
+    assert app.shapes["compute"] is not rt                             # switched
+    assert rt.spend_accrued > 0
+    c = await server._cancel(app, out.batch_id, "drain")
+    assert any(b.job_id == "101" for b in c.blocks_left), c.blocks_left
+
+
+async def test_cancel_runs_under_the_heartbeat_and_status_and_cancel_are_bounded(monkeypatch):
+    """(Plausible.) cancel keeps the client's progress heartbeat as status does, and one call of either stays inside
+    its budget however long a pass's steps could take: the long ones are left to the background loop."""
+    import asyncio
+
+    from hpc_bridge import batch, server
+
+    used: list[str] = []
+
+    async def spy(ctx, work, label):
+        used.append(label)
+        return await work
+
+    monkeypatch.setattr(server, "_heartbeat", spy)
+    app, _rt, _runner = await _batch_app()
+    out = await _start(app, n=4)
+    ctx = SimpleNamespace(request_context=SimpleNamespace(lifespan_context=app))
+    await server.cancel_tool(ctx, out.batch_id, "drain")
+    assert "cancel" in used
+
+    async def slow_switch(app_, run):
+        await asyncio.sleep(30)
+
+    monkeypatch.setattr(batch, "CALL_BUDGET_S", 1.0)
+    monkeypatch.setattr(batch, "_maybe_switch", slow_switch)
+    app2, _rt2, _runner2 = await _batch_app()
+    out2 = await _start(app2, n=4)
+    t0 = time.monotonic()
+    await server._status(app2, out2.batch_id)
+    assert time.monotonic() - t0 < 5
+
+
+# ---- review round 1 (651c5bc): the ledger and the wrapper -------------------------------------------------------------
+
+_END = str(int(time.time()) + 900)
+_ENV = {"SLURM_JOB_ID": "101", "SLURM_JOB_END_TIME": _END}
+
+
+class _BashRunner(_BatchRunner):
+    """Runs each submitted script locally, the way ShellFunction would (brace-escaped, then .format(), then bash) — at
+    once (`live=False`) or in a thread, its future finishing when the script exits (`live=True`)."""
+
+    def __init__(self, home, *, live: bool = False, **kw):
+        super().__init__(**kw)
+        self.live = live
+        self.env = {"PATH": os.environ["PATH"], "HOME": str(home), "TMPDIR": str(home), **_ENV}
+
+    def submit(self, command):
+        from hpc_bridge.runner import _escape_for_shellfunction
+
+        fut = super().submit(command)
+        script = _escape_for_shellfunction(command).format()
+
+        def run():
+            p = subprocess.run([_BASH, "-c", script], capture_output=True, text=True, env=self.env, timeout=120)
+            fut.finish(_Res(p.returncode, p.stdout, p.stderr))
+
+        if self.live:
+            threading.Thread(target=run, daemon=True).start()
+        else:
+            run()
+        return fut
+
+
+def _canary():
+    return CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.4.0", worker_job="101",
+                        worker_remaining_s=900.0)
+
+
+def _bash(script, tmp, timeout=60):
+    env = {"PATH": os.environ["PATH"], "HOME": str(tmp), "TMPDIR": str(tmp), **_ENV}
+    return subprocess.run([_BASH, "-c", script], capture_output=True, text=True, env=env, timeout=timeout)
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+async def test_a_second_batch_into_the_same_results_dir_runs_its_rows(tmp_path):
+    """L1. The attempt claim is scoped by the batch id: a second batch in the same results_dir runs its rows (it was
+    wedged in submit_unknown, every claim read as a duplicate)."""
+    from hpc_bridge import batch, server
+
+    runner = _BashRunner(tmp_path, canary=_canary())
+    app, _rt, _ = await _batch_app(runner=runner)
+    rd = str(tmp_path / "out")
+    a = await server._run_batch(app, command="echo one {x}", rows=[{"x": 0}, {"x": 1}], task_walltime_s=60,
+                                results_dir=rd)
+    for _ in range(3):
+        await batch.tick(app, a.batch_id)
+    assert app.ledger.counts(a.batch_id)["done"] == 2
+    b = await server._run_batch(app, command="echo two {x}", rows=[{"x": 0}, {"x": 1}], task_walltime_s=60,
+                                results_dir=rd)
+    for _ in range(3):
+        await batch.tick(app, b.batch_id)
+    c = app.ledger.counts(b.batch_id)
+    assert c["done"] == 2, c
+    assert b.results_dir == f"{rd}/{b.batch_id}"
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+async def test_an_old_cancel_marker_does_not_cancel_a_new_batch_in_the_same_dir(tmp_path):
+    """L1. An aborted batch's CANCELLED marker is its own: a later batch in the same results_dir runs."""
+    from hpc_bridge import batch, server
+
+    runner = _BashRunner(tmp_path, canary=_canary())
+    app, _rt, _ = await _batch_app(runner=runner)
+    rd = tmp_path / "out"
+    (rd).mkdir()
+    (rd / batch.CANCEL_MARKER).touch()                                   # a marker at the old, unscoped place
+    a = await server._run_batch(app, command="true", rows=[1], task_walltime_s=60, results_dir=str(rd))
+    (Path(a.results_dir) / batch.CANCEL_MARKER).touch()                  # and the batch's own: a's alone
+    b = await server._run_batch(app, command="echo {row}", rows=[7], task_walltime_s=60, results_dir=str(rd))
+    for _ in range(3):
+        await batch.tick(app, b.batch_id)
+    assert app.ledger.counts(b.batch_id)["done"] == 1
+
+
+@pytest.mark.skipif(_BASH is None or os.geteuid() == 0, reason="needs bash, and a user a chmod binds")
+async def test_an_unwritable_results_dir_fails_the_row_with_its_cause(tmp_path):
+    """L1. A claim that fails for any reason but an existing attempt (EACCES here; ENOSPC, EDQUOT on a full disk) fails
+    the row with that cause — it is no duplicate, and an idempotent row is not sent again and again."""
+    from hpc_bridge import batch, server
+
+    runner = _BashRunner(tmp_path, canary=_canary())
+    app, _rt, _ = await _batch_app(runner=runner)
+    out = await server._run_batch(app, command="echo {x}", rows=[{"x": 0}], task_walltime_s=60,
+                                  results_dir=str(tmp_path / "out"), idempotent=True)
+    d = Path(out.results_dir) / "tasks" / "0"
+    d.mkdir(parents=True, exist_ok=True)
+    d.chmod(0o555)
+    try:
+        for _ in range(6):
+            await batch.tick(app, out.batch_id)
+        sends = sum("/tasks/0/attempt-" in c for c in runner.commands)
+        t = app.ledger.task(out.batch_id, 0)
+        assert sends == 1 and t["state"] == "failed", (sends, t["state"], t["attempt"])
+        assert "Permission denied" in (t["settled_by"] or "") + (t["evidence"] or ""), t
+    finally:
+        d.chmod(0o755)
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_too_little_free_space_is_found_before_the_claim(tmp_path):
+    """L1. The free-space check comes before the claim: a full disk fails the row (rc 75) without leaving an attempt
+    directory that a retry would read as a duplicate."""
+    from hpc_bridge import batch
+
+    rd = tmp_path / "rd"
+    s = batch.task_script("echo hi", results_dir=str(rd), index=0, attempt=1, task_walltime_s=30,
+                          min_free_mb=10 ** 9)
+    r = batch.parse_result(_bash(s, tmp_path).stdout)
+    assert r is not None and r.no_space and r.rc == batch.NO_SPACE_RC
+    assert not (rd / "tasks" / "0" / "attempt-1").exists()
+
+
+async def test_the_sdk_result_watcher_quitting_keeps_the_rows_in_flight(monkeypatch):
+    """L2. SDK 4.18's "SDK thread quit unexpectedly." (its AMQP thread gave up: a laptop asleep, a network down) is set
+    on every open future — the tasks themselves run on in the block. No row is failed on it and no slot refilled: the
+    runner is rebuilt, and the results are recovered by REST."""
+    from hpc_bridge import batch
+
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, runner = await _batch_app(workers=3)                     # capacity 2
+    out = await _start(app, n=6)
+    first = list(runner.futures)
+    for f in first:
+        f.fail(RuntimeError("SDK thread quit unexpectedly."))
+    await batch.tick(app, out.batch_id)
+    c = app.ledger.counts(out.batch_id)
+    assert c["failed"] == 0 and c["in_flight"] == 2 and len(runner.futures) == 2, (c, len(runner.futures))
+    runner.rest[first[0].task_id] = ("success", _ok_report(0))
+    clock[0] += batch.REST_EVERY_S + 1
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["state"] == "done"
+    assert len(runner.futures) == 3                                    # the freed slot, refilled once, on a result
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+@pytest.mark.parametrize("value", ["$(touch {m})", "a;touch {m}", "`touch {m}`", "a\ntouch {m}",
+                                   "$'\\x41'; touch {m}", "\" ; touch {m} ; \"", "' ; touch {m} ; '", "{y}"])
+def test_a_row_value_never_runs_as_code(tmp_path, value):
+    """L3 (security). A row value reaches the command as data, never as shell: it is passed in an environment variable
+    and the placeholder becomes a reference to it, whatever the value holds — command substitution, a separator,
+    backticks, a newline, ANSI-C quoting, quotes, or another placeholder's name."""
+    from hpc_bridge import batch
+
+    m = tmp_path / "pwned"
+    row = {"x": value.replace("{m}", str(m)), "y": f"$(touch {m})"}
+    names = {"x", "y", "index"}
+    cmd = batch.substitute("printf '%s|' {x}", row, 0, names)
+    s = batch.task_script(cmd, results_dir=str(tmp_path / "rd"), index=0, attempt=1, task_walltime_s=30,
+                          fields=batch.row_values(row, 0, names))
+    r = batch.parse_result(_bash(s, tmp_path).stdout)
+    assert not m.exists(), cmd
+    assert r is not None and r.rc == 0 and r.tail == row["x"] + "|", (r and r.tail)
+
+
+@pytest.mark.parametrize("template", ['echo "{x}"', "echo '{x}'", "cat <<EOF\n{x}\nEOF", "echo $'{x}'",
+                                      'echo "a $(echo {x})"', "cat <<-'X'\n\t{x}\n\tX"])
+def test_a_placeholder_inside_quotes_or_a_heredoc_is_refused(template):
+    """L3. A placeholder inside quotes or a here-document is refused, saying how to write it (bare: each value reaches
+    the command as one word)."""
+    from hpc_bridge import batch
+
+    with pytest.raises(batch.BatchRefusal, match="bare"):
+        batch.validate(template, [{"x": 1}], 10)
+
+
+def test_braces_that_are_no_placeholder_are_left_as_written():
+    from hpc_bridge import batch
+
+    t = "echo ${HOME} out_{x}.txt '{print $1}' \"{other}\" \\{x}; cat <<EOF\n{other}\nEOF\necho {x}"
+    cmd, _rows, _wall, names = batch.validate(t, [{"x": 1}], 10)
+    got = batch.substitute(cmd, {"x": 1}, 0, names)
+    assert got == ("echo ${HOME} out_\"$HPCB_F_x\".txt '{print $1}' \"{other}\" \\{x}; cat <<EOF\n{other}\nEOF\n"
+                   "echo \"$HPCB_F_x\"")
+
+
+async def test_mep_restart_presumption_still_runs_so_stop_is_not_refused_forever(monkeypatch):
+    """L4. After a restart on a MEP, the presumption counts from the ledger's record that a block was seen (this process
+    never saw one): the rows in flight are presumed lost in time, and a stop is no longer refused for good."""
+    from hpc_bridge import batch, server
+
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, _runner = await _batch_app(mep=True, workers=3)          # capacity 2, block 101 seen by the canary
+    out = await _start(app, n=4)
+    app2, _rt2, _runner2 = await _restart(app, mep=True)               # the service still lists both as pending
+    clock[0] += 60 + batch.PRESUME_GRACE_S + 3600
+    await server._status(app2, out.batch_id)
+    await server._cancel(app2, out.batch_id, "abort")
+    for _ in range(3):
+        clock[0] += 60
+        await batch.tick(app2, out.batch_id)
+    assert batch.in_flight_note(app2) is None, app2.ledger.counts(out.batch_id)
+
+
+class _NoIdYet(_BatchRunner):
+    """The SDK has queued the submit but its batch_run answer (task id, task group) has not come back yet."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.task_group_id = None
+
+    def submit(self, command):
+        fut = super().submit(command)
+        self.group_tasks.remove(fut.task_id)
+        fut.task_id = None
+        return fut
+
+
+async def test_ssh_restart_before_the_first_answer_does_not_wedge_rows_in_flight(monkeypatch):
+    """L4. The server died before the service's first answer: no task id, no task group. Those rows still have a path —
+    presumed lost once task_walltime_s + the grace have passed since a block was seen."""
+    from hpc_bridge import batch, server
+
+    cmds: list[str] = []
+    monkeypatch.setattr(batch, "login_runner", _login_fake(cmds, sacct="RUNNING"))
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, _ = await _batch_app(workers=3, runner=_NoIdYet(canary=_canary()))
+    out = await _start(app, n=4)                                         # the server dies within its first 2 s
+    app2, _rt2, _runner2 = await _restart(app)
+    await server._status(app2, out.batch_id)
+    await server._cancel(app2, out.batch_id, "abort")
+    for _ in range(4):
+        clock[0] += 3600
+        await batch.tick(app2, out.batch_id)
+    assert batch.in_flight_note(app2) is None, app2.ledger.counts(out.batch_id)
+
+
+async def test_ssh_evidence_after_a_restart_settles_rows_this_process_never_sent(monkeypatch):
+    """L4. SSH evidence reads the ledger's rows, not this process's futures: after a restart, sacct saying the job they
+    were sent to ended settles them lost on that evidence."""
+    from hpc_bridge import batch, server
+
+    cmds: list[str] = []
+    monkeypatch.setattr(batch, "login_runner", _login_fake(cmds, sacct="CANCELLED"))
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, _runner = await _batch_app(workers=3)
+    out = await _start(app, n=4)
+    app2, _rt2, _runner2 = await _restart(app)
+    clock[0] += 120
+    await server._status(app2, out.batch_id)
+    await batch.tick(app2, out.batch_id)
+    rows = app2.ledger.tasks(out.batch_id, states=("lost",))
+    assert len(rows) == 2 and all("job 101" in (r["settled_by"] or "") for r in rows), rows
+    assert any("-j 101" in c for c in cmds)
+
+
+async def test_submit_unknown_is_not_resent_while_its_copy_in_an_old_group_is_pending():
+    """L5. Reconciliation reads EVERY task group the batch used: an idempotent submit_unknown row is not sent again
+    while its first copy, in the old runner's group, may still run."""
+    from hpc_bridge import batch
+
+    app, rt, runner = await _batch_app(workers=3)                       # capacity 2
+    made = []
+
+    def factory(eid, user_endpoint_config=None, **_kw):
+        r = _BatchRunner(canary=runner._canary)
+        made.append(r)
+        return r
+
+    app.runner_factory = factory
+    out = await _start(app, n=6, idempotent=True)
+    first = app.batches[out.batch_id].runner
+    f0 = first.futures[0]
+    f0.task_id = None                                                   # the POST's answer was lost: S4
+    app.ledger._con.execute("update task set task_id = null where batch_id = ? and idx = 0", (out.batch_id,))
+    f0.fail(ConnectionError("the response to the batch_run POST was lost"))   # yet the task IS in first's group
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["state"] == "submit_unknown"
+    rt.user_endpoint_config["hpcb_block"] = 42                           # a new confirmation (reap + yes, next block)
+    first.futures[1].finish(_ok_report(1))
+    for _ in range(3):
+        await batch.tick(app, out.batch_id)
+    second = app.batches[out.batch_id].runner
+    assert second is not first
+    assert not any("/tasks/0/attempt-2" in c for c in second.commands), "row 0 resent while its first copy may run"
+    assert set(app.ledger.task_groups(out.batch_id)) == {first.task_group_id, second.task_group_id}
+
+
+async def test_the_next_block_waits_for_an_unknown_submit():
+    """L5. The switch to the next block waits for a submit of unknown fate on the block in front, as for a task out."""
+    from hpc_bridge import batch, server
+
+    app, rt, runner = await _batch_app(remaining_s=150.0, workers=3)
+    app.facility.fresh_ueps = True
+    runner.fail_submit_of = {1}
+    out = await _start(app, n=6)
+    await batch.tick(app, out.batch_id)
+    runner.futures[0].finish(_ok_report(0, remaining_s=80.0))
+    await batch.tick(app, out.batch_id)
+    await server._run_batch(app, batch_id=out.batch_id, confirm_spend=True)
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.counts(out.batch_id)["submit_unknown"] == 1
+    assert app.shapes["compute"] is rt, "switched blocks under a submit of unknown fate"
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_a_backgrounded_child_does_not_hold_the_task_past_its_walltime(tmp_path):
+    """L6. A command that leaves a background child holding its stdout: the task still ends with its command (the
+    child, of the command's own process group, is ended with it) and prints its result line."""
+    from hpc_bridge import batch
+
+    s = batch.task_script("sleep 25 & echo started", results_dir=str(tmp_path / "rd"), index=0, attempt=1,
+                          task_walltime_s=2)
+    t0 = time.monotonic()
+    r = batch.parse_result(_bash(s, tmp_path).stdout)
+    assert r is not None and r.rc == 0 and r.tail == "started\n" and time.monotonic() - t0 < 12, time.monotonic() - t0
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_the_stderr_tail_is_the_streams_real_end_past_the_cap(tmp_path):
+    """L6. stderr's tail past the cap is the stream's real end, as stdout's is — not the head's last kilobyte."""
+    from hpc_bridge import batch
+
+    s = batch.task_script("head -c 1500000 /dev/zero | tr '\\0' y >&2; echo >&2; echo FINAL-ERROR >&2; exit 2",
+                          results_dir=str(tmp_path / "rd"), index=0, attempt=1, task_walltime_s=30)
+    r = batch.parse_result(_bash(s, tmp_path).stdout)
+    assert r is not None and r.rc == 2 and r.stderr_tail.endswith("FINAL-ERROR\n"), r and r.stderr_tail[-40:]
+
+
+def test_a_reused_pid_does_not_hold_a_dead_servers_lease_forever(tmp_path):
+    """L7. The lease's identity carries the holder's process start time: a dead server's pid handed on to another
+    process does not hold the lease."""
+    from hpc_bridge.ledger import Ledger, Owner
+
+    led = Ledger.open(tmp_path / "state")
+    here = Owner.here()
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    led.add_batch("batch-0000000000aa", command="echo {x}", rows=[{"x": 1}], task_walltime_s=60, capacity=1,
+                  results_dir="/scratch/x", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
+                  owner=Owner(here.host, dead.pid, started="started-an-hour-ago"), now=time.time() - 3600)
+    squatter = subprocess.Popen(["sleep", "30"])                         # started an hour after the last heartbeat
+    try:
+        led._con.execute("update batch set owner_pid = ?", (squatter.pid,))   # the OS handed the dead pid on
+        assert led.take_lease("batch-0000000000aa", here).ok
+    finally:
+        squatter.kill()
+        squatter.wait()
+
+
+def test_a_dead_holder_recorded_under_another_hostname_is_taken_over(tmp_path):
+    """L7. The ledger is on a local disk: a holder recorded under a hostname that has since changed (macOS renames
+    itself on a new network; a container's name) is this machine's — dead, it is taken over."""
+    from hpc_bridge.ledger import Ledger, Owner
+
+    led = Ledger.open(tmp_path / "state")
+    dead = subprocess.Popen(["true"])
+    dead.wait()
+    led.add_batch("batch-0000000000ab", command="true", rows=[1], task_walltime_s=60, capacity=1,
+                  results_dir="/scratch/x", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
+                  owner=Owner("old-name.local", dead.pid), now=time.time() - 3600)
+    assert led.take_lease("batch-0000000000ab", Owner.here()).ok
+    live = subprocess.Popen(["sleep", "30"])
+    try:
+        led.add_batch("batch-0000000000ac", command="true", rows=[1], task_walltime_s=60, capacity=1,
+                      results_dir="/scratch/x", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
+                      owner=Owner("old-name.local", live.pid), now=time.time() - 3600)
+        assert not led.take_lease("batch-0000000000ac", Owner.here()).ok   # alive: never taken
+    finally:
+        live.kill()
+        live.wait()
+
+
+async def test_wait_s_waits_when_nothing_changes():
+    """L8. status(wait_s) waits for something to change — a row settling, the phase — or until wait_s is up; a pass
+    that changed nothing does not end it."""
+    import asyncio
+
+    from hpc_bridge import batch, server
+
+    app, _rt, _runner = await _batch_app()
+    out = await _start(app, n=4)
+    app.batch_autoloop = True
+    batch._start_loop(app, app.batches[out.batch_id])
+    await asyncio.sleep(0.1)
+    try:
+        t0 = time.monotonic()
+        await server._status(app, out.batch_id, wait_s=4)
+        took = time.monotonic() - t0
+    finally:
+        app.batches[out.batch_id].loop.cancel()
+    assert took >= 3.5, f"status(wait_s=4) returned after {took:.1f} s with nothing settled"
+
+
+async def test_wait_s_returns_when_a_row_settles():
+    import asyncio
+
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app()
+    out = await _start(app, n=4)
+    app.batch_autoloop = True
+    batch._start_loop(app, app.batches[out.batch_id])
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.5, lambda: runner.futures[0].finish(_ok_report(0)))
+    try:
+        t0 = time.monotonic()
+        st = await server._status(app, out.batch_id, wait_s=20)
+        took = time.monotonic() - t0
+    finally:
+        app.batches[out.batch_id].loop.cancel()
+    assert st.counts.done == 1 and took < 5, (took, st.counts)
