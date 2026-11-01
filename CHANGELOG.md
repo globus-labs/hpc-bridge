@@ -11,34 +11,53 @@ installed plugin only when that version changes); git tags mark releases.
   the backlog in the server and sends at most `capacity` tasks at a time (the block's workers less one kept for
   interactive commands). It rides the block the user confirmed; no new spend semantics (vault
   `Planned/Batch and swarm execution.md`).
+  - **The template:** `{name}` for a row's field, written bare. Each value reaches the command as one word, as data:
+    it is passed in an environment variable (`HPCB_F_<name>`) and the placeholder becomes a reference to it, so
+    nothing in a value is ever read as shell. A placeholder inside quotes or a here-document is refused, saying how to
+    write it.
   - **The admission gate:** a row is sent only while the block's remaining walltime, read from inside the block
     (`SLURM_JOB_END_TIME`, `squeue %L`, PBS stime + walltime; the canary reports it too), covers `task_walltime_s`
     + 30 s. Past that, or when the block is reaped, stopped or the server restarts, the batch pauses at
     `needs_confirmation`; only `run_batch(batch_id=…, confirm_spend=True)` resumes it, and `status` never does. So
     no task waits at the interchange as a block ends, and parsl starts no block nobody confirmed (#204's pattern).
-  - **The wrapper** around each task claims `<results_dir>/tasks/<i>/attempt-<n>/` atomically (a retried POST that
-    ran a task twice exits early), checks free space, and caps each stream at 1 MB at the source. The result carries
-    a tail of the stream's real end and a pointer to the file, so a big output is no MaxResultSizeExceeded. The
-    wrapper also runs the command under its own timeout (rc 124) and kills it on the `CANCELLED` marker (rc 143).
+  - **The wrapper** around each task works in the batch's own directory, `<results_dir>/<batch id>/`. It checks free
+    space, then claims `tasks/<i>/attempt-<n>/` atomically: only an existing attempt is a duplicate (a retried POST
+    that ran a task twice exits early), and any other failure fails the row with the OS's own words. It caps each
+    stream at 1 MB at the source; the result carries a tail of each stream's real end and a pointer to the file, so a
+    big output is no MaxResultSizeExceeded. The wrapper runs the command under its own timeout (rc 124), kills its
+    process group on the batch's `CANCELLED` marker (rc 143), and ends what is left of that group when the command
+    exits, so a background child cannot hold the task past its walltime.
   - **The ledger** (`<state_dir>/ledger.sqlite3`, WAL, 0600, refused on a network filesystem) holds every row,
-    attempt and Globus task id. It holds the lease that makes one server the only admitter and collector (a takeover
-    needs a stale heartbeat and a dead pid on this host), and the configs a stop or a reap retired. A restarted server
+    attempt, Globus task id and task group. It holds the lease that makes one server the only admitter and collector
+    (a takeover needs a stale heartbeat and a holder that is gone: its pid dead, or handed on to a process started at
+    another time; the hostname is not trusted for it), and the configs a stop or a reap retired. A restarted server
     pulls what finished meanwhile by REST, with the raw `v2.get_task_batch` (`get_batch_result` drops failed tasks).
+    Taking a batch over, by `status` or by `run_batch(batch_id=…)`, pauses one that was admitting: only the user's yes
+    resumes it.
   - **Settling:** a result wins; `lost` needs evidence (ManagerLost, or sacct saying the block's job ended). On a
     facility MEP a task is `presumed_lost` only past a clock that starts at evidence a block started; it keeps its
-    slot and is never retried. A submit error leaves `submit_unknown`, reconciled against the batch's own task group;
-    only an `idempotent` row is ever sent again. After a reap on an SSH endpoint, parsl starts a pilot for the task
-    that was out on the dead block, and nobody confirmed it: for five minutes the batch cancels the reaped block's
-    user endpoint's pilots by that endpoint's own marker.
+    slot and is never retried; a dead server's rows in flight are presumed the same way, so a stop is never refused
+    for good. A submit error leaves `submit_unknown`, reconciled against every task group the batch's runners were
+    minted; only an `idempotent` row is ever sent again, and a row the service never received is `lost` on that
+    evidence. The SDK's own result channel failing ("SDK thread quit unexpectedly.") is no task result: the rows keep
+    their slots and are recovered by REST. After a reap on an SSH endpoint, parsl starts a pilot for the task that
+    was out on the dead block, and nobody confirmed it: for five minutes the background loop cancels the reaped
+    block's user endpoint's pilots by that endpoint's own marker — unless the user's yes went to that same user
+    endpoint.
   - **Crossing a block's walltime:** the user's yes at the pause covers the next block. Once the tasks out on the old
     block finish, a fresh block is confirmed on an endpoint hpc-bridge stood up (a new user endpoint). With nothing
-    left in the backlog, no block is asked for.
+    left in the backlog, no block is asked for. A pause, a drain, an abort or a stop withdraws that yes. The block left
+    behind is banked to its end and named in `blocks_left`.
   - **`cancel`:** `drain` keeps the backlog. `abort` cancels the backlog and ends the tasks in flight: their wrappers
-    see the marker and kill their commands. It never touches the session's block. `stop_endpoint` pauses every batch
-    under the lock first, and refuses while batch tasks are out, naming `cancel(id, 'abort')`.
+    see the marker and kill their commands. It never touches the session's block. On a facility MEP the marker is one
+    small task, sent only to the batch's confirmed, live block with a worker to spare; the answer says when the marker
+    could not be written, and that the tasks out then run to their end. `blocks_left` names every block of ours that
+    can still bill. `stop_endpoint` pauses every batch under the lock first, refuses while batch tasks are out (naming
+    `cancel(id, 'abort')`), and answers `draining`, naming the batch, while a submit of unknown fate may be queued.
+    `status(wait_s)` waits for a row to settle or the phase to change.
   - **`poll_task` takes a Globus task id:** a running answer carries `globus_task_id`, and an agent's command leaves
-    its rc and output tail in the session directory, so a result outlives the service's 30-minute window and a
-    restart.
+    its rc and output tail in the session directory. Once the service cannot answer for it, `poll_task` reads them
+    there over the login shape, so a result outlives the service's 30-minute window and a restart.
   - **Every Executor's task group is now the service's.** A new Executor no longer inherits the one an earlier
     Executor of the process adopted; two Executors on one group swallow each other's results (spike S1).
   - **Harness:** run_batch counts as a billed start, and the journal's event rows become `Trace.events`. A polling
