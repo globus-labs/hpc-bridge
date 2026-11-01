@@ -166,6 +166,89 @@ _RESET_WORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", 
                           "esac", ";;"})
 
 
+# Programs that read COMMANDS from their standard input whatever their operands (a value fed to one runs as code)
+_STDIN_ALWAYS = frozenset({"dc", "ed", "ex", "at", "batch", "crontab", "parallel", "ssh", "rsh", "sqlite3", "mysql",
+                           "psql", "gdb", "ftp", "expect", "m4", "octave", "gnuplot", "R", "su"})
+# Shells and interpreters: they read their program from standard input when given no script file
+_INTERPRETERS = ("python", "pypy", "perl", "ruby", "node", "nodejs", "Rscript", "php", "lua", "luajit", "tclsh",
+                 "wish", "julia", "osascript", "pwsh", "powershell", "deno", "bun")
+_STDIN_FILES = frozenset({"-", "/dev/stdin", "/dev/fd/0", "/proc/self/fd/0"})
+# their options that take the next word as an argument (so it is no script file)
+_OPT_ARG = frozenset({"-W", "-X", "-I", "-M", "-r", "--require", "-o", "+o", "-O", "+O", "-C", "--input-type"})
+# options that give the program in an argument (`-c` code, `-e` code, `-m` a module): standard input is then data
+_CODE_IN_ARG = frozenset({"-c", "-e", "-E", "-m", "-p", "--eval", "--print", "-r", "-command"})
+_WRAPPERS = frozenset({"env", "sudo", "doas", "timeout", "nice", "nohup", "exec", "command", "builtin", "stdbuf",
+                       "xargs", "srun", "mpirun", "mpiexec", "chrt", "taskset", "ionice", "setsid", "numactl",
+                       "strace", "ltrace", "valgrind", "unbuffer", "caffeinate"})
+_NUMERIC = re.compile(r"^[0-9][0-9.]*[smhd]?$|^0x[0-9a-fA-F]+$")
+_ASSIGN = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*=")
+# what `xargs` may run on stdin's items without this reader having to vouch for its options
+_XARGS_SAFE = frozenset({"echo", "printf", "rm", "rmdir", "ls", "cat", "wc", "grep", "egrep", "fgrep", "mkdir", "touch",
+                         "cp", "mv", "ln", "stat", "head", "tail", "gzip", "gunzip", "bzip2", "xz", "md5sum",
+                         "sha1sum", "sha256sum", "basename", "dirname", "readlink", "realpath", "du", "chmod",
+                         "true", "false", "uniq", "cut", "tr", "tee"})
+_XARGS_OPT_ARG = frozenset({"-I", "-L", "-n", "-P", "-s", "-d", "-E", "-a", "--arg-file", "--delimiter", "--max-args",
+                            "--max-procs", "--max-lines", "--max-chars"})
+
+
+def _is_shell_or_interp(n: str) -> bool:
+    return n in _SHELLS or any(n.startswith(p) for p in _INTERPRETERS)
+
+
+def _reads_code_from_stdin(words: list[str]) -> str | None:
+    """Why this simple command would read CODE from its standard input (a value piped or here-stringed into it runs),
+    or None. Errs toward saying it does: a shell or interpreter with no script file, `xargs` running one or a command
+    this reader cannot vouch for, `parallel`, `source /dev/stdin`, awk/sed `-f -`, and programs that read commands
+    from stdin whatever their operands (`dc`, `ed`, `at`, `ssh`, `sqlite3`…)."""
+    names = [_bare(w) for w in words]
+    paths = [w.replace("'", "").replace('"', "").replace("\\", "") for w in words]
+    for k, n in enumerate(names):
+        rest = names[k + 1:]
+        rest = [p if p in _STDIN_FILES else r for p, r in zip(paths[k + 1:], rest, strict=True)]
+        if n in _STDIN_ALWAYS:
+            return f"`{n}` reads commands from its standard input"
+        if n in ("source", ".") and rest and rest[0] in _STDIN_FILES:
+            return f"`{n} {rest[0]}` runs its standard input"
+        if (n in _AWK or n in _SED) and any(rest[j] == "-f" and j + 1 < len(rest) and rest[j + 1] in _STDIN_FILES
+                                            for j in range(len(rest))):
+            return f"`{n} -f -` reads its program from standard input"
+        if n == "xargs":
+            if any(_is_shell_or_interp(w) for w in rest):
+                return "`xargs` runs a shell or an interpreter on its standard input's items"
+            j = 0
+            while j < len(rest) and rest[j].startswith("-"):
+                j += 2 if rest[j] in _XARGS_OPT_ARG else 1
+            cmd = rest[j] if j < len(rest) else None
+            if cmd is not None and cmd not in _XARGS_SAFE:
+                return f"`xargs` runs `{cmd}` on its standard input's items, which this reader cannot vouch for"
+            return None
+        if _is_shell_or_interp(n):
+            j = 0
+            while j < len(rest) and (rest[j].startswith(("-", "+")) and rest[j] not in _STDIN_FILES):
+                if rest[j] in _CODE_IN_ARG or (n in _SHELLS and re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", rest[j])):
+                    return None   # its program is an argument (checked as such): standard input is data
+                if n in _SHELLS and re.fullmatch(r"-[A-Za-z]*s[A-Za-z]*", rest[j]):
+                    return f"`{n} -s` reads its program from standard input"
+                j += 2 if rest[j] in _OPT_ARG else 1
+            if j >= len(rest) or rest[j] in _STDIN_FILES:
+                return f"`{n}` with no script file reads its program from standard input"
+            return None
+    return None
+
+
+def _wrapper_slot(names: list[str]) -> str | None:
+    """The wrapper (`env`, `sudo`, `timeout`, `xargs`…) whose options or command the word being written would be — no
+    command word after its options yet — or None."""
+    last = max((k for k, n in enumerate(names) if n in _WRAPPERS), default=None)
+    if last is None:
+        return None
+    for w in names[last + 1:]:
+        if w.startswith("-") or _ASSIGN.match(w) or _NUMERIC.match(w):
+            continue
+        return None   # the wrapped command's own word is there: what follows is its argument
+    return names[last]
+
+
 def _bare(word: str) -> str:
     w = word.replace("'", "").replace('"', "").replace("\\", "")
     return w.rsplit("/", 1)[-1]
@@ -200,6 +283,13 @@ def _code_arg(words: list[str]) -> str | None:
             return f"in a `{n}` command, which hands its arguments to another shell as code"
     if "printf" in names and "-v" in names:
         return "in a `printf -v` command, whose variable name bash evaluates"
+    if "printf" in names:
+        k = len(names) - 1 - names[::-1].index("printf")
+        if "--" not in names[k + 1:] and all(w.startswith("-") for w in names[k + 1:]):
+            return "as printf's format (a value starting with `-v` would make printf assign a variable bash evaluates)"
+    if (w := _wrapper_slot(names)) is not None:
+        return (f"where `{w}` reads its options and the command it runs: a value there could be an option (`env -S …`) "
+                "or the command itself")
     if {"test", "["} & set(names) and ({"-v", "-R"} & set(names) or _ARITH_TEST & set(names)):
         return "in a `test` with an integer or variable-name operator, whose operands bash may evaluate"
     if "wait" in names and "-p" in names:
@@ -235,16 +325,22 @@ class _Frame:
     words: list[str] = field(default_factory=list)   # top / cmdsub: the current simple command's words so far
     wstart: int | None = None                        # …and where the word being read began
     marks: list[int] = field(default_factory=list)   # …and the placeholders it substitutes (checked once it ends)
+    stage: int = 0             # top / cmdsub: the current simple command's place in its pipeline (0: the first)
+    herestr: bool = False      # …and whether it has a here-string (`<<<`)
+    skip_word: bool = False    # …the next word is the here-string's data, not one of the command's words
+    feeds_from_outer: bool = False   # a `>(…)`: its program reads the enclosing command's output
 
 
-def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], str | None]:
+def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], str | None, set[str]]:
     """Read the template as bash does — conservatively. Returns, per placeholder start, None (substitute: a bare word
     of the outer shell, read as data) or "keep" (escaped or in a comment: left as written) or the reason it is refused;
-    and a reason the whole template is refused (None when it is not)."""
+    a reason the whole template is refused (None when it is not); and the names substituted where a value starting
+    with `-` could be read as an option (a word's start, no `--` before it in its command)."""
     n = len(t)
     stack: list[_Frame] = [_Frame("top")]
     escaped: set[int] = set()
     decisions: dict[int, str | None] = {}
+    exposed: set[str] = set()
     whole: str | None = None
     uncertain: str | None = None
     pending: list[tuple[str, bool, bool]] = []   # here-documents opened on this line: (delimiter, strip tabs, quoted)
@@ -255,22 +351,30 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
     def end_word(f: _Frame, i: int) -> None:
         if f.wstart is not None:
             w = t[f.wstart:i]
-            if not (not f.words and _bare(w) in _RESET_WORDS):
+            if f.skip_word:
+                f.skip_word = False
+            elif not (not f.words and _bare(w) in _RESET_WORDS):
                 f.words.append(w)
             if _bare(w) == "case" and f.kind == "cmdsub":
                 nonlocal uncertain
                 uncertain = uncertain or "a `case` inside `$(…)`, whose `)` this reader may take for the end"
             f.wstart = None
 
-    def close_cmd(f: _Frame, i: int) -> None:
+    def close_cmd(f: _Frame, i: int, *, pipe: bool = False) -> None:
         """The simple command ended: what only its whole words show (a `test` whose operator comes after the
-        placeholder) refuses the placeholders it substituted."""
+        placeholder; a pipeline stage or a here-string feeding a program that reads code from stdin) refuses the
+        placeholders it substituted — for stdin, every one before it in this frame (a loop or a group feeds a pipe
+        too)."""
         end_word(f, i)
         names = {_bare(w) for w in f.words}
         if f.marks and {"test", "["} & names and (_ARITH_TEST | {"-v", "-R"}) & names:
             for k in f.marks:
                 decisions[k] = "in a `test` with an integer or variable-name operator, whose operands bash may evaluate"
-        f.words, f.marks = [], []
+        if f.words and (f.stage > 0 or f.herestr) and (why := _reads_code_from_stdin(f.words)):
+            for k in [k for k, d in decisions.items() if d is None and f.start <= k < i]:
+                decisions[k] = f"fed to a program's standard input that it reads as code ({why})"
+        f.words, f.marks, f.herestr = [], [], False
+        f.stage = f.stage + 1 if pipe else 0
 
     def outer_words() -> list[str]:
         for f in reversed(stack):
@@ -296,11 +400,14 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
             elif plain(f) and uncertain:
                 decisions[i] = uncertain
             elif plain(f):
+                at_start = f.wstart is None
                 if f.wstart is None:
                     f.wstart = i
                 decisions[i] = _code_arg(f.words)
                 if decisions[i] is None:
                     f.marks.append(i)
+                    if at_start and "--" not in {_bare(w) for w in f.words}:
+                        exposed.add(m.group(1))
             else:
                 decisions[i] = "a place this reader cannot vouch for"
             i = m.end()
@@ -349,8 +456,14 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
                 i += 1
                 continue
             if f.kind == "cmdsub" and ch == ")" and f.depth == 0:
+                end_word(f, i)
+                reader = _reads_code_from_stdin(f.words) if f.feeds_from_outer and f.words else None
                 close_cmd(f, i)
                 stack.pop()
+                if reader:   # `cmd > >(sh)`: the enclosing command's output is that program's code
+                    parent = stack[-1]
+                    for k in [k for k, d in decisions.items() if d is None and parent.start <= k < i]:
+                        decisions[k] = f"fed to a program's standard input that it reads as code ({reader})"
                 i += 1
                 continue
             if f.kind == "arith" and ch == ")" and f.depth == 0 and t.startswith("))", i):
@@ -445,6 +558,18 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
                 decisions.setdefault(mm.start(), "keep")
             i = eol
             continue
+        if ch in "<>" and t.startswith("(", i + 1):
+            # a process substitution: a program may read its output as code (`sh <(…)`) — refused inside
+            end_word(f, i)
+            push("cmdsub", i + 2, "a process substitution, whose output a program may read as code")
+            stack[-1].feeds_from_outer = ch == ">"
+            i += 2
+            continue
+        if t.startswith("<<<", i):
+            end_word(f, i)
+            f.herestr = f.skip_word = True
+            i += 3
+            continue
         if ch == "<" and t.startswith("<<", i) and not t.startswith("<<<", i):
             end_word(f, i)
             j = i + 2
@@ -484,8 +609,10 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
             continue
         if ch in _BLANK:
             end_word(f, i)
+        elif ch == "&" and (t.startswith(">", i + 1) or t[i - 1:i] in (">", "<", "|")):
+            end_word(f, i)   # a redirection (`&>`, `>&`, `2>&1`) or the `&` of `|&`: no new command
         elif ch in ";&|()":
-            close_cmd(f, i)
+            close_cmd(f, i, pipe=ch == "|" and t[i + 1:i + 2] != "|" and t[i - 1:i] != "|")
             if ch == "(":
                 f.depth += 1
             elif ch == ")":
@@ -500,7 +627,7 @@ def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], s
             close_cmd(f, n)
     if len(stack) > 1 or pending:
         whole = whole or "its quotes, brackets or here-documents do not close where this reader can tell"
-    return decisions, whole
+    return decisions, whole, exposed
 
 
 def _refusal_text(name: str, why: str) -> str:
@@ -513,9 +640,9 @@ def _refusal_text(name: str, why: str) -> str:
                 f"`bash <<'EOF'` … `\"${v}\"`), or as an argument (`bash -c '… \"$1\" …' _ {{{name}}}`). Never hand a "
                 "value to eval, sh -c or an interpreter as code.")
     return (f"the command has {{{name}}} {why}: a row's value must stay data. Write it as a bare word of an ordinary "
-            f"command; for an inner program pass it as an argument (`bash -c '… \"$1\" …' _ {{{name}}}`) or read "
-            f"{v} from the environment there (a here-document with a quoted delimiter). Never hand a value to eval, sh "
-            "-c or an interpreter as code.")
+            f"command; for an inner program pass it as an argument (`bash -c '… \"$1\" …' _ {{{name}}}`), write it to "
+            f"a file and pass the file, or read {v} from the environment there (a here-document with a quoted "
+            "delimiter). Never hand a value to eval, sh -c, an interpreter's stdin or a wrapper's options as code.")
 
 
 def substitute(template: str, row: Any, index: int, names: set[str] | None = None) -> str:
@@ -528,7 +655,7 @@ def substitute(template: str, row: Any, index: int, names: set[str] | None = Non
     ShellFunction's `cmd.format()`."""
     fields = row_fields(row, index)
     use = set(fields) if names is None else names
-    decisions, whole = _template_decisions(template, use)
+    decisions, whole, _exposed = _template_decisions(template, use)
     if whole is not None:
         raise BatchRefusal(f"the command cannot be checked safe: {whole}. Never hand a row's value to eval, sh -c or "
                            "an interpreter as code; pass it as a bare word, an argument, or read from the environment "
@@ -548,6 +675,17 @@ def substitute(template: str, row: Any, index: int, names: set[str] | None = Non
         return f'"${FIELD_VAR}{name}"'
 
     return _FIELD.sub(one, template)
+
+
+def dash_rows(template: str, rows: list[Any], names: set[str]) -> list[int]:
+    """The rows whose value for a placeholder that starts a word (with no `--` before it in its command) begins with
+    `-`: a command may read it as an option. run_batch warns of them (a negative number as an option's argument is
+    legitimate, so it never refuses)."""
+    _d, _w, exposed = _template_decisions(template, names)
+    if not exposed:
+        return []
+    return [i for i, r in enumerate(rows)
+            if any(_text(v).startswith("-") for k, v in row_fields(r, i).items() if k in exposed)]
 
 
 def row_values(row: Any, index: int, names: set[str]) -> dict[str, str]:
@@ -1261,6 +1399,12 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     out = _status_of(app, bid, detail="summary", offset=0, limit=50)
     out.admitted = admitted
     out.block = st.block
+    dashed = dash_rows(command, rows, _names)
+    if dashed:
+        shown = ", ".join(str(i) for i in dashed[:10]) + ("…" if len(dashed) > 10 else "")
+        out.notice = ((out.notice or "") + f" Row(s) {shown} give a placeholder a value starting with '-': a command "
+                      "may read it as an option. Put `--` before the placeholder (`rm -- {f}`), or give paths as "
+                      "`./-name`.")
     out.notice = (f"{bid}: {len(rows)} row(s) accepted; {admitted} admitted now, at most {out.capacity} out at once "
                   f"(the block's workers less one kept for your interactive commands). Results land in "
                   f"{batch_dir(rd, bid)}. Follow "

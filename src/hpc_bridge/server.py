@@ -2376,7 +2376,9 @@ async def run_batch(
     `command`: shell, with `{name}` for each field of a row and `{index}` for the row's number — written BARE, never
     inside quotes, a here-document, arithmetic, [[ ]], ${…} or backticks (refused): each value reaches the command as
     one word, as data (the environment variable HPCB_F_<name>). Never hand a value to eval, sh -c, ssh or an
-    interpreter as code (the obvious forms are refused); for an inner program pass it as an argument or read
+    interpreter as code, nor pipe it into one (the obvious forms are refused). A value starting with `-` can be read
+    as an option: put `--` before its placeholder (run_batch names such rows). For an inner program pass it as an
+    argument or read
     $HPCB_F_<name> from the environment in a here-document with a quoted delimiter (<<'EOF'). Other braces such as
     ${HOME} stay as written. `rows`: a list of objects with identifier keys, e.g.
     [{"n": 1}, {"n": 2}], or of plain values, bound as `{row}`. `task_walltime_s` (required): the most seconds one row
