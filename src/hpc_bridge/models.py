@@ -17,6 +17,7 @@ class Submission:
     command: str     # the first one: sbatch / qsub / salloc, or srun outside a block
     calls: int       # how many submit calls the command line makes
     own_exit: bool   # the line's exit code is that one submission's own answer (last, only, direct, not --wait)
+    names: tuple[str, ...] = ()   # EVERY submit call's command on the line, in order (batch phase 2a's gate reads them)
 
 
 # Where the next block's queue or account comes from (BlockTerms). A DEFAULT is the facility's configured one:

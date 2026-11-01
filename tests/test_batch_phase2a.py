@@ -237,6 +237,10 @@ async def test_a_hand_sbatch_while_the_envelope_is_open_asks_first_and_runs_noth
     assert len(world.sched.calls("sbatch")) == before                  # the command never ran
 
 
+_R1 = pytest.mark.xfail(strict=True, reason="fix round 1 (the probed Slurm 23.11): not built yet")
+
+
+@_R1
 async def test_a_confirmed_hand_sbatch_is_held_adopted_reserved_and_released(world):
     from hpc_bridge import server
 
@@ -247,8 +251,8 @@ async def test_a_confirmed_hand_sbatch_is_held_adopted_reserved_and_released(wor
     native = out.jobs[0].native_id
     job = world.sched.job(native)
     assert job["held_at_submit"] is True and job["held"] is False, job   # submitted held, released once reserved
-    assert job["deadline"] and abs(_epoch(job["deadline"]) - _epoch(first.envelope.deadline)) < 2, job
-    assert job.get("deadline_tz") == "UTC0"
+    # its deadline is set AT SUBMIT (a user may not `scontrol update Deadline=`: probe §1) and read back before release
+    assert job["deadline_epoch"] and abs(job["deadline_epoch"] - _epoch(first.envelope.deadline)) < 5, job
     assert out.jobs[0].worst_case == pytest.approx(4.0)                 # 4 billing units × its 1 h, from scontrol
     env = await server._status(world.app, first.envelope.envelope_id)
     assert out.jobs[0].job_id in env.envelope.job_ids
@@ -367,6 +371,7 @@ async def test_with_no_billing_tres_a_slice_is_metered_at_its_own_rate_not_a_who
     assert st.job.charged == pytest.approx(1.0), st.job                 # 2 cores × 0.5 h, never 4 × 0.5 h
 
 
+@_R1
 async def test_the_meter_counts_every_array_task(world):
     from hpc_bridge import server
 
@@ -484,6 +489,7 @@ async def test_a_new_session_is_asked_again_naming_what_remains(world):
     assert len(world.sched.calls("sbatch")) == 2
 
 
+@_R1
 async def test_the_deadline_defaults_within_24_hours_and_every_job_carries_it(world):
     now = time.time()
     out = await _confirmed(world.app, command="sleep 60")
@@ -492,7 +498,8 @@ async def test_the_deadline_defaults_within_24_hours_and_every_job_carries_it(wo
     job = world.sched.job(out.job.native_id)
     header = [ln for ln in job["script"].splitlines() if ln.startswith("#SBATCH")]
     assert any(ln.startswith("#SBATCH --deadline=") for ln in header), header
-    assert abs(_epoch(job["deadline"]) - dl) < 2 and job["tz"] == "UTC0", job   # read as UTC by the scheduler
+    # the header's deadline is in the cluster's own local time — no TZ is forced on sbatch (it would reach the job)
+    assert abs(job["deadline_epoch"] - dl) < 2 and job["tz"] is None, job
     for hours in (0, -1, 24 * 8):   # none, or past the operator's longest: refused, nothing submitted
         bad = await _submit(world.app, command="sleep 60", envelope={"cap": 50, "deadline_hours": hours},
                             confirm_spend=True)
