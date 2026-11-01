@@ -1112,7 +1112,10 @@ async def _stop_mep(app: AppCtx, eid: str | None) -> EndpointStatus:
             rt = app.shapes.get(DEFAULT_SHAPE)
             current = warmth._leave_block(app, DEFAULT_SHAPE, rt, how="stop") if rt is not None else None
             warmth._drop_compute_shape_locked(app)  # its spend stays in the session total (app.released_spend)
-        return _left_blocks_status(app, eid, current, lost, op="stop", spent=_total_session_spend(app))
+        out = _left_blocks_status(app, eid, current, lost, op="stop", spent=_total_session_spend(app))
+        if (unknown_batch := batch.unknown_note(app)) is not None:  # a batch submit the service may have queued
+            out.notice = f"{out.notice or ''} Also: {unknown_batch}.".strip()
+        return out
 
 
 def _left_blocks_here(app: AppCtx, eid: str | None, current: LeftBlock | None) -> list[LeftBlock]:
@@ -1279,6 +1282,12 @@ async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
         return EndpointStatus(
             status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
             notice=_store_problem_notice(detail, store_problem))
+    if confirmed and not pending and (unknown_batch := batch.unknown_note(app)) is not None:
+        # a batch submit of unknown fate may be queued at the service: the endpoint can start a block for it
+        return EndpointStatus(
+            status="draining", block_state="cold", endpoint_id=eid, session_spend=_total_session_spend(app),
+            notice=(f"{detail}. Spend is NOT confirmed stopped: {unknown_batch}. Call stop_endpoint again once they "
+                    "are settled. The login endpoint stays online for reuse."))
     if confirmed and not pending:
         return EndpointStatus(
             status="down",  # the cancel CONFIRMED, and no task of ours is left that could start a block
@@ -2364,12 +2373,15 @@ async def run_batch(
     per row. hpc-bridge keeps the backlog and sends at most `capacity` tasks at a time (the block's workers, less one
     kept for your interactive commands); a durable ledger records every row, so the batch survives this server.
 
-    `command`: shell, with `{name}` for each field of a row (substituted shell-quoted; other braces such as ${HOME}
-    stay as written) and `{index}` for the row's number. `rows`: a list of objects with identifier keys, e.g.
+    `command`: shell, with `{name}` for each field of a row and `{index}` for the row's number — written BARE, never
+    inside quotes or a here-document (refused): each value reaches the command as one word, as data (the environment
+    variable HPCB_F_<name>); other braces such as ${HOME} stay as written. `rows`: a list of objects with identifier
+    keys, e.g.
     [{"n": 1}, {"n": 2}], or of plain values, bound as `{row}`. `task_walltime_s` (required): the most seconds one row
     may run — it is killed then (rc 124), and a row is admitted only while the block has task_walltime_s + 30 s of
-    walltime left. Each row's stdout/stderr are kept (capped) under `results_dir` (default: a dir under the facility's
-    scratch root); a result carries the exit code, the output's tail and a pointer to the file.
+    walltime left. Each row's stdout/stderr are kept (capped) in the batch's own dir, `<results_dir>/<batch id>/`
+    (default: under the facility's scratch root); a result carries the exit code, the output's tail and a pointer to
+    the file.
 
     Spend: the same floor as ensure_endpoint_up — an unconfirmed block answers phase="needs_confirmation" with `block`
     (nothing recorded); confirm_spend=True confirms ONE block, as there. When the block ends (its walltime, a reap, a
@@ -2405,10 +2417,11 @@ async def status_tool(ctx: Context, id: str, detail: str = "summary", offset: in
 async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResult:  # noqa: A002
     """Stop a batch. mode="drain": admit nothing more, let the tasks in flight finish, keep the backlog (resumable with
     run_batch(batch_id=…, confirm_spend=True)). mode="abort": cancel the backlog and end the tasks in flight (each is
-    killed within a few seconds, rc 143). status="draining" while any task is still in flight — call again — and
-    "down" once none is; `blocks_left` names the compute block that still bills (stop_endpoint ends it)."""
+    killed within a few seconds, rc 143, when the notice says the marker was written). status="draining" while any
+    task is still in flight — call again — and "down" once none is; `blocks_left` names every block of ours that can
+    still bill."""
     try:
-        return await _cancel(ctx.request_context.lifespan_context, id, mode)
+        return await _heartbeat(ctx, _cancel(ctx.request_context.lifespan_context, id, mode), "cancel")
     except Exception as exc:  # noqa: BLE001
         return CancelResult(id=str(id), status="refused", notice=f"cancel failed: {type(exc).__name__}: {exc}")
 

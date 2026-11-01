@@ -10,9 +10,11 @@ the configs a stop or a reap retired.
   on login nodes and beside loam: `open` refuses one by its type (`fs_type`), naming HPC_BRIDGE_STATE_DIR.
 - **One admission point.** `reserve` checks the lease holder, the retired configs and the window in ONE
   `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt.
-- **One owner per batch.** A lease row (host, pid, heartbeat). A takeover needs a stale heartbeat AND a holder pid
-  that is dead on THIS host (an orphaned server keeps its pid: `harness:server_orphaned`); a holder on another host
-  is never taken over.
+- **One owner per batch.** A lease row (host, pid, the process's start time, heartbeat). A takeover needs a stale
+  heartbeat AND a holder that is gone: its pid dead, or alive but started at another time (the pid was handed on). An
+  orphaned server keeps its pid and its start time (`harness:server_orphaned`), so it is never taken over. The ledger is
+  on a local disk, so its holders are this machine's processes: the hostname is not trusted for it (macOS renames
+  itself on a new network; a container's name is its own).
 """
 from __future__ import annotations
 
@@ -24,7 +26,7 @@ import subprocess
 import sys
 import time
 from collections.abc import Iterable
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
 
@@ -65,14 +67,31 @@ class UnknownBatch(LedgerError):
     """No batch of that id in the ledger."""
 
 
+def proc_start(pid: int) -> str | None:
+    """When process `pid` started, as the OS says (Linux: /proc/<pid>/stat's starttime; elsewhere `ps -o lstart=`), or
+    None when it cannot be told (no such process). Two processes that share a pid over time differ here."""
+    try:
+        stat = Path(f"/proc/{int(pid)}/stat").read_text()
+        return "linux:" + stat.rsplit(")", 1)[1].split()[19]
+    except (OSError, IndexError, ValueError):
+        pass
+    try:
+        out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
+                             stdin=subprocess.DEVNULL).stdout.strip()
+    except (OSError, subprocess.SubprocessError, ValueError):
+        return None
+    return ("ps:" + " ".join(out.split())) if out else None
+
+
 @dataclass(frozen=True)
 class Owner:
     host: str
     pid: int
+    started: str | None = field(default=None, compare=False)   # the process's start time (`proc_start`)
 
     @classmethod
     def here(cls) -> Owner:
-        return cls(socket.gethostname(), os.getpid())
+        return cls(socket.gethostname(), os.getpid(), proc_start(os.getpid()))
 
     def __str__(self) -> str:
         return f"pid {self.pid} on {self.host}"
@@ -178,6 +197,7 @@ create table if not exists batch (
   blocks_seen text default '[]',
   owner_host text,
   owner_pid integer,
+  owner_start text,
   heartbeat real,
   cancel_requested text
 );
@@ -203,9 +223,16 @@ create table if not exists task (
   remaining_s real,
   settled_by text,
   evidence text,
+  sent_job text,
   primary key (batch_id, idx)
 );
 create index if not exists task_by_tid on task (task_id);
+create table if not exists tgroup (
+  batch_id text not null,
+  group_id text not null,
+  at real,
+  primary key (batch_id, group_id)
+);
 create table if not exists retired (
   endpoint_id text not null,
   uec_hash text not null,
@@ -233,7 +260,9 @@ create table if not exists event (
 """
 
 _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "truncated", "job_id", "host", "workers",
-                "remaining_s", "settled_by", "evidence", "started_at", "task_id")
+                "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job")
+# Columns a ledger written by an earlier build may lack: added on open.
+_ADDED_COLUMNS = {"batch": [("owner_start", "text")], "task": [("sent_job", "text")]}
 
 
 class Ledger:
@@ -244,6 +273,7 @@ class Ledger:
         self._con = con
         self.lease_stale_s = LEASE_STALE_S
         self.pid_alive = _pid_alive          # a seam: the tests decide which pids are alive
+        self.proc_start = proc_start         # a seam: when a pid's process started
         self.host = socket.gethostname()
 
     # -- opening ---------------------------------------------------------------------------------------------------
@@ -269,6 +299,11 @@ class Ledger:
         con.execute("pragma journal_mode = wal")
         con.execute("pragma synchronous = normal")
         con.executescript(_SCHEMA)
+        for table, cols in _ADDED_COLUMNS.items():
+            have = {str(r[1]) for r in con.execute(f"pragma table_info({table})")}
+            for name, kind in cols:
+                if name not in have:
+                    con.execute(f"alter table {table} add column {name} {kind}")
         con.execute("insert or ignore into meta values ('schema_version', ?)", (str(SCHEMA_VERSION),))
         return cls(path, con)
 
@@ -293,10 +328,10 @@ class Ledger:
         with self._tx(immediate=True) as c:
             c.execute("insert into batch (id, created_at, facility, endpoint_id, session_id, uec_hash, command, "
                       "script_hash, task_walltime_s, results_dir, idempotent, capacity, state, owner_host, owner_pid, "
-                      "heartbeat) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "owner_start, heartbeat) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (batch_id, at, facility, endpoint_id, session_id, uec_hash, command, script_hash,
                        float(task_walltime_s), results_dir, int(bool(idempotent)), int(capacity), state, owner.host,
-                       owner.pid, at))
+                       owner.pid, owner.started, at))
             c.executemany("insert into task (batch_id, idx, row_json, state) values (?,?,?,'backlog')",
                           [(batch_id, i, json.dumps(r)) for i, r in enumerate(rows)])
             c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
@@ -341,27 +376,40 @@ class Ledger:
     # -- the lease -------------------------------------------------------------------------------------------------
     def holder(self, batch_id: str) -> Lease:
         b = self.batch(batch_id)
-        return Lease(True, Owner(str(b["owner_host"] or ""), int(b["owner_pid"] or 0)), float(b["heartbeat"] or 0.0))
+        return Lease(True, Owner(str(b["owner_host"] or ""), int(b["owner_pid"] or 0), b.get("owner_start")),
+                     float(b["heartbeat"] or 0.0))
+
+    def holder_alive(self, holder: Owner) -> bool:
+        """Whether the process that holds a lease still runs: its pid is alive and, when its start time is on the
+        record, it is the same process (a pid handed on to another process is not the holder). The hostname is not
+        consulted: the ledger is on this machine's local disk."""
+        if not self.pid_alive(holder.pid):
+            return False
+        if holder.started:
+            now = self.proc_start(holder.pid)
+            if now is not None and now != holder.started:
+                return False
+        return True
 
     def take_lease(self, batch_id: str, owner: Owner, *, now: float | None = None) -> Lease:
         """Take or refresh the batch's lease: refreshed by its holder; taken over only when the holder's heartbeat is
-        stale AND its pid is dead on this host."""
+        stale AND the holder is gone (`holder_alive`)."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
-            r = c.execute("select owner_host, owner_pid, heartbeat from batch where id = ?", (batch_id,)).fetchone()
+            r = c.execute("select owner_host, owner_pid, owner_start, heartbeat from batch where id = ?",
+                          (batch_id,)).fetchone()
             if r is None:
                 raise UnknownBatch(batch_id)
-            held = Owner(str(r["owner_host"] or ""), int(r["owner_pid"] or 0))
+            held = Owner(str(r["owner_host"] or ""), int(r["owner_pid"] or 0), r["owner_start"])
             beat = float(r["heartbeat"] or 0.0)
             if held == owner:
                 c.execute("update batch set heartbeat = ? where id = ?", (at, batch_id))
                 return Lease(True, owner, at)
             stale = at - beat > self.lease_stale_s
-            dead = held.host == owner.host and not self.pid_alive(held.pid)
-            if not (stale and dead):
+            if not (stale and not self.holder_alive(held)):
                 return Lease(False, held, beat)
-            c.execute("update batch set owner_host = ?, owner_pid = ?, heartbeat = ? where id = ?",
-                      (owner.host, owner.pid, at, batch_id))
+            c.execute("update batch set owner_host = ?, owner_pid = ?, owner_start = ?, heartbeat = ? where id = ?",
+                      (owner.host, owner.pid, owner.started, at, batch_id))
             c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
                       (at, batch_id, "batch.lease", json.dumps({"from": str(held), "to": str(owner)})))
             return Lease(True, owner, at)
@@ -371,6 +419,23 @@ class Ledger:
             cur = c.execute("update batch set heartbeat = ? where id = ? and owner_host = ? and owner_pid = ?",
                             (time.time(), batch_id, owner.host, owner.pid))
             return cur.rowcount == 1
+
+    # -- the task groups a batch's runners were minted ------------------------------------------------------------
+    def add_task_group(self, batch_id: str, group_id: str, *, now: float | None = None) -> None:
+        """Record a task group the service minted for one of the batch's runners (every one: a new confirmation's runner
+        gets its own, and reconciliation reads them all)."""
+        with self._tx() as c:
+            c.execute("insert or ignore into tgroup values (?,?,?)",
+                      (batch_id, str(group_id), time.time() if now is None else now))
+            c.execute("update batch set task_group_id = ? where id = ?", (str(group_id), batch_id))
+
+    def task_groups(self, batch_id: str) -> list[str]:
+        rows = self._con.execute("select group_id from tgroup where batch_id = ? order by at", (batch_id,)).fetchall()
+        out = [str(r[0]) for r in rows]
+        legacy = self._con.execute("select task_group_id from batch where id = ?", (batch_id,)).fetchone()
+        if legacy is not None and legacy[0] and str(legacy[0]) not in out:
+            out.append(str(legacy[0]))
+        return out
 
     # -- retired configs -------------------------------------------------------------------------------------------
     def retire(self, endpoint_id: str, uec_hash: str, *, why: str, now: float | None = None) -> None:

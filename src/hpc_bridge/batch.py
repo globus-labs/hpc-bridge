@@ -13,10 +13,15 @@ through the session's ONE confirmed compute block, instead of an agent looping r
   batch at needs_confirmation; only run_batch(batch_id=…, confirm_spend=True) resumes it. A plain status never does.
 - **The ledger** (hpc_bridge.ledger) is the record: the rows, every attempt, its Globus task id and settlement, the
   lease (one admitter and collector per batch), the retired configs.
-- **The wrapper** around each task (`task_script`) claims `<results_dir>/tasks/<i>/attempt-<n>/` with an atomic mkdir
-  (a retried POST that ran twice exits early), checks free space, caps each stream at the source, runs the command in
-  its own process group under its own timeout (rc 124) and a watch for the `CANCELLED` marker (rc 143: an abort), and
-  prints ONE small `HPCB_RESULT {json}` line — the output stays in files, never in the result (no 10 MB limit).
+- **The template.** `{name}` is replaced by a REFERENCE to an environment variable holding the row's value
+  (`"$HPCB_F_name"`), never by the value: a value is data, whatever it holds. A placeholder inside quotes or a
+  here-document is refused (write it bare: each value reaches the command as one word).
+- **The wrapper** around each task (`task_script`) works in the batch's own directory, `<results_dir>/<batch id>/`:
+  it checks free space, then claims `tasks/<i>/attempt-<n>/` with an atomic mkdir (only an existing attempt is a
+  duplicate — a retried POST that ran twice exits early; any other failure fails the row with its cause), caps each
+  stream at the source, runs the command in its own process group under its own timeout (rc 124) and a watch for the
+  batch's `CANCELLED` marker (rc 143: an abort), ends what is left of that group when the command exits, and prints ONE
+  small `HPCB_RESULT {json}` line — the output stays in files, never in the result (no 10 MB limit).
 - **Settling.** A result wins whenever it arrives. On an SSH endpoint `lost` needs evidence (a ManagerLost/WorkerLost
   result, or sacct saying the block's job ended); on a MEP `presumed_lost` is a clock that starts at evidence a block
   started, keeps its window slot and is never retried. Retries only for idempotent batches, and only on evidence. Any
@@ -78,6 +83,10 @@ IDLE_TICK_S = 10.0
 EVIDENCE_EVERY_S = 30.0                # how often the block's job is looked up while tasks are out (SSH)
 EVIDENCE_AFTER_S = 20.0                # …once the oldest task out is older than this
 REST_EVERY_S = 10.0                    # after a restart: how often in-flight rows are pulled by REST
+UNKNOWN_SETTLE_S = 120.0              # a submit_unknown row's task groups are trusted to list it after this long
+CALL_BUDGET_S = 100.0                  # one status / cancel call's passes, past its wait_s (under every client timeout)
+MARKER_WAIT_S = 30.0                   # how long a MEP cancel waits for its marker task to answer
+MARKER_MIN_REMAINING_S = 60.0          # a MEP block with less walltime left gets no marker task (it may be ending)
 RESULT_MARK = "HPCB_RESULT"
 CANCEL_MARKER = "CANCELLED"
 CANCEL_RC = 143
@@ -85,7 +94,9 @@ TIMEOUT_RC = 124
 NO_SPACE_RC = 75
 
 _ID = re.compile(r"^batch-[0-9a-f]{12}$")
-_FIELD = re.compile(r"\{([A-Za-z_][A-Za-z0-9_]*)\}")
+# `{name}` — never `${name}`, which is the shell's own parameter expansion
+_FIELD = re.compile(r"(?<!\$)\{([A-Za-z_][A-Za-z0-9_]*)\}")
+FIELD_VAR = "HPCB_F_"   # a row's value `name` reaches its command as the environment variable HPCB_F_<name>
 _IDENT = re.compile(r"^[A-Za-z_][A-Za-z0-9_]{0,63}$")
 # A results directory hpc-bridge splices into the wrapper: plain path characters, optionally under $HOME / ${HOME} / ~.
 _RESULTS_DIR = re.compile(r"^(\$HOME/|\$\{HOME\}/|~/|/)[A-Za-z0-9_./+-]{0,400}$")
@@ -122,22 +133,123 @@ def row_fields(row: Any, index: int) -> dict[str, Any]:
     return fields
 
 
+def _contexts(t: str) -> list[str]:
+    """What each character of a shell template is in: "n" plain shell, "q" quotes ('…', "…", $'…'), "h" a
+    here-document's body, "e" escaped by a backslash, "c" a comment. A light reading of the shell's own rules — enough
+    to tell where a placeholder stands."""
+    n = len(t)
+    ctx = ["n"] * n
+    i, state = 0, "n"
+    pending: list[tuple[str, bool]] = []   # here-documents opened on this line: (delimiter, <<- strips tabs)
+    while i < n:
+        ch = t[i]
+        if state == "n":
+            if ch == "\\" and i + 1 < n:
+                ctx[i] = ctx[i + 1] = "e"
+                i += 2
+            elif ch == "'":
+                ctx[i], state = "q", "sq"
+                i += 1
+            elif ch == "$" and i + 1 < n and t[i + 1] == "'":
+                ctx[i] = ctx[i + 1] = "q"
+                state = "ansi"
+                i += 2
+            elif ch == '"':
+                ctx[i], state = "q", "dq"
+                i += 1
+            elif ch == "#" and (i == 0 or t[i - 1] in " \t\n;|&("):
+                while i < n and t[i] != "\n":
+                    ctx[i] = "c"
+                    i += 1
+            elif t.startswith("<<<", i):
+                i += 3
+            elif t.startswith("<<", i):
+                j = i + 2
+                strip = j < n and t[j] == "-"
+                j += 1 if strip else 0
+                while j < n and t[j] in " \t":
+                    j += 1
+                k = j
+                while k < n and t[k] not in " \t\n;|&<>()":
+                    k += 1
+                delim = t[j:k].replace("'", "").replace('"', "").replace("\\", "")
+                if delim:
+                    pending.append((delim, strip))
+                i = k
+            elif ch == "\n" and pending:
+                i += 1
+                for delim, strip in pending:
+                    while i < n:
+                        e = t.find("\n", i)
+                        end = n if e < 0 else e
+                        line = t[i:end]
+                        if (line.lstrip("\t") if strip else line) == delim:
+                            i = end
+                            break
+                        for m in range(i, min(end + 1, n)):
+                            ctx[m] = "h"
+                        i = end + 1
+                pending = []
+            else:
+                i += 1
+            continue
+        ctx[i] = "q"
+        if state in ("dq", "ansi") and ch == "\\" and i + 1 < n:
+            ctx[i + 1] = "q"
+            i += 2
+            continue
+        if (state == "sq" and ch == "'") or (state == "ansi" and ch == "'") or (state == "dq" and ch == '"'):
+            state = "n"
+        i += 1
+    return ctx
+
+
 def substitute(template: str, row: Any, index: int, names: set[str] | None = None) -> str:
     """The template with this row's fields in: `{name}` for each name the batch's rows define (`names`; default: this
-    row's own) becomes the value, shell-quoted. Any other brace text stays as written (`${HOME}`, `awk '{print $1}'`).
-    The result is plain shell; GlobusRunner.submit brace-escapes it for ShellFunction's `cmd.format()`."""
+    row's own) becomes `"$HPCB_F_name"`, a reference to the environment variable the wrapper sets to the value
+    (`row_values`, `task_script(fields=…)`) — the value itself never enters the command's text, so nothing in it is ever
+    read as shell. A placeholder inside quotes or a here-document is refused (BatchRefusal, saying how to write it); one
+    in a comment or escaped (`\\{x}`) and any other brace text stay as written (`${HOME}`, `awk '{print $1}'`). The
+    result is plain shell; GlobusRunner.submit brace-escapes it for ShellFunction's `cmd.format()`."""
     fields = row_fields(row, index)
     use = set(fields) if names is None else names
+    ctx = _contexts(template)
 
     def one(m: re.Match[str]) -> str:
         name = m.group(1)
-        if name not in use:
+        if name not in use or ctx[m.start()] in ("e", "c"):
             return m.group(0)
+        if ctx[m.start()] in ("q", "h"):
+            where = "a here-document" if ctx[m.start()] == "h" else "quotes"
+            raise BatchRefusal(
+                f"the command has {{{name}}} inside {where}: write it bare — e.g. `grep -c {{{name}}} out.txt`, not "
+                f"`grep -c \"{{{name}}}\" out.txt` — each row's value reaches the command as ONE word, already quoted "
+                f"(it is passed as the environment variable {FIELD_VAR}{name}; inside a here-document, write "
+                f"${FIELD_VAR}{name} itself)")
         if name not in fields:
             raise BatchRefusal(f"row {index} has no field {name!r}, which the command uses")
-        return shlex.quote(_text(fields[name]))
+        return f'"${FIELD_VAR}{name}"'
 
     return _FIELD.sub(one, template)
+
+
+def row_values(row: Any, index: int, names: set[str]) -> dict[str, str]:
+    """The values this row's task gets as HPCB_F_<name> (the names its batch's command uses)."""
+    fields = row_fields(row, index)
+    return {k: _text(fields[k]) for k in sorted(names) if k in fields}
+
+
+def _field_exports(fields: dict[str, str] | None) -> str:
+    """The shell lines that set HPCB_F_<name> to each value, carried base64-encoded (a value is data: no character of
+    it is ever read as shell), its trailing newlines kept."""
+    lines = []
+    for name, value in sorted((fields or {}).items()):
+        if not _IDENT.match(name):
+            raise ValueError(f"invalid field name {name!r}")
+        v = f"{FIELD_VAR}{name}"
+        b64 = base64.b64encode(value.encode()).decode()
+        lines.append(f"{v}=\"$(printf %s '{b64}' | base64 --decode; printf x)\"; {v}=\"${{{v}%x}}\"; export {v}")
+    return "\n  ".join(lines)
 
 
 def validate(command: Any, rows: Any, task_walltime_s: Any) -> tuple[str, list[Any], float, set[str]]:
@@ -158,8 +270,12 @@ def validate(command: Any, rows: Any, task_walltime_s: Any) -> tuple[str, list[A
                     raise BatchRefusal(f"row {i}: field name {k!r} is not an identifier ([A-Za-z_][A-Za-z0-9_]*)")
                 if not isinstance(v, str | int | float | bool) and v is not None:
                     raise BatchRefusal(f"row {i}: field {k!r} must be a string, a number or a boolean")
+                if "\x00" in _text(v):
+                    raise BatchRefusal(f"row {i}: field {k!r} holds a NUL character, which no shell variable can")
             names |= set(r)
         elif isinstance(r, str | int | float | bool):
+            if "\x00" in _text(r):
+                raise BatchRefusal(f"row {i} holds a NUL character, which no shell variable can")
             names.add("row")
         else:
             raise BatchRefusal(f"row {i} is {type(r).__name__}: a row is an object or a plain value")
@@ -182,6 +298,12 @@ def quoted_dir(path: str) -> str:
     return shlex.quote(path)
 
 
+def batch_dir(results_dir: str, batch_id: str) -> str:
+    """The batch's own directory under its results_dir: every attempt, and its CANCELLED marker, live there — so two
+    batches that share a results_dir never read each other's claims or markers."""
+    return f"{results_dir.rstrip('/')}/{batch_id}"
+
+
 def under_home(path: str) -> bool:
     return path.startswith(("$HOME", "${HOME}", "~/")) or bool(re.match(r"^/(home|Users|global/homes)/", path))
 
@@ -200,31 +322,46 @@ __hb_out() {
     "$__hb_j" "$__hb_host" "${PARSL_WORKER_COUNT:-}" >&3
   printf ', "remaining_s": %s%s}\n' "${__hb_rem:-null}" "$1" >&3
 }
-mkdir -p "$__hb_t" || { __hb_out ', "rc": 1, "error": "cannot create the results directory"'; exit 0; }
-if ! mkdir "$__hb_a"; then __hb_out ', "duplicate": true'; exit 0; fi
+__hb_fail() {
+  __hb_out ', "rc": 1, "error_b64": "'"$(printf %s "$1" | base64 | tr -d '\n')"'"'
+  exit 0
+}
+__hb_e=$(mkdir -p "$__hb_t" 2>&1) || __hb_fail "cannot create $__hb_t: $__hb_e"
+__hb_free=$(df -Pk "$__hb_t" | awk 'NR==2{print $4}')
+case "$__hb_free" in ''|*[!0-9]*) ;; *)
+  if [ "$__hb_free" -lt @@MINKB@@ ]; then
+    __hb_out ', "rc": @@NRC@@, "no_space": true, "free_kb": '"$__hb_free"; exit 0; fi;;
+esac
+if ! __hb_e=$(mkdir "$__hb_a" 2>&1); then
+  [ -d "$__hb_a" ] && { __hb_out ', "duplicate": true'; exit 0; }
+  __hb_fail "cannot claim $__hb_a: $__hb_e"
+fi
 if [ -e "$__hb_rd/@@CANCEL@@" ]; then
   echo @@CRC@@ > "$__hb_a/rc"; __hb_out ', "rc": @@CRC@@, "cancelled": true, "ran": false'; exit 0
 fi
-__hb_free=$(df -Pk "$__hb_rd" | awk 'NR==2{print $4}')
-case "$__hb_free" in ''|*[!0-9]*) ;; *)
-  if [ "$__hb_free" -lt @@MINKB@@ ]; then echo @@NRC@@ > "$__hb_a/rc"
-    __hb_out ', "rc": @@NRC@@, "no_space": true, "free_kb": '"$__hb_free"; exit 0; fi;;
-esac
 __hb_start=$(date +%s)
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"; mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"
-tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" &
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
+mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
+tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" 3>&- 4>&- &
+__hb_p1=$!
 { tee "$__hb_f.t" | { head -c @@CAP@@ > "$__hb_a/stdout"; wc -c | tr -d ' ' > "$__hb_a/.stdout.dropped"; }
-} < "$__hb_f.o" &
-{ head -c @@CAP@@ > "$__hb_a/stderr"; wc -c | tr -d ' ' > "$__hb_a/.stderr.dropped"; } < "$__hb_f.e" &
+} < "$__hb_f.o" 3>&- 4>&- &
+__hb_p2=$!
+tail -c @@ETAIL@@ < "$__hb_f.u" > "$__hb_a/.stderr.tail" 3>&- 4>&- &
+__hb_p3=$!
+{ tee "$__hb_f.u" | { head -c @@CAP@@ > "$__hb_a/stderr"; wc -c | tr -d ' ' > "$__hb_a/.stderr.dropped"; }
+} < "$__hb_f.e" 3>&- 4>&- &
+__hb_p4=$!
 set -m
 (
   export HPCB_ROW_INDEX=@@I@@ HPCB_ATTEMPT=@@N@@ HPCB_TASK_DIR="$__hb_a"
   @@SESSION@@
+  @@FIELDS@@
   eval "$(printf %s @@B64@@ | base64 --decode)"
-) > "$__hb_f.o" 2> "$__hb_f.e" < /dev/null &
+) > "$__hb_f.o" 2> "$__hb_f.e" < /dev/null 3>&- 4>&- &
 __hb_c=$!
 set +m
 (
@@ -239,13 +376,17 @@ set +m
   __hb_k=0
   while [ "$__hb_k" -lt @@GRACE@@ ] && kill -0 "$__hb_c"; do sleep 1; __hb_k=$((__hb_k + 1)); done
   kill -KILL -- "-$__hb_c" || kill -KILL "$__hb_c"
-) &
+) > /dev/null 3>&- 4>&- &
 __hb_w=$!
 wait "$__hb_c"
 __hb_rc=$?
 kill "$__hb_w"
-wait
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t"
+kill -TERM -- "-$__hb_c"
+( sleep @@GRACE@@; kill -KILL -- "-$__hb_c"; kill "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4" ) > /dev/null 3>&- 4>&- &
+__hb_g=$!
+wait "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
+kill "$__hb_g"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
 __hb_why=$(cat "$__hb_a/.why")
 case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
@@ -255,7 +396,7 @@ __hb_od=$(cat "$__hb_a/.stdout.dropped")
 case "$__hb_od" in ''|*[!0-9]*) __hb_od=0;; esac
 __hb_tr=false; [ "$__hb_od" -gt 0 ] && __hb_tr=true
 __hb_tl=$(base64 < "$__hb_a/.stdout.tail" | tr -d '\n')
-__hb_el=$(tail -c @@ETAIL@@ "$__hb_a/stderr" | base64 | tr -d '\n')
+__hb_el=$(base64 < "$__hb_a/.stderr.tail" | tr -d '\n')
 __hb_r=", \"rc\": $__hb_rc, \"started\": $__hb_start, \"ended\": $(date +%s)"
 __hb_r="$__hb_r, \"stdout_path\": \"$__hb_a/stdout\", \"stdout_bytes\": ${__hb_ob:-0}"
 __hb_r="$__hb_r, \"stdout_dropped\": $__hb_od, \"truncated\": $__hb_tr, \"why\": \"$__hb_why\""
@@ -267,9 +408,12 @@ exit 0
 
 def task_script(command: str, *, results_dir: str, index: int, attempt: int, task_walltime_s: float,
                 session: session_shell.Session | None = None, cap_bytes: int = OUTPUT_CAP_BYTES,
-                guard: session_shell.Guard | None = None, min_free_mb: int = MIN_FREE_MB) -> str:
-    """The script one batch task runs on the worker (see the module doc). `session`: the cwd/env it replays
-    READ-ONLY (never written back). `guard`: the wrong-block guard, refusing (exit 86) before anything is claimed."""
+                guard: session_shell.Guard | None = None, min_free_mb: int = MIN_FREE_MB,
+                fields: dict[str, str] | None = None) -> str:
+    """The script one batch task runs on the worker (see the module doc). `results_dir`: the batch's OWN directory
+    (`batch_dir`). `session`: the cwd/env it replays READ-ONLY (never written back). `guard`: the wrong-block guard,
+    refusing (exit 86) before anything is claimed. `fields`: the row's values, set as HPCB_F_<name> after the session's
+    env (`row_values`)."""
     replay = ""
     if session is not None:
         sd = session.quoted_state_dir()
@@ -281,7 +425,7 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@MARK@@", RESULT_MARK).replace("@@CANCEL@@", CANCEL_MARKER)
             .replace("@@CRC@@", str(CANCEL_RC)).replace("@@TRC@@", str(TIMEOUT_RC)).replace("@@NRC@@", str(NO_SPACE_RC))
             .replace("@@MINKB@@", str(int(min_free_mb) * 1024)).replace("@@CAP@@", str(int(cap_bytes)))
-            .replace("@@SESSION@@", replay).replace("@@B64@@", b64)
+            .replace("@@SESSION@@", replay).replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
             .replace("@@WALL@@", str(max(1, round(task_walltime_s)))).replace("@@GRACE@@", str(KILL_GRACE_S))
             .replace("@@TAIL@@", str(TAIL_BYTES)).replace("@@ETAIL@@", str(STDERR_TAIL_BYTES)))
     return session_shell.guard_prefix(guard) + body
@@ -351,7 +495,8 @@ def parse_result(stdout: str | None) -> TaskReport | None:
                 workers=int(workers) if workers else None, remaining_s=_num(d.get("remaining_s")),
                 started=_num(d.get("started")), duplicate=bool(d.get("duplicate")),
                 cancelled=bool(d.get("cancelled")) or d.get("why") == "cancelled",
-                no_space=bool(d.get("no_space")), timed_out=d.get("why") == "timeout", error=d.get("error"))
+                no_space=bool(d.get("no_space")), timed_out=d.get("why") == "timeout",
+                error=_b64(d["error_b64"]) if d.get("error_b64") else d.get("error"))
     return None
 
 
@@ -474,6 +619,18 @@ class _Run:
     # being confirmed (`_maybe_switch` drops the shape, then awaits the new block's start)
     passing: asyncio.Lock = field(default_factory=asyncio.Lock)
     switching: bool = False
+    # the config hash of the reaped block's user endpoint (`old_uep`): a block confirmed with the SAME config after the
+    # reap goes to that same user endpoint, and is the user's, never released
+    old_uep_hash: str | None = None
+    # blocks of ours that can still bill though no shape holds them: one the next-block switch left to run out its
+    # last minutes (job, the wall-clock end), and a block the facility started for a task of ours that reached it
+    # after the confirmed one went (the wrong-block guard's job)
+    switched_left: list[tuple[str | None, float | None]] = field(default_factory=list)
+    relaunched: list[str] = field(default_factory=list)
+    marker_future: Any = None          # a MEP abort's marker task, while it is out: never a second one
+    marker_written: bool = False       # …and once it wrote the marker, none again
+    groups_recorded: set[str] = field(default_factory=set)
+    last_change: tuple[Any, ...] | None = None   # what status(wait_s) waits to see change
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -604,6 +761,7 @@ def pause(app: AppCtx, bid: str, reason: str) -> None:
         _journal({"event": "batch.pause", "batch_id": bid, "reason": reason})
     run = app.batches.get(bid)
     if run is not None:
+        run.next_block = False   # any pause withdraws the user's yes for the next block: it is asked for again
         run.wake.set()
 
 
@@ -637,6 +795,23 @@ def in_flight_note(app: AppCtx) -> str | None:
     a killed server sent run on (status(id) collects them here), and releasing the block under them would have the
     endpoint relaunch one for them."""
     parts = []
+    for bid in _ledger_batch_ids(app):
+        run = app.batches.get(bid)
+        try:
+            c = _counts(ledger_of(app), bid)
+        except LedgerError:
+            continue
+        out = c.get("in_flight", 0)   # the ledger's: a presumed-lost row keeps its future, never the stop
+        if out:
+            mine = "" if run is not None else " (sent by an earlier hpc-bridge server: status first collects them here)"
+            parts.append(f"{bid} has {out} task(s) in flight on the block{mine} (admission is now "
+                         f"paused; {c.get('backlog', 0)} row(s) wait in its backlog) — end them with "
+                         f"cancel('{bid}', 'abort'), or wait for them (status('{bid}', wait_s=60)) and then call "
+                         "stop_endpoint again")
+    return "; ".join(parts) or None
+
+
+def _ledger_batch_ids(app: AppCtx) -> list[str]:
     ids = list(app.batches)
     if app.state.endpoint_id is not None:
         try:
@@ -645,20 +820,23 @@ def in_flight_note(app: AppCtx) -> str | None:
                     if b["id"] not in app.batches]
         except LedgerError:
             pass
-    for bid in ids:
-        run = app.batches.get(bid)
+    return ids
+
+
+def unknown_note(app: AppCtx) -> str | None:
+    """The batches with a submit of unknown fate (`submit_unknown`): its POST may have reached the service, so the task
+    may be queued, and the endpoint can start a block to run it. A stop is never `down` while one exists — it names
+    them, and what settles them. None when there is none."""
+    parts = []
+    for bid in _ledger_batch_ids(app):
         try:
-            c = _counts(ledger_of(app), bid)
+            n = _counts(ledger_of(app), bid).get("submit_unknown", 0)
         except LedgerError:
             continue
-        out = c.get("in_flight", 0)
-        futures = len(run.futures) if run is not None else 0
-        if out or futures:
-            mine = "" if run is not None else " (sent by an earlier hpc-bridge server: status first collects them here)"
-            parts.append(f"{bid} has {max(out, futures)} task(s) in flight on the block{mine} (admission is now "
-                         f"paused; {c.get('backlog', 0)} row(s) wait in its backlog) — end them with "
-                         f"cancel('{bid}', 'abort'), or wait for them (status('{bid}', wait_s=60)) and then call "
-                         "stop_endpoint again")
+        if n:
+            parts.append(f"{bid} has {n} submit(s) of unknown fate (the service may have queued them, and the endpoint "
+                         "can start a block to run them) — they are reconciled against the batch's task groups: "
+                         f"status('{bid}', wait_s=60) settles them once the service accounts for them")
     return "; ".join(parts) or None
 
 
@@ -729,8 +907,8 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                         f"a task needs task_walltime_s + {MARGIN_S:g} s of it left to be admitted, so this batch would "
                         f"never start a row. Ask for a longer block, or rows of at most {fits} s.")
     bid = _new_id()
-    rd = results_dir or f"{app.scratch_root.rstrip('/')}/batches/{bid}"
-    if not _RESULTS_DIR.match(rd):
+    rd = results_dir or f"{app.scratch_root.rstrip('/')}/batches"
+    if not _RESULTS_DIR.match(batch_dir(rd, bid)):
         return _refused(f"the default results directory {rd!r} cannot be used; pass results_dir=")
     led = ledger_of(app)
     owner = owner_of(app)
@@ -741,6 +919,8 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                   idempotent=idempotent, endpoint_id=app.state.endpoint_id, uec_hash=uec_hash(rt),
                   session_id=session_id, owner=owner, facility=app.machine,
                   script_hash=hashlib.sha256(command.encode()).hexdigest()[:16], now=_now())
+    if run.block_job:   # the block its first check saw, on the record (a restart's presumption counts from it)
+        led.add_block_seen(bid, run.block_job)
     app.batches[bid] = run
     async with app.lock:
         admitted = _admit_locked(app, run)
@@ -749,7 +929,8 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     out.admitted = admitted
     out.block = st.block
     out.notice = (f"{bid}: {len(rows)} row(s) accepted; {admitted} admitted now, at most {out.capacity} out at once "
-                  f"(the block's workers less one kept for your interactive commands). Results land in {rd}. Follow "
+                  f"(the block's workers less one kept for your interactive commands). Results land in "
+                  f"{batch_dir(rd, bid)}. Follow "
                   f"it with status('{bid}', wait_s=60); stop it with cancel('{bid}'). " + (out.notice or "")).strip()
     return out
 
@@ -761,11 +942,17 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
     if not led.has_batch(bid):
         return _refused(f"no batch {bid} in the ledger", bid=bid)
     owner = owner_of(app)
-    lease = led.take_lease(bid, owner, now=_now())
-    if not lease.ok:
-        return _refused(f"{bid} is held by another hpc-bridge server ({lease.holder}, heartbeat "
-                        f"{int(_now() - lease.heartbeat)} s ago): only that server admits for it. "
-                        f"status('{bid}') reads it from here.", bid=bid)
+    if bid not in app.batches:
+        # a batch this process does not run: taken over as a restart's is (`_adopt`) — one that was admitting is paused
+        # first, so only the user's yes (confirm_spend) resumes it (rule 4: its spend lived in the dead process)
+        if _adopt(app, bid) is None:
+            lease = led.holder(bid)
+            return _refused(f"{bid} is held by another hpc-bridge server ({lease.holder}, heartbeat "
+                            f"{int(_now() - lease.heartbeat)} s ago): only that server admits for it. "
+                            f"status('{bid}') reads it from here.", bid=bid)
+    elif not led.take_lease(bid, owner, now=_now()).ok:
+        app.batches.pop(bid, None)
+        return _refused(f"{bid} is held by another hpc-bridge server now: status('{bid}') reads it from here.", bid=bid)
     b = led.batch(bid)
     if b["state"] in ("done", "cancelled"):
         return _status_of(app, bid)
@@ -800,7 +987,12 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         run = _Run(bid, rt, runner=_batch_runner(app, rt), runner_hash=uec_hash(rt))
         if old is not None:   # results of tasks sent on the old block still settle through their own futures
             run.futures, run.guards, run.sent_on = old.futures, old.guards, old.sent_on
+            run.sent_job, run.old_runners = old.sent_job, old.old_runners + ([old.runner] if old.runner else [])
             run.adopted = old.adopted   # rows a dead server queued are still reconciled after the resume
+            run.old_uep, run.old_uep_until, run.old_uep_hash = old.old_uep, old.old_uep_until, old.old_uep_hash
+            run.switched_left, run.relaunched = old.switched_left, old.relaunched
+            if old.loop is not None and not old.loop.done():
+                old.loop.cancel()
         app.batches[bid] = run
     run.ensure_up = ensure_up
     if run.block_end_at is None:   # never over what a result said since: a check can be older than that
@@ -843,14 +1035,39 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
         run = _adopt(app, bid)
     if run is not None:
         wait = max(0.0, min(float(wait_s or 0.0), MAX_WAIT_S))
-        if wait > 0 and (run.futures or led.batch(bid)["state"] == "admitting"):
-            run.wake.clear()
-            try:
-                await asyncio.wait_for(run.wake.wait(), timeout=wait)
-            except TimeoutError:
-                pass
-        await tick(app, bid)
+        deadline = time.monotonic() + wait + CALL_BUDGET_S
+        await tick(app, bid, deadline=deadline)
+        if wait > 0 and app.batches.get(bid) is run and isinstance(run, _Run):
+            await _wait_for_change(app, run, wait, deadline)
     return _status_of(app, bid, detail=detail, offset=offset, limit=limit)
+
+
+def _change_key(led: Ledger, bid: str) -> tuple[Any, ...]:
+    """What status(wait_s) waits to see change: the phase, and every count but the backlog's move into flight (an
+    admission is no settlement)."""
+    c = led.counts(bid)
+    return (led.batch(bid)["state"], *(c.get(k, 0) for k in ("done", "failed", "lost", "cancelled", "presumed_lost",
+                                                              "submit_unknown")))
+
+
+async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float) -> None:
+    """Until a row settles or the phase changes, or `wait` is up. The background loop does the passes when it runs;
+    otherwise this call does, as the loop would."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    before = _change_key(led, bid)
+    end = time.monotonic() + wait
+    while (left := end - time.monotonic()) > 0 and app.batches.get(bid) is run:
+        looping = run.loop is not None and not run.loop.done()
+        run.wake.clear()
+        try:
+            await asyncio.wait_for(run.wake.wait(), timeout=min(left, 0.5 if looping else TICK_S))
+        except TimeoutError:
+            pass
+        if not looping:
+            await tick(app, bid, deadline=deadline)
+        if _change_key(led, bid) != before:
+            return
 
 
 def _adopt(app: AppCtx, bid: str) -> _Run | None:
@@ -866,6 +1083,7 @@ def _adopt(app: AppCtx, bid: str) -> _Run | None:
     if b["state"] == "admitting":
         pause(app, bid, f"the hpc-bridge server that ran {bid} stopped (a restart): its spend confirmation lived in "
                         "that process, so admission resumes only on the user's yes")
+    _start_loop(app, run)   # what the dead server sent is collected (or presumed) without a tool call
     return run
 
 
@@ -889,75 +1107,163 @@ async def cancel(app: AppCtx, bid: str, *, mode: str = "drain") -> CancelResult:
                             notice=f"{bid} is held by another hpc-bridge server ({b['owner_host']} pid "
                                    f"{b['owner_pid']}); the {mode} was recorded in the ledger and that server applies "
                                    "it at its next pass.")
-    dropped = await _apply_cancel(app, run, mode)
-    await tick(app, bid)
+    deadline = time.monotonic() + CALL_BUDGET_S
+    dropped, marker = await _apply_cancel(app, run, mode, deadline=deadline)
+    await tick(app, bid, deadline=deadline)
     c = _counts(led, bid)
     out = _out_now(c)
     left = _blocks_left(app, run)
+    wall = int(float(b["task_walltime_s"]))
+    if mode == "abort" and out and marker is None:
+        how = (f"each one's wrapper sees the {CANCEL_MARKER} marker within ~2 s and kills its command (rc 143); call "
+               "cancel again or status to see them settle")
+    elif mode == "abort" and out:
+        how = (f"the {CANCEL_MARKER} marker was not written ({marker}), so nothing has told them to stop: each runs to "
+               f"its end — at most task_walltime_s ({wall} s), when its wrapper kills it — or until the block ends")
     if mode == "abort":
-        word = (f"aborted: {dropped} backlog row(s) cancelled; " + (
-            f"{out} task(s) still in flight — each one's wrapper sees the {CANCEL_MARKER} marker within ~2 s and "
-            "kills its command (rc 143); call cancel again or status to see them settle"
-            if out else "nothing of it is in flight"))
+        word = f"aborted: {dropped} backlog row(s) cancelled; " + (
+            f"{out} task(s) still in flight — {how}" if out else "nothing of it is in flight")
     else:
         word = (f"drained: admission stopped, {c.get('backlog', 0)} row(s) kept in the backlog (resume with "
                 f"run_batch(batch_id='{bid}', confirm_spend=True)); " +
                 (f"{out} task(s) in flight finish on their own" if out else "nothing of it is in flight"))
-    tail = (" The session's block keeps billing until stop_endpoint (or its idle release): see blocks_left."
-            if left else "")
+    tail = (f" {len(left)} block(s) of ours can still bill (the session's until stop_endpoint, or its idle release): "
+            "see blocks_left." if left else "")
     return CancelResult(id=bid, status="draining" if out else "down", mode=mode,  # type: ignore[arg-type]
                         backlog_dropped=dropped, in_flight=out, blocks_left=left, notice=f"{bid} {word}.{tail}")
 
 
-async def _apply_cancel(app: AppCtx, run: _Run, mode: str) -> int:
+async def _apply_cancel(app: AppCtx, run: _Run, mode: str, *, deadline: float | None = None) -> tuple[int, str | None]:
+    """Apply a drain or an abort. Returns (backlog rows dropped, why the CANCELLED marker was not written — None when
+    it was, or when nothing was out to need it)."""
     led = ledger_of(app)
     bid = run.batch_id
     b = led.batch(bid)
     led.update_batch(bid, cancel_requested=None)
+    run.next_block = False   # a cancel never asks for another block
     if mode == "drain":
         if b["state"] not in ("done", "cancelled"):
             pause(app, bid, f"drained by cancel('{bid}', 'drain'): the backlog is kept")
-        return 0
+        return 0, None
     dropped = led.cancel_backlog(bid, now=_now())
     led.update_batch(bid, state="cancelled", pause_reason="aborted by cancel")
     led.event(bid, "batch.abort", {"backlog_dropped": dropped})
     _journal({"event": "batch.pause", "batch_id": bid, "reason": "abort"})
     if _out_now(_counts(led, bid)) or run.futures:
-        await write_cancel_marker(app, run, b["results_dir"])
-    return dropped
+        ok, why = await write_cancel_marker(app, run, batch_dir(str(b["results_dir"]), bid), deadline=deadline)
+        return dropped, None if ok else why
+    return dropped, None
 
 
-async def write_cancel_marker(app: AppCtx, run: _Run, results_dir: str) -> bool:
-    """The CANCELLED marker in the results directory, which each running wrapper watches: over the free login shape
-    on an SSH endpoint; on a facility MEP as one small task on the block (a worker is kept free of the batch when the
-    block has two or more)."""
+def _marker_block_why_not(app: AppCtx, run: _Run) -> str | None:
+    """Why a MEP marker task may NOT be sent now, or None when it may. It is a submit: it may only go to the block the
+    batch's tasks run on, while that block is confirmed, live and not ending, its config not retired, with a worker the
+    batch keeps free — else it would revive the user endpoint and start a block nobody confirmed (#204's pattern), or
+    wait behind the very row it is meant to end."""
+    rt = app.shapes.get("compute")
+    if run.runner is None or rt is None or run.rt is not rt:
+        return "no confirmed block of this batch's is bound here (a restart, a stop or a switch)"
+    if not rt.spend_confirmed or rt.reaped:
+        return "the block's spend is no longer confirmed" + (f" (reaped: {rt.reaped})" if rt.reaped else "")
+    if run.runner_hash != uec_hash(rt) or (app.state.endpoint_id is not None
+                                           and ledger_of(app).retired(app.state.endpoint_id, uec_hash(rt))):
+        return "the block's config was retired"
+    rem = run.remaining()
+    if rem is None or rem < MARKER_MIN_REMAINING_S:
+        return "the block's remaining walltime is unknown or nearly gone"
+    if (run.workers_seen or workers_of(rt) or 1) <= 1:
+        return ("the block has one worker, which the batch's task holds: a marker task would wait behind the very row "
+                "it is meant to end")
+    return None
+
+
+async def write_cancel_marker(app: AppCtx, run: _Run, results_dir: str, *,
+                              deadline: float | None = None) -> tuple[bool, str]:
+    """The CANCELLED marker in the batch's own directory, which each running wrapper watches: over the free login shape
+    on an SSH endpoint; on a facility MEP as ONE small task on the batch's confirmed, live block
+    (`_marker_block_why_not`) — never a second while one is out. Returns (written, why not)."""
     cmd = f"mkdir -p {quoted_dir(results_dir)} && touch {quoted_dir(results_dir)}/{CANCEL_MARKER} && echo HPCB_MARKED"
     try:
         if _has_login_shape(app) and login_runner is not None:
             out = await login_runner(app)(cmd)
-            return "HPCB_MARKED" in (out.stdout or "")
-        runner = run.runner
-        if runner is not None:
-            fut = runner.submit(cmd)
-            res = await asyncio.to_thread(fut.result, 60)
-            return "HPCB_MARKED" in _shell_fields(res)[1]
+            if "HPCB_MARKED" in (out.stdout or ""):
+                return True, ""
+            return False, "the login shape did not answer for it"
+        if run.marker_written:   # a marker is never taken back: no second task for it
+            return True, ""
+        fut = run.marker_future
+        if fut is None:
+            if (why := _marker_block_why_not(app, run)) is not None:
+                return False, why
+            rt = app.shapes.get("compute")
+            guard = warmth._new_guard(rt) if rt is not None else None
+            fut = run.marker_future = run.runner.submit(session_shell.guard_prefix(guard) + cmd)
+        budget = MARKER_WAIT_S if deadline is None else max(0.0, min(MARKER_WAIT_S, deadline - time.monotonic()))
+        try:
+            res = await asyncio.to_thread(fut.result, budget)
+        except TimeoutError:
+            return False, (f"its task was sent to the block but has not run within {int(budget)} s — no other is "
+                           "sent; it lands once a worker frees")
+        run.marker_future = None
+        if "HPCB_MARKED" in _shell_fields(res)[1]:
+            run.marker_written = True
+            return True, ""
+        return False, "its task ran but did not write it (another block answered, or the results dir is unwritable)"
     except Exception as exc:  # noqa: BLE001 - the marker is best effort; the answer says the tasks are still out
+        run.marker_future = None
         print(f"hpc-bridge: the cancel marker could not be written ({type(exc).__name__}: {exc})", file=sys.stderr)
-    return False
+        return False, f"{type(exc).__name__}: {exc}"
+
+
+def _iso(wall: float | None) -> str | None:
+    return None if wall is None else time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(wall))
 
 
 def _blocks_left(app: AppCtx, run: _Run) -> list[BlockLeft]:
+    """Every block of ours that can still bill: the session's confirmed block; the ones a stop, detach, reconnect or
+    switch left draining on this endpoint (`app.left_blocks`, a facility endpoint's); the one the batch's next-block
+    switch left to run out its last minutes; a block the facility started for a task of ours after the confirmed one
+    went; and, for a while after a reap, the reaped block's user endpoint, which may start a pilot for the task that
+    was out on it."""
+    out: list[BlockLeft] = []
+    named: set[str] = set()
+    ssh = _has_login_shape(app)
     rt = app.shapes.get("compute")
-    if rt is None or not rt.spend_confirmed:
-        return []
-    job = rt.block_job or run.block_job
-    until = None
-    if run.block_end_at is not None:
-        until = time.strftime("%Y-%m-%dT%H:%M:%SZ", time.gmtime(run.block_end_at))
-    how = ("stop_endpoint() releases it" if _has_login_shape(app) else
-           "the facility idle-releases it once no work is sent (nothing here can cancel it); the user's own "
-           f"scancel {job} ends it now" if job else "the facility idle-releases it once no work is sent")
-    return [BlockLeft(job_id=job, bill_until=until, how_to_end=how)]
+    if rt is not None and rt.spend_confirmed:
+        job = rt.block_job or run.block_job
+        how = ("stop_endpoint() releases it" if ssh else
+               "the facility idle-releases it once no work is sent (nothing here can cancel it); the user's own "
+               f"scancel {job} ends it now" if job else "the facility idle-releases it once no work is sent")
+        out.append(BlockLeft(job_id=job, bill_until=_iso(run.block_end_at), how_to_end=how))
+        named.add(str(job))
+    now_m, now_w = time.monotonic(), _now()
+    for left in warmth._prune_left(app):
+        if left.endpoint_id not in (None, app.state.endpoint_id) or (left.job and left.job in named):
+            continue
+        until = None if left.until is None else now_w + (left.until - now_m)
+        what = "a check of ours still queued there" if left.kind == "check" else f"left draining by a {left.how}"
+        out.append(BlockLeft(job_id=left.job, bill_until=_iso(until), how_to_end=(
+            f"{what}: the facility idle-releases it once no work is sent (nothing here can cancel it)"
+            + (f"; the user's own scancel {left.job} ends it now" if left.job else ""))))
+        named.add(str(left.job))
+    for job, end in run.switched_left:
+        if (end is None or end > now_w) and str(job) not in named:
+            out.append(BlockLeft(job_id=job, bill_until=_iso(end), how_to_end=(
+                "the block in front when the batch moved to the next one: it runs out its last minutes with nothing of "
+                "ours on it" + ("; stop_endpoint() cancels it" if ssh else f"; the user's own scancel {job} ends it"))))
+            named.add(str(job))
+    for job in run.relaunched:
+        if job not in named:
+            out.append(BlockLeft(job_id=job, how_to_end=(
+                "the facility started it for a task of ours that reached it after the confirmed block went; it "
+                "idle-releases once no work is sent" + ("; stop_endpoint() cancels it" if ssh else
+                                                        f"; the user's own scancel {job} ends it now"))))
+            named.add(job)
+    if run.old_uep and now_w < run.old_uep_until:
+        out.append(BlockLeft(job_id=None, bill_until=_iso(run.old_uep_until), how_to_end=(
+            f"the reaped block's user endpoint ({run.old_uep}) may start a pilot for the task that was out on it: "
+            f"hpc-bridge cancels its pilots by that marker until {_iso(run.old_uep_until)}")))
+    return out
 
 
 # ---- one pass: collect, settle, admit -------------------------------------------------------------------------------
@@ -981,7 +1287,7 @@ async def _loop(app: AppCtx, bid: str) -> None:
         except Exception as exc:  # noqa: BLE001 - a pass that fails is logged; the next one tries again
             print(f"hpc-bridge: batch {bid} pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             b = {"state": "admitting"}
-        idle = not run.futures and b["state"] != "admitting"
+        idle = not run.futures and b["state"] != "admitting" and not _still_settling(app, run)
         if idle and b["state"] in ("done", "cancelled", "needs_confirmation"):
             if run.runner is not None and b["state"] in ("done", "cancelled"):
                 try:
@@ -996,33 +1302,54 @@ async def _loop(app: AppCtx, bid: str) -> None:
             pass
 
 
-async def tick(app: AppCtx, bid: str) -> int:
-    """One pass over a batch this process holds: settle what came back, reconcile unknown submits, presume (MEP) or
-    look for evidence (SSH), then admit what the window, the gate and the lease allow. Returns how many it admitted."""
+def _still_settling(app: AppCtx, run: _Run) -> bool:
+    """Something of the batch may still settle without this process's futures — a row in flight it did not send (a
+    restart), a submit of unknown fate — or the reaped block's user endpoint is still watched: the loop keeps going."""
+    if run.old_uep and _now() < run.old_uep_until:
+        return True
+    try:
+        c = _counts(ledger_of(app), run.batch_id)
+    except LedgerError:
+        return False
+    return bool(c.get("in_flight", 0) + c.get("submit_unknown", 0))
+
+
+async def tick(app: AppCtx, bid: str, *, deadline: float | None = None) -> int:
+    """One pass over a batch this process holds: settle what came back, reconcile unknown submits, presume or look for
+    evidence, then admit what the window, the gate and the lease allow. Returns how many it admitted. `deadline`
+    (monotonic): a tool call's pass skips the steps that could outlast it — the background loop runs them."""
     run = app.batches.get(bid)
     if run is None:
         return 0
     async with run.passing:
-        return await _tick(app, bid, run)
+        return await _tick(app, bid, run, deadline)
 
 
-async def _tick(app: AppCtx, bid: str, run: _Run) -> int:
+def _room(deadline: float | None, need_s: float) -> bool:
+    return deadline is None or deadline - time.monotonic() >= need_s
+
+
+async def _tick(app: AppCtx, bid: str, run: _Run, deadline: float | None = None) -> int:
     led = ledger_of(app)
     if not led.heartbeat(bid, owner_of(app)):
         app.batches.pop(bid, None)   # another process took the lease: this one reads, never admits
         return 0
     b = led.batch(bid)
     if b.get("cancel_requested"):
-        await _apply_cancel(app, run, str(b["cancel_requested"]))
+        await _apply_cancel(app, run, str(b["cancel_requested"]), deadline=deadline)
     _collect(app, run)
-    await _rest_pull(app, run)
-    await _reconcile_unsent(app, run)
-    await _reconcile(app, run)
+    if _room(deadline, 20):
+        await _rest_pull(app, run)
+        await _reconcile_unsent(app, run)
+        await _reconcile(app, run)
     _presume(app, run)
-    await _evidence(app, run)
-    await _release_old_uep(app, run)
-    await _maybe_switch(app, run)
-    await _maybe_warm(app, run)
+    if _room(deadline, 40):
+        await _evidence(app, run)
+        await _release_old_uep(app, run)
+    if _room(deadline, 90):
+        await _maybe_switch(app, run)
+    if _room(deadline, 40):
+        await _maybe_warm(app, run)
     async with app.lock:
         n = _admit_locked(app, run)
     _maybe_done(app, run)
@@ -1102,9 +1429,10 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     led = ledger_of(app)
     bid = run.batch_id
     guard = warmth._new_guard(rt)
-    script = task_script(substitute(str(b["command"]), row, index, names), results_dir=str(b["results_dir"]),
-                         index=index, attempt=attempt, task_walltime_s=float(b["task_walltime_s"]), session=session,
-                         guard=guard)
+    script = task_script(substitute(str(b["command"]), row, index, names),
+                         results_dir=batch_dir(str(b["results_dir"]), bid), index=index, attempt=attempt,
+                         task_walltime_s=float(b["task_walltime_s"]), session=session, guard=guard,
+                         fields=row_values(row, index, names))
     try:
         fut = run.runner.submit(script)
     except Exception as exc:  # noqa: BLE001 - the Executor refused before sending (shut down): never sent
@@ -1121,7 +1449,9 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     rt.batch_inflight += 1
     tid = getattr(fut, "task_id", None)
     if tid:
-        led.set_task_id(bid, index, attempt, str(tid))
+        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job, task_id=str(tid))
+    else:
+        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job)
     try:
         loop = asyncio.get_running_loop()
         fut.add_done_callback(lambda _f, ev=run.wake: loop.call_soon_threadsafe(ev.set))
@@ -1148,17 +1478,24 @@ async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
     led = ledger_of(app)
     b = led.batch(run.batch_id)
     rem = run.remaining()
-    if not led.counts(run.batch_id).get("backlog", 0):
-        run.next_block = False   # nothing left for a next block to run
+    c = led.counts(run.batch_id)
+    if not c.get("backlog", 0) or b["state"] != "admitting":
+        run.next_block = False   # nothing left for a next block to run, or the batch was paused, drained or stopped
         return None
     if (not run.next_block or run.ensure_up is None or rt is None or rt is not run.rt or not _fresh_ok(app)
             or rem is None or admit_ok(rem, float(b["task_walltime_s"])) or run.futures or rt.inflight
-            or rt.batch_inflight or warmth._live_task_handles(app, "compute")):
+            or rt.batch_inflight or c.get("submit_unknown", 0) or c.get("in_flight", 0)
+            or warmth._live_task_handles(app, "compute")):
         return None
     old_job = run.block_job
     async with app.lock:
-        if app.shapes.get("compute") is not rt:
+        if app.shapes.get("compute") is not rt or led.batch(run.batch_id)["state"] != "admitting":
             return None
+        # the block in front runs out its last minutes on its own: banked to its end, and named while it can bill
+        warmth._bank_warm_interval(rt, app)
+        if rem > 0:
+            rt.spend_accrued += warmth.estimate_spend(rem, warmth._block_nodes(rt, app), app.charge_factor)
+        run.switched_left.append((old_job, _now() + max(0.0, rem)))
         warmth._drop_compute_shape_locked(app)
         run.switching = True
     try:
@@ -1209,10 +1546,13 @@ def _drop(run: _Run, key: tuple[int, int]) -> None:
 
 def _collect(app: AppCtx, run: _Run) -> None:
     led = ledger_of(app)
-    tg = getattr(run.runner, "task_group_id", None) if run.runner is not None else None
-    if tg and str(tg) != (led.batch(run.batch_id).get("task_group_id") or ""):
-        # on the record as soon as the service minted it: a server that restarts reconciles against it
-        led.update_batch(run.batch_id, task_group_id=str(tg))
+    for r in [run.runner, *run.old_runners]:
+        tg = getattr(r, "task_group_id", None) if r is not None else None
+        if tg and str(tg) not in run.groups_recorded:
+            # on the record as soon as the service minted it: every runner's (reconciliation reads them all, and a
+            # server that restarts too)
+            led.add_task_group(run.batch_id, str(tg))
+            run.groups_recorded.add(str(tg))
     for key, fut in list(run.futures.items()):
         index, attempt = key
         tid = getattr(fut, "task_id", None)
@@ -1228,10 +1568,32 @@ def _collect(app: AppCtx, run: _Run) -> None:
             led.settle(run.batch_id, index, attempt, "backlog", only_from=("in_flight",))
             continue
         exc = fut.exception()
+        if exc is not None and tid and _client_side(exc):
+            # the SDK's own machinery failed (its result watcher quit: a laptop asleep, a network down) — not the task,
+            # which runs on in the block. It keeps its slot (nothing is refilled on it), the runner is rebuilt, and its
+            # result is pulled by REST (`_rest_pull`: a row out with a task id and no future here)
+            _runner_broken(run, exc)
+            continue
         if exc is not None:
             _settle_failure(app, run, index, attempt, exc, sent=bool(tid))
             continue
         _settle_result(app, run, index, attempt, fut.result(), guard)
+
+
+def _client_side(exc: BaseException) -> bool:
+    """A future's exception that is the SDK's own (its AMQP result watcher gave up and failed every open future: "SDK
+    thread quit unexpectedly.", a connection it could not reopen, a channel it could not keep) — not the task's result,
+    which a TaskExecutionFailed is (a ManagerLost / WorkerLost included)."""
+    return not (type(exc).__name__ == "TaskExecutionFailed" or _LOST.search(str(exc)))
+
+
+def _runner_broken(run: _Run, exc: BaseException) -> None:
+    if run.runner is not None:
+        print(f"hpc-bridge: batch {run.batch_id}: the SDK's result channel failed ({type(exc).__name__}: {exc}); "
+              "rebuilding its runner, results by REST", file=sys.stderr)
+        run.old_runners.append(run.runner)
+        run.runner, run.runner_hash = None, None
+    run.last_rest = 0.0
 
 
 def _settle_failure(app: AppCtx, run: _Run, index: int, attempt: int, exc: BaseException | str, *, sent: bool) -> None:
@@ -1276,6 +1638,9 @@ def _settle_result(app: AppCtx, run: _Run, index: int, attempt: int, res: Any, g
     if refused is not None:   # it reached ANOTHER block than the confirmed one and ran nothing: the block is gone
         led.settle(bid, index, attempt, "backlog", only_from=holding, evidence="refused on a replacement block")
         rt = app.shapes.get("compute")
+        if refused.job and refused.job not in run.relaunched and refused.job != run.block_job:
+            run.relaunched.append(refused.job)
+            led.add_block_seen(bid, refused.job)
         why = (f"the confirmed block (job {run.block_job or '?'}) is gone: a task of {bid} reached another block "
                f"({'job ' + refused.job if refused.job else 'a job hpc-bridge cannot read'}) and refused to run there")
         if rt is not None and rt is run.rt and rt.reaped is None:
@@ -1387,16 +1752,15 @@ async def _reconcile_unsent(app: AppCtx, run: _Run) -> None:
     mine = set(run.futures)   # this process's own sends: their ids come with the service's answer
     unsent = [t for t in led.tasks(run.batch_id, states=("in_flight",))
               if not t.get("task_id") and (int(t["idx"]), int(t["attempt"])) not in mine]
-    tg = led.batch(run.batch_id).get("task_group_id")
+    groups = led.task_groups(run.batch_id)
     client = _lookup_client(app, run)
-    if not unsent or not tg or client is None or (run.last_unsent and _now() - run.last_unsent < REST_EVERY_S):
+    # no group on the record (the server died before the service's first answer): nothing can be reconciled — those
+    # rows are presumed in time instead (`_presume`)
+    if not unsent or not groups or client is None or (run.last_unsent and _now() - run.last_unsent < REST_EVERY_S):
         return
     run.last_unsent = _now()
-    try:
-        r = await asyncio.to_thread(client._compute_web_client.v2.get_task_group, tg)
-        ids = [str(x.get("id")) for x in (r.get("tasks") or []) if x.get("id")]
-    except Exception as exc:  # noqa: BLE001 - try again next pass
-        print(f"hpc-bridge: batch {run.batch_id}: task-group read failed ({exc})", file=sys.stderr)
+    ids = await _group_tasks(client, run.batch_id, groups)
+    if ids is None:
         return
     known = {str(t["task_id"]) for t in led.tasks(run.batch_id) if t.get("task_id")}
     strays = [i for i in ids if i not in known]
@@ -1432,18 +1796,13 @@ async def _reconcile(app: AppCtx, run: _Run) -> None:
     unknown = led.tasks(run.batch_id, states=("submit_unknown",))
     if not unknown:
         return
-    runner = run.runner
-    tg = getattr(runner, "task_group_id", None) if runner is not None else None
+    groups = led.task_groups(run.batch_id)
     client = _lookup_client(app, run)
-    if not tg or client is None:
+    if not groups or client is None:
         return
-    try:
-        r = await asyncio.to_thread(client._compute_web_client.v2.get_task_group, tg)
-        ids = [str(x.get("id")) for x in (r.get("tasks") or []) if x.get("id")]
-    except Exception as exc:  # noqa: BLE001 - try again next pass
-        print(f"hpc-bridge: batch {run.batch_id}: task-group read failed ({exc})", file=sys.stderr)
+    ids = await _group_tasks(client, run.batch_id, groups)
+    if ids is None:
         return
-    led.update_batch(run.batch_id, task_group_id=str(tg))
     known = {str(t["task_id"]) for t in led.tasks(run.batch_id) if t.get("task_id")}
     strays = [i for i in ids if i not in known]
     pending = False
@@ -1462,24 +1821,59 @@ async def _reconcile(app: AppCtx, run: _Run) -> None:
             if row is not None and row["state"] == "submit_unknown" and int(row["attempt"]) == rep.attempt:
                 led.settle(run.batch_id, rep.index, rep.attempt, "submit_unknown", task_id=tid)
                 _settle_result(app, run, rep.index, rep.attempt, res.result, None)
-    if pending or not led.batch(run.batch_id)["idempotent"]:
+    if pending:
         return
+    idem = bool(led.batch(run.batch_id)["idempotent"])
     for t in led.tasks(run.batch_id, states=("submit_unknown",)):
-        led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "backlog", only_from=("submit_unknown",),
-                   evidence="reconciled: no task of ours in the group answers for it; sent again (idempotent)")
+        i, a = int(t["idx"]), int(t["attempt"])
+        if idem:
+            led.settle(run.batch_id, i, a, "backlog", only_from=("submit_unknown",),
+                       evidence="reconciled: no task of ours in the batch's task groups answers for it; sent again "
+                                "(idempotent)")
+        elif t.get("admitted_at") and _now() - float(t["admitted_at"]) > UNKNOWN_SETTLE_S:
+            # well past the failed submit, the service's task groups list no task of ours the ledger does not know:
+            # the POST never reached it. Not idempotent, so never sent again: lost, on that evidence
+            why = "evidence: the submit never reached the service (its task groups list no task for it)"
+            led.settle(run.batch_id, i, a, "lost", only_from=("submit_unknown",), settled_by=why, evidence=why)
+            _event(run.batch_id, "batch.settle", i, a, "lost", reason=why)
+
+
+async def _group_tasks(client: Any, bid: str, groups: list[str]) -> list[str] | None:
+    """Every task in the batch's task groups (each runner's), or None when one could not be read (try again later)."""
+    ids: list[str] = []
+    for tg in groups:
+        try:
+            r = await asyncio.to_thread(client._compute_web_client.v2.get_task_group, tg)
+        except Exception as exc:  # noqa: BLE001 - try again next pass
+            print(f"hpc-bridge: batch {bid}: task-group read failed ({exc})", file=sys.stderr)
+            return None
+        ids += [str(x.get("id")) for x in (r.get("tasks") or []) if x.get("id")]
+    return ids
 
 
 def _presume(app: AppCtx, run: _Run) -> None:
-    """MEP only: a task out past its clock (block evidence + task_walltime_s + the grace) is presumed lost — it keeps
-    its slot, is never retried, and only unblocks a stop or a cancel. A later result still wins."""
-    if _has_login_shape(app):
-        return
+    """A task out past its clock (block evidence + task_walltime_s + the grace) is presumed lost — it keeps its slot, is
+    never retried, and only unblocks a stop or a cancel; a later result still wins. On a MEP every row out (no evidence
+    channel exists there); on SSH only a row this process holds no future for (a dead server sent it: its evidence may
+    never come), and anywhere a submit of unknown fate the task groups could not settle. The block evidence is this
+    process's, else the ledger's (a block seen before the restart: any admission needed one)."""
     led = ledger_of(app)
     wall = float(led.batch(run.batch_id)["task_walltime_s"])
-    for t in led.tasks(run.batch_id, states=("in_flight",)):
-        if t.get("admitted_at") and presumed_lost(admitted_at=float(t["admitted_at"]), block_seen_at=run.block_seen_at,
-                                                  task_walltime_s=wall, now=_now()):
-            led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "presumed_lost", only_from=("in_flight",),
+    seen = run.block_seen_at
+    held = set(run.futures)
+    ssh = _has_login_shape(app)
+    any_seen = bool(json.loads(led.batch(run.batch_id).get("blocks_seen") or "[]"))
+    for t in led.tasks(run.batch_id, states=("in_flight", "submit_unknown")):
+        key = (int(t["idx"]), int(t["attempt"]))
+        if ssh and t["state"] == "in_flight" and key in held:
+            continue
+        if not t.get("admitted_at"):
+            continue
+        evidence = seen if seen is not None else (float(t["admitted_at"]) if any_seen else None)
+        if presumed_lost(admitted_at=float(t["admitted_at"]), block_seen_at=evidence, task_walltime_s=wall,
+                         now=_now()):
+            led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "presumed_lost",
+                       only_from=("in_flight", "submit_unknown"),
                        settled_by="presumption", evidence="no result past task_walltime_s + the grace since a block "
                                                           "was seen; it keeps its slot and is never retried")
             _event(run.batch_id, "batch.settle", int(t["idx"]), int(t["attempt"]), "presumed_lost")
@@ -1497,6 +1891,12 @@ async def _release_old_uep(app: AppCtx, run: _Run) -> None:
     never the endpoint-wide one, which would take the new block too."""
     if (not run.old_uep or _now() > run.old_uep_until or login_runner is None or not _has_login_shape(app)
             or _now() - run.last_release < RELEASE_EVERY_S):
+        return
+    cur = app.shapes.get("compute")
+    if cur is not None and cur.spend_confirmed and run.old_uep_hash is not None and uec_hash(cur) == run.old_uep_hash:
+        # the block the user confirmed after the reap went to the SAME user endpoint (the same config: no fresh one per
+        # confirmation here): its pilot carries that marker and is the user's block — never released
+        run.old_uep = None
         return
     run.last_release = _now()
     mark = shlex.quote(run.old_uep)
@@ -1520,24 +1920,43 @@ _ENDED = ("CANCELLED", "TIMEOUT", "FAILED", "COMPLETED", "NODE_FAIL", "PREEMPTED
 
 
 async def _evidence(app: AppCtx, run: _Run) -> None:
-    """SSH only: while tasks are out, look up the block's job on the free login shape now and then; a job the scheduler
-    says has ended settles the tasks out on it `lost`, on that evidence (a reaped block: sacct says CANCELLED)."""
-    if not _has_login_shape(app) or login_runner is None or not run.futures or not run.block_job:
+    """SSH only: while tasks are out, look up the job(s) they were sent to on the free login shape now and then; a job
+    the scheduler says has ended settles the tasks out on it `lost`, on that evidence (a reaped block: sacct says
+    CANCELLED). The rows are the ledger's — a dead server's too — and each one's job is the one it was sent to (this
+    process's record, else the ledger's `sent_job`, else the last block the batch saw)."""
+    if not _has_login_shape(app) or login_runner is None:
         return
     now = _now()
     led = ledger_of(app)
     out_rows = led.tasks(run.batch_id, states=("in_flight",))
+    if not out_rows:
+        return
     oldest = min((float(t["admitted_at"]) for t in out_rows if t.get("admitted_at")), default=None)
     if oldest is None or now - oldest < EVIDENCE_AFTER_S or now - run.last_evidence < EVIDENCE_EVERY_S:
         return
     run.last_evidence = now
-    job = run.block_job
+    seen = json.loads(led.batch(run.batch_id).get("blocks_seen") or "[]")
+    fallback = run.block_job or (str(seen[-1]) if seen else None)
+    by_job: dict[str, list[tuple[int, int]]] = {}
+    for t in out_rows:
+        key = (int(t["idx"]), int(t["attempt"]))
+        job = run.sent_job.get(key) if key in run.sent_job else (t.get("sent_job") or None)
+        job = job or fallback
+        if job and session_shell._JOB_ID.fullmatch(str(job)):
+            by_job.setdefault(str(job), []).append(key)
+    for job, keys in by_job.items():
+        await _evidence_for(app, run, job, keys, now)
+
+
+async def _evidence_for(app: AppCtx, run: _Run, job: str, keys: list[tuple[int, int]], now: float) -> None:
+    led = ledger_of(app)
     q = shlex.quote(job)
     cmd = (f"s=$(squeue -h -j {q} -o %T 2>/dev/null | head -n 1); "
            f"a=$(sacct -X -n -P -j {q} -o State 2>/dev/null | head -n 1 | awk '{{print $1}}'); "
            f"u=$(sacct -X -n -P -j {q} -o SubmitLine%800 2>/dev/null | grep -o 'uep\\.[0-9a-f.-]*' | head -n 1); "
            f"p=$(qstat -x -f {q} 2>/dev/null | sed -n 's/^ *job_state = //p' | head -n 1); "
            'echo "HPCB_JOB_STATE squeue=$s sacct=$a pbs=$p uep=$u"')
+    assert login_runner is not None
     try:
         res = await login_runner(app)(cmd)
     except Exception:  # noqa: BLE001 - no evidence this pass
@@ -1552,9 +1971,11 @@ async def _evidence(app: AppCtx, run: _Run) -> None:
     if not state:
         return
     why = f"sacct says the block's job {job} is {state}" if state != "F" else f"PBS says the block's job {job} finished"
-    if re.fullmatch(r"uep\.[0-9a-f-]{36}\.[0-9a-f-]{36}", m.group(4) or ""):
+    rt = run.rt
+    if re.fullmatch(r"uep\.[0-9a-f-]{36}\.[0-9a-f-]{36}", m.group(4) or "") and job == run.block_job:
         run.old_uep, run.old_uep_until = m.group(4), now + RELEASE_OLD_UEP_S
-    for key in [k for k in list(run.futures) if run.sent_job.get(k) in (job, None)]:   # those on THAT block
+        run.old_uep_hash = run.runner_hash or (uec_hash(rt) if rt is not None else None)
+    for key in keys:
         index, attempt = key
         _drop(run, key)
         if led.batch(run.batch_id)["idempotent"]:
@@ -1564,12 +1985,13 @@ async def _evidence(app: AppCtx, run: _Run) -> None:
             led.settle(run.batch_id, index, attempt, "lost", only_from=list(HOLDING), settled_by=f"evidence: {why}",
                        evidence=why)
         _event(run.batch_id, "batch.settle", index, attempt, "lost", reason=why)
-    rt = run.rt
     full = f"the block (job {job}) ended under the batch — {why}"
-    if rt is not None and app.shapes.get("compute") is rt and rt.reaped is None:
-        warmth._mark_reaped(app, rt, full, warmth._release_bound(app, "compute", rt), kicked=False)
-    retire_all(app, rt, full)
-    pause(app, run.batch_id, f"the block was reaped — {full}; its tasks out were settled lost, the backlog is kept")
+    if job == run.block_job and rt is not None:
+        if app.shapes.get("compute") is rt and rt.reaped is None:
+            warmth._mark_reaped(app, rt, full, warmth._release_bound(app, "compute", rt), kicked=False)
+        retire_all(app, rt, full)
+    if led.batch(run.batch_id)["state"] in ("admitting", "needs_confirmation"):
+        pause(app, run.batch_id, f"the block was reaped — {full}; its tasks out were settled lost, the backlog is kept")
 
 
 # ---- the answer ------------------------------------------------------------------------------------------------------
@@ -1612,7 +2034,7 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     if run is None and state not in ("done", "cancelled"):
         beat = int(_now() - float(b["heartbeat"] or 0))
         owner = f"pid {b['owner_pid']} on {b['owner_host']} (heartbeat {beat} s ago)"
-        if str(b["owner_host"] or "") == owner_of(app).host and not led.pid_alive(int(b["owner_pid"] or 0)):
+        if not led.holder_alive(led.holder(bid).holder):
             # its server is gone (that pid is dead here): nothing admits for it, whatever its last state said; this
             # server takes the lease over once the heartbeat is stale, and then asks again before sending more
             phase = "needs_confirmation"
@@ -1638,7 +2060,8 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     return BatchStatus(
         batch_id=bid, phase=phase, tasks=total, chunk=int(b.get("chunk") or 1), capacity=int(b["capacity"] or 1),
         counts=BatchCounts(**{k: c.get(k, 0) for k in BatchCounts.model_fields}),
-        results=[_task_result(t) for t in rows], offset=offset, next_offset=nxt, results_dir=b.get("results_dir"),
+        results=[_task_result(t) for t in rows], offset=offset, next_offset=nxt,
+        results_dir=batch_dir(str(b["results_dir"]), bid) if b.get("results_dir") else None,
         blocks_seen=json.loads(b.get("blocks_seen") or "[]"), owner=owner, reason=reason, notice=text)
 
 
@@ -1677,19 +2100,56 @@ async def poll_uuid(app: AppCtx, task_id: str) -> ShellOutcome | None:
     if it is None:
         return None
     client = _lookup_client(app)
+    got: RestResult | None = None
+    if client is not None:
+        try:
+            got = (await asyncio.to_thread(collect_rest, client, [task_id])).get(task_id)
+        except Exception as exc:  # noqa: BLE001 - the service unreachable: the session dir may still answer
+            print(f"hpc-bridge: poll_task {task_id}: REST failed ({exc})", file=sys.stderr)
+    if got is not None and got.state == "failed":
+        return ShellOutcome(phase="failed", exit_code=1, stderr_snippet=got.error[-4000:], block_state="warm",
+                            notice="the task failed (its result from the service)")
+    if got is not None and got.state == "success":
+        rc, out, err = _shell_fields(got.result)
+        return ShellOutcome(phase="complete", exit_code=rc, stdout=out, stderr_snippet=err, block_state="warm")
+    # the service cannot answer (no client yet, unreachable, or it has no result: past its window, or not yet
+    # delivered) — the session dir the command wrote its rc and tail to may (session_shell.wrap(result_key=…))
+    kept = await _session_result(app, it)
+    if kept is not None:
+        rc, tail = kept
+        return ShellOutcome(phase="complete", exit_code=rc, stdout=tail, block_state="warm",
+                            notice="read from the session dir on the facility (the service had no result for it): the "
+                                   "exit code and the output's last 4 kB")
     if client is None:
         return ShellOutcome(phase="running", block_state="cold", task_id=task_id, globus_task_id=task_id,
                             notice="the ledger knows this task, but no Globus client is up yet to look it up: "
                                    "connect_facility first, then poll_task again")
-    got = (await asyncio.to_thread(collect_rest, client, [task_id])).get(task_id)
-    if got is None or got.state == "pending":
-        return ShellOutcome(phase="running", block_state="warm", task_id=task_id, globus_task_id=task_id,
-                            notice="the service lists the task as still pending")
-    if got.state == "failed":
-        return ShellOutcome(phase="failed", exit_code=1, stderr_snippet=got.error[-4000:], block_state="warm",
-                            notice="the task failed (its result from the service)")
-    rc, out, err = _shell_fields(got.result)
-    return ShellOutcome(phase="complete", exit_code=rc, stdout=out, stderr_snippet=err, block_state="warm")
+    return ShellOutcome(phase="running", block_state="warm", task_id=task_id, globus_task_id=task_id,
+                        notice="the service lists the task as still pending")
+
+
+async def _session_result(app: AppCtx, it: dict[str, Any]) -> tuple[int | None, str] | None:
+    """An interactive task's rc and output tail from its session dir, read over the free login shape (an SSH
+    endpoint's; a facility MEP has no free channel to read it): None when there is none, or no channel."""
+    key, root, sid = it.get("result_key"), it.get("state_dir"), it.get("session_id") or "default"
+    if not key or not root or login_runner is None or not _has_login_shape(app):
+        return None
+    try:
+        d = f"{session_shell.Session(str(sid), str(root)).quoted_state_dir()}/results/{shlex.quote(str(key))}"
+    except ValueError:
+        return None
+    cmd = (f'if [ -f {d}/rc ]; then echo "HPCB_RC $(cat {d}/rc)"; '
+           f'echo "HPCB_TAIL $(base64 < {d}/tail 2>/dev/null | tr -d \'\\n\')"; fi')
+    try:
+        res = await login_runner(app)(cmd)
+    except Exception:  # noqa: BLE001 - no answer from the files either
+        return None
+    m = re.search(r"^HPCB_RC (\S*)", res.stdout or "", re.M)
+    if m is None:
+        return None
+    t = re.search(r"^HPCB_TAIL (\S*)", res.stdout or "", re.M)
+    rc = int(m.group(1)) if m.group(1).lstrip("-").isdigit() else None
+    return rc, _b64(t.group(1)) if t else ""
 
 
 def record_interactive(app: AppCtx, task_id: str | None, *, shape: str, session_id: str, result_key: str | None,

@@ -16,7 +16,8 @@ The tool surface the graders read (the stage-A checkpoint fixes it):
 - The journal's event rows (`Trace.events`): {"event": "batch.admit" | "batch.settle" | "batch.pause" | "batch.resume",
   "ts", "pid", "batch_id", "index", "attempt", "task_id", "in_flight", "capacity", "remaining_s", "need_s", "job_id",
   "state", "reason"}.
-- The wrapper's files on the facility: `<results_dir>/tasks/<index>/attempt-<n>/meta.json` (written when the attempt
+- The wrapper's files on the facility, in the batch's own dir (`results_dir` in its answers: `<base>/<batch id>`):
+  `<dir>/tasks/<index>/attempt-<n>/meta.json` (written when the attempt
   STARTS: index, attempt, job, host, start, remaining_s), `…/rc`, `…/stdout`, `…/stderr`.
 
 MAIN (no batch tools): a script whose `run_batch` meets "Unknown tool" falls back to what an agent could do today —

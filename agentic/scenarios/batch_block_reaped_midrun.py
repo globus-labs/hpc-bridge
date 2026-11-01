@@ -48,7 +48,7 @@ RESULTS = "$HOME/hpcb-batches/{endpoint_name}/reaped"   # the hook fills {endpoi
 MIDRUN_HOOKS = [{
     "name": "reap_after_5_results",
     "after_tool": "run_batch",
-    "poll": f"ls {RESULTS}/tasks/*/attempt-*/rc 2>/dev/null | wc -l",
+    "poll": f"ls {RESULTS}/tasks/*/attempt-*/rc {RESULTS}/batch-*/tasks/*/attempt-*/rc 2>/dev/null | wc -l",
     "until": r"^\s*([5-9]|[1-9][0-9]+)\s*$",
     "every_s": 3,
     "poll_timeout_s": 900,

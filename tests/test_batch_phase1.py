@@ -266,8 +266,10 @@ async def test_retired_token_pauses_every_engine_path(monkeypatch):
     # the resume path: a batch still admitting whose block's config was retired meanwhile — run_batch(batch_id=…)
     # without the yes sends nothing with it, and pauses naming the retirement
     app2, rt2, runner2 = await _batch_app()
+    rt2.user_endpoint_config["hpcb_block"] = 2                         # another confirmation's config: not retired
     out2 = await _start(app2, n=6)
     sent2 = len(runner2.futures)
+    assert sent2 == 2
     runner2.futures[0].finish(_ok_report(0))
     app2.ledger.retire("fake-eid", batch.uec_hash(rt2), why="stop_endpoint released this block")
     res = await server._run_batch(app2, batch_id=out2.batch_id)
@@ -918,8 +920,10 @@ async def test_reap_evidence_settles_only_the_reaped_blocks_tasks_and_releases_i
     def runner_for(_app):
         async def run(cmd):
             cmds.append(cmd)
-            if "HPCB_JOB_STATE" in cmd:
+            if "HPCB_JOB_STATE" in cmd and "-j 13 " in cmd:                     # the reaped block
                 return SimpleNamespace(stdout=f"HPCB_JOB_STATE squeue= sacct=CANCELLED pbs= uep={uep}\n")
+            if "HPCB_JOB_STATE" in cmd:                                         # the new one runs
+                return SimpleNamespace(stdout="HPCB_JOB_STATE squeue=RUNNING sacct=RUNNING pbs= uep=\n")
             return SimpleNamespace(stdout="HPCB_RELEASED 14\n")
         return run
 
@@ -1286,11 +1290,14 @@ async def test_a_block_a_switch_left_is_named_in_blocks_left_and_banked_to_its_e
     from hpc_bridge import batch, server
 
     app, rt, _runner = await _batch_app(remaining_s=150.0, workers=3)
-    out, run, runner = await _at_next_block(app)
+    app.charge_factor = 1.0
+    out, _run, runner = await _at_next_block(app)
+    before = app.released_spend
     runner.futures[1].finish(_ok_report(1, remaining_s=70.0))
     await batch.tick(app, out.batch_id)
     assert app.shapes["compute"] is not rt                             # switched
-    assert rt.spend_accrued > 0
+    # banked to its end: its ~70 s left (a node-hour each 3600 s) on top of whatever ran to now
+    assert app.released_spend - before >= 60 / 3600, (before, app.released_spend)
     c = await server._cancel(app, out.batch_id, "drain")
     assert any(b.job_id == "101" for b in c.blocks_left), c.blocks_left
 
@@ -1411,19 +1418,20 @@ async def test_an_old_cancel_marker_does_not_cancel_a_new_batch_in_the_same_dir(
 
 
 @pytest.mark.skipif(_BASH is None or os.geteuid() == 0, reason="needs bash, and a user a chmod binds")
-async def test_an_unwritable_results_dir_fails_the_row_with_its_cause(tmp_path):
+async def test_an_unwritable_results_dir_fails_the_row_with_its_cause(tmp_path, monkeypatch):
     """L1. A claim that fails for any reason but an existing attempt (EACCES here; ENOSPC, EDQUOT on a full disk) fails
     the row with that cause — it is no duplicate, and an idempotent row is not sent again and again."""
     from hpc_bridge import batch, server
 
+    monkeypatch.setattr(batch, "_new_id", lambda: "batch-00000000beef")
+    d = tmp_path / "out" / "batch-00000000beef" / "tasks" / "0"
+    d.mkdir(parents=True)
+    d.chmod(0o555)                                  # mkdir attempt-1 fails: EACCES
     runner = _BashRunner(tmp_path, canary=_canary())
     app, _rt, _ = await _batch_app(runner=runner)
-    out = await server._run_batch(app, command="echo {x}", rows=[{"x": 0}], task_walltime_s=60,
-                                  results_dir=str(tmp_path / "out"), idempotent=True)
-    d = Path(out.results_dir) / "tasks" / "0"
-    d.mkdir(parents=True, exist_ok=True)
-    d.chmod(0o555)
     try:
+        out = await server._run_batch(app, command="echo {x}", rows=[{"x": 0}], task_walltime_s=60,
+                                      results_dir=str(tmp_path / "out"), idempotent=True)
         for _ in range(6):
             await batch.tick(app, out.batch_id)
         sends = sum("/tasks/0/attempt-" in c for c in runner.commands)
@@ -1557,12 +1565,14 @@ async def test_ssh_restart_before_the_first_answer_does_not_wedge_rows_in_flight
     app, _rt, _ = await _batch_app(workers=3, runner=_NoIdYet(canary=_canary()))
     out = await _start(app, n=4)                                         # the server dies within its first 2 s
     app2, _rt2, _runner2 = await _restart(app)
-    await server._status(app2, out.batch_id)
-    await server._cancel(app2, out.batch_id, "abort")
+    await server._status(app2, out.batch_id)                            # its heartbeat is fresh: a read
+    await server._cancel(app2, out.batch_id, "abort")                   # recorded, for the holder to apply
     for _ in range(4):
         clock[0] += 3600
-        await batch.tick(app2, out.batch_id)
+        await server._status(app2, out.batch_id)                        # as the stop's refusal says: status collects
     assert batch.in_flight_note(app2) is None, app2.ledger.counts(out.batch_id)
+    assert app2.ledger.counts(out.batch_id)["presumed_lost"] == 2 and app2.ledger.batch(out.batch_id)["state"] == \
+        "cancelled"
 
 
 async def test_ssh_evidence_after_a_restart_settles_rows_this_process_never_sent(monkeypatch):
