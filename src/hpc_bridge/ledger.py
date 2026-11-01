@@ -75,12 +75,13 @@ def proc_start(pid: int) -> str | None:
         return "linux:" + stat.rsplit(")", 1)[1].split()[19]
     except (OSError, IndexError, ValueError):
         pass
-    try:
+    try:   # the C locale and UTC: every reader renders the same start the same way, whatever its own TZ or LC_*
+        env = {**os.environ, "LC_ALL": "C", "LANG": "C", "TZ": "UTC0"}
         out = subprocess.run(["ps", "-o", "lstart=", "-p", str(int(pid))], capture_output=True, text=True, timeout=5,
-                             stdin=subprocess.DEVNULL).stdout.strip()
+                             stdin=subprocess.DEVNULL, env=env).stdout.strip()
     except (OSError, subprocess.SubprocessError, ValueError):
         return None
-    return ("ps:" + " ".join(out.split())) if out else None
+    return ("psutc:" + " ".join(out.split())) if out else None
 
 
 @dataclass(frozen=True)
@@ -224,6 +225,9 @@ create table if not exists task (
   settled_by text,
   evidence text,
   sent_job text,
+  sent_uec text,
+  unknown_since real,
+  unheld text,
   primary key (batch_id, idx)
 );
 create index if not exists task_by_tid on task (task_id);
@@ -260,9 +264,11 @@ create table if not exists event (
 """
 
 _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "truncated", "job_id", "host", "workers",
-                "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job")
+                "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job", "sent_uec",
+                "unknown_since", "unheld")
 # Columns a ledger written by an earlier build may lack: added on open.
-_ADDED_COLUMNS = {"batch": [("owner_start", "text")], "task": [("sent_job", "text")]}
+_ADDED_COLUMNS = {"batch": [("owner_start", "text")],
+                  "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")]}
 
 
 class Ledger:
@@ -387,7 +393,9 @@ class Ledger:
             return False
         if holder.started:
             now = self.proc_start(holder.pid)
-            if now is not None and now != holder.started:
+            # compared only in one form (/proc's ticks, or ps in C/UTC): a start recorded another way, or unreadable
+            # now, is no evidence — a live pid's lease is never taken on it
+            if now is not None and now.split(":", 1)[0] == holder.started.split(":", 1)[0] and now != holder.started:
                 return False
         return True
 
@@ -544,6 +552,13 @@ class Ledger:
             q += " limit ? offset ?"
             args += [int(limit), int(offset)]
         return [dict(r) for r in self._con.execute(q, args)]
+
+    def unknown_holding(self, batch_id: str) -> list[dict[str, Any]]:
+        """Rows a submit of unknown fate left that still hold the stop: a copy may be queued at the service
+        (`unknown_since` set), and no evidence says it can no longer run (`unheld` unset)."""
+        return [dict(r) for r in self._con.execute(
+            "select * from task where batch_id = ? and unknown_since is not null and unheld is null order by idx",
+            (batch_id,))]
 
     def counts(self, batch_id: str) -> dict[str, int]:
         out = {s: 0 for s in STATES}

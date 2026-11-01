@@ -78,12 +78,13 @@ MAX_ROWS = 10_000
 MAX_COMMAND = 64 * 1024
 MAX_WAIT_S = 60.0
 KILL_GRACE_S = 5
+READER_GRACE_S = 2                     # after the leftover group is killed: the stream readers' time to reach EOF
 TICK_S = 2.0
 IDLE_TICK_S = 10.0
 EVIDENCE_EVERY_S = 30.0                # how often the block's job is looked up while tasks are out (SSH)
 EVIDENCE_AFTER_S = 20.0                # …once the oldest task out is older than this
 REST_EVERY_S = 10.0                    # after a restart: how often in-flight rows are pulled by REST
-UNKNOWN_SETTLE_S = 120.0              # a submit_unknown row's task groups are trusted to list it after this long
+UNKNOWN_SETTLE_S = 120.0              # an unknown submit's POST is long over this far past its failure
 CALL_BUDGET_S = 100.0                  # one status / cancel call's passes, past its wait_s (under every client timeout)
 MARKER_WAIT_S = 30.0                   # how long a MEP cancel waits for its marker task to answer
 MARKER_MIN_REMAINING_S = 60.0          # a MEP block with less walltime left gets no marker task (it may be ending)
@@ -133,99 +134,415 @@ def row_fields(row: Any, index: int) -> dict[str, Any]:
     return fields
 
 
-def _contexts(t: str) -> list[str]:
-    """What each character of a shell template is in: "n" plain shell, "q" quotes ('…', "…", $'…'), "h" a
-    here-document's body, "e" escaped by a backslash, "c" a comment. A light reading of the shell's own rules — enough
-    to tell where a placeholder stands."""
-    n = len(t)
-    ctx = ["n"] * n
-    i, state = 0, "n"
-    pending: list[tuple[str, bool]] = []   # here-documents opened on this line: (delimiter, <<- strips tabs)
-    while i < n:
-        ch = t[i]
-        if state == "n":
-            if ch == "\\" and i + 1 < n:
-                ctx[i] = ctx[i + 1] = "e"
-                i += 2
-            elif ch == "'":
-                ctx[i], state = "q", "sq"
-                i += 1
-            elif ch == "$" and i + 1 < n and t[i + 1] == "'":
-                ctx[i] = ctx[i + 1] = "q"
-                state = "ansi"
-                i += 2
-            elif ch == '"':
-                ctx[i], state = "q", "dq"
-                i += 1
-            elif ch == "#" and (i == 0 or t[i - 1] in " \t\n;|&("):
-                while i < n and t[i] != "\n":
-                    ctx[i] = "c"
-                    i += 1
-            elif t.startswith("<<<", i):
-                i += 3
-            elif t.startswith("<<", i):
-                j = i + 2
-                strip = j < n and t[j] == "-"
-                j += 1 if strip else 0
-                while j < n and t[j] in " \t":
-                    j += 1
-                k = j
-                while k < n and t[k] not in " \t\n;|&<>()":
-                    k += 1
-                delim = t[j:k].replace("'", "").replace('"', "").replace("\\", "")
-                if delim:
-                    pending.append((delim, strip))
-                i = k
-            elif ch == "\n" and pending:
-                i += 1
-                for delim, strip in pending:
-                    while i < n:
-                        e = t.find("\n", i)
-                        end = n if e < 0 else e
-                        line = t[i:end]
-                        if (line.lstrip("\t") if strip else line) == delim:
-                            i = end
-                            break
-                        for m in range(i, min(end + 1, n)):
-                            ctx[m] = "h"
-                        i = end + 1
-                pending = []
-            else:
-                i += 1
+# ---- where a placeholder stands: a conservative reading of bash's own grammar --------------------------------------
+# The guarantee (review rounds 1 and 2): the OUTER shell never parses a row's value as code. A value is passed as an
+# environment variable and its placeholder becomes `"$HPCB_F_name"` — which is data only where it is a bare word of a
+# command the outer shell runs. So a placeholder is substituted ONLY where this reader is certain of that, and refused
+# wherever it is not: inside quotes or a here-document (bash would read the inserted quotes as closing its own), inside
+# arithmetic, `[[ ]]`, `${…}`, an array subscript or backticks (bash evaluates those), as the code argument of a shell
+# (`sh -c`), an interpreter (`python -c`, `perl -e`), `awk`/`sed`'s program, `ssh`/`watch` (a remote or inner shell),
+# or in a command that reads its arguments as code, names or arithmetic (`eval`, `trap`, `let`, `read`, `declare`…),
+# and after any `#` this reader may judge otherwise than bash does.
+
+_BLANK = " \t"
+_META = ";&|()<>"
+_IDENT_RE = re.compile(r"^[A-Za-z_][A-Za-z0-9_]*$")
+_DIRECT_REF = re.compile(r"\$\{?" + "HPCB_F_")
+_SHELLS = frozenset({"sh", "bash", "zsh", "dash", "ksh", "mksh", "ash", "yash", "fish", "csh", "tcsh", "busybox",
+                     "rbash", "posh", "oksh", "su", "flock", "script", "nsenter", "chroot"})
+_INTERP_FLAGS: tuple[tuple[str, frozenset[str]], ...] = (
+    ("python", frozenset({"-c"})), ("pypy", frozenset({"-c"})), ("perl", frozenset({"-e", "-E"})),
+    ("ruby", frozenset({"-e"})), ("node", frozenset({"-e", "-p", "--eval", "--print"})),
+    ("Rscript", frozenset({"-e"})), ("julia", frozenset({"-e", "--eval"})), ("php", frozenset({"-r"})),
+    ("lua", frozenset({"-e"})), ("osascript", frozenset({"-e"})), ("pwsh", frozenset({"-c", "-command"})),
+    ("powershell", frozenset({"-c", "-command"})), ("tclsh", frozenset()), ("deno", frozenset({"eval"})))
+_EVAL_LIKE = frozenset({"eval", "trap", "let", "declare", "typeset", "local", "readonly", "export", "unset", "read",
+                        "mapfile", "readarray", "getopts", "compgen", "complete", "bind", "alias", "fc", "coproc"})
+_REMOTE = frozenset({"ssh", "rsh", "pdsh", "clush", "watch", "parallel", "sshpass", "mosh", "autossh"})
+_AWK = frozenset({"awk", "gawk", "mawk", "nawk"})
+_SED = frozenset({"sed", "gsed"})
+_ARITH_TEST = frozenset({"-eq", "-ne", "-lt", "-le", "-gt", "-ge"})
+_RESET_WORDS = frozenset({"then", "do", "else", "elif", "if", "while", "until", "!", "{", "}", "time", "fi", "done",
+                          "esac", ";;"})
+
+
+def _bare(word: str) -> str:
+    w = word.replace("'", "").replace('"', "").replace("\\", "")
+    return w.rsplit("/", 1)[-1]
+
+
+def _first_operand_after(names: list[str], k: int, takes_arg: frozenset[str] = frozenset()) -> bool:
+    """Whether every word after index `k` is an option (or an option's argument): the next operand is the one being
+    written now."""
+    j = k + 1
+    while j < len(names):
+        w = names[j]
+        if w in takes_arg:
+            if j + 1 == len(names):
+                return False   # the word being written is that option's own argument
+            j += 2
             continue
-        ctx[i] = "q"
-        if state in ("dq", "ansi") and ch == "\\" and i + 1 < n:
-            ctx[i + 1] = "q"
+        if not w.startswith("-") or w == "-":
+            return False
+        j += 1
+    return True
+
+
+def _code_arg(words: list[str]) -> str | None:
+    """Why the word being written after these (the current simple command's words so far) would be read as code — a
+    shell's or an interpreter's program, a remote command, `eval`'s argument, a variable name or arithmetic — or
+    None."""
+    names = [_bare(w) for w in words]
+    for n in names:
+        if n in _EVAL_LIKE:
+            return f"in a `{n}` command, which reads its arguments as shell code, a variable name or arithmetic"
+        if n in _REMOTE:
+            return f"in a `{n}` command, which hands its arguments to another shell as code"
+    if "printf" in names and "-v" in names:
+        return "in a `printf -v` command, whose variable name bash evaluates"
+    if {"test", "["} & set(names) and ({"-v", "-R"} & set(names) or _ARITH_TEST & set(names)):
+        return "in a `test` with an integer or variable-name operator, whose operands bash may evaluate"
+    if "wait" in names and "-p" in names:
+        return "in a `wait -p` command, whose variable name bash evaluates"
+    if any(n in _SHELLS for n in names):
+        for k in range(len(names) - 1, -1, -1):
+            if re.fullmatch(r"-[A-Za-z]*c[A-Za-z]*", names[k]) and _first_operand_after(names, k):
+                return "as the code a shell runs (`-c`)"
+    for n in names:
+        for interp, flags in _INTERP_FLAGS:
+            if n.startswith(interp) and flags:
+                for k in range(len(names) - 1, -1, -1):
+                    if names[k] in flags and _first_operand_after(names, k):
+                        return f"as the program `{n} {names[k]}` runs"
+    for k, n in enumerate(names):
+        if n in _AWK and "-f" not in names[k + 1:] and _first_operand_after(names, k, frozenset({"-v", "-F"})):
+            return f"as `{n}`'s program"
+        if n in _SED:
+            rest = names[k + 1:]
+            if rest and rest[-1] in ("-e", "--expression"):
+                return f"as `{n}`'s script"
+            if "-e" not in rest and "-f" not in rest and "--expression" not in rest and _first_operand_after(names, k):
+                return f"as `{n}`'s script"
+    return None
+
+
+@dataclass
+class _Frame:
+    kind: str                  # top | cmdsub | arith | arith2 | sub | param | cond | sq | dq | ansi | bt
+    danger: str | None = None  # why a placeholder anywhere in it is refused (inherited by the frames it opens)
+    depth: int = 0             # its own brackets' nesting, for its closer
+    start: int = 0             # where its text begins
+    words: list[str] = field(default_factory=list)   # top / cmdsub: the current simple command's words so far
+    wstart: int | None = None                        # …and where the word being read began
+    marks: list[int] = field(default_factory=list)   # …and the placeholders it substitutes (checked once it ends)
+
+
+def _template_decisions(t: str, use: set[str]) -> tuple[dict[int, str | None], str | None]:
+    """Read the template as bash does — conservatively. Returns, per placeholder start, None (substitute: a bare word
+    of the outer shell, read as data) or "keep" (escaped or in a comment: left as written) or the reason it is refused;
+    and a reason the whole template is refused (None when it is not)."""
+    n = len(t)
+    stack: list[_Frame] = [_Frame("top")]
+    escaped: set[int] = set()
+    decisions: dict[int, str | None] = {}
+    whole: str | None = None
+    uncertain: str | None = None
+    pending: list[tuple[str, bool, bool]] = []   # here-documents opened on this line: (delimiter, strip tabs, quoted)
+
+    def plain(f: _Frame) -> bool:
+        return f.kind in ("top", "cmdsub")
+
+    def end_word(f: _Frame, i: int) -> None:
+        if f.wstart is not None:
+            w = t[f.wstart:i]
+            if not (not f.words and _bare(w) in _RESET_WORDS):
+                f.words.append(w)
+            if _bare(w) == "case" and f.kind == "cmdsub":
+                nonlocal uncertain
+                uncertain = uncertain or "a `case` inside `$(…)`, whose `)` this reader may take for the end"
+            f.wstart = None
+
+    def close_cmd(f: _Frame, i: int) -> None:
+        """The simple command ended: what only its whole words show (a `test` whose operator comes after the
+        placeholder) refuses the placeholders it substituted."""
+        end_word(f, i)
+        names = {_bare(w) for w in f.words}
+        if f.marks and {"test", "["} & names and (_ARITH_TEST | {"-v", "-R"}) & names:
+            for k in f.marks:
+                decisions[k] = "in a `test` with an integer or variable-name operator, whose operands bash may evaluate"
+        f.words, f.marks = [], []
+
+    def outer_words() -> list[str]:
+        for f in reversed(stack):
+            if plain(f):
+                return f.words
+        return []
+
+    def push(kind: str, i: int, why: str | None = None) -> None:
+        stack.append(_Frame(kind, danger=stack[-1].danger or why, start=i))
+
+    i = 0
+    while i < n:
+        f = stack[-1]
+        ch = t[i]
+        m = _FIELD.match(t, i) if ch == "{" and (i == 0 or t[i - 1] != "$") else None
+        if m is not None and m.group(1) in use:
+            if f.kind in ("sq", "dq", "ansi"):
+                decisions[i] = "quotes"
+            elif f.kind == "bt":
+                decisions[i] = "backticks — write $(…) instead"
+            elif f.danger:
+                decisions[i] = f.danger
+            elif plain(f) and uncertain:
+                decisions[i] = uncertain
+            elif plain(f):
+                if f.wstart is None:
+                    f.wstart = i
+                decisions[i] = _code_arg(f.words)
+                if decisions[i] is None:
+                    f.marks.append(i)
+            else:
+                decisions[i] = "a place this reader cannot vouch for"
+            i = m.end()
+            continue
+        if f.kind == "sq":
+            if ch == "'":
+                stack.pop()
+            i += 1
+            continue
+        if f.kind in ("ansi", "bt"):
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if (f.kind == "ansi" and ch == "'") or (f.kind == "bt" and ch == "`"):
+                stack.pop()
+            i += 1
+            continue
+        if f.kind == "dq":
+            if ch == "\\" and i + 1 < n:
+                i += 2
+                continue
+            if ch == '"':
+                stack.pop()
+                i += 1
+                continue
+            if _DIRECT_REF.match(t, i) and (why := _code_arg(outer_words())):
+                whole = whole or f"a row's variable is expanded inside a string {why}"
+        if f.kind != "dq":
+            # plain-like frames: top, cmdsub (with words, comments, here-documents), arith, sub, param, cond
+            if ch == "\\" and i + 1 < n:
+                escaped.update((i, i + 1))
+                if plain(f) and f.wstart is None:
+                    f.wstart = i
+                i += 2
+                continue
+            if ch == "'" or (ch == "$" and t.startswith("$'", i)):
+                if plain(f) and f.wstart is None:
+                    f.wstart = i
+                push("ansi" if ch == "$" else "sq", i)
+                i += 2 if ch == "$" else 1
+                continue
+            if ch == '"':
+                if plain(f) and f.wstart is None:
+                    f.wstart = i
+                push("dq", i)
+                i += 1
+                continue
+            if f.kind == "cmdsub" and ch == ")" and f.depth == 0:
+                close_cmd(f, i)
+                stack.pop()
+                i += 1
+                continue
+            if f.kind == "arith" and ch == ")" and f.depth == 0 and t.startswith("))", i):
+                stack.pop()
+                i += 2
+                continue
+            if f.kind in ("arith2", "sub") and ch == "]" and f.depth == 0:
+                stack.pop()
+                i += 1
+                continue
+            if f.kind == "param" and ch == "}" and f.depth == 0:
+                stack.pop()
+                i += 1
+                continue
+            if f.kind == "cond" and t.startswith("]]", i) and (i == 0 or t[i - 1] in _BLANK + "\n"):
+                stack.pop()
+                i += 2
+                continue
+            if plain(f) and _DIRECT_REF.match(t, i) and (why := _code_arg(f.words)):
+                whole = whole or f"a row's variable is expanded {why}"
+        # openers (in dq too: `$(`, `$((`, `${`, `$[`, backticks)
+        if ch == "`":
+            if plain(f) and f.wstart is None:
+                f.wstart = i
+            push("bt", i, "backticks — write $(…) instead")
+            i += 1
+            continue
+        if t.startswith("$((", i):
+            if plain(f) and f.wstart is None:
+                f.wstart = i
+            push("arith", i, "arithmetic, which bash evaluates (a value there can run code)")
+            i += 3
+            continue
+        if t.startswith("$(", i):
+            if plain(f) and f.wstart is None:
+                f.wstart = i
+            push("cmdsub", i + 2)
             i += 2
             continue
-        if (state == "sq" and ch == "'") or (state == "ansi" and ch == "'") or (state == "dq" and ch == '"'):
-            state = "n"
+        if t.startswith("${", i):
+            if plain(f) and f.wstart is None:
+                f.wstart = i
+            push("param", i, "a `${…}` expansion, whose subscripts and offsets bash evaluates")
+            i += 2
+            continue
+        if t.startswith("$[", i):
+            push("arith2", i, "arithmetic, which bash evaluates (a value there can run code)")
+            i += 2
+            continue
+        if f.kind == "dq":
+            i += 1
+            continue
+        if not plain(f):
+            # the nesting its own closer counts
+            if f.kind == "arith" and ch == "(":
+                f.depth += 1
+            elif f.kind == "arith" and ch == ")":
+                f.depth -= 1
+            elif f.kind in ("arith2", "sub") and ch == "[":
+                f.depth += 1
+            elif f.kind in ("arith2", "sub") and ch == "]":
+                f.depth -= 1
+            elif f.kind == "param" and ch == "{":
+                f.depth += 1
+            elif f.kind == "param" and ch == "}":
+                f.depth -= 1
+            i += 1
+            continue
+        # ---- top / cmdsub: plain shell
+        if t.startswith("((", i):
+            push("arith", i, "arithmetic, which bash evaluates (a value there can run code)")
+            i += 2
+            continue
+        if f.wstart is None and t.startswith("[[", i) and (i + 2 >= n or t[i + 2] in _BLANK + "\n"):
+            push("cond", i, "a `[[ ]]` test, whose operands bash may evaluate as arithmetic")
+            i += 2
+            continue
+        if ch == "[" and f.wstart is not None and _IDENT_RE.match(t[f.wstart:i]):
+            push("sub", i, "an array subscript, which bash evaluates")
+            i += 1
+            continue
+        if ch == "#" and f.wstart is None:
+            j, folded = i - 1, False
+            while j >= 1 and t[j] == "\n" and t[j - 1] == "\\" and (j - 1) in escaped:
+                j, folded = j - 2, True
+            subtle = folded or (j >= f.start and (j in escaped or t[j] in _META))
+            eol = t.find("\n", i)
+            eol = n if eol < 0 else eol
+            if subtle and any(c in t[i:eol] for c in "'\"`\\$"):
+                uncertain = uncertain or "a `#` this reader and bash may read differently (a comment or not)"
+            for mm in _FIELD.finditer(t, i, eol):
+                decisions.setdefault(mm.start(), "keep")
+            i = eol
+            continue
+        if ch == "<" and t.startswith("<<", i) and not t.startswith("<<<", i):
+            end_word(f, i)
+            j = i + 2
+            strip = j < n and t[j] == "-"
+            j += 1 if strip else 0
+            while j < n and t[j] in _BLANK:
+                j += 1
+            k = j
+            while k < n and t[k] not in _BLANK + "\n" + _META:
+                k += 1
+            raw = t[j:k]
+            quoted = any(c in raw for c in "'\"\\")
+            delim = raw.replace("'", "").replace('"', "").replace("\\", "")
+            if delim:
+                pending.append((delim, strip, quoted))
+            i = k
+            continue
+        if ch == "\n":
+            close_cmd(f, i)
+            i += 1
+            for delim, strip, quoted in pending:
+                while i < n:
+                    e = t.find("\n", i)
+                    eol = n if e < 0 else e
+                    line = t[i:eol]
+                    if (line.lstrip("\t") if strip else line) == delim:
+                        i = eol
+                        break
+                    for mm in _FIELD.finditer(t, i, eol):
+                        if mm.group(1) in use:
+                            decisions[mm.start()] = "a here-document"
+                    if not quoted and _DIRECT_REF.search(line):
+                        whole = whole or ("a row's variable is expanded inside a here-document whose delimiter is not "
+                                          "quoted: the value would become part of the text an inner program reads")
+                    i = eol + 1
+            pending = []
+            continue
+        if ch in _BLANK:
+            end_word(f, i)
+        elif ch in ";&|()":
+            close_cmd(f, i)
+            if ch == "(":
+                f.depth += 1
+            elif ch == ")":
+                f.depth -= 1
+        elif ch in "<>":
+            end_word(f, i)
+        elif f.wstart is None:
+            f.wstart = i
         i += 1
-    return ctx
+    for f in reversed(stack):
+        if plain(f):
+            close_cmd(f, n)
+    if len(stack) > 1 or pending:
+        whole = whole or "its quotes, brackets or here-documents do not close where this reader can tell"
+    return decisions, whole
+
+
+def _refusal_text(name: str, why: str) -> str:
+    v = f"{FIELD_VAR}{name}"
+    if why in ("quotes", "a here-document"):
+        return (f"the command has {{{name}}} inside {why}: write it bare — e.g. `wc -l {{{name}}}`, not "
+                f"`wc -l \"{{{name}}}\"` — each row's value reaches the command as ONE word, already quoted (it is the "
+                f"environment variable {v}). For an inner program, give it the value as data: a here-document with a "
+                f"QUOTED delimiter that reads it from the environment (`python3 - <<'EOF'` … `os.environ[\"{v}\"]`; "
+                f"`bash <<'EOF'` … `\"${v}\"`), or as an argument (`bash -c '… \"$1\" …' _ {{{name}}}`). Never hand a "
+                "value to eval, sh -c or an interpreter as code.")
+    return (f"the command has {{{name}}} {why}: a row's value must stay data. Write it as a bare word of an ordinary "
+            f"command; for an inner program pass it as an argument (`bash -c '… \"$1\" …' _ {{{name}}}`) or read "
+            f"{v} from the environment there (a here-document with a quoted delimiter). Never hand a value to eval, sh "
+            "-c or an interpreter as code.")
 
 
 def substitute(template: str, row: Any, index: int, names: set[str] | None = None) -> str:
     """The template with this row's fields in: `{name}` for each name the batch's rows define (`names`; default: this
     row's own) becomes `"$HPCB_F_name"`, a reference to the environment variable the wrapper sets to the value
-    (`row_values`, `task_script(fields=…)`) — the value itself never enters the command's text, so nothing in it is ever
-    read as shell. A placeholder inside quotes or a here-document is refused (BatchRefusal, saying how to write it); one
-    in a comment or escaped (`\\{x}`) and any other brace text stay as written (`${HOME}`, `awk '{print $1}'`). The
-    result is plain shell; GlobusRunner.submit brace-escapes it for ShellFunction's `cmd.format()`."""
+    (`row_values`, `task_script(fields=…)`) — the value itself never enters the command's text. Substituted only where
+    `_template_decisions` is certain the reference is a bare word the outer shell treats as data; refused (BatchRefusal,
+    saying how to write it) everywhere else. Escaped (`\\{x}`) or commented placeholders and any other brace text stay
+    as written (`${HOME}`, `awk '{print $1}'`). The result is plain shell; GlobusRunner.submit brace-escapes it for
+    ShellFunction's `cmd.format()`."""
     fields = row_fields(row, index)
     use = set(fields) if names is None else names
-    ctx = _contexts(template)
+    decisions, whole = _template_decisions(template, use)
+    if whole is not None:
+        raise BatchRefusal(f"the command cannot be checked safe: {whole}. Never hand a row's value to eval, sh -c or "
+                           "an interpreter as code; pass it as a bare word, an argument, or read from the environment "
+                           "in a here-document with a quoted delimiter.")
 
     def one(m: re.Match[str]) -> str:
         name = m.group(1)
-        if name not in use or ctx[m.start()] in ("e", "c"):
+        if name not in use:
             return m.group(0)
-        if ctx[m.start()] in ("q", "h"):
-            where = "a here-document" if ctx[m.start()] == "h" else "quotes"
-            raise BatchRefusal(
-                f"the command has {{{name}}} inside {where}: write it bare — e.g. `grep -c {{{name}}} out.txt`, not "
-                f"`grep -c \"{{{name}}}\" out.txt` — each row's value reaches the command as ONE word, already quoted "
-                f"(it is passed as the environment variable {FIELD_VAR}{name}; inside a here-document, write "
-                f"${FIELD_VAR}{name} itself)")
+        d = decisions.get(m.start(), "keep")
+        if d == "keep":
+            return m.group(0)
+        if d is not None:
+            raise BatchRefusal(_refusal_text(name, d))
         if name not in fields:
             raise BatchRefusal(f"row {index} has no field {name!r}, which the command uses")
         return f'"${FIELD_VAR}{name}"'
@@ -343,18 +660,22 @@ __hb_start=$(date +%s)
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
-mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
+mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
 tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" 3>&- 4>&- &
 __hb_p1=$!
-{ tee "$__hb_f.t" | { head -c @@CAP@@ > "$__hb_a/stdout"; wc -c | tr -d ' ' > "$__hb_a/.stdout.dropped"; }
-} < "$__hb_f.o" 3>&- 4>&- &
+{ head -c @@CAP@@ > "$__hb_a/stdout"; wc -c | tr -d ' ' > "$__hb_a/.stdout.dropped"; } \
+  < "$__hb_f.p" > /dev/null 3>&- 4>&- &
 __hb_p2=$!
 tail -c @@ETAIL@@ < "$__hb_f.u" > "$__hb_a/.stderr.tail" 3>&- 4>&- &
 __hb_p3=$!
-{ tee "$__hb_f.u" | { head -c @@CAP@@ > "$__hb_a/stderr"; wc -c | tr -d ' ' > "$__hb_a/.stderr.dropped"; }
-} < "$__hb_f.e" 3>&- 4>&- &
+{ head -c @@CAP@@ > "$__hb_a/stderr"; wc -c | tr -d ' ' > "$__hb_a/.stderr.dropped"; } \
+  < "$__hb_f.q" > /dev/null 3>&- 4>&- &
 __hb_p4=$!
+tee "$__hb_f.t" < "$__hb_f.o" > "$__hb_f.p" 3>&- 4>&- &
+__hb_t1=$!
+tee "$__hb_f.u" < "$__hb_f.e" > "$__hb_f.q" 3>&- 4>&- &
+__hb_t2=$!
 set -m
 (
   export HPCB_ROW_INDEX=@@I@@ HPCB_ATTEMPT=@@N@@ HPCB_TASK_DIR="$__hb_a"
@@ -382,11 +703,14 @@ wait "$__hb_c"
 __hb_rc=$?
 kill "$__hb_w"
 kill -TERM -- "-$__hb_c"
-( sleep @@GRACE@@; kill -KILL -- "-$__hb_c"; kill "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4" ) > /dev/null 3>&- 4>&- &
+( sleep @@GRACE@@; kill -KILL -- "-$__hb_c"; sleep @@RGRACE@@; kill "$__hb_t1" "$__hb_t2"; sleep @@RGRACE@@
+  kill "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4" ) > /dev/null 3>&- 4>&- &
 __hb_g=$!
-wait "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
+wait "$__hb_t1" "$__hb_t2" "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
 kill "$__hb_g"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u"
+[ -s "$__hb_a/.stdout.tail" ] || tail -c @@TAIL@@ "$__hb_a/stdout" > "$__hb_a/.stdout.tail"
+[ -s "$__hb_a/.stderr.tail" ] || tail -c @@ETAIL@@ "$__hb_a/stderr" > "$__hb_a/.stderr.tail"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
 __hb_why=$(cat "$__hb_a/.why")
 case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
@@ -427,6 +751,7 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@MINKB@@", str(int(min_free_mb) * 1024)).replace("@@CAP@@", str(int(cap_bytes)))
             .replace("@@SESSION@@", replay).replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
             .replace("@@WALL@@", str(max(1, round(task_walltime_s)))).replace("@@GRACE@@", str(KILL_GRACE_S))
+            .replace("@@RGRACE@@", str(READER_GRACE_S))
             .replace("@@TAIL@@", str(TAIL_BYTES)).replace("@@ETAIL@@", str(STDERR_TAIL_BYTES)))
     return session_shell.guard_prefix(guard) + body
 
@@ -601,6 +926,7 @@ class _Run:
     last_evidence: float = 0.0
     last_rest: float = 0.0
     last_unsent: float = 0.0
+    last_unknown_look: float = 0.0
     adopted: bool = False
     # The user's yes (a resume with confirm_spend) covers the NEXT block while the one in front cannot take a row: on an
     # endpoint hpc-bridge stood up, once nothing of ours runs on it, the batch asks for a fresh block (`_maybe_switch`)
@@ -824,19 +1150,26 @@ def _ledger_batch_ids(app: AppCtx) -> list[str]:
 
 
 def unknown_note(app: AppCtx) -> str | None:
-    """The batches with a submit of unknown fate (`submit_unknown`): its POST may have reached the service, so the task
-    may be queued, and the endpoint can start a block to run it. A stop is never `down` while one exists — it names
-    them, and what settles them. None when there is none."""
+    """The batches with a submit of unknown fate: its POST may have reached the service — in a task group the client
+    never learnt — so the task may be queued, and the endpoint can start a block to run it. A row holds the stop from
+    its failure until evidence says where the task could run (`_unknown_evidence`: on SSH, its config retired and its
+    user endpoint gone with nothing queued) or its copy's result came back; absence from the groups we know is no
+    evidence. A stop is never `down` while one holds it — this names them. None when there is none."""
     parts = []
+    ssh = _has_login_shape(app)
     for bid in _ledger_batch_ids(app):
         try:
-            n = _counts(ledger_of(app), bid).get("submit_unknown", 0)
+            rows = ledger_of(app).unknown_holding(bid)
         except LedgerError:
             continue
-        if n:
-            parts.append(f"{bid} has {n} submit(s) of unknown fate (the service may have queued them, and the endpoint "
-                         "can start a block to run them) — they are reconciled against the batch's task groups: "
-                         f"status('{bid}', wait_s=60) settles them once the service accounts for them")
+        if rows:
+            idx = ", ".join(str(r["idx"]) for r in rows[:10]) + ("…" if len(rows) > 10 else "")
+            parts.append(
+                f"{bid} has {len(rows)} submit(s) of unknown fate (row(s) {idx}): the service may have queued them, "
+                "and the endpoint can start a block to run them. " + (
+                    f"Once this block's config is retired (stop_endpoint does that) and its user endpoint has exited "
+                    f"with nothing queued, they can no longer run: status('{bid}', wait_s=60) looks"
+                    if ssh else "On a facility endpoint nothing here can tell when they can no longer run"))
     return "; ".join(parts) or None
 
 
@@ -1036,9 +1369,19 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
     if run is not None:
         wait = max(0.0, min(float(wait_s or 0.0), MAX_WAIT_S))
         deadline = time.monotonic() + wait + CALL_BUDGET_S
-        await tick(app, bid, deadline=deadline)
-        if wait > 0 and app.batches.get(bid) is run and isinstance(run, _Run):
-            await _wait_for_change(app, run, wait, deadline)
+        busy = False
+        try:
+            await tick(app, bid, deadline=deadline, lock_wait_s=min(CALL_BUDGET_S, LOCK_WAIT_S))
+        except PassBusy:
+            busy = True
+        if app.batches.get(bid) is run and isinstance(run, _Run):
+            _start_loop(app, run)   # the steps a tool call leaves (a switch, a block check) are the loop's
+            if wait > 0 and not busy:
+                busy = await _wait_for_change(app, run, wait, deadline)
+        out = _status_of(app, bid, detail=detail, offset=offset, limit=limit)
+        if busy:
+            out.notice = (out.notice or "") + _BUSY_NOTE
+        return out
     return _status_of(app, bid, detail=detail, offset=offset, limit=limit)
 
 
@@ -1050,9 +1393,9 @@ def _change_key(led: Ledger, bid: str) -> tuple[Any, ...]:
                                                               "submit_unknown")))
 
 
-async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float) -> None:
+async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float) -> bool:
     """Until a row settles or the phase changes, or `wait` is up. The background loop does the passes when it runs;
-    otherwise this call does, as the loop would."""
+    otherwise this call does, as the loop would. Returns whether a pass was found busy (the answer says so)."""
     led = ledger_of(app)
     bid = run.batch_id
     before = _change_key(led, bid)
@@ -1065,9 +1408,13 @@ async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float)
         except TimeoutError:
             pass
         if not looping:
-            await tick(app, bid, deadline=deadline)
+            try:
+                await tick(app, bid, deadline=deadline)
+            except PassBusy:
+                return True
         if _change_key(led, bid) != before:
-            return
+            return False
+    return False
 
 
 def _adopt(app: AppCtx, bid: str) -> _Run | None:
@@ -1109,7 +1456,12 @@ async def cancel(app: AppCtx, bid: str, *, mode: str = "drain") -> CancelResult:
                                    "it at its next pass.")
     deadline = time.monotonic() + CALL_BUDGET_S
     dropped, marker = await _apply_cancel(app, run, mode, deadline=deadline)
-    await tick(app, bid, deadline=deadline)
+    busy = False
+    try:
+        await tick(app, bid, deadline=deadline, lock_wait_s=min(CALL_BUDGET_S, LOCK_WAIT_S))
+    except PassBusy:
+        busy = True
+    _start_loop(app, run)
     c = _counts(led, bid)
     out = _out_now(c)
     left = _blocks_left(app, run)
@@ -1130,7 +1482,8 @@ async def cancel(app: AppCtx, bid: str, *, mode: str = "drain") -> CancelResult:
     tail = (f" {len(left)} block(s) of ours can still bill (the session's until stop_endpoint, or its idle release): "
             "see blocks_left." if left else "")
     return CancelResult(id=bid, status="draining" if out else "down", mode=mode,  # type: ignore[arg-type]
-                        backlog_dropped=dropped, in_flight=out, blocks_left=left, notice=f"{bid} {word}.{tail}")
+                        backlog_dropped=dropped, in_flight=out, blocks_left=left,
+                        notice=f"{bid} {word}.{tail}" + (_BUSY_NOTE if busy else ""))
 
 
 async def _apply_cancel(app: AppCtx, run: _Run, mode: str, *, deadline: float | None = None) -> tuple[int, str | None]:
@@ -1235,7 +1588,8 @@ def _blocks_left(app: AppCtx, run: _Run) -> list[BlockLeft]:
                "the facility idle-releases it once no work is sent (nothing here can cancel it); the user's own "
                f"scancel {job} ends it now" if job else "the facility idle-releases it once no work is sent")
         out.append(BlockLeft(job_id=job, bill_until=_iso(run.block_end_at), how_to_end=how))
-        named.add(str(job))
+        if job:
+            named.add(str(job))
     now_m, now_w = time.monotonic(), _now()
     for left in warmth._prune_left(app):
         if left.endpoint_id not in (None, app.state.endpoint_id) or (left.job and left.job in named):
@@ -1245,13 +1599,15 @@ def _blocks_left(app: AppCtx, run: _Run) -> list[BlockLeft]:
         out.append(BlockLeft(job_id=left.job, bill_until=_iso(until), how_to_end=(
             f"{what}: the facility idle-releases it once no work is sent (nothing here can cancel it)"
             + (f"; the user's own scancel {left.job} ends it now" if left.job else ""))))
-        named.add(str(left.job))
-    for job, end in run.switched_left:
-        if (end is None or end > now_w) and str(job) not in named:
+        if left.job:
+            named.add(str(left.job))
+    for job, end in run.switched_left:   # a job unknown here is never taken for another block: always listed
+        if (end is None or end > now_w) and not (job and str(job) in named):
             out.append(BlockLeft(job_id=job, bill_until=_iso(end), how_to_end=(
                 "the block in front when the batch moved to the next one: it runs out its last minutes with nothing of "
                 "ours on it" + ("; stop_endpoint() cancels it" if ssh else f"; the user's own scancel {job} ends it"))))
-            named.add(str(job))
+            if job:
+                named.add(str(job))
     for job in run.relaunched:
         if job not in named:
             out.append(BlockLeft(job_id=job, how_to_end=(
@@ -1309,20 +1665,45 @@ def _still_settling(app: AppCtx, run: _Run) -> bool:
         return True
     try:
         c = _counts(ledger_of(app), run.batch_id)
+        holding = bool(_has_login_shape(app) and ledger_of(app).unknown_holding(run.batch_id))
     except LedgerError:
         return False
-    return bool(c.get("in_flight", 0) + c.get("submit_unknown", 0))
+    return bool(c.get("in_flight", 0) + c.get("submit_unknown", 0)) or holding
 
 
-async def tick(app: AppCtx, bid: str, *, deadline: float | None = None) -> int:
+class PassBusy(Exception):
+    """A tool call's pass could not start within its budget: the background loop's pass holds the batch (a block being
+    confirmed, a slow lookup). The call answers from the ledger instead."""
+
+
+LOCK_WAIT_S = 10.0   # the most a tool call waits for the loop's pass to finish before answering from the ledger
+
+
+async def tick(app: AppCtx, bid: str, *, deadline: float | None = None, lock_wait_s: float = LOCK_WAIT_S) -> int:
     """One pass over a batch this process holds: settle what came back, reconcile unknown submits, presume or look for
     evidence, then admit what the window, the gate and the lease allow. Returns how many it admitted. `deadline`
-    (monotonic): a tool call's pass skips the steps that could outlast it — the background loop runs them."""
+    (monotonic): a TOOL CALL's pass — it waits for a running pass at most until then (PassBusy), never starts a
+    next-block switch or a block check (the background loop's, which has no budget to keep), and skips the lookups
+    that could outlast it."""
     run = app.batches.get(bid)
     if run is None:
         return 0
-    async with run.passing:
+    if deadline is None:
+        async with run.passing:
+            return await _tick(app, bid, run, None)
+    try:
+        await asyncio.wait_for(run.passing.acquire(),
+                               timeout=max(0.0, min(lock_wait_s, deadline - time.monotonic())))
+    except TimeoutError:
+        raise PassBusy(bid) from None
+    try:
         return await _tick(app, bid, run, deadline)
+    finally:
+        run.passing.release()
+
+
+_BUSY_NOTE = (" A pass of this batch's background loop is still running (a block being confirmed, or a slow lookup), "
+              "so this answer is the ledger's view as of now.")
 
 
 def _room(deadline: float | None, need_s: float) -> bool:
@@ -1346,9 +1727,9 @@ async def _tick(app: AppCtx, bid: str, run: _Run, deadline: float | None = None)
     if _room(deadline, 40):
         await _evidence(app, run)
         await _release_old_uep(app, run)
-    if _room(deadline, 90):
+        await _unknown_evidence(app, run)
+    if deadline is None:   # the background loop's alone: a switch confirms a block and may take minutes
         await _maybe_switch(app, run)
-    if _room(deadline, 40):
         await _maybe_warm(app, run)
     async with app.lock:
         n = _admit_locked(app, run)
@@ -1449,9 +1830,11 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     rt.batch_inflight += 1
     tid = getattr(fut, "task_id", None)
     if tid:
-        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job, task_id=str(tid))
+        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job,
+                   sent_uec=run.runner_hash, task_id=str(tid))
     else:
-        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job)
+        led.settle(bid, index, attempt, "in_flight", only_from=("in_flight",), sent_job=run.block_job,
+                   sent_uec=run.runner_hash)
     try:
         loop = asyncio.get_running_loop()
         fut.add_done_callback(lambda _f, ev=run.wake: loop.call_soon_threadsafe(ev.set))
@@ -1602,7 +1985,7 @@ def _settle_failure(app: AppCtx, run: _Run, index: int, attempt: int, exc: BaseE
     text = exc if isinstance(exc, str) else f"{type(exc).__name__}: {exc}"
     if not sent:   # the submit itself failed: the POST may still have reached the service (S4)
         led.settle(bid, index, attempt, "submit_unknown", only_from=("in_flight",),
-                   evidence=f"the submit failed: {text[:300]}")
+                   evidence=f"the submit failed: {text[:300]}", unknown_since=_now(), unheld=None)
         _event(bid, "batch.settle", index, attempt, "submit_unknown")
         return
     holding = list(HOLDING)
@@ -1658,7 +2041,8 @@ def _settle_result(app: AppCtx, run: _Run, index: int, attempt: int, res: Any, g
     _learn_block(app, run, rep)
     if rep.duplicate:   # this task was a second copy of an attempt that already ran: its own result is elsewhere
         led.settle(bid, index, attempt, "submit_unknown", only_from=("in_flight",),
-                   evidence="a duplicate of this attempt answered; the one that ran is reconciled from the task group")
+                   evidence="a duplicate of this attempt answered; the one that ran is reconciled from the task group",
+                   unknown_since=_now(), unheld=None)
         return
     fields: dict[str, Any] = {"rc": rep.rc, "tail": rep.tail, "stderr_tail": rep.stderr_tail,
                               "stdout_path": rep.stdout_path, "stdout_bytes": rep.stdout_bytes,
@@ -1819,23 +2203,18 @@ async def _reconcile(app: AppCtx, run: _Run) -> None:
                 continue
             row = led.task(run.batch_id, rep.index)
             if row is not None and row["state"] == "submit_unknown" and int(row["attempt"]) == rep.attempt:
-                led.settle(run.batch_id, rep.index, rep.attempt, "submit_unknown", task_id=tid)
+                led.settle(run.batch_id, rep.index, rep.attempt, "submit_unknown", task_id=tid,
+                           unheld="its copy's result came back (the batch's task group)")
                 _settle_result(app, run, rep.index, rep.attempt, res.result, None)
-    if pending:
-        return
-    idem = bool(led.batch(run.batch_id)["idempotent"])
+    if pending or not led.batch(run.batch_id)["idempotent"]:
+        return   # a non-idempotent row is never sent again, nor called lost on absence: the failed POST may have
+        # queued its task in a group of its own, which no runner ever learnt
     for t in led.tasks(run.batch_id, states=("submit_unknown",)):
-        i, a = int(t["idx"]), int(t["attempt"])
-        if idem:
-            led.settle(run.batch_id, i, a, "backlog", only_from=("submit_unknown",),
-                       evidence="reconciled: no task of ours in the batch's task groups answers for it; sent again "
-                                "(idempotent)")
-        elif t.get("admitted_at") and _now() - float(t["admitted_at"]) > UNKNOWN_SETTLE_S:
-            # well past the failed submit, the service's task groups list no task of ours the ledger does not know:
-            # the POST never reached it. Not idempotent, so never sent again: lost, on that evidence
-            why = "evidence: the submit never reached the service (its task groups list no task for it)"
-            led.settle(run.batch_id, i, a, "lost", only_from=("submit_unknown",), settled_by=why, evidence=why)
-            _event(run.batch_id, "batch.settle", i, a, "lost", reason=why)
+        # idempotent: sent again. Its first copy may still be queued in a group we never learnt, so the row keeps
+        # holding the stop (`unknown_since`) until evidence clears it
+        led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "backlog", only_from=("submit_unknown",),
+                   evidence="reconciled: no task of ours in the batch's known task groups answers for it; sent again "
+                            "(idempotent)")
 
 
 async def _group_tasks(client: Any, bid: str, groups: list[str]) -> list[str] | None:
@@ -1855,25 +2234,25 @@ def _presume(app: AppCtx, run: _Run) -> None:
     """A task out past its clock (block evidence + task_walltime_s + the grace) is presumed lost — it keeps its slot, is
     never retried, and only unblocks a stop or a cancel; a later result still wins. On a MEP every row out (no evidence
     channel exists there); on SSH only a row this process holds no future for (a dead server sent it: its evidence may
-    never come), and anywhere a submit of unknown fate the task groups could not settle. The block evidence is this
-    process's, else the ledger's (a block seen before the restart: any admission needed one)."""
+    never come). Never a submit of unknown fate: its task may be queued where no clock of ours can see it
+    (`_unknown_evidence`). The block evidence is this process's, else the ledger's (a block seen before the restart:
+    any admission needed one)."""
     led = ledger_of(app)
     wall = float(led.batch(run.batch_id)["task_walltime_s"])
     seen = run.block_seen_at
     held = set(run.futures)
     ssh = _has_login_shape(app)
     any_seen = bool(json.loads(led.batch(run.batch_id).get("blocks_seen") or "[]"))
-    for t in led.tasks(run.batch_id, states=("in_flight", "submit_unknown")):
+    for t in led.tasks(run.batch_id, states=("in_flight",)):
         key = (int(t["idx"]), int(t["attempt"]))
-        if ssh and t["state"] == "in_flight" and key in held:
+        if ssh and key in held:
             continue
         if not t.get("admitted_at"):
             continue
         evidence = seen if seen is not None else (float(t["admitted_at"]) if any_seen else None)
         if presumed_lost(admitted_at=float(t["admitted_at"]), block_seen_at=evidence, task_walltime_s=wall,
                          now=_now()):
-            led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "presumed_lost",
-                       only_from=("in_flight", "submit_unknown"),
+            led.settle(run.batch_id, int(t["idx"]), int(t["attempt"]), "presumed_lost", only_from=("in_flight",),
                        settled_by="presumption", evidence="no result past task_walltime_s + the grace since a block "
                                                           "was seen; it keeps its slot and is never retried")
             _event(run.batch_id, "batch.settle", int(t["idx"]), int(t["attempt"]), "presumed_lost")
@@ -1913,6 +2292,54 @@ async def _release_old_uep(app: AppCtx, run: _Run) -> None:
         led.add_block_seen(run.batch_id, j)
         led.event(run.batch_id, "batch.release", {"job": j, "uep": run.old_uep})
         _journal({"event": "batch.release", "batch_id": run.batch_id, "job_id": j, "uep": run.old_uep})
+
+
+async def _unknown_evidence(app: AppCtx, run: _Run) -> None:
+    """SSH only: an unknown submit stops holding the stop once evidence says its task can never run nor start a block
+    — the config it went out with is retired (a stop or a reap: nothing of ours submits with it again), and the user
+    endpoint that config targets has exited, with no pilot of it queued, in two looks a few seconds apart. A task
+    left pending at the service does not start a user endpoint again; only a new submit with its config would (spike
+    S5). Counted from the failure (`unknown_since`), never the admission: the POST is long over by then. The row stays
+    what it was in the ledger (its fate is still unknown), with that evidence (`unheld`)."""
+    if not _has_login_shape(app) or login_runner is None or app.state.endpoint_id is None:
+        return
+    now = _now()
+    if now - run.last_unknown_look < EVIDENCE_EVERY_S:
+        return
+    led = ledger_of(app)
+    rows = [r for r in led.unknown_holding(run.batch_id)
+            if r.get("unknown_since") and now - float(r["unknown_since"]) >= UNKNOWN_SETTLE_S
+            and r.get("sent_uec") and led.retired(app.state.endpoint_id, str(r["sent_uec"]))]
+    if not rows:
+        return
+    run.last_unknown_look = now
+    seen = json.loads(led.batch(run.batch_id).get("blocks_seen") or "[]")
+    by_job: dict[str, list[dict[str, Any]]] = {}
+    for r in rows:
+        job = str(r.get("sent_job") or (seen[-1] if seen else ""))
+        if session_shell._JOB_ID.fullmatch(job):
+            by_job.setdefault(job, []).append(r)
+    for job, group in by_job.items():
+        q = shlex.quote(job)
+        cmd = (f"u=$(sacct -X -n -P -j {q} -o SubmitLine%800 2>/dev/null | grep -o 'uep\\.[0-9a-f.-]*' | head -n 1); "
+               'if [ -z "$u" ]; then echo "HPCB_UEPX none"; else '
+               'a=$(ps -eo args 2>/dev/null); sleep 3; b=$(ps -eo args 2>/dev/null); '
+               'q=$(squeue -h -u "$USER" -o %o 2>/dev/null | grep -cF "$u"); '
+               "echo \"HPCB_UEPX $u $(printf '%s\\n' \"$a\" | grep -cF \"$u\") "
+               "$(printf '%s\\n' \"$b\" | grep -cF \"$u\") $q ${#a} ${#b}\"; fi")
+        try:
+            res = await login_runner(app)(cmd)
+        except Exception:  # noqa: BLE001 - no evidence this pass
+            continue
+        m = re.search(r"HPCB_UEPX (uep\.[0-9a-f-]{36}\.[0-9a-f-]{36}) (\d+) (\d+) (\d+) (\d+) (\d+)", res.stdout or "")
+        if not m or m.group(2) != "0" or m.group(3) != "0" or m.group(4) != "0" or "0" in (m.group(5), m.group(6)):
+            continue
+        why = (f"its user endpoint ({m.group(1)}) has exited with no pilot of it queued, and the config it went out "
+               "with is retired: a task left pending at the service does not start it again (only a new submit with "
+               "that config would), so this submit can neither run nor start a block")
+        for r in group:
+            led.settle(run.batch_id, int(r["idx"]), int(r["attempt"]), str(r["state"]), unheld=why)
+            _event(run.batch_id, "batch.unheld", int(r["idx"]), int(r["attempt"]), str(r["state"]), reason=why)
 
 
 _ENDED = ("CANCELLED", "TIMEOUT", "FAILED", "COMPLETED", "NODE_FAIL", "PREEMPTED", "OUT_OF_MEMORY", "BOOT_FAIL",
@@ -2034,7 +2461,9 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     if run is None and state not in ("done", "cancelled"):
         beat = int(_now() - float(b["heartbeat"] or 0))
         owner = f"pid {b['owner_pid']} on {b['owner_host']} (heartbeat {beat} s ago)"
-        if not led.holder_alive(led.holder(bid).holder):
+        holder = led.holder(bid).holder
+        heartbeating = time.time() - float(b["heartbeat"] or 0) <= led.lease_stale_s and led.pid_alive(holder.pid)
+        if not heartbeating and not led.holder_alive(holder):
             # its server is gone (that pid is dead here): nothing admits for it, whatever its last state said; this
             # server takes the lease over once the heartbeat is stale, and then asks again before sending more
             phase = "needs_confirmation"

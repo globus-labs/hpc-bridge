@@ -2374,9 +2374,11 @@ async def run_batch(
     kept for your interactive commands); a durable ledger records every row, so the batch survives this server.
 
     `command`: shell, with `{name}` for each field of a row and `{index}` for the row's number — written BARE, never
-    inside quotes or a here-document (refused): each value reaches the command as one word, as data (the environment
-    variable HPCB_F_<name>); other braces such as ${HOME} stay as written. `rows`: a list of objects with identifier
-    keys, e.g.
+    inside quotes, a here-document, arithmetic, [[ ]], ${…} or backticks (refused): each value reaches the command as
+    one word, as data (the environment variable HPCB_F_<name>). Never hand a value to eval, sh -c, ssh or an
+    interpreter as code (the obvious forms are refused); for an inner program pass it as an argument or read
+    $HPCB_F_<name> from the environment in a here-document with a quoted delimiter (<<'EOF'). Other braces such as
+    ${HOME} stay as written. `rows`: a list of objects with identifier keys, e.g.
     [{"n": 1}, {"n": 2}], or of plain values, bound as `{row}`. `task_walltime_s` (required): the most seconds one row
     may run — it is killed then (rc 124), and a row is admitted only while the block has task_walltime_s + 30 s of
     walltime left. Each row's stdout/stderr are kept (capped) in the batch's own dir, `<results_dir>/<batch id>/`
