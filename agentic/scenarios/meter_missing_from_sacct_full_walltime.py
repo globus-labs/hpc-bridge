@@ -70,7 +70,7 @@ async def SCRIPT(ops) -> str:
     if sub.job_id:
         await jc.wait_job(ops, sub.job_id, until=lambda s: jc.job_of(s).get("meter_source") == "sacct"
                           and s.get("phase") in jc.JOB_TERMINAL, timeout_s=180)
-    s = await bc.stop(ops, tries=8)
+    s = await jc.stop(ops, tries=8)
     return f"stop said {s.get('status')!r}"
 
 

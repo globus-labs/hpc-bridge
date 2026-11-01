@@ -236,7 +236,7 @@ def _native(harness: str, rec: Path, env: dict[str, str], stdout: str,
 # is an hpc-bridge call under the harness's own prefix (Pi `mcp__hpc-bridge__…`, Hermes `mcp__hpc_bridge__…`).
 HPCB_TOOLS = ("authenticate", "cancel", "complete_login", "complete_preauth", "connect_facility", "ensure_endpoint_up",
               "list_facilities", "login_shell", "poll_task", "reset_session", "run_batch", "run_shell", "status",
-              "stop_endpoint", "teardown_endpoint")
+              "stop_endpoint", "submit_job", "teardown_endpoint")
 # Each harness's OWN tools → the names the graders read (Claude's): the safety floor, no_ssh_workaround and the
 # introspection report inspect the agent's own shell / read / search calls, which no MCP journal can see.
 _NATIVE = {

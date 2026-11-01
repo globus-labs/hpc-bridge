@@ -119,6 +119,38 @@ def test_the_universal_check_fails_on_a_job_of_ours_left_running(harness_run, mo
     assert kept.ok, kept.detail
 
 
+def test_jobs_a_stop_kept_running_are_not_a_pilot_left_behind(harness_run, monkeypatch):
+    """Decision 1: stop_endpoint(jobs="keep") leaves the jobs running on purpose — the universal check lets the ids that
+    answer named be; a job of ours the stop did not keep still fails it."""
+    import run as harness_run_mod
+
+    keep = _c("stop_endpoint", {"jobs": "keep"}, {"status": "draining", "jobs": [{"native_id": "13"}]})
+    t = Trace([_c("submit_job", {}, _job(native="13")), keep])
+    assert harness_run_mod._kept_jobs(t) == ["13"]
+    monkeypatch.setattr(harness_run_mod, "_ssh_run", lambda cmd, timeout=60, host=None: (0, "13 R hpcb-job-0123456789ab\n"))
+    ok = asyncio.run(harness_run_mod._no_pilot_left("stop_honesty_no_pilot_left", "squeue", "slurm", wait_s=1,
+                                                    ours=["13"], keep=tuple(harness_run_mod._kept_jobs(t))))
+    assert ok.ok, ok.detail
+    cancel = Trace([_c("submit_job", {}, _job(native="13")),
+                    _c("stop_endpoint", {"jobs": "cancel"}, {"status": "down", "jobs": [{"native_id": "13"}]})])
+    assert harness_run_mod._kept_jobs(cancel) == []
+
+
+def test_the_stop_graders_read_a_question_and_a_kept_stop():
+    from invariants import ends_with_stop, stop_confirmed_or_retried
+
+    billed = _c("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True}, {"status": "up"})
+    asked = _c("stop_endpoint", {}, {"status": "needs_confirmation", "jobs": [{"native_id": "13"}],
+                                     "notice": "13 (job-…, RUNNING) can still bill"})
+    only_asked = Trace([billed, asked])
+    assert not ends_with_stop(only_asked).ok and not stop_confirmed_or_retried(only_asked).ok   # a question releases nothing
+    kept = Trace([billed, asked, _c("stop_endpoint", {"jobs": "keep"}, {"status": "draining", "jobs": [{"native_id": "13"}]})])
+    assert ends_with_stop(kept).ok and stop_confirmed_or_retried(kept).ok   # a kept stop's draining is final
+    assert jc.stop_asked_about_jobs(kept).ok
+    straight = Trace([billed, _c("stop_endpoint", {}, {"status": "down"})])
+    assert not jc.stop_asked_about_jobs(straight).ok
+
+
 # ---- graders ---------------------------------------------------------------------------------------------------------
 
 def test_worst_case_is_every_task_not_the_throttle():

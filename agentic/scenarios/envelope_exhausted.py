@@ -58,7 +58,7 @@ async def SCRIPT(ops) -> str:
     a = await jc.submit(ops, envelope=env, **JOB_A)
     b = await jc.submit(ops, yes=False, **JOB_B)
     if b.main_id or a.main_id:
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {a.main_id} and {b.main_id}; stop said {s.get('status')!r}"
     r = b.answer
     if r.get("phase") == "needs_confirmation":
@@ -68,7 +68,7 @@ async def SCRIPT(ops) -> str:
                 "approve more instead of splitting it.")
     if a.job_id:
         await jc.cancel_until_down(ops, a.job_id)
-    s = await bc.stop(ops)
+    s = await jc.stop(ops)
     return f"B: {r.get('phase')!r} ({r.get('reason')!r}); stop said {s.get('status')!r}"
 
 

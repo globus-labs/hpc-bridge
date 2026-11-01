@@ -737,6 +737,20 @@ def _listed_pilots(scheduler: str, out: str, *, ours: Iterable[str] = (), keep: 
     return pilots
 
 
+def _kept_jobs(trace: Trace | None) -> list[str]:
+    """The jobs the run's stops deliberately KEPT running (batch phase 2a: stop_endpoint(jobs="keep") answers
+    `draining` naming them in `jobs`) — not a pilot left behind: the universal check lets them be."""
+    out: list[str] = []
+    for _i, c in (trace.named("stop_endpoint") if trace is not None else []):
+        if str(c.input.get("jobs")) != "keep":
+            continue
+        for j in (c.result or {}).get("jobs") or []:
+            nid = str(j.get("native_id") or "") if isinstance(j, dict) else ""
+            if nid and nid not in out:
+                out.append(nid)
+    return out
+
+
 def _our_jobs(trace: Trace | None) -> list[str]:
     """The scheduler ids the run's answers name as hpc-bridge's own jobs (batch phase 2a): a submit_job / status job's
     `native_id`, an adopted hand submit's (run_shell's `jobs`), an envelope's job list — once each, in order."""
@@ -768,7 +782,8 @@ async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list
                          keep: Iterable[str] = ()) -> Result:
     """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue — nor, batch phase 2a, a
     Jobs-mode job of hpc-bridge's (`hpcb-job-*`, or an id in `ours`: what the run's answers named as its own), less the
-    jobs the scenario keeps running past the run (`keep`, its KEEP_RUNNING). A pilot that is ENDING is
+    jobs meant to keep running past the run (`keep`: the scenario's KEEP_RUNNING — jobs not ours — and the ids a
+    stop_endpoint(jobs="keep") answer named, `_kept_jobs`). A pilot that is ENDING is
     waited for — re-listed every PILOT_ENDING_POLL_S, up to `wait_s` — and passes once it is gone:
       - a job the run's own stops said they cancelled (`cancelled`, from `_stop_cancelled_jobs`), while it is listed as
         ending, or — PBS only, for PBS_CANCEL_GRACE_S — as R (PBS lists a qdel'd job as R until its MoM reports — run
@@ -883,7 +898,8 @@ async def _postchecks(scen, res=None) -> list[Result]:
             results.append(await _no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], cancelled=cancelled,
                                                 wait_s=_pilot_end_wait_s(), timeout=pc.get("timeout", 60),
                                                 ours=_our_jobs(getattr(res, "trace", None)),
-                                                keep=tuple(getattr(scen, "KEEP_RUNNING", ()) or ())))
+                                                keep=tuple(getattr(scen, "KEEP_RUNNING", ()) or ())
+                                                + tuple(_kept_jobs(getattr(res, "trace", None)))))
             continue
         # "on": "each_login" runs the check on EVERY login node (a round-robin pool: a manager process left on the
         # node the alias did not pick is exactly the leak a pin bug produces) and joins the outputs

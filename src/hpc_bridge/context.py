@@ -10,6 +10,7 @@ names, so `from hpc_bridge.server import AppCtx` keeps working.
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -530,6 +531,10 @@ class AppCtx:
     ledger: Any = None
     batch_owner: Any = None
     batch_autoloop: bool = True
+    # Batch phase 2a (hpc_bridge.jobs): this server's session — minted once per server lifespan, it is what an envelope
+    # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
+    session_token: str = field(default_factory=lambda: secrets.token_hex(8))
+    jobs_meter_at: float = 0.0
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

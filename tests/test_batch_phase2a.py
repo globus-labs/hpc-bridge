@@ -20,10 +20,15 @@ The surface these tests are written against (the stage-A checkpoint fixes it):
 - `envelope` (submit_job's argument): {cap, deadline_hours, max_jobs, max_nodes_per_block, accounts, partitions,
   at_deadline: drain|abort, site_backstop}. Opened by the confirming call; read by status("env-…"); closed by
   cancel("env-…", drain|abort), by its deadline, or by stop_endpoint.
-- `status("job-…")` / `status("env-…")` → JobStatus; `cancel("job-…"|"env-…", mode)` → CancelResult.
+- `status("job-…")` / `status("env-…")` → the one BatchStatus model (`kind` job | envelope, `job`, `envelope`: the
+  coordinator's ruling, so structured output survives); `cancel("job-…"|"env-…", mode)` → CancelResult.
 - `run_shell(…, confirm_spend=False)`: a recognised hand sbatch/qsub while this session's envelope is open answers
   needs_confirmation (nothing runs); with confirm_spend=True it runs HELD, is adopted (ledgered, reserved, given the
   envelope's deadline), then released — or cancelled while still held when it does not fit (D2 (c)).
+- `stop_endpoint(jobs=None|"cancel"|"keep")` (the user's decision 1): with Jobs-mode jobs of ours that can still bill,
+  a stop with no choice answers needs_confirmation naming them and changes nothing; cancel ends them (down only once
+  none is listed); keep releases only the blocks (draining, never down).
+- `submit_job(…, exclude_jobs=[native ids])` with confirm_spend=True: jobs the user says are not theirs to count.
 - `Ledger.add_envelope(…)`, `Ledger.reserve_job(…)` (THE admission point: BEGIN IMMEDIATE), `EnvelopeExhausted`.
 - `PartitionShape.min_charge_h`: a queue's minimum charge, in hours of the job's billing (a catalog fact).
 - `HPC_BRIDGE_ENVELOPE_MAX`: the operator ceiling on the SUM of open envelopes' caps, per facility and account.
@@ -53,10 +58,7 @@ from tests.fakes import FakeFacility
 from tests.test_server import _DoneFuture, _FakeRunner, _Res
 
 _BASH = shutil.which("bash")
-pytestmark = [
-    pytest.mark.skipif(_BASH is None, reason="needs bash"),
-    pytest.mark.xfail(strict=True, reason="batch phase 2a is not built yet (stage A: failing first)"),
-]
+pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
 
 WHOLE = PartitionShape(name="main", kind="whole_node", cores=4, billing={"cpu": 1.0})     # 4 billing units / hour
 SLICED = PartitionShape(name="shared", kind="per_core", cores=4, billing={"cpu": 1.0})
@@ -426,6 +428,23 @@ async def test_unledgered_jobs_count_and_are_named(world):
     assert stray in (env.notice or "")
 
 
+async def test_jobs_the_user_says_are_not_theirs_are_never_counted_again(world):
+    """One unrelated job of the user's must not exhaust an envelope: `exclude_jobs` on a confirming call records them
+    as the user's own, and the meter never counts them again (the notice names what it does count)."""
+    from hpc_bridge import batch, server
+
+    out = await _confirmed(world.app, command="sleep 60", envelope={"cap": 10})
+    stray = world.sched.add_job(name="mine", state="RUNNING", elapsed=0, timelimit_min=60, billing=4)
+    asked = await _submit(world.app, command="sleep 61", confirm_spend=True)
+    assert asked.phase == "needs_confirmation" and asked.reason == "envelope_exhausted", asked
+    assert stray in (asked.notice or "") and "exclude_jobs" in (asked.notice or ""), asked.notice
+    yes = await _submit(world.app, command="sleep 61", confirm_spend=True, exclude_jobs=[stray])
+    assert yes.phase in ("queued", "running"), yes
+    env = await server._status(world.app, out.envelope.envelope_id)
+    assert env.envelope.unledgered == [] and env.envelope.spent + env.envelope.committed == pytest.approx(8.0), env
+    assert stray in batch.ledger_of(world.app).excluded_jobs(out.envelope.envelope_id)
+
+
 async def test_the_meter_is_one_sacct_call_per_tick(world):
     from hpc_bridge import server
 
@@ -514,7 +533,8 @@ async def test_cancel_of_a_job_is_draining_until_the_scheduler_has_ended_it(worl
     assert final.status == "down", final
 
 
-async def test_stop_endpoint_ends_our_jobs_and_is_never_down_while_one_bills(world):
+async def _two_billing_jobs(world):
+    """A submit_job job and an adopted hand submit, both RUNNING."""
     from hpc_bridge import server
 
     job = await _confirmed(world.app, command="sleep 3600", envelope={"cap": 20})
@@ -523,27 +543,106 @@ async def test_stop_endpoint_ends_our_jobs_and_is_never_down_while_one_bills(wor
     ids = [job.job.native_id, hand.jobs[0].native_id]
     for jid in ids:
         world.sched.set(jid, state="RUNNING", elapsed=60)
+    return job, ids
+
+
+async def test_a_stop_with_no_job_of_ours_billing_works_as_today(world):
+    from hpc_bridge import server
+
+    out = await _confirmed(world.app, command="sleep 30")
+    world.sched.set(out.job.native_id, state="COMPLETED", elapsed=30)
+    st = await server._stop_endpoint(world.app)
+    assert st.status == "down" and st.spend_stopped is True, st
+    assert world.sched.calls("scancel") == []
+
+
+async def test_a_stop_while_our_jobs_can_bill_asks_first_and_changes_nothing(world):
+    from hpc_bridge import server
+
+    _job, ids = await _two_billing_jobs(world)
+    st = await server._stop_endpoint(world.app)
+    assert st.status == "needs_confirmation", st
+    notice = st.notice or ""
+    assert all(j in notice for j in ids) and "RUNNING" in notice and 'jobs="cancel"' in notice, notice
+    assert {j.native_id for j in st.jobs} == set(ids) and all(j.committed > 0 for j in st.jobs), st.jobs
+    assert world.sched.calls("scancel") == []                                  # nothing cancelled …
+    assert not any("-O" in c for c in world.sched.calls("squeue"))             # … nor the blocks released
+
+
+async def test_stop_jobs_cancel_ends_them_closes_the_envelope_and_is_down_only_once_none_is_listed(world):
+    from hpc_bridge import server
+
+    job, ids = await _two_billing_jobs(world)
     world.sched.knob(cancel_lag=2)
-    first = await server._stop_endpoint(world.app)
+    first = await server._stop_endpoint(world.app, jobs="cancel")
     assert all(any(j in c for c in world.sched.calls("scancel")) for j in ids), world.sched.calls("scancel")
-    assert first.status != "down" and all(j in (first.notice or "") for j in ids), first
+    assert first.status == "draining" and all(j in (first.notice or "") for j in ids), first
     final = first
     for _ in range(4):
-        final = await server._stop_endpoint(world.app)
+        final = await server._stop_endpoint(world.app, jobs="cancel")
         if final.status == "down":
             break
     assert final.status == "down" and final.spend_stopped is True, final
+    env = await server._status(world.app, job.envelope.envelope_id)
+    assert env.phase == "closed", env
+    again = await _submit(world.app, command="sleep 60")
+    assert again.phase == "needs_confirmation" and again.envelope.envelope_id != job.envelope.envelope_id, again
 
 
-async def test_a_stop_with_no_endpoint_is_not_down_while_a_ledger_job_bills(world):
+async def test_stop_jobs_keep_releases_the_blocks_leaves_the_jobs_and_is_never_down(world):
+    from hpc_bridge import server
+
+    job, ids = await _two_billing_jobs(world)
+    st = await server._stop_endpoint(world.app, jobs="keep")
+    assert st.status == "draining" and st.spend_stopped is not True, st
+    notice = st.notice or ""
+    assert all(j in notice for j in ids) and job.job.job_id in notice and job.envelope.envelope_id in notice, notice
+    assert "cancel(" in notice and world.sched.calls("scancel") == []          # the jobs run on
+    assert any("-O" in c for c in world.sched.calls("squeue"))                 # the endpoint's blocks: released as today
+    env = await server._status(world.app, job.envelope.envelope_id)
+    assert env.phase == "draining" and set(env.envelope.job_ids) >= {job.job.job_id}, env
+    late = await _submit(world.app, command="sleep 60", confirm_spend=False)
+    assert late.phase == "needs_confirmation", late                          # nothing new is admitted after a stop
+    assert len(world.sched.calls("sbatch")) == 2
+    ended = await server._cancel(world.app, job.envelope.envelope_id, "abort")
+    assert all(any(j in c for c in world.sched.calls("scancel")) for j in ids), ended
+
+
+async def test_a_later_sessions_stop_asks_about_an_earlier_servers_jobs(world):
     from hpc_bridge import server
 
     out = await _confirmed(world.app, command="sleep 3600")
     world.sched.set(out.job.native_id, state="RUNNING", elapsed=60)
     app2 = _new_session(world)
-    app2.state.endpoint_id = None                                      # a new chat that has not connected yet
     st = await server._stop_endpoint(app2)
-    assert st.status != "down" and out.job.job_id in (st.notice or ""), st
+    assert st.status == "needs_confirmation" and out.job.native_id in (st.notice or ""), st
+    unbound = _new_session(world)
+    unbound.state.endpoint_id = None                                   # a chat that has not connected yet
+    blind = await server._stop_endpoint(unbound)
+    assert blind.status == "needs_confirmation" and out.job.native_id in (blind.notice or ""), blind
+    kept = await server._stop_endpoint(unbound, jobs="cancel")         # no channel: nothing can be cancelled from here
+    assert kept.status == "draining" and "connect_facility" in (kept.notice or ""), kept
+    done = await server._stop_endpoint(app2, jobs="cancel")
+    assert any(out.job.native_id in c for c in world.sched.calls("scancel")) and done.status in ("draining", "down")
+
+
+async def test_a_held_job_a_dead_server_never_released_is_ours_listed_and_cancelled(world):
+    """D2: the server died between the hold and the release — the held job is ledgered (ours): a later session's stop
+    lists it, and a cancel of it ends it."""
+    from hpc_bridge import batch, server
+
+    first = await _confirmed(world.app, command="sleep 3600", envelope={"cap": 20})
+    held = world.sched.add_job(name="hand", state="PENDING", held=True, reason="JobHeldUser", timelimit_min=60)
+    batch.ledger_of(world.app).reserve_job(first.envelope.envelope_id, "job-00000000beef", session="dead-session",
+                                           worst_case=4.0, source="adopt", native_id=held, state="held",
+                                           ignore_owner=True)
+    app2 = _new_session(world)
+    st = await server._stop_endpoint(app2)
+    assert st.status == "needs_confirmation" and held in (st.notice or "") and "held" in (st.notice or "").lower(), st
+    env = await server._status(app2, first.envelope.envelope_id)
+    assert "job-00000000beef" in env.envelope.job_ids
+    c = await server._cancel(app2, "job-00000000beef", "abort")
+    assert any(held in x for x in world.sched.calls("scancel")) and c.status in ("draining", "down"), c
 
 
 async def test_exhausted_is_not_down(world):
@@ -705,6 +804,14 @@ async def test_status_and_cancel_read_job_and_envelope_ids_and_refuse_others(wor
     job = await server._status(world.app, out.job.job_id)
     env = await server._status(world.app, out.envelope.envelope_id)
     assert job.job.job_id == out.job.job_id and env.envelope.envelope_id == out.envelope.envelope_id
+    assert (job.kind, env.kind) == ("job", "envelope") and job.batch_id is None, (job, env)
+    from hpc_bridge.models import BatchStatus
+
+    assert isinstance(job, BatchStatus) and isinstance(env, BatchStatus)    # one model: structured output survives
+    from hpc_bridge import server as srv
+
+    tool = next(t for t in await srv.mcp.list_tools() if t.name == "status")
+    assert tool.outputSchema and "kind" in tool.outputSchema.get("properties", {}), tool.outputSchema
     bad = await server._status(world.app, "job-zzz")
     assert bad.phase == "refused", bad
     unknown = await server._cancel(world.app, "env-000000000000", "abort")

@@ -54,7 +54,7 @@ async def SCRIPT(ops) -> str:
         e = st.get("envelope") or {}
         ops.say(f"{env_id}: spent {e.get('spent')}, committed {e.get('committed')}, unledgered "
                 f"{[u.get('native_id') for u in e.get('unledgered') or []]}")
-    s = await bc.stop(ops, tries=8)
+    s = await jc.stop(ops, tries=8)
     return f"stop said {s.get('status')!r}"
 
 

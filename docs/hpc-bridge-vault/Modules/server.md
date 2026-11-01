@@ -1,11 +1,11 @@
 # server.py
 
 > [!abstract] Role
-> The FastMCP server — the agent-facing entry point. Declares the **fifteen** MCP tools (the three batch tools are thin wrappers over [[batch]]), holds session state (`AppCtx`), gates on the Globus login, selects/binds the facility (SSH personal endpoint or facility MEP), and runs the provision → canary → dispatch → spend flow under a lock.
+> The FastMCP server — the agent-facing entry point. Declares the **sixteen** MCP tools (the three batch tools are thin wrappers over [[batch]], `submit_job` and the `job-`/`env-` ids of `status`/`cancel` over [[jobs]]), holds session state (`AppCtx`), gates on the Globus login, selects/binds the facility (SSH personal endpoint or facility MEP), and runs the provision → canary → dispatch → spend flow under a lock.
 
 ## What it does
 
-`server.py` is the runtime heart. It exposes fifteen tools ([[The MCP tools]]; `run_batch` / `status` / `cancel` delegate to [[batch]] through `_run_batch` / `_status` / `_cancel`), each a thin `@mcp.tool()` wrapper over a private `_`-helper that takes the `AppCtx`:
+`server.py` is the runtime heart. It exposes sixteen tools ([[The MCP tools]]; `submit_job` delegates to [[jobs]] through `_submit_job`, and `stop_endpoint(jobs=…)` asks about Jobs-mode jobs first (`_stop_endpoint` → `jobs.billing_jobs`, then `_stop_endpoint_blocks`, the stop as it was); `run_batch` / `status` / `cancel` delegate to [[batch]] through `_run_batch` / `_status` / `_cancel`), each a thin `@mcp.tool()` wrapper over a private `_`-helper that takes the `AppCtx`:
 
 | Tool | Helper | Does |
 |---|---|---|

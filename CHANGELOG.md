@@ -6,6 +6,39 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Added
+- **Batches (phase 2a): Jobs mode, the budget envelope, the billing meter, and hand submits gated and adopted.**
+  One new tool, `submit_job` (16 tools), plus `job-` / `env-` ids on `status` and `cancel`, `run_shell(confirm_spend=…)`
+  and `stop_endpoint(jobs="cancel"|"keep")` (vault `Planned/Batch and swarm execution.md` §2, §3, §12 D2).
+  - **`submit_job`** (SSH facilities only; a facility endpoint has no free status or cancel channel, so it refuses
+    there): the command becomes a scheduler job that outlives any endpoint, in a frozen `<scratch>/jobs/<id>/job.sh`
+    written once, its sha256 on the ledger. The header comes from the terms; the session's cwd and env are replayed;
+    the command is carried base64, so no line of it can become a directive; its exit code is written beside it.
+    Arrays (`array="0-19%4"`, `{index}` through phase 1's template rules), dependencies (`depends_on`), and `adopt=` for a
+    job submitted by hand.
+  - **The envelope:** every job runs under a budget the user approves once (cap, deadline — 24 h by default, at most
+    168 h, carried by every Slurm job as `--deadline` in UTC; soft on PBS — max_jobs, accounts, partitions, a named site
+    backstop). The first call answers `needs_confirmation` with the job's terms (worst case = every array task, never
+    the throttle's few, never below the queue's minimum charge) and nothing is submitted; inside the envelope a job that
+    fits is admitted at once, one that does not answers `envelope_exhausted`. Admission reserves the worst case in one
+    `BEGIN IMMEDIATE` transaction before anything is submitted. The envelope belongs to the session that approved it:
+    a later session or a restarted server asks again, naming what remains. `HPC_BRIDGE_ENVELOPE_MAX` bounds the sum of
+    open envelopes per facility and account. A compute block confirmed while it is open is admitted against it. The
+    terms state the honest limit: the envelope binds only what hpc-bridge starts.
+  - **The meter** reads one sacct (Slurm, with squeue in the same call) or `qstat -x -f -F json` (PBS) per look:
+    billing TRES × elapsed, never below the queue's minimum charge (`min_charge_h`, a new catalog field on a
+    partition); committed = a running job's remaining walltime, a queued one's full walltime; a ledger job sacct does
+    not list holds its full walltime; jobs of the user's that hpc-bridge did not start are counted and named, until the
+    user excludes them (`exclude_jobs`).
+  - **D2, gate and adopt:** a recognised hand `sbatch`/`qsub` while this session's envelope is open answers
+    `needs_confirmation` and runs nothing; on the yes (`run_shell(…, confirm_spend=True)`) it runs with its jobs held,
+    each is adopted (ledgered, reserved, given the envelope's deadline) and released, or cancelled still held if it
+    does not fit.
+  - **A stop asks about jobs that can still bill** — any session's, a dead server's and a held hand submit included —
+    naming each one, and changes nothing until `stop_endpoint(jobs="cancel")` (cancel them; `down` only once the
+    scheduler lists none) or `jobs="keep"` (release only the blocks; `draining`, never `down`, naming how to end them).
+    Nothing is admitted after a stop either way.
+  - `status` keeps one model for every kind of id (`kind: batch|job|envelope`, optional `job` / `envelope`), so its
+    structured output survives.
 - **Batches (phase 1): one command over many rows on the confirmed block, with a durable ledger.** Three tools:
   `run_batch`, `status`, `cancel`. Instead of a `run_shell` per input, `run_batch(command, rows, task_walltime_s)` keeps
   the backlog in the server and sends at most `capacity` tasks at a time (the block's workers less one kept for

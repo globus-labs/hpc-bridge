@@ -81,6 +81,7 @@ def test_a_dict_when_input_reads_the_calls_effective_arguments():
     assert not m({"shape": "compute"}, {"command": "x"}, "login_shell")               # no such argument: no default
     assert not m("compute", {"command": "hostname"}, "run_shell")   # a regex reads what was SENT, never a default
     assert hooks.effective_input("run_shell", {"command": "c"}) == {"command": "c", "session_id": "default",
+                                                                     "confirm_spend": False,
                                                                      "shape": "compute"}
 
 

@@ -1,7 +1,7 @@
 # Batch and agent-swarm execution: design
 
 > [!abstract] In one line
-> Designed 2026-10-30. Phase 1 (the durable ledger and `run_batch` / `status` / `cancel` on the session's confirmed compute block) is MERGED (#238, 2026-11-01: [[batch]], [[ledger]]; "Phase 1 as built" below) and was live-checked on Anvil's facility endpoint the same day ("Phase 1, live" below); phases 2–4 are designed, not built.
+> Designed 2026-10-30. Phase 1 (the durable ledger and `run_batch` / `status` / `cancel` on the session's confirmed compute block) is MERGED (#238, 2026-11-01: [[batch]], [[ledger]]; "Phase 1 as built" below) and was live-checked on Anvil's facility endpoint the same day ("Phase 1, live" below). Phase 2a (the envelope, the meter, Jobs mode, D2) is BUILT on `feat/batch-phase2a` ([[jobs]], [[meter]]; "Phase 2a as built" below), with its live cells still to run; 2b (`export_handoff`), 3 and 4 are designed, not built.
 
 _Design lead's draft, 2026-10-30. Code references are to `fix/perlmutter-report` at 74fd47d. Library behaviour is from the installed `mcp` 1.30.0, `globus-compute-sdk` 4.18.0 and `globus_sdk`, plus the Globus Compute and Parsl docs (via Context7). Inputs: the three research reports (working files of the design, not kept in the repo), the adversarial review ([[Batch design review 2026-10-30]]), the vault, `HANDOFF.md`, `SKILL.md`, and loam's `hpc-deployment` skill (`develop`). No product code. **Revised the same day with the phase-0 spike results** (S1, S2, S4, S5, S7, S8 on a fake cluster and, for S7, read-only on Delta and Anvil): [[Batch spikes 2026-10-30]] holds the evidence._
 
@@ -381,6 +381,28 @@ One run of `main` at 15929b5 through hpc-bridge's own functions, with no agent: 
 - Also: `envelope_new_session_reasks`, `envelope_ceiling_sums`, `envelope_bypass_counted`, `meter_missing_from_sacct_full_walltime`, `handoff_polaris_shape`, `handoff_mep_min_blocks_refused`.
 
 **Harness work:** an allowlist in `stop_honesty_no_pilot_left` for jobs meant to keep running; `_hand_submit_idxs` learns `submit_job`; a `world:charged_within_envelope` check.
+
+#### Phase 2a as built (2026-11-01, branch `feat/batch-phase2a`)
+
+Modules [[jobs]] and [[meter]], the [[ledger]]'s `envelope`, `job` and `meter_reading` tables, and tools in [[The MCP tools]]. Built test-first:
+- `tests/test_batch_phase2a.py`: strict xfails on main at cc9f856, green with the build. It runs a fake Slurm and PBS under real bash (`tests/fake_sched.py`), so the tests pin what hpc-bridge sends.
+- `agentic/harness/jobs_checks.py` with `test_jobs_scenarios.py`, and nine scenarios.
+
+`export_handoff` is phase 2b. Where §2–§3 left a choice open, or the checkpoint (and the user's decisions, 2026-11-01) settled it:
+- **One new tool, `submit_job`** (16 tools). The envelope has no tool of its own:
+  - opened by the confirming `submit_job(…, envelope={…}, confirm_spend=True)`;
+  - read by `status("env-…")`;
+  - closed by `cancel("env-…")`, its deadline, or a stop.
+
+  `status` keeps ONE model (`BatchStatus` + `kind` + `job` / `envelope`), so its structured output survives. There is no `script` argument (a command may be multi-line).
+- **Inside an open envelope a job that fits is admitted on its first call**: the envelope is the approval. A call asks only when there is no envelope, the job doesn't fit, the envelope is another session's (whose server is gone), or the cap changes.
+- **D2 (c):** the yes runs the hand submit with `sbatch`/`qsub` as exported bash functions adding `--hold` / `-h`. Each job is then read, reserved as a `held` row, given the deadline and released, or cancelled while still held. A held job a dead server never released is ours: a stop lists it, and a cancel ends it.
+- **A stop with Jobs-mode jobs of ours that can still bill** (user's decision 1) answers `needs_confirmation`, naming each one, and changes nothing. `jobs="cancel"` cancels them; `jobs="keep"` releases only the blocks (`draining`, never `down`). Nothing is admitted after a stop.
+- **"Not mine"** is in 2a: `exclude_jobs` on a confirming call (coordinator's ruling).
+- **The deadline:** 24 h by default and at most 168 h, written in the header as UTC under `TZ=UTC0`. On PBS it is soft.
+- **A compute block confirmed while the envelope is open** is reserved against it (`pool_block`) until the stop.
+- **Units:** the cap is in "billing units" (Slurm billing TRES-hours; on PBS without weights, core-hours).
+- **Deferred:** `max_concurrent_blocks` (phase 3 pools) and the PBS queue limits in the terms (`qstat -Qf`).
 
 ### Phase 3: campaign pools
 

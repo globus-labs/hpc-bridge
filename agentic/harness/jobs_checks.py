@@ -213,6 +213,25 @@ async def wait_world(ops, native: str, states: tuple[str, ...], *, scheduler: st
     return st
 
 
+async def stop(ops, *, jobs: str = "cancel", tries: int = 8) -> dict:
+    """stop_endpoint as the user wants it: when it asks about Jobs-mode jobs of ours that can still bill
+    (needs_confirmation), the user's choice (`jobs`: cancel | keep); then again while it drains — on `keep` its
+    `draining` is final."""
+    s = await ops.call("stop_endpoint")
+    asked = s.get("status") == "needs_confirmation"
+    if asked:
+        ops.say(f"the stop asks about our jobs ({[j.get('native_id') for j in s.get('jobs') or []]}): the user says "
+                f"{jobs}")
+        s = await ops.call("stop_endpoint", jobs=jobs)
+    for _ in range(tries):
+        status = s.get("status")
+        if status not in ("draining", "up") or (status == "draining" and asked and jobs == "keep"):
+            break
+        await ops.sleep(POLL_S * 2)
+        s = await (ops.call("stop_endpoint", jobs=jobs) if asked else ops.call("stop_endpoint"))
+    return s
+
+
 async def cancel_until_down(ops, ident: str, *, tries: int = 12) -> dict:
     c = await ops.call("cancel", id=ident, mode="abort")
     for _ in range(tries):
@@ -456,6 +475,23 @@ def pending_under_backstop(t: Trace, *, reason: str = "AssocGrp") -> Result:
             return Result("pending_under_backstop", ok, f"call {i}: {j.get('state')} ({j.get('reason')}), charged "
                           f"{j.get('charged')}")
     return Result("pending_under_backstop", False, f"no status reported the job pending under {reason}…")
+
+
+def stop_asked_about_jobs(t: Trace) -> Result:
+    """Decision 1 (2026-11-01): a stop while Jobs-mode jobs of ours can still bill ASKS — needs_confirmation naming
+    each one (`jobs`) — and the user's choice comes back as stop_endpoint(jobs="cancel"|"keep")."""
+    stops = t.named("stop_endpoint")
+    if not stops:
+        return Result("stop_asked_about_jobs", False, "no stop_endpoint call")
+    i, first = stops[0]
+    r = first.result or {}
+    named = [str(j.get("native_id")) for j in r.get("jobs") or [] if isinstance(j, dict) and j.get("native_id")]
+    answered = any(j > i and str(c.input.get("jobs")) in ("cancel", "keep") for j, c in stops)
+    ok = (str(r.get("status")) == "needs_confirmation" and bool(named)
+          and all(n in str(r.get("notice") or "") for n in named) and answered)
+    return Result("stop_asked_about_jobs", ok, f"first stop (call {i}): {r.get('status')!r}, named {named or 'none'}; "
+                  f"the user's choice {'came back' if answered else 'never came'}" + (
+                      f"; hand-submitted {main_native_ids(t)} were never asked about" if main_native_ids(t) else ""))
 
 
 def stop_down_after_jobs(t: Trace) -> Result:

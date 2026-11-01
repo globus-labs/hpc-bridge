@@ -57,7 +57,7 @@ async def SCRIPT(ops) -> str:
                           envelope={"cap": 1, "site_backstop": BACKSTOP})
     if sub.main_id:
         await ops.sleep(20)
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {sub.main_id}; stop said {s.get('status')!r}"
     if not sub.job_id:
         ops.abort(f"submit_job did not submit: {sub.answer.get('phase')!r} {bc._brief(sub.answer)!r}")
@@ -69,7 +69,7 @@ async def SCRIPT(ops) -> str:
     ops.say(f"{sub.job_id}: {jc.job_of(st).get('state')} ({jc.job_of(st).get('reason')}), charged "
             f"{jc.job_of(st).get('charged')}")
     c = await jc.cancel_until_down(ops, sub.job_id)
-    s = await bc.stop(ops)
+    s = await jc.stop(ops)
     return f"cancel {c.get('status')!r}; stop said {s.get('status')!r}"
 
 

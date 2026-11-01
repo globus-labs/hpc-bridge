@@ -67,7 +67,7 @@ async def SCRIPT(ops) -> str:
     sub = await jc.submit(ops, command=COMMAND, session_id="dev", cores=1, walltime="00:10:00")
     if sub.main_id:
         await jc.wait_world(ops, sub.main_id, ("RUNNING",))
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {sub.main_id}; stop said {s.get('status')!r}"
     if not sub.job_id:
         ops.abort(f"submit_job did not submit: {sub.answer.get('phase')!r} {bc._brief(sub.answer)!r}")
@@ -75,7 +75,7 @@ async def SCRIPT(ops) -> str:
     ops.say(f"{sub.job_id} ({sub.native}) is {st.get('phase')!r}, charged {jc.job_of(st).get('charged')}")
     c = await jc.cancel_until_down(ops, sub.job_id)
     ops.say(f"cancel said {c.get('status')!r}: {str(c.get('notice') or '')[:200]}")
-    s = await bc.stop(ops)
+    s = await jc.stop(ops)
     return f"{sub.job_id} cancelled ({c.get('status')!r}); stop said {s.get('status')!r}"
 
 

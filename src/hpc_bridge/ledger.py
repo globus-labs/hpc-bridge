@@ -67,6 +67,41 @@ class UnknownBatch(LedgerError):
     """No batch of that id in the ledger."""
 
 
+class EnvelopeError(LedgerError):
+    """An envelope cannot admit this job (the reason is the text)."""
+
+
+class EnvelopeExhausted(EnvelopeError):
+    """spent + committed + this job's worst case would pass the cap. `held`: what the envelope holds now; `need`: the
+    job's worst case; `cap`."""
+
+    def __init__(self, msg: str, *, held: float = 0.0, need: float = 0.0, cap: float = 0.0) -> None:
+        super().__init__(msg)
+        self.held, self.need, self.cap = held, need, cap
+
+
+class EnvelopeNotOwned(EnvelopeError):
+    """Another session approved the envelope: this one asks again before admitting anything (rule 3)."""
+
+
+class EnvelopeClosed(EnvelopeError):
+    """The envelope admits nothing (drained, stopped, closed, or past its deadline)."""
+
+
+class EnvelopeLimit(EnvelopeError):
+    """The job passes one of the envelope's other dimensions (max_jobs, max_nodes_per_block, accounts, partitions)."""
+
+
+def job_hold(j: dict[str, Any]) -> float:
+    """What one job holds against its envelope: nothing once refused; its worst case until the meter has read it; then
+    what it charged plus what it can still bill."""
+    if j.get("state") == "refused":
+        return 0.0
+    if (j.get("meter_source") or "none") == "none":
+        return float(j.get("worst_case") or 0.0)
+    return float(j.get("charged") or 0.0) + float(j.get("committed") or 0.0)
+
+
 def proc_start(pid: int) -> str | None:
     """When process `pid` started, as the OS says (Linux: /proc/<pid>/stat's starttime; elsewhere `ps -o lstart=`), or
     None when it cannot be told (no such process). Two processes that share a pid over time differ here."""
@@ -261,7 +296,92 @@ create table if not exists event (
   kind text not null,
   data text
 );
+create table if not exists envelope (
+  id text primary key,
+  created_at real not null,
+  facility text,
+  endpoint_id text,
+  account text,
+  unit text,
+  cap real not null,
+  max_jobs integer,
+  max_nodes_per_block integer,
+  accounts text default '[]',
+  partitions text default '[]',
+  deadline real not null,
+  at_deadline text default 'drain',
+  site_backstop text,
+  approved_by text,
+  approved_at real,
+  owner_host text,
+  owner_pid integer,
+  owner_start text,
+  state text not null,
+  closed_at real,
+  close_reason text,
+  spent real default 0,
+  committed real default 0,
+  unledgered text default '[]',
+  unledgered_hold real default 0,
+  excluded text default '[]',
+  metered_at real
+);
+create table if not exists job (
+  id text primary key,
+  envelope_id text not null,
+  created_at real not null,
+  source text not null,
+  native_id text,
+  scheduler text,
+  session_id text,
+  approved_by text,
+  partition text,
+  account text,
+  nodes integer,
+  cores integer,
+  memory_gb real,
+  gpus integer,
+  walltime_s real,
+  tasks integer default 1,
+  array_spec text,
+  throttle integer,
+  depends_on text default '[]',
+  rate real,
+  min_charge_h real,
+  worst_case real not null,
+  script_path text,
+  script_hash text,
+  deadline real,
+  state text not null,
+  sched_state text,
+  exit_code integer,
+  reason text,
+  charged real default 0,
+  committed real default 0,
+  meter_source text default 'none',
+  array_counts text default '{}',
+  metered_at real,
+  ended_at real
+);
+create index if not exists job_by_native on job (native_id);
+create table if not exists meter_reading (
+  seq integer primary key autoincrement,
+  at real not null,
+  envelope_id text not null,
+  source text,
+  spent real,
+  committed real,
+  unledgered text default '[]',
+  detail text
+);
 """
+
+# A Jobs-mode job's states (batch phase 2a). Admission holds a reservation from `reserved` on; a job the scheduler can
+# still bill is LIVE (a reserved row has not reached the scheduler yet but may at any moment; a held hand submit is ours
+# until released or cancelled).
+JOB_LIVE = ("reserved", "submit_unknown", "held", "queued", "running")
+JOB_ENDED = ("done", "failed", "cancelled", "refused")
+ENVELOPE_ADMITTING = ("open", "exhausted")
 
 _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "truncated", "job_id", "host", "workers",
                 "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job", "sent_uec",
@@ -582,6 +702,177 @@ class Ledger:
     def itask(self, task_id: str) -> dict[str, Any] | None:
         r = self._con.execute("select * from itask where task_id = ?", (task_id,)).fetchone()
         return None if r is None else dict(r)
+
+    # -- envelopes (batch phase 2a) --------------------------------------------------------------------------------
+    def add_envelope(self, envelope_id: str, *, facility: str | None, account: str | None, unit: str, cap: float,
+                     deadline: float, approved_by: str, owner: Owner, endpoint_id: str | None = None,
+                     max_jobs: int | None = None, max_nodes_per_block: int | None = None,
+                     accounts: Iterable[str] | None = None, partitions: Iterable[str] | None = None,
+                     at_deadline: str = "drain", site_backstop: str | None = None,
+                     now: float | None = None) -> str:
+        at = time.time() if now is None else now
+        with self._tx(immediate=True) as c:
+            c.execute("insert into envelope (id, created_at, facility, endpoint_id, account, unit, cap, max_jobs, "
+                      "max_nodes_per_block, accounts, partitions, deadline, at_deadline, site_backstop, approved_by, "
+                      "approved_at, owner_host, owner_pid, owner_start, state) "
+                      "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,'open')",
+                      (envelope_id, at, facility, endpoint_id, account, unit, float(cap), max_jobs, max_nodes_per_block,
+                       json.dumps(list(accounts or [])), json.dumps(list(partitions or [])), float(deadline),
+                       at_deadline, site_backstop, approved_by, at, owner.host, owner.pid, owner.started))
+            c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
+                      (at, envelope_id, "envelope.open", json.dumps({"cap": cap, "by": approved_by})))
+        return envelope_id
+
+    def envelope(self, envelope_id: str) -> dict[str, Any] | None:
+        r = self._con.execute("select * from envelope where id = ?", (envelope_id,)).fetchone()
+        return None if r is None else dict(r)
+
+    def envelopes(self, *, facility: str | None = None, states: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        q, args = "select * from envelope where 1=1", list[Any]()
+        if facility is not None:
+            q += " and facility = ?"
+            args.append(facility)
+        if states is not None:
+            st = list(states)
+            q += f" and state in ({','.join('?' * len(st))})"
+            args += st
+        return [dict(r) for r in self._con.execute(q + " order by created_at", args)]
+
+    def update_envelope(self, envelope_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._tx(immediate=True) as c:
+            c.execute(f"update envelope set {cols} where id = ?", (*fields.values(), envelope_id))
+
+    def rebind_envelope(self, envelope_id: str, *, session: str, owner: Owner, cap: float | None = None,
+                        now: float | None = None) -> None:
+        """The user's yes in a later session: the envelope is this session's from now on (its cap raised or lowered
+        when the yes named one)."""
+        at = time.time() if now is None else now
+        with self._tx(immediate=True) as c:
+            c.execute("update envelope set approved_by = ?, approved_at = ?, owner_host = ?, owner_pid = ?, "
+                      "owner_start = ?, cap = coalesce(?, cap) where id = ?",
+                      (session, at, owner.host, owner.pid, owner.started, cap, envelope_id))
+            c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
+                      (at, envelope_id, "envelope.rebind", json.dumps({"by": session, "cap": cap})))
+
+    def envelope_owner(self, e: dict[str, Any]) -> Owner:
+        return Owner(str(e.get("owner_host") or ""), int(e.get("owner_pid") or 0), e.get("owner_start"))
+
+    def excluded_jobs(self, envelope_id: str) -> list[str]:
+        e = self.envelope(envelope_id)
+        return list(json.loads((e or {}).get("excluded") or "[]"))
+
+    def exclude_jobs(self, envelope_id: str, native_ids: Iterable[str]) -> list[str]:
+        """The user said these jobs are theirs, not hpc-bridge's: the meter never counts them against the envelope
+        again."""
+        with self._tx(immediate=True) as c:
+            r = c.execute("select excluded from envelope where id = ?", (envelope_id,)).fetchone()
+            have = list(json.loads((r[0] if r else None) or "[]"))
+            have += [str(n) for n in native_ids if str(n) not in have]
+            c.execute("update envelope set excluded = ? where id = ?", (json.dumps(have), envelope_id))
+            c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
+                      (time.time(), envelope_id, "envelope.exclude", json.dumps(have)))
+        return have
+
+    def envelope_hold(self, c: sqlite3.Connection, envelope_id: str) -> tuple[float, int]:
+        """(what the envelope holds now — every job's `job_hold` plus the unledgered jobs the meter counted —, the
+        array tasks admitted), read on connection `c` (inside a transaction)."""
+        e = c.execute("select unledgered_hold from envelope where id = ?", (envelope_id,)).fetchone()
+        held = float((e[0] if e else 0.0) or 0.0)
+        tasks = 0
+        for r in c.execute("select * from job where envelope_id = ?", (envelope_id,)):
+            j = dict(r)
+            held += job_hold(j)
+            if j.get("state") != "refused":
+                tasks += int(j.get("tasks") or 1)
+        return held, tasks
+
+    def reserve_job(self, envelope_id: str, job_id: str, *, session: str, worst_case: float, tasks: int = 1,
+                    nodes: int = 1, account: str | None = None, partition: str | None = None,
+                    source: str = "submit_job", native_id: str | None = None, state: str = "reserved",
+                    ignore_owner: bool = False, now: float | None = None, **fields: Any) -> dict[str, Any]:
+        """THE admission point of an envelope: in one BEGIN IMMEDIATE transaction, check that the envelope admits (open,
+        this session's, before its deadline), that the job passes its dimensions, and that what it holds plus this
+        job's worst case stays within the cap — then insert the job, holding its worst case. `ignore_owner`: an adopted
+        job the user already said yes to in a session that is gone (the held-job repair)."""
+        at = time.time() if now is None else now
+        with self._tx(immediate=True) as c:
+            r = c.execute("select * from envelope where id = ?", (envelope_id,)).fetchone()
+            if r is None:
+                raise EnvelopeClosed(f"no envelope {envelope_id}")
+            e = dict(r)
+            if not ignore_owner:
+                if e["state"] not in ENVELOPE_ADMITTING:
+                    raise EnvelopeClosed(f"envelope {envelope_id} is {e['state']}: it admits nothing more")
+                if e["approved_by"] != session:
+                    raise EnvelopeNotOwned(f"envelope {envelope_id} was approved by another session")
+                if float(e["deadline"]) <= at:
+                    raise EnvelopeClosed(f"envelope {envelope_id} is past its deadline")
+            accounts = json.loads(e.get("accounts") or "[]")
+            partitions = json.loads(e.get("partitions") or "[]")
+            if accounts and (account or "") not in accounts and not ignore_owner:
+                raise EnvelopeLimit(f"account {account!r} is not one the envelope allows ({', '.join(accounts)})")
+            if partitions and partition and partition not in partitions and not ignore_owner:
+                raise EnvelopeLimit(f"partition {partition!r} is not one the envelope allows ({', '.join(partitions)})")
+            if e.get("max_nodes_per_block") and nodes > int(e["max_nodes_per_block"]) and not ignore_owner:
+                raise EnvelopeLimit(f"{nodes} nodes is over the envelope's max_nodes_per_block "
+                                    f"{int(e['max_nodes_per_block'])}")
+            held, admitted = self.envelope_hold(c, envelope_id)
+            if e.get("max_jobs") and admitted + tasks > int(e["max_jobs"]) and not ignore_owner:
+                raise EnvelopeLimit(f"{tasks} task(s) would make {admitted + tasks}, over the envelope's max_jobs "
+                                    f"{int(e['max_jobs'])}")
+            cap = float(e["cap"])
+            if held + float(worst_case) > cap + 1e-9 and not ignore_owner:
+                raise EnvelopeExhausted(f"{held:g} of {cap:g} is held; this job needs {float(worst_case):g}",
+                                        held=held, need=float(worst_case), cap=cap)
+            if e["state"] == "exhausted" and not ignore_owner:
+                c.execute("update envelope set state = 'open' where id = ?", (envelope_id,))
+            cols = {"id": job_id, "envelope_id": envelope_id, "created_at": at, "source": source,
+                    "native_id": native_id, "approved_by": session, "partition": partition, "account": account,
+                    "nodes": nodes, "tasks": tasks, "worst_case": float(worst_case), "state": state, **fields}
+            names = ", ".join(cols)
+            c.execute(f"insert into job ({names}) values ({','.join('?' * len(cols))})", tuple(cols.values()))
+            c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
+                      (at, envelope_id, "job.reserve", json.dumps({"job": job_id, "worst_case": worst_case,
+                                                                   "held_before": held})))
+            return cols
+
+    def job(self, job_id: str) -> dict[str, Any] | None:
+        r = self._con.execute("select * from job where id = ?", (job_id,)).fetchone()
+        return None if r is None else dict(r)
+
+    def jobs(self, *, envelope_id: str | None = None, envelope_ids: Iterable[str] | None = None,
+             states: Iterable[str] | None = None) -> list[dict[str, Any]]:
+        q, args = "select * from job where 1=1", list[Any]()
+        if envelope_id is not None:
+            q += " and envelope_id = ?"
+            args.append(envelope_id)
+        if envelope_ids is not None:
+            ids = list(envelope_ids)
+            q += f" and envelope_id in ({','.join('?' * len(ids)) or 'null'})"
+            args += ids
+        if states is not None:
+            st = list(states)
+            q += f" and state in ({','.join('?' * len(st))})"
+            args += st
+        return [dict(r) for r in self._con.execute(q + " order by created_at", args)]
+
+    def update_job(self, job_id: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._tx(immediate=True) as c:
+            c.execute(f"update job set {cols} where id = ?", (*fields.values(), job_id))
+
+    def meter_reading(self, envelope_id: str, *, source: str, spent: float, committed: float,
+                      unledgered: list[dict[str, Any]], detail: dict[str, Any], now: float | None = None) -> None:
+        at = time.time() if now is None else now
+        with self._tx() as c:
+            c.execute("insert into meter_reading (at, envelope_id, source, spent, committed, unledgered, detail) "
+                      "values (?,?,?,?,?,?,?)", (at, envelope_id, source, spent, committed, json.dumps(unledgered),
+                                                 json.dumps(detail, default=str)))
 
     # -- events ----------------------------------------------------------------------------------------------------
     def event(self, batch_id: str | None, kind: str, data: dict[str, Any], *, now: float | None = None) -> None:

@@ -173,7 +173,7 @@ def _slurm_opts(args: list[str]) -> dict[str, Any]:
         a = args[i]
         if a.startswith("--") and "=" in a:
             k, v = a[2:].split("=", 1)
-        elif a in ("--parsable", "--hold", "-H"):
+        elif a in ("--parsable", "--hold", "-H", "--exclusive", "--wait", "-W", "--requeue", "--no-requeue"):
             k, v = a.lstrip("-"), True
         elif a.startswith("--"):
             k, v = a[2:], args[i + 1] if i + 1 < len(args) else ""

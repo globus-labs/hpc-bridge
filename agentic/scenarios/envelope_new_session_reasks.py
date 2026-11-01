@@ -45,18 +45,20 @@ async def SCRIPT(ops) -> str:
     await bc.reconnect(ops)
     if a.main_id:
         b = await jc.submit(ops, **JOB)
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {a.main_id}, {b.main_id}; stop said {s.get('status')!r}"
     r = await ops.call("submit_job", **JOB)
     ops.say(f"the new session's first submit_job: {r.get('phase')!r} ({r.get('reason')!r}): {bc._brief(r)}")
     if r.get("phase") == "needs_confirmation":
         ops.say("the user says yes")
         r = await ops.call("submit_job", confirm_spend=True, **JOB)
-    s = await bc.stop(ops, tries=8)
+    s = await jc.stop(ops, tries=8)
     return f"B: {r.get('phase')!r}; stop said {s.get('status')!r}"
 
 
-EXTRA_INVARIANTS = [jc.reask_names_remaining, jc.nothing_submitted_before_yes, jc.stop_down_after_jobs]
+EXTRA_INVARIANTS = [jc.reask_names_remaining, jc.nothing_submitted_before_yes, jc.stop_asked_about_jobs,
+                    jc.stop_down_after_jobs]
 WORLD_CHECKS = [jc.charged_within_envelope]
-EXPECT_OK = ["agent_engaged", "reask_names_remaining", "nothing_submitted_before_yes", "stop_down_after_jobs"]
+EXPECT_OK = ["agent_engaged", "reask_names_remaining", "nothing_submitted_before_yes", "stop_asked_about_jobs",
+             "stop_down_after_jobs"]
 _ = (Result, Trace)

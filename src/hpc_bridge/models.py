@@ -92,6 +92,10 @@ class PartitionShape(BaseModel):
     # PBS: the `place` a slice must ask for where the queue's or server's default place is exclusive but the nodes may
     # be shared ("free:shared"); None: the default place shares, or not known. A slice never asks for place=excl.
     place: str | None = None
+    # The queue's minimum charge, in hours of the job's billing (batch phase 2a's meter): a job that started is charged
+    # at least this long (NERSC Perlmutter `preempt`: 2 h). A site's policy, so a catalog fact (registry entry or a
+    # facility's details=), never discovered; None: no minimum known.
+    min_charge_h: float | None = None
 
     @field_validator("name")
     @classmethod
@@ -133,6 +137,11 @@ class PartitionShape(BaseModel):
     def _amount(cls, v: Any) -> float | None:
         f = _positive(v)
         return round(f, 1) if f is not None else None
+
+    @field_validator("min_charge_h", mode="before")
+    @classmethod
+    def _hours(cls, v: Any) -> float | None:
+        return _positive(v)
 
     @field_validator("billing", mode="before")
     @classmethod
@@ -191,6 +200,146 @@ class BlockTerms(BaseModel):
     charge_unit: str | None = None
 
 
+# ---- batch phase 2a: the budget envelope, Jobs mode (vault `Planned/Batch and swarm execution.md` §2, §3) --------
+
+class UnledgeredJob(BaseModel):
+    """A job of the user's the meter's sweep found that hpc-bridge did not start (a script's own sbatch, a subprocess):
+    counted against the envelope until the user says it is not theirs (submit_job(exclude_jobs=[…]))."""
+
+    native_id: str
+    name: str | None = None
+    state: str | None = None
+    charged: float = 0.0
+    committed: float = 0.0
+
+
+class JobInfo(BaseModel):
+    """One job of an envelope, as the ledger and the latest meter reading have it. `state`: the scheduler's own word
+    (PENDING, RUNNING, COMPLETED, FAILED, CANCELLED, TIMEOUT, …; HELD for a hand submit held for its adoption).
+    `charged`: what it has billed (billing TRES × elapsed, never below the queue's minimum), `committed`: the most it
+    can still bill (a running job's remaining walltime, a queued one's full walltime), both in `unit`. `meter_source`:
+    sacct | qstat (read), squeue (sacct did not list it: held at its full walltime), missing (neither did: the same),
+    none (not read yet)."""
+
+    job_id: str
+    native_id: str | None = None
+    source: Literal["submit_job", "adopt", "pool_block"] = "submit_job"
+    state: str = "RESERVED"
+    exit_code: int | None = None
+    reason: str | None = None
+    charged: float = 0.0
+    committed: float = 0.0
+    worst_case: float = 0.0
+    unit: str = "billing units"
+    meter_source: str = "none"
+    tasks: int = 1
+    throttle: int | None = None
+    array_counts: dict[str, int] = Field(default_factory=dict)
+    partition: str | None = None
+    account: str | None = None
+    walltime: str | None = None
+    deadline: str | None = None
+    script_path: str | None = None
+    script_hash: str | None = None
+    session_id: str | None = None
+
+
+class JobTerms(BaseModel):
+    """What a job (or an array) will receive and can bill — the spend question's terms, and the receipt of the call that
+    submitted it. `worst_case` = tasks × rate × max(walltime, the queue's minimum charge): every task of an array, never
+    the throttle's few. `binds`: the honest limit — what the envelope can and cannot bind. `site_backstop`: "none"
+    unless the user named one (an sbank suballocation, a Slurm GrpTRESMins)."""
+
+    facility: str | None = None
+    scheduler: str = "slurm"
+    account: str | None = None
+    partition: str | None = None
+    nodes: int = 1
+    whole_node: bool | None = None
+    cores_per_node: int | None = None
+    memory_gb: float | None = None
+    gpus_per_node: int | None = None
+    walltime: str
+    tasks: int = 1
+    throttle: int | None = None
+    rate: float
+    unit: str = "billing units"
+    worst_case: float
+    basis: str
+    min_charge_h: float | None = None
+    deadline: str
+    script_path: str | None = None
+    binds: str
+    site_backstop: str = "none"
+
+
+class EnvelopeInfo(BaseModel):
+    """A budget envelope (design §3): approved once by the session that owns it, enforced by the server for everything
+    hpc-bridge starts. `state`: proposed (asked, not open) | open | exhausted (nothing more fits; what is in flight runs
+    on) | draining (closed to admission — a drain or a stop that kept its jobs — while a job can still bill) | closed.
+    `spent` + `committed` + `remaining` = `cap`, in `unit`. `owned`: this server's session approved it (any other asks
+    again). `unledgered`: jobs it counts that hpc-bridge did not start."""
+
+    envelope_id: str
+    state: Literal["proposed", "open", "exhausted", "draining", "closed"]
+    facility: str | None = None
+    account: str | None = None
+    unit: str = "billing units"
+    cap: float
+    spent: float = 0.0
+    committed: float = 0.0
+    remaining: float = 0.0
+    max_jobs: int | None = None
+    jobs: list[JobInfo] = Field(default_factory=list)   # its jobs (a compute block's reservation is not listed)
+    tasks: int = 0                                       # array tasks admitted (what max_jobs counts)
+    max_nodes_per_block: int | None = None
+    accounts: list[str] = Field(default_factory=list)
+    partitions: list[str] = Field(default_factory=list)
+    deadline: str
+    at_deadline: Literal["drain", "abort"] = "drain"
+    site_backstop: str = "none"
+    owned: bool = True
+    binds: str = ""
+    job_ids: list[str] = Field(default_factory=list)
+    unledgered: list[UnledgeredJob] = Field(default_factory=list)
+    excluded: list[str] = Field(default_factory=list)
+
+
+class EnvelopeRequest(BaseModel):
+    """submit_job's `envelope`: what the user approves. `cap` in the facility's unit (the terms name it; default: this
+    job's worst case); `deadline_hours` (default 24, at most 168); `max_jobs` (array tasks counted);
+    `max_nodes_per_block`; allowed `accounts` / `partitions` (default: this job's account, any partition);
+    `at_deadline`: drain (admit no more) or abort (cancel what is left); `site_backstop`: the user's own words for a
+    site limit that holds jobs past a cap (else "none")."""
+
+    cap: float | None = None
+    deadline_hours: float | None = None
+    max_jobs: int | None = None
+    max_nodes_per_block: int | None = None
+    accounts: list[str] | None = None
+    partitions: list[str] | None = None
+    at_deadline: Literal["drain", "abort"] = "drain"
+    site_backstop: str | None = None
+
+
+JobPhase = Literal["needs_confirmation", "needs_account", "refused", "queued", "running", "done", "failed",
+                   "cancelled", "open", "exhausted", "draining", "closed"]
+
+
+class JobStatus(BaseModel):
+    """submit_job's answer. phase: needs_confirmation (nothing submitted: `reason` envelope_needed — no envelope yet;
+    envelope_exhausted — it does not fit what is left; envelope_new_session — another session approved the envelope;
+    and `terms` say what the yes approves) | needs_account | refused (`reason`) | queued | running | done | failed |
+    cancelled (the job, submitted)."""
+
+    phase: JobPhase
+    reason: str | None = None
+    job: JobInfo | None = None
+    terms: JobTerms | None = None
+    envelope: EnvelopeInfo | None = None
+    notice: str | None = None
+
+
 class ShellOutcome(BaseModel):
     # needs_confirmation: a scheduler compute shape whose spend hasn't been acknowledged — the
     # command was NOT dispatched and no block was started (run ensure_endpoint_up(confirm_spend=True)).
@@ -213,6 +362,10 @@ class ShellOutcome(BaseModel):
     # question to the user names it. None for every other phase.
     block: BlockTerms | None = None
     notice: str | None = None
+    # A hand sbatch/qsub while this session's envelope is open (batch phase 2a, D2): needs_confirmation names the
+    # envelope it would count against; the confirmed call's answer lists the jobs it adopted (`jobs`, source "adopt").
+    envelope: EnvelopeInfo | None = None
+    jobs: list[JobInfo] = Field(default_factory=list)
     # Internal, never serialized: a `failed` outcome the worker itself answered (a result over Compute's size limit:
     # it ran the command) — a liveness proof, so warmth must not void the block's confirmation for it.
     _worker_answered: bool = PrivateAttr(default=False)
@@ -270,11 +423,17 @@ class EndpointStatus(BaseModel):
     # terminal (a password / one-time code) — relay this command, as connect_facility's needs_preauth; never handle the
     # secret. Then call ensure_endpoint_up again: the repair rides that connection.
     preauth_command: str | None = None
+    # stop_endpoint while Jobs-mode jobs of ours can still bill (batch phase 2a): each one — its scheduler id, state and
+    # what it can still bill. needs_confirmation asks stop_endpoint(jobs="cancel"|"keep"); a stop that kept them names
+    # them here (draining, never down).
+    jobs: list[JobInfo] = Field(default_factory=list)
 
 
 # ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------
 
-BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused"]
+BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused",
+                     # a job- or env- id's (batch phase 2a; status answers them in this one model)
+                     "queued", "running", "failed", "open", "exhausted", "draining", "closed"]
 TaskState = Literal["backlog", "in_flight", "submit_unknown", "presumed_lost", "done", "failed", "lost", "cancelled"]
 
 
@@ -320,8 +479,13 @@ class BatchStatus(BaseModel):
     yet (the block is still starting, or its remaining walltime is not known); `needs_confirmation` — admission is
     paused and resumes only with run_batch(batch_id=…, confirm_spend=True) (`reason` says why: the block's walltime, a
     reap, a stop, a server restart, a drain); `needs_account` — as run_shell; `done` — every row settled; `cancelled`;
-    `refused` — this call was refused (`reason`), nothing was recorded or admitted."""
+    `refused` — this call was refused (`reason`), nothing was recorded or admitted.
 
+    status() answers every kind of id in this one model (`kind`): a batch (`batch-…`, the fields above), a job
+    (`job-…`: `job`, `envelope`; phase queued | running | done | failed | cancelled) or an envelope (`env-…`:
+    `envelope`; phase open | exhausted | draining | closed)."""
+
+    kind: Literal["batch", "job", "envelope"] = "batch"
     batch_id: str | None = None
     phase: BatchPhase
     tasks: int = 0
@@ -342,6 +506,8 @@ class BatchStatus(BaseModel):
     block: BlockTerms | None = None
     session_spend: NodeHours = 0.0
     notice: str | None = None
+    job: JobInfo | None = None
+    envelope: EnvelopeInfo | None = None
 
 
 class BlockLeft(BaseModel):

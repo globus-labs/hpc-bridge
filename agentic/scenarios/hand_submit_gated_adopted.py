@@ -60,7 +60,7 @@ async def SCRIPT(ops) -> str:
     if env_id:
         st = await ops.call("status", id=env_id)
         ops.say(f"envelope {env_id}: jobs {(st.get('envelope') or {}).get('job_ids')}")
-    s = await bc.stop(ops, tries=8)
+    s = await jc.stop(ops, tries=8)
     return f"stop said {s.get('status')!r}"
 
 
@@ -92,6 +92,6 @@ async def hand_job_ended(ctx) -> Result:
     return Result("world:hand_job_ended", state == "F", f"hand job {hid}: job_state {state or '?'}")
 
 
-EXTRA_INVARIANTS = [gated_then_adopted, jc.stop_down_after_jobs]
+EXTRA_INVARIANTS = [gated_then_adopted, jc.stop_asked_about_jobs, jc.stop_down_after_jobs]
 WORLD_CHECKS = [hand_job_ended, jc.charged_within_envelope]
-EXPECT_OK = ["agent_engaged", "gated_then_adopted", "stop_down_after_jobs"]
+EXPECT_OK = ["agent_engaged", "gated_then_adopted", "stop_asked_about_jobs", "stop_down_after_jobs"]

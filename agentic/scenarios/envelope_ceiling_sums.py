@@ -45,14 +45,14 @@ async def SCRIPT(ops) -> str:
     await bc.reconnect(b_ops)
     if a.main_id:
         b = await jc.submit(b_ops, **JOB)
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {a.main_id}, {b.main_id}; stop said {s.get('status')!r}"
     over = await b_ops.call("submit_job", confirm_spend=True, envelope={"cap": 0.6}, **JOB)
     b_ops.say(f"B asked for 0.6: {over.get('phase')!r} ({over.get('reason')!r}): {bc._brief(over)}")
     fits = await b_ops.call("submit_job", confirm_spend=True, envelope={"cap": 0.4}, **JOB)
     b_ops.say(f"B asked for 0.4: {fits.get('phase')!r}")
-    sb = await bc.stop(b_ops, tries=8)
-    sa = await bc.stop(ops, tries=8)
+    sb = await jc.stop(b_ops, tries=8)
+    sa = await jc.stop(ops, tries=8)
     return f"B over: {over.get('phase')!r}; B fits: {fits.get('phase')!r}; stops {sb.get('status')!r}/{sa.get('status')!r}"
 
 

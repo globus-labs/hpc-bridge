@@ -45,14 +45,14 @@ async def SCRIPT(ops) -> str:
     sub = await jc.submit(ops, command=COMMAND, array=f"0-{TASKS - 1}%{THROTTLE}", cores=1, walltime="00:10:00")
     if sub.main_id:
         await jc.wait_world(ops, sub.main_id, ("COMPLETED", "FAILED", "CANCELLED"), timeout_s=420)
-        s = await bc.stop(ops)
+        s = await jc.stop(ops)
         return f"main fallback: hand-submitted {sub.main_id}; stop said {s.get('status')!r}"
     if not sub.job_id:
         ops.abort(f"submit_job did not submit: {sub.answer.get('phase')!r} {bc._brief(sub.answer)!r}")
     st = await jc.wait_job(ops, sub.job_id, until=lambda s: s.get("phase") in jc.JOB_TERMINAL, timeout_s=600)
     ops.say(f"{sub.job_id}: {st.get('phase')!r}, tasks {jc.job_of(st).get('array_counts')}, charged "
             f"{jc.job_of(st).get('charged')}")
-    s = await bc.stop(ops)
+    s = await jc.stop(ops)
     return f"{sub.job_id} {st.get('phase')!r}; stop said {s.get('status')!r}"
 
 

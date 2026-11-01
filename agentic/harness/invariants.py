@@ -711,7 +711,9 @@ def ends_with_stop(t: Trace) -> Result:
                       f"no billed block left: the scheduler REJECTED the block of every confirmed start (calls "
                       f"{rejected}) — none was created, none bills")
     last = max(billed)
-    stopped_after = [i for i, _ in t.named("stop_endpoint", "teardown_endpoint") if i > last]  # a teardown releases too
+    # a teardown releases too; a stop that only ASKED (needs_confirmation: Jobs-mode jobs of ours can still bill, batch
+    # phase 2a) released nothing
+    stopped_after = [i for i, c in t.named("stop_endpoint", "teardown_endpoint") if i > last and not _stop_asked(c)]
     return Result(
         "ends_with_stop",
         bool(stopped_after),
@@ -1307,6 +1309,19 @@ def stop_is_honest(t: Trace) -> Result:
     )
 
 
+def _stop_asked(c: ToolCall) -> bool:
+    """A stop that only asked the user (batch phase 2a: Jobs-mode jobs of ours can still bill — `jobs="cancel"` or
+    `"keep"`): it released and cancelled nothing."""
+    return c.name == "stop_endpoint" and str((c.result or {}).get("status")) == "needs_confirmation"
+
+
+def _kept_stop(c: ToolCall) -> bool:
+    """A stop the user chose to keep its jobs running (`jobs="keep"`): its `draining` is final — the jobs bill on as
+    asked, the stop named them and how to end them."""
+    return (c.name == "stop_endpoint" and str(c.input.get("jobs")) == "keep"
+            and str((c.result or {}).get("status")) == "draining")
+
+
 def stop_confirmed_or_retried(t: Trace) -> Result:
     """The agent's half of #24 (SKILL.md: "on `draining`, call stop_endpoint again until you
     get `down`"): (1) every stop_endpoint result with status="draining" must be FOLLOWED by
@@ -1324,6 +1339,7 @@ def stop_confirmed_or_retried(t: Trace) -> Result:
     unretried = [
         i for i, c in stops
         if str((c.result or {}).get("status")) == "draining" and not any(j > i for j, _ in stops)
+        and not _kept_stop(c)
     ]
     billed = _starts_to_release(t) + _slurm_work_idxs(t)
     if not billed:
@@ -1337,7 +1353,7 @@ def stop_confirmed_or_retried(t: Trace) -> Result:
                       "no stop_endpoint after the last billed activity (see ends_with_stop)")
     last_i, last_c = after[-1]
     last_status = str((last_c.result or {}).get("status"))
-    ok = not unretried and last_status == "down"
+    ok = not unretried and (last_status == "down" or _kept_stop(last_c))
     # "after a draining retry" only when a draining stop came before the final one — a refused stop (`up`: our work
     # still held the block) followed by a `down` is no draining retry, and the detail said it was
     retried = any(str((c.result or {}).get("status")) == "draining" for _, c in after[:-1])
