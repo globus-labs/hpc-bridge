@@ -1146,10 +1146,10 @@ async def test_a_mep_stop_names_an_unknown_submit():
     assert st.status == "draining" and out.batch_id in (st.notice or "") and "unknown" in (st.notice or ""), st
 
 
-async def test_an_unknown_submit_its_task_groups_never_listed_settles_lost_and_is_never_resent(monkeypatch):
-    """S3 / L4: a non-idempotent submit_unknown row has a path to settle — once the batch's task groups, read well after
-    the failed submit, list no task of ours the ledger does not know, the POST never reached the service: the row is
-    `lost` on that evidence (never sent again: it is not idempotent)."""
+async def test_a_non_idempotent_unknown_submit_is_never_resent_nor_called_lost_on_absence(monkeypatch):
+    """S3, as corrected in review round 2: the groups the client learnt listing no task for a failed submit is NO
+    evidence (its POST may have minted a group of its own). The row stays submit_unknown, is never sent again, and
+    keeps holding the stop."""
     from hpc_bridge import batch
 
     clock = [1000.0]
@@ -1163,8 +1163,9 @@ async def test_an_unknown_submit_its_task_groups_never_listed_settles_lost_and_i
     clock[0] += batch.UNKNOWN_SETTLE_S + 1
     await batch.tick(app, out.batch_id)
     t = app.ledger.task(out.batch_id, 0)
-    assert t["state"] == "lost" and "never reached" in (t["settled_by"] or ""), t
+    assert t["state"] == "submit_unknown" and t["unheld"] is None, t
     assert sum("/tasks/0/attempt-" in c for c in runner.commands) == 1
+    assert batch.unknown_note(app) is not None
 
 
 async def test_reap_release_never_cancels_the_new_confirmed_block_on_the_same_user_endpoint(monkeypatch):
@@ -1500,7 +1501,7 @@ def test_a_row_value_never_runs_as_code(tmp_path, value):
 
 
 @pytest.mark.parametrize("template", ['echo "{x}"', "echo '{x}'", "cat <<EOF\n{x}\nEOF", "echo $'{x}'",
-                                      'echo "a $(echo {x})"', "cat <<-'X'\n\t{x}\n\tX"])
+                                      "cat <<-'X'\n\t{x}\n\tX"])
 def test_a_placeholder_inside_quotes_or_a_heredoc_is_refused(template):
     """L3. A placeholder inside quotes or a here-document is refused, saying how to write it (bare: each value reaches
     the command as one word)."""
@@ -1677,9 +1678,10 @@ def test_a_reused_pid_does_not_hold_a_dead_servers_lease_forever(tmp_path):
     here = Owner.here()
     dead = subprocess.Popen(["true"])
     dead.wait()
+    form = (here.started or "psutc:").split(":", 1)[0]               # the form this reader compares in
     led.add_batch("batch-0000000000aa", command="echo {x}", rows=[{"x": 1}], task_walltime_s=60, capacity=1,
                   results_dir="/scratch/x", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
-                  owner=Owner(here.host, dead.pid, started="started-an-hour-ago"), now=time.time() - 3600)
+                  owner=Owner(here.host, dead.pid, started=f"{form}:an hour ago"), now=time.time() - 3600)
     squatter = subprocess.Popen(["sleep", "30"])                         # started an hour after the last heartbeat
     try:
         led._con.execute("update batch set owner_pid = ?", (squatter.pid,))   # the OS handed the dead pid on
@@ -1751,3 +1753,395 @@ async def test_wait_s_returns_when_a_row_settles():
     finally:
         app.batches[out.batch_id].loop.cancel()
     assert st.counts.done == 1 and took < 5, (took, st.counts)
+
+
+# ---- review round 2 (ff57dcf) ---------------------------------------------------------------------------------------
+# Each of these failed on ff57dcf (red log: scratchpad bp1/red_batch_r2.txt). The reviewer's reproductions, adapted.
+
+# 1. A row's value never runs as code: the detector refuses wherever it is not certain a placeholder is a bare word.
+
+_REFUSED_TEMPLATES = [
+    'bash -c x\\ #"\necho {x}\n"',                 # an escaped blank before `#`: no comment to bash
+    '(true)# "\nbash -c "\necho {x}\n"',           # `)#`: a comment to bash
+    "(true)# it's\nbash <<EOF # '\necho {x}\nEOF",
+    'echo a >/dev/null #ok\nbash -c "echo {x}"',
+    "eval {x}", "eval echo {x}", "if true; then eval echo {x}; fi",
+    "bash -c {x}", "sh -lc {x}", "env bash -c {x}", "timeout 5 sh -c -x {x}", "sudo -u u bash -c pre{x}",
+    "python3 -c {x}", "perl -e {x}", "node -e {x}", "ssh host echo {x}", "watch echo {x}",
+    "[[ {x} -eq 1 ]]", "(( {x} > 1 ))", "y=$(( {x} + 1 ))", "for ((i=0; i<{x}; i++)); do :; done", "y=$[{x}+1]",
+    "a[{x}]=1", "echo ${arr[{x}]}", "echo ${v:{x}}", "read {x}", "printf -v {x} %s 1", "declare {x}=1",
+    "trap {x} EXIT", "echo `echo {x}`", "test -v {x}", "[ {x} -eq 1 ]", "let n={x}",
+    "awk {x} file", "sed {x} f", "sed -e {x} f",
+    'echo "$(sh -c "echo {x}")"', 'echo "$(case a in a) sh -c "{x}";; esac)"',
+    'bash -c "echo $HPCB_F_x"', 'python3 <<EOF\nprint("$HPCB_F_x")\nEOF', "echo 'unclosed {x}",
+]
+
+
+@pytest.mark.parametrize("template", _REFUSED_TEMPLATES)
+def test_a_placeholder_the_outer_shell_could_read_as_code_is_refused(template):
+    """1 (security). Refused wherever this reader cannot vouch that `{x}` is a bare word of a command the outer shell runs
+    as data: quotes and here-documents (also when a `#` bash reads otherwise hides them), arithmetic, `[[ ]]`, `${…}`,
+    subscripts, backticks, a shell's `-c`, an interpreter's code flag, awk/sed's program, ssh/watch, eval-like
+    commands — and a row's variable written straight into such a string."""
+    from hpc_bridge import batch
+
+    with pytest.raises(batch.BatchRefusal):
+        batch.validate(template, [{"x": "1"}], 10)
+
+
+@pytest.mark.parametrize("template", [
+    'bash -c x\\ #"\necho {x}\n"',          # an escaped blank before `#`: no comment to bash, one to the detector
+    '(true)# "\nbash -c "\necho {x}\n"',    # `)#`: a comment to bash, none to the detector
+])
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_a_placeholder_bash_reads_inside_quotes_is_refused_or_never_runs(tmp_path, template):
+    """1, the reviewer's: the detector's comment rule disagreed with bash's, so a quote it never saw opened a `bash -c`
+    string around the placeholder, and the row's value ran as code."""
+    from hpc_bridge.batch import BatchRefusal, substitute
+
+    pwn = tmp_path / "PWNED"
+    val = f";touch${{IFS}}{pwn};"
+    try:
+        s = substitute(template, {"x": val}, 0, {"x", "index"})
+    except BatchRefusal:
+        return
+    subprocess.run([_BASH, "-c", s], env=dict(os.environ, HPCB_F_x=val), capture_output=True, cwd=tmp_path,
+                   timeout=30)
+    assert not pwn.exists(), "the row's value ran as code"
+
+
+_ALLOWED_TEMPLATES = [
+    "printf '%s|' {x}",
+    'out="$(printf %s {x})"; printf \'%s|\' "$out"',
+    "case {x} in zzz) echo no;; esac; printf '%s|' {x}",
+    "for v in $(printf %s {x}); do :; done; printf '%s|' {x}",
+    "cd . && printf '%s|' {x} # it's fine",
+    "bash -c 'printf \"%s|\" \"$1\"' _ {x}",                       # the advice: the value as an argument
+    "python3 - <<'EOF'\nimport os, sys\nsys.stdout.write(os.environ[\"HPCB_F_x\"] + \"|\")\nEOF",   # the advice
+    "bash <<'EOF'\nprintf '%s|' \"$HPCB_F_x\"\nEOF",                  # the advice: a quoted delimiter
+    "awk -v n=1 'BEGIN{}' </dev/null; printf '%s|' {x}",
+    "f=out_{x}.txt; printf '%s|' {x}",
+]
+_ADVERSARIAL_VALUES = ["$(touch {m})", "`touch {m}`", ";touch {m};", "a[$(touch {m})]", "\"; touch {m}; \"",
+                       "'); __import__('os').system('touch {m}'); ('", "x\ntouch {m}", "$'\\x41'"]
+
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+@pytest.mark.parametrize("template", _ALLOWED_TEMPLATES)
+def test_a_template_it_allows_keeps_every_value_data(tmp_path, template):
+    """1. What it allows — bare words, `"$(…)"` around one, a case word, the value as an inner shell's argument, a
+    here-document with a QUOTED delimiter reading the value from the environment (the refusal's own advice) — keeps
+    each adversarial value data: nothing runs, and the value comes out intact."""
+    from hpc_bridge import batch
+
+    m = tmp_path / "pwned"
+    for k, raw in enumerate(_ADVERSARIAL_VALUES):
+        row = {"x": raw.replace("{m}", str(m))}
+        names = {"x", "index"}
+        cmd = batch.substitute(template, row, 0, names)
+        s = batch.task_script(cmd, results_dir=str(tmp_path / "rd" / str(k)), index=0, attempt=1,
+                              task_walltime_s=30, fields=batch.row_values(row, 0, names))
+        r = batch.parse_result(_bash(s, tmp_path).stdout)
+        assert not m.exists(), (template, raw)
+        assert r is not None and r.rc == 0, (template, raw, r)
+        if "printf %s {x}" not in template or "\n" not in raw:   # $(…) drops a value's trailing newlines only
+            assert r.tail.endswith(row["x"] + "|"), (template, raw, r.tail)
+
+
+def test_the_refusal_advises_a_quoted_delimiter_and_the_environment():
+    """1(A). The advice for a value an inner program needs: a QUOTED delimiter, the program reading the variable from
+    its environment, or the value as an argument — never `$HPCB_F_x` pasted into an unquoted here-document."""
+    from hpc_bridge import batch
+
+    with pytest.raises(batch.BatchRefusal) as e:
+        batch.validate("python3 <<EOF\nprint('{x}')\nEOF", [{"x": 1}], 10)
+    text = str(e.value)
+    assert "<<'EOF'" in text and 'os.environ["HPCB_F_x"]' in text and "never hand" in text.lower(), text
+
+
+def test_common_safe_forms_are_not_refused():
+    """1. The false refusal of `out="$(basename {x})"` is gone (`$(…)` opens a quoting context of its own)."""
+    from hpc_bridge import batch
+
+    for t in ['out="$(basename {x})"; echo $out', "echo $(basename {x})", "cd run-{x} && ./sim",
+              "awk -v n={x} '{print n, $1}' data", "f=results/{x}.txt; [ -f $f ] || ./run {x} > $f",
+              "sed -n '1p' {x}", "python -c \"import sys; print(sys.argv[1])\" {x}", "ls *.{x}", "echo {x}{y}",
+              "grep -c {x} out.txt", "cat <<'EOF' > in.txt\nN=5\nEOF\n./sim {x}"]:
+        batch.validate(t, [{"x": "1", "y": "2"}], 10)
+
+
+# 2. An unknown submit is never `lost` on absence; it holds the stop until evidence says where it could run.
+
+class _MintsOnFirstPost(_BatchRunner):
+    """The SDK's Executor: its task group is minted by the service at its first POST and learnt from the response. When
+    that POST's response is lost, the task IS queued in the group the POST minted, which the client never learns."""
+
+    def __init__(self, **kw):
+        super().__init__(**kw)
+        self.hidden_group = str(uuid.uuid4())
+        _GROUPS[self.hidden_group] = []
+        self.task_group_id = None
+
+    def submit(self, command):
+        n = len(self.futures)
+        if n in self.fail_submit_of:
+            fut = _PendingFuture()
+            self.commands.append(command)
+            self.futures.append(fut)
+            fut.task_id = None
+            _GROUPS[self.hidden_group].append(str(uuid.uuid4()))   # it reached the service: queued, still pending
+            fut.fail(ConnectionError("the response to the batch_run POST was lost"))
+            return fut
+        if self.task_group_id is None:
+            self.task_group_id = str(uuid.uuid4())
+            self.group_tasks = []
+            _GROUPS[self.task_group_id] = self.group_tasks
+        return super().submit(command)
+
+
+async def test_an_unknown_submit_queued_in_the_group_its_own_post_minted_is_not_settled_lost(monkeypatch):
+    """2, the reviewer's: the groups the client learnt cannot list a task its failed POST queued in a group of its own,
+    so absence is no evidence: the row stays submit_unknown and keeps holding the stop."""
+    from hpc_bridge import batch
+
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    runner = _MintsOnFirstPost(canary=_canary())
+    app, _rt, _ = await _batch_app(workers=3, runner=runner)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=2)
+    runner.futures[1].finish(_ok_report(1))
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["state"] == "submit_unknown"
+    for _ in range(3):
+        clock[0] += batch.UNKNOWN_SETTLE_S + batch.PRESUME_GRACE_S + 3600
+        await batch.tick(app, out.batch_id)
+    t = app.ledger.task(out.batch_id, 0)
+    assert t["state"] == "submit_unknown", f"settled {t['state']} while its task is queued at the service"
+    assert batch.unknown_note(app) is not None, "a stop can now answer down while that task may start a block"
+
+
+async def _ssh_unknown_after_a_stop(monkeypatch, *, ps: str = "0 0", queued: str = "0"):
+    from hpc_bridge import batch, server
+    from hpc_bridge.models import ShellOutcome
+
+    cmds: list[str] = []
+
+    def runner_for(_app):
+        async def run(cmd):
+            cmds.append(cmd)
+            if "HPCB_UEPX" in cmd:
+                return SimpleNamespace(stdout=f"HPCB_UEPX {_UEP} {ps} {queued} 4096 4096\n")
+            return SimpleNamespace(stdout="")
+        return run
+
+    monkeypatch.setattr(batch, "login_runner", runner_for)
+    clock = [10_000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, runner = await _batch_app(workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=1)
+    await batch.tick(app, out.batch_id)
+
+    async def fake_run_shell(a, command, session_id="default", shape="compute", **_kw):
+        return ShellOutcome(phase="complete", exit_code=0, stdout="released 101\n", block_state="warm")
+
+    monkeypatch.setattr(server, "_run_shell", fake_run_shell)
+    st = await server._stop_endpoint(app)                    # retires the block's config
+    assert st.status == "draining" and out.batch_id in (st.notice or "")
+    return app, out, clock, cmds
+
+
+async def test_an_ssh_unknown_submit_stops_holding_once_its_user_endpoint_is_gone_and_its_config_retired(monkeypatch):
+    """2. On SSH the evidence that ends the stop's `draining`: the config the submit went out with is retired, and the
+    user endpoint it targets has exited with no pilot queued (two looks). The row stays submit_unknown in the ledger,
+    with that evidence; it no longer holds the stop. Counted from the failure."""
+    from hpc_bridge import batch, server
+
+    app, out, clock, cmds = await _ssh_unknown_after_a_stop(monkeypatch)
+    await batch.tick(app, out.batch_id)
+    assert not any("HPCB_UEPX" in c for c in cmds), "looked before the failure was UNKNOWN_SETTLE_S old"
+    clock[0] += batch.UNKNOWN_SETTLE_S + 1
+    await batch.tick(app, out.batch_id)
+    assert any("HPCB_UEPX" in c and "-j 101" in c for c in cmds)
+    t = app.ledger.task(out.batch_id, 0)
+    assert t["state"] == "submit_unknown" and "has exited" in (t["unheld"] or ""), t
+    assert batch.unknown_note(app) is None
+    st = await server._stop_endpoint(app)
+    assert st.status == "down", st
+
+
+async def test_an_ssh_unknown_submit_whose_user_endpoint_still_runs_keeps_holding(monkeypatch):
+    from hpc_bridge import batch
+
+    app, out, clock, _cmds = await _ssh_unknown_after_a_stop(monkeypatch, ps="1 1")
+    clock[0] += batch.UNKNOWN_SETTLE_S + 1
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["unheld"] is None and batch.unknown_note(app) is not None
+
+
+async def test_an_unknown_submit_is_never_presumed_away(monkeypatch):
+    """2. The presumption takes rows in flight only: an unknown submit past any clock still holds the stop (MEP)."""
+    from hpc_bridge import batch, server
+
+    clock = [1000.0]
+    monkeypatch.setattr(batch, "_now", lambda: clock[0])
+    app, _rt, runner = await _batch_app(mep=True, workers=3)
+    runner.fail_submit_of = {0}
+    out = await _start(app, n=1)
+    clock[0] += 10 * (batch.PRESUME_GRACE_S + 3600)
+    await batch.tick(app, out.batch_id)
+    assert app.ledger.task(out.batch_id, 0)["state"] == "submit_unknown"
+    st = await server._stop_endpoint(app)
+    assert st.status == "draining" and out.batch_id in (st.notice or "")
+
+
+# 3. Lease liveness does not depend on the reader's TZ or locale.
+
+def test_a_live_holders_start_time_reads_the_same_whatever_the_readers_tz_or_locale(monkeypatch):
+    from hpc_bridge.ledger import proc_start
+
+    if os.path.exists(f"/proc/{os.getpid()}/stat"):
+        pytest.skip("Linux reads /proc, which is environment-independent")
+    monkeypatch.setenv("TZ", "UTC")
+    a = proc_start(os.getpid())
+    monkeypatch.setenv("TZ", "Pacific/Auckland")
+    b = proc_start(os.getpid())
+    monkeypatch.setenv("LC_ALL", "de_DE.UTF-8")
+    c = proc_start(os.getpid())
+    assert a is not None and a == b == c, (a, b, c)
+
+
+def test_a_live_holder_is_not_taken_over_by_a_server_in_another_tz(tmp_path, monkeypatch):
+    from hpc_bridge.ledger import Ledger, Owner, proc_start
+
+    led = Ledger.open(tmp_path / "state")
+    monkeypatch.setenv("TZ", "UTC")
+    holder = Owner("laptop", os.getpid(), proc_start(os.getpid()))
+    led.add_batch("batch-000000000001", command="echo {x}", rows=[{"x": 1}], task_walltime_s=60.0, capacity=1,
+                  results_dir="/scratch/u/b", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
+                  owner=holder, now=time.time() - 120)
+    monkeypatch.setenv("TZ", "Pacific/Auckland")
+    lease = led.take_lease("batch-000000000001", Owner("laptop", 999_999, "ps:other"), now=time.time())
+    assert not lease.ok, "a live holder's lease was taken over"
+
+
+def test_a_start_time_recorded_in_another_form_never_takes_a_live_pids_lease(tmp_path):
+    """3. A start this reader cannot compare (another form: an earlier build's local-time `ps:` string) is no
+    evidence the pid was handed on: a live pid keeps its lease, and a status read never calls it gone."""
+    from hpc_bridge.ledger import Ledger, Owner
+
+    led = Ledger.open(tmp_path / "state")
+    led.add_batch("batch-000000000002", command="true", rows=[1], task_walltime_s=60.0, capacity=1,
+                  results_dir="/scratch/u/b", idempotent=False, endpoint_id="e", uec_hash="u", session_id="default",
+                  owner=Owner("laptop", os.getpid(), "ps:Sat Oct 31 18:00:00 2026"), now=time.time() - 120)
+    assert led.holder_alive(led.holder("batch-000000000002").holder)
+    assert not led.take_lease("batch-000000000002", Owner("laptop", 999_999), now=time.time()).ok
+
+
+async def test_status_never_calls_a_live_heartbeating_server_gone():
+    from hpc_bridge import server
+    from hpc_bridge.ledger import Ledger
+
+    app, _rt, _runner = await _batch_app()
+    out = await _start(app, n=3)
+    app.ledger.close()
+    app2, _rt2, _runner2 = await _batch_app()
+    app2.batch_owner = _owner(pid=os.getpid() + 100_000)
+    app2.ledger = Ledger.open()
+    app2.ledger.proc_start = lambda pid: "psutc:someone else"       # even a start that reads otherwise
+    st = await server._status(app2, out.batch_id)
+    assert st.owner and st.phase != "needs_confirmation" and "gone" not in (st.reason or ""), st
+
+
+# 4. A tool call never waits past its budget for the loop's pass, and never starts a switch.
+
+async def test_a_status_call_is_bounded_while_the_background_pass_is_in_a_long_step(monkeypatch):
+    import asyncio
+
+    from hpc_bridge import batch, server
+
+    async def slow_switch(app_, run):
+        await asyncio.sleep(20)
+
+    monkeypatch.setattr(batch, "CALL_BUDGET_S", 1.0)
+    monkeypatch.setattr(batch, "_maybe_switch", slow_switch)
+    app, _rt, _runner = await _batch_app()
+    app.batch_autoloop = True
+    out = await _start(app, n=4)
+    await asyncio.sleep(0.2)                       # the loop's first pass is now inside its long step
+    t0 = time.monotonic()
+    try:
+        st = await asyncio.wait_for(server._status(app, out.batch_id), timeout=25)
+        c = await asyncio.wait_for(server._cancel(app, out.batch_id, "drain"), timeout=25)
+    finally:
+        took = time.monotonic() - t0
+        for run in list(app.batches.values()):
+            if run.loop is not None:
+                run.loop.cancel()
+    assert took < 8, f"status and cancel took {took:.1f} s"
+    assert "still running" in (st.notice or "") and "still running" in (c.notice or ""), (st.notice, c.notice)
+
+
+async def test_a_tool_calls_pass_never_starts_the_next_block_switch():
+    """4. A status call's pass leaves the switch (which confirms a block, and may take minutes) to the loop."""
+    from hpc_bridge import batch, server
+
+    app, rt, _runner = await _batch_app(remaining_s=150.0, workers=3)
+    out, run, runner = await _at_next_block(app)
+    calls = _count_switches(run)
+    runner.futures[1].finish(_ok_report(1, remaining_s=70.0))
+    await server._status(app, out.batch_id)
+    assert calls == [] and app.shapes["compute"] is rt
+    await batch.tick(app, out.batch_id)                                 # the loop's pass does it
+    assert calls == [True] and app.shapes["compute"] is not rt
+
+
+# 5. The wrapper's bounded wait keeps the tails.
+
+@pytest.mark.skipif(_BASH is None, reason="needs bash")
+def test_the_result_keeps_the_output_tail_when_a_leftover_child_ignores_term(tmp_path):
+    from hpc_bridge.batch import parse_result, task_script
+
+    s = task_script("(trap '' TERM; sleep 300) & echo started; echo oops >&2", results_dir=str(tmp_path / "rd"),
+                    index=0, attempt=1, task_walltime_s=30, min_free_mb=1)
+    t0 = time.monotonic()
+    p = subprocess.run([_BASH, "-c", s], capture_output=True, text=True, timeout=60, start_new_session=True)
+    rep = parse_result(p.stdout)
+    assert rep is not None and rep.rc == 0 and time.monotonic() - t0 < 20
+    assert (tmp_path / "rd/tasks/0/attempt-1/stdout").read_text() == "started\n"
+    assert rep.tail == "started\n" and rep.stderr_tail == "oops\n", (rep.tail, rep.stderr_tail)
+
+
+@pytest.mark.skipif(_BASH is None or shutil.which("perl") is None, reason="needs bash and perl")
+def test_the_result_keeps_the_output_tail_when_a_setsid_child_holds_the_stream(tmp_path):
+    """5. A child that left the command's process group (setsid) still holds stdout: the wrapper ends in bounded time,
+    and the tail comes from what was written."""
+    from hpc_bridge.batch import parse_result, task_script
+
+    tag = f"hpcb-setsid-{uuid.uuid4().hex[:8]}"
+    s = task_script(f"perl -MPOSIX -e 'POSIX::setsid(); $0=\"{tag}\"; sleep 40' & sleep 1; echo started",
+                    results_dir=str(tmp_path / "rd"), index=0, attempt=1, task_walltime_s=30, min_free_mb=1)
+    t0 = time.monotonic()
+    try:
+        p = subprocess.run([_BASH, "-c", s], capture_output=True, text=True, timeout=60, start_new_session=True)
+        rep = parse_result(p.stdout)
+        assert rep is not None and rep.rc == 0 and time.monotonic() - t0 < 20, time.monotonic() - t0
+        assert rep.tail == "started\n", rep.tail
+    finally:
+        subprocess.run(["pkill", "-f", tag], capture_output=True)
+
+
+# 6. blocks_left lists every block whose job is unknown.
+
+async def test_a_switched_left_block_of_unknown_job_is_still_named_in_blocks_left():
+    from hpc_bridge import batch
+
+    app, rt, _runner = await _batch_app()
+    out = await _start(app, n=2)
+    run = app.batches[out.batch_id]
+    rt.block_job = None
+    run.block_job = None
+    run.switched_left.append((None, batch._now() + 300))
+    left = batch._blocks_left(app, run)
+    assert len(left) == 2, [b.how_to_end[:60] for b in left]
