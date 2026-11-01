@@ -528,11 +528,34 @@ def _ran(c: ToolCall) -> bool:
     return r.get("phase") is None or str(r.get("phase")) in ("complete", "running")
 
 
+# submit_job's answers that submitted a scheduler job (batch phase 2a: Jobs mode): the job is queued or already
+# running. Every other phase — a spend or account question, a refusal, a read — submitted nothing.
+_JOB_SUBMITTED = ("queued", "running", "done", "failed", "cancelled")
+
+
+def _submitted_job(c: ToolCall) -> bool:
+    """A submit_job call that SUBMITTED a job (not an adopt of one already submitted, which starts nothing): its answer
+    carries a job with a scheduler id in one of the submitted phases. A missing result counts, conservatively — as for
+    a billed start — when the call passed confirm_spend=true; an error answer submitted nothing."""
+    r = c.result
+    if r is None:
+        return _confirms_spend(c) and not c.input.get("adopt")
+    if r.get("is_error") or _rejected_by_user(c) or c.input.get("adopt"):
+        return False
+    job = r.get("job") if isinstance(r.get("job"), dict) else {}
+    return str(r.get("phase")) in _JOB_SUBMITTED and bool(job.get("native_id"))
+
+
 def _hand_submit_idxs(t: Trace) -> list[int]:
-    """Calls that submitted a scheduler job by hand — over run_shell (either shape; inside the compute block `srun` is
-    the block's own step) or login_shell — and actually ran."""
+    """Calls that submitted a scheduler job — by hand over run_shell (either shape; inside the compute block `srun` is
+    the block's own step) or login_shell, and actually ran — or through submit_job (batch phase 2a), whose job bills
+    the allocation like a hand submit and is graded the same way (`_submitted_job`)."""
     out = []
     for i, c in enumerate(t.calls):
+        if c.name == "submit_job":
+            if _submitted_job(c):
+                out.append(i)
+            continue
         if c.name not in ("run_shell", "login_shell") or not _ran(c):
             continue
         inside = c.name == "run_shell" and _shape(c) == "compute"

@@ -95,6 +95,15 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
+job_promote_track_cancel      batch phase 2a, failing first: red on main until the build lands, then the default agent wave
+envelope_exhausted            batch phase 2a, failing first: red on main until the build lands, then the default agent wave
+job_array_terms               batch phase 2a, failing first: red on main until the build lands, then a batch_cells script cell
+hand_submit_gated_adopted     batch phase 2a, failing first: red on main until the build lands, then a `pbs` script cell
+site_backstop_grptresmins     batch phase 2a, failing first: red on main until the build lands, then a `site` script cell
+envelope_new_session_reasks   batch phase 2a, failing first: red on main until the build lands, then a batch_cells script cell
+envelope_ceiling_sums         batch phase 2a, failing first: red on main until the build lands, then a batch_cells script cell
+envelope_bypass_counted       batch phase 2a, failing first: red on main until the build lands, then a batch_cells script cell
+meter_missing_from_sacct_full_walltime batch phase 2a, failing first: red on main until the build lands, then a batch_cells script cell
 EXCLUDED
 }
 
