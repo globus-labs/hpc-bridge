@@ -47,6 +47,10 @@ installed plugin only when that version changes); git tags mark releases.
     `world:ledger_matches_sacct` check, and eight scenarios: `batch_fanout_collect`, `batch_crosses_walltime`,
     `batch_restart_resume`, `batch_two_servers_one_ledger`, `batch_block_reaped_midrun`, `batch_big_output`,
     `batch_abort_midrun` and `mep_batch_fanout`.
+
+## 0.1.26 — 2026-10-31 — blocks sized to the work; returning users reattach, repair and get terms the scheduler takes
+
+### Added
 - **A block asks for what the work needs: a slice of a node, and N nodes are one shell over the allocation.** On the
   live Anvil run of 2026-10-24 a bring-your-own block on the per-core `shared` partition asked for an exclusive whole
   node (parsl's default), queued for more than a day waiting for an idle one, and would have billed all 128 cores.

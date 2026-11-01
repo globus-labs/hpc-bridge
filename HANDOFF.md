@@ -1,8 +1,6 @@
 # hpc-bridge — handoff (state of the repo)
 
-_Snapshot: 2026-10-13. `main` carries **plugin 0.1.23**: the 5 s scaling pass and job-id reap detection (#173),
-honest Esc/stop (#175), long output cut only to a marked end (#174), hand-submitted batch jobs counted as spend
-(#176), the no-facility notice (#177) and ALCF Polaris in the registry (#179). The latest tag is
+_Snapshot: 2026-10-31. `main` carries **plugin 0.1.26**: blocks sized to the work (a slice of a node, N nodes; #234, merged in #235), the Perlmutter report's fixes, and returning users — a zero-SSH reattach on a new laptop, venv repairs past a killed manager or a dead login node, discovery terms the scheduler takes (#236). The latest tag is
 **`v0.1.20-beta.1`** (2026-10-06, pre-release). The repository is **`globus-labs/hpc-bridge`**. Design rationale
 lives in `docs/hpc-bridge-vault/`; this file is the live state + how-to-run + gotchas on top._
 
