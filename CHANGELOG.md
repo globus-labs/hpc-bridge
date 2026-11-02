@@ -33,6 +33,17 @@ installed plugin only when that version changes); git tags mark releases.
     `handoffs="keep"` releases only the session's blocks (the release spares loam's user endpoint) and answers
     `draining`. `"cancel"` ends the handoff and answers `down` only once nothing of it is listed. On a facility
     endpoint the stop names the handoff and its release.
+  - **Review round 1:**
+    - A caller's `scheduler_options` may carry only harmless directives: nodes, time, output path, queue, account,
+      GPUs and arrays are refused by name. PBS `select_options` may add no chunk, cores or ranks.
+    - Concurrent stops keep their own release scope.
+    - A canary is keyed on the caller's own config. It is kept on disk and collected by task id after a restart or a
+      client-side failure, so it is never sent twice. It is also one of the stop's sent checks, so no stop says `down`
+      while it is queued.
+    - The minimum-charge bound counts blocks that end at their walltime. `init_blocks > max_blocks` is refused, and
+      the rate is not rounded before the multiply.
+    - The handoff's read after a cancel runs inside the stop's one budget.
+    - The terms say `worker_init` runs as shell.
   - **The fake `pbs_mep` template** takes `available_accelerators`.
   - **Three scripted scenarios:** `handoff_polaris_shape`, `handoff_mep_min_blocks_refused` and `handoff_ssh_shape`.
 - **Batches (phase 2a): Jobs mode, the budget envelope, the billing meter, and hand submits gated and adopted.**

@@ -12,6 +12,7 @@ release call patch `scheduler_ops._release_blocks_over_login`.
 from __future__ import annotations
 
 import asyncio
+import contextvars
 import itertools
 import re
 import shlex
@@ -31,6 +32,10 @@ from .runner import _RECEIPT, SubmitAnswer, submit_answer
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
 
 Scope = tuple[tuple[str, ...], tuple[int, ...]]
+# The user endpoints the release of THIS stop must spare (batch phase 2b: a stop that keeps a loam handoff's pool
+# running), set by the stop for its own call: a context variable is per task, so a concurrent stop never sees — nor
+# clears — another's scope (review round 1, item 2).
+RELEASE_KEEP: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("hpcb_release_keep", default=None)
 
 
 def _scope_sh(eid: str, scope: Scope) -> str:
@@ -117,9 +122,9 @@ def _release_cmd_for(app: AppCtx, eid: str) -> str:
     """The release one-liner for the bound facility's scheduler. The scheduler lives on the facility's MachineProfile
     (SlurmFacility.profile.scheduler); a facility without one (LocalFacility/dev, or test doubles) has never spoken
     anything but Slurm's squeue/scancel, so default there instead of assuming an attribute that isn't part of the
-    Facility protocol. A stop that keeps a loam handoff's pool running (`app.release_keep`, batch phase 2b) spares its
-    user endpoints' blocks."""
-    keep = getattr(app, "release_keep", None)
+    Facility protocol. A stop that keeps a loam handoff's pool running (`RELEASE_KEEP`, set for that stop's own call;
+    batch phase 2b) spares its user endpoints' blocks."""
+    keep = RELEASE_KEEP.get()
     return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid, keep=keep)
 
 async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunner) -> tuple[bool, str]:

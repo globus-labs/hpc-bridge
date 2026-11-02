@@ -102,6 +102,22 @@ class _Meta:
         return {"user_config_template": self.template, "user_config_schema": self.schema,
                 "endpoint_version": self.version, "python_version": self.python, "display_name": "fake facility"}
 
+    def get_task(self, tid):
+        """The web service's view of a task by id (SDK 4.18's `Client.get_task`), for every canary any runner sent."""
+        fut = TASKS.get(tid)
+        if fut is None or not fut.done() or fut.cancelled():
+            return {"pending": True, "status": "waiting-for-nodes"}
+        exc = fut.exception()
+        if isinstance(exc, TaskExecutionFailed):
+            raise exc
+        if exc is not None:   # failed on the client's side alone: the service still has it
+            return {"pending": True, "status": "running"}
+        return {"pending": False, "status": "success", "task_id": tid, "result": fut.result()}
+
+
+# Every canary sent in this test process, by task id: what the service knows (the `_Meta.get_task` stand-in).
+TASKS: dict[str, object] = {}
+
 
 class _Block:
     """What the scheduler gives the canary's worker: its job id, a GPU pin, the worker count, and the user endpoint's
@@ -155,11 +171,18 @@ class _Runner(_FakeRunner):
         w = self.world
         canary = _CANARY_SENTINEL in command
         if canary and w.fail is not None:
-            return _DoneFuture(exc=w.fail)
+            fut = _DoneFuture(exc=w.fail)
+            if w.fail_tid:
+                fut.task_id = f"canary-{len(w.futures) + 1}-{id(w)}"
+                w.futures.append((fut, command))
+                TASKS[fut.task_id] = _PendingFuture()   # the service still has it queued
+            return fut
         if canary and w.pending:
             fut = _PendingFuture()
             fut.task_id = f"canary-{len(w.futures) + 1}"
             w.futures.append((fut, command))
+            self.futures.append(fut)
+            TASKS[fut.task_id] = fut
             return fut
         p = subprocess.run([_BASH, "-c", _escape_for_shellfunction(command).format()], capture_output=True, text=True,
                            env=w.block.env(), cwd=w.block.cwd, timeout=60)
@@ -167,6 +190,8 @@ class _Runner(_FakeRunner):
         if canary:
             fut.task_id = f"canary-{len(w.futures) + 1}"
             w.futures.append((fut, command))
+            self.futures.append(fut)
+            TASKS[fut.task_id] = fut
         return fut
 
 
@@ -184,6 +209,7 @@ class _Runners:
         self.futures: list[tuple[object, str]] = []
         self.pending = False
         self.fail: BaseException | None = None
+        self.fail_tid = False   # the failure is the client's alone: the task was registered (it has an id)
 
     def __call__(self, eid, user_endpoint_config=None, **_kw):
         r = _Runner(self, eid, dict(user_endpoint_config or {}))
@@ -374,7 +400,8 @@ async def test_a_failed_canary_writes_no_record_and_asks_again_before_another(tm
     _ask, out = await _yes(app, LOAM_UEC)
     assert out.phase == "refused" and out.reason == "canary_failed" and out.record is None, out
     assert "Unknown queue" in (out.notice or "")
-    assert not (Path(os.environ["HPC_BRIDGE_STATE_DIR"]) / "handoffs").exists()
+    store = Path(os.environ["HPC_BRIDGE_STATE_DIR"]) / "handoffs"
+    assert list(store.glob("hoff-*")) == [] and list(store.glob("pending-*")) == [], list(store.iterdir())
     app.runners.fail = None
     again = await _export(app, LOAM_UEC)                              # the failure spent the yes: asked again
     assert again.phase == "needs_confirmation", again
@@ -411,7 +438,8 @@ async def test_a_minimum_charge_with_no_known_idle_window_is_refused_as_unbounde
     assert _sent(app) == []
 
 
-async def test_a_stop_while_the_canary_is_queued_is_never_down(tmp_path):
+async def test_a_stop_while_the_canary_is_queued_asks_first(tmp_path):
+    # (cancel and keep while it is queued: test_handoff_phase2b_r1.py, F5)
     app = _ssh_app(tmp_path)
     app.runners.pending = True
     _ask, out = await _yes(app, {"partition": "main", "walltime": "00:10:00", "max_blocks": 1})
@@ -521,6 +549,8 @@ async def test_no_account_on_an_account_floor_facility_asks_for_one(tmp_path, mo
     ("account", "hpcb; rm -rf ~"),
     ("queue", "debug$(id)"),
     ("scheduler_options", "#PBS -l filesystems=home\nrm -rf ~"),
+    ("scheduler_options", "#PBS -l select=999:ncpus=64"),          # a directive, but one that moves the terms' bounds
+    ("scheduler_options", "#PBS -o /scratch/elsewhere"),           # ... or the path a stop finds loam's blocks by
     ("worker_init", "source env.sh\x00; curl x"),
     ("endpoint_setup", "true"),
     ("walltime", "00:15:00\n#PBS -l select=999"),
@@ -711,7 +741,9 @@ async def test_keep_releases_only_the_sessions_block_and_names_the_running_hando
     assert st.status == "draining" and st.spend_stopped is not True, st
     assert out.record.handoff_id in (st.notice or "") and [h.handoff_id for h in st.handoffs] == [
         out.record.handoff_id], st
-    assert app.release_keep is None                                 # the scope lasts the one stop
+    from hpc_bridge import scheduler_ops
+
+    assert scheduler_ops.RELEASE_KEEP.get() is None                 # the scope lasts the one stop, in its own context
 
 
 async def test_cancel_ends_the_handoff_and_is_down_only_once_nothing_of_it_is_listed(tmp_path):

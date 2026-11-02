@@ -43,5 +43,11 @@
   - **`end`** and **`drop_pending`** carry out the user's `cancel`.
   - **`mep_note`** names a facility endpoint's handoffs and their release.
 
+**Since review round 1:**
+- **`normalize`** checks the caller's config before anything else. A caller's `scheduler_options` may carry only allow-listed directives (`_directive_problem`); PBS `select_options` may name only `ngpus`, `system` and `mem`, with no `+` chunk.
+- **The key and the pending file:** a handoff is keyed (`_key`) on the caller's own config, the facility and the endpoint. Its pending canary is written to `pending-<key>.json` with its task id. `_collect` reads it from the service by task id after a restart or a client-side failure.
+- **The sent check:** `_note_check` puts the canary among the endpoint's sent checks, so every stop sees it until it resolves.
+- **The terms:** the minimum-charge factor divides by `min(idle, walltime)`, and `init_blocks > max_blocks` is refused.
+
 ## See also
 [[Batch and swarm execution]] · [[The MCP tools]] · [[facility-mep]] · [[scheduler_ops]] · [[runner]]

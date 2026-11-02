@@ -1189,27 +1189,31 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None, handoffs: str | N
     if handoffs not in (None, "cancel", "keep"):
         return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=f"handoffs must be \"cancel\" or \"keep\", not {handoffs!r}. Nothing was done.")
+    t0 = time.monotonic()   # ONE budget for the whole stop, the handoff's own read included (review round 1, item 7)
     items = handoff.live(app)
     ssh = _has_login_shape(app) and app.state.endpoint_id is not None
     if ssh and items and handoffs is None:
         return handoff.question(app, items, op="stop")
-    if ssh and items and handoffs == "keep":
-        app.release_keep = handoff.scope_of(items)
+    # the scope rides THIS call's context (a concurrent stop has its own): never shared state (review round 1, item 2)
+    token = scheduler_ops.RELEASE_KEEP.set(handoff.scope_of(items) if ssh and items and handoffs == "keep" else None)
     try:
-        st = await _stop_endpoint_jobs(app, jobs)
+        st = await _stop_endpoint_jobs(app, jobs, t0=t0)
     finally:
-        app.release_keep = None
+        scheduler_ops.RELEASE_KEEP.reset(token)
     if not items:
         return st
     if not ssh:
         st.handoffs = [it.ref for it in items]
         st.notice = f"{st.notice or ''} {handoff.mep_note(items)}".strip()
         return st
-    return await _handoff_after_stop(app, st, items, handoffs or "keep")
+    return await _handoff_after_stop(app, st, items, handoffs or "keep", deadline=t0 + STOP_BUDGET_S)
 
 
-async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choice: str) -> EndpointStatus:
-    """The stop's answer with loam's handoff(s) in it. Nothing to add while the stop itself only asked or refused."""
+async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choice: str, *,
+                              deadline: float) -> EndpointStatus:
+    """The stop's answer with loam's handoff(s) in it. Nothing to add while the stop itself only asked or refused. The
+    read of what is left of loam's pool runs within what is left of the stop's one budget; past it, the answer is
+    `draining`, saying what was not confirmed."""
     if st.status not in ("down", "draining"):
         return st
     st.handoffs = [it.ref for it in items]
@@ -1225,11 +1229,17 @@ async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choi
     handoff.drop_pending(app, items)
     handoff.end(items, "stop_endpoint(handoffs=\"cancel\")")
     cmd = scheduler_ops._release_cmd(jobmode.scheduler_of(app), eid, only=handoff.scope_of(items))
-    out = await _login_runner(app)(cmd)
-    last = ((out.stdout or "").strip().splitlines() or [""])[-1].strip() if out.phase == "complete" else ""
+    last, why = "", "the stop's time ran out first"
+    if (room := deadline - time.monotonic()) > 0.5:
+        try:
+            out = await asyncio.wait_for(_login_runner(app)(cmd), timeout=room)
+            last = ((out.stdout or "").strip().splitlines() or [""])[-1].strip() if out.phase == "complete" else ""
+            why = last or out.phase
+        except TimeoutError:
+            pass
     left: list[str] = []
     if not last.startswith("released "):
-        left.append(f"whether anything of its user endpoint is still listed was not read ({last or out.phase})")
+        left.append(f"whether anything of its user endpoint is still listed was not confirmed ({why})")
     elif scheduler_ops._released_jobs(last):
         left.append(f"its job(s) {' '.join(scheduler_ops._released_jobs(last))} were still listed and are cancelled "
                     "now — call stop_endpoint again to confirm none is")
@@ -1243,7 +1253,7 @@ async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choi
     return st
 
 
-async def _stop_endpoint_jobs(app: AppCtx, jobs: str | None = None) -> EndpointStatus:
+async def _stop_endpoint_jobs(app: AppCtx, jobs: str | None = None, *, t0: float | None = None) -> EndpointStatus:
     """stop_endpoint, Jobs mode first (batch phase 2a). With no Jobs-mode job of ours that can still bill — any
     session's, a dead server's and a held hand submit included — it is the stop it always was
     (`_stop_endpoint_blocks`). With one, a stop with no choice changes nothing and asks (`jobs.stop_question`);
@@ -1253,7 +1263,7 @@ async def _stop_endpoint_jobs(app: AppCtx, jobs: str | None = None) -> EndpointS
     if jobs not in (None, "cancel", "keep"):
         return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
-    t0 = time.monotonic()
+    t0 = time.monotonic() if t0 is None else t0   # the caller's start: one budget for the whole stop
 
     def left(cap: float) -> float:   # ONE deadline for the whole stop (review r3): every phase takes from it
         return max(0.5, min(cap, STOP_BUDGET_S - (time.monotonic() - t0)))
@@ -2740,7 +2750,10 @@ async def export_handoff(ctx: Context, user_endpoint_config: dict[str, Any], exp
     nodes_per_block, max_blocks, min_blocks, max_workers_per_node, available_accelerators, scheduler_options,
     worker_init, …) or hpc-bridge's (partition); the facility's defaults fill what it leaves out. Every value must be
     data the template renders: a key the template does not use, or its schema refuses, is refused by name — never
-    dropped. `expires_hours`: how long the record is good for, from the user's yes (default 24, at most 168).
+    dropped — and `scheduler_options` may carry only harmless directives (a job name, mail, filesystems): one that sets
+    the nodes, time, queue, account, GPUs, an array or the output path is refused; use the config's own key. The
+    `worker_init` value is loam's own code: it runs as shell in the canary's block and in every block of loam's pool,
+    by design. `expires_hours`: how long the record is good for, from the user's yes (default 24, at most 168).
 
     Spend: the first call answers phase="needs_confirmation" with `terms` and sends nothing — the canary's cost and the
     pool's worst case until the record expires, in the facility's unit. Ask the user; on their yes call again with the

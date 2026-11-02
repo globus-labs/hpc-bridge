@@ -442,6 +442,22 @@ Where §8 left a choice open, or the checkpoint (the coordinator's decisions, 20
   - **On a MEP** the stop only names the handoff and its `release`.
   - **Why `handoffs` is separate from `jobs`:** they are two consents about two owners' work.
 - **The fake `pbs_mep` template and schema take `available_accelerators`** (a count, 1–4, rendered only when sent), so the canary sees a `CUDA_VISIBLE_DEVICES` pin. The stack needs `down.sh --wipe` before the live cells.
+- **Live (2026-11-02, at 5b47a2f): all three cells OK.** `uep_id_seen` was read from the canary's working directory on the fake PBS facility endpoint.
+- **Review round 1 (8 defects at 5b47a2f; fixed test-first in `tests/test_handoff_phase2b_r1.py`):**
+  1. **A caller's `scheduler_options` may carry only harmless directives.**
+     - Allowed on Slurm: a job name, a comment, mail, `--begin`, `--signal`, requeue, `--export`, `--open-mode`.
+     - Allowed on PBS: `-N`, `-m`, `-M`, `-r` and `-l filesystems=…`.
+     - Why: sbatch and qsub take the last of a repeated option, so `--nodes`, `--time`, `--output` (which takes loam's blocks out of the `uep.<eid>` marker a stop finds them by), the partition, account, GPUs, arrays, QOS and memory would move the bounds the terms and the release are built on. Each is refused by name, pointing to the config's own key.
+     - PBS `select_options` may name only `ngpus`, `system` and `mem`; no `+` chunk.
+  2. **A stop's keep scope is a context variable** (`scheduler_ops.RELEASE_KEEP`): per call, so a concurrent stop never clears another's.
+  3. **One canary per config.**
+     - A handoff is keyed on the caller's own config, the facility and the endpoint — not on the merged config, whose session defaults can move.
+     - The pending canary is on disk (`<state_dir>/handoffs/pending-<key>.json`, with its task id). A restarted server collects it by task id from the service, and so does a client-side failure (any exception but the endpoint's `TaskExecutionFailed`). Neither ever sends a second.
+  4. **The canary joins the endpoint's sent checks** (`warmth._keep_checks`, in memory and on disk), so every stop — after a `handoffs="cancel"` too — is `down` only once it has resolved.
+  5. **The minimum-charge factor is `min_charge ÷ min(idle, walltime)`.** With work queued, a block ends at its walltime and parsl starts the next one at once.
+  6. **`init_blocks > max_blocks` is refused**, since parsl starts init_blocks with no max_blocks check. The hourly rate is read unrounded, and only the final figures are rounded, up.
+  7. **The handoff's own read after a cancel runs inside the stop's one 300 s budget.** Past it, the answer is `draining`, saying what was not confirmed.
+  8. **The tests now test what they name.** `binds` and the tool docstring also say that `worker_init` runs as shell in the canary's block and in loam's pool, by design.
 - **Not built:**
   - The universal graders (`_billed_start_idxs`) do not learn `export_handoff`; all three cells are scripted.
   - A handoff from a phase-3 campaign.

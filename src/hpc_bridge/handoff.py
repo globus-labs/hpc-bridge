@@ -425,6 +425,89 @@ def _schema_problem(key: str, v: Any, prop: dict[str, Any]) -> str | None:
     return None
 
 
+# Scheduler directives a caller's `scheduler_options` may carry (review round 1, item 1): sbatch and qsub take the LAST
+# of a repeated option and parsl writes these after its own, so any directive that sets the block's size, time, queue,
+# account, GPUs, an array, or its output path (by which a stop finds loam's blocks: `uep.<eid>`) would move the very
+# bounds the terms and the release are built on. Allow-listed: what changes none of them.
+_SLURM_OK = frozenset({"--job-name", "-J", "--comment", "--mail-type", "--mail-user", "--begin", "--signal",
+                       "--requeue", "--no-requeue", "--open-mode", "--export", "--get-user-env"})
+_SLURM_FLAGS = frozenset({"--requeue", "--no-requeue", "--get-user-env"})   # take no value
+_PBS_OK = frozenset({"-N", "-m", "-M", "-r"})
+_PBS_RESOURCES = frozenset({"filesystems"})
+_SELECT_OK = frozenset({"ngpus", "system", "mem"})
+_HINT = {
+    "--nodes": "nodes_per_block", "-N": "nodes_per_block", "--time": "walltime", "-t": "walltime",
+    "--partition": "partition (or queue)", "-p": "partition (or queue)", "--account": "account", "-A": "account",
+    "--cpus-per-task": "cores_per_node", "-c": "cores_per_node", "--mem": "mem_per_node",
+    "-l select": "nodes_per_block and select_options", "-l walltime": "walltime", "-q": "queue",
+    "-l ncpus": "cpus_per_node", "-l nodes": "nodes_per_block",
+}
+
+
+def _directive_problem(text: str, scheduler: str) -> str | None:
+    """The first directive of a caller's `scheduler_options` that is not allow-listed, as written, or None."""
+    pbs = scheduler == "pbs"
+    for line in text.split("\n"):
+        rest = line.strip()
+        if not rest:
+            continue
+        rest = rest[len("#PBS"):] if pbs else rest[len("#SBATCH"):]
+        try:
+            tokens = shlex.split(rest)
+        except ValueError:
+            return line.strip()[:60]
+        i = 0
+        while i < len(tokens):
+            t = tokens[i]
+            if pbs:
+                if t == "-l" or (t.startswith("-l") and len(t) > 2):
+                    value = t[2:] if len(t) > 2 else (tokens[i + 1] if i + 1 < len(tokens) else "")
+                    i += 1 if len(t) > 2 else 2
+                    for part in value.split(","):
+                        name = part.split("=", 1)[0].strip()
+                        if name not in _PBS_RESOURCES:
+                            return f"-l {name}"
+                    continue
+                if t in _PBS_OK:
+                    i += 2
+                    continue
+                return t
+            if t.startswith("--"):
+                name, eq, _v = t.partition("=")
+                if name not in _SLURM_OK:
+                    return name
+                i += 1 if (eq or name in _SLURM_FLAGS) else 2
+                continue
+            if t.startswith("-") and len(t) >= 2 and t[:2] in _SLURM_OK:
+                i += 1 if len(t) > 2 else 2
+                continue
+            return t[:2] if t.startswith("-") else t
+    return None
+
+
+def _select_problem(v: Any) -> str | None:
+    """PBS `select_options` (appended to parsl's `select=<nodes>:ncpus=<n>`) may name only per-node resources that move
+    no count: never a second chunk (`+…`), cores, MPI ranks or nodes."""
+    if not isinstance(v, str):
+        return None
+    if "+" in v:
+        return "adds a chunk (`+`) to the block's select"
+    for part in v.split(":"):
+        name = part.split("=", 1)[0].strip()
+        if name not in _SELECT_OK:
+            return f"sets `{name}`, which moves the block's size: only {sorted(_SELECT_OK)} may be given here"
+    return None
+
+
+def _directive_refusal(opt: str) -> HandoffRefusal:
+    hint = _HINT.get(opt) or _HINT.get(opt.split("=")[0]) or "the config's own key, where the template takes one"
+    return HandoffRefusal("invalid", (
+        f"Refused, nothing was sent: `scheduler_options` sets `{opt}`, which the terms or the release depend on (the "
+        "block's size, time, queue, account, GPUs, arrays or output path — the scheduler takes it over the config's "
+        f"own). Set it through {hint} instead. Only harmless directives pass (a job name, mail, a comment; on PBS "
+        "-N, -m, -M, -r and -l filesystems=…)."))
+
+
 @dataclass
 class Plan:
     """The config to send, and what the template makes of it."""
@@ -446,23 +529,15 @@ def _bad(key: str, why: str) -> HandoffRefusal:
                                      "renders, never code — send the config again without it, or with a value that is.")
 
 
-def build(app: AppCtx, given: Any, md: dict[str, Any], access: str) -> Plan:
-    """The wire-ready config for `given` (loam's keys, in the template's names or hpc-bridge's): the facility's own
-    compute defaults under it, every value checked, fitted to the facility's schema, every key rendered; the server's
-    own `init_blocks: 0` / `min_blocks: 0` where the template renders them and the caller left them out; on an
-    endpoint hpc-bridge stood up, a block request of its own. Raises HandoffRefusal."""
-    from . import warmth
+def _kmap(app: AppCtx, access: str) -> dict[str, str]:
+    return dict(getattr(app.facility, "key_map", None) or {}) if access == "mep" else {}
 
-    fac = app.facility
+
+def normalize(app: AppCtx, given: Any, access: str) -> dict[str, Any]:
+    """The caller's own config, in the template's key names, every value checked as data: what a handoff is keyed on
+    (with the endpoint) and what is laid over the facility's defaults. Raises HandoffRefusal."""
     sched = _scheduler(app)
-    text = md.get("user_config_template")
-    if not isinstance(text, str) or not text.strip():
-        raise HandoffRefusal("template_unknown", "Refused, nothing was sent: the facility's published template could "
-                             "not be read, and the terms need its values (blocks, walltime, idle release). Try again "
-                             "later.")
-    raw_schema = md.get("user_config_schema")
-    schema: dict[str, Any] = raw_schema if isinstance(raw_schema, dict) else {}
-    kmap: dict[str, str] = dict(getattr(fac, "key_map", None) or {}) if access == "mep" else {}
+    kmap = _kmap(app, access)
     if not isinstance(given, dict):
         raise HandoffRefusal("invalid", "Refused, nothing was sent: user_endpoint_config must be an object of keys.")
     if len(given) > MAX_KEYS:
@@ -480,7 +555,31 @@ def build(app: AppCtx, given: Any, md: dict[str, Any], access: str) -> Plan:
                                             f"are the same setting here (the facility's `{wk}`); send one.")
         if (why := _check_value(wk, v, sched)) is not None:   # the caller's values first, whatever else is wrong
             raise _bad(k, why)
+        if wk == "scheduler_options" and (opt := _directive_problem(v, sched)) is not None:
+            raise _directive_refusal(opt)
+        if wk == "select_options" and (why := _select_problem(v)) is not None:
+            raise HandoffRefusal("invalid", f"Refused, nothing was sent: `select_options` {why}. Set the block's size "
+                                            "through nodes_per_block (and cpus_per_node where the template takes it).")
         caller[wk] = v
+    return caller
+
+
+def build(app: AppCtx, caller: dict[str, Any], md: dict[str, Any], access: str) -> Plan:
+    """The wire-ready config for the caller's own (`normalize`): the facility's own compute defaults under it, every
+    value checked, fitted to the facility's schema, every key rendered; the server's own `init_blocks: 0` /
+    `min_blocks: 0` where the template renders them and the caller left them out; on an endpoint hpc-bridge stood up,
+    a block request of its own. Raises HandoffRefusal."""
+    from . import warmth
+
+    sched = _scheduler(app)
+    text = md.get("user_config_template")
+    if not isinstance(text, str) or not text.strip():
+        raise HandoffRefusal("template_unknown", "Refused, nothing was sent: the facility's published template could "
+                             "not be read, and the terms need its values (blocks, walltime, idle release). Try again "
+                             "later.")
+    raw_schema = md.get("user_config_schema")
+    schema: dict[str, Any] = raw_schema if isinstance(raw_schema, dict) else {}
+    kmap = _kmap(app, access)
     base_hb = warmth._seed_uec(app, "compute")
     base = {kmap.get(k, k): v for k, v in base_hb.items() if k not in RESERVED and v not in (None, "")}
     wire = {**base, **caller}
@@ -531,6 +630,12 @@ def build(app: AppCtx, given: Any, md: dict[str, Any], access: str) -> Plan:
     if plan.facts["min_blocks"] is _UNSET:
         raise HandoffRefusal("unbounded", "Refused, nothing was sent: the template's min_blocks cannot be read, so the "
                                           "pool cannot be bounded. Send min_blocks: 0 if the template takes it.")
+    ib, mb = plan.facts["init_blocks"], plan.facts["max_blocks"]
+    if isinstance(ib, int) and isinstance(mb, int) and ib > mb:
+        raise HandoffRefusal("invalid", (
+            f"Refused, nothing was sent: init_blocks {ib} is more than max_blocks {mb}. Parsl starts init_blocks at "
+            "once, with no max_blocks check, each time the user endpoint starts — so max_blocks would not bound the "
+            "pool. Send init_blocks no higher than max_blocks (0 starts blocks on demand)."))
     return plan
 
 
@@ -578,9 +683,10 @@ def _hours(v: Any) -> float:
 
 BINDS = ("The user endpoint config bounds loam's pool — at most max_blocks blocks at once, each its nodes for its "
          "walltime — and nothing else does: once loam holds this record hpc-bridge does not police the endpoint, "
-         "count its spend or stop it at expires_at (loam's preflight must refuse an expired record). Any task loam "
-         "runs can submit scheduler jobs of its own; a hard cap needs the site (an sbank suballocation, a Slurm "
-         "GrpTRESMins).")
+         "count its spend or stop it at expires_at (loam's preflight must refuse an expired record). The config's "
+         "worker_init is loam's own code and runs as shell in the canary's block and in every block of loam's pool, "
+         "by design. Any task loam runs can submit scheduler jobs of its own; a hard cap needs the site (an sbank "
+         "suballocation, a Slurm GrpTRESMins).")
 
 
 def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
@@ -604,7 +710,11 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
         size = dataclasses.replace(size, nodes=nodes)
     got = resources.charge(size, shape, 3600.0)
     if got is not None:
-        rate, per = got
+        # the exact hourly rate: `charge` rounds its figure to 2 decimals, so it is read over a million hours and
+        # divided back — only the final figures are rounded, and up (review round 1, item 6)
+        exact = resources.charge(size, shape, 3600.0 * 1_000_000)
+        rate = (exact[0] / 1_000_000) if exact is not None else got[0]
+        per = got[1]
         unit = getattr(app, "charge_unit", None) or "billing units"
     else:
         rate, per, unit = float(nodes), f"{nodes} node{'s' if nodes > 1 else ''}", "node-hours"
@@ -616,13 +726,18 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
             f"Refused, nothing was sent: this queue charges every block at least {m:g} h, and the template's idle "
             "release cannot be read, so how many blocks a pool can start (each charged the minimum) has no bound. "
             "Send max_idletime= if the template takes it."))
-    factor = max(1.0, m * 3600 / idle) if m and idle else 1.0
+    # a block lives at least until its idle release — or its walltime, when work is queued and parsl starts the next
+    # one at once (TIMEOUT is no block failure): each slot starts at most hours ÷ that many blocks, each charged at
+    # least the minimum (review round 1, item 5)
+    life_h = min(idle / 3600, wall_h) if idle else wall_h
+    factor = max(1.0, m / life_h) if m else 1.0
     last = max(wall_h, m or 0.0)
     worst = max_blocks * rate * (hours * factor + last)
     canary = max(1, int(f["init_blocks"])) * rate * last
     basis = (f"{max_blocks} block{'s' if max_blocks > 1 else ''} at once × {rate:g} {unit}/h ({per}) × "
              f"({hours:g} h until the record expires"
-             + (f" × {factor:g}: blocks charged at least {m:g} h, idle-released after {idle} s" if factor > 1 else "")
+             + (f" × {factor:g}: every block is charged at least {m:g} h and may last only {life_h * 60:g} min "
+                "(its idle release, or its walltime with work queued)" if factor > 1 else "")
              + f" + {last:g} h for a block started just before it expires)")
     queue = hb.get("partition")
     return HandoffTerms(
@@ -640,6 +755,11 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
 
 @dataclass
 class Pending:
+    """A handoff whose one canary is out. Kept in memory (`app.handoffs`) and on disk (`pending-<key>.json`), so a later
+    call — of this server or a restarted one — collects it by its task id and never sends another (review round 1,
+    item 3). `future` / `runner`: this process's, while it has them; None after a restart, or once the client lost
+    track of the task (its future failed on the client's side alone: the service may still hold it)."""
+
     key: str
     runner: Any
     future: Any
@@ -649,6 +769,76 @@ class Pending:
     eid: str
     approved: float
     hours: float
+    sent_at: float = 0.0
+    task_id: str | None = None
+
+
+NO_ID_S = 300.0   # a canary with no task id that long after its send was never registered (warmth's _NO_ID_BOUND_S)
+
+
+def _pending_path(key: str) -> Path:
+    return handoffs_dir() / f"pending-{key[:32]}.json"
+
+
+def _persist(p: Pending) -> None:
+    """The pending canary on disk: what a restarted server needs to collect it (its task id) and to build the record
+    from the config it validated (its wire config, terms and the template's access/scheduler)."""
+    d = handoffs_dir()
+    try:
+        d.mkdir(parents=True, exist_ok=True, mode=0o700)
+        raw = {"key": p.key, "eid": p.eid, "task_id": p.task_id, "sent_at": p.sent_at, "approved": p.approved,
+               "hours": p.hours, "wire": p.plan.wire, "access": p.plan.access, "scheduler": p.plan.scheduler,
+               "terms": p.terms.model_dump(mode="json")}
+        tmp = d / f".pending-{p.key[:32]}.tmp"
+        fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
+        with os.fdopen(fd, "w") as fh:
+            fh.write(json.dumps(raw))
+        tmp.replace(_pending_path(p.key))
+    except OSError as exc:
+        print(f"hpc-bridge: could not record the handoff canary on disk ({exc})", file=sys.stderr)
+
+
+def _unpersist(key: str) -> None:
+    try:
+        _pending_path(key).unlink(missing_ok=True)
+    except OSError:
+        pass
+
+
+def _from_disk(raw: dict[str, Any], md: dict[str, Any]) -> Pending | None:
+    """A pending canary read back from disk (another life of this server): no future of its own — the service is asked
+    by its task id."""
+    try:
+        text = md.get("user_config_template") or ""
+        wire = dict(raw["wire"])
+        plan = Plan(wire=wire, hb=wire, template=str(text), access=str(raw["access"]), scheduler=str(raw["scheduler"]))
+        _facts(plan)
+        tid = raw.get("task_id")
+        return Pending(key=str(raw["key"]), runner=None, future=None, plan=plan,
+                       terms=HandoffTerms.model_validate(raw["terms"]), md=md, eid=str(raw["eid"]),
+                       approved=float(raw["approved"]), hours=float(raw["hours"]),
+                       sent_at=float(raw.get("sent_at") or 0.0), task_id=str(tid) if tid else None)
+    except (KeyError, TypeError, ValueError):
+        return None
+
+
+def _disk_pendings(eid: str | None = None) -> list[dict[str, Any]]:
+    d = handoffs_dir()
+    out = []
+    for path in sorted(d.glob("pending-*.json")) if d.is_dir() else []:
+        try:
+            raw = json.loads(path.read_text())
+        except (OSError, ValueError):
+            continue
+        if isinstance(raw, dict) and (eid is None or raw.get("eid") == eid):
+            out.append(raw)
+    return out
+
+
+def _lookup(app: AppCtx) -> Any:
+    """An SDK Client (or the facility's own client) that looks a task up by id."""
+    factory = getattr(app.facility, "_client_factory", None)
+    return factory() if callable(factory) else None
 
 
 async def _metadata(app: AppCtx, eid: str) -> dict[str, Any]:
@@ -668,9 +858,11 @@ async def _metadata(app: AppCtx, eid: str) -> dict[str, Any]:
     return md
 
 
-def _key(wire: dict[str, Any]) -> str:
-    stable = {k: v for k, v in wire.items() if k != "hpcb_block"}
-    return hashlib.sha256(json.dumps(stable, sort_keys=True, default=str).encode()).hexdigest()
+def _key(app: AppCtx, eid: str, caller: dict[str, Any]) -> str:
+    """What one handoff is: the caller's OWN config (never the facility's or the session's defaults under it, which may
+    move — review round 1, item 3), on this facility and endpoint."""
+    who = {"facility": app.machine or getattr(app.facility, "name", None), "eid": eid, "uec": caller}
+    return hashlib.sha256(json.dumps(who, sort_keys=True, default=str).encode()).hexdigest()
 
 
 def _task_id(fut: Any) -> str | None:
@@ -704,12 +896,21 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
         raise HandoffRefusal("no_facility", "Refused: this endpoint has no scheduler template to hand off.")
     access = "ssh" if ssh else "mep"
     eid = str(app.state.endpoint_id)
+    caller = normalize(app, given, access)
+    key = _key(app, eid, caller)
     md = await _metadata(app, eid)
-    plan = build(app, given, md, access)
-    key = _key(plan.wire)
     pend = app.handoffs.get(key)
+    if pend is None:   # another life of this server sent it: collect it by its task id, never send another
+        raw = next((r for r in _disk_pendings(eid) if r.get("key") == key), None)
+        if raw is not None and (pend := _from_disk(raw, md)) is not None:
+            if time.time() > pend.approved + pend.hours * 3600:
+                _unpersist(key)
+                pend = None
+            else:
+                app.handoffs[key] = pend
     if pend is not None:
         return await _collect(app, pend)
+    plan = build(app, caller, md, access)
     if getattr(app.facility, "account_required", False) and not plan.hb.get("account"):
         raise HandoffRefusal("needs_account", _NEEDS_ACCOUNT)
     terms = terms_of(app, plan, hours)
@@ -726,9 +927,28 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
         return HandoffResult(phase="refused", reason="canary_failed",
                              notice=f"The canary could not be sent: {runner.dispatch_error_text(exc)}")
     pend = Pending(key=key, runner=run, future=fut, plan=plan, terms=terms, md=md, eid=eid, approved=approved,
-                   hours=hours)
+                   hours=hours, sent_at=time.time(), task_id=_task_id(fut))
     app.handoffs[key] = pend
+    _persist(pend)
+    await _note_check(app, pend)
     return await _collect(app, pend)
+
+
+async def _note_check(app: AppCtx, pend: Pending) -> None:
+    """The canary is a task of ours that can start a block while it is queued: it joins the endpoint's sent checks,
+    in memory and on disk, where every stop's honesty looks (`down` only once each has resolved) — whatever becomes of
+    the handoff, a cancel included (review round 1, item 4)."""
+    from . import warmth
+    from .context import SentCheck
+
+    blk = pend.plan.wire.get("hpcb_block")
+    client = getattr(pend.runner, "task_client", None)
+    check = SentCheck(future=pend.future, client=client() if callable(client) else None, task_id=pend.task_id,
+                      sent_at=pend.sent_at, what="check",
+                      block=blk if isinstance(blk, int) and not isinstance(blk, bool) else None)
+    async with app.lock:
+        warmth._keep_checks(app, pend.eid, [check])
+        warmth._watch_ids(app, pend.eid)
 
 
 def _config_defaults(app: AppCtx) -> Any:
@@ -737,26 +957,70 @@ def _config_defaults(app: AppCtx) -> Any:
     return out[1] if isinstance(out, tuple) else None
 
 
+def _validating(pend: Pending, why: str = "") -> HandoffResult:
+    return HandoffResult(phase="validating", task_id=pend.task_id, terms=pend.terms,
+                         user_endpoint_config=dict(pend.plan.wire), notice=(
+                             "The canary is out (one billed task with exactly this config): its block is still queued "
+                             f"or starting{why}. Call export_handoff again with the same config to collect it — "
+                             "nothing more is sent."))
+
+
 async def _collect(app: AppCtx, pend: Pending) -> HandoffResult:
+    """The canary's answer: from this process's own future while it has one; else from the service, by task id."""
+    from globus_compute_sdk.errors import TaskExecutionFailed
+
     fut = pend.future
+    if fut is not None:
+        if (tid := _task_id(fut)) is not None and tid != pend.task_id:
+            pend.task_id = tid
+            _persist(pend)
+            from . import warmth
+
+            async with app.lock:
+                warmth._persist_checks(app, pend.eid)
+        try:
+            res = await asyncio.to_thread(fut.result, WAIT_S)
+        except TimeoutError:
+            exc = fut.exception() if fut.done() and not fut.cancelled() else None
+            if not isinstance(exc, TimeoutError):
+                return _validating(pend)
+            return _failed(app, pend, exc)
+        except TaskExecutionFailed as exc:   # the endpoint's own verdict: nothing of it is left queued
+            return _failed(app, pend, exc)
+        except Exception as exc:  # noqa: BLE001 - the client's side alone: the service may still hold it
+            pend.task_id = pend.task_id or _task_id(fut)
+            if runner.never_sent(fut) or (pend.task_id is None and time.time() - pend.sent_at > NO_ID_S):
+                return _failed(app, pend, exc)
+            pend.future = None
+            _close(pend.runner)
+            pend.runner = None
+            _persist(pend)
+            return _validating(pend, f" — this client lost track of its answer ({type(exc).__name__}), so it is read "
+                                     "from the service by its task id")
+        return _exported(app, pend, res)
+    if pend.task_id is None:
+        if time.time() - pend.sent_at > NO_ID_S:
+            return _failed(app, pend, RuntimeError("the canary was never registered with the service"))
+        return _validating(pend, " (its task id is not known yet)")
+    client = _lookup(app)
+    if client is None:
+        return _validating(pend, " (no client to read it from here)")
     try:
-        res = await asyncio.to_thread(fut.result, WAIT_S)
-    except TimeoutError:
-        exc = fut.exception() if fut.done() and not fut.cancelled() else None
-        if not isinstance(exc, TimeoutError):
-            return HandoffResult(phase="validating", task_id=_task_id(fut), terms=pend.terms,
-                                 user_endpoint_config=dict(pend.plan.wire), notice=(
-                                     "The canary is out (one billed task with exactly this config): its block is still "
-                                     "queued or starting. Call export_handoff again with the same config to collect it "
-                                     "— nothing more is sent."))
+        task = await asyncio.wait_for(asyncio.to_thread(client.get_task, pend.task_id), WAIT_S)
+    except TaskExecutionFailed as exc:
         return _failed(app, pend, exc)
-    except Exception as exc:  # noqa: BLE001 - the task failed, or the dispatch path broke
-        return _failed(app, pend, exc)
-    return _exported(app, pend, res)
+    except Exception as exc:  # noqa: BLE001 - not read this time: asked again next call
+        return _validating(pend, f" (the service could not be read: {type(exc).__name__})")
+    if not isinstance(task, dict) or task.get("pending", True) is not False:
+        return _validating(pend)
+    if str(task.get("status", "")).lower() != "success" or task.get("result") is None:
+        return _failed(app, pend, RuntimeError(f"the service says {task.get('status')!r}"))
+    return _exported(app, pend, task["result"])
 
 
 def _failed(app: AppCtx, pend: Pending, exc: BaseException) -> HandoffResult:
     app.handoffs.pop(pend.key, None)
+    _unpersist(pend.key)
     _close(pend.runner)
     return HandoffResult(phase="refused", reason="canary_failed", terms=pend.terms,
                          user_endpoint_config=dict(pend.plan.wire), notice=(
@@ -845,7 +1109,8 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
                              globus_compute_endpoint=seen.worker_gce, host=host),
         client_requirements=HandoffClient(python=mm, dill=seen.worker_dill, globus_compute_sdk=_sdk_version()),
         terms=terms,
-        validation=HandoffValidation(ok=ok, task_id=_task_id(pend.future), job_id=job, host=host, device_pin=pins,
+        validation=HandoffValidation(ok=ok, task_id=pend.task_id or _task_id(pend.future), job_id=job, host=host,
+                                     device_pin=pins,
                                      identity=seen.worker_user, remaining_s=seen.worker_remaining_s,
                                      workers=seen.worker_count, queue_checks=checks),
         release=release_of(plan, job, seen.worker_user),
@@ -855,8 +1120,11 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
     )
     path = _write(rec)
     app.handoffs.pop(pend.key, None)
+    _unpersist(pend.key)
     _close(pend.runner)
-    return HandoffResult(phase="exported", record=rec, path=str(path), task_id=_task_id(pend.future), terms=terms,
+    if pend.task_id is not None:
+        app.resolved_checks[pend.task_id] = "ok"   # it ran: no stop waits on it any more
+    return HandoffResult(phase="exported", record=rec, path=str(path), task_id=pend.task_id, terms=terms,
                          user_endpoint_config=dict(plan.wire), notice=(
                              f"Exported {rid} to {path}: the canary ran on job {job or '(unknown)'}"
                              f"{f' on {host}' if host else ''}. Loam reads the record (its loam.env for set_env.sh, "
@@ -945,11 +1213,22 @@ def live(app: AppCtx, now: float | None = None) -> list[Live]:
         return []
     now = time.time() if now is None else now
     out: list[Live] = []
+    seen = set()
     for p in list(app.handoffs.values()):
         if p.eid == eid:
+            seen.add(p.key)
             out.append(Live(ref=HandoffRef(handoff_id="(validating)", state="validating",
-                                           expires_at=p.terms.expires_at, task_id=_task_id(p.future),
+                                           expires_at=p.terms.expires_at, task_id=p.task_id or _task_id(p.future),
                                            uep_id_seen=None), pending=p))
+    for raw in _disk_pendings(eid):   # one another life of this server sent (a restart): it is out all the same
+        if raw.get("key") in seen or not isinstance(raw.get("approved"), int | float):
+            continue
+        if now > float(raw["approved"]) + float(raw.get("hours") or 0) * 3600:
+            continue
+        p2 = _from_disk(raw, app.handoff_meta.get(eid, {}))
+        if p2 is not None:
+            out.append(Live(ref=HandoffRef(handoff_id="(validating)", state="validating",
+                                           expires_at=p2.terms.expires_at, task_id=p2.task_id), pending=p2))
     d = handoffs_dir()
     for path in sorted(d.glob("hoff-*.json")) if d.is_dir() else []:
         try:
@@ -1027,9 +1306,12 @@ def end(items: list[Live], how: str) -> None:
 
 
 def drop_pending(app: AppCtx, items: list[Live]) -> None:
+    """The user ended these handoffs: no record will be exported for them. Their canaries stay among the endpoint's
+    sent checks (`_note_check`), so a later stop still sees one that is queued."""
     for it in items:
         if it.pending is not None:
             app.handoffs.pop(it.pending.key, None)
+            _unpersist(it.pending.key)
             _close(it.pending.runner)
 
 
