@@ -107,6 +107,9 @@ meter_missing_from_sacct_full_walltime batch phase 2a: joins the sweep after its
 envelope_leftover_held        batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 envelope_stop_races_submit    batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 hand_sbatch_adopted           batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
+handoff_polaris_shape         batch phase 2b: joins the sweep after its first live proof (by hand), as a `pbs_mep` script cell
+handoff_mep_min_blocks_refused batch phase 2b: joins the sweep after its first live proof (by hand), as a `pbs_mep` script cell
+handoff_ssh_shape             batch phase 2b: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 EXCLUDED
 }
 
