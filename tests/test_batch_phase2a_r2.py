@@ -59,7 +59,7 @@ def test_r2_1_the_pending_reason_is_read_from_squeue_not_sacct():
 
     assert "%r" in meter.slurm_cmd("2026-11-01T00:00:00")
     raw = ("HPCB_SACCT_BEGIN\n7|hpcb-job-x|PENDING|0|60||billing=4,cpu=4,node=1|main|hpcb|0:0|None\nHPCB_SACCT_RC=0\n"
-           "HPCB_SQUEUE_BEGIN\n7|PENDING|0:00|1:00:00|4|AssocGrpCPUMinutesLimit|hpcb-job-x\nHPCB_SQUEUE_RC=0\n"
+           "HPCB_SQUEUE_BEGIN\n7|PENDING|0:00|1:00:00|4|main|AssocGrpCPUMinutesLimit|hpcb-job-x\nHPCB_SQUEUE_RC=0\n"
            "HPCB_METER_END\n")
     view = meter.parse_slurm(raw)
     r = meter.job_reading({"native_id": "7", "rate": 4, "walltime_s": 3600, "worst_case": 4, "tasks": 1}, view)
@@ -135,19 +135,18 @@ def test_r2_3_a_stepped_throttled_array_reads_back_as_every_task():
     assert r is not None and r.tasks == 50, r
 
 
-async def test_r2_3_a_hand_submit_the_envelopes_deadline_cut_short_is_explained(world):
-    """sbatch refuses a walltime past the wrapper's `--deadline` (probe r1): the answer says the envelope's deadline
-    caused it, and how to proceed."""
+async def test_r2_3_a_hand_submit_longer_than_the_envelopes_deadline_runs_and_says_no_deadline_applies(world):
+    """Converted in round 3 (D2 simplified): no wrapper adds the envelope's `--deadline`, so sbatch takes the job as
+    the command wrote it; it is adopted, counted to its own walltime, and the answer says no envelope deadline applies."""
     from hpc_bridge import server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 50, "deadline_hours": 2})
     script = _hand_script(world, "#!/bin/bash\n#SBATCH -t 05:00:00\n#SBATCH -p main\nsleep 300\n")
     out = await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
-    assert [j for j in world.sched.submitted() if j["id"] != first.job.native_id] == []   # sbatch refused it
-    words = (out.notice or "").lower()
-    assert "deadline" in words and "walltime" in words and "deadline_hours" in (out.notice or ""), out.notice
-    m = re.search(r"walltime of at most (\d{2}):(\d{2}):\d{2}", out.notice or "")   # what does fit
-    assert m and int(m.group(1)) * 60 + int(m.group(2)) in range(115, 121), out.notice
+    hand = [j for j in world.sched.submitted() if j["id"] != first.job.native_id]
+    assert len(hand) == 1 and hand[0]["deadline_epoch"] is None, hand
+    assert "no envelope deadline" in (out.notice or "").lower(), out.notice
+    assert out.jobs and out.jobs[0].worst_case == pytest.approx(20.0), out.jobs       # 4 × 5 h
     assert world.sched.calls("scancel") == []
 
 

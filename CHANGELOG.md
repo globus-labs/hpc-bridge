@@ -24,6 +24,8 @@ installed plugin only when that version changes); git tags mark releases.
     nothing is submitted; the proposal is made after a meter reading, and its cap covers what jobs of the user's that
     hpc-bridge did not start already hold (named, so the user can exclude one) plus the job; a yes after what is held
     grew is proposed again with the new figure — it never refuses itself, nor opens at a cap the user did not see. A
+    proposal is stable: it names an absolute deadline the yes reuses, and a job with no time limit is held to it, so
+    the user's think-time does not change the figure. A
     proposed cap and every "at least" figure are rounded UP (asking for the figure admits the job), what remains is
     rounded down. Inside the envelope a job that fits is admitted at once, one that does not
     answers `envelope_exhausted`. The first job of an envelope is admitted only after one meter reading of what else the
@@ -43,6 +45,7 @@ installed plugin only when that version changes); git tags mark releases.
     partition); committed = a running job's remaining walltime, a queued one's full walltime; a ledger job sacct does
     not list holds its full walltime; jobs of the user's that hpc-bridge did not start are counted and named (one with
     no time limit, for all the time left to the envelope's deadline; an array's pending tasks, which only squeue lists;
+    a job squeue lists before sacct does, or an array none of whose tasks has started, at its billing read by scontrol;
     through an accounting outage, at their last count), until the user
     excludes them (`exclude_jobs`). A pending job's reason is the scheduler's own (squeue `%r`; PBS: its comment —
     sacct says `None`), and one a site limit holds (an association's or QOS's limit, a GrpTRESMins backstop) is said
@@ -50,24 +53,21 @@ installed plugin only when that version changes); git tags mark releases.
   - **D2, gate and adopt:** a recognised hand `sbatch`/`qsub` anywhere on a command line while this session's envelope
     is open answers `needs_confirmation` and runs nothing (`login_shell` refuses it, and a `run_batch` template that
     submits jobs is refused, pointing at `submit_job` with an array). On the yes (`run_shell(…, confirm_spend=True)`)
-    the command runs with a wrapper first on its PATH — so `command`, `env`, `nohup`, `timeout`, `nice` and `exec`
-    reach it — that submits each job HELD with the envelope's deadline in the same submit (reading only sbatch's or
-    qsub's own options, never the script's arguments) and keeps the real sbatch/qsub's own receipt in a per-command
-    mark file; the real command runs with the command's own PATH minus the wrapper, no variable of the wrapper's is
-    exported, and once the hand is closed the wrapper falls through to the real command for anything that inherited
-    it. A job is
-    the command's only by that evidence (never by digits in its output): it is read back (its request, its deadline,
-    whether it can finish before the envelope's), reserved and released, or cancelled while still held. A job that
-    appeared meanwhile without a mark (an absolute path, sudo) is counted, named "submitted unheld, no deadline applied",
-    and never cancelled by hpc-bridge on its own — adopted only once the command has ended, so a later job of the
-    user's is never read as the command's. Its ledger row is written before the command runs and closed on every exit
-    path, so a command that outlives the sync-wait is reconciled (bounded) by the next status, submit_job or stop. When sbatch refuses a job because the
-    envelope's deadline comes before its walltime could end, the answer says so, with the walltime that fits.
-  - **A stop asks about jobs that can still bill** — any session's, a dead server's, a held hand submit and another
-    facility's included — naming each one, and changes nothing until `stop_endpoint(jobs="cancel")` (cancel them;
-    `down` only once none can bill) or `jobs="keep"` (release only the blocks; `draining`, never `down`, naming how to
-    end them). A stop closes admission as it BEGINS (a submit_job during it is proposed afresh) and reads the ledger
-    again before it answers; another facility's PBS job (no scheduler deadline) stays listed until a read shows it
+    the command runs UNMODIFIED, inside one remote shell that lists the user's jobs immediately before it and —
+    written to the session dir, so even a command that outlives the sync-wait has it taken when it ends — immediately
+    after it. The jobs that appeared between are adopted after the fact: ledgered, metered, reserved even past the cap
+    (admission then closes, and the answer says the approved submit put the envelope over its cap, by how much),
+    named as "jobs that appeared while your approved command ran" (one that is not: `exclude_jobs`), with no envelope
+    deadline applied — the terms and the answer say so. hpc-bridge never cancels them on its own; the stop asks about
+    them by name, and `jobs="cancel"` or `cancel("job-…")` ends them because the user chose. A job the user submits
+    from their own terminal after the command ended is never read as the command's.
+  - **A stop asks about jobs that can still bill** — any session's, a dead server's, an adopted one and another
+    facility's included, and an approved hand submit not yet accounted for (a command still running, jobs not yet
+    adopted) — naming each one, and changes NOTHING (it only reads) until `stop_endpoint(jobs="cancel")` (cancel them,
+    in one scheduler call; `down` only once none can bill) or `jobs="keep"` (release only the blocks; `draining`,
+    never `down`, naming how to end them). Proceeding, it closes admission first (a submit_job during it is proposed
+    afresh) and reads the ledger again before it answers, all under one 300 s deadline (past it: `draining`, saying
+    what it could not confirm); another facility's PBS job (no scheduler deadline) stays listed until a read shows it
     ended. Nothing is admitted after a stop either way. A cancel says "cancelled" only for a job whose state
     afterwards is cancelled — never by scancel's exit code (it answers 0 for a job that had already ended); a stop
     that cannot read the ledger is never `down`.

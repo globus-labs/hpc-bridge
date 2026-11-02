@@ -11,6 +11,12 @@ digits in the command's output. The shim (a wrapper on PATH, so `command`/`env`/
 reach it) adds the hold, the envelope's deadline and the marker in ONE submit, and keeps itself out of the job's
 environment. A marked job is released only once its deadline and its fit are read back; an unmarked one that appeared
 meanwhile is metered only ("submitted unheld, no deadline applied") and never cancelled without the user's say-so.
+
+Round 3 (the user's decision) simplified D2 to what the design says: no wrapper, no hold, no mark file, no release, no
+cancel-while-held — the command runs unmodified and what appeared between its two snapshots is adopted after the fact,
+never cancelled by hpc-bridge on its own. The A1–A4 tests below that pinned the hold were converted to that behaviour
+(their property — never cancel or touch a job the evidence does not show, never read digits as receipts — still
+holds); the deadline read-back tests went with the hold (no envelope deadline is applied to an adopted job).
 """
 from __future__ import annotations
 
@@ -61,7 +67,8 @@ async def test_A1_squeue_after_a_hand_sbatch_does_not_cancel_an_unrelated_job(wo
     assert other not in [j.native_id for j in (out.jobs or [])], out.jobs
     hand = _others(world, first)
     hand = [j for j in hand if j["id"] != other]
-    assert hand and hand[0]["state"] == "CANCELLED" and hand[0]["held"], hand   # only the hand job, still held
+    assert hand and hand[0]["state"] != "CANCELLED" and world.sched.calls("scancel") == [], hand   # nothing cancelled
+    assert [j.native_id for j in out.jobs or []] == [hand[0]["id"]], out.jobs   # only the job that appeared
 
 
 def test_A1_a_receipt_is_read_only_from_the_submit_calls_own_output_and_never_a_number_or_an_address():
@@ -75,8 +82,8 @@ def test_A1_a_receipt_is_read_only_from_the_submit_calls_own_output_and_never_a_
     assert jobs._receipts_in("slurm", "4242\nSubmitted batch job 17\n4243;cluster\n") == ["4242", "17", "4243"]
 
 
-# A2: a receipt captured by $(…) was never read: the held job stayed held forever
-async def test_A2_a_captured_parsable_receipt_does_not_leave_the_job_held(world):
+# A2: a receipt captured by $(…): the job is adopted all the same (by the snapshot diff, never by the receipt)
+async def test_A2_a_captured_parsable_receipt_is_adopted(world):
     from hpc_bridge import server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20})
@@ -84,13 +91,12 @@ async def test_A2_a_captured_parsable_receipt_does_not_leave_the_job_held(world)
     out = await server._run_shell(world.app, f'jid=$(sbatch --parsable {script}); echo "queued as $jid"',
                                   shape="login", agent_call=True, confirm_spend=True)
     hand = _others(world, first)
-    assert len(hand) == 1 and hand[0]["held_at_submit"] is True
-    assert not hand[0]["held"], (out.notice, hand[0])                  # adopted and released
-    assert out.jobs and out.jobs[0].native_id == hand[0]["id"]
+    assert len(hand) == 1 and out.jobs and out.jobs[0].native_id == hand[0]["id"], (out.notice, hand)
 
 
-# A2: whatever the command's outcome, a marked held job ends up on the ledger; the next call (or the stop) reconciles it
-async def test_A2_a_held_job_whose_command_outlived_the_sync_wait_is_reconciled_by_the_next_call(world):
+# A2: whatever the command's outcome, what it submitted ends up on the ledger — a command still running past the
+# sync-wait has its after-snapshot written when it ENDS, and the next call adopts
+async def test_A2_a_job_whose_command_outlived_the_sync_wait_is_adopted_by_the_next_call(world):
     from hpc_bridge import batch, server
     from tests.test_server import _PendingFuture
 
@@ -107,31 +113,30 @@ async def test_A2_a_held_job_whose_command_outlived_the_sync_wait_is_reconciled_
     out = await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
     runner.submit = real_submit
     hand = _others(world, first)
-    assert hand and hand[0]["held_at_submit"], hand
+    assert hand, hand
+    await server._status(world.app, first.envelope.envelope_id)          # the next call adopts
     rows = [j for j in batch.ledger_of(world.app).jobs() if j.get("native_id") == hand[0]["id"]]
-    assert rows, ("the held job is not on the ledger", out)
-    await server._status(world.app, first.envelope.envelope_id)          # the next call reconciles
-    assert not world.sched.job(hand[0]["id"])["held"], world.sched.job(hand[0]["id"])
+    assert rows and rows[0]["source"] == "adopt", ("the job is not on the ledger", out)
 
 
-# A3: the gate recognised these wrappers and said "runs HELD", but the function shim was bypassed
+# A3: the gate recognises these forms; the yes runs them as they are, and the job that appeared is adopted
 @pytest.mark.parametrize("wrap", ["command sbatch", "timeout 60 sbatch", "nohup sbatch", "env sbatch", "nice sbatch",
                                   "exec sbatch"])
-async def test_A3_a_gated_wrapped_sbatch_is_really_held(world, wrap):
-    from hpc_bridge import server
+async def test_A3_a_gated_wrapped_sbatch_is_adopted(world, wrap):
+    from hpc_bridge import batch, server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20})
     script = _hand_script(world)
     asked = await server._run_shell(world.app, f"{wrap} {script}", shape="login", agent_call=True)
-    assert asked.phase == "needs_confirmation" and "HELD" in (asked.notice or "")
+    assert asked.phase == "needs_confirmation" and "adopted" in (asked.notice or "")
     await server._run_shell(world.app, f"{wrap} {script}", shape="login", agent_call=True, confirm_spend=True)
     hand = _others(world, first)
-    assert hand and hand[0]["held_at_submit"] is True, hand
+    rows = [j for j in batch.ledger_of(world.app).jobs() if hand and j.get("native_id") == hand[0]["id"]]
+    assert hand and not hand[0]["held_at_submit"] and rows, (hand, rows)
 
 
-# A3: the shim must never reach the job's own environment (sbatch --export=ALL): a self-resubmitting job's sbatch is not
-# held, and no exported function or shim PATH is carried
-async def test_A3_the_shim_does_not_leak_into_the_submitted_jobs_environment(world):
+# A3: nothing of hpc-bridge's reaches the job's own environment (sbatch --export=ALL): the command runs unmodified
+async def test_A3_nothing_leaks_into_the_submitted_jobs_environment(world):
     from hpc_bridge import server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20})
@@ -139,13 +144,11 @@ async def test_A3_the_shim_does_not_leak_into_the_submitted_jobs_environment(wor
     await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
     hand = _others(world, first)[0]
     env = hand["submit_env"]
-    assert not [k for k in env if k.startswith("BASH_FUNC_")], env
-    assert "hpcb-shim" not in env.get("PATH", "") and not [k for k in env if k.startswith("HPCB_SHIM")], env
+    assert not [k for k in env if k.startswith(("BASH_FUNC_", "HPCB_SHIM"))] and "hpcb-shim" not in env.get("PATH", "")
 
 
-# A3 (and A6): a submit by absolute path bypasses any shim: it is found by the snapshot, metered only, named "unheld", and
-# never cancelled (even when it does not fit)
-async def test_A3_an_unheld_submit_the_shim_could_not_see_is_metered_named_and_never_cancelled(world):
+# A3 (and A6): a submit by absolute path is adopted like any other: metered, named, no deadline, never cancelled
+async def test_A3_a_submit_by_absolute_path_is_adopted_named_and_never_cancelled(world):
     from hpc_bridge import batch, server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 6})
@@ -154,7 +157,7 @@ async def test_A3_an_unheld_submit_the_shim_could_not_see_is_metered_named_and_n
     out = await server._run_shell(world.app, f"{real} {script}", shape="login", agent_call=True, confirm_spend=True)
     hand = _others(world, first)
     assert len(hand) == 1 and not hand[0]["held_at_submit"] and hand[0]["state"] != "CANCELLED", hand
-    assert "unheld" in (out.notice or "") and "no deadline" in (out.notice or ""), out.notice
+    assert "appeared while your approved command ran" in (out.notice or "") and "deadline" in (out.notice or "")
     assert world.sched.calls("scancel") == []
     rows = [j for j in batch.ledger_of(world.app).jobs() if j.get("native_id") == hand[0]["id"]]
     assert rows and rows[0]["source"] == "adopt", rows                  # metered: it counts against the envelope
@@ -195,35 +198,9 @@ async def test_A6_a_run_batch_template_that_submits_jobs_is_refused(world):
     assert out.phase == "refused" and "submit_job" in (out.notice or "") and "array" in (out.notice or ""), out
 
 
-# A4/B5: Slurm 23.11 refuses a user's `scontrol update Deadline=` (probe §1) — the deadline is set AT SUBMIT; a job whose
-# deadline is not read back is never released
-async def test_A4_a_hand_job_is_released_only_with_the_deadline_read_back(world):
-    from hpc_bridge import server
-
-    first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20})
-    script = _hand_script(world)
-    out = await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
-    hand = _others(world, first)[0]
-    assert not hand["held"] and hand["deadline_epoch"], (out.notice, hand)
-    assert abs(hand["deadline_epoch"] - _epoch(first.envelope.deadline)) < 5, hand
-    assert not [c for c in world.sched.calls("scontrol") if c[:2] == ["scontrol", "update"]]
-
-
-async def test_A4_a_hand_job_with_its_own_later_deadline_is_cancelled_while_held(world):
-    from hpc_bridge import server
-
-    first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20, "deadline_hours": 2})
-    script = _hand_script(world, "#!/bin/bash\n#SBATCH -t 01:00:00\n#SBATCH -p main\nsleep 300\n")
-    out = await server._run_shell(world.app, f"sbatch --deadline=now+86400 {script}", shape="login",
-                                  agent_call=True, confirm_spend=True)
-    hand = _others(world, first)[0]
-    assert hand["state"] == "CANCELLED" and hand["held"], (out.notice, hand)
-    assert "deadline" in (out.notice or ""), out.notice
-
-
-async def test_A4_a_hand_job_whose_walltime_cannot_finish_before_the_deadline_is_cancelled_while_held(pbs):
-    """On PBS (no deadline at submit) the read-back fit check cancels it while held. On Slurm sbatch itself refuses a
-    walltime past the wrapper's --deadline (probe r1): test_batch_phase2a_r2.py pins that answer."""
+# A4 (converted, round 3): no envelope deadline is applied to an adopted job, and none is ever set after submit — a job
+# whose walltime runs past the envelope's deadline is adopted, counted to its own walltime, and never cancelled
+async def test_A4_an_adopted_job_gets_no_deadline_and_a_long_one_is_never_cancelled(pbs):
     from hpc_bridge import server
 
     first = await _confirmed(pbs.app, command="sleep 60", partition="workq",
@@ -232,7 +209,8 @@ async def test_A4_a_hand_job_whose_walltime_cannot_finish_before_the_deadline_is
     script.write_text("#!/bin/bash\n#PBS -l select=1:ncpus=4\n#PBS -l walltime=05:00:00\nsleep 300\n")
     out = await server._run_shell(pbs.app, f"qsub {script}", shape="login", agent_call=True, confirm_spend=True)
     hand = next(j for j in pbs.sched.submitted() if j["id"] != first.job.native_id.split(".")[0])
-    assert hand["state"] == "CANCELLED" and hand["held"], (out.notice, hand)
+    assert hand["state"] != "CANCELLED" and pbs.sched.calls("qdel") == [], (out.notice, hand)
+    assert out.jobs and out.jobs[0].worst_case == pytest.approx(20.0) and out.jobs[0].deadline is None, out.jobs
 
 
 # A5: adoption understated the worst case

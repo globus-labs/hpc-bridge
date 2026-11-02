@@ -1172,6 +1172,9 @@ def _login_runner(app: AppCtx):
     return run
 
 
+STOP_BUDGET_S = 300.0   # a stop's whole Jobs-mode work around the block release has one deadline (review r3)
+
+
 async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus:
     """stop_endpoint, Jobs mode first (batch phase 2a). With no Jobs-mode job of ours that can still bill — any
     session's, a dead server's and a held hand submit included — it is the stop it always was
@@ -1182,31 +1185,52 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus
     if jobs not in (None, "cancel", "keep"):
         return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
-    try:   # nothing is admitted once a stop has begun — not while it releases the blocks either (review r2, P5)
-        jobmode.close_admission(app)
-    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: said below
-        print(f"hpc-bridge: the stop could not close admission ({type(exc).__name__}: {exc})", file=sys.stderr)
+    t0 = time.monotonic()
+
+    def left(cap: float) -> float:   # ONE deadline for the whole stop (review r3): every phase takes from it
+        return max(0.5, min(cap, STOP_BUDGET_S - (time.monotonic() - t0)))
+
+    # 1. read only: a stop that ASKS changes nothing — no adoption, no admission closed (review r3)
     try:
-        live = await jobmode.billing_jobs(app)
+        hands = await asyncio.wait_for(jobmode.hand_results(app, budget_s=20.0, adopt=False), left(25.0))
+        live = await asyncio.wait_for(jobmode.billing_jobs(app, reconcile=False), left(40.0))
+    except TimeoutError:
+        return jobmode.unconfirmed(await _stop_endpoint_blocks(app), "what of ours can still bill was not read")
     except Exception as exc:  # noqa: BLE001 - the ledger unreadable: the blocks are released, and it is never down
         print(f"hpc-bridge: the stop could not read the Jobs-mode ledger ({type(exc).__name__}: {exc})",
               file=sys.stderr)
         return jobmode.ledger_unreadable(await _stop_endpoint_blocks(app), exc)
-    if live and jobs is None:
-        return jobmode.stop_question(app, live)
+    unaccounted = [res for _h, res in hands if res.pending or res.running]
+    if (live or unaccounted) and jobs is None:
+        return jobmode.stop_question(app, live, hands)
     if live and app.state.endpoint_id is None:
         return jobmode.stop_without_channel(app, live, jobs or "keep")
+    # 2. it proceeds: admission closes FIRST — a submit_job while the blocks are released is proposed afresh (r2, P5)
+    try:
+        jobmode.close_admission(app)
+    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: said by the answer's own read
+        print(f"hpc-bridge: the stop could not close admission ({type(exc).__name__}: {exc})", file=sys.stderr)
+    notes: list[str] = []
     cancelled = ""
-    if live and jobs == "cancel":
-        cancelled = await jobmode.cancel_for_stop(app, live)
-    elif live and jobs == "keep":
-        jobmode.keep_for_stop(app, live)
+    try:
+        if hands:   # what appeared while approved commands ran is adopted — then read again what can bill
+            notes = await asyncio.wait_for(jobmode.reconcile_pending(app, budget_s=20.0), left(25.0))
+            live = await asyncio.wait_for(jobmode.billing_jobs(app, reconcile=False), left(30.0))
+        if live and jobs == "cancel":
+            cancelled = await asyncio.wait_for(jobmode.cancel_for_stop(app, live), left(25.0))
+        elif live and jobs == "keep":
+            jobmode.keep_for_stop(app, live)
+    except TimeoutError:
+        return jobmode.unconfirmed(await _stop_endpoint_blocks(app), "the cancels of our jobs were not confirmed")
     st = await _stop_endpoint_blocks(app)
     try:   # the ledger is read again before the answer: an admission that raced the stop is never left out of it
-        return await jobmode.after_stop(app, st, jobs if live else None, cancelled)
+        return await asyncio.wait_for(jobmode.after_stop(app, st, jobs if live else None, cancelled, notes),
+                                      left(60.0))
+    except TimeoutError:
+        return jobmode.unconfirmed(st, "what of ours can still bill was not read again after the release")
     except Exception as exc:  # noqa: BLE001
         print(f"hpc-bridge: the stop's Jobs-mode answer failed ({type(exc).__name__}: {exc})", file=sys.stderr)
-        return st
+        return jobmode.ledger_unreadable(st, exc)
 
 
 async def _stop_endpoint_blocks(app: AppCtx) -> EndpointStatus:
@@ -2262,30 +2286,19 @@ async def _run_shell(
 
 
 async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, envelope: dict) -> ShellOutcome:
-    """D2 (c) after the user's yes: the hand submit runs with a wrapper first on its PATH that submits each job HELD,
-    with the envelope's deadline, and keeps the real sbatch/qsub's own receipt (`jobs.begin_hand`, `held_command`) —
-    set up, and its ledger row written, BEFORE the dispatch is counted (nothing may await between the count and the
-    submit). Whatever the outcome, its jobs are reconciled (`jobs.finish_hand`): adopted and released, cancelled while
-    still held when they do not fit, or — a submit the wrapper could not hold — counted and never cancelled; a command
-    still running is reconciled again by the next call. With nothing submitted, #176's advisory is kept."""
-    hand = await jobmode.begin_hand(app, envelope, session_id)
-    if isinstance(hand, str):
-        return ShellOutcome(phase="failed", block_state="cold", exit_code=None,
-                            notice=(f"NOTHING ran: the hold for this hand submit could not be set up on the login node "
-                                    f"({hand}). Try again; without the hold hpc-bridge does not run it."))
-    try:
-        ready = await _ready_session(app, shape, session_id)
-    except BaseException:   # cancelled (or failed) before the command was sent: the hand is closed (review r2, P1)
-        jobmode.drop_hand(app, hand, "the call ended before the command was sent")
-        raise
+    """D2 after the user's yes (round 3, the user's decision): the hand submit runs UNMODIFIED, inside one remote shell
+    that lists the user's jobs immediately before it and — into the session dir — immediately after it ends
+    (`jobs.hand_command`); its `hand` ledger row is written in the same locked step as the dispatch's count, with no
+    await between (`jobs.open_hand`). Whatever the outcome, the jobs that appeared are adopted after the fact
+    (`jobs.finish_hand`) — or, for a command still running, by the next call once it ends; never cancelled by
+    hpc-bridge on its own. With nothing submitted, #176's advisory is kept."""
+    ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
-        jobmode.drop_hand(app, hand, ready.phase)
         return ready
     runner, session, rt, guard = ready
+    hand = jobmode.open_hand(app, envelope, session)   # sync: nothing awaits between the count and the submit
     key = secrets.token_hex(8)
-    # once sent, the command's exit status (the wrapper's EXIT trap) says when it ended — whatever becomes of this call
-    jobmode.hand_started(app, hand, f"{session.quoted_state_dir()}/results/{key}/rc")
-    held = jobmode.held_command(hand, command)
+    held = jobmode.hand_command(app, hand, command)
     out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
                                   lambda: session_shell.wrap(held, session, guard=guard, result_key=key),
                                   agent_call=True, submission=None, guard=guard, result_key=key)

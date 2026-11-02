@@ -35,7 +35,7 @@ SACCT_FIELDS = ("JobID", "JobName", "State", "ElapsedRaw", "TimelimitRaw", "Allo
 # AssocGrpCPUMinutesLimit under GrpTRESMins + `safe`); the name last, so a `|` in it cannot shift a column
 # %l and %C: an array no task of which has started has NO sacct row (probe 3b): squeue's limit and CPUs are all there
 # is to count it by (review r2)
-SQUEUE_FMT = "%i|%T|%M|%l|%C|%r|%j"
+SQUEUE_FMT = "%i|%T|%M|%l|%C|%P|%r|%j"
 SACCT_MARK, SQUEUE_MARK, END_MARK = "HPCB_SACCT_BEGIN", "HPCB_SQUEUE_BEGIN", "HPCB_METER_END"
 QSTAT_MARK = "HPCB_QSTAT_BEGIN"
 _LIVE_SQUEUE = frozenset({"PENDING", "RUNNING", "COMPLETING", "CONFIGURING", "SUSPENDED", "RESIZING", "REQUEUED",
@@ -123,6 +123,15 @@ class SchedView:
     names: dict[str, str] = field(default_factory=dict)
     reasons: dict[str, str] = field(default_factory=dict)
     queued: dict[str, tuple[float | None, float | None]] = field(default_factory=dict)   # base -> squeue (limit, cpus)
+    units: dict[str, int] = field(default_factory=dict)          # base -> squeue lines that are one job or one task
+    partitions: dict[str, str] = field(default_factory=dict)     # base -> squeue %P
+    # base -> what a caller read for a job squeue lists and sacct does not (an array none of whose tasks has started;
+    # one slurmdbd has not recorded yet): {"rate": billing per task, "limit_s": …, "name": …} — its billing, never
+    # bare CPUs where the billing differs (review r3)
+    extra: dict[str, dict[str, Any]] = field(default_factory=dict)
+
+    def squeue_only(self) -> list[str]:
+        return [b for b in dict.fromkeys([*self.pending, *self.units]) if b not in self.rows]
     ok: bool = False
     source: str = "sacct"
     calls: int = 0
@@ -222,16 +231,20 @@ def parse_slurm(out: str) -> SchedView:
         base, _, task = cols[0].partition("_")
         if task.startswith("[") and cols[1] == "PENDING":
             v.pending[base] = v.pending.get(base, 0) + range_count(task)
+        else:
+            v.units[base] = v.units.get(base, 0) + 1
         if len(cols) > 4 and base not in v.queued:
             try:
                 sq_cpus: float | None = float(cols[4])
             except ValueError:
                 sq_cpus = None
             v.queued[base] = (_sq_secs(cols[3]), sq_cpus)
-        if cols[1] == "PENDING" and len(cols) > 5 and cols[5] not in ("", "None", "(null)"):
-            v.reasons[base] = cols[5]
-        if len(cols) > 6:
-            v.names.setdefault(base, "|".join(cols[6:]))
+        if len(cols) > 5 and cols[5]:
+            v.partitions.setdefault(base, cols[5])
+        if cols[1] == "PENDING" and len(cols) > 6 and cols[6] not in ("", "None", "(null)"):
+            v.reasons[base] = cols[6]
+        if len(cols) > 7:
+            v.names.setdefault(base, "|".join(cols[7:]))
         prev = v.live.get(base)
         v.live[base] = cols[1] if prev is None or cols[1] == "RUNNING" else prev
     return v
@@ -411,30 +424,39 @@ def unledgered(view: SchedView, known: set[str], excluded: set[str], *, accounts
             rate = r.billing if r.billing is not None else (r.cpus or 1.0)
             n = r.pending_tasks or 1
             states.append(r.state)
-            limit = r.limit_s if r.limit_s is not None else r.elapsed_s + horizon_s
+            # no limit (UNLIMITED, a PBS job with none) — or running past it — holds all the time to `horizon_s`:
+            # charged + committed is then the same whenever it is read, so a proposal does not grow with the clock
+            no_limit = r.limit_s is None or (r.state not in _ENDED and r.state != "PENDING"
+                                             and r.elapsed_s >= r.limit_s)
+            limit = r.elapsed_s + horizon_s if no_limit else float(r.limit_s or 0.0)
             if r.pending_tasks or r.state == "PENDING":
                 co += n * rate * limit / 3600
                 continue
             ch += rate * r.elapsed_s / 3600
             if r.state not in _ENDED:
                 co += rate * max(0.0, limit - r.elapsed_s) / 3600
+        first = rows[0]
+        rate0 = first.billing if first.billing is not None else (first.cpus or 1.0)
         pend = view.pending.get(base, 0) if not any(r.pending_tasks for r in rows) else 0
         if pend:   # sacct has no row for an array's pending tasks (probe 3b): squeue's count
-            first = rows[0]
-            rate = first.billing if first.billing is not None else (first.cpus or 1.0)
             limit = first.limit_s if first.limit_s is not None else (view.queued.get(base, (None, None))[0]
                                                                      or horizon_s)
-            co += pend * rate * limit / 3600
+            co += pend * rate0 * limit / 3600
             states.append("PENDING")
-        out.append({"native_id": base, "name": rows[0].name, "state": _phase_state(states), "charged": round(ch, 6),
-                    "committed": round(co, 6)})
-    for base, n in view.pending.items():   # an array none of whose tasks has started: no sacct row at all
-        if base in view.rows or base in known or base in excluded:
+        out.append({"native_id": base, "name": first.name, "state": _phase_state(states), "charged": round(ch, 6),
+                    "committed": round(co, 6), "rate": rate0})
+    for base in view.squeue_only():   # squeue lists it, sacct does not: an unstarted array, one not recorded yet
+        if base in known or base in excluded:
             continue
+        x = view.extra.get(base) or {}
         limit_s, cpus = view.queued.get(base, (None, None))
-        limit = limit_s if limit_s is not None else horizon_s
-        out.append({"native_id": base, "name": view.names.get(base, ""), "state": "PENDING", "charged": 0.0,
-                    "committed": round(n * (cpus or 1.0) * limit / 3600, 6)})
+        raw_limit = x.get("limit_s") or limit_s
+        sq_limit = float(raw_limit) if raw_limit else horizon_s
+        rate = float(x.get("rate") or cpus or 1.0)
+        n = view.pending.get(base, 0) + view.units.get(base, 0)
+        state = view.live.get(base, "PENDING")
+        out.append({"native_id": base, "name": x.get("name") or view.names.get(base, ""), "state": state,
+                    "charged": 0.0, "committed": round(max(n, 1) * rate * sq_limit / 3600, 6), "rate": rate})
     return out
 
 

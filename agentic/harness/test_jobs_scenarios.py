@@ -27,7 +27,7 @@ from test_batch_scenarios import _connect_answers, _drive, _Server, _stub_sdk  #
 JOB_SCENARIOS = ["job_promote_track_cancel", "job_array_terms", "envelope_exhausted", "hand_submit_gated_adopted",
                  "site_backstop_grptresmins", "envelope_new_session_reasks", "envelope_ceiling_sums",
                  "envelope_bypass_counted", "meter_missing_from_sacct_full_walltime", "envelope_leftover_held",
-                 "envelope_stop_races_submit"]
+                 "envelope_stop_races_submit", "hand_sbatch_adopted"]
 JOB, ENV = "job-0123456789ab", "env-0123456789ab"
 
 
@@ -391,6 +391,33 @@ def test_a_re_proposal_is_answered_once_more_and_admits():
                         _c("submit_job", {"command": "x", "confirm_spend": True}, _leftover_ask(10.0, held=6.0)),
                         _c("submit_job", {"command": "x", "confirm_spend": True}, _job(native="1002"))])
     assert jc.proposal_yes_admits(reproposed).ok
+
+
+def test_reask_names_remaining_accepts_the_figure_rounded_down():
+    """Live r2 (envelope_new_session_reasks): remaining 1.4944 is said "1.49 of 2 … left" — rounded DOWN, as every
+    remaining figure is; the grader takes that form."""
+    def run(notice, remaining=1.4944):
+        r = {"phase": "needs_confirmation", "reason": "envelope_new_session", "notice": notice,
+             "envelope": {"envelope_id": ENV, "remaining": remaining}}
+        return jc.reask_names_remaining(Trace([_c("submit_job", {"command": "x"}, r)], texts=[jc.RESTARTED],
+                                              text_at=[0]))
+    assert run("It has 1.49 of 2 billing units left").ok
+    assert run("It has 1.4944 of 2 left").ok
+    assert not run("It has 1.5 of 2 left").ok                           # rounded UP: never
+    assert run("It has 1.5 of 2 billing units left", remaining=1.5).ok
+
+
+def test_adopted_named_without_deadline_grades_the_d2_answer():
+    said = ("Adopted into envelope env-x: jobs that appeared while your approved command ran — job-1 (scheduler job "
+            "1002, …); no envelope deadline is applied to them.")
+    ok = Trace([_c("run_shell", {"command": "sbatch h.sh"}, {"phase": "needs_confirmation"}),
+                _c("run_shell", {"command": "sbatch h.sh", "confirm_spend": True},
+                   {"phase": "complete", "notice": said, "jobs": [{"job_id": JOB, "native_id": "1002",
+                                                                  "source": "adopt"}]})])
+    assert jc.adopted_named_without_deadline(ok).ok
+    held = Trace([_c("run_shell", {"command": "sbatch h.sh", "confirm_spend": True},
+                     {"phase": "complete", "notice": "held, released", "jobs": [{"source": "adopt"}]})])
+    assert not jc.adopted_named_without_deadline(held).ok
 
 
 def test_no_admission_during_stop_reads_the_submit_issued_while_the_stop_ran():

@@ -25,6 +25,7 @@ job as a hand `sbatch` / `qsub` over run_shell on the login shape (`main_submit`
 from __future__ import annotations
 
 import json
+import math
 import re
 import shlex
 import sqlite3
@@ -376,7 +377,11 @@ def reask_names_remaining(t: Trace, *, after_text: str = RESTARTED) -> Result:
     r = c.result or {}
     env = envelope_of(r)
     left = env.get("remaining")
-    named = isinstance(left, int | float) and f"{float(left):g}" in str(r.get("notice") or "")
+    notice = str(r.get("notice") or "")
+    # every remaining figure is said rounded DOWN to 2 decimals (live r2: 1.4944 is "1.49 of 2 … left")
+    down = math.floor(float(left) * 100 + 1e-6) / 100 if isinstance(left, int | float) else None
+    forms = {f"{float(left):g}", f"{down:.2f}".rstrip("0").rstrip(".")} if down is not None else set()
+    named = any(re.search(rf"(?<![\d.]){re.escape(f)}(?![\d])", notice) for f in forms)
     ok = str(r.get("phase")) == "needs_confirmation" and r.get("reason") == "envelope_new_session" and named
     return Result("reask_names_remaining", ok, f"first submit_job after the restart (call {i}): {r.get('phase')!r} "
                   f"reason {r.get('reason')!r}, remaining {left!r} {'named' if named else 'not named'} in the notice")
@@ -449,6 +454,23 @@ def proposal_yes_admits(t: Trace) -> Result:
             return Result("proposal_yes_admits", False, f"call {i}: {r.get('phase')} ({r.get('reason')}): "
                           f"{str(r.get('notice') or '')[:160]!r}")
     return Result("proposal_yes_admits", False, "the yes never came back admitted")
+
+
+def adopted_named_without_deadline(t: Trace) -> Result:
+    """Round 3 (D2 as the design says): the approved hand submit's answer adopted its job(s) and SAID so — named as jobs
+    that appeared while the approved command ran, with no envelope deadline applied."""
+    for i, c in t.named("run_shell"):
+        r = c.result or {}
+        if str(c.input.get("confirm_spend")).lower() != "true":
+            continue
+        jobs = [j for j in r.get("jobs") or [] if isinstance(j, dict) and j.get("source") == "adopt"]
+        if not jobs:
+            continue
+        words = str(r.get("notice") or "").lower()
+        ok = "appeared while your approved command ran" in words and "no envelope deadline" in words
+        return Result("adopted_named_without_deadline", ok, f"call {i}: adopted {[j.get('native_id') for j in jobs]}; "
+                      f"{'named, no deadline said' if ok else 'NOT said as the design asks'}")
+    return Result("adopted_named_without_deadline", False, "no confirmed hand submit adopted a job")
 
 
 def no_admission_during_stop(t: Trace) -> Result:

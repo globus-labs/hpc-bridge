@@ -158,7 +158,7 @@ async def test_wrapper_keeps_the_commands_own_path_for_the_job(world):
         script = _hand_script(world)
         await server._run_shell(world.app, f"export PATH=/opt/mytool/bin:$PATH; sbatch {script}", shape="login",
                                 agent_call=True, confirm_spend=True)
-        hand = [j for j in world.sched.submitted() if j.get("held_at_submit")]
+        hand = [j for j in world.sched.submitted() if j.get("name") == "hand.sh"]   # (round 3: run unmodified)
         assert hand, world.sched.submitted()
         assert "/opt/mytool/bin" in hand[0]["submit_env"].get("PATH", ""), hand[0]["submit_env"]
 
@@ -190,9 +190,10 @@ async def test_a_leaked_jobs_own_sbatch_is_not_left_held_forever(world):
     await _w(body())
 
 
-# ---- item 3 (P2): a script's own argument never drops the hold -------------------------------------------------------
+# ---- item 3 (P2), converted in round 3: with no wrapper there is no hold to drop — a script argument that looks like
+# sbatch's own is passed through as the command wrote it, and the job is adopted, never cancelled
 @pytest.mark.parametrize("arg", ["-W", "--wait", "-H"])
-async def test_a_script_argument_does_not_drop_the_hold(world, arg):
+async def test_a_script_argument_is_passed_through_and_the_job_adopted(world, arg):
     """`sbatch job.sh -W` — `-W` is job.sh's argument (sbatch stops at the script)."""
     from hpc_bridge import server
 
@@ -202,7 +203,8 @@ async def test_a_script_argument_does_not_drop_the_hold(world, arg):
         out = await server._run_shell(world.app, f"sbatch {script} {arg}", shape="login", agent_call=True,
                                       confirm_spend=True)
         hand = [j for j in world.sched.submitted() if j["id"] != first.job.native_id]
-        assert hand and hand[0]["held_at_submit"], (hand[0]["held_at_submit"], hand[0]["state"], out.notice)
+        assert hand and hand[0]["argv"][-1] == arg and hand[0]["state"] != "CANCELLED", hand
+        assert out.jobs and out.jobs[0].native_id == hand[0]["id"], out.notice
 
     await _w(body())
 

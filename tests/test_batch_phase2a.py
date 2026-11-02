@@ -237,7 +237,9 @@ async def test_a_hand_sbatch_while_the_envelope_is_open_asks_first_and_runs_noth
     assert len(world.sched.calls("sbatch")) == before                  # the command never ran
 
 
-async def test_a_confirmed_hand_sbatch_is_held_adopted_reserved_and_released(world):
+async def test_a_confirmed_hand_sbatch_runs_unmodified_and_its_job_is_adopted(world):
+    """D2 as the design says (round 3, the user's decision): the yes runs the command as it is; the job that appeared
+    while it ran is adopted after the fact — ledgered, reserved at its full request — with no envelope deadline."""
     from hpc_bridge import server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 20})
@@ -246,24 +248,21 @@ async def test_a_confirmed_hand_sbatch_is_held_adopted_reserved_and_released(wor
     assert out.phase == "complete" and out.jobs and out.jobs[0].source == "adopt", out
     native = out.jobs[0].native_id
     job = world.sched.job(native)
-    assert job["held_at_submit"] is True and job["held"] is False, job   # submitted held, released once reserved
-    # its deadline is set AT SUBMIT (a user may not `scontrol update Deadline=`: probe §1) and read back before release
-    assert job["deadline_epoch"] and abs(job["deadline_epoch"] - _epoch(first.envelope.deadline)) < 5, job
-    assert out.jobs[0].worst_case == pytest.approx(4.0)                 # 4 billing units × its 1 h, from scontrol
+    assert job["held_at_submit"] is False and job["deadline_epoch"] is None, job     # submitted as the command said
+    assert out.jobs[0].worst_case == pytest.approx(4.0) and out.jobs[0].unheld, out.jobs   # 4 × 1 h, from scontrol
     env = await server._status(world.app, first.envelope.envelope_id)
     assert out.jobs[0].job_id in env.envelope.job_ids
 
 
-async def test_a_hand_sbatch_that_does_not_fit_is_cancelled_while_still_held(world):
+async def test_a_hand_sbatch_that_does_not_fit_is_adopted_over_the_cap_and_never_cancelled(world):
     from hpc_bridge import server
 
     first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 6})   # 4 of 6 held by the first job
     script = _hand_script(world)
     out = await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
-    assert "exhausted" in (out.notice or "").lower() and not out.jobs, out
+    assert "over its cap" in (out.notice or "").lower() and out.jobs, out
     hand = [j for j in world.sched.submitted() if j["id"] != first.job.native_id]
-    assert len(hand) == 1 and hand[0]["state"] == "CANCELLED" and hand[0]["held"] is True, hand  # never released
-    assert ["scontrol", "release", hand[0]["id"]] not in world.sched.calls("scontrol")
+    assert len(hand) == 1 and hand[0]["state"] != "CANCELLED" and world.sched.calls("scancel") == [], hand
 
 
 async def test_a_hand_sbatch_with_no_envelope_open_keeps_the_advisory(world):
@@ -287,7 +286,7 @@ async def test_a_hand_qsub_is_gated_and_adopted_on_pbs(pbs):
     out = await server._run_shell(pbs.app, f"qsub {script}", shape="login", agent_call=True, confirm_spend=True)
     assert out.jobs and out.jobs[0].source == "adopt", out
     job = pbs.sched.job(out.jobs[0].native_id.split(".")[0])
-    assert job["held_at_submit"] is True and job["held"] is False, job
+    assert job["held_at_submit"] is False and job["state"] != "CANCELLED", job     # run unmodified, adopted after
 
 
 # ---- rule 2: the meter never understates -------------------------------------------------------------------------------

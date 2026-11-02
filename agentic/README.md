@@ -58,7 +58,7 @@ agentic/
                            first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 98 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 99 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -93,7 +93,7 @@ agentic/
                              envelope_exhausted · job_array_terms · hand_submit_gated_adopted · site_backstop_grptresmins ·
                              envelope_new_session_reasks · envelope_ceiling_sums · envelope_bypass_counted ·
                              meter_missing_from_sacct_full_walltime · envelope_leftover_held ·
-                             envelope_stop_races_submit
+                             envelope_stop_races_submit · hand_sbatch_adopted
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·

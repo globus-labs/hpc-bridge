@@ -1,7 +1,9 @@
-"""hand_submit_gated_adopted — decision D2 (c), gate and adopt (batch phase 2a, design §12 D2, §10): while an envelope is
-open, a recognised hand `qsub` answers needs_confirmation and runs nothing; on the user's yes it runs HELD, is adopted
-(ledgered, reserved against the envelope), released — and stop_endpoint cancels it with everything else of ours. Fake
-cluster, `pbs` profile (OpenPBS: `qsub -h`, `qrls`, `qstat -x -f -F json`); scripted.
+"""hand_submit_gated_adopted — decision D2, gate and adopt (batch phase 2a, design §12 D2, §10; round 3: as the design
+says): while an envelope is open, a recognised hand `qsub` answers needs_confirmation and runs nothing; on the user's
+yes it runs UNMODIFIED, and the job that appeared while it ran is adopted after the fact (ledgered, reserved against the
+envelope, named, no envelope deadline applied) — and stop_endpoint asks about it, then cancels it with everything else
+of ours on the user's "cancel". Fake cluster, `pbs` profile (OpenPBS `qselect`, `qstat -f -F json`); scripted. Its
+Slurm twin: hand_sbatch_adopted.
 
     HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=pbs ./agentic/run_smoke.sh hand_submit_gated_adopted
 
@@ -9,7 +11,8 @@ THE SCRIPT: connect; submit_job a small job (1 cpu × 10 min) under an envelope 
 `~/hand.pbs` (1 cpu, 10 min, `sleep 300`); run_shell(login, "qsub ~/hand.pbs") — asked, nothing runs; the user's yes:
 the same with confirm_spend=True — adopted; status(env) lists it; stop_endpoint until `down`.
 
-GRADED: the hand qsub was gated, then adopted (`gated_then_adopted`); the stop ended down (`stop_down_after_jobs`); PBS
+GRADED: the hand qsub was gated, then adopted (`gated_then_adopted`) and said so — appeared while the approved command
+ran, no envelope deadline (`adopted_named_without_deadline`); the stop ended down (`stop_down_after_jobs`); PBS
 says the hand job FINISHED (`world:hand_job_ended` — qdel'd by the stop) and the universal check finds no job of ours
 left (the adopted id is ours); within the envelope (`world:charged_within_envelope`).
 
@@ -30,7 +33,7 @@ TARGETS = ("fake",)
 REQUIRES = {"scheduler": "pbs", "mfa": "none"}
 SCHEDULER = "pbs"
 KIND = "regression"
-SUMMARY = "D2: a hand qsub under an open envelope asks first, then is held, adopted, reserved, and cancelled by stop"
+SUMMARY = "D2: a hand qsub under an open envelope asks first, then runs as is; its job is adopted, and the stop ends it"
 TAGS = ["fake", "pbs", "jobs", "envelope", "spend", "stop", "scripted"]
 PERSONA = None
 USER_GOAL = ""
@@ -92,6 +95,8 @@ async def hand_job_ended(ctx) -> Result:
     return Result("world:hand_job_ended", state == "F", f"hand job {hid}: job_state {state or '?'}")
 
 
-EXTRA_INVARIANTS = [gated_then_adopted, jc.stop_asked_about_jobs, jc.stop_down_after_jobs]
+EXTRA_INVARIANTS = [gated_then_adopted, jc.adopted_named_without_deadline, jc.stop_asked_about_jobs,
+                    jc.stop_down_after_jobs]
 WORLD_CHECKS = [hand_job_ended, jc.charged_within_envelope]
-EXPECT_OK = ["agent_engaged", "gated_then_adopted", "stop_asked_about_jobs", "stop_down_after_jobs"]
+EXPECT_OK = ["agent_engaged", "gated_then_adopted", "adopted_named_without_deadline", "stop_asked_about_jobs",
+             "stop_down_after_jobs"]
