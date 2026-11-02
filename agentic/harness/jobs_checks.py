@@ -181,6 +181,10 @@ async def submit(ops, *, yes: bool = True, scheduler: str = "slurm", **args: Any
         ops.say(f"the user approved: {(r.get('terms') or {}).get('basis') or ''} "
                 f"(envelope cap {(r.get('envelope') or {}).get('cap')})")
         r = await ops.call("submit_job", confirm_spend=True, **args)
+        if r.get("phase") == "needs_confirmation" and r.get("reason") == "envelope_needed":
+            # proposed again (round 2): what is held changed since the proposal — the user sees the new figure
+            ops.say(f"proposed again (envelope cap {(r.get('envelope') or {}).get('cap')}): the user approves that")
+            r = await ops.call("submit_job", confirm_spend=True, **args)
     return Submitted(r)
 
 
@@ -407,6 +411,71 @@ def ceiling_refused(t: Trace, *, ceiling: float) -> Result:
     ok = bool(refused) and named and total <= ceiling + 1e-6 and len(opened) >= 2
     return Result("ceiling_refused", ok, f"refused at call(s) {[i for i, _c in refused] or 'none'}; open caps "
                   f"{opened or 'none'} sum {total:g} of the ceiling {ceiling:g}")
+
+
+def proposal_covers_held(t: Trace, *, name: str) -> Result:
+    """Round 2 (live 2026-11-01, job_promote_track_cancel): the FIRST envelope proposal — made after a meter reading —
+    covers what the jobs hpc-bridge did not start already hold (the `name` job among them) plus this job's worst case,
+    and its notice names that job, so the user's yes can admit it."""
+    for i, c in asked(t, "envelope_needed"):
+        r = c.result or {}
+        env, terms = envelope_of(r), terms_of(r)
+        held = [u for u in env.get("unledgered") or [] if isinstance(u, dict)]
+        mine = [u for u in held if str(u.get("name", "")).startswith(name)]
+        total = sum(float(u.get("charged") or 0) + float(u.get("committed") or 0) for u in held)
+        worst = float(terms.get("worst_case") or 0)
+        cap = float(env.get("cap") or 0)
+        named = bool(mine) and str(mine[0].get("native_id")) in str(r.get("notice") or "")
+        ok = bool(mine) and cap + 1e-6 >= total + worst and named
+        return Result("proposal_covers_held", ok, f"call {i}: cap {cap:g} for {total:g} held "
+                      f"({[u.get('native_id') for u in held]}) + worst case {worst:g}; the {name!r} job "
+                      f"{'named' if named else 'NOT named'} in the notice")
+    return Result("proposal_covers_held", False, "no envelope proposal (needs_confirmation, envelope_needed)")
+
+
+def proposal_yes_admits(t: Trace) -> Result:
+    """The user's yes to the proposal (after at most one proposal again, should what is held change between) was
+    admitted — it never refused itself (envelope_exhausted) for an amount the user had not seen."""
+    calls = submits(t)
+    first = next((k for k, (_i, c) in enumerate(calls)
+                  if str((c.result or {}).get("phase")) == "needs_confirmation"), None)
+    if first is None:
+        return Result("proposal_yes_admits", False, "no proposal")
+    for i, c in calls[first + 1:]:
+        r = c.result or {}
+        if str(r.get("phase")) in JOB_SUBMITTED:
+            return Result("proposal_yes_admits", True, f"call {i}: {r.get('phase')}")
+        if r.get("reason") != "envelope_needed":
+            return Result("proposal_yes_admits", False, f"call {i}: {r.get('phase')} ({r.get('reason')}): "
+                          f"{str(r.get('notice') or '')[:160]!r}")
+    return Result("proposal_yes_admits", False, "the yes never came back admitted")
+
+
+def no_admission_during_stop(t: Trace) -> Result:
+    """Round 2 (review P5): a submit_job issued while a stop ran is never admitted from the envelope the stop closes —
+    it is proposed afresh (needs_confirmation) — or, if it got in, the stop did not answer `down`."""
+    stops = t.named("stop_endpoint")
+    subs = submits(t)
+    if not stops or not subs:
+        return Result("no_admission_during_stop", False, "premise not met: no stop or no submit_job")
+    i_stop, stop = stops[0]
+    if stop.t_call is not None and stop.t_result is not None:
+        late = [(i, c) for i, c in subs if not _confirms(c) and c.t_call is not None
+                and stop.t_call <= c.t_call <= stop.t_result]
+    else:   # no timestamps on the record: the unconfirmed submit_job right beside the first stop
+        late = [(i, c) for i, c in subs if not _confirms(c) and abs(i - i_stop) == 1]
+    if not late:
+        return Result("no_admission_during_stop", False, "premise not met: no submit_job was issued while the stop ran")
+    i, c = late[0]
+    phase = str((c.result or {}).get("phase"))
+    said = str((stop.result or {}).get("status"))
+    ok = phase not in JOB_SUBMITTED or said != "down"
+    return Result("no_admission_during_stop", ok, f"the submit during the stop (call {i}) answered {phase!r}; the stop "
+                  f"(call {i_stop}) said {said!r}")
+
+
+def _confirms(c: ToolCall) -> bool:
+    return str(c.input.get("confirm_spend")).strip().lower() == "true"
 
 
 def bypass_named_and_counted(t: Trace, *, name: str) -> Result:

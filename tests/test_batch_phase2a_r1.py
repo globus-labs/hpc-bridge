@@ -221,13 +221,17 @@ async def test_A4_a_hand_job_with_its_own_later_deadline_is_cancelled_while_held
     assert "deadline" in (out.notice or ""), out.notice
 
 
-async def test_A4_a_hand_job_whose_walltime_cannot_finish_before_the_deadline_is_cancelled_while_held(world):
+async def test_A4_a_hand_job_whose_walltime_cannot_finish_before_the_deadline_is_cancelled_while_held(pbs):
+    """On PBS (no deadline at submit) the read-back fit check cancels it while held. On Slurm sbatch itself refuses a
+    walltime past the wrapper's --deadline (probe r1): test_batch_phase2a_r2.py pins that answer."""
     from hpc_bridge import server
 
-    first = await _confirmed(world.app, command="sleep 60", envelope={"cap": 50, "deadline_hours": 2})
-    script = _hand_script(world, "#!/bin/bash\n#SBATCH -t 05:00:00\n#SBATCH -p main\nsleep 300\n")
-    out = await server._run_shell(world.app, f"sbatch {script}", shape="login", agent_call=True, confirm_spend=True)
-    hand = _others(world, first)[0]
+    first = await _confirmed(pbs.app, command="sleep 60", partition="workq",
+                             envelope={"cap": 50, "deadline_hours": 2})
+    script = pbs.tmp / "home" / "hand.pbs"
+    script.write_text("#!/bin/bash\n#PBS -l select=1:ncpus=4\n#PBS -l walltime=05:00:00\nsleep 300\n")
+    out = await server._run_shell(pbs.app, f"qsub {script}", shape="login", agent_call=True, confirm_spend=True)
+    hand = next(j for j in pbs.sched.submitted() if j["id"] != first.job.native_id.split(".")[0])
     assert hand["state"] == "CANCELLED" and hand["held"], (out.notice, hand)
 
 

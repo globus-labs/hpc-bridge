@@ -538,6 +538,9 @@ class AppCtx:
     # job ids this process is admitting right now (reserved, not yet submitted): a stop or cancel meanwhile asks the
     # admission to give up (`cancel_requested`) and counts the job as one that can still bill (review B2)
     jobs_admitting: set[str] = field(default_factory=set)
+    # the envelopes this session proposed and the user has not yet said yes to (jobs._proposal_key -> the cap shown,
+    # what was held then): a yes opens at the cap the user saw, or is proposed again when what is held outgrew it
+    jobs_proposals: dict[tuple, dict] = field(default_factory=dict)
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

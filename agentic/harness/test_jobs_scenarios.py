@@ -26,7 +26,8 @@ from test_batch_scenarios import _connect_answers, _drive, _Server, _stub_sdk  #
 
 JOB_SCENARIOS = ["job_promote_track_cancel", "job_array_terms", "envelope_exhausted", "hand_submit_gated_adopted",
                  "site_backstop_grptresmins", "envelope_new_session_reasks", "envelope_ceiling_sums",
-                 "envelope_bypass_counted", "meter_missing_from_sacct_full_walltime"]
+                 "envelope_bypass_counted", "meter_missing_from_sacct_full_walltime", "envelope_leftover_held",
+                 "envelope_stop_races_submit"]
 JOB, ENV = "job-0123456789ab", "env-0123456789ab"
 
 
@@ -360,6 +361,79 @@ def test_spend_follows_question_credits_submit_jobs_own_question():
     unasked = Trace([_c("connect_facility", {}, {"phase": "needs_account"}),
                      _c("run_shell", {"shape": "login", "command": "sbatch j.sh"}, {"phase": "complete"})])
     assert not spend_follows_question(unasked).ok              # a hand submit nobody asked about still fails
+
+
+# ---- fix round 2: the proposal covers what is already held (live 2026-11-01, job_promote_track_cancel) ------------------
+
+def _leftover_ask(cap, *, held=4.0, worst=4.0, name="leftover", nid="1001", notice=None):
+    r = _ask(worst=worst, notice=notice if notice is not None else f"already held: job {nid} ({name}) …")
+    r["envelope"].update(cap=cap, unledgered=[{"native_id": nid, "name": name, "state": "RUNNING", "charged": 0.0,
+                                               "committed": held}])
+    return r
+
+
+def test_proposal_covers_held_grades_the_first_proposal():
+    ok = Trace([_c("submit_job", {"command": "x"}, _leftover_ask(8.0)),
+                _c("submit_job", {"command": "x", "confirm_spend": True}, _job(native="1002"))])
+    assert jc.proposal_covers_held(ok, name="leftover").ok and jc.proposal_yes_admits(ok).ok
+    short = Trace([_c("submit_job", {"command": "x"}, _leftover_ask(4.0)),
+                   _c("submit_job", {"command": "x", "confirm_spend": True},
+                      _ask("envelope_exhausted", notice="Envelope … is exhausted"))])
+    assert not jc.proposal_covers_held(short, name="leftover").ok        # the cap left no room for what was held
+    assert not jc.proposal_yes_admits(short).ok                          # and the yes refused itself
+    unnamed = Trace([_c("submit_job", {"command": "x"}, _leftover_ask(8.0, notice="a cap of 8"))])
+    assert not jc.proposal_covers_held(unnamed, name="leftover").ok      # held, but the notice never named it
+    assert not jc.proposal_covers_held(Trace([]), name="leftover").ok
+
+
+def test_a_re_proposal_is_answered_once_more_and_admits():
+    reproposed = Trace([_c("submit_job", {"command": "x"}, _leftover_ask(8.0)),
+                        _c("submit_job", {"command": "x", "confirm_spend": True}, _leftover_ask(10.0, held=6.0)),
+                        _c("submit_job", {"command": "x", "confirm_spend": True}, _job(native="1002"))])
+    assert jc.proposal_yes_admits(reproposed).ok
+
+
+def test_no_admission_during_stop_reads_the_submit_issued_while_the_stop_ran():
+    stop = {"status": "down", "spend_stopped": True}
+    fresh = Trace([_c("stop_endpoint", {}, stop, t=(10.0, 13.0)),
+                   _c("submit_job", {"command": "x"}, _ask(), t=(10.5, 11.0))])
+    assert jc.no_admission_during_stop(fresh).ok                         # proposed afresh: not admitted
+    admitted = Trace([_c("stop_endpoint", {}, stop, t=(10.0, 13.0)),
+                      _c("submit_job", {"command": "x"}, _job(), t=(10.5, 11.0))])
+    assert not jc.no_admission_during_stop(admitted).ok                  # admitted, and the stop still said down
+    honest = Trace([_c("stop_endpoint", {}, {"status": "draining"}, t=(10.0, 13.0)),
+                    _c("submit_job", {"command": "x"}, _job(), t=(10.5, 11.0))])
+    assert jc.no_admission_during_stop(honest).ok                        # admitted, and the stop said so
+    after = Trace([_c("stop_endpoint", {}, stop, t=(10.0, 13.0)),
+                   _c("submit_job", {"command": "x"}, _job(), t=(14.0, 15.0))])
+    assert not jc.no_admission_during_stop(after).ok                     # premise not met: none during the stop
+
+
+def test_the_leftover_script_says_yes_to_a_re_proposal(monkeypatch, tmp_path):
+    _stub_sdk(monkeypatch, tmp_path)
+    mod = importlib.import_module("envelope_leftover_held")
+    yeses: list[dict] = []
+
+    def submit(a):
+        if not a.get("confirm_spend"):
+            return _leftover_ask(8.0)
+        yeses.append(a)
+        return _leftover_ask(10.0, held=6.0) if len(yeses) == 1 else _job(native="1002")
+
+    server = _Server({
+        "connect_facility": _connect_answers(),
+        "run_shell": lambda a: {"phase": "complete", "exit_code": 0, "stdout": "1001\n"},
+        "submit_job": submit,
+        "status": lambda a: _job(),
+        "stop_endpoint": lambda a: {"status": "down", "spend_stopped": True},
+    })
+    res = _drive(mod.SCRIPT, server)
+    assert not res.final.is_error, res.final.result
+    hidden = [c for c in res.trace.calls if c.name == "run_shell"]
+    assert hidden and hidden[0].input.get("command") == mod.HIDDEN          # the leftover comes BEFORE the proposal
+    first_submit = next(i for i, c in enumerate(res.trace.calls) if c.name == "submit_job")
+    assert res.trace.calls.index(hidden[0]) < first_submit
+    assert len(yeses) == 2 and jc.proposal_yes_admits(res.trace).ok
 
 
 # ---- the service actions ---------------------------------------------------------------------------------------------

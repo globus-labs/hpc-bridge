@@ -11,7 +11,10 @@ probe_pbs.out, 2026-11-01):
   set at submit (`--deadline`, in the submitting shell's local time, or `now+N` seconds);
 - `scontrol show job -o` prints `ReqTRES=` / `AllocTRES=` (never `TRES=`) and `NumNodes=N-N`;
 - `sacct -X` lists NO row for a pending array's tasks (only the started `N_i`); `squeue` shows them as `N_[a-b%t]`;
-- `scancel --state=PENDING` on an array leaves its running tasks; a cancelled job reads `CANCELLED by <uid>`;
+- `scancel --state=PENDING` on an array leaves its running tasks; a cancelled job reads `CANCELLED by <uid>`; a scancel
+  of an ended job answers rc 0 and nothing (probe r1);
+- sbatch REFUSES a job whose time limit cannot end before its `--deadline` ("Requested time limit is invalid", probe
+  r1); sacct's `Reason` says `None` for a pending job — squeue's `%r` has the reason (live r1: AssocGrpCPUMinutesLimit);
 - PBS: `qsub -h` holds (`H`), `qrls` releases, a qdel'd job is `F` with Exit_status 271, `Account_Name` may be absent;
   `qstat -t` lists an array's subjobs `N[i].server` beside its parent `N[].server`.
 
@@ -257,10 +260,17 @@ def sbatch(argv: list[str], st: dict[str, Any]) -> int:
                  "elapsed": {str(i): 0 for i in idx}}
     held = bool(opts.get("hold") or opts.get("H"))
     dl = opts.get("deadline")
+    limit_min = _minutes(str(opts.get("time", "30")))
+    dl_epoch = _deadline_epoch(dl)
+    if dl_epoch is not None and limit_min * 60 > dl_epoch - time.time():   # probe r1: refused at submit
+        st["next"] -= 1
+        print("sbatch: error: Batch job submission failed: Requested time limit is invalid (missing or exceeds some "
+              "limit)", file=sys.stderr)
+        return 1
     job = _new_job(jid, st, name=opts.get("job-name", Path(script_path).name if script_path else "wrap"),
                    partition=opts.get("partition", "main"), account=opts.get("account", ""), nodes=nodes,
-                   timelimit_min=_minutes(str(opts.get("time", "30"))), held=held, held_at_submit=held,
-                   reason="JobHeldUser" if held else "Priority", deadline=dl, deadline_epoch=_deadline_epoch(dl),
+                   timelimit_min=limit_min, held=held, held_at_submit=held,
+                   reason="JobHeldUser" if held else "Priority", deadline=dl, deadline_epoch=dl_epoch,
                    array=opts.get("array"), tasks=tasks, script=script, script_path=script_path, via="sbatch",
                    tz=os.environ.get("TZ"), argv=argv, dependency=opts.get("dependency"),
                    comment=opts.get("comment"), submit_env=_submit_env(),
@@ -312,7 +322,8 @@ _SACCT = {
     "Partition": lambda j, t: j["partition"],
     "Account": lambda j, t: j["account"],
     "ExitCode": lambda j, t: j["exit"],
-    "Reason": lambda j, t: j["reason"] if _task_state(j, t) == "PENDING" else "None",
+    # the fake cluster's sacct said `None` for a job pending under a site limit (live 2026-11-01): the reason is squeue's
+    "Reason": lambda j, t: "None",
     "NNodes": lambda j, t: str(j["nodes"]),
     "Submit": lambda j, t: time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(j["submit"])),
     "Start": lambda j, t: "Unknown" if _task_state(j, t) == "PENDING" else time.strftime(
@@ -424,6 +435,7 @@ def squeue(argv: list[str], st: dict[str, Any]) -> int:
                               ("%t", {"PENDING": "PD", "RUNNING": "R", "COMPLETING": "CG"}.get(state, state[:2])),
                               ("%j", j["name"]), ("%M", _hms(el)), ("%l", _hms(j["timelimit_min"])),
                               ("%r", j["reason"]), ("%P", j["partition"]), ("%D", str(j["nodes"])),
+                              ("%C", str(j.get("cpus") or _bill(j))),
                               ("%k", j.get("comment") or "(null)")):
                 line = line.replace(code, val)
             print(line)

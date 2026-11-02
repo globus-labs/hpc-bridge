@@ -1182,6 +1182,10 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus
     if jobs not in (None, "cancel", "keep"):
         return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
+    try:   # nothing is admitted once a stop has begun — not while it releases the blocks either (review r2, P5)
+        jobmode.close_admission(app)
+    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: said below
+        print(f"hpc-bridge: the stop could not close admission ({type(exc).__name__}: {exc})", file=sys.stderr)
     try:
         live = await jobmode.billing_jobs(app)
     except Exception as exc:  # noqa: BLE001 - the ledger unreadable: the blocks are released, and it is never down
@@ -1198,7 +1202,7 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus
     elif live and jobs == "keep":
         jobmode.keep_for_stop(app, live)
     st = await _stop_endpoint_blocks(app)
-    try:
+    try:   # the ledger is read again before the answer: an admission that raced the stop is never left out of it
         return await jobmode.after_stop(app, st, jobs if live else None, cancelled)
     except Exception as exc:  # noqa: BLE001
         print(f"hpc-bridge: the stop's Jobs-mode answer failed ({type(exc).__name__}: {exc})", file=sys.stderr)
@@ -2269,13 +2273,19 @@ async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, enve
         return ShellOutcome(phase="failed", block_state="cold", exit_code=None,
                             notice=(f"NOTHING ran: the hold for this hand submit could not be set up on the login node "
                                     f"({hand}). Try again; without the hold hpc-bridge does not run it."))
-    ready = await _ready_session(app, shape, session_id)
+    try:
+        ready = await _ready_session(app, shape, session_id)
+    except BaseException:   # cancelled (or failed) before the command was sent: the hand is closed (review r2, P1)
+        jobmode.drop_hand(app, hand, "the call ended before the command was sent")
+        raise
     if isinstance(ready, ShellOutcome):
         jobmode.drop_hand(app, hand, ready.phase)
         return ready
     runner, session, rt, guard = ready
     key = secrets.token_hex(8)
-    held = jobmode.held_command(hand, command, float(envelope["deadline"]))
+    # once sent, the command's exit status (the wrapper's EXIT trap) says when it ended — whatever becomes of this call
+    jobmode.hand_started(app, hand, f"{session.quoted_state_dir()}/results/{key}/rc")
+    held = jobmode.held_command(hand, command)
     out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
                                   lambda: session_shell.wrap(held, session, guard=guard, result_key=key),
                                   agent_call=True, submission=None, guard=guard, result_key=key)

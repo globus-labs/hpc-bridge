@@ -935,14 +935,19 @@ class Ledger:
         with self._tx(immediate=True) as c:
             c.execute(f"update job set {cols} where id = ?", (*fields.values(), job_id))
 
-    def move_job(self, job_id: str, *, only_from: Iterable[str], unless_cancel: bool = False, **fields: Any) -> bool:
+    def move_job(self, job_id: str, *, only_from: Iterable[str], unless_cancel: bool = False,
+                 while_admitting: bool = False, **fields: Any) -> bool:
         """Move a job's row only from `only_from` states (and, with `unless_cancel`, only if no stop or cancel asked
-        for it meanwhile) — one transaction, so a stop and an admission cannot both win. Returns whether it moved."""
+        for it meanwhile; with `while_admitting`, only while its envelope still admits — a stop closes it first) — one
+        transaction, so a stop and an admission cannot both win. Returns whether it moved."""
         st = list(only_from)
         cols = ", ".join(f"{k} = ?" for k in fields)
         q = f"update job set {cols} where id = ? and state in ({','.join('?' * len(st))})"
         if unless_cancel:
             q += " and coalesce(cancel_requested, 0) = 0"
+        if while_admitting:
+            q += (" and exists (select 1 from envelope where envelope.id = job.envelope_id and envelope.state in "
+                  f"({','.join(repr(s) for s in ENVELOPE_ADMITTING)}))")
         with self._tx(immediate=True) as c:
             return c.execute(q, (*fields.values(), job_id, *st)).rowcount == 1
 

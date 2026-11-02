@@ -21,8 +21,11 @@ installed plugin only when that version changes); git tags mark releases.
     168 h, carried by every Slurm job as `--deadline` in the cluster's own local time, no TZ forced on sbatch; soft on
     PBS — max_jobs, accounts, partitions, a named site backstop). The first call answers `needs_confirmation` with the
     job's terms (worst case = every array task, never the throttle's few, never below the queue's minimum charge) and
-    nothing is submitted; a proposed cap and every "at least" figure are rounded UP (asking for the figure admits the
-    job), what remains is rounded down. Inside the envelope a job that fits is admitted at once, one that does not
+    nothing is submitted; the proposal is made after a meter reading, and its cap covers what jobs of the user's that
+    hpc-bridge did not start already hold (named, so the user can exclude one) plus the job; a yes after what is held
+    grew is proposed again with the new figure — it never refuses itself, nor opens at a cap the user did not see. A
+    proposed cap and every "at least" figure are rounded UP (asking for the figure admits the job), what remains is
+    rounded down. Inside the envelope a job that fits is admitted at once, one that does not
     answers `envelope_exhausted`. The first job of an envelope is admitted only after one meter reading of what else the
     user runs (`meter_unread` if the accounting cannot be read). Admission reserves the worst case in one
     `BEGIN IMMEDIATE` transaction before anything is submitted, and a stop or cancel that comes while a job is being
@@ -34,28 +37,40 @@ installed plugin only when that version changes); git tags mark releases.
     count. The terms state the honest limit: the envelope binds only what hpc-bridge starts.
   - **The meter** reads one sacct (Slurm, `-D` so a requeued job's earlier runs count, with squeue in the same call:
     an array's pending tasks, and what is still live) or `qstat -x -f -F json -t` (PBS, task by task) per look, each
-    bounded (`HPC_BRIDGE_METER_TIMEOUT_S`, default 15 s: a hung sacct is an unread one, never a held channel):
+    bounded (`HPC_BRIDGE_METER_TIMEOUT_S`, default 15 s: a hung sacct, an unreachable PBS server, a killed qstat is an
+    unread read, never a held channel nor "no jobs"):
     billing TRES × elapsed, never below the queue's minimum charge (`min_charge_h`, a new catalog field on a
     partition); committed = a running job's remaining walltime, a queued one's full walltime; a ledger job sacct does
     not list holds its full walltime; jobs of the user's that hpc-bridge did not start are counted and named (one with
-    no time limit, to the envelope's deadline; through an accounting outage, at their last count), until the user
-    excludes them (`exclude_jobs`).
+    no time limit, for all the time left to the envelope's deadline; an array's pending tasks, which only squeue lists;
+    through an accounting outage, at their last count), until the user
+    excludes them (`exclude_jobs`). A pending job's reason is the scheduler's own (squeue `%r`; PBS: its comment —
+    sacct says `None`), and one a site limit holds (an association's or QOS's limit, a GrpTRESMins backstop) is said
+    plainly: it will not start until that limit changes.
   - **D2, gate and adopt:** a recognised hand `sbatch`/`qsub` anywhere on a command line while this session's envelope
     is open answers `needs_confirmation` and runs nothing (`login_shell` refuses it, and a `run_batch` template that
     submits jobs is refused, pointing at `submit_job` with an array). On the yes (`run_shell(…, confirm_spend=True)`)
     the command runs with a wrapper first on its PATH — so `command`, `env`, `nohup`, `timeout`, `nice` and `exec`
-    reach it — that submits each job HELD with the envelope's deadline in the same submit and keeps the real
-    sbatch/qsub's own receipt in a per-command mark file; neither the wrapper nor its variables reach the job. A job is
+    reach it — that submits each job HELD with the envelope's deadline in the same submit (reading only sbatch's or
+    qsub's own options, never the script's arguments) and keeps the real sbatch/qsub's own receipt in a per-command
+    mark file; the real command runs with the command's own PATH minus the wrapper, no variable of the wrapper's is
+    exported, and once the hand is closed the wrapper falls through to the real command for anything that inherited
+    it. A job is
     the command's only by that evidence (never by digits in its output): it is read back (its request, its deadline,
     whether it can finish before the envelope's), reserved and released, or cancelled while still held. A job that
     appeared meanwhile without a mark (an absolute path, sudo) is counted, named "submitted unheld, no deadline applied",
-    and never cancelled by hpc-bridge on its own. Its ledger row is written before the command runs, so a command that
-    outlives the sync-wait is reconciled by the next status, submit_job or stop.
+    and never cancelled by hpc-bridge on its own — adopted only once the command has ended, so a later job of the
+    user's is never read as the command's. Its ledger row is written before the command runs and closed on every exit
+    path, so a command that outlives the sync-wait is reconciled (bounded) by the next status, submit_job or stop. When sbatch refuses a job because the
+    envelope's deadline comes before its walltime could end, the answer says so, with the walltime that fits.
   - **A stop asks about jobs that can still bill** — any session's, a dead server's, a held hand submit and another
     facility's included — naming each one, and changes nothing until `stop_endpoint(jobs="cancel")` (cancel them;
     `down` only once none can bill) or `jobs="keep"` (release only the blocks; `draining`, never `down`, naming how to
-    end them). Nothing is admitted after a stop either way. A cancel says "cancelled" only for what the scheduler
-    cancelled; a stop that cannot read the ledger is never `down`.
+    end them). A stop closes admission as it BEGINS (a submit_job during it is proposed afresh) and reads the ledger
+    again before it answers; another facility's PBS job (no scheduler deadline) stays listed until a read shows it
+    ended. Nothing is admitted after a stop either way. A cancel says "cancelled" only for a job whose state
+    afterwards is cancelled — never by scancel's exit code (it answers 0 for a job that had already ended); a stop
+    that cannot read the ledger is never `down`.
   - `status` keeps one model for every kind of id (`kind: batch|job|envelope`, optional `job` / `envelope`), so its
     structured output survives.
 - **Batches (phase 1): one command over many rows on the confirmed block, with a durable ledger.** Three tools:

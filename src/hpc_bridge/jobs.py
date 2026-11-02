@@ -268,6 +268,8 @@ async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known
         for j in jobs:
             if j.get("native_id") or j.get("state") not in ("submit_unknown", "reserved"):
                 continue
+            if j.get("source") == "pool_block":   # a block's reservation waits for its block, however long it queues
+                continue
             base = by_name.get(f"hpcb-{j['id']}")
             if base is not None:
                 led.update_job(j["id"], native_id=base, state="queued")
@@ -382,10 +384,28 @@ def envelope_info(app: AppCtx, e: dict[str, Any], *, state: str | None = None) -
         excluded=json.loads(e.get("excluded") or "[]"))
 
 
+# Why a pending job waits, when it is a SITE LIMIT (an association's or QOS's Grp*/Max* limit, a partition's limit, a
+# PBS server or queue limit) — it may never run (live 2026-11-01: AssocGrpCPUMinutesLimit under GrpTRESMins + `safe`).
+# Priority, Resources, Dependency, BeginTime, JobHeldUser are not.
+_SITE_LIMIT = re.compile(r"^(?:Assoc|QOS)|MaxJobs|MaxSubmit|Limit|would exceed|AccountNotAllowed|InvalidAccount"
+                         r"|InvalidQOS", re.I)
+
+
+def site_limit(reason: str | None) -> bool:
+    return bool(reason) and _SITE_LIMIT.search(str(reason)) is not None
+
+
+def _limit_words(reason: str, ident: str) -> str:
+    return (f" A site limit holds it ({reason}): it will not start until that limit changes (an administrator lifts "
+            "or raises it, or the usage it counts ages out), and it bills nothing while it waits — tell the user; "
+            f"cancel('{ident}', 'abort') ends it.")
+
+
 def _bills_note(info: EnvelopeInfo) -> str:
     live = [j for j in info.jobs if j.committed > 0 or j.state in ("RUNNING", "PENDING", "HELD", "RESERVED")]
-    parts = [f"{j.job_id} ({j.native_id or 'not submitted'}, {j.state}{', submitted unheld' if j.unheld else ''}, "
-             f"{_g(j.charged)} charged, up to {_gu(j.committed)} more)" for j in live]
+    parts = [f"{j.job_id} ({j.native_id or 'not submitted'}, {j.state}{', submitted unheld' if j.unheld else ''}"
+             + (f", held by a site limit: {j.reason}" if j.state == "PENDING" and site_limit(j.reason) else "")
+             + f", {_g(j.charged)} charged, up to {_gu(j.committed)} more)" for j in live]
     parts += [f"job {u.native_id} ({u.name or '?'}, {u.state}: not started by hpc-bridge, counted {_g(u.charged)} + "
               f"{_gu(u.committed)})" for u in info.unledgered]
     return "; ".join(parts) or "nothing"
@@ -761,16 +781,57 @@ def _deadline_hours(req: EnvelopeRequest) -> float:
     return h
 
 
-def _proposed(app: AppCtx, req: EnvelopeRequest, spec: Spec, deadline: float) -> EnvelopeInfo:
-    # the default cap is the job's worst case rounded UP (live 2026-11-01: rounded to 3.33 below a worst case of
-    # 3.333…, the proposal refused itself)
-    cap = float(req.cap) if req.cap is not None else _up(spec.worst_case, 2)
+def _proposed(app: AppCtx, req: EnvelopeRequest, spec: Spec, deadline: float, *, cap: float,
+               held: list[dict[str, Any]]) -> EnvelopeInfo:
+    """The envelope a proposal shows: its cap, and what the jobs hpc-bridge did not start already hold in it."""
+    spent = sum(float(u.get("charged") or 0) for u in held)
+    committed = sum(float(u.get("committed") or 0) for u in held)
     return EnvelopeInfo(envelope_id="env-" + "0" * 12, state="proposed", facility=facility_key(app),
-                        account=spec.account, unit=UNIT, cap=cap, remaining=cap,
+                        account=spec.account, unit=UNIT, cap=cap, spent=round(spent, 4), committed=round(committed, 4),
+                        remaining=_down(cap - spent - committed),
                         max_jobs=req.max_jobs, max_nodes_per_block=req.max_nodes_per_block,
                         accounts=req.accounts or ([spec.account] if spec.account else []),
                         partitions=req.partitions or [], deadline=_iso(deadline) or "", at_deadline=req.at_deadline,
-                        site_backstop=req.site_backstop or "none", owned=True, binds=BINDS)
+                        site_backstop=req.site_backstop or "none", owned=True, binds=BINDS,
+                        unledgered=[UnledgeredJob(**u) for u in held])
+
+
+def _proposal_key(app: AppCtx, spec: Spec) -> tuple:
+    return (facility_key(app), spec.account or "", spec.partition or "", spec.tasks, round(spec.worst_case, 6))
+
+
+async def _held_now(app: AppCtx, accounts: list[str], exclude: list[str], horizon_s: float) -> tuple[
+        bool, list[dict[str, Any]], str]:
+    """What the jobs hpc-bridge did not start hold on this facility right now — the reading a NEW envelope's proposal
+    stands on (live 2026-11-01: a proposal at exactly the job's worst case, a leftover job of the user's counted by the
+    yes, and the yes refused itself). (read, those jobs as the meter counts them, why not read)."""
+    if not _can_reach(app):
+        return False, [], "no login channel"
+    led = _ledger(app)
+    sched = scheduler_of(app)
+    known = {_base(j["native_id"]) for j in led.jobs(envelope_ids=[e["id"] for e in
+                                                                   led.envelopes(facility=facility_key(app))])
+             if j.get("native_id")}
+    cmd = meter.pbs_cmd() if sched == "pbs" else meter.slurm_cmd(time.strftime("%Y-%m-%dT%H:%M:%S",
+                                                                                time.gmtime(_now() - 120)))
+    try:
+        out = await _login(app, cmd)
+    except Exception as exc:  # noqa: BLE001 - not read: the proposal says so
+        return False, [], f"{type(exc).__name__}: {exc}"
+    raw = _text(out)
+    if meter.END_MARK not in raw:
+        return False, [], raw.strip()[-200:] or "the login shape did not answer"
+    view = meter.parse_pbs(raw) if sched == "pbs" else meter.parse_slurm(raw)
+    meter.journal_tick(envelope_id=None, jobs=0, sacct_calls=view.calls, source=view.source)
+    if not view.ok:
+        return False, [], view.error or "the accounting did not answer"
+    accts = {a for a in accounts if a}
+    return True, meter.unledgered(view, known, set(exclude), accounts=accts or None, horizon_s=horizon_s), ""
+
+
+def _held_words(held: list[dict[str, Any]]) -> str:
+    return ", ".join(f"job {u['native_id']} ({u.get('name') or '?'}, {u.get('state')}: "
+                     f"{_gu(float(u.get('charged') or 0) + float(u.get('committed') or 0))})" for u in held)
 
 
 def _limits_refusal(req: EnvelopeRequest | None, e: dict[str, Any] | None, spec: Spec) -> str | None:
@@ -865,35 +926,70 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
 
 async def _open_and_admit(app: AppCtx, spec: Spec, req: EnvelopeRequest, hours: float, *, confirm_spend: bool,
                           exclude: list[str] | None) -> JobStatus:
+    """No envelope of this session here yet: propose one, after reading what the jobs hpc-bridge did not start already
+    hold (its cap, by default, covers them plus this job — rounded up), or open it on the user's yes. A yes with no cap
+    of its own opens at the cap this session PROPOSED; when what is held outgrew it (or no proposal of this server
+    preceded the yes) it is proposed again — the yes never refuses itself for an amount the user could not see, and
+    never opens at one they did not see (round 2)."""
     deadline = _now() + hours * 3600
-    proposal = _proposed(app, req, spec, deadline)
     terms = terms_of(app, spec, deadline, req.site_backstop)
     if spec.walltime_s > hours * 3600:
         return _refused(f"the job's walltime ({_hms(spec.walltime_s)}) does not fit before the envelope's deadline "
                         f"({_g(hours)} h): it could never finish in it — ask for a longer deadline or a shorter job")
+    accts = req.accounts or ([spec.account] if spec.account else [])
+    read, held, unread = await _held_now(app, accts or [spec.account or ""], list(exclude or []), hours * 3600)
+    held_sum = sum(float(u.get("charged") or 0) + float(u.get("committed") or 0) for u in held)
+    need = _up(held_sum + spec.worst_case, 2)
+    key = _proposal_key(app, spec)
+    prop = app.jobs_proposals.get(key)
+    if req.cap is not None:
+        cap = float(req.cap)
+    elif confirm_spend and prop is not None and need <= float(prop["cap"]) + 1e-9:
+        cap = float(prop["cap"])
+    else:
+        cap = need
+    proposal = _proposed(app, req, spec, deadline, cap=cap, held=held)
     if (why := _limits_refusal(req, None, spec)) is not None:
         return JobStatus(phase="refused" if confirm_spend else "needs_confirmation", reason="envelope_limit",
                          terms=terms, envelope=proposal, notice=f"{why}. Nothing was submitted.")
-    if proposal.cap + 1e-9 < spec.worst_case:
+    held_note = (f" Already held on this facility and account: {_gu(held_sum)} {UNIT} by job(s) hpc-bridge did not "
+                 f"start, which count against any envelope here — {_held_words(held)}. If one is not the user's to "
+                 "count here, pass exclude_jobs=[…] with their yes and it is never counted." if held else "")
+    if not read:
+        held_note = (f" What else the user runs could not be read just now ({unread}): the cap covers this job alone, "
+                     "and the yes is admitted only once a reading works.")
+    if cap + 1e-9 < held_sum + spec.worst_case:
         return JobStatus(phase="needs_confirmation", reason="envelope_exhausted", terms=terms, envelope=proposal,
-                         notice=(f"The envelope asked for ({_g(proposal.cap)} {UNIT}) cannot hold this job: its worst "
-                                 f"case is {_gu(spec.worst_case)} ({spec.basis}). Ask the user to approve at least "
-                                 f"{_gu(spec.worst_case)}, or a smaller job — do not split the work to fit. Nothing "
-                                 "was submitted."))
+                         notice=(f"The envelope asked for ({_g(cap)} {UNIT}) cannot hold this job: its worst case is "
+                                 f"{_gu(spec.worst_case)} ({spec.basis}).{held_note} Ask the user to approve at least "
+                                 f"{_gu(held_sum + spec.worst_case)}, or a smaller job — do not split the work to fit. "
+                                 "Nothing was submitted."))
     accounts = proposal.accounts or [spec.account or ""]
     top, open_caps = _ceiling_room(app, accounts)
     if top is not None and open_caps + proposal.cap > top + 1e-9:
         return _ceiling_refusal(top, open_caps, proposal.cap)
-    if not confirm_spend:
+    asking_again = confirm_spend and req.cap is None and (prop is None or cap > float(prop["cap"]) + 1e-9)
+    if not confirm_spend or asking_again:
+        if req.cap is None:
+            app.jobs_proposals[key] = {"cap": cap, "held": held_sum, "at": _now()}
         backstop = (f"site backstop: {req.site_backstop}" if req.site_backstop else "site backstop: none")
+        why_again = ""
+        if asking_again and prop is not None:
+            why_again = (f"What is held changed since the proposal ({_gu(float(prop['held']))} then, "
+                         f"{_gu(held_sum)} now), so the yes is not admitted at a figure the user did not see: this is "
+                         "the proposal again. ")
+        elif asking_again:
+            why_again = ("No proposal of this server came before this yes (a restart, or the question was skipped), "
+                         "so nothing is opened at a figure the user did not see: this is the proposal. ")
         return JobStatus(phase="needs_confirmation", reason="envelope_needed", terms=terms, envelope=proposal,
-                         notice=(f"This job needs the user's yes to a budget envelope first — nothing was submitted. "
-                                 f"The job: {spec.basis} = at most {_gu(spec.worst_case)} {UNIT} "
+                         notice=(f"{why_again}This job needs the user's yes to a budget envelope first — nothing was "
+                                 f"submitted. The job: {spec.basis} = at most {_gu(spec.worst_case)} {UNIT} "
                                  f"({spec.partition or 'the default partition'}, account {spec.account or 'none'}). "
                                  f"The envelope: a cap of {_g(proposal.cap)} {UNIT}, deadline {proposal.deadline} "
-                                 f"({_g(hours)} h; every job carries it), {backstop}. {BINDS} Ask the user; on their "
-                                 "yes call submit_job again with the same arguments and confirm_spend=True. Within the "
-                                 "envelope, later jobs that fit are admitted without asking."))
+                                 f"({_g(hours)} h; every job carries it), {backstop}.{held_note} {BINDS} Ask the user; "
+                                 "on their yes call submit_job again with the same arguments and confirm_spend=True. "
+                                 "Within the envelope, later jobs that fit are admitted without asking."))
+    app.jobs_proposals.pop(key, None)
     led = _ledger(app)
     eid = _new_id("env")
     try:
@@ -1004,13 +1100,15 @@ async def _write_and_submit(app: AppCtx, e: dict[str, Any], spec: Spec, job_id: 
         led.update_job(job_id, state="refused", reason=str(exc)[:300])
         return _refused(f"job.sh could not be written: {exc}"[:400])
     # a stop or cancel that came while it was being admitted wins: one transaction decides (review B2)
-    if not led.move_job(job_id, only_from=("reserved",), unless_cancel=True, script_path=path, script_hash=digest):
+    if not led.move_job(job_id, only_from=("reserved",), unless_cancel=True, while_admitting=True, script_path=path,
+                        script_hash=digest):
         led.update_job(job_id, state="refused", reason="a stop or cancel came first: it was never submitted",
                        script_path=path, script_hash=digest)
         return JobStatus(phase="refused", reason="stopped", terms=terms,
                          envelope=envelope_info(app, led.envelope(e["id"]) or e),
-                         notice=(f"{job_id} was never submitted: a stop or cancel asked for it while it was being "
-                                 "admitted. It bills nothing; its reservation was released."))
+                         notice=(f"{job_id} was never submitted: a stop or cancel asked for it, or its envelope "
+                                 "stopped admitting, while it was being admitted. It bills nothing; its reservation "
+                                 "was released."))
     try:
         native, raw = await _submit_script(app, job_id, path, spec)
     except Exception as exc:  # noqa: BLE001 - the submit's fate is unknown: the reservation holds; the sweep finds it
@@ -1036,8 +1134,10 @@ async def _write_and_submit(app: AppCtx, e: dict[str, Any], spec: Spec, job_id: 
     row = led.job(job_id) or {}
     if row.get("cancel_requested"):   # a stop or cancel came while the submit was in flight: it ends at once
         said = await _scancel(app, [native])
+        await tick(app, envelope_ids=[e["id"]])
+        row = led.job(job_id) or row
+        gone = row.get("state") not in JOB_LIVE      # by its state after the cancel, never scancel's rc
         led.update_job(job_id, reason="a stop or cancel came while it was submitted: cancelled at once")
-        gone = native in said.ok
         return JobStatus(phase="cancelled" if gone else "queued", reason="stopped",
                          job=job_info(led.job(job_id) or row), terms=terms,
                          envelope=envelope_info(app, led.envelope(e["id"]) or e),
@@ -1088,6 +1188,8 @@ async def status(app: AppCtx, ident: str) -> BatchStatus:
         if info.reason:
             note += f" ({info.reason})"
         note += f"; charged {_g(info.charged)} {UNIT}, up to {_gu(info.committed)} more."
+        if info.state == "PENDING" and info.reason and site_limit(info.reason):
+            note += _limit_words(info.reason, ident)
         if info.meter_source in ("missing", "squeue"):
             note += (" sacct did not list it" + (" (it could not be read: " + t.error + ")" if t.error and not t.ok
                                                  else "") + ": it is counted at its full walltime until sacct does.")
@@ -1130,7 +1232,7 @@ def _per_id(verb: str, ids: list[str], label: str) -> str:
     if not ids:
         return ""
     words = " ".join(shlex.quote(i) for i in ids)
-    return (f"for __j in {words}; do __r=$({verb} \"$__j\" 2>&1); if [ $? -eq 0 ]; then "
+    return (f"for __j in {words}; do __r=$(__hb_bound {verb} \"$__j\" 2>&1); if [ $? -eq 0 ]; then "
             f"echo \"HPCB_{label}_OK $__j\"; else printf 'HPCB_{label}_FAIL %s %s\\n' \"$__j\" "
             "\"$(printf %s \"$__r\" | tr '\\n' ' ' | cut -c1-200)\"; fi; done; ")
 
@@ -1151,16 +1253,16 @@ async def _scancel(app: AppCtx, natives: list[str], *, pending_only: bool = Fals
     if (not ids and not by_name) or not _can_reach(app):
         return Cancelled()
     if scheduler_of(app) == "pbs":
-        cmd = "set -f; " + _per_id("qdel", ids, "CAN")
+        cmd = f"{meter._bound()}set -f; " + _per_id("qdel", ids, "CAN")
         for n in by_name:
-            cmd += (f"for __j in $(qselect -u {_USER} -N hpcb-{n} 2>/dev/null); do qdel \"$__j\" >/dev/null 2>&1; "
-                    f"done; echo \"HPCB_CAN_OK name:hpcb-{n}\"; ")
+            cmd += (f"for __j in $(__hb_bound qselect -u {_USER} -N hpcb-{n} 2>/dev/null); do __hb_bound qdel "
+                    f"\"$__j\" >/dev/null 2>&1; done; echo \"HPCB_CAN_OK name:hpcb-{n}\"; ")
     else:
         verb = "scancel --state=PENDING" if pending_only else "scancel"
-        cmd = "set -f; " + _per_id(verb, [i.split(".")[0] for i in ids], "CAN")
+        cmd = f"{meter._bound()}set -f; " + _per_id(verb, [i.split(".")[0] for i in ids], "CAN")
         for n in by_name:
-            cmd += (f"__r=$(scancel --name=hpcb-{n} --user={_USER} 2>&1) && echo \"HPCB_CAN_OK name:hpcb-{n}\" "
-                    f"|| echo \"HPCB_CAN_FAIL name:hpcb-{n} $__r\"; ")
+            cmd += (f"__r=$(__hb_bound scancel --name=hpcb-{n} --user={_USER} 2>&1) && echo \"HPCB_CAN_OK "
+                    f"name:hpcb-{n}\" || echo \"HPCB_CAN_FAIL name:hpcb-{n} $__r\"; ")
     try:
         out = await _login(app, cmd + "echo HPCB_CANCEL_END")
     except Exception as exc:  # noqa: BLE001 - nothing is said cancelled
@@ -1185,14 +1287,30 @@ def _left(rows: list[dict[str, Any]]) -> list[BlockLeft]:
     return out
 
 
-def _cancel_words(said: Cancelled, natives: list[str]) -> str:
-    done = [n for n in natives if n in said.ok]
-    failed = [n for n in natives if n in said.failed and not any(b in said.failed[n] for b in _BENIGN)]
-    words = f"cancelled: {' '.join(done)}" if done else ""
-    if failed:
-        words += ("; " if words else "") + "the scheduler did NOT cancel " + ", ".join(
-            f"{n} ({said.failed[n][:160]!r})" for n in failed)
-    return words
+def _cancel_words(said: Cancelled, after: list[dict[str, Any]], *, drain: bool = False) -> str:
+    """What a cancel did, by each job's state AFTER it, as the meter read it — never by scancel's exit code (probe r1:
+    scancel of a job that had already ended answers rc 0 and nothing)."""
+    def nid(j: dict[str, Any]) -> str:
+        return str(j.get("native_id"))
+
+    done = [nid(j) for j in after if j.get("state") == "cancelled"]
+    ended = [f"{nid(j)} ({j.get('sched_state') or j.get('state')})" for j in after if j.get("state") in ("done",
+                                                                                                         "failed")]
+    live = [j for j in after if j.get("state") in JOB_LIVE]
+    refused = [j for j in live if nid(j) in said.failed and not any(b in said.failed[nid(j)] for b in _BENIGN)]
+    going = [nid(j) for j in live if j not in refused]
+    parts = []
+    if done:
+        parts.append(f"cancelled: {' '.join(done)}")
+    if ended:
+        parts.append(f"had already ended (not cancelled): {', '.join(ended)}")
+    if going:
+        parts.append(f"pending tasks cancelled, running ones go on: {' '.join(going)}" if drain else
+                     f"cancel sent, still listed by the scheduler: {' '.join(going)}")
+    if refused:
+        parts.append("the scheduler did NOT cancel " + ", ".join(f"{nid(j)} ({said.failed[nid(j)][:160]!r})"
+                                                                  for j in refused))
+    return "; ".join(parts)
 
 
 async def cancel(app: AppCtx, ident: str, mode: str = "drain") -> CancelResult:
@@ -1245,7 +1363,8 @@ async def cancel(app: AppCtx, ident: str, mode: str = "drain") -> CancelResult:
     e = led.envelope(eid)
     if e is not None and e["state"] == "draining" and not still and ident.startswith("env-"):
         led.update_envelope(eid, state="closed", closed_at=_now())
-    what = _cancel_words(said, natives) if acting else ""
+    what = _cancel_words(said, [j for j in rows if j["id"] in {t["id"] for t in targets} and j.get("native_id")],
+                         drain=mode == "drain") if acting and natives else ""
     if not what:
         what = "drained: it admits nothing more" if mode == "drain" else "nothing was cancelled"
     if spared:
@@ -1300,60 +1419,107 @@ def gated_outcome(app: AppCtx, e: dict[str, Any], sub: Submission) -> ShellOutco
                 "hpc-bridge. stop_endpoint asks about these jobs like any job of ours."))
 
 
-# The wrapper first on PATH for one gated command (written by begin_hand into <scratch>/hand/<token>/hpcb-shim). It runs
-# the REAL sbatch/qsub — found on the PATH the command started with, and with that PATH, so neither the wrapper nor its
-# variables reach the job (sbatch --export=ALL) — adding the hold, the envelope's deadline and the marker in the same
-# submit, and appends the real command's own stdout (its receipt) to the command's mark file. Without its variables
-# (anything outside the gated command) it is the real command, untouched. `--wait` (a job that blocks the submit until
-# it ends) is never held; a hold the user asked for themselves is left in place (HPCB_SHIM_USER_HOLD).
+# The wrapper first on PATH for one gated command (written by begin_hand into <scratch>/hand/<token>/hpcb-shim). Its
+# hand's mark file, deadline and token are written INTO it — no variable of it is exported to the command (review r2,
+# P3: they reached a job a submit by absolute path made). It runs the REAL sbatch/qsub with the command's own PATH at
+# that moment, minus only the wrapper's directory (so `module load X; sbatch job.sh` gives the job X), adding the hold,
+# the envelope's deadline and the marker in the same submit, and appends the real command's own stdout (its receipt) to
+# the mark file. Once its hand is closed (its `open` file gone) it is the real command, untouched: a job that inherited
+# the command's PATH is never held by it afterwards. Only sbatch's/qsub's OWN options — those before the script
+# operand — are read (review r2, P2: `sbatch job.sh -W` dropped the hold): `--wait` / `block=true` is never held; a
+# hold the user asked for themselves is left in place (HPCB_SHIM_USER_HOLD).
 _SHIM_HEAD = r"""#!/bin/bash
-# hpc-bridge (D2): one gated command's hold on @@CMD@@ -- removed after it. The real @@CMD@@ runs HELD, with the
-# envelope's deadline and a marker; its own answer goes to the command's mark file. Nothing of this reaches the job.
-__self=$(cd "$(dirname "$0")" 2>/dev/null && pwd)
-__p="${HPCB_SHIM_PATH-}"; __m="${HPCB_SHIM_MARK-}"; __d="${HPCB_SHIM_DEADLINE-}"; __t="${HPCB_SHIM_TOKEN-}"
-unset HPCB_SHIM_PATH HPCB_SHIM_MARK HPCB_SHIM_DEADLINE HPCB_SHIM_TOKEN
-if [ -n "$__p" ]; then PATH=$__p; else PATH=${PATH//"$__self:"/}; fi
-export PATH
+# hpc-bridge (D2): one gated command's hold on @@CMD@@. While its hand is open the real @@CMD@@ runs HELD, with the
+# envelope's deadline and a marker, its own answer kept in the hand's mark file; once the hand is closed it is the real
+# @@CMD@@, untouched.
+__s=@@SHIM@@; __m=@@MARK@@; __o=@@OPEN@@; __d=@@DEADLINE@@; __t=@@TOKEN@@
+__np=
+IFS=: read -r -a __parts <<< "$PATH"
+for __x in "${__parts[@]}"; do
+  [ -n "$__x" ] && [ "$__x" != "$__s" ] && [ "$__x" != "$(dirname "$0")" ] && __np="${__np:+$__np:}$__x"
+done
+PATH=$__np; export PATH
 __r=$(type -P @@CMD@@) || { echo "@@CMD@@: command not found" >&2; exit 127; }
-case "$__d" in ''|*[!0-9]*) exec "$__r" "$@";; esac
-[ -n "$__m" ] || exec "$__r" "$@"
+[ -f "$__o" ] || exec "$__r" "$@"
 __left=$(( __d - $(date +%s) ))
 if [ "$__left" -le 0 ]; then
   echo "hpc-bridge: the envelope's deadline has passed: nothing was submitted" >&2; exit 1
 fi
 """
+# The real command's stderr is kept too (prefixed, so no line of it can read as a receipt): a refusal the envelope's
+# deadline caused (sbatch: "Requested time limit is invalid", probe r1) is explained in the answer.
+_SHIM_TAIL = r"""__rc=${PIPESTATUS[0]}
+cat "$__e" >&2
+sed 's/^/HPCB_SHIM_ERR /' "$__e" >> "$__m"
+rm -f "$__e"
+echo "HPCB_SHIM_RC=$__rc $$ left=$__left" >> "$__m"
+exit "$__rc"
+"""
+# sbatch's own options, up to the script operand: the flags (no value), everything else -X / --long takes the next
+# word unless written --long=value or -Xvalue
 _SHIM_SLURM = _SHIM_HEAD + r"""__h=--hold
-for __a in "$@"; do case "$__a" in --wait|-W) __h=;; --hold|-H) __h=; echo HPCB_SHIM_USER_HOLD >> "$__m";; esac; done
+__i=1
+while [ "$__i" -le "$#" ]; do
+  __a=${!__i}
+  case "$__a" in
+    --) break;;
+    --wait|-W) __h=;;
+    --hold|-H) __h=; echo HPCB_SHIM_USER_HOLD >> "$__m";;
+    --*=*) ;;
+    --parsable|--exclusive|--requeue|--no-requeue|--test-only|--overcommit|--quiet|--verbose|--spread-job) ;;
+    --use-min-nodes|--contiguous|--no-kill|--get-user-env|--ignore-pbs|--oversubscribe|--reboot|--help|--usage) ;;
+    --version|--immediate|--kill-on-invalid-dep) ;;
+    --*) __i=$(( __i + 1 ));;
+    -[OQvkVhsI]) ;;
+    -?) __i=$(( __i + 1 ));;
+    -*) ;;
+    *) break;;
+  esac
+  __i=$(( __i + 1 ))
+done
 echo "HPCB_SHIM_START $$" >> "$__m"
-"$__r" ${__h:+"$__h"} --comment="hpcb-$__t" --deadline="now+$__left" "$@" | tee -a "$__m"
-__rc=${PIPESTATUS[0]}
-echo "HPCB_SHIM_RC=$__rc $$" >> "$__m"
-exit "$__rc"
-"""
+__e="$__m.err.$$"
+"$__r" ${__h:+"$__h"} --comment="hpcb-$__t" --deadline="now+$__left" "$@" 2>"$__e" | tee -a "$__m"
+""" + _SHIM_TAIL
+# qsub's own options, up to the script operand: -h -I -V -X -z -f are flags; -W's value may say block=true
 _SHIM_PBS = _SHIM_HEAD + r"""__h=-h
-for __a in "$@"; do case "$__a" in *block=true*) __h=;; -h) __h=; echo HPCB_SHIM_USER_HOLD >> "$__m";; esac; done
+__i=1
+while [ "$__i" -le "$#" ]; do
+  __a=${!__i}
+  case "$__a" in
+    --) break;;
+    -h) __h=; echo HPCB_SHIM_USER_HOLD >> "$__m";;
+    -W) __i=$(( __i + 1 )); case "${!__i}" in *block=true*) __h=;; esac;;
+    -W*) case "$__a" in *block=true*) __h=;; esac;;
+    -[IVXzf]) ;;
+    -?) __i=$(( __i + 1 ));;
+    -*) ;;
+    *) break;;
+  esac
+  __i=$(( __i + 1 ))
+done
 echo "HPCB_SHIM_START $$" >> "$__m"
-"$__r" ${__h:+"$__h"} "$@" | tee -a "$__m"
-__rc=${PIPESTATUS[0]}
-echo "HPCB_SHIM_RC=$__rc $$" >> "$__m"
-exit "$__rc"
-"""
+__e="$__m.err.$$"
+"$__r" ${__h:+"$__h"} "$@" 2>"$__e" | tee -a "$__m"
+""" + _SHIM_TAIL
 
 
-def _shim(sched: str) -> tuple[str, str]:
-    """(the command it stands for, the wrapper's text)."""
-    if sched == "pbs":
-        return "qsub", _SHIM_PBS.replace("@@CMD@@", "qsub")
-    return "sbatch", _SHIM_SLURM.replace("@@CMD@@", "sbatch")
+def _shim(sched: str, *, root: str, deadline: float, token: str) -> tuple[str, str]:
+    """(the command it stands for, the wrapper's text for the hand at `root`)."""
+    name, text = ("qsub", _SHIM_PBS) if sched == "pbs" else ("sbatch", _SHIM_SLURM)
+    return name, (text.replace("@@CMD@@", name).replace("@@SHIM@@", batch.quoted_dir(f"{root}/hpcb-shim"))
+                  .replace("@@MARK@@", batch.quoted_dir(f"{root}/mark"))
+                  .replace("@@OPEN@@", batch.quoted_dir(f"{root}/open"))
+                  .replace("@@DEADLINE@@", str(math.floor(deadline))).replace("@@TOKEN@@", token))
 
 
 def _snapshot(sched: str, dest: str, word: str) -> str:
     """The user's jobs the scheduler lists now, one id a line, into `dest` (and echoed between HPCB_<word> markers);
-    nothing — and no HPCB_<word>_OK — when it could not be read."""
+    nothing — and no HPCB_<word>_OK — when it could not be read. Bounded (the caller defines __hb_bound)."""
     if sched == "pbs":
-        read, norm = f"qselect -u {_USER}", "sed -n '/./p'"
+        read, norm = f"__hb_bound qselect -u {_USER}", "sed -n '/./p'"
     else:
-        read, norm = f"squeue -h -u {_USER} -o %i", "sed -n 's/_.*//;/./p'"
+        read, norm = f"__hb_bound squeue -h -u {_USER} -o %i", "sed -n 's/_.*//;/./p'"
     return (f"if __ids=$({read} 2>/dev/null); then printf '%s\\n' \"$__ids\" | {norm} | sort -u > {dest}; "
             f"echo HPCB_{word}_OK; echo HPCB_{word}_BEGIN; cat {dest}; echo HPCB_{word}_END; fi; ")
 
@@ -1375,15 +1541,15 @@ async def begin_hand(app: AppCtx, e: dict[str, Any], session_id: str) -> dict[st
     sched = scheduler_of(app)
     token = secrets.token_hex(6)
     root = f"{app.scratch_root.rstrip('/')}/hand/{token}"
-    name, text = _shim(sched)
+    name, text = _shim(sched, root=root, deadline=float(e["deadline"]), token=token)
     b64 = shlex.quote(base64.b64encode(text.encode()).decode())
     old = led.hands(facility=facility_key(app), states=("closed",))[:20]
     rm = "".join(f"rm -rf {batch.quoted_dir(_hand_dir(h))} 2>/dev/null; " for h in old)
-    cmd = (f"umask 077; set -f; {rm}d={batch.quoted_dir(root)}; s=\"$d/hpcb-shim\"; "
+    cmd = (f"{meter._bound()}umask 077; set -f; {rm}d={batch.quoted_dir(root)}; s=\"$d/hpcb-shim\"; "
            'mkdir -p "$s" || { echo "HPCB_HAND_FAILED cannot create $d"; exit 0; }; '
            f'printf %s {b64} | base64 --decode > "$s/{name}" && chmod 700 "$s/{name}" '
            '|| { echo "HPCB_HAND_FAILED cannot write the hold"; exit 0; }; '
-           ': > "$d/mark"; ' + _snapshot(sched, '"$d/before"', "BEFORE") + "echo HPCB_HAND_READY")
+           ': > "$d/mark"; : > "$d/open"; ' + _snapshot(sched, '"$d/before"', "BEFORE") + "echo HPCB_HAND_READY")
     try:
         out = await _login(app, cmd)
     except Exception as exc:  # noqa: BLE001 - no hold: nothing may run
@@ -1404,23 +1570,29 @@ async def begin_hand(app: AppCtx, e: dict[str, Any], session_id: str) -> dict[st
 
 
 def drop_hand(app: AppCtx, h: dict[str, Any], why: str) -> None:
-    """The command never ran (its block was cold, its spend unconfirmed…): nothing to reconcile."""
+    """The command never ran (its block was cold, its spend unconfirmed, the call was cancelled first…): the hand is
+    closed at once — an open one would read every later job of the user's as this command's (review r2, P1)."""
     _ledger(app).update_hand(h["token"], state="closed", note=f"never ran: {why}"[:200])
 
 
-def held_command(h: dict[str, Any], command: str, deadline: float) -> str:
-    """The gated command, run with the wrapper first on PATH and its variables set — and both taken off again after
-    it, so the session's persisted env never carries them."""
+def hand_started(app: AppCtx, h: dict[str, Any], rc_path: str) -> None:
+    """The command is about to be sent: where its exit status will be (the session's results/<key>/rc, written by the
+    wrapper's EXIT trap) — a later reconciliation knows from it that the command has ended, whatever became of the call
+    that sent it."""
+    _ledger(app).update_hand(h["token"], handle=rc_path)
+
+
+def held_command(h: dict[str, Any], command: str) -> str:
+    """The gated command, run with the wrapper's directory first on PATH — and taken off again after it, so the
+    session's persisted env never carries it. Nothing else of the wrapper is in the command's environment."""
     b64 = shlex.quote(base64.b64encode(command.encode()).decode())
     mark = batch.quoted_dir(str(h["mark_path"]))
     return (f"__hpcb_shim={batch.quoted_dir(str(h['shim_dir']))}\n"
-            f"export HPCB_SHIM_PATH=\"$PATH\" HPCB_SHIM_MARK={mark} HPCB_SHIM_DEADLINE={math.floor(deadline)} "
-            f"HPCB_SHIM_TOKEN={h['token']}\n"
             'export PATH="$__hpcb_shim:$PATH"\n'
             f'eval "$(printf %s {b64} | base64 -d)"\n'
             "__hpcb_hrc=$?\n"
             'PATH=${PATH//"$__hpcb_shim:"/}; export PATH\n'
-            "unset HPCB_SHIM_PATH HPCB_SHIM_MARK HPCB_SHIM_DEADLINE HPCB_SHIM_TOKEN __hpcb_shim\n"
+            "unset __hpcb_shim\n"
             f"echo HPCB_HAND_DONE >> {mark} 2>/dev/null\n"
             '(exit "$__hpcb_hrc")\n')
 
@@ -1514,7 +1686,8 @@ def _request(sched: str, native: str, text: str) -> _Request | None:
 
 
 def _req_cmd(sched: str) -> str:
-    return 'qstat -f -F json "$__j" 2>&1' if sched == "pbs" else 'TZ=UTC0 scontrol show job -o "$__j" 2>&1'
+    return ('__hb_bound qstat -f -F json "$__j" 2>&1' if sched == "pbs"
+            else '__hb_bound env TZ=UTC0 scontrol show job -o "$__j" 2>&1')
 
 
 def _req_chunks(raw: str) -> dict[str, str]:
@@ -1529,8 +1702,8 @@ async def _read_requests(app: AppCtx, natives: list[str]) -> dict[str, _Request]
     ids = [n for n in natives if _NATIVE.match(n)]
     if not ids:
         return {}
-    cmd = (f"set -f; for __j in {' '.join(shlex.quote(n) for n in ids)}; do echo \"HPCB_REQ $__j\"; "
-           f"{_req_cmd(sched)}; done; echo HPCB_REQ_END")
+    cmd = (f"{meter._bound()}set -f; for __j in {' '.join(shlex.quote(n) for n in ids[:50])}; do "
+           f"echo \"HPCB_REQ $__j\"; {_req_cmd(sched)}; done; echo HPCB_REQ_END")
     out = await _login(app, cmd)
     got: dict[str, _Request] = {}
     for n, text in _req_chunks(_text(out)).items():
@@ -1565,6 +1738,28 @@ def _hand_misfit(sched: str, r: _Request, e: dict[str, Any], now: float) -> str 
     return None
 
 
+_TIME_LIMIT_REFUSED = re.compile(r"time limit is invalid|Requested time limit", re.I)
+
+
+def _deadline_refusal(sched: str, mark: str, e: dict[str, Any]) -> str | None:
+    """A gated sbatch the scheduler refused because the wrapper's `--deadline` (the envelope's) comes before the job's
+    walltime could end — Slurm refuses that at submit (probe r1: "Requested time limit is invalid") — said as what it
+    is, with how to go on (round 2). None when the mark shows no such refusal."""
+    if sched == "pbs":
+        return None
+    errs = [ln[len("HPCB_SHIM_ERR "):] for ln in mark.splitlines() if ln.startswith("HPCB_SHIM_ERR ")]
+    if not any(_TIME_LIMIT_REFUSED.search(x) for x in errs):
+        return None
+    lefts = [int(m.group(1)) for m in re.finditer(r"HPCB_SHIM_RC=[1-9]\d* \S+ left=(\d+)", mark)]
+    left = min(lefts) if lefts else max(0, int(float(e["deadline"]) - _now()))
+    return (f"sbatch refused the job, and it is the envelope's deadline that did it: every hand submit under envelope "
+            f"{e['id']} carries its deadline ({_iso(float(e['deadline']))}, {_hms(left) or '00:00:00'} from then), and "
+            "Slurm refuses a job whose walltime cannot end before its deadline — sbatch's \"Requested time limit is "
+            f"invalid\" is that. Nothing was submitted. To go on: a walltime of at most {_hms(left) or '00:00:00'} "
+            "(#SBATCH -t / --time), or — once this envelope is closed — a new one with a later deadline "
+            "(submit_job(…, envelope={deadline_hours: …}), at most 168 h).")
+
+
 @dataclass
 class HandResult:
     jobs: list[JobInfo] = field(default_factory=list)
@@ -1577,7 +1772,7 @@ async def _release_and_cancel(app: AppCtx, release: list[str], cancel: list[str]
         Cancelled, Cancelled]:
     """One login call: release `release`, cancel `cancel` (both held, both this command's by its mark), per id."""
     pbs = scheduler_of(app) == "pbs"
-    cmd = ("set -f; " + _per_id("qrls" if pbs else "scontrol release", release, "REL")
+    cmd = (f"{meter._bound()}set -f; " + _per_id("qrls" if pbs else "scontrol release", release, "REL")
            + _per_id("qdel" if pbs else "scancel", cancel, "CAN") + cleanup + "echo HPCB_RC_END")
     rel, can = Cancelled(), Cancelled()
     try:
@@ -1596,8 +1791,11 @@ async def reconcile_hand(app: AppCtx, h: dict[str, Any], *, final: bool) -> Hand
     receipts in its mark file, and the jobs of the user's that appeared since its snapshot — is ledgered. A marked job
     is read while held, checked (deadline read back, fits the envelope, can finish before its deadline), reserved and
     released, or cancelled while still held (it never ran). An unmarked one (the wrapper could not hold it) is counted
-    at its full request, named, never cancelled by hpc-bridge. `final`: the command has ended; the hand closes once no
-    submit of it is still in flight."""
+    at its full request, named, never cancelled by hpc-bridge — and only once the command has ENDED, so a later job of
+    the user's is never read as this command's (review r2, P1). `final`: the command has ended (its outcome said so;
+    else its exit-status file, `hand_started`, or its HPCB_HAND_DONE line does); the hand closes once no submit of it is
+    still in flight, and its directory goes with it (the wrapper then falls through: P3). Every scheduler command in it
+    is bounded."""
     led = _ledger(app)
     sched = scheduler_of(app)
     res = HandResult()
@@ -1606,9 +1804,12 @@ async def reconcile_hand(app: AppCtx, h: dict[str, Any], *, final: bool) -> Hand
     d = batch.quoted_dir(_hand_dir(h))
     before_ok = h.get("note") != "before_failed"
     snap = _snapshot(sched, '"$d/after"', "AFTER") if before_ok else ""
-    cmd = (f"set -f; d={d}; echo HPCB_MARK_BEGIN; cat \"$d/mark\" 2>/dev/null; echo; echo HPCB_MARK_END; {snap}"
+    rc_file = str(h.get("handle") or "")
+    ended_cmd = f"[ -f {rc_file} ] && echo HPCB_CMD_ENDED; " if rc_file else ""
+    cmd = (f"{meter._bound()}set -f; d={d}; echo HPCB_MARK_BEGIN; cat \"$d/mark\" 2>/dev/null; echo; "
+           f"echo HPCB_MARK_END; {ended_cmd}{snap}"
            'for __j in $( { [ -f "$d/before" ] && [ -f "$d/after" ] && grep -vxF -f "$d/before" "$d/after"; } '
-           f'2>/dev/null ); do echo "HPCB_REQ $__j"; {_req_cmd(sched)}; done; echo HPCB_REQ_END')
+           f'2>/dev/null | head -n 50 ); do echo "HPCB_REQ $__j"; {_req_cmd(sched)}; done; echo HPCB_REQ_END')
     try:
         out = await _login(app, cmd)
     except Exception as exc:  # noqa: BLE001 - the next call reads it again
@@ -1621,11 +1822,13 @@ async def reconcile_hand(app: AppCtx, h: dict[str, Any], *, final: bool) -> Hand
         return res
     mark = raw.split("HPCB_MARK_BEGIN", 1)[1].split("HPCB_MARK_END", 1)[0]
     marks = _receipts_in(sched, mark)
-    done = "HPCB_HAND_DONE" in mark
+    ended = final or "HPCB_HAND_DONE" in mark or "HPCB_CMD_ENDED" in raw.split("HPCB_MARK_END", 1)[1]
     inflight = mark.count("HPCB_SHIM_START") > len(re.findall(r"HPCB_SHIM_RC=", mark))
     user_hold = "HPCB_SHIM_USER_HOLD" in mark
     chunks = _req_chunks(raw)
-    res.found = bool(marks) or bool(chunks)
+    res.found = bool(marks) or bool(chunks) or "HPCB_SHIM_START" in mark
+    if e is not None and (cut := _deadline_refusal(sched, mark, e)):
+        res.notes.append(cut)
     on_ledger = {_base(j["native_id"]) for j in led.jobs() if j.get("native_id")}
     reqs: dict[str, _Request] = {}
     for k, text in chunks.items():
@@ -1644,7 +1847,7 @@ async def reconcile_hand(app: AppCtx, h: dict[str, Any], *, final: bool) -> Hand
         reqs.update({_base(k): v for k, v in more.items()})
     excluded = set(json.loads((e or {}).get("excluded") or "[]"))
     unmarked: list[str] = []
-    if before_ok and "HPCB_AFTER_OK" in raw:
+    if ended and not inflight and before_ok and "HPCB_AFTER_OK" in raw:
         mb = {_base(n) for n in marks}
         for k in chunks:
             b = _base(k)
@@ -1730,12 +1933,18 @@ async def reconcile_hand(app: AppCtx, h: dict[str, Any], *, final: bool) -> Hand
                      "so."
                      + (f" The envelope is now OVER its cap ({_gd(-info.remaining)} {UNIT} past it): it admits "
                         "nothing more until the user raises the cap or jobs end." if over else ""))
-    closing = (final or done) and not inflight
+    closing = ended and not inflight
     if not closing and now - float(h.get("created_at") or now) > HAND_MAX_OPEN_S:
         closing = True
     if not closing and (float(e["deadline"]) <= now or e["state"] == "closed"):
         closing = True
+    # closing removes the hand's directory — its `open` file with it: the wrapper a job inherited falls through (P3)
     cleanup = f"rm -rf {d} 2>/dev/null; " if closing else ""
+    if closing and not (release or cancel):
+        try:
+            await _login(app, f"{cleanup}echo HPCB_HAND_CLOSED")
+        except Exception:  # noqa: BLE001 - the next hand's setup removes a closed hand's directory too
+            pass
     if release or cancel:
         rel, can = await _release_and_cancel(app, [n for n, _ in release], [n for n, _, _ in cancel],
                                              cleanup=cleanup)
@@ -1787,9 +1996,13 @@ async def finish_hand(app: AppCtx, h: dict[str, Any], out: ShellOutcome) -> tupl
     return out, res.found
 
 
-async def reconcile_pending(app: AppCtx) -> list[str]:
+RECONCILE_BUDGET_S = 60.0   # what one status / submit_job / stop spends on open hand submits, at most (review r2)
+
+
+async def reconcile_pending(app: AppCtx, *, budget_s: float = RECONCILE_BUDGET_S) -> list[str]:
     """Every hand submit still open on this facility — a command that outlived its sync-wait, a server that died
-    before it read the jobs — reconciled now (review A2). Returns what it said."""
+    before it read the jobs — reconciled now (review A2), within `budget_s` (each of its scheduler commands is bounded
+    too); what is left waits for the next call. Returns what it said."""
     if not _can_reach(app):
         return []
     try:
@@ -1797,7 +2010,11 @@ async def reconcile_pending(app: AppCtx) -> list[str]:
     except LedgerError:
         return []
     notes: list[str] = []
+    started = time.monotonic()
     for h in hands:
+        if time.monotonic() - started > budget_s:
+            notes.append(f"{len(hands)} hand submit(s) are open; the rest are reconciled by the next call.")
+            break
         try:
             res = await reconcile_hand(app, h, final=False)
         except Exception as exc:  # noqa: BLE001 - the next call tries again
@@ -1934,8 +2151,8 @@ async def billing_jobs(app: AppCtx) -> list[dict[str, Any]]:
     led = _ledger(app)
     fac = facility_key(app)
     here = app.state.endpoint_id is not None and _can_reach(app)
-    if here:
-        await reconcile_pending(app)
+    if here:   # a stop reads twice (before and after the blocks): 30 s each keeps it well under ~300 s
+        await reconcile_pending(app, budget_s=30.0)
         ids = [e["id"] for e in led.envelopes(facility=fac) if any(j.get("state") in JOB_LIVE
                                                                    for j in led.jobs(envelope_id=e["id"]))]
         if ids:
@@ -1949,8 +2166,11 @@ async def billing_jobs(app: AppCtx) -> list[dict[str, Any]]:
         if here and _facility_of(led, j, cache) == fac:
             out.append(j)
             continue
+        # aged out by deadline + walltime only where the scheduler enforces the deadline (Slurm): a PBS job carries
+        # none, and stays until a read shows it ended (review r2)
         dl = j.get("deadline")
-        if dl is None or now < float(dl) + float(j.get("walltime_s") or 0.0):
+        if (dl is None or j.get("scheduler") == "pbs"
+                or now < float(dl) + float(j.get("walltime_s") or 0.0)):
             out.append(j)
     return out
 
@@ -1980,7 +2200,7 @@ def stop_question(app: AppCtx, rows: list[dict[str, Any]]) -> EndpointStatus:
                 f"{_jobs_words(app, rows)}. Ask the user, then call stop_endpoint(jobs=\"cancel\") to cancel them and "
                 "close their envelope (down only once the scheduler lists none), or stop_endpoint(jobs=\"keep\") to "
                 "release only the endpoint's blocks and leave them running under their envelope and deadline. Nothing "
-                "was cancelled or released."))
+                "was cancelled or released; nothing more is admitted (a stop closes admission)."))
 
 
 async def cancel_for_stop(app: AppCtx, rows: list[dict[str, Any]]) -> str:
@@ -2002,8 +2222,10 @@ async def cancel_for_stop(app: AppCtx, rows: list[dict[str, Any]]) -> str:
         led.update_job(j["id"], cancel_requested=1)
     names = [j["id"] for j in unsent if j.get("state") == "submit_unknown"
              or (j.get("state") == "reserved" and j["id"] not in app.jobs_admitting)]
-    said = await _scancel(app, natives, names=names) if (natives or names) else Cancelled()
-    return " ".join(n for n in natives if n in said.ok)
+    if natives or names:
+        await _scancel(app, natives, names=names)
+    # the job ids a cancel went to: what became of each is read after it (`after_stop`), never from scancel's rc
+    return " ".join(j["id"] for j in targets if j.get("native_id"))
 
 
 def keep_for_stop(app: AppCtx, rows: list[dict[str, Any]]) -> None:
@@ -2043,9 +2265,15 @@ def close_admission(app: AppCtx) -> None:
 async def after_stop(app: AppCtx, st: EndpointStatus, choice: str | None, cancelled: str) -> EndpointStatus:
     """The stop's answer, honest about our jobs: `cancel` — draining while any of ours can still bill; `keep` —
     draining, never down, naming them and how to end them."""
-    still = await billing_jobs(app) if choice else []
+    still = await billing_jobs(app)   # always read again: a job admitted while the stop ran is one that can bill
     close_admission(app)
-    prefix = f"Jobs-mode job(s) cancelled: {cancelled}. " if cancelled else ""
+    led = _ledger(app)
+    sent = [r for r in (led.job(i) for i in cancelled.split()) if r is not None]
+    done = [str(r["native_id"]) for r in sent if r.get("state") == "cancelled"]
+    ended = [f"{r['native_id']} ({r.get('sched_state') or r.get('state')})" for r in sent
+             if r.get("state") in ("done", "failed")]
+    prefix = ((f"Jobs-mode job(s) cancelled: {' '.join(done)}. " if done else "")
+              + (f"Already ended, not cancelled: {', '.join(ended)}. " if ended else ""))
     if choice == "keep" and still:
         envs = sorted({j["envelope_id"] for j in still})
         st.jobs = [job_info(j) for j in still]

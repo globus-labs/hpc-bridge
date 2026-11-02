@@ -104,6 +104,8 @@ envelope_new_session_reasks   batch phase 2a: joins the sweep after its first li
 envelope_ceiling_sums         batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 envelope_bypass_counted       batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 meter_missing_from_sacct_full_walltime batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
+envelope_leftover_held        batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
+envelope_stop_races_submit    batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 EXCLUDED
 }
 
