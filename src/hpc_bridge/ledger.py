@@ -92,6 +92,36 @@ class EnvelopeLimit(EnvelopeError):
     """The job passes one of the envelope's other dimensions (max_jobs, max_nodes_per_block, accounts, partitions)."""
 
 
+class EnvelopeCeiling(EnvelopeError):
+    """HPC_BRIDGE_ENVELOPE_MAX: the sum of the open envelopes' caps on a facility and account would pass the ceiling.
+    `open_caps`: what is open already on the account it binds; `ceiling`; `account`."""
+
+    def __init__(self, msg: str, *, open_caps: float, ceiling: float, account: str | None) -> None:
+        super().__init__(msg)
+        self.open_caps, self.ceiling, self.account = open_caps, ceiling, account
+
+
+def envelope_accounts(e: dict[str, Any]) -> list[str]:
+    """Every account an envelope admits: its `accounts`, else its own account ("" for none)."""
+    got = list(json.loads(e.get("accounts") or "[]"))
+    return got or [e.get("account") or ""]
+
+
+def _ceiling_check(c: sqlite3.Connection, *, facility: str | None, accounts: Iterable[str], cap: float,
+                   ceiling: float | None, except_id: str | None = None) -> None:
+    """Inside the caller's transaction: the new cap plus the caps of every other envelope still open on the facility
+    that admits one of `accounts` stays within the ceiling (review B7: every account an envelope admits counts)."""
+    if ceiling is None:
+        return
+    rows = [dict(r) for r in c.execute("select * from envelope where facility is ? and state in "
+                                       "('open','exhausted','draining')", (facility,))]
+    for acct in accounts:
+        open_caps = sum(float(e["cap"]) for e in rows if e["id"] != except_id and acct in envelope_accounts(e))
+        if open_caps + float(cap) > float(ceiling) + 1e-9:
+            raise EnvelopeCeiling(f"{open_caps:g} is open on account {acct or '(none)'} of a ceiling of {ceiling:g}",
+                                  open_caps=open_caps, ceiling=float(ceiling), account=acct or None)
+
+
 def job_hold(j: dict[str, Any]) -> float:
     """What one job holds against its envelope: nothing once refused; its worst case until the meter has read it; then
     what it charged plus what it can still bill."""
@@ -361,9 +391,25 @@ create table if not exists job (
   meter_source text default 'none',
   array_counts text default '{}',
   metered_at real,
-  ended_at real
+  ended_at real,
+  cancel_requested integer default 0,
+  unheld integer default 0,
+  hand text
 );
 create index if not exists job_by_native on job (native_id);
+create table if not exists hand (
+  token text primary key,
+  envelope_id text not null,
+  facility text,
+  session text,
+  mark_path text,
+  shim_dir text,
+  before text default '[]',
+  handle text,
+  created_at real not null,
+  state text not null,
+  note text
+);
 create table if not exists meter_reading (
   seq integer primary key autoincrement,
   at real not null,
@@ -388,7 +434,9 @@ _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "tru
                 "unknown_since", "unheld")
 # Columns a ledger written by an earlier build may lack: added on open.
 _ADDED_COLUMNS = {"batch": [("owner_start", "text")],
-                  "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")]}
+                  "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")],
+                  "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
+                          ("hand", "text")]}
 
 
 class Ledger:
@@ -709,9 +757,13 @@ class Ledger:
                      max_jobs: int | None = None, max_nodes_per_block: int | None = None,
                      accounts: Iterable[str] | None = None, partitions: Iterable[str] | None = None,
                      at_deadline: str = "drain", site_backstop: str | None = None,
-                     now: float | None = None) -> str:
+                     ceiling: float | None = None, now: float | None = None) -> str:
+        """Open an envelope. With `ceiling` (HPC_BRIDGE_ENVELOPE_MAX) the sum of the open caps is checked in the SAME
+        BEGIN IMMEDIATE transaction as the insert, on every account it admits (`EnvelopeCeiling`)."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
+            _ceiling_check(c, facility=facility, accounts=list(accounts or []) or [account or ""], cap=cap,
+                           ceiling=ceiling)
             c.execute("insert into envelope (id, created_at, facility, endpoint_id, account, unit, cap, max_jobs, "
                       "max_nodes_per_block, accounts, partitions, deadline, at_deadline, site_backstop, approved_by, "
                       "approved_at, owner_host, owner_pid, owner_start, state) "
@@ -745,12 +797,29 @@ class Ledger:
         with self._tx(immediate=True) as c:
             c.execute(f"update envelope set {cols} where id = ?", (*fields.values(), envelope_id))
 
+    def set_cap(self, envelope_id: str, cap: float, *, ceiling: float | None = None) -> None:
+        """The user's yes to a new cap, checked against the ceiling in the same transaction."""
+        with self._tx(immediate=True) as c:
+            r = c.execute("select * from envelope where id = ?", (envelope_id,)).fetchone()
+            if r is None:
+                raise EnvelopeClosed(f"no envelope {envelope_id}")
+            e = dict(r)
+            _ceiling_check(c, facility=e["facility"], accounts=envelope_accounts(e), cap=cap, ceiling=ceiling,
+                           except_id=envelope_id)
+            c.execute("update envelope set cap = ? where id = ?", (float(cap), envelope_id))
+
     def rebind_envelope(self, envelope_id: str, *, session: str, owner: Owner, cap: float | None = None,
-                        now: float | None = None) -> None:
+                        ceiling: float | None = None, now: float | None = None) -> None:
         """The user's yes in a later session: the envelope is this session's from now on (its cap raised or lowered
-        when the yes named one)."""
+        when the yes named one, within the ceiling)."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
+            if cap is not None:
+                r = c.execute("select * from envelope where id = ?", (envelope_id,)).fetchone()
+                if r is not None:
+                    e = dict(r)
+                    _ceiling_check(c, facility=e["facility"], accounts=envelope_accounts(e), cap=cap,
+                                   ceiling=ceiling, except_id=envelope_id)
             c.execute("update envelope set approved_by = ?, approved_at = ?, owner_host = ?, owner_pid = ?, "
                       "owner_start = ?, cap = coalesce(?, cap) where id = ?",
                       (session, at, owner.host, owner.pid, owner.started, cap, envelope_id))
@@ -865,6 +934,41 @@ class Ledger:
         cols = ", ".join(f"{k} = ?" for k in fields)
         with self._tx(immediate=True) as c:
             c.execute(f"update job set {cols} where id = ?", (*fields.values(), job_id))
+
+    def move_job(self, job_id: str, *, only_from: Iterable[str], unless_cancel: bool = False, **fields: Any) -> bool:
+        """Move a job's row only from `only_from` states (and, with `unless_cancel`, only if no stop or cancel asked
+        for it meanwhile) — one transaction, so a stop and an admission cannot both win. Returns whether it moved."""
+        st = list(only_from)
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        q = f"update job set {cols} where id = ? and state in ({','.join('?' * len(st))})"
+        if unless_cancel:
+            q += " and coalesce(cancel_requested, 0) = 0"
+        with self._tx(immediate=True) as c:
+            return c.execute(q, (*fields.values(), job_id, *st)).rowcount == 1
+
+    # -- hand submits in flight (D2): what a reconciliation needs, whatever the command's outcome ----------------
+    def add_hand(self, token: str, *, envelope_id: str, facility: str | None, session: str, mark_path: str,
+                 shim_dir: str, before: list[str], now: float | None = None) -> None:
+        with self._tx() as c:
+            c.execute("insert into hand (token, envelope_id, facility, session, mark_path, shim_dir, before, "
+                      "created_at, state) values (?,?,?,?,?,?,?,?,'open')",
+                      (token, envelope_id, facility, session, mark_path, shim_dir, json.dumps(before),
+                       time.time() if now is None else now))
+
+    def hands(self, *, facility: str | None = None, states: Iterable[str] = ("open",)) -> list[dict[str, Any]]:
+        st = list(states)
+        q, args = f"select * from hand where state in ({','.join('?' * len(st))})", list[Any](st)
+        if facility is not None:
+            q += " and facility is ?"
+            args.append(facility)
+        return [dict(r) for r in self._con.execute(q + " order by created_at", args)]
+
+    def update_hand(self, token: str, **fields: Any) -> None:
+        if not fields:
+            return
+        cols = ", ".join(f"{k} = ?" for k in fields)
+        with self._tx() as c:
+            c.execute(f"update hand set {cols} where token = ?", (*fields.values(), token))
 
     def meter_reading(self, envelope_id: str, *, source: str, spent: float, committed: float,
                       unledgered: list[dict[str, Any]], detail: dict[str, Any], now: float | None = None) -> None:

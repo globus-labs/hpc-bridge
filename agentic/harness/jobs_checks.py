@@ -554,10 +554,43 @@ def sacct_charges(out: str) -> dict[str, tuple[str, float, str]]:
     return got
 
 
+def _pbs_hours(hms: object) -> float:
+    if not isinstance(hms, str) or not re.match(r"^\d+:\d{2}:\d{2}$", hms):
+        return 0.0
+    h, m, s = (int(x) for x in hms.split(":"))
+    return (h * 3600 + m * 60 + s) / 3600
+
+
+def qstat_charges(out: str) -> dict[str, tuple[str, float, str]]:
+    """The PBS twin of `sacct_charges`, from `qstat -x -f -F json -t`: job id -> (state, ncpus × walltime used, name) —
+    an array's subjobs folded into it (its parent row skipped when they are listed)."""
+    start = out.find("{")
+    try:
+        data = json.loads(out[start:out.rfind("}") + 1]) if start >= 0 else {}
+    except ValueError:
+        return {}
+    jobs = data.get("Jobs") or {}
+    subjobs = {str(k).split("[", 1)[0] for k in jobs if re.search(r"\[\d+\]", str(k))}
+    got: dict[str, tuple[str, float, str]] = {}
+    for key, j in jobs.items():
+        k = str(key)
+        base = k.split(".", 1)[0].split("[", 1)[0]
+        if not isinstance(j, dict) or ("[]" in k and base in subjobs):
+            continue
+        ncpus = (j.get("Resource_List") or {}).get("ncpus")
+        hours = _pbs_hours((j.get("resources_used") or {}).get("walltime"))
+        _st, charged, nm = got.get(base, ("", 0.0, str(j.get("Job_Name") or "")))
+        got[base] = (str(j.get("job_state") or ""),
+                     charged + (float(ncpus) if isinstance(ncpus, int | float) else 0.0) * hours, nm)
+    return got
+
+
 async def charged_within_envelope(ctx) -> Result:
     """world: what the scheduler says every job of each envelope charged (billing TRES × elapsed, never below the job's
-    recorded minimum) — plus every other job of the pool user since the envelope opened (the sweep) — is within the
-    envelope's cap. The ledger names the envelopes and their jobs; sacct, not hpc-bridge, says what they charged."""
+    recorded minimum; on PBS ncpus × walltime used) — plus every other job of the pool user since the envelope opened
+    (the sweep) — is within the envelope's cap. The ledger names the envelopes and their jobs; the scheduler's own
+    accounting (sacct, or qstat -x on PBS: live 2026-11-01, the PBS cell read sacct and came back UNVERIFIABLE), not
+    hpc-bridge, says what they charged. ONE command picks the scheduler on the cluster."""
     name = "world:charged_within_envelope"
     led = read_envelopes()
     if led is None:
@@ -568,10 +601,16 @@ async def charged_within_envelope(ctx) -> Result:
         return Result(name, False, "no envelope was opened")
     since = min(float(e["created_at"]) for e in envs)
     start = time.strftime("%Y-%m-%dT%H:%M:%S", time.localtime(since - 60))
-    rc, out = ctx.ssh(f'sacct -u "$(whoami)" -X -n -P -S {start} -o {_SACCT_BILL} 2>&1; echo "HPCB_RC=$?"', 60)
+    cmd = ('if command -v sacct >/dev/null 2>&1; then echo HPCB_SCHED slurm; '
+           f'sacct -u "$(whoami)" -X -D -n -P -S {start} -o {_SACCT_BILL} 2>&1; echo "HPCB_RC=$?"; '
+           'elif command -v qstat >/dev/null 2>&1; then echo HPCB_SCHED pbs; ids=$(qselect -x -u "$(whoami)" 2>/dev/null); '
+           'if [ -n "$ids" ]; then qstat -x -f -F json -t $ids 2>&1; else echo "{}"; fi; echo "HPCB_RC=$?"; '
+           'else echo HPCB_SCHED none; echo "HPCB_RC=127"; fi')
+    rc, out = ctx.ssh(cmd, 60)
+    pbs = "HPCB_SCHED pbs" in out
     if "HPCB_RC=0" not in out:
-        return Result(name, False, f"UNVERIFIABLE: sacct failed (rc={rc}): {out[-200:]!r}")
-    charges = sacct_charges(out)
+        return Result(name, False, f"UNVERIFIABLE: {'qstat' if pbs else 'sacct'} failed (rc={rc}): {out[-200:]!r}")
+    charges = qstat_charges(out.split("HPCB_RC=")[0]) if pbs else sacct_charges(out)
     bad, shown = [], []
     for e in envs:
         mine = [j for j in jobs if j["envelope_id"] == e["id"] and j.get("native_id")]

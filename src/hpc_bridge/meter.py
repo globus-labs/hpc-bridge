@@ -2,22 +2,29 @@
 
 One login-shape call per tick reads what the scheduler says every job of ours charged and can still charge:
 
-- **Slurm**: `sacct -X -n -P -u "$USER" -S <earliest> -o JobID,JobName,State,ElapsedRaw,TimelimitRaw,AllocTRES,ReqTRES,
-  Partition,Account,ExitCode,Reason` (under TZ=UTC0: -S is UTC), then, in the same call, `squeue -h -u "$USER" -o
-  "%i|%T|%M|%l|%j"` — the fallback for a job sacct does not list, and whether a cancelled job is still on its way out.
-- **PBS**: `qstat -x -f -F json $(qselect -x -u "$USER")`.
+- **Slurm**: `sacct -X -D -n -P -u "$USER" -S <earliest> -o JobID,JobName,State,ElapsedRaw,TimelimitRaw,AllocTRES,
+  ReqTRES,Partition,Account,ExitCode,Reason` (under TZ=UTC0: -S is UTC; `-D`: a requeued job's earlier runs too), then,
+  in the same call, `squeue -h -u "$USER" -o "%i|%T|%M|%l|%j"` — what is still live (a cancelled job on its way out),
+  the pending tasks of an array (sacct has no row for them: the fake cluster's probe, 2026-11-01), and the fallback for
+  a job sacct does not list.
+- **PBS**: `qstat -x -f -F json -t $(qselect -x -u "$USER")` (`-t`: an array's subjobs).
+
+Each scheduler command runs under a bash-native timeout (`METER_TIMEOUT_S`, below the sync-wait): with slurmdbd down
+sacct HANGS (live 2026-11-01: the tick outlived the sync-wait, read nothing and held the login channel for the next
+call); killed, it is an unreadable sacct, and every job is held at its full walltime.
 
 The rules (`job_reading`): **charged** = the job's `billing` TRES (AllocTRES, else ReqTRES: it carries the site's
 partition weights) × elapsed; where the scheduler reports no billing, the rate the terms reserved at (the slice's billed
 cores × the weights, never a whole node for a slice). Never below the queue's minimum charge (`min_charge_h`, a catalog
 fact) once the job started. **committed** = a running job's remaining walltime, a queued one's full walltime (and every
-pending array task's). **A ledger job sacct does not list** holds its full walltime: squeue says only whether it
-is still live. **Unledgered** jobs — every other job of the user in the same output — count, and are named, until
-the user says they are not theirs (`exclude_jobs`).
+pending array task's). **A ledger job sacct does not list** holds its full walltime: squeue says only whether it is
+still live. **Unledgered** jobs — every other job of the user in the same output — count, and are named, until the user
+says they are not theirs (`exclude_jobs`); one with no time limit (UNLIMITED) is held to the envelope's deadline.
 """
 from __future__ import annotations
 
 import json
+import os
 import re
 from dataclasses import dataclass, field
 from typing import Any
@@ -30,22 +37,43 @@ QSTAT_MARK = "HPCB_QSTAT_BEGIN"
 _LIVE_SQUEUE = frozenset({"PENDING", "RUNNING", "COMPLETING", "CONFIGURING", "SUSPENDED", "RESIZING", "REQUEUED",
                           "REQUEUE_HOLD", "REQUEUE_FED", "SIGNALING", "STAGE_OUT", "STOPPED"})
 _ENDED = frozenset({"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "DEADLINE", "NODE_FAIL", "OUT_OF_MEMORY",
-                    "PREEMPTED", "BOOT_FAIL", "REVOKED", "SPECIAL_EXIT"})
+                    "PREEMPTED", "BOOT_FAIL", "REVOKED", "SPECIAL_EXIT", "REQUEUED"})
 _FAILED = frozenset({"FAILED", "TIMEOUT", "DEADLINE", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL",
                      "REVOKED", "SPECIAL_EXIT"})
+# A bash-native timeout (no coreutils `timeout` assumed): the command in the background, a watcher that TERMs it. The
+# watcher's own output goes nowhere: an orphaned `sleep` must not hold the call's stdout open past the command.
+_BOUND = ('__hb_bound() { "$@" & local p=$!; ( sleep @@S@@; kill -TERM "$p" 2>/dev/null ) </dev/null >/dev/null 2>&1 & '
+          'local w=$!; wait "$p"; local rc=$?; kill "$w" 2>/dev/null; wait "$w" 2>/dev/null; return "$rc"; }; ')
+
+
+def timeout_s() -> int:
+    """How long one scheduler read may take: HPC_BRIDGE_METER_TIMEOUT_S, else 15 s — and always a few seconds under
+    the sync-wait, so the tick's login call answers in it."""
+    from .config import SYNC_WAIT_S
+
+    try:
+        want = float(os.environ.get("HPC_BRIDGE_METER_TIMEOUT_S", "") or 15.0)
+    except ValueError:
+        want = 15.0
+    return max(1, int(min(want, max(1.0, float(os.environ.get("HPC_BRIDGE_SYNC_WAIT_S", "") or SYNC_WAIT_S) - 4))))
+
+
+def _bound() -> str:
+    return _BOUND.replace("@@S@@", str(timeout_s()))
 
 
 def slurm_cmd(since_iso: str) -> str:
     """The tick's one login-shape command on Slurm (`since_iso`: UTC, `YYYY-MM-DDTHH:MM:SS`)."""
     fields = ",".join(f"{f}%200" if f in ("JobName", "AllocTRES", "ReqTRES", "Reason") else f for f in SACCT_FIELDS)
-    return (f'echo {SACCT_MARK}; TZ=UTC0 sacct -X -n -P -u "$USER" -S {since_iso} -o {fields} 2>&1; '
-            f'echo "HPCB_SACCT_RC=$?"; echo {SQUEUE_MARK}; squeue -h -u "$USER" -o \'{SQUEUE_FMT}\' 2>/dev/null; '
-            f'echo "HPCB_SQUEUE_RC=$?"; echo {END_MARK}')
+    return (f'{_bound()}echo {SACCT_MARK}; __hb_bound env TZ=UTC0 sacct -X -D -n -P -u "$USER" -S {since_iso} '
+            f'-o {fields} 2>&1; echo "HPCB_SACCT_RC=$?"; echo {SQUEUE_MARK}; '
+            f'__hb_bound squeue -h -u "$USER" -o \'{SQUEUE_FMT}\' 2>/dev/null; echo "HPCB_SQUEUE_RC=$?"; '
+            f'echo {END_MARK}')
 
 
 def pbs_cmd() -> str:
-    return (f'echo {QSTAT_MARK}; ids=$(qselect -x -u "$USER" 2>/dev/null); '
-            'if [ -n "$ids" ]; then qstat -x -f -F json $ids 2>/dev/null; else echo "{}"; fi; '
+    return (f'{_bound()}echo {QSTAT_MARK}; ids=$(__hb_bound qselect -x -u "$USER" 2>/dev/null); '
+            'if [ -n "$ids" ]; then __hb_bound qstat -x -f -F json -t $ids 2>/dev/null; else echo "{}"; fi; '
             f'echo "HPCB_QSTAT_RC=$?"; echo {END_MARK}')
 
 
@@ -78,35 +106,52 @@ class Row:
 
 @dataclass
 class SchedView:
-    """What one tick read: `rows` by base id; `live` — ids the scheduler still lists (squeue, or a non-final PBS state);
-    `ok` — whether the accounting read worked (sacct / qstat); `source`."""
+    """What one tick read: `rows` by base id (sacct / qstat); `live` — base ids the scheduler still lists, with their
+    state (squeue, or a non-final PBS state); `pending` — an array's pending tasks squeue lists (sacct has no row for
+    them); `ok` — whether the accounting read worked; `source`."""
     rows: dict[str, list[Row]] = field(default_factory=dict)
     live: dict[str, str] = field(default_factory=dict)
+    pending: dict[str, int] = field(default_factory=dict)
+    names: dict[str, str] = field(default_factory=dict)
     ok: bool = False
     source: str = "sacct"
     calls: int = 0
     error: str = ""
 
 
-def _tres(spec: str, key: str) -> float | None:
-    m = re.search(rf"(?:^|,){key}=([0-9.]+)", spec or "")
+def tres(spec: str, key: str) -> float | None:
+    m = re.search(rf"(?:^|,){re.escape(key)}=([0-9.]+)", spec or "")
     return float(m.group(1)) if m else None
 
 
-def _range_count(spec: str) -> int:
-    """`[4-19%4]` / `[2,5,7-9]` → how many tasks."""
+def range_count(spec: str) -> int:
+    """`[4-19%4]` / `[2,5,7-9]` / `0-98:2` → how many tasks."""
     s = spec.strip("[]").split("%", 1)[0]
     n = 0
     for part in s.split(","):
+        step = 1
+        if ":" in part:
+            part, st = part.split(":", 1)
+            try:
+                step = max(1, int(st))
+            except ValueError:
+                step = 1
         if "-" in part:
             a, b = part.split("-", 1)
             try:
-                n += int(b) - int(a) + 1
+                n += (int(b) - int(a)) // step + 1
             except ValueError:
                 n += 1
         elif part:
             n += 1
     return max(n, 1)
+
+
+def _limit(raw: str) -> float | None:
+    try:
+        return float(raw) * 60 if raw not in ("", "UNLIMITED", "Partition_Limit") else None
+    except ValueError:
+        return None
 
 
 def parse_slurm(out: str) -> SchedView:
@@ -115,48 +160,47 @@ def parse_slurm(out: str) -> SchedView:
     m = re.search(r"HPCB_SACCT_RC=(\d+)", out)
     v.ok = m is not None and m.group(1) == "0"
     if not v.ok:
-        v.error = sacct.strip()[-200:]
+        v.error = sacct.strip()[-200:] or "sacct did not answer in time"
     else:
         for line in sacct.splitlines():
             cols = line.split("|")
             if len(cols) < len(SACCT_FIELDS) or not cols[0][:1].isdigit():
                 continue
             d = dict(zip(SACCT_FIELDS, cols, strict=False))
-            jid = d["JobID"]
-            base, _, task = jid.partition("_")
+            base, _, task = d["JobID"].partition("_")
             pending = 0
             if task.startswith("["):
-                pending, task = _range_count(task), ""
+                pending, task = range_count(task), ""
             state = (d["State"].split() or ["UNKNOWN"])[0]
             try:
                 elapsed = float(d["ElapsedRaw"] or 0)
             except ValueError:
                 elapsed = 0.0
-            try:
-                limit = float(d["TimelimitRaw"]) * 60 if d["TimelimitRaw"] not in ("", "UNLIMITED", "Partition_Limit") \
-                    else None
-            except ValueError:
-                limit = None
-            bill = _tres(d["AllocTRES"], "billing")
+            bill = tres(d["AllocTRES"], "billing")
             if bill is None:
-                bill = _tres(d["ReqTRES"], "billing")
-            cpus = _tres(d["AllocTRES"], "cpu") or _tres(d["ReqTRES"], "cpu")
-            ec = None
-            if re.match(r"^\d+", d.get("ExitCode") or ""):
-                ec = int(re.match(r"^(\d+)", d["ExitCode"]).group(1))  # type: ignore[union-attr]
-            v.rows.setdefault(base.split(".")[0], []).append(Row(
-                base=base.split(".")[0], task=task or None, name=d["JobName"], state=state, elapsed_s=elapsed,
-                limit_s=limit, billing=bill, partition=d.get("Partition") or None, account=d.get("Account") or None,
-                exit_code=ec, reason=(d.get("Reason") or None) if d.get("Reason") not in ("None", "") else None,
+                bill = tres(d["ReqTRES"], "billing")
+            cpus = tres(d["AllocTRES"], "cpu") or tres(d["ReqTRES"], "cpu")
+            em = re.match(r"^(\d+)", d.get("ExitCode") or "")
+            b = base.split(".")[0]
+            v.names.setdefault(b, d["JobName"])
+            v.rows.setdefault(b, []).append(Row(
+                base=b, task=task or None, name=d["JobName"], state=state, elapsed_s=elapsed,
+                limit_s=_limit(d["TimelimitRaw"]), billing=bill, partition=d.get("Partition") or None,
+                account=d.get("Account") or None, exit_code=int(em.group(1)) if em else None,
+                reason=(d.get("Reason") or None) if d.get("Reason") not in ("None", "") else None,
                 pending_tasks=pending, cpus=cpus))
     sq = _between(out, SQUEUE_MARK, "HPCB_SQUEUE_RC=") or ""
     for line in sq.splitlines():
         cols = line.split("|")
-        if len(cols) < 2 or not cols[0][:1].isdigit():
+        if len(cols) < 2 or not cols[0][:1].isdigit() or cols[1] not in _LIVE_SQUEUE:
             continue
-        base = cols[0].split("_", 1)[0]
-        if cols[1] in _LIVE_SQUEUE:
-            v.live[base] = cols[1] if base not in v.live or cols[1] == "RUNNING" else v.live[base]
+        base, _, task = cols[0].partition("_")
+        if task.startswith("[") and cols[1] == "PENDING":
+            v.pending[base] = v.pending.get(base, 0) + range_count(task)
+        if len(cols) > 4:
+            v.names.setdefault(base, cols[4])
+        prev = v.live.get(base)
+        v.live[base] = cols[1] if prev is None or cols[1] == "RUNNING" else prev
     return v
 
 
@@ -179,12 +223,18 @@ def parse_pbs(out: str) -> SchedView:
         data = json.loads(body[start:]) if start >= 0 else {}
         v.ok = isinstance(data, dict)
     except ValueError:
-        v.error = body.strip()[-200:]
+        v.error = body.strip()[-200:] or "qstat did not answer in time"
         return v
-    for key, j in (data.get("Jobs") or {}).items():
+    jobs = data.get("Jobs") or {}
+    subjobs = {str(k).split("[", 1)[0] for k in jobs if re.search(r"\[\d+\]", str(k))}
+    for key, j in jobs.items():
         if not isinstance(j, dict):
             continue
-        base = str(key).split(".", 1)[0].split("[", 1)[0]
+        k = str(key)
+        base = k.split(".", 1)[0].split("[", 1)[0]
+        is_parent = "[]" in k
+        if is_parent and base in subjobs:
+            continue   # the subjobs carry the array (qstat -t)
         st = str(j.get("job_state") or "")
         rl, used = j.get("Resource_List") or {}, j.get("resources_used") or {}
         if st in ("F", "X"):
@@ -194,8 +244,10 @@ def parse_pbs(out: str) -> SchedView:
             state = _PBS_STATE.get(st, "PENDING")
             v.live[base] = state
         ncpus = rl.get("ncpus")
+        task = re.search(r"\[(\d+)\]", k)
+        v.names.setdefault(base, str(j.get("Job_Name") or ""))
         v.rows.setdefault(base, []).append(Row(
-            base=base, task=None, name=str(j.get("Job_Name") or ""), state=state,
+            base=base, task=task.group(1) if task else None, name=str(j.get("Job_Name") or ""), state=state,
             elapsed_s=_pbs_secs(used.get("walltime")) or 0.0, limit_s=_pbs_secs(rl.get("walltime")), billing=None,
             partition=j.get("queue"), account=j.get("Account_Name"),
             exit_code=j.get("Exit_status") if isinstance(j.get("Exit_status"), int) else None,
@@ -219,13 +271,14 @@ class Reading:
 def _phase_state(states: list[str]) -> str:
     if any(s in ("RUNNING", "COMPLETING") for s in states):
         return "RUNNING"
-    if any(s in ("PENDING", "SUSPENDED", "CONFIGURING", "REQUEUED") for s in states):
+    if any(s in ("PENDING", "SUSPENDED", "CONFIGURING") for s in states):
         return "PENDING"
-    if states and all(s == "COMPLETED" for s in states):
+    final = [s for s in states if s != "REQUEUED"] or states
+    if final and all(s == "COMPLETED" for s in final):
         return "COMPLETED"
-    if any(s in _FAILED for s in states):
-        return next(s for s in states if s in _FAILED)
-    return states[-1] if states else "UNKNOWN"
+    if any(s in _FAILED for s in final):
+        return next(s for s in final if s in _FAILED)
+    return final[-1] if final else "UNKNOWN"
 
 
 def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
@@ -241,7 +294,6 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
     if not view.ok or not rows:
         # sacct (or qstat) did not list it: its full walltime is held — squeue says only whether it is still live
         prior = float(job.get("charged") or 0.0)
-        # still live: the scheduler lists it, or — sacct unreadable — the ledger last saw it live
         live = listed is not None or (not view.ok and job.get("state") in ("reserved", "submit_unknown", "held",
                                                                            "queued", "running"))
         return Reading(prior, max(0.0, worst - prior), listed or (job.get("sched_state") or "UNKNOWN"),
@@ -252,6 +304,7 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
     accounted = 0
     exit_code: int | None = None
     reason: str | None = None
+    finals = [r for r in rows if r.state != "REQUEUED"]
     for r in rows:
         r_rate = r.billing if r.billing is not None else rate
         r_limit = r.limit_s if r.limit_s is not None else limit_s
@@ -263,13 +316,12 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
             states.append("PENDING")
             reason = reason or r.reason
             continue
-        accounted += 1
+        if r.state != "REQUEUED":
+            accounted += 1
         state = r.state
-        if state in _ENDED and listed and native and r.task is None and len(rows) == 1:
-            state = listed   # sacct already says CANCELLED; the scheduler still lists it on its way out
         counts[state] = counts.get(state, 0) + 1
         states.append(state)
-        started = r.elapsed_s > 0 or state not in ("PENDING",)
+        started = r.elapsed_s > 0 or state != "PENDING"
         billed = max(r.elapsed_s, min_s) if started and state != "PENDING" else 0.0
         charged += r_rate * billed / 3600
         if state in _ENDED:
@@ -278,24 +330,33 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
             committed += r_rate * max(r_limit, min_s) / 3600
         else:
             committed += r_rate * max(0.0, max(r_limit, min_s) - billed) / 3600
-        if len(rows) == 1:
+        if len(finals) == 1 and r.state != "REQUEUED":
             exit_code = r.exit_code
         reason = reason or (r.reason if state == "PENDING" else None)
-    if accounted < tasks:   # tasks the scheduler did not list at all: each holds its full walltime
-        committed += (tasks - accounted) * rate * max(limit_s, min_s) / 3600
+    sq_pending = view.pending.get(native, 0)
+    if sq_pending and "PENDING" not in counts:   # an array's pending tasks: in squeue only
+        counts["PENDING"] = sq_pending
+        states.append("PENDING")
+    missing = max(0, tasks - accounted)   # tasks the accounting did not list (pending ones, or not seen at all)
+    if missing:
+        committed += missing * rate * max(limit_s, min_s) / 3600
     state = _phase_state(states)
-    live = state in ("RUNNING", "PENDING") or bool(listed)
+    if listed and state not in ("RUNNING", "PENDING"):
+        state = "COMPLETING" if listed in ("COMPLETING", "RUNNING") else listed   # cancelled, still on its way out
+    live = bool(listed) or state in ("RUNNING", "PENDING", "COMPLETING")
     return Reading(round(charged, 6), round(committed, 6), state, view.source, exit_code, reason, counts, live)
 
 
-def unledgered(view: SchedView, known: set[str], excluded: set[str], *, account: str | None = None) -> list[dict]:
-    """Every job in the tick that is not a ledger job's and not one the user excluded (on the envelope's account when
-    the row says one): what it charged and can still charge, at its own billing (else its cpus) per hour."""
+def unledgered(view: SchedView, known: set[str], excluded: set[str], *, accounts: set[str] | None = None,
+               horizon_s: float = 0.0) -> list[dict]:
+    """Every job in the tick that is not a ledger job's and not one the user excluded (on one of the envelope's
+    accounts when the row says one): what it charged and can still charge, at its own billing (else its cpus) per hour.
+    A job with no time limit (UNLIMITED) is held to `horizon_s` (the envelope's deadline), never to nothing."""
     out = []
     for base, rows in view.rows.items():
         if base in known or base in excluded:
             continue
-        if account and any(r.account and r.account != account for r in rows):
+        if accounts and any(r.account and r.account not in accounts for r in rows):
             continue
         ch = co = 0.0
         states = []
@@ -303,12 +364,13 @@ def unledgered(view: SchedView, known: set[str], excluded: set[str], *, account:
             rate = r.billing if r.billing is not None else (r.cpus or 1.0)
             n = r.pending_tasks or 1
             states.append(r.state)
+            limit = r.limit_s if r.limit_s is not None else max(horizon_s, r.elapsed_s)
             if r.pending_tasks or r.state == "PENDING":
-                co += n * rate * (r.limit_s or 0.0) / 3600
+                co += n * rate * limit / 3600
                 continue
             ch += rate * r.elapsed_s / 3600
             if r.state not in _ENDED:
-                co += rate * max(0.0, (r.limit_s or 0.0) - r.elapsed_s) / 3600
+                co += rate * max(0.0, limit - r.elapsed_s) / 3600
         out.append({"native_id": base, "name": rows[0].name, "state": _phase_state(states), "charged": round(ch, 6),
                     "committed": round(co, 6)})
     return out

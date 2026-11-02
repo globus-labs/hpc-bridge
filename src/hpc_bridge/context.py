@@ -535,6 +535,9 @@ class AppCtx:
     # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
     session_token: str = field(default_factory=lambda: secrets.token_hex(8))
     jobs_meter_at: float = 0.0
+    # job ids this process is admitting right now (reserved, not yet submitted): a stop or cancel meanwhile asks the
+    # admission to give up (`cancel_requested`) and counts the job as one that can still bill (review B2)
+    jobs_admitting: set[str] = field(default_factory=set)
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

@@ -35,10 +35,7 @@ from tests.test_batch_phase2a import (  # noqa: F401 - fixtures and helpers
 )
 
 _FIXTURES = (world, pbs)   # pytest fixtures, used by name as test parameters below
-pytestmark = [
-    pytest.mark.skipif(_BASH is None, reason="needs bash"),
-    pytest.mark.xfail(strict=True, reason="fix round 1 is not built yet (failing first; red log red_p2a_r1.txt)"),
-]
+pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
 
 
 def _others(world, first):
@@ -328,8 +325,11 @@ async def _capture_provision(monkeypatch, app):
     from hpc_bridge import warmth
 
     seen: dict = {}
+    real = warmth._provision
 
     async def fake_provision(app_, shape, **kw):
+        if shape != "compute":   # the free login shape (the meter's channel) provisions as ever
+            return await real(app_, shape, **kw)
         seen["pool"] = [float(j["worst_case"]) for j in _pool_rows(app_) if j["state"] != "refused"]
         seen["confirm"] = kw.get("confirm_spend")
         raise RuntimeError("stopped by the review test before any block is submitted")

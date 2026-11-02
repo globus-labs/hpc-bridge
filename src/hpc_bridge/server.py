@@ -457,7 +457,8 @@ async def _ensure_endpoint_up(
     if confirm_spend and shape == DEFAULT_SHAPE:
         # batch phase 2a: while this session's envelope is open, a block it confirms is admitted against it (read off
         # the lock: the meter rides the login shape)
-        refused = await jobmode.block_admission(app, shape, partition=partition)
+        refused = await jobmode.block_admission(app, shape, partition=partition, account=account,
+                                                sizing=sizing if not login_only else None)
         if refused is not None:
             refused.session_spend = _total_session_spend(app)
             return refused
@@ -1183,10 +1184,10 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus
                               notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
     try:
         live = await jobmode.billing_jobs(app)
-    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: the stop of blocks still runs, and says so
+    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: the blocks are released, and it is never down
         print(f"hpc-bridge: the stop could not read the Jobs-mode ledger ({type(exc).__name__}: {exc})",
               file=sys.stderr)
-        live = []
+        return jobmode.ledger_unreadable(await _stop_endpoint_blocks(app), exc)
     if live and jobs is None:
         return jobmode.stop_question(app, live)
     if live and app.state.endpoint_id is None:
@@ -1968,6 +1969,15 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
     if login_exec is None:
         return LoginShellResult(exit_code=1, notice=_no_facility_notice(app))
     sub = await _detect_submission(command, "login")  # the same login node, over SSH: a job submitted here is billed
+    gate = jobmode.gate_envelope(app, sub)
+    if gate is not None:   # review A6: a fresh SSH runs outside the hold — the envelope's jobs go through run_shell
+        return LoginShellResult(
+            exit_code=1,
+            notice=(f"Refused, NOTHING ran: this command submits a batch job by hand while envelope {gate['id']} is "
+                    "open, and login_shell runs over a fresh SSH, outside the hold that adopts such a job into the "
+                    "envelope. Use submit_job (the envelope admits it), or run_shell(command, shape='login') — it "
+                    "asks, then submits HELD and adopts each job."),
+        )
     try:
         rc, out, err = await login_exec(command)
     except Exception as exc:  # noqa: BLE001 - never crash the tool; report structurally
@@ -2248,25 +2258,32 @@ async def _run_shell(
 
 
 async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, envelope: dict) -> ShellOutcome:
-    """D2 (c) after the user's yes: the hand submit runs with sbatch/qsub holding what they submit (`jobs.HOLD_SHIM`,
-    in its shell and every bash it starts), then each job it created is adopted into the envelope and released — or
-    cancelled while still held when it does not fit. With no receipt in its output #176's advisory is kept."""
+    """D2 (c) after the user's yes: the hand submit runs with a wrapper first on its PATH that submits each job HELD,
+    with the envelope's deadline, and keeps the real sbatch/qsub's own receipt (`jobs.begin_hand`, `held_command`) —
+    set up, and its ledger row written, BEFORE the dispatch is counted (nothing may await between the count and the
+    submit). Whatever the outcome, its jobs are reconciled (`jobs.finish_hand`): adopted and released, cancelled while
+    still held when they do not fit, or — a submit the wrapper could not hold — counted and never cancelled; a command
+    still running is reconciled again by the next call. With nothing submitted, #176's advisory is kept."""
+    hand = await jobmode.begin_hand(app, envelope, session_id)
+    if isinstance(hand, str):
+        return ShellOutcome(phase="failed", block_state="cold", exit_code=None,
+                            notice=(f"NOTHING ran: the hold for this hand submit could not be set up on the login node "
+                                    f"({hand}). Try again; without the hold hpc-bridge does not run it."))
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
+        jobmode.drop_hand(app, hand, ready.phase)
         return ready
     runner, session, rt, guard = ready
     key = secrets.token_hex(8)
-    held = jobmode.HOLD_SHIM + command
+    held = jobmode.held_command(hand, command, float(envelope["deadline"]))
     out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
                                   lambda: session_shell.wrap(held, session, guard=guard, result_key=key),
                                   agent_call=True, submission=None, guard=guard, result_key=key)
-    if out.phase != "complete":
-        return out
-    adopted = await jobmode.adopt_hand_submits(app, envelope, out)
-    if not adopted.jobs and not jobmode._receipts(app, out.stdout):
+    out, found = await jobmode.finish_hand(app, hand, out)
+    if not found:
         sub = await _detect_submission(command, shape)
-        adopted = _with_submission_notice(adopted, sub, shape)
-    return adopted
+        out = _with_submission_notice(out, sub, shape)
+    return out
 
 
 async def _reset_session(
@@ -2434,6 +2451,16 @@ async def _run_batch(
 ) -> BatchStatus:
     if _no_facility_bound(app) and batch_id is None:
         return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
+    if isinstance(command, str) and batch_id is None:
+        sub = await _detect_submission(command, shape)
+        if sub is not None and {"sbatch", "qsub"} & {sub.command, *sub.names}:   # review A6
+            return BatchStatus(
+                phase="refused", reason="template submits jobs",
+                notice=("Refused, nothing was recorded or run: the template submits a scheduler job per row "
+                        f"(`{next(n for n in (*sub.names, sub.command) if n in ('sbatch', 'qsub'))}`) — each would be "
+                        "a billed job outside every envelope and the confirmed block. Use submit_job with array=… "
+                        "(one job, every row a task, {index} in the command), or a run_batch template that does the "
+                        "work itself on the block."))
     return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
                                  task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
                                  shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id)

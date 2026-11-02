@@ -320,10 +320,6 @@ def test_array_within_throttle_and_never_started():
     assert not asyncio.run(jc.never_started(_ctx(t, lambda *a, **k: (0, "1001|CANCELLED|2033-05-18T03:00:00|61\n")))).ok
 
 
-_R1 = pytest.mark.xfail(strict=True, reason="fix round 1: not built yet")
-
-
-@_R1
 def test_charged_within_envelope_reads_pbs_when_the_cluster_is_pbs(tmp_path):
     """Live 2026-11-01 (hand_submit_gated_adopted, pbs): the world check ran sacct on PBS — UNVERIFIABLE. It reads
     qstat -x -f -F json there: ncpus × the walltime used."""
@@ -346,7 +342,6 @@ def test_charged_within_envelope_reads_pbs_when_the_cluster_is_pbs(tmp_path):
     assert "qstat" in seen[0] and "sacct" in seen[0], seen        # one command that picks the scheduler there
 
 
-@_R1
 def test_spend_follows_question_credits_submit_jobs_own_question():
     """Live 2026-11-01: every Jobs-mode cell failed spend_follows_question — submit_job counted as a hand submit with no
     question. submit_job's own needs_confirmation IS the question (the user's yes came back as confirm_spend); so is a

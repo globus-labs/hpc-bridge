@@ -237,10 +237,6 @@ async def test_a_hand_sbatch_while_the_envelope_is_open_asks_first_and_runs_noth
     assert len(world.sched.calls("sbatch")) == before                  # the command never ran
 
 
-_R1 = pytest.mark.xfail(strict=True, reason="fix round 1 (the probed Slurm 23.11): not built yet")
-
-
-@_R1
 async def test_a_confirmed_hand_sbatch_is_held_adopted_reserved_and_released(world):
     from hpc_bridge import server
 
@@ -371,7 +367,6 @@ async def test_with_no_billing_tres_a_slice_is_metered_at_its_own_rate_not_a_who
     assert st.job.charged == pytest.approx(1.0), st.job                 # 2 cores × 0.5 h, never 4 × 0.5 h
 
 
-@_R1
 async def test_the_meter_counts_every_array_task(world):
     from hpc_bridge import server
 
@@ -489,7 +484,6 @@ async def test_a_new_session_is_asked_again_naming_what_remains(world):
     assert len(world.sched.calls("sbatch")) == 2
 
 
-@_R1
 async def test_the_deadline_defaults_within_24_hours_and_every_job_carries_it(world):
     now = time.time()
     out = await _confirmed(world.app, command="sleep 60")

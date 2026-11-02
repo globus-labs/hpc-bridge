@@ -243,6 +243,10 @@ class JobInfo(BaseModel):
     script_path: str | None = None
     script_hash: str | None = None
     session_id: str | None = None
+    # a hand submit the hold could not catch (an absolute path to sbatch/qsub, sudo, a shell that reset PATH): counted
+    # at its full request, with no deadline of the envelope's — hpc-bridge never cancels it on its own (only on a
+    # cancel of this job id: the user's say-so)
+    unheld: bool = False
 
 
 class JobTerms(BaseModel):
