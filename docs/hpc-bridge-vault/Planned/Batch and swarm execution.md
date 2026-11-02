@@ -1,7 +1,7 @@
 # Batch and agent-swarm execution: design
 
 > [!abstract] In one line
-> Designed 2026-10-30. Phase 1 (the durable ledger and `run_batch` / `status` / `cancel` on the session's confirmed compute block) is MERGED (#238, 2026-11-01: [[batch]], [[ledger]]; "Phase 1 as built" below) and was live-checked on Anvil's facility endpoint the same day ("Phase 1, live" below). Phase 2a (the envelope, the meter, Jobs mode, D2) is BUILT on `feat/batch-phase2a` ([[jobs]], [[meter]]; "Phase 2a as built" below), with its live cells still to run; 2b (`export_handoff`), 3 and 4 are designed, not built.
+> Designed 2026-10-30. Phase 1 (the durable ledger and `run_batch` / `status` / `cancel` on the session's confirmed compute block) is MERGED (#238, 2026-11-01: [[batch]], [[ledger]]; "Phase 1 as built" below) and was live-checked on Anvil's facility endpoint the same day ("Phase 1, live" below). Phase 2a (the envelope, the meter, Jobs mode, D2) is BUILT on `feat/batch-phase2a` ([[jobs]], [[meter]]; "Phase 2a as built" below), with its live cells still to run. Phase 2b (`export_handoff`, the loam handoff) is BUILT on `feat/batch-phase2b` ([[handoff]]; "Phase 2b as built" below), with its live cells still to run. Phases 3 and 4 are designed, not built.
 
 _Design lead's draft, 2026-10-30. Code references are to `fix/perlmutter-report` at 74fd47d. Library behaviour is from the installed `mcp` 1.30.0, `globus-compute-sdk` 4.18.0 and `globus_sdk`, plus the Globus Compute and Parsl docs (via Context7). Inputs: the three research reports (working files of the design, not kept in the repo), the adversarial review ([[Batch design review 2026-10-30]]), the vault, `HANDOFF.md`, `SKILL.md`, and loam's `hpc-deployment` skill (`develop`). No product code. **Revised the same day with the phase-0 spike results** (S1, S2, S4, S5, S7, S8 on a fake cluster and, for S7, read-only on Delta and Anvil): [[Batch spikes 2026-10-30]] holds the evidence._
 
@@ -406,6 +406,46 @@ Modules [[jobs]] and [[meter]], the [[ledger]]'s `envelope`, `job` and `meter_re
 - **A compute block confirmed while the envelope is open** is reserved against it (`pool_block`) until the stop.
 - **Units:** the cap is in "billing units" (Slurm billing TRES-hours; on PBS without weights, core-hours).
 - **Deferred:** `max_concurrent_blocks` (phase 3 pools) and the PBS queue limits in the terms (`qstat -Qf`).
+
+#### Phase 2b as built (2026-11-02, branch `feat/batch-phase2b`)
+
+Module [[handoff]]; the tool in [[The MCP tools]]. Built test-first:
+- `tests/test_handoff_phase2b.py`: red on main at a00952b, green with the build. It uses the fake `pbs_mep` template and schema, a Polaris-shaped template, and hpc-bridge's own SSH template; the canary runs under real bash with a block's environment, and a fake Slurm sits on the login node.
+- `agentic/harness/handoff_checks.py` with `test_handoff_scenarios.py`, and three scripted scenarios:
+  - `handoff_polaris_shape` and `handoff_mep_min_blocks_refused` (fake `pbs_mep`);
+  - `handoff_ssh_shape` (fake `default`).
+
+Where §8 left a choice open, or the checkpoint (the coordinator's decisions, 2026-11-02) settled it:
+- **A 17th tool, `export_handoff(user_endpoint_config, expires_hours=24, confirm_spend=False)`,** not an argument on `ensure_endpoint_up`. It touches no session state, it hands an endpoint to someone hpc-bridge then stops policing, and its return is a record.
+- **The input is loam's config, not a `campaign_id`:** there are no campaigns before phase 3.
+  - **How the config is built:** the facility's compute defaults go under the caller's keys. Either key name works (`queue`, or hpc-bridge's `partition` through `key_map`).
+  - **What is refused by name:** a caller key that is not rendered, or that the schema refuses. A default key that is not rendered is not sent.
+  - **What the server writes:** `init_blocks: 0` and `min_blocks: 0` where the template renders them and the caller left them out.
+  - **On SSH:** a block request of the handoff's own (`hpcb_block`), so loam's user endpoint is never the session's.
+- **The record has no `path` argument.** It always goes to `<state_dir>/handoffs/hoff-<12 hex>.json`, mode 0600.
+- **It adds `handoff_id` and `loam.env`** (the four keys, plain strings). Loam writes `set_env.sh` itself, quoting every value: `printf 'export %s=%q\n'` or `shlex.quote`. A script inside the record would be code loam sources.
+- **`expires_at` counts from the user's yes:** default 24 h, at most 168 h. The canary is where the exposure starts.
+- **`worst_case = max_blocks × rate × (hours × max(1, min_charge ÷ idle) + max(walltime, min_charge))`.**
+  - The rate is the partition's billing where its weights are known, else node-hours.
+  - A minimum charge with an unreadable idle window is refused as `unbounded`.
+  - `canary_worst_case` is stated beside it.
+- **`template.sha256`** is the registry's verification digest: the template, a newline, then the schema as canonical JSON.
+- **`validation.queue_checks`** holds only "the scheduler took a block on queue X". There is no `qstat -Qf`, since a MEP has no free channel, and the Aurora `debug-scaling` ≥ 2 nodes rule has no catalog field.
+- **`uep_id_seen`** is read from the canary's working directory (`uep.<manager>.<uep>/…`). Where that is not seen it is null, with `uep_id_note`; the live polaris cell gates on it.
+- **A stop or teardown on an endpoint hpc-bridge stood up, while a handoff of it is unexpired or still validating, asks first** (the coordinator's addition).
+  - `stop_endpoint(handoffs="keep")`: [[scheduler_ops]] `_release_cmd(keep=…)` spares loam's user endpoint, and the answer is `draining`, naming it.
+  - `handoffs="cancel"`:
+    - The handoff ends: its record gets a `.ended` mark beside it, and a canary still out is dropped.
+    - `_release_cmd(only=…)` reads the scheduler again.
+    - The answer is `down` only once nothing of the handoff's user endpoint is listed and no canary of it can still be queued. hpc-bridge does not kill loam's user-endpoint process: it exits on its own idle window, and a submit from loam starts it again (said in the answer).
+  - **Teardown** asks the same way; its `keep` is answered with the stop that can keep the pool.
+  - **On a MEP** the stop only names the handoff and its `release`.
+  - **Why `handoffs` is separate from `jobs`:** they are two consents about two owners' work.
+- **The fake `pbs_mep` template and schema take `available_accelerators`** (a count, 1–4, rendered only when sent), so the canary sees a `CUDA_VISIBLE_DEVICES` pin. The stack needs `down.sh --wipe` before the live cells.
+- **Not built:**
+  - The universal graders (`_billed_start_idxs`) do not learn `export_handoff`; all three cells are scripted.
+  - A handoff from a phase-3 campaign.
+  - S3 (Polaris), which could lift D6.
 
 ### Phase 3: campaign pools
 

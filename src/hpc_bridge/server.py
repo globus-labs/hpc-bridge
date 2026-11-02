@@ -22,6 +22,7 @@ from . import (
     config,
     connect,
     dispatch,
+    handoff,
     login_gate,
     notices,
     resources,
@@ -1175,7 +1176,74 @@ def _login_runner(app: AppCtx):
 STOP_BUDGET_S = 300.0   # a stop's whole Jobs-mode work around the block release has one deadline (review r3)
 
 
-async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus:
+async def _stop_endpoint(app: AppCtx, jobs: str | None = None, handoffs: str | None = None) -> EndpointStatus:
+    """stop_endpoint, loam handoffs first (batch phase 2b), then Jobs mode (`_stop_endpoint_jobs`).
+
+    On an endpoint hpc-bridge stood up, a loam handoff of it that is unexpired (or still validating) makes a stop ASK
+    and change nothing: `handoffs="keep"` releases only this session's blocks — loam's user endpoint is spared by the
+    release — and answers `draining`, naming it; `handoffs="cancel"` releases loam's blocks too, ends the handoff, and
+    is `down` only once the scheduler lists nothing of its user endpoint (and no canary of it is still queued). A
+    separate argument from `jobs`: they are two consents about two owners' work, and one may be kept while the other
+    ends. On a facility endpoint the handoff's user endpoint is not ours to stop: the stop names it and its release,
+    nothing more."""
+    if handoffs not in (None, "cancel", "keep"):
+        return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                              notice=f"handoffs must be \"cancel\" or \"keep\", not {handoffs!r}. Nothing was done.")
+    items = handoff.live(app)
+    ssh = _has_login_shape(app) and app.state.endpoint_id is not None
+    if ssh and items and handoffs is None:
+        return handoff.question(app, items, op="stop")
+    if ssh and items and handoffs == "keep":
+        app.release_keep = handoff.scope_of(items)
+    try:
+        st = await _stop_endpoint_jobs(app, jobs)
+    finally:
+        app.release_keep = None
+    if not items:
+        return st
+    if not ssh:
+        st.handoffs = [it.ref for it in items]
+        st.notice = f"{st.notice or ''} {handoff.mep_note(items)}".strip()
+        return st
+    return await _handoff_after_stop(app, st, items, handoffs or "keep")
+
+
+async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choice: str) -> EndpointStatus:
+    """The stop's answer with loam's handoff(s) in it. Nothing to add while the stop itself only asked or refused."""
+    if st.status not in ("down", "draining"):
+        return st
+    st.handoffs = [it.ref for it in items]
+    if choice == "keep":
+        if st.status == "down":
+            st.status, st.spend_stopped = "draining", None
+        st.notice = (f"Kept running, as asked: {handoff._named(items)} — loam's user endpoint was spared by the "
+                     "release and keeps running under its record (hpc-bridge does not police it). " + (st.notice or ""))
+        return st
+    eid = app.state.endpoint_id
+    assert eid is not None
+    pending = [it for it in items if it.pending is not None]
+    handoff.drop_pending(app, items)
+    handoff.end(items, "stop_endpoint(handoffs=\"cancel\")")
+    cmd = scheduler_ops._release_cmd(jobmode.scheduler_of(app), eid, only=handoff.scope_of(items))
+    out = await _login_runner(app)(cmd)
+    last = ((out.stdout or "").strip().splitlines() or [""])[-1].strip() if out.phase == "complete" else ""
+    left: list[str] = []
+    if not last.startswith("released "):
+        left.append(f"whether anything of its user endpoint is still listed was not read ({last or out.phase})")
+    elif scheduler_ops._released_jobs(last):
+        left.append(f"its job(s) {' '.join(scheduler_ops._released_jobs(last))} were still listed and are cancelled "
+                    "now — call stop_endpoint again to confirm none is")
+    if pending:
+        left.append("its canary task may still be queued, and its user endpoint starts a block to run it once")
+    if left and st.status == "down":
+        st.status, st.spend_stopped = "draining", None
+    st.notice = ((f"Ended, as asked: {handoff._named(items)} — loam's blocks are cancelled"
+                  + (f", but {'; '.join(left)}." if left else ", and the scheduler lists nothing of it.")
+                  + " A submit from loam with that config would start its user endpoint again. ") + (st.notice or ""))
+    return st
+
+
+async def _stop_endpoint_jobs(app: AppCtx, jobs: str | None = None) -> EndpointStatus:
     """stop_endpoint, Jobs mode first (batch phase 2a). With no Jobs-mode job of ours that can still bill — any
     session's, a dead server's and a held hand submit included — it is the stop it always was
     (`_stop_endpoint_blocks`). With one, a stop with no choice changes nothing and asks (`jobs.stop_question`);
@@ -1687,7 +1755,8 @@ async def _orphaned_stop(app: AppCtx, eid: str, *, queued: bool = False) -> Endp
 
 
 @mcp.tool()
-async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = None) -> EndpointStatus:
+async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = None,
+                        handoffs: Literal["cancel", "keep"] | None = None) -> EndpointStatus:
     """Stop spending on the HPC compute block. On an endpoint hpc-bridge stood up over SSH it cancels the billed
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
     reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
@@ -1705,11 +1774,33 @@ async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = N
     `needs_confirmation`, names each job (`jobs`) and does nothing. Ask the user, then call stop_endpoint(jobs="cancel")
     — cancel them too (`down` only once the scheduler lists none) — or stop_endpoint(jobs="keep") — release only the
     endpoint's blocks and leave the jobs running under their envelope and deadline (`draining`, naming how to end
-    them). Either way nothing new is admitted afterwards."""
-    return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context, jobs), "stop_endpoint")
+    them). Either way nothing new is admitted afterwards.
+
+    A loam handoff of this endpoint (export_handoff) that is unexpired makes a stop on an endpoint hpc-bridge stood up
+    ASK first too (`handoffs` names each, with its expiry): stop_endpoint(handoffs="cancel") cancels loam's blocks as
+    well and ends the handoff; stop_endpoint(handoffs="keep") releases only this session's block and leaves loam's user
+    endpoint running (`draining`, naming it). On a facility endpoint the stop only names the handoff and its release."""
+    return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context, jobs, handoffs),
+                            "stop_endpoint")
 
 
-async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
+async def _teardown_endpoint(app: AppCtx, handoffs: str | None = None) -> EndpointStatus:
+    """A teardown, loam handoffs first (batch phase 2b): on an endpoint hpc-bridge stood up, an unexpired handoff of it
+    makes the first call ASK (a teardown ends loam's user endpoint with the manager) and change nothing;
+    handoffs="cancel" tears down and ends the handoff; "keep" cannot be honoured by a teardown, and is answered with
+    the stop that can (stop_endpoint(handoffs="keep")). A teardown already under way is never asked about again."""
+    if handoffs not in (None, "cancel", "keep"):
+        return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                              notice=f"handoffs must be \"cancel\" or \"keep\", not {handoffs!r}. Nothing was done.")
+    if app.teardown_task is None and _has_login_shape(app) and (items := handoff.live(app)):
+        if handoffs != "cancel":
+            return handoff.question(app, items, op="teardown")
+        handoff.drop_pending(app, items)
+        handoff.end(items, "teardown_endpoint(handoffs=\"cancel\")")
+    return await _teardown_endpoint_blocks(app)
+
+
+async def _teardown_endpoint_blocks(app: AppCtx) -> EndpointStatus:
     """FULLY tear the endpoint down: release the billed block, then `gce stop` + delete the login
     manager over SSH (the facility's `teardown()`), and clear ALL shape/state so nothing lingers.
     The rare, explicit 'destroy it' op — normally the login endpoint STAYS ONLINE for zero-SSH reuse
@@ -1972,7 +2063,7 @@ async def _teardown_preauth_gate(app: AppCtx, eid: str, *, fac=None, machine: st
 
 
 @mcp.tool(annotations=_DESTRUCTIVE)
-async def teardown_endpoint(ctx: Context) -> EndpointStatus:
+async def teardown_endpoint(ctx: Context, handoffs: Literal["cancel", "keep"] | None = None) -> EndpointStatus:
     """FULLY tear down the login-node endpoint (gce stop + delete over SSH) — the rare 'destroy it'
     operation. **Normally do NOT call this.** The login endpoint is DESIGNED to stay online for
     zero-SSH reuse and costs nothing (a free login-node process, no allocation); `stop_endpoint`
@@ -1980,8 +2071,12 @@ async def teardown_endpoint(ctx: Context) -> EndpointStatus:
     insists on removing the endpoint entirely. Afterwards, do not call run_shell (it re-provisions).
     The login-node ops can take a few minutes on a slow filesystem: a `tearing_down` status means they are
     still running — call teardown_endpoint again in about a minute to confirm `down`; call nothing else
-    meanwhile. On a one-time-code facility the first call may instead ask for a code (`complete_preauth`)."""
-    return await _heartbeat(ctx, _teardown_endpoint(ctx.request_context.lifespan_context), "teardown_endpoint")
+    meanwhile. On a one-time-code facility the first call may instead ask for a code (`complete_preauth`).
+    With an unexpired loam handoff (export_handoff) of this endpoint the first call asks and does nothing — a teardown
+    ends loam's user endpoint too: teardown_endpoint(handoffs="cancel") once the user agrees (to keep loam's pool,
+    stop_endpoint(handoffs="keep") instead)."""
+    return await _heartbeat(ctx, _teardown_endpoint(ctx.request_context.lifespan_context, handoffs),
+                            "teardown_endpoint")
 
 
 async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
@@ -2626,6 +2721,44 @@ async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResul
         return await _heartbeat(ctx, _cancel(ctx.request_context.lifespan_context, id, mode), "cancel")
     except Exception as exc:  # noqa: BLE001
         return CancelResult(id=str(id), status="refused", notice=f"cancel failed: {type(exc).__name__}: {exc}")
+
+
+# ---- batch phase 2b: export_handoff, the loam handoff (hpc_bridge.handoff; design §8) --------------------------------
+
+async def _export_handoff(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = handoff.DEFAULT_EXPIRES_H,
+                          confirm_spend: bool = False) -> handoff.HandoffResult:
+    return await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend)
+
+
+@mcp.tool()
+async def export_handoff(ctx: Context, user_endpoint_config: dict[str, Any], expires_hours: float = 24.0,
+                         confirm_spend: bool = False) -> handoff.HandoffResult:
+    """Hand a Globus Compute endpoint to an orchestrator such as loam: validate loam's EXACT user endpoint config with
+    one billed canary, then export a data-only record (`hpc-bridge.handoff` v1) loam reads to run its own agents.
+
+    `user_endpoint_config`: loam's config, in the facility template's own key names (queue, account, walltime,
+    nodes_per_block, max_blocks, min_blocks, max_workers_per_node, available_accelerators, scheduler_options,
+    worker_init, …) or hpc-bridge's (partition); the facility's defaults fill what it leaves out. Every value must be
+    data the template renders: a key the template does not use, or its schema refuses, is refused by name — never
+    dropped. `expires_hours`: how long the record is good for, from the user's yes (default 24, at most 168).
+
+    Spend: the first call answers phase="needs_confirmation" with `terms` and sends nothing — the canary's cost and the
+    pool's worst case until the record expires, in the facility's unit. Ask the user; on their yes call again with the
+    same config and confirm_spend=True: ONE canary is sent (phase="validating" while its block starts — call again with
+    the same config to collect it; nothing more is sent), then phase="exported" with the `record` and its `path`.
+    The terms say `enforced_by: "uec-bounds-only"`: once loam holds the record, hpc-bridge does not police that
+    endpoint — the config's own bounds (max_blocks × nodes × walltime) are all that limits it.
+
+    On a facility multi-user endpoint a pool with min_blocks >= 1 is refused (it cannot be bounded: parsl replaces a
+    cancelled block, and nothing can stop a facility's user endpoint): send min_blocks 0. The record's `release` says
+    how the pool really ends: stop submitting, then its blocks idle-release; a block can be cancelled sooner. Loam
+    writes its set_env.sh from the record's `loam.env`, quoting each value itself."""
+    try:
+        return await _heartbeat(ctx, _export_handoff(ctx.request_context.lifespan_context, user_endpoint_config,
+                                                     expires_hours, confirm_spend), "export_handoff")
+    except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
+        return handoff.HandoffResult(phase="refused", reason=f"{type(exc).__name__}"[:80],
+                                     notice=f"export_handoff failed: {type(exc).__name__}: {exc}"[:400])
 
 
 def main() -> None:

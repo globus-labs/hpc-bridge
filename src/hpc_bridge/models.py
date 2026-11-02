@@ -376,6 +376,20 @@ class ShellOutcome(BaseModel):
     _worker_answered: bool = PrivateAttr(default=False)
 
 
+class HandoffRef(BaseModel):
+    """A loam handoff a stop or teardown is about (hpc_bridge.handoff): its id, whether it is exported (loam holds the
+    record) or still validating (its canary is out), when its record expires, where the record is, the user endpoint
+    its canary saw and the scheduler jobs known of it."""
+
+    handoff_id: str
+    state: Literal["exported", "validating"]
+    expires_at: str | None = None
+    path: str | None = None
+    uep_id_seen: str | None = None
+    task_id: str | None = None
+    jobs: list[str] = Field(default_factory=list)
+
+
 class EndpointStatus(BaseModel):
     # needs_confirmation: a scheduler compute block was requested without an explicit spend
     # acknowledgement — nothing was provisioned; re-call with confirm_spend=True to proceed.
@@ -432,6 +446,10 @@ class EndpointStatus(BaseModel):
     # what it can still bill. needs_confirmation asks stop_endpoint(jobs="cancel"|"keep"); a stop that kept them names
     # them here (draining, never down).
     jobs: list[JobInfo] = Field(default_factory=list)
+    # stop_endpoint / teardown_endpoint while a loam handoff (export_handoff, batch phase 2b) of this endpoint is
+    # unexpired, or its canary is still out: each one. On an endpoint hpc-bridge stood up, needs_confirmation asks
+    # handoffs="cancel"|"keep"; a stop that kept one names it (draining). On a facility endpoint it is only named.
+    handoffs: list[HandoffRef] = Field(default_factory=list)
 
 
 # ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------

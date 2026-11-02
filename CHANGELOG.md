@@ -6,6 +6,35 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Added
+- **Batches (phase 2b): `export_handoff`, the loam handoff.** A 17th tool, plus `stop_endpoint(handoffs=…)` and
+  `teardown_endpoint(handoffs=…)` (vault `Planned/Batch and swarm execution.md` §8, §12 D6; `Modules/handoff.md`).
+  - **The terms come first.** `export_handoff(user_endpoint_config, expires_hours=24)` first answers
+    `needs_confirmation` with the terms and sends nothing. The terms give the canary's cost and the pool's worst case
+    until the record expires: `max_blocks` × the block's rate × the window plus one more block. They are in the
+    facility's billing unit, else node-hours, and never below a queue's minimum charge. They say
+    `enforced_by: "uec-bounds-only"`.
+  - **The yes sends ONE billed canary with exactly that config.** The answer is `validating` until it returns; calling
+    again collects it, never a second. Then `exported` writes a `hpc-bridge.handoff` v1 record to
+    `<state_dir>/handoffs/hoff-<id>.json`, mode 0600. Unknown fields are ignored, and a breaking change makes v2.
+  - **The record's config is wire-ready:** after `key_map` and schema fitting, every key rendered by the template.
+    It also carries:
+    - the template's digest;
+    - the worker's versions and the client Python required;
+    - the canary's job, host, device pin, mapped identity and user endpoint;
+    - a `release` naming the end that works (stop submitting, idle release, then `qdel`/`scancel` of a block — with
+      `min_blocks` 0 nothing replaces it);
+    - `loam.env` as data. Loam writes `set_env.sh` itself, quoting each value.
+  - **Validation:**
+    - Every value is checked: no value becomes shell code.
+    - `scheduler_options` may hold only scheduler directives.
+    - A key the template does not render, or its schema refuses, is refused by name and never dropped.
+  - **D6:** on a facility multi-user endpoint, `min_blocks ≥ 1` is refused before any terms.
+  - **On an endpoint hpc-bridge stood up**, a stop or teardown asks first while a handoff of it is unexpired.
+    `handoffs="keep"` releases only the session's blocks (the release spares loam's user endpoint) and answers
+    `draining`. `"cancel"` ends the handoff and answers `down` only once nothing of it is listed. On a facility
+    endpoint the stop names the handoff and its release.
+  - **The fake `pbs_mep` template** takes `available_accelerators`.
+  - **Three scripted scenarios:** `handoff_polaris_shape`, `handoff_mep_min_blocks_refused` and `handoff_ssh_shape`.
 - **Batches (phase 2a): Jobs mode, the budget envelope, the billing meter, and hand submits gated and adopted.**
   One new tool, `submit_job` (16 tools), plus `job-` / `env-` ids on `status` and `cancel`, `run_shell(confirm_spend=…)`
   and `stop_endpoint(jobs="cancel"|"keep")` (vault `Planned/Batch and swarm execution.md` §2, §3, §12 D2).

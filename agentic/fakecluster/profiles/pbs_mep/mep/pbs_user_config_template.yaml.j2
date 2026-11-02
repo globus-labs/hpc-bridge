@@ -8,7 +8,9 @@
     - a user `worker_init` is PREPENDED to the facility's own, which puts the facility's endpoint venv on the workers'
       PATH (Polaris: /opt/globus-compute-agent/venv-py313/bin; here /opt/hpcb-mep/gce/bin, the manager's own install,
       mounted read-only on the moms) — so the worker runs the user endpoint's exact packages;
-    - the block idle-releases after 240 s (Polaris's default).
+    - the block idle-releases after 240 s (Polaris's default);
+    - `available_accelerators` (a count, as Polaris's template takes it) pins one device per worker
+      (CUDA_VISIBLE_DEVICES); rendered only when the client sends it (batch phase 2b, the loam handoff).
     Client strings arrive already JSON-quoted (the manager json.dumps every string), so a literal string default is
     `| tojson`'d to match, and a client worker_init is spliced in without its quotes (`[1:-1]`: its JSON escapes stay
     valid inside the double-quoted YAML string). -#}
@@ -16,6 +18,9 @@ engine:
   type: GlobusComputeEngine
   run_in_sandbox: true
   max_workers_per_node: {{ max_workers_per_node | default(2) }}
+{% if available_accelerators is defined %}
+  available_accelerators: {{ available_accelerators }}
+{% endif %}
   address:
     type: address_by_interface
     ifname: eth0

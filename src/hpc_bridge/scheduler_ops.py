@@ -30,11 +30,35 @@ from .runner import _RECEIPT, SubmitAnswer, submit_answer
 
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
 
-def _release_cmd(scheduler: str, eid: str) -> str:
+Scope = tuple[tuple[str, ...], tuple[int, ...]]
+
+
+def _scope_sh(eid: str, scope: Scope) -> str:
+    """Shell that sets `x` to the user endpoint directories (`uep.<eid>.<id>`, space-separated) a scoped release is
+    about (batch phase 2b: a loam handoff's pool): the ids given (UUIDs only), and the user endpoints whose own log
+    names one of the block requests given (BLOCK_REQUEST_LOG + the number, read to the end of the line — the template's
+    endpoint_setup line, as the stop's evidence finds a user endpoint). Built only from a UUID and whole numbers."""
+    ueps = [u for u in scope[0] if _UUID.fullmatch(u or "")]
+    nums = [n for n in (block_number(b) for b in scope[1]) if n is not None]
+    out = f"x={shlex.quote(' '.join(f'uep.{eid}.{u}' for u in ueps))}; "
+    if nums and _UUID.fullmatch(eid or ""):
+        pats = " ".join(f"-e {shlex.quote(BLOCK_REQUEST_LOG + str(n) + '$')}" for n in nums)
+        out += (f'x="$x $(grep -lE {pats} -- "{_GC_DIR}"/uep.{eid}.*/endpoint.log 2>/dev/null '
+                "| sed 's#/endpoint[.]log$##; s#.*/##' | tr '\\n' ' ')\"; ")
+    return out
+
+
+def _release_cmd(scheduler: str, eid: str, *, keep: Scope | None = None, only: Scope | None = None) -> str:
     """Login-shape shell one-liner that cancels THIS endpoint's scheduler block(s), matched
     precisely by the `uep.<eid>` StdOut marker Parsl writes under the UEP dir. Scheduler-specific:
     Slurm reads squeue/scancel; PBS reads qstat -f (unwrapping its 80-col line continuations so a
-    wrapped Output_Path can't split the marker) and qdel."""
+    wrapped Output_Path can't split the marker) and qdel.
+
+    Scoped (batch phase 2b, a loam handoff on this endpoint): `keep` spares the blocks of the user endpoints it names
+    (`_scope_sh`) — a stop that leaves loam's pool running; `only` cancels just theirs — and says it could not find
+    them, never "released none", when it names none it can find."""
+    if keep is not None or only is not None:
+        return _scoped_release_cmd(scheduler, eid, keep=keep, only=only)
     m = shlex.quote(f"uep.{eid}")
     if scheduler == "pbs":
         # NB: `qstat -f -u $USER` yields NOTHING on PBS Pro — the -u filter suppresses full-format
@@ -60,12 +84,43 @@ def _release_cmd(scheduler: str, eid: str) -> str:
             f'else echo "release failed: {cancel} refused$bad; cancelled:${{ok:- none}}"; fi; fi; '
             f'else echo "release failed: {query.split()[0]} could not be read"; fi')
 
+
+def _scoped_release_cmd(scheduler: str, eid: str, *, keep: Scope | None, only: Scope | None) -> str:
+    """`_release_cmd` scoped to (`only`) or around (`keep`) the user endpoints `_scope_sh` finds: a record matches one
+    when it names `uep.<eid>.<id>/` (its directory, so one id is never another's prefix)."""
+    m = shlex.quote(f"uep.{eid}")
+    scope = only if only is not None else keep
+    assert scope is not None
+    cond = "k" if only is not None else "!k"
+    body = ("index($0,m){k=0; for(i=1;i<=n;i++) if(index($0, X[i] \"/\")) k=1; if(" + cond + ") print $1}")
+    if scheduler == "pbs":
+        query, cancel = "qstat -f", "qdel"
+        prog = 'BEGIN{RS="Job Id: "; n=split(x,X," ")} ' + body
+        pick = f"sed ':a;N;$!ba;s/\\n\\t//g' | awk -v m={m} -v x=\"$x\" {shlex.quote(prog)}"
+    else:
+        query, cancel = 'squeue -u "$USER" -h -O "JobID:30,StdOut:1024"', "scancel"
+        prog = 'BEGIN{n=split(x,X," ")} ' + body
+        pick = f"awk -v m={m} -v x=\"$x\" {shlex.quote(prog)}"
+    run = (f'if q=$({query} 2>/dev/null); then ids=$(printf \'%s\\n\' "$q" | {pick}); '
+           'if [ -z "$ids" ]; then echo "released none"; else ok=""; bad=""; '
+           f'for j in $ids; do if {cancel} "$j"; then ok="$ok $j"; else bad="$bad $j"; fi; done; '
+           'if [ -z "$bad" ]; then echo "released$ok"; '
+           f'else echo "release failed: {cancel} refused$bad; cancelled:${{ok:- none}}"; fi; fi; '
+           f'else echo "release failed: {query.split()[0]} could not be read"; fi')
+    # neither scope may act blind: an `only` that finds none would read "released none" (nothing of it listed), a `keep`
+    # that finds none would cancel the very pool it keeps
+    return (_scope_sh(eid, scope) + 'if [ -z "$(printf %s "$x" | tr -d " ")" ]; then '
+            'echo "release failed: the handoff\'s user endpoint could not be found"; else ' + run + "; fi")
+
+
 def _release_cmd_for(app: AppCtx, eid: str) -> str:
     """The release one-liner for the bound facility's scheduler. The scheduler lives on the facility's MachineProfile
     (SlurmFacility.profile.scheduler); a facility without one (LocalFacility/dev, or test doubles) has never spoken
     anything but Slurm's squeue/scancel, so default there instead of assuming an attribute that isn't part of the
-    Facility protocol."""
-    return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid)
+    Facility protocol. A stop that keeps a loam handoff's pool running (`app.release_keep`, batch phase 2b) spares its
+    user endpoints' blocks."""
+    keep = getattr(app, "release_keep", None)
+    return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid, keep=keep)
 
 async def _release_blocks_over_login(app: AppCtx, eid: str, run_login: LoginRunner) -> tuple[bool, str]:
     """Cancel this endpoint's scheduler block(s) by running the scheduler's cancel (scancel/qdel)

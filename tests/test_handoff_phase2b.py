@@ -108,8 +108,8 @@ class _Block:
     own directory (the worker runs in a sandbox under it)."""
 
     def __init__(self, tmp: Path, manager: str, *, scheduler: str = "pbs", job: str = "12.fakepbs",
-                 pin: str | None = "0", workers: int = 2, uep: str | None = UEP_ID):
-        self.scheduler, self.job, self.pin, self.workers = scheduler, job, pin, workers
+                 pin: str | None = "0", workers: int = 2, uep: str | None = UEP_ID, sched=None):
+        self.scheduler, self.job, self.pin, self.workers, self.sched = scheduler, job, pin, workers, sched
         name = f"uep.{manager}.{uep}" if uep else "endpoint"
         self.cwd = tmp / "home" / ".globus_compute" / name / "tasks_working_dir" / "task-1"
         self.cwd.mkdir(parents=True, exist_ok=True)
@@ -131,6 +131,10 @@ class _Block:
             env["SLURM_JOB_END_TIME"] = str(int(datetime.now(UTC).timestamp()) + 900)
         if self.pin is not None:
             env["CUDA_VISIBLE_DEVICES"] = self.pin
+        if self.sched is not None:   # the login node's scheduler: the fake Slurm (tests/fake_sched.py) first on PATH
+            senv = self.sched.env()
+            env.update({k: v for k, v in senv.items() if k != "PATH"})
+            env["PATH"] = f"{self.sched.bin}:{env['PATH']}"
         return env
 
 
@@ -541,21 +545,24 @@ async def test_loams_environment_is_escaped_data(tmp_path, monkeypatch):
     assert env["HPC_GLOBUS_ENDPOINT_ID"] == MEP_UUID and env["HPC_NNODES"] == "1", env
     assert env["HPC_SYSTEM"] == rec.facility.system == "fake-pbs-mep", env
     assert json.loads(env["HPC_ENDPOINT_CONFIG_JSON"]) == rec.user_endpoint_config
-    parsed = {}
-    for line in rec.loam.set_env_sh.splitlines():
-        if not line.strip() or line.lstrip().startswith("#"):
-            continue
-        words = shlex.split(line)
-        assert words[0] == "export" and len(words) == 2, line
-        k, v = words[1].split("=", 1)
-        parsed[k] = v
-    assert parsed == env
-    # and sourcing it in a shell defines exactly those values, running nothing
-    script = tmp_path / "set_env.sh"
-    script.write_text(rec.loam.set_env_sh)
-    p = subprocess.run([_BASH, "-c", f'. {shlex.quote(str(script))} && printf "%s" "$HPC_ENDPOINT_CONFIG_JSON"'],
-                       capture_output=True, text=True, timeout=30, env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
-    assert p.returncode == 0 and json.loads(p.stdout) == rec.user_endpoint_config, p
+    assert all(isinstance(v, str) for v in env.values()), env
+    # the record carries data, never a script: loam writes set_env.sh itself, quoting each value
+    raw = json.loads(Path(out.path).read_text())
+    assert set(raw["loam"]) == {"env"}, raw["loam"]
+    for how in ("shlex", "printf"):
+        script = tmp_path / f"set_env_{how}.sh"
+        if how == "shlex":   # Python's way, as the vault says
+            script.write_text("".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()))
+        else:                # the shell's: printf 'export %s=%q\n'
+            gen = subprocess.run([_BASH, "-c", 'for k in "$@"; do printf "export %s=%q\\n" "$k" "${!k}"; done', "_",
+                                  *env], capture_output=True, text=True, timeout=30,
+                                 env={"PATH": "/usr/bin:/bin", **env})
+            assert gen.returncode == 0, gen
+            script.write_text(gen.stdout)
+        p = subprocess.run([_BASH, "-c", f'. {shlex.quote(str(script))} && printf "%s" "$HPC_ENDPOINT_CONFIG_JSON"'],
+                           capture_output=True, text=True, timeout=30,
+                           env={"PATH": "/usr/bin:/bin", "HOME": str(tmp_path)})
+        assert p.returncode == 0 and json.loads(p.stdout) == rec.user_endpoint_config, (how, p)
 
 
 # ---- what the canary saw ---------------------------------------------------------------------------------------------
@@ -658,6 +665,108 @@ async def test_a_longer_horizon_is_a_larger_worst_case(tmp_path, monkeypatch):
     short = await _export(app, LOAM_UEC, expires_hours=1)
     long = await _export(app, LOAM_UEC, expires_hours=48)
     assert long.terms.worst_case > short.terms.worst_case > short.terms.canary_worst_case, (short.terms, long.terms)
+
+
+# ---- 7. a stop or teardown while a handoff of the endpoint is unexpired (the coordinator's addition, stage B) ----------
+
+SESSION_UEP = "9d8c7b6a-5f4e-4d3c-8b2a-1f0e9d8c7b6a"
+
+
+async def _ssh_with_handoff(tmp: Path, *, lag: int = 0):
+    """hpc-bridge's own endpoint with a fake Slurm on its login node: the session's block (job 2001, its own user
+    endpoint) and loam's, exported through a handoff whose canary saw loam's user endpoint (job 2002)."""
+    from tests.fake_sched import FakeSched
+
+    sched = FakeSched(tmp / "sched", user="u")
+    if lag:
+        sched.knob(cancel_lag=lag)
+    home = tmp / "home" / ".globus_compute"
+    mine = sched.add_job(state="RUNNING", name="parsl.mine",
+                         stdout=f"{home}/uep.{SSH_EID}.{SESSION_UEP}/submit_scripts/parsl.mine.stdout")
+    loam = sched.add_job(state="RUNNING", name="parsl.loam",
+                         stdout=f"{home}/uep.{SSH_EID}.{UEP_ID}/submit_scripts/parsl.loam.stdout")
+    block = _Block(tmp, SSH_EID, scheduler="slurm", job=loam, pin=None, workers=2, sched=sched)
+    app = _ssh_app(tmp, block=block)
+    _ask, out = await _yes(app, {"partition": "main", "walltime": "00:10:00", "max_blocks": 1})
+    assert out.phase == "exported" and out.record.endpoint.uep_id_seen == UEP_ID, out
+    return app, sched, mine, loam, out
+
+
+async def test_a_stop_with_an_unexpired_handoff_asks_first_and_changes_nothing(tmp_path):
+    app, sched, mine, loam, out = await _ssh_with_handoff(tmp_path)
+    st = await server._stop_endpoint(app)
+    assert st.status == "needs_confirmation", st
+    assert [h.handoff_id for h in st.handoffs] == [out.record.handoff_id], st.handoffs
+    assert st.handoffs[0].expires_at == out.record.expires_at and out.record.expires_at in (st.notice or "")
+    assert "cancels loam's blocks" in (st.notice or "") and "user endpoint" in (st.notice or ""), st.notice
+    assert sched.calls("scancel") == [] and sched.job(mine)["state"] == sched.job(loam)["state"] == "RUNNING"
+    again = await server._stop_endpoint(app)                      # nothing changed: it asks again
+    assert again.status == "needs_confirmation"
+
+
+async def test_keep_releases_only_the_sessions_block_and_names_the_running_handoff(tmp_path):
+    app, sched, mine, loam, out = await _ssh_with_handoff(tmp_path)
+    st = await server._stop_endpoint(app, handoffs="keep")
+    assert sched.job(mine)["state"] == "CANCELLED" and sched.job(loam)["state"] == "RUNNING", sched.jobs()
+    assert st.status == "draining" and st.spend_stopped is not True, st
+    assert out.record.handoff_id in (st.notice or "") and [h.handoff_id for h in st.handoffs] == [
+        out.record.handoff_id], st
+    assert app.release_keep is None                                 # the scope lasts the one stop
+
+
+async def test_cancel_ends_the_handoff_and_is_down_only_once_nothing_of_it_is_listed(tmp_path):
+    app, sched, mine, loam, _out = await _ssh_with_handoff(tmp_path)
+    st = await server._stop_endpoint(app, handoffs="cancel")
+    assert sched.job(mine)["state"] == sched.job(loam)["state"] == "CANCELLED", sched.jobs()
+    assert st.status == "down" and "nothing of it" in (st.notice or ""), st
+    nxt = await server._stop_endpoint(app)                          # ended: no later stop asks about it
+    assert nxt.status == "down" and nxt.handoffs == [], nxt
+
+
+async def test_cancel_while_loams_job_is_still_listed_is_draining(tmp_path):
+    app, sched, _mine, loam, _out = await _ssh_with_handoff(tmp_path, lag=5)   # a cancelled job listed COMPLETING
+    st = await server._stop_endpoint(app, handoffs="cancel")
+    assert st.status == "draining" and loam in (st.notice or ""), st
+    assert sched.job(loam)["state"] == "CANCELLED"
+
+
+async def test_an_expired_handoff_is_not_asked_about(tmp_path):
+    app, _sched, _mine, _loam, out = await _ssh_with_handoff(tmp_path)
+    raw = json.loads(Path(out.path).read_text())
+    raw["expires_at"] = (datetime.now(UTC) - timedelta(minutes=1)).strftime("%Y-%m-%dT%H:%M:%SZ")
+    Path(out.path).write_text(json.dumps(raw))
+    st = await server._stop_endpoint(app)
+    assert st.status != "needs_confirmation" and st.handoffs == [], st
+
+
+async def test_teardown_asks_the_same_way_and_keep_is_answered_with_the_stop(tmp_path, monkeypatch):
+    app, sched, _mine, _loam, _out = await _ssh_with_handoff(tmp_path)
+    torn: list[bool] = []
+
+    async def teardown(a):
+        torn.append(True)
+        return server.EndpointStatus(status="down", block_state="cold", notice="torn down")
+
+    monkeypatch.setattr(server, "_teardown_endpoint_blocks", teardown)
+    ask = await server._teardown_endpoint(app)
+    assert ask.status == "needs_confirmation" and ask.handoffs and "teardown" in (ask.notice or ""), ask
+    keep = await server._teardown_endpoint(app, handoffs="keep")
+    assert keep.status == "needs_confirmation" and 'stop_endpoint(handoffs="keep")' in (keep.notice or ""), keep
+    assert torn == [] and sched.calls("scancel") == []
+    done = await server._teardown_endpoint(app, handoffs="cancel")
+    assert done.status == "down" and torn == [True], done
+    from hpc_bridge import handoff
+
+    assert handoff.live(app) == []
+
+
+async def test_on_a_facility_endpoint_the_stop_names_the_handoff_and_its_release_only(tmp_path, monkeypatch):
+    app = await _mep_app(tmp_path, monkeypatch)
+    _ask, out = await _yes(app, LOAM_UEC)
+    st = await server._stop_endpoint(app)
+    assert st.status == "draining" and [h.handoff_id for h in st.handoffs] == [out.record.handoff_id], st
+    assert out.record.handoff_id in (st.notice or "") and "qdel 12.fakepbs" in (st.notice or ""), st.notice
+    assert "hpc-bridge does not stop it" in (st.notice or "")
 
 
 # ---- the surface -----------------------------------------------------------------------------------------------------
