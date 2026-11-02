@@ -1580,7 +1580,7 @@ def _submission(command: str, *, inside_job: bool = False) -> Submission | None:
     top = _group(_lex(command, []))
     last = _submit_call(top[-1], 0, inside_job) if top else None
     own_exit = len(calls) == 1 and last is not None and last.direct and not _waits(last.name, last.args)
-    return Submission(calls[0].name, len(calls), own_exit)
+    return Submission(calls[0].name, len(calls), own_exit, tuple(c.name for c in calls))
 
 
 def _submission_refused(sub: Submission, exit_code: int | None, stdout: str) -> bool:

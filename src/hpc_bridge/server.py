@@ -29,6 +29,7 @@ from . import (
     session_shell,
     warmth,
 )
+from . import jobs as jobmode
 from .binding import (  # noqa: F401 - re-exported for imports; PATCH binding.<name>, not server.<name>
     _catalog_facility,
     _entry_from_details,
@@ -98,7 +99,9 @@ from .models import (
     CancelResult,
     ConnectFacilityResult,
     EndpointStatus,
+    EnvelopeRequest,
     FacilityDetails,
+    JobStatus,
     LoginShellResult,
     LoginStatus,
     PreauthStatus,
@@ -451,6 +454,14 @@ async def _ensure_endpoint_up(
         if dropped:
             async with app.lock:
                 return _dropped_term_status(app, shape, dropped)
+    if confirm_spend and shape == DEFAULT_SHAPE:
+        # batch phase 2a: while this session's envelope is open, a block it confirms is admitted against it (read off
+        # the lock: the meter rides the login shape)
+        refused = await jobmode.block_admission(app, shape, partition=partition, account=account,
+                                                sizing=sizing if not login_only else None)
+        if refused is not None:
+            refused.session_spend = _total_session_spend(app)
+            return refused
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -1161,7 +1172,68 @@ def _login_runner(app: AppCtx):
     return run
 
 
-async def _stop_endpoint(app: AppCtx) -> EndpointStatus:
+STOP_BUDGET_S = 300.0   # a stop's whole Jobs-mode work around the block release has one deadline (review r3)
+
+
+async def _stop_endpoint(app: AppCtx, jobs: str | None = None) -> EndpointStatus:
+    """stop_endpoint, Jobs mode first (batch phase 2a). With no Jobs-mode job of ours that can still bill — any
+    session's, a dead server's and a held hand submit included — it is the stop it always was
+    (`_stop_endpoint_blocks`). With one, a stop with no choice changes nothing and asks (`jobs.stop_question`);
+    `jobs="cancel"` cancels them and closes their envelope — `down` only once the scheduler lists none —
+    and `"keep"` releases only the endpoint's blocks and leaves them running under their envelope and deadline
+    (`draining`, never `down`). Either way nothing is admitted after a stop."""
+    if jobs not in (None, "cancel", "keep"):
+        return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                              notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
+    t0 = time.monotonic()
+
+    def left(cap: float) -> float:   # ONE deadline for the whole stop (review r3): every phase takes from it
+        return max(0.5, min(cap, STOP_BUDGET_S - (time.monotonic() - t0)))
+
+    # 1. read only: a stop that ASKS changes nothing — no adoption, no admission closed (review r3)
+    try:
+        hands = await asyncio.wait_for(jobmode.hand_results(app, budget_s=20.0, adopt=False), left(25.0))
+        live = await asyncio.wait_for(jobmode.billing_jobs(app, reconcile=False), left(40.0))
+    except TimeoutError:
+        return jobmode.unconfirmed(await _stop_endpoint_blocks(app), "what of ours can still bill was not read")
+    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: the blocks are released, and it is never down
+        print(f"hpc-bridge: the stop could not read the Jobs-mode ledger ({type(exc).__name__}: {exc})",
+              file=sys.stderr)
+        return jobmode.ledger_unreadable(await _stop_endpoint_blocks(app), exc)
+    unaccounted = [res for _h, res in hands if res.pending or res.running]
+    if (live or unaccounted) and jobs is None:
+        return jobmode.stop_question(app, live, hands)
+    if live and app.state.endpoint_id is None:
+        return jobmode.stop_without_channel(app, live, jobs or "keep")
+    # 2. it proceeds: admission closes FIRST — a submit_job while the blocks are released is proposed afresh (r2, P5)
+    try:
+        jobmode.close_admission(app)
+    except Exception as exc:  # noqa: BLE001 - the ledger unreadable: said by the answer's own read
+        print(f"hpc-bridge: the stop could not close admission ({type(exc).__name__}: {exc})", file=sys.stderr)
+    notes: list[str] = []
+    cancelled = ""
+    try:
+        if hands:   # what appeared while approved commands ran is adopted — then read again what can bill
+            notes = await asyncio.wait_for(jobmode.reconcile_pending(app, budget_s=20.0), left(25.0))
+            live = await asyncio.wait_for(jobmode.billing_jobs(app, reconcile=False), left(30.0))
+        if live and jobs == "cancel":
+            cancelled = await asyncio.wait_for(jobmode.cancel_for_stop(app, live), left(25.0))
+        elif live and jobs == "keep":
+            jobmode.keep_for_stop(app, live)
+    except TimeoutError:
+        return jobmode.unconfirmed(await _stop_endpoint_blocks(app), "the cancels of our jobs were not confirmed")
+    st = await _stop_endpoint_blocks(app)
+    try:   # the ledger is read again before the answer: an admission that raced the stop is never left out of it
+        return await asyncio.wait_for(jobmode.after_stop(app, st, jobs if live else None, cancelled, notes),
+                                      left(60.0))
+    except TimeoutError:
+        return jobmode.unconfirmed(st, "what of ours can still bill was not read again after the release")
+    except Exception as exc:  # noqa: BLE001
+        print(f"hpc-bridge: the stop's Jobs-mode answer failed ({type(exc).__name__}: {exc})", file=sys.stderr)
+        return jobmode.ledger_unreadable(st, exc)
+
+
+async def _stop_endpoint_blocks(app: AppCtx) -> EndpointStatus:
     """Release the compute block over the **login endpoint (AMQP)** and LEAVE the manager online for
     reuse. "Stop" means *stop spending*, not destroy the endpoint: the login-node manager is the
     whole point — it persists so the next session reuses it with **zero SSH** ([[Standing up the
@@ -1615,7 +1687,7 @@ async def _orphaned_stop(app: AppCtx, eid: str, *, queued: bool = False) -> Endp
 
 
 @mcp.tool()
-async def stop_endpoint(ctx: Context) -> EndpointStatus:
+async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = None) -> EndpointStatus:
     """Stop spending on the HPC compute block. On an endpoint hpc-bridge stood up over SSH it cancels the billed
     scheduler block over the login endpoint (no SSH) and **leaves the login-node endpoint online** so a later
     reconnect reuses it with zero SSH — "stop" means stop spending, not tear the endpoint down; `down` (with
@@ -1627,8 +1699,14 @@ async def stop_endpoint(ctx: Context) -> EndpointStatus:
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
     the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
-    compute block."""
-    return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context), "stop_endpoint")
+    compute block.
+
+    Jobs (submit_job's, or hand submits it adopted) that can still bill make a stop ASK first: it answers
+    `needs_confirmation`, names each job (`jobs`) and does nothing. Ask the user, then call stop_endpoint(jobs="cancel")
+    — cancel them too (`down` only once the scheduler lists none) — or stop_endpoint(jobs="keep") — release only the
+    endpoint's blocks and leave the jobs running under their envelope and deadline (`draining`, naming how to end
+    them). Either way nothing new is admitted afterwards."""
+    return await _heartbeat(ctx, _stop_endpoint(ctx.request_context.lifespan_context, jobs), "stop_endpoint")
 
 
 async def _teardown_endpoint(app: AppCtx) -> EndpointStatus:
@@ -1919,6 +1997,15 @@ async def _login_shell(app: AppCtx, command: str) -> LoginShellResult:
     if login_exec is None:
         return LoginShellResult(exit_code=1, notice=_no_facility_notice(app))
     sub = await _detect_submission(command, "login")  # the same login node, over SSH: a job submitted here is billed
+    gate = jobmode.gate_envelope(app, sub)
+    if gate is not None:   # review A6: a fresh SSH runs outside the hold — the envelope's jobs go through run_shell
+        return LoginShellResult(
+            exit_code=1,
+            notice=(f"Refused, NOTHING ran: this command submits a batch job by hand while envelope {gate['id']} is "
+                    "open, and login_shell runs over a fresh SSH, outside the hold that adopts such a job into the "
+                    "envelope. Use submit_job (the envelope admits it), or run_shell(command, shape='login') — it "
+                    "asks, then submits HELD and adopts each job."),
+        )
     try:
         rc, out, err = await login_exec(command)
     except Exception as exc:  # noqa: BLE001 - never crash the tool; report structurally
@@ -2163,15 +2250,25 @@ async def _dispatch_counted(
 
 
 async def _run_shell(
-    app: AppCtx, command: str, session_id: str = "default", shape: str = DEFAULT_SHAPE, *, agent_call: bool = False
+    app: AppCtx, command: str, session_id: str = "default", shape: str = DEFAULT_SHAPE, *, agent_call: bool = False,
+    confirm_spend: bool = False,
 ) -> ShellOutcome:
     """`agent_call`: the agent's own command (the run_shell tool) — a client cancel keeps it tracked, and the internal
-    session is off limits. Internal callers (the scheduler ops on the login shape) leave it False."""
+    session is off limits. Internal callers (the scheduler ops on the login shape) leave it False.
+
+    `confirm_spend` (batch phase 2a, D2): the user's yes to a hand sbatch / qsub that this session's open envelope
+    gated — it then runs with its jobs HELD and each is adopted (`jobs.adopt_hand_submits`). It never confirms a
+    block (ensure_endpoint_up does)."""
     if agent_call and session_id.startswith(_RESERVED_SESSION_PREFIX):
         return _reserved_session_outcome(session_id)
     # Before the dispatch is counted: once it is, nothing may await before its submit (a stop queued behind it must
     # find the command sent), and a cancel here propagates with nothing counted or sent.
     sub = await _detect_submission(command, shape)
+    gate = jobmode.gate_envelope(app, sub) if agent_call else None
+    if gate is not None and not confirm_spend:
+        return jobmode.gated_outcome(app, gate, sub)  # type: ignore[arg-type]
+    if gate is not None:
+        return await _run_held(app, command, session_id, shape, gate)
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
@@ -2185,6 +2282,30 @@ async def _run_shell(
                                   agent_call=agent_call, submission=sub, guard=guard, result_key=key)
     if shared:
         out.notice = f"{out.notice} {shared}" if out.notice else shared
+    return out
+
+
+async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, envelope: dict) -> ShellOutcome:
+    """D2 after the user's yes (round 3, the user's decision): the hand submit runs UNMODIFIED, inside one remote shell
+    that lists the user's jobs immediately before it and — into the session dir — immediately after it ends
+    (`jobs.hand_command`); its `hand` ledger row is written in the same locked step as the dispatch's count, with no
+    await between (`jobs.open_hand`). Whatever the outcome, the jobs that appeared are adopted after the fact
+    (`jobs.finish_hand`) — or, for a command still running, by the next call once it ends; never cancelled by
+    hpc-bridge on its own. With nothing submitted, #176's advisory is kept."""
+    ready = await _ready_session(app, shape, session_id)
+    if isinstance(ready, ShellOutcome):
+        return ready
+    runner, session, rt, guard = ready
+    hand = jobmode.open_hand(app, envelope, session)   # sync: nothing awaits between the count and the submit
+    key = secrets.token_hex(8)
+    held = jobmode.hand_command(app, hand, command)
+    out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
+                                  lambda: session_shell.wrap(held, session, guard=guard, result_key=key),
+                                  agent_call=True, submission=None, guard=guard, result_key=key)
+    out, found = await jobmode.finish_hand(app, hand, out)
+    if not found:
+        sub = await _detect_submission(command, shape)
+        out = _with_submission_notice(out, sub, shape)
     return out
 
 
@@ -2274,7 +2395,7 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
 
 @mcp.tool()
 async def run_shell(
-    command: str, ctx: Context, session_id: str = "default", shape: str = DEFAULT_SHAPE
+    command: str, ctx: Context, session_id: str = "default", shape: str = DEFAULT_SHAPE, confirm_spend: bool = False
 ) -> ShellOutcome:
     """Run a shell command on the warm HPC compute block.
 
@@ -2291,11 +2412,15 @@ async def run_shell(
     still running past the sync-wait comes back phase="running" with a task_id; poll it with
     poll_task(task_id) until phase="complete". The task runs up to the block walltime and keeps the
     block warm while it runs, so it won't be cut or idle-released — but a *detached* process is not a
-    task, so the block would idle-release out from under it (issue #21)."""
+    task, so the block would idle-release out from under it (issue #21).
+
+    While a budget envelope of this session is open (submit_job), a hand sbatch/qsub answers
+    phase="needs_confirmation" and runs nothing; after the user's yes, call it again with confirm_spend=True: its jobs
+    are held, adopted into the envelope (`jobs`, their job- ids) and released. confirm_spend never confirms a block."""
     try:
         return dispatch.for_agent(await _heartbeat(ctx, _run_shell(
-            ctx.request_context.lifespan_context, command, session_id, shape, agent_call=True
-        ), "run_shell"))  # cut only here: _run_shell's own callers (the pilot probe, allocations) read it whole
+            ctx.request_context.lifespan_context, command, session_id, shape, agent_call=True,
+            confirm_spend=confirm_spend), "run_shell"))  # cut only here: _run_shell's own callers read it whole
     except Exception as exc:  # noqa: BLE001
         return _error_outcome(exc)
 
@@ -2349,6 +2474,16 @@ async def _run_batch(
 ) -> BatchStatus:
     if _no_facility_bound(app) and batch_id is None:
         return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
+    if isinstance(command, str) and batch_id is None:
+        sub = await _detect_submission(command, shape)
+        if sub is not None and {"sbatch", "qsub"} & {sub.command, *sub.names}:   # review A6
+            return BatchStatus(
+                phase="refused", reason="template submits jobs",
+                notice=("Refused, nothing was recorded or run: the template submits a scheduler job per row "
+                        f"(`{next(n for n in (*sub.names, sub.command) if n in ('sbatch', 'qsub'))}`) — each would be "
+                        "a billed job outside every envelope and the confirmed block. Use submit_job with array=… "
+                        "(one job, every row a task, {index} in the command), or a run_batch template that does the "
+                        "work itself on the block."))
     return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
                                  task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
                                  shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id)
@@ -2356,11 +2491,36 @@ async def _run_batch(
 
 async def _status(app: AppCtx, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
                   wait_s: float = 0.0) -> BatchStatus:
+    if isinstance(id, str) and id.startswith(("job-", "env-")):   # batch phase 2a: Jobs mode and the envelope
+        return await jobmode.status(app, id)
     return await batch.status(app, id, detail=detail, offset=offset, limit=limit, wait_s=wait_s)
 
 
 async def _cancel(app: AppCtx, id: str, mode: str = "drain") -> CancelResult:  # noqa: A002 - the tool's own name
+    if isinstance(id, str) and id.startswith(("job-", "env-")):
+        return await jobmode.cancel(app, id, mode)
     return await batch.cancel(app, id, mode=mode)
+
+
+async def _submit_job(
+    app: AppCtx, command: str | None = None, session_id: str = "default", account: str | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
+    depends_on: list[str] | None = None, adopt: str | None = None, envelope: dict | None = None,
+    confirm_spend: bool = False, exclude_jobs: list[str] | None = None,
+) -> JobStatus:
+    if _no_facility_bound(app):
+        return JobStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
+    if app.state.endpoint_id is None and _has_login_shape(app):
+        st = await _ensure_endpoint_up(app, "login")   # the free login shape the job is written and sent over
+        if st.status not in ("up", "provisioning") or app.state.endpoint_id is None:
+            return JobStatus(phase="refused", reason="login shape",
+                             notice=f"The login shape is not up ({st.status}): {st.notice or ''}".strip())
+    return await jobmode.submit_job(
+        app, command=command, session_id=session_id, account=account, partition=partition, nodes=nodes, cores=cores,
+        memory_gb=memory_gb, gpus=gpus, whole_node=whole_node, walltime=walltime, array=array,
+        depends_on=depends_on, adopt=adopt, envelope=envelope, confirm_spend=confirm_spend,
+        exclude_jobs=exclude_jobs)
 
 
 @mcp.tool()
@@ -2401,6 +2561,41 @@ async def run_batch(
                            notice=f"run_batch failed: {type(exc).__name__}: {exc}")
 
 
+@mcp.tool()
+async def submit_job(
+    ctx: Context, command: str | None = None, session_id: str = "default", account: str | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
+    depends_on: list[str] | None = None, adopt: str | None = None, envelope: EnvelopeRequest | None = None,
+    confirm_spend: bool = False, exclude_jobs: list[str] | None = None,
+) -> JobStatus:
+    """Run `command` as a SCHEDULER JOB that outlives any endpoint (long walltime, arrays, dependencies) — SSH
+    facilities only. The job carries the session's cwd and env (`session_id`); hpc-bridge writes it a frozen job.sh
+    and tracks it in its ledger. Size as for ensure_endpoint_up (`partition`, `account`, `nodes`, `cores`,
+    `memory_gb`, `gpus`, `whole_node`) plus `walltime` (HH:MM:SS). `array`: task indices, e.g. "0-19" or "0-19%4"
+    (at most 4 at once); `{index}` in the command is each task's index, written BARE (as run_batch's placeholders).
+    `depends_on`: job- ids that must finish first. `adopt`: a scheduler job id submitted by hand, to bring under the
+    envelope.
+
+    Spend: every job runs under a budget ENVELOPE the user approves once — the first call answers
+    phase="needs_confirmation" with `terms` (the job's worst case: EVERY array task × its size × walltime) and the
+    `envelope` it would open (cap, deadline ≤ 24 h by default, site backstop "none" unless the user names one).
+    Nothing is submitted until the user's yes comes back as confirm_spend=True (with `envelope={cap, deadline_hours,
+    max_jobs, site_backstop, …}` when the user set them). Later jobs that fit are admitted at once; one that does not
+    answers needs_confirmation, reason "envelope_exhausted" — ask the user, never split the work to fit. A later
+    session asks again ("envelope_new_session"). `exclude_jobs`: scheduler ids of jobs the meter counts that the user
+    says are not theirs to count (with confirm_spend=True). Follow a job with status("job-…"), the envelope with
+    status("env-…"); end them with cancel(id, "abort")."""
+    try:
+        return await _heartbeat(ctx, _submit_job(
+            ctx.request_context.lifespan_context, command, session_id, account, partition, nodes, cores, memory_gb,
+            gpus, whole_node, walltime, array, depends_on, adopt,
+            envelope.model_dump() if envelope is not None else None, confirm_spend, exclude_jobs), "submit_job")
+    except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
+        return JobStatus(phase="refused", reason=f"{type(exc).__name__}: {exc}"[:200],
+                         notice=f"submit_job failed: {type(exc).__name__}: {exc}"[:400])
+
+
 @mcp.tool(name="status")
 async def status_tool(ctx: Context, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
                       wait_s: float = 0.0) -> BatchStatus:
@@ -2408,7 +2603,9 @@ async def status_tool(ctx: Context, id: str, detail: str = "summary", offset: in
     detail="failed" (failed / lost ones, with exit codes) or detail="page" (every row, `offset`/`limit`). `wait_s` (at
     most 60) waits for something to change first. It collects results and keeps a running batch going; it never
     resumes a paused one (phase="needs_confirmation": see `reason`). From another hpc-bridge server it reads the
-    ledger (`owner` names the server that runs the batch)."""
+    ledger (`owner` names the server that runs the batch). A `job-…` id (submit_job) answers kind="job" with `job`
+    (state, exit code, charged and still committed, the scheduler's reason) and its `envelope`; an `env-…` id answers
+    kind="envelope": what it holds, what remains, what still bills — each read with one scheduler call."""
     try:
         return await _heartbeat(ctx, _status(ctx.request_context.lifespan_context, id, detail, offset, limit, wait_s),
                                 "status")
@@ -2423,7 +2620,8 @@ async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResul
     run_batch(batch_id=…, confirm_spend=True)). mode="abort": cancel the backlog and end the tasks in flight (each is
     killed within a few seconds, rc 143, when the notice says the marker was written). status="draining" while any
     task is still in flight — call again — and "down" once none is; `blocks_left` names every block of ours that can
-    still bill."""
+    still bill. A `job-…` id: abort cancels the job (drain only its pending array tasks); an `env-…` id: drain admits
+    nothing more, abort cancels every job of the envelope; "down" only once the scheduler lists none of them."""
     try:
         return await _heartbeat(ctx, _cancel(ctx.request_context.lifespan_context, id, mode), "cancel")
     except Exception as exc:  # noqa: BLE001

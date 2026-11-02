@@ -28,7 +28,7 @@ import subprocess
 import sys
 import time
 from collections import Counter
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass
 from pathlib import Path
@@ -669,9 +669,11 @@ def _stop_notice(result: dict | None) -> str:
 
 
 def _stop_cancelled_jobs(trace: Trace | None) -> list[str]:
-    """Every job id the run's stop_endpoint answers (any status, every phase) say they cancelled, in order, once each."""
+    """Every job id the run's stop_endpoint answers (any status, every phase) say they cancelled, in order, once each —
+    and, batch phase 2a, every job a `cancel` answer says it cancelled (a Jobs-mode job or an envelope's: the same
+    `cancelled: <ids>` words)."""
     out: list[str] = []
-    for _i, c in (trace.named("stop_endpoint") if trace is not None else []):
+    for _i, c in (trace.named("stop_endpoint", "cancel") if trace is not None else []):
         for m in _CANCELLED_RE.finditer(_stop_notice(c.result)):
             out += [j for j in (m.group(1) or m.group(2)).split() if j not in out]
     return out
@@ -692,21 +694,75 @@ def _job_key(scheduler: str, job: str) -> str:
     return job.split(".", 1)[0] if scheduler == "pbs" else job
 
 
-def _listed_pilots(scheduler: str, out: str) -> list[tuple[str, str]]:
-    """Every line of the queue listing that names a parsl pilot, as (job, state). PBS: the `qstat -w` row's first column
-    and its `S` column (the one before Elap Time — 11 columns in all); Slurm: the `%i %t %j` line's first two words. A
-    line that names `parsl` but does not parse is (its text, "?"): never an ending state nor a cancelled job's id, so it
-    fails the check."""
+# Batch phase 2a (Jobs mode): hpc-bridge's own scheduler jobs are named `hpcb-job-<12 hex>` (submit_job's header); a
+# PBS `qstat -w` row cuts a name to 15 columns, which still starts with this.
+OUR_JOB_PREFIX = "hpcb-job-"
+
+
+def _job_name(scheduler: str, tok: list[str]) -> str:
+    """The job's name in a parsed listing row: Slurm's `%i %t %j` third word; PBS `qstat -w`'s Jobname column (4th)."""
+    if scheduler == "pbs":
+        return tok[3] if len(tok) > 3 else ""
+    return tok[2] if len(tok) > 2 else ""
+
+
+def _kept(scheduler: str, job: str, name: str, keep: tuple[str, ...]) -> bool:
+    """A job the scenario MEANS to keep running past the run (`KEEP_RUNNING`: job names or name prefixes, or ids):
+    e.g. a job submitted outside hpc-bridge that the stop must leave alone (envelope_bypass_counted)."""
+    return any(name == k or name.startswith(k) or _job_key(scheduler, job) == _job_key(scheduler, k) for k in keep)
+
+
+def _listed_pilots(scheduler: str, out: str, *, ours: Iterable[str] = (), keep: Iterable[str] = ()) -> list[tuple[str, str]]:
+    """Every line of the queue listing that names a job of OURS, as (job, state): a parsl pilot (the endpoint's
+    blocks), and — batch phase 2a — a Jobs-mode job (its name starts `hpcb-job-`) or a job id the run's answers named as
+    hpc-bridge's (`ours`: submit_job's, and a hand submit it adopted), less what the scenario keeps running (`keep`).
+    PBS: the `qstat -w` row's first column and its `S` column (the one before Elap Time — 11 columns in all); Slurm: the
+    `%i %t %j` line's first two words. A line that names `parsl` but does not parse is (its text, "?"): never an ending
+    state nor a cancelled job's id, so it fails the check."""
+    ours_keys = {_job_key(scheduler, j) for j in ours}
+    keep_t = tuple(keep)
     pilots = []
     for line in out.splitlines():
-        if "parsl" not in line:
-            continue
         tok = line.split()
+        name = _job_name(scheduler, tok)
+        job_mode = bool(tok) and (name.startswith(OUR_JOB_PREFIX) or _job_key(scheduler, tok[0]) in ours_keys)
+        if "parsl" not in line and not job_mode:
+            continue
+        if tok and _kept(scheduler, tok[0], name, keep_t):
+            continue
         if len(tok) < (11 if scheduler == "pbs" else 3):
             pilots.append((line.strip(), "?"))
         else:
             pilots.append((tok[0], tok[-2] if scheduler == "pbs" else tok[1]))
     return pilots
+
+
+def _kept_jobs(trace: Trace | None) -> list[str]:
+    """The jobs the run's stops deliberately KEPT running (batch phase 2a: stop_endpoint(jobs="keep") answers
+    `draining` naming them in `jobs`) — not a pilot left behind: the universal check lets them be."""
+    out: list[str] = []
+    for _i, c in (trace.named("stop_endpoint") if trace is not None else []):
+        if str(c.input.get("jobs")) != "keep":
+            continue
+        for j in (c.result or {}).get("jobs") or []:
+            nid = str(j.get("native_id") or "") if isinstance(j, dict) else ""
+            if nid and nid not in out:
+                out.append(nid)
+    return out
+
+
+def _our_jobs(trace: Trace | None) -> list[str]:
+    """The scheduler ids the run's answers name as hpc-bridge's own jobs (batch phase 2a): a submit_job / status job's
+    `native_id`, an adopted hand submit's (run_shell's `jobs`), an envelope's job list — once each, in order."""
+    out: list[str] = []
+    for _i, c in (trace.named("submit_job", "status", "run_shell") if trace is not None else []):
+        r = c.result or {}
+        jobs = [r.get("job")] + list(r.get("jobs") or []) + list((r.get("envelope") or {}).get("jobs") or [])
+        for j in jobs:
+            nid = str((j or {}).get("native_id") or "") if isinstance(j, dict) else ""
+            if nid and nid not in out:
+                out.append(nid)
+    return out
 
 
 def _jobs(pilots: list[tuple[str, str]], notes: dict[str, str] | None = None) -> str:
@@ -722,8 +778,12 @@ def _rc_why(rc: int) -> str:
 async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list[str] | None = None,
                          wait_s: float = PILOT_END_WAIT_UNKNOWN_S, timeout: int = 60,
                          sleep: Callable[[float], Awaitable[object]] | None = None,
-                         clock: Callable[[], float] | None = None) -> Result:
-    """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue. A pilot that is ENDING is
+                         clock: Callable[[], float] | None = None, ours: Iterable[str] = (),
+                         keep: Iterable[str] = ()) -> Result:
+    """The universal `world:<name>` row: no parsl pilot of the pool user is left in the queue — nor, batch phase 2a, a
+    Jobs-mode job of hpc-bridge's (`hpcb-job-*`, or an id in `ours`: what the run's answers named as its own), less the
+    jobs meant to keep running past the run (`keep`: the scenario's KEEP_RUNNING — jobs not ours — and the ids a
+    stop_endpoint(jobs="keep") answer named, `_kept_jobs`). A pilot that is ENDING is
     waited for — re-listed every PILOT_ENDING_POLL_S, up to `wait_s` — and passes once it is gone:
       - a job the run's own stops said they cancelled (`cancelled`, from `_stop_cancelled_jobs`), while it is listed as
         ending, or — PBS only, for PBS_CANCEL_GRACE_S — as R (PBS lists a qdel'd job as R until its MoM reports — run
@@ -763,7 +823,7 @@ async def _no_pilot_left(name: str, cmd: str, scheduler: str, *, cancelled: list
                 await sleep(max(0.0, min(PILOT_ENDING_POLL_S, wait_s - waited)))
                 continue
             fails = 0
-            pilots = _listed_pilots(scheduler, out)
+            pilots = _listed_pilots(scheduler, out, ours=ours, keep=keep)
             waiting, live = [], []
             for job, state in pilots:
                 key = _job_key(scheduler, job)
@@ -836,7 +896,10 @@ async def _postchecks(scen, res=None) -> list[Result]:
                 continue
             cancelled = _stop_cancelled_jobs(getattr(res, "trace", None))
             results.append(await _no_pilot_left(pc["name"], pc["cmd"], pc["pilots"], cancelled=cancelled,
-                                                wait_s=_pilot_end_wait_s(), timeout=pc.get("timeout", 60)))
+                                                wait_s=_pilot_end_wait_s(), timeout=pc.get("timeout", 60),
+                                                ours=_our_jobs(getattr(res, "trace", None)),
+                                                keep=tuple(getattr(scen, "KEEP_RUNNING", ()) or ())
+                                                + tuple(_kept_jobs(getattr(res, "trace", None)))))
             continue
         # "on": "each_login" runs the check on EVERY login node (a round-robin pool: a manager process left on the
         # node the alias did not pick is exactly the leak a pin bug produces) and joins the outputs

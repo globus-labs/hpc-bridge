@@ -10,6 +10,7 @@ names, so `from hpc_bridge.server import AppCtx` keeps working.
 from __future__ import annotations
 
 import asyncio
+import secrets
 from collections.abc import Callable, Collection
 from concurrent.futures import Future
 from dataclasses import dataclass, field
@@ -530,6 +531,16 @@ class AppCtx:
     ledger: Any = None
     batch_owner: Any = None
     batch_autoloop: bool = True
+    # Batch phase 2a (hpc_bridge.jobs): this server's session — minted once per server lifespan, it is what an envelope
+    # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
+    session_token: str = field(default_factory=lambda: secrets.token_hex(8))
+    jobs_meter_at: float = 0.0
+    # job ids this process is admitting right now (reserved, not yet submitted): a stop or cancel meanwhile asks the
+    # admission to give up (`cancel_requested`) and counts the job as one that can still bill (review B2)
+    jobs_admitting: set[str] = field(default_factory=set)
+    # the envelopes this session proposed and the user has not yet said yes to (jobs._proposal_key -> the cap shown,
+    # what was held then): a yes opens at the cap the user saw, or is proposed again when what is held outgrew it
+    jobs_proposals: dict[tuple, dict] = field(default_factory=dict)
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

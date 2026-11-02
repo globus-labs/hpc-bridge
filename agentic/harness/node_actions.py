@@ -31,6 +31,11 @@ lowercase name):
   submit filter reads on every submit (job_submit.lua), so a job naming it is refused from then on. Undone by
   `qos_restore`, which empties the list.
 
+SERVICE actions stop or start a whole service container of the stack (the host's `docker stop` / `docker start`), named
+by its hostname (batch phase 2a):
+- `dbd_off` — the accounting daemon (`slurmdbd`) goes away: `sacct` fails at once while slurmctld and `squeue` carry on,
+  so a job hpc-bridge submitted is missing from sacct. Undone by `dbd_on` (slurmctld resends what it kept).
+
 Stdlib only: the host half runs on the host's python3; the jail half is imported by scenarios (which scenario_knobs.py
 imports on the host).
 """
@@ -63,9 +68,14 @@ ACTIONS: dict[str, str] = {
     "qos_retire": f"printf '%s\\n' {{arg}} >> {_RETIRED} && chmod 644 {_RETIRED} && {_QOS_SAID}",
     "qos_restore": f"rm -f {_RETIRED} && {_QOS_SAID}",
 }
-UNDO = {"sshd_off": "sshd_on", "sshd_closed": "sshd_on", "qos_retire": "qos_restore"}
+UNDO = {"sshd_off": "sshd_on", "sshd_closed": "sshd_on", "qos_retire": "qos_restore", "dbd_off": "dbd_on"}
 CONTROLLER_ACTIONS = frozenset({"qos_retire", "qos_restore"})
 CONTROLLER = "slurmctld"   # the controller container's hostname (fakecluster/docker-compose.yml)
+# SERVICE actions stop or start a whole service container (`docker stop` / `docker start`), not a command inside one:
+# `dbd_off` takes the accounting daemon away (slurmdbd is its container's PID 1), so `sacct` fails at once ("Connection
+# refused") while slurmctld and `squeue` carry on and keep their records for it — a ledger job is then missing from
+# sacct (batch phase 2a, meter_missing_from_sacct_full_walltime); `dbd_on` gives it back and slurmctld resends them.
+SERVICE_ACTIONS = {"dbd_off": ("stop", "slurmdbd"), "dbd_on": ("start", "slurmdbd")}
 _ARG = re.compile(r"^[a-z][a-z0-9_]{0,31}$")
 ACTION_TIMEOUT_S = 60
 POLL_S = 0.5
@@ -119,17 +129,50 @@ def docker_exec(container: str, cmd: str) -> tuple[int, str]:
         return 127, f"{type(exc).__name__}: {exc}"
 
 
+def docker_service(project: str, hostname: str, verb: str) -> tuple[int, str]:
+    """`docker stop|start` the compose service container of `project` whose hostname is `hostname` — a stopped one
+    too (`docker ps -a`: `dbd_on` starts the container `dbd_off` stopped)."""
+    try:
+        ids = subprocess.run(["docker", "ps", "-aq", "--filter", f"label=com.docker.compose.project={project}",
+                              "--filter", "label=com.docker.compose.oneoff=False"],
+                             capture_output=True, text=True, timeout=30).stdout.split()
+        rows = subprocess.run(["docker", "inspect", "-f", "{{.Config.Hostname}}|{{.Name}}", *ids],
+                              capture_output=True, text=True, timeout=30).stdout.splitlines() if ids else []
+        name = next((n.lstrip("/") for h, _, n in (r.partition("|") for r in rows) if h == hostname), None)
+        if name is None:
+            return 2, f"no container of {project} answers to the hostname {hostname!r}"
+        r = subprocess.run(["docker", verb, name], capture_output=True, text=True, timeout=ACTION_TIMEOUT_S,
+                           stdin=subprocess.DEVNULL)
+        return r.returncode, f"HPCB_SERVICE {hostname} {verb}: {(r.stdout + r.stderr).strip()[-300:]}"
+    except (subprocess.SubprocessError, OSError) as exc:
+        return 127, f"{type(exc).__name__}: {exc}"
+
+
 class Server:
     """Answers the jail's requests; remembers what to undo."""
 
     def __init__(self, req: Path, *, user: str, hosts: list[str], containers: Callable[[], dict[str, str]],
-                 execute: Callable[[str, str], tuple[int, str]] = docker_exec) -> None:
+                 execute: Callable[[str, str], tuple[int, str]] = docker_exec,
+                 service: Callable[[str, str], tuple[int, str]] | None = None) -> None:
         self.req, self.user, self.hosts = Path(req), user, list(hosts)
         self._containers, self._execute = containers, execute
+        self._service = service
         self.answered: set[int] = set()
         self.pending_undo: dict[str, str] = {}   # host -> the action that gives it back
 
     def act(self, action: str, host: str, arg: str | None = None) -> tuple[int, str]:
+        if action in SERVICE_ACTIONS:
+            verb, svc = SERVICE_ACTIONS[action]
+            if host != svc:
+                return 2, f"{action} acts on the {svc!r} service, not {host!r}"
+            if self._service is None:
+                return 2, "no service channel on this host"
+            rc, out = self._service(svc, verb)
+            if rc == 0 and action in UNDO:
+                self.pending_undo[host] = UNDO[action]
+            elif rc == 0:
+                self.pending_undo = {h: a for h, a in self.pending_undo.items() if not (h == host and a == action)}
+            return rc, out
         if action not in ACTIONS:
             return 2, f"unknown node action {action!r} (have: {sorted(ACTIONS)})"
         if action in CONTROLLER_ACTIONS:
@@ -182,7 +225,8 @@ def _raise_stop(_signum, _frame) -> None:
 def serve(req: Path, *, user: str, hosts: list[str], project: str, parent_pid: int | None = None) -> None:
     from admin_tap import alive  # the same parent watch as the tap's (a run_smoke.sh killed outright)
 
-    srv = Server(req, user=user, hosts=hosts, containers=lambda: docker_containers(project))
+    srv = Server(req, user=user, hosts=hosts, containers=lambda: docker_containers(project),
+                 service=lambda svc, verb: docker_service(project, svc, verb))
     for sig in (signal.SIGTERM, signal.SIGINT):
         signal.signal(sig, _raise_stop)
     with contextlib.suppress(OSError):
