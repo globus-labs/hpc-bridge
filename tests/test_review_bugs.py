@@ -335,18 +335,24 @@ async def test_byo_details_cached_only_once_the_login_shape_is_proven_warm(monke
     assert "byo" not in app.pending_facility_cache
 
 
+@pytest.mark.client_view   # this test models the client's ssh config and network itself
 async def test_unreachable_pinned_login_node_drops_the_pin(monkeypatch, tmp_path):
     import contextlib
     import socket
     from types import SimpleNamespace
 
+    from hpc_bridge.facility import remote
     from hpc_bridge.state import EndpointRecord, LoginNodeStore
     from tests.fakes import FakeCatalog
     store = LoginNodeStore(tmp_path / "endpoints.json")
     store.put(EndpointRecord(endpoint_id="e1", login_host="login03.example.edu", alias="anvil", user="u",
                              key_path="/k", name="hpc-bridge-anvil", provisioned_at="2026-09-03T00:00:00Z"))
-    # the target as `rebind` leaves it: the pin, verified against the HostName ssh resolved for the alias
-    target = SimpleNamespace(host="login03.example.edu", user="u", host_key_alias="anvil.example.edu")
+    # the user's ~/.ssh/config, as `ssh -G` reads it: the alias `anvil` connects to anvil.example.edu
+    monkeypatch.setattr(remote, "_ssh_config", lambda h: {"hostname": "anvil.example.edu", "port": "22"}
+                        if h == "anvil" else {})
+    # the target as `rebind` leaves it: the alias, its HostName overridden by the pin, verified against the alias's key
+    target = SimpleNamespace(host="login03.example.edu", user="u", host_key_alias="anvil.example.edu",
+                             ssh_alias="anvil")
     fac = SimpleNamespace(store=store, alias="anvil", profile=SimpleNamespace(endpoint_name="hpc-bridge-anvil", scheduler="slurm"),
                           cli=SimpleNamespace(target=target))
     monkeypatch.setattr(binding, "_facility_from_entry", lambda entry, *, account: fac)

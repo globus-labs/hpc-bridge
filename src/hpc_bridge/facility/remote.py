@@ -95,17 +95,28 @@ class SshTarget:
     # the name the USER trusted — the alias they connected to — via OpenSSH's HostKeyAlias. A pin can then
     # never redirect the bearer credential to a machine whose key differs from the alias's (review A10).
     host_key_alias: str | None = None
+    # After a pin: the ssh-config Host the user named. ssh still connects to IT, with only HostName overridden to
+    # `host` — so the alias's Port, User, ProxyJump/ProxyCommand and IdentityFile all still apply (2026-11-03: a pin
+    # that replaced the destination lost a port-forward's Port 2222). None when unpinned (`host` is the alias).
+    ssh_alias: str | None = None
 
     def __post_init__(self) -> None:
         # Defence in depth behind the model validators: never let a "-…" or whitespace host reach argv.
-        h = self.host or ""
-        if h.startswith("-") or any(ch.isspace() for ch in h) or not h:
-            raise ValueError(f"invalid ssh host {self.host!r}")
+        for h in [self.host or "", *([self.ssh_alias] if self.ssh_alias is not None else [])]:
+            if h.startswith("-") or any(ch.isspace() for ch in h) or not h:
+                raise ValueError(f"invalid ssh host {h!r}")
+
+    def _pinned(self) -> bool:
+        return bool(self.ssh_alias) and self.ssh_alias != self.host
+
+    def _hostname_opts(self) -> list[str]:
+        """A pinned target overrides the alias's HostName, and nothing else."""
+        return ["-o", f"HostName={self.host}"] if self._pinned() else []
 
     def _control_path(self) -> str:
-        # %C hashes localhost/user/host/port: short (fits macOS' ~104-char socket-path limit) and
-        # auto-distinct after `rebind` swaps host, so the alias master and the pinned-node master
-        # land on separate sockets with no bookkeeping.
+        # %C hashes localhost/HostName/port/user/ProxyJump: short (fits macOS' ~104-char socket-path limit) and
+        # auto-distinct after `rebind` overrides HostName, so the alias master and the pinned-node master land on
+        # separate sockets with no bookkeeping.
         return f"{self.control_dir}/%C"
 
     def argv(self, remote_cmd: str) -> list[str]:
@@ -132,18 +143,22 @@ class SshTarget:
                 "-o", f"ControlPath={self._control_path()}",
                 "-o", f"ControlPersist={self.control_persist}",
             ]
+        opts += self._hostname_opts()
         opts += ["--", self._destination(), remote_cmd]  # `--`: the destination can never be read as an option
         return opts
 
     def _destination(self) -> str:
-        return f"{self.user}@{self.host}" if self.user else self.host
+        dest = self.ssh_alias if self._pinned() and self.ssh_alias else self.host  # a pin keeps the alias
+        return f"{self.user}@{dest}" if self.user else dest
 
     def control_argv(self, request: str) -> list[str]:
         """argv for an `ssh -O <request>` control command (e.g. 'exit', 'check') against this
-        target's master socket. Only meaningful when control_dir is set."""
+        target's master socket. Only meaningful when control_dir is set. The same destination and HostName
+        as `argv()`, so `%C` names the same socket."""
         return [
             "ssh", "-O", request,
             "-o", f"ControlPath={self._control_path()}",
+            *self._hostname_opts(),
             "--", self._destination(),
         ]
 
@@ -156,7 +171,8 @@ class SshTarget:
             opts += ["-o", f"HostKeyAlias={self.host_key_alias}"]  # without it the pin's name is an UNKNOWN host)
         if self.key_path:
             opts += ["-i", self.key_path]
-        opts += ["--", self._destination()]
+        # run in the USER's terminal: the alias they named (its Port, ProxyJump…), a pin only as its HostName
+        opts += [*self._hostname_opts(), "--", self._destination()]
         return opts
 
     def preauth_command(self) -> str:
@@ -177,21 +193,89 @@ _TEARDOWN_SSH_S = 30.0
 _BOOTSTRAP_SSH_S = 900.0
 
 
-def _resolved_hostname(host: str) -> str:
-    """The HostName OpenSSH would connect to for `host` (an alias resolves through ~/.ssh/config) — the
-    name known_hosts keys the host key by. Falls back to `host` itself when `ssh -G` is unavailable."""
+def _ssh_config(host: str) -> dict[str, str]:
+    """The client's effective ssh config for `host` — `ssh -G`, read locally, no connection: lower-case keys, the first
+    value of each. {} when ssh is unavailable or refuses the name."""
     import subprocess
 
     try:
         out = subprocess.run(["ssh", "-G", "--", host], stdin=subprocess.DEVNULL, capture_output=True, text=True,
                              timeout=10, check=False).stdout
-    except Exception:  # noqa: BLE001 - no ssh binary / odd host -> the name as given
-        return host
+    except Exception:  # noqa: BLE001 - no ssh binary / odd host -> no config known
+        return {}
+    conf: dict[str, str] = {}
     for line in out.splitlines():
-        k, _, v = line.partition(" ")
-        if k.lower() == "hostname" and v.strip():
-            return v.strip()
-    return host
+        k, _, v = line.strip().partition(" ")
+        if k and v.strip():
+            conf.setdefault(k.lower(), v.strip())
+    return conf
+
+
+@dataclass(frozen=True)
+class SshRoute:
+    """How the CLIENT's ssh reaches an alias (`ssh -G`): the host and port it connects to, and any proxy in between.
+    Every probe and every pin decision reads this, never a default port (2026-11-03: a port-forward on 2222)."""
+
+    hostname: str
+    port: int = 22
+    proxyjump: str | None = None
+    proxycommand: str | None = None
+    host_key_alias: str | None = None   # the alias's own HostKeyAlias, when its config sets one
+
+    @property
+    def proxied(self) -> bool:
+        """Reached through a bastion or a command: no TCP probe from here says what the far side reaches."""
+        return bool(self.proxyjump or self.proxycommand)
+
+    @property
+    def follows_hostname(self) -> bool:
+        """Does a HostName override still steer this route? A ProxyCommand only when it reads `%h`: one that names its
+        own target goes there whatever HostName says, and a pin would be a pin in name only."""
+        return self.proxycommand is None or "%h" in self.proxycommand
+
+    @property
+    def known_hosts_name(self) -> str:
+        """The name known_hosts keeps the alias's host key under — what a pin verifies against (HostKeyAlias): the
+        alias's own HostKeyAlias, else its HostName, as `[HostName]:port` off port 22 (OpenSSH's own key)."""
+        if self.host_key_alias:
+            return self.host_key_alias
+        return self.hostname if self.port == 22 else f"[{self.hostname}]:{self.port}"
+
+
+def _ssh_route(alias: str | None) -> SshRoute:
+    """The alias's route as the client's ssh resolves it (`_ssh_config`). With no ssh config known, the name itself on
+    port 22 — what ssh would do."""
+    conf = _ssh_config(alias) if alias else {}
+
+    def opt(key: str) -> str | None:
+        v = conf.get(key)
+        return None if v is None or v.lower() == "none" else v
+
+    try:
+        port = int(conf.get("port", "22"))
+    except ValueError:
+        port = 22
+    return SshRoute(hostname=conf.get("hostname") or alias or "", port=port, proxyjump=opt("proxyjump"),
+                    proxycommand=opt("proxycommand"), host_key_alias=opt("hostkeyalias"))
+
+
+def _tcp_answers(host: str, port: int, timeout_s: float = 3.0) -> bool:
+    """Does (host, port) take a TCP connection FROM HERE? No default port: callers pass the alias's own (`SshRoute`)."""
+    import socket
+
+    try:
+        with socket.create_connection((host, port), timeout=timeout_s):
+            return True
+    except OSError:
+        return False
+
+
+def _alias_answers(route: SshRoute) -> bool | None:
+    """Does the alias's own host answer from here, on its own port? None through a proxy: no TCP probe reaches past a
+    bastion or a ProxyCommand, so nothing here can tell the client's outage from the far side's."""
+    if route.proxied or not route.hostname:
+        return None
+    return _tcp_answers(route.hostname, route.port)
 
 
 async def ssh_exec(
@@ -319,37 +403,57 @@ def _resolves_from_here(host: str) -> bool:
     import socket
 
     try:
-        socket.getaddrinfo(host, 22, proto=socket.IPPROTO_TCP)
+        socket.getaddrinfo(host, None, proto=socket.IPPROTO_TCP)
         return True
     except OSError:
         return False
 
 
-def _routable_pin(host: str | None, addr: str | None = None, *, resolves=None) -> str | None:
-    """The reconnect pin for the login node the manager landed on — the node's FQDN when it is reachable from the
-    client via the SAME external path as the alias, else the ADDRESS the bootstrap connection actually reached
-    (`$SSH_CONNECTION`'s server field), else None (keep the alias).
+def _is_address(s: str) -> bool:
+    try:
+        ipaddress.ip_address(s.strip())
+    except ValueError:
+        return False
+    return True
 
-    Some facilities' `hostname -f` reports an INTERNAL name — Midway's `beagle3-tbd1.rcc.local`, Aurora's
-    `aurora-uan-0009.hostmgmt.cm.aurora.alcf.anl.gov` (both seen live), or a plain-looking name their DNS never
-    publishes — and pinning it breaks login_shell and teardown. Internal-suffix (`.local`/`.internal`/
-    `.localdomain`), single-label and management-plane (`hostmgmt`/`cm`/`mgmt`/…) names are dropped outright; any
-    other name must RESOLVE from here (`resolves`, injectable for tests). The address is used only when it is a
-    real unicast one — a NAT/VIP front makes it as round-robin as the alias, but no worse. The host KEY is still
-    checked against the alias the user trusted (HostKeyAlias), so neither pin can redirect the credential."""
+
+def _routable_pin(host: str | None, addr: str | None = None, *, route: SshRoute, resolves=None,
+                  answers=None) -> str | None:
+    """The reconnect pin for the login node the manager landed on, or None (keep the alias). THE one gate between what
+    the FACILITY says about itself — `hostname -f`, `$SSH_CONNECTION`'s server field, a recorded pin — and an ssh
+    command: a candidate is pinned only if the CLIENT reaches it on the alias's own path (`route`, from `ssh -G`), and
+    is then used only as a HostName override on the alias (`SshTarget.ssh_alias`), so its Port, User, ProxyJump and
+    IdentityFile still apply. `tests/test_login_pin_nat.py` holds every other path to this one (the vantage rule).
+
+    The node's FQDN first: internal-suffix (`.local`/`.internal`/`.localdomain`), single-label and management-plane
+    (`hostmgmt`/`cm`/`mgmt`/…) names are dropped outright — Midway's `beagle3-tbd1.rcc.local`, Aurora's
+    `aurora-uan-0009.hostmgmt.cm.aurora.alcf.anl.gov` (both seen live). On a direct route any other name must resolve
+    from here (`resolves`) AND take a TCP connection on the alias's port (`answers`, both injectable). Then the ADDRESS
+    the bootstrap connection reached — the node's own view, which is NOT routable by construction: behind NAT, a
+    port-forward, a bastion or a VIP it is an internal address (172.20.0.7, a Docker port-forward on 2222: live
+    2026-11-03), so it too must answer on the alias's port. Through a proxy (ProxyJump, or a ProxyCommand that reads
+    `%h`) no probe from here means anything: a name is pinned as a HostName override the proxy resolves, an address
+    never; a ProxyCommand that ignores `%h` gets no pin at all. The host KEY is still checked against the alias the
+    user trusted (HostKeyAlias), so no pin can redirect the credential."""
     check = resolves or _resolves_from_here
+    reach = answers or _tcp_answers
+    if route.proxied and not route.follows_hostname:
+        return None
+    if host and _is_address(host):   # a recorded pin may be an address: it is checked as one, never as a name
+        host, addr = None, host
     if host:
         h = host.strip().rstrip(".")
         labels = {label.lower() for label in h.split(".")}
         if "." in h and not h.lower().endswith(_INTERNAL_HOST_SUFFIXES) and not (labels & _INTERNAL_HOST_LABELS) \
-                and check(h):
+                and (route.proxied or (check(h) and reach(h, route.port))):
             return h
-    if addr:
+    if addr and not route.proxied:
         try:
             ip = ipaddress.ip_address(addr.strip())
         except ValueError:
             return None
-        if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved):
+        if not (ip.is_loopback or ip.is_link_local or ip.is_unspecified or ip.is_multicast or ip.is_reserved) \
+                and reach(str(ip), route.port):
             return str(ip)
     return None
 
@@ -828,8 +932,9 @@ class RemoteEndpointCLI:
         # connection: the alias round-robins, so a separate hostname probe could resolve
         # a different node than the one now hosting the manager daemon. The sentinel
         # isolates the FQDN from gce's own stdout.
-        # …and the ADDRESS this connection reached ($SSH_CONNECTION's server field): routable by construction, it is
-        # the pin when the node's own name is not (internal names — Midway's *.rcc.local, a `.int.` domain).
+        # …and the ADDRESS this connection reached ($SSH_CONNECTION's server field) — the NODE's view of it: behind NAT,
+        # a port-forward or a bastion an internal address. Both are only candidates: `_routable_pin` pins one only if
+        # the client reaches it on the alias's own path.
         self.start_note = ""
         rc, out, err = await self._start_once(name)
         if rc != 0:
@@ -1147,13 +1252,16 @@ class RemoteEndpointCLI:
         self.last_whoami_error = None if rc == 0 else ((err or out or "").strip() or f"rc={rc}")
         return rc == 0
 
-    def rebind(self, host: str) -> None:
-        """Re-point this CLI at a specific host (the pinned FQDN) for reconnect. The host KEY is still
-        checked against the name the user trusted (HostKeyAlias), so a pin cannot redirect to a
-        different machine. known_hosts is keyed by the RESOLVED HostName (an ssh-config alias such as
-        `globus1` stores its key under `globus1.cs.uchicago.edu`), hence `ssh -G` (found live 2026-09-04)."""
-        alias = self.target.host_key_alias or _resolved_hostname(self.target.host)
-        self.target = replace(self.target, host=host, host_key_alias=alias)
+    def rebind(self, host: str, route: SshRoute | None = None) -> None:
+        """Pin this CLI to a specific login node — `host`, as `_routable_pin` returned it — for reconnect and teardown.
+        ssh still connects to the ALIAS, with only its HostName overridden (`SshTarget.ssh_alias`): the alias's Port,
+        User, ProxyJump and IdentityFile still apply, and its ControlMaster is keyed apart from the pinned one's (%C).
+        The host KEY is still checked against the name the user trusted (HostKeyAlias), so a pin cannot redirect to a
+        different machine. known_hosts keys it by the RESOLVED HostName (`globus1` stores its key under
+        `globus1.cs.uchicago.edu`: live 2026-09-04) — `[HostName]:port` off port 22 — hence `ssh -G` (`route`)."""
+        alias = self.target.ssh_alias or self.target.host
+        trusted = self.target.host_key_alias or (route or _ssh_route(alias)).known_hosts_name
+        self.target = replace(self.target, host=host, ssh_alias=alias, host_key_alias=trusted)
 
     async def close(self) -> bool:
         """Close the SSH ControlMaster for this target (best-effort, bounded). True when a master was
@@ -1828,7 +1936,7 @@ class SlurmFacility:
             if not pinned or not self.alias or not _UNREACHABLE.search(str(exc)):
                 raise
             dead = target.host
-        self.cli.target = replace(target, host=self.alias, host_key_alias=None)  # the facility's host, as before a pin
+        self.cli.target = replace(target, host=self.alias, host_key_alias=None, ssh_alias=None)  # as before a pin
         self.cli.venv_ready = None
         self._past_dead_pin = dead
         try:
@@ -1942,8 +2050,12 @@ class SlurmFacility:
         self.logs_block_requests = True  # …and it names each block request in its compute user endpoint's log
         self.compute_init_blocks = compute_init_blocks(uep)  # …and starts this many blocks per new life
         self.takes_resources = takes_resources(uep)  # …and renders a block's size (hpc_bridge.resources)
-        # the node's FQDN when routable from here, else the address this connection reached, else the alias
-        host = await asyncio.to_thread(_routable_pin, host, addr)
+        # the node's FQDN, else the address this connection reached — each only if the client reaches it on the
+        # alias's own path (its port; never an address through a proxy) — else the alias
+        target = getattr(self.cli, "target", None)
+        route = await asyncio.to_thread(_ssh_route, getattr(target, "ssh_alias", None) or self.alias
+                                        or getattr(target, "host", None))
+        host = await asyncio.to_thread(_routable_pin, host, addr, route=route)
         if host:
             # Pin the live session to the node the manager daemon actually landed on, so
             # later control-plane ops — above all teardown — reach THIS node instead of

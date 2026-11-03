@@ -186,6 +186,38 @@ installed plugin only when that version changes); git tags mark releases.
     `batch_restart_resume`, `batch_two_servers_one_ledger`, `batch_block_reaped_midrun`, `batch_big_output`,
     `batch_abort_midrun` and `mep_batch_fanout`.
 
+### Fixed
+- **The login-node pin is chosen from the client's side, and overrides HostName only.** Found by a user driving the
+  fake cluster from the host (`hpcb-fake` → `localhost:2222`, a Docker port-forward): the bootstrap pinned
+  `$SSH_CONNECTION`'s server field, `172.20.0.7`, a Docker-internal address the Mac cannot reach, and every later
+  reconnect, `login_shell` and teardown failed. The harness never saw it: it runs inside the Docker network.
+  - **`_routable_pin` checks reachability on the alias's own path** (`ssh -G`: HostName, Port, ProxyJump,
+    ProxyCommand). On a direct alias, the node's name or address is pinned only if a TCP connect to it on the alias's
+    port answers from the client. Through a ProxyJump (or a ProxyCommand that reads `%h`), a name is pinned as a
+    HostName override the proxy resolves and an address never; a ProxyCommand that ignores `%h` gets no pin.
+  - **A pin keeps the alias.** `rebind` used to replace the ssh destination, losing the alias's Port, User, ProxyJump
+    and IdentityFile. ssh now connects to the alias with `-o HostName=<pin>` (`argv`, `control_argv`, `preauth_argv`:
+    the user's pre-auth line too). The host key is checked under the name known_hosts keeps for the alias,
+    `[HostName]:port` off port 22 (it was the bare HostName, which a non-22 alias's key is never stored under).
+  - **The dead-pin check probes the alias's real port.** `connect._drop_dead_pin` probed port 22, so the port-forward's
+    `localhost:22` read as a client outage and the bad pin was kept for good. Through a proxy it no longer reads an
+    outage it cannot probe for.
+  - **A saved pin clears itself.** Every facility build checks a recorded pin again, from the client: an unusable one
+    is cleared from `endpoints.json` (the record kept) when the alias's own host answers, and kept in use through a
+    client outage. This also covers a connect that reuses an online endpoint with no SSH at all.
+  - **`_tcp_answers` has no default port.** Every probe passes the alias's own port.
+
+### Testing
+- `tests/test_login_pin_nat.py` (27 tests, red on 49e342e but for 3 controls): the port-forward, the reachable FQDN, ProxyJump and
+  ProxyCommand aliases, the pinned argv, the dead-pin port, an old bad pin cleared or kept, the pre-auth line under a
+  port-forward and a ProxyJump, the client-view convention (every probe uses 2222 or none is made through the
+  bastion; every argv keeps the alias), and the vantage rule: an AST scan of `src/hpc_bridge` that fails any path from
+  `HPCB_HOST`/`HPCB_ADDR`, `start`'s report or a recorded `login_host` to an ssh target other than through
+  `_routable_pin(…, route=…)`.
+- The unit tier no longer reads the developer's `~/.ssh/config` or the network for the pin: `conftest` fakes
+  `remote._ssh_config` (no Host blocks) and `remote._tcp_answers` (every host answers) unless a test is marked
+  `client_view`. The Perlmutter #1 tests now assert the dead pin is dropped before any SSH reaches it.
+
 ## 0.1.26 — 2026-10-31 — blocks sized to the work; returning users reattach, repair and get terms the scheduler takes
 
 ### Added

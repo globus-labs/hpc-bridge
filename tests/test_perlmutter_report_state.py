@@ -31,7 +31,8 @@ from hpc_bridge.profile import Profile
 from hpc_bridge.state import EndpointRecord, FacilityStore, LoginNodeStore
 from tests.fakes import FakeCatalog, FakeFacility
 
-pytestmark = pytest.mark.skipif(sys.platform == "win32", reason="the fake OpenSSH client is a sh script")
+pytestmark = [pytest.mark.skipif(sys.platform == "win32", reason="the fake OpenSSH client is a sh script"),
+              pytest.mark.client_view]   # the fake ssh answers `ssh -G`; the World fakes the client's TCP
 
 ALIAS = "perlmutter"                       # the user's ~/.ssh/config Host — not a DNS name
 CANONICAL = "perlmutter.nersc.gov"         # its HostName: answers on :22
@@ -48,12 +49,13 @@ if [ "$1" = "-G" ]; then
   echo "user alice"; exit 0
 fi
 for a in "$@"; do [ "$a" = "-O" ] && { echo "Control socket connect: No such file or directory" >&2; exit 255; }; done
-dest=""; cmd=""; seen=0
+dest=""; cmd=""; seen=0; override=""
 for a in "$@"; do
   if [ "$seen" = 1 ]; then if [ -z "$dest" ]; then dest="$a"; else cmd="$a"; fi; continue; fi
+  case "$a" in HostName=*) override="${a#HostName=}";; esac   # `-o HostName=<pin>`: a pinned login node
   [ "$a" = "--" ] && seen=1
 done
-host="${dest#*@}"
+host="${override:-${dest#*@}}"
 case "$cmd" in *HPCB_PROBE_BEGIN*) kind=probe;; *) kind=bringup;; esac
 echo "$host $kind" >> "$FAKE_SSH_LOG"
 case " $FAKE_SSH_DOWN " in *" $host "*)
@@ -133,28 +135,34 @@ def _app() -> AppCtx:
 
 async def test_1_dead_pin_is_dropped_when_the_alias_is_an_ssh_config_host(monkeypatch, tmp_path):
     """On 0.1.20 `_drop_dead_pin` probed the ALIAS with a raw TCP connect: an ssh-config Host such as 'perlmutter' is no
-    DNS name, so the probe read a client-side outage and kept the dead pin. It now probes the HostName ssh resolves."""
+    DNS name, so the probe read a client-side outage and kept the dead pin. It now probes the HostName ssh resolves.
+
+    Since 2026-11-03 a recorded pin is checked from the client BEFORE any SSH (`binding._slurm_facility` ->
+    `_routable_pin`, on the alias's own port): login22 does not answer, the HostName `ssh -G` resolves for 'perlmutter'
+    does, so the pin is dropped there and the dead node is never dialled (the report's CANNOT REACH no longer happens).
+    Probing the bare alias would still read an outage and keep the pin: its resolution is what is under test."""
     w = World(monkeypatch, tmp_path)
     _cache_proven_perlmutter()
     _pin_login22()
     res = await server._connect_facility(_app(), "perlmutter")
-    # the report's error, reproduced through the real bring-up: the cached config, the pin, the first SSH step
-    assert res.phase == "failed" and res.notice.startswith(f"CANNOT REACH {PINNED}"), res.notice
-    assert w.ssh_log() == [(PINNED, "bringup")]
+    # the bring-up went to the alias, never to the dead node (and the alias asks for the user's login: item 2)
+    assert w.ssh_log() == [(ALIAS, "bringup")], (w.ssh_log(), res.notice)
+    assert not res.notice.startswith(f"CANNOT REACH {PINNED}"), res.notice
     # the canonical host answers (CANONICAL is reachable), so the pin is dead and must be dropped
-    assert "pin was dropped" in res.notice, res.notice
-    assert LoginNodeStore().get(alias=ALIAS, name=ENDPOINT) is None
+    rec = LoginNodeStore().get(alias=ALIAS, name=ENDPOINT)
+    assert rec is None or rec.login_host is None
 
 
 async def test_1_control_the_same_dead_pin_is_dropped_when_the_alias_is_a_dns_name(monkeypatch, tmp_path):
     """The control for the test above (passed on 0.1.20): the same state and the same timeout, but the alias resolves
     in DNS — and the pin IS dropped. So it is the alias's resolution that keeps the pin, not timeout vs refused."""
-    World(monkeypatch, tmp_path, dns=(ALIAS, CANONICAL, PINNED))
+    w = World(monkeypatch, tmp_path, dns=(ALIAS, CANONICAL, PINNED))
     _cache_proven_perlmutter()
     _pin_login22()
     res = await server._connect_facility(_app(), "perlmutter")
-    assert res.notice.startswith(f"CANNOT REACH {PINNED}") and "pin was dropped" in res.notice, res.notice
-    assert LoginNodeStore().get(alias=ALIAS, name=ENDPOINT) is None
+    assert w.ssh_log() == [(ALIAS, "bringup")], (w.ssh_log(), res.notice)   # caught before any SSH (2026-11-03)
+    rec = LoginNodeStore().get(alias=ALIAS, name=ENDPOINT)
+    assert rec is None or rec.login_host is None
 
 
 async def test_1_explicit_ssh_host_is_not_silently_ignored_after_the_kept_config_failed(monkeypatch, tmp_path):
@@ -165,7 +173,9 @@ async def test_1_explicit_ssh_host_is_not_silently_ignored_after_the_kept_config
     _pin_login22()
     app = _app()
     first = await server._connect_facility(app, "perlmutter")
-    assert first.notice.startswith(f"CANNOT REACH {PINNED}"), first.notice
+    # the kept config did not bring the facility up (since 2026-11-03 the dead pin is dropped before any SSH, and the
+    # alias asks for the user's login instead of timing out on login22)
+    assert first.phase in ("failed", "needs_preauth") and PINNED not in {h for h, _ in w.ssh_log()}, first.notice
     w.clear_log()
     again = await server._connect_facility(app, "perlmutter", ssh_host=CANONICAL)
     # the host the call names is used (or the call is refused without SSH): never the old alias or its pinned node

@@ -249,7 +249,9 @@ def test_preauth_argv_carries_the_host_key_alias_for_a_pinned_node():
     cli = RemoteEndpointCLI(SshTarget(host="login.expanse.sdsc.edu", user="u", control_dir="/tmp/cm"), "true")
     cli.rebind("login02.expanse.sdsc.edu")
     argv = cli.target.preauth_argv()
-    assert "HostKeyAlias=login.expanse.sdsc.edu" in argv and argv[-1] == "u@login02.expanse.sdsc.edu"
+    # ssh connects to the alias, the pinned node only its HostName (2026-11-03: the alias's Port/ProxyJump still apply)
+    assert "HostKeyAlias=login.expanse.sdsc.edu" in argv and argv[-1] == "u@login.expanse.sdsc.edu"
+    assert "HostName=login02.expanse.sdsc.edu" in argv
     assert "HostKeyAlias" not in " ".join(SshTarget(host="h", user="u", control_dir="/tmp/cm").preauth_argv())
 
 

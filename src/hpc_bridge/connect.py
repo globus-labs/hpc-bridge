@@ -40,6 +40,8 @@ from .dispatch import for_agent
 from .facility.remote import (
     NeedsPreauth,
     SshTarget,
+    _alias_answers,
+    _ssh_route,
     is_interactive_auth_failure,
     key_accepted_second_factor_pending,
     offers_one_time_code,
@@ -278,16 +280,6 @@ def _master_alive(target) -> bool:
     return r.returncode == 0
 
 
-def _tcp_answers(host: str, port: int = 22, timeout_s: float = 3.0) -> bool:
-    import socket
-
-    try:
-        with socket.create_connection((host, port), timeout=timeout_s):
-            return True
-    except OSError:
-        return False
-
-
 async def _online_endpoint(fac) -> str | None:
     """UUID of an online endpoint of ours at `fac`, asked of the Globus web service only — NO SSH. None when
     there is none, or the facility cannot say (no finder, no profile, a web error: `find_online_endpoint`
@@ -308,15 +300,17 @@ def _drop_dead_pin(fac) -> bool:
     an UNREACHABLE host qualifies: a refused login keeps the pin (the host is fine; the access isn't).
     True when a pin was in use and got dropped.
 
-    The facility's host is probed where ssh connects for it: the HostName `rebind` resolved for the alias (`ssh -G`,
-    kept on the target as its HostKeyAlias). An ssh-config Host such as `perlmutter` is no name a resolver knows, so a
-    probe of the alias itself read as a client-side outage and kept the dead pin (Perlmutter report 2026-10-29, #1)."""
+    The facility's host is probed where the client's ssh connects for the alias: its HostName AND its port (`ssh -G`).
+    An ssh-config Host such as `perlmutter` is no name a resolver knows, so a probe of the alias itself read as a
+    client-side outage and kept the dead pin (Perlmutter report 2026-10-29, #1); a port-forward's `localhost` probed
+    on 22 instead of its 2222 did the same (2026-11-03). Through a ProxyJump/ProxyCommand no TCP probe reaches the
+    far side: the failure the caller saw is then never read as the client's outage, and the pin goes."""
     store, alias = getattr(fac, "store", None), getattr(fac, "alias", None)
     target = getattr(getattr(fac, "cli", None), "target", None)
     name = getattr(getattr(fac, "profile", None), "endpoint_name", None)
     if store is None or not alias or target is None or not name or getattr(target, "host", alias) == alias:
         return False
-    if not _tcp_answers(getattr(target, "host_key_alias", None) or alias):
+    if _alias_answers(_ssh_route(alias)) is False:
         # The facility's canonical host doesn't answer either: a CLIENT-side outage (VPN off, no network),
         # not a dead pin. Dropping it would send teardown/login_shell to the round-robin alias later
         # and orphan the endpoint the pin protects (review 2). Keep the pin.
