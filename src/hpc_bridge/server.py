@@ -388,7 +388,12 @@ async def _ensure_endpoint_up(
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
+    *,
+    recheck: bool = True,
 ) -> EndpointStatus:
+    """ensure_endpoint_up. `recheck` (the tool's own call): a check is sent even when one passed moments ago — a status
+    probe re-verifies the worker. A caller about to send work there (run_batch) passes False: a check that passed
+    within the canary TTL is trusted, as run_shell trusts it — its work carries the wrong-block guard."""
     if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
         return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=_no_facility_notice(app))
@@ -510,8 +515,9 @@ async def _ensure_endpoint_up(
             rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the terms this call named itself
         try:
             # force_canary: a status probe must re-verify the worker (and kick a cold block),
-            # never trust the TTL — that's exactly the cold-start gap callers are asking about.
-            block = await warmth._provision(app, shape, force_canary=True, confirm_spend=confirm_spend)
+            # never trust the TTL — that's exactly the cold-start gap callers are asking about. Not run_batch's: a
+            # second check right after one passed, slow under load, read a live block as reaped (sweep 2026-11-02).
+            block = await warmth._provision(app, shape, force_canary=recheck, confirm_spend=confirm_spend)
         except Exception as exc:  # noqa: BLE001 - provisioning unavailable (e.g. non-Linux host)
             return EndpointStatus(
                 status="down",
@@ -2569,10 +2575,13 @@ async def reset_session(
 # ---- batch phase 1: run_batch / status / cancel (hpc_bridge.batch; vault `Planned/Batch and swarm execution.md`) ---
 
 batch.login_runner = _login_runner   # the free login-shape channel the batch engine's markers and job looks ride
+batch.login_busy = lambda app: _busy_session(app, "login", _INTERNAL_SESSION)   # an op of ours still holds it
 
 
 async def _batch_ensure_up(app: AppCtx, confirm_spend: bool) -> EndpointStatus:
-    return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend)
+    # a check that passed within the canary TTL stands (`recheck`): run_batch right after ensure_endpoint_up said `up`
+    # sent a second one, which under load outlived the canary wait and voided a live block's confirmation
+    return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False)
 
 
 async def _run_batch(
@@ -2691,7 +2700,9 @@ async def submit_job(
     Nothing is submitted until the user's yes comes back as confirm_spend=True (with `envelope={cap, deadline_hours,
     max_jobs, site_backstop, …}` when the user set them). Later jobs that fit are admitted at once; one that does not
     answers needs_confirmation, reason "envelope_exhausted" — ask the user, never split the work to fit. A later
-    session asks again ("envelope_new_session"). `exclude_jobs`: scheduler ids of jobs the meter counts that the user
+    session asks again ("envelope_new_session"). phase="busy" (hpc-bridge's login channel was still busy with a
+    scheduler command of its own): nothing was submitted or refused — make the same call again shortly, no new yes.
+    `exclude_jobs`: scheduler ids of jobs the meter counts that the user
     says are not theirs to count (with confirm_spend=True). Follow a job with status("job-…"), the envelope with
     status("env-…"); end them with cancel(id, "abort")."""
     try:

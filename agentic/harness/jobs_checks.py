@@ -178,15 +178,35 @@ async def submit(ops, *, yes: bool = True, scheduler: str = "slurm", **args: Any
                                               array=args.get("array"), nodes=int(args.get("nodes") or 1),
                                               partition=args.get("partition"), account=args.get("account"),
                                               scheduler=scheduler))
+    r = await _again_while_busy(ops, r, args)
     if r.get("phase") == "needs_confirmation" and yes:
         ops.say(f"the user approved: {(r.get('terms') or {}).get('basis') or ''} "
                 f"(envelope cap {(r.get('envelope') or {}).get('cap')})")
-        r = await ops.call("submit_job", confirm_spend=True, **args)
+        r = await _again_while_busy(ops, await ops.call("submit_job", confirm_spend=True, **args),
+                                    {"confirm_spend": True, **args})
         if r.get("phase") == "needs_confirmation" and r.get("reason") == "envelope_needed":
             # proposed again (round 2): what is held changed since the proposal — the user sees the new figure
             ops.say(f"proposed again (envelope cap {(r.get('envelope') or {}).get('cap')}): the user approves that")
-            r = await ops.call("submit_job", confirm_spend=True, **args)
+            r = await _again_while_busy(ops, await ops.call("submit_job", confirm_spend=True, **args),
+                                        {"confirm_spend": True, **args})
     return Submitted(r)
+
+
+BUSY_RETRY_S = POLL_S
+BUSY_TRIES = 8
+
+
+async def _again_while_busy(ops, r: dict, args: dict) -> dict:
+    """submit_job's `busy` (hpc-bridge's login channel still held by a scheduler command of its own; sweep 2026-11-02):
+    nothing was submitted or refused, so the same call again after a pause — as an agent does — a bounded number of
+    times."""
+    for _ in range(BUSY_TRIES):
+        if r.get("phase") != "busy":
+            break
+        ops.say(f"submit_job is busy ({r.get('reason')!r}): the same call again shortly")
+        await ops.sleep(BUSY_RETRY_S)
+        r = await ops.call("submit_job", **args)
+    return r
 
 
 async def wait_job(ops, job_id: str, *, until, timeout_s: float = 600.0) -> dict:

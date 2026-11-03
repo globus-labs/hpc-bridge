@@ -38,8 +38,10 @@ service first.
   and `_proposal` returns it with `reused=True` and a lead naming the endpoint.
 - **Confirming** the proposal binds the session's config and reattaches over the web, as a cached record always did.
   No SSH happens before the reattach.
-- **Fallbacks.** A ghost, a probe that did not run, or nothing online leaves the SSH probe as before, its notice opened
-  by why. With no Globus login gate (`app.login_flow is None`: hermetic tests, a dev server) the web service is not
+- **Fallbacks.** A ghost, a probe that did not run, or nothing online leaves the SSH probe as before. A proposal's
+  notice opens with why; a FAILED probe's leads with what failed — NO SSH ACCESS, CANNOT REACH, the pre-auth handoff —
+  and says why after it (`_then_context`; the 2026-11-02 sweep: the f2b cells' graders, and the agent, read the head).
+  With no Globus login gate (`app.login_flow is None`: hermetic tests, a dev server) the web service is not
   asked: the SDK's Client on a store with no login runs its own command-line login on the MCP transport.
 - **What never takes this rung.** A registry facility resolves to its entry first, so a facility endpoint wins; on a
   registry outage the facility may be a catalogued one, so the rung is skipped.

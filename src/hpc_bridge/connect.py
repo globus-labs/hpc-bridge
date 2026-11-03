@@ -890,7 +890,7 @@ async def _propose_or_ask(
             # resolves to nothing and answers needs_facility_details (review 2026-10-10)
             app.preauth_resume = f"connect_facility({facility!r}, ssh_host={host!r})"
         handoff = _needs_preauth_result(facility, pre.target, otp_ok=pre.otp_ok)
-        handoff.notice = fallback + (handoff.notice or "")   # why the endpoint was not used instead, when one is online
+        handoff.notice = _then_context(handoff.notice or "", fallback)   # why the endpoint was not used: after it
         return handoff
     except Exception as exc:  # noqa: BLE001 - probe/connect/creds failure -> structured result
         # The same first-contact explanation the bootstrap gives (stranger's walk): a refused SSH is
@@ -898,12 +898,24 @@ async def _propose_or_ask(
         return ConnectFacilityResult(
             phase="failed",
             facility=facility,
-            notice=fallback + _explain_provision_error(
+            notice=_then_context(_explain_provision_error(
                 exc, host=host, user=config.ssh_user(),
                 fallback=f"discovery over SSH to {host!r} failed: {type(exc).__name__}: {exc}",  # bounded by its ends
-            ),
+            ), fallback),
         )
     return _proposal(app, facility, draft, notes, lead=proposal_lead + fallback)
+
+
+def _then_context(failure: str, context: str) -> str:
+    """A failure's notice with `context` after it, never before: what failed leads — NO SSH ACCESS, CANNOT REACH, the
+    pre-auth handoff — which the agent reads first and graders match by its head (sweep 2026-11-02: the zero-SSH
+    reattach's "no endpoint of yours … is online: probed over SSH." opened them). The context is the reattach's note:
+    why our endpoint was not used instead."""
+    context = context.strip()
+    if not context:
+        return failure
+    sep = "" if failure.endswith(("\n", " ")) else " "
+    return f"{failure}{sep}{context[:1].upper()}{context[1:]}"
 
 
 def _proposal(app: AppCtx | None, facility: str, draft: FacilityDetails, notes: list[str], *, lead: str = "",

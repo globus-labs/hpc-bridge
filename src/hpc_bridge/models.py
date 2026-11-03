@@ -327,15 +327,16 @@ class EnvelopeRequest(BaseModel):
     site_backstop: str | None = None
 
 
-JobPhase = Literal["needs_confirmation", "needs_account", "refused", "queued", "running", "done", "failed",
+JobPhase = Literal["needs_confirmation", "needs_account", "refused", "busy", "queued", "running", "done", "failed",
                    "cancelled", "open", "exhausted", "draining", "closed"]
 
 
 class JobStatus(BaseModel):
     """submit_job's answer. phase: needs_confirmation (nothing submitted: `reason` envelope_needed — no envelope yet;
     envelope_exhausted — it does not fit what is left; envelope_new_session — another session approved the envelope;
-    and `terms` say what the yes approves) | needs_account | refused (`reason`) | queued | running | done | failed |
-    cancelled (the job, submitted)."""
+    and `terms` say what the yes approves) | needs_account | refused (`reason`) | busy (`reason` login_channel_busy:
+    nothing submitted and nothing refused — hpc-bridge's login channel was still busy; the same call again shortly) |
+    queued | running | done | failed | cancelled (the job, submitted)."""
 
     phase: JobPhase
     reason: str | None = None
