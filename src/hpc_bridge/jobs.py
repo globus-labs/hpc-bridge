@@ -32,6 +32,7 @@
 """
 from __future__ import annotations
 
+import asyncio
 import base64
 import calendar
 import hashlib
@@ -185,6 +186,34 @@ def _can_reach(app: AppCtx) -> bool:
     return _has_login_shape(app) and app.state.endpoint_id is not None and batch.login_runner is not None
 
 
+# A scheduler command of hpc-bridge's own that outlived its sync-wait (a slow sacct under load) holds the internal login
+# session until it ends, and the next one fails at once as busy (sweep 2026-11-02: the yes of a first job was refused
+# for it). submit_job's admission reads wait for it, at most this long each — two such reads in one call, well within
+# the ~300 s a tool call may run — and answer `busy` (retryable: nothing submitted, nothing refused) when it still runs.
+LOGIN_BUSY_WAIT_S = 30.0
+_LOGIN_BUSY_POLL_S = 0.25
+
+
+async def _login_free(app: AppCtx, wait_s: float) -> str | None:
+    """None once no scheduler command of hpc-bridge's own holds the login channel, waiting for one (off the lock) at
+    most `wait_s`; else the task id of the one still running."""
+    busy = batch.login_busy
+    if busy is None:
+        return None
+    deadline = time.monotonic() + max(0.0, wait_s)
+    while (tid := busy(app)) is not None:
+        left = deadline - time.monotonic()
+        if left <= 0:
+            return tid
+        await asyncio.sleep(min(_LOGIN_BUSY_POLL_S, left))
+    return None
+
+
+def _busy_words(tid: str, wait_s: float) -> str:
+    return (f"hpc-bridge's login channel is still busy after {wait_s:.0f} s: an earlier scheduler command of its own "
+            f"(task_id={tid!r}) is still running in its login session")
+
+
 _USER = '"${USER:-$(id -un)}"'
 
 
@@ -195,6 +224,7 @@ class Tick:
     ok: bool
     readings: dict[str, meter.Reading] = field(default_factory=dict)   # job id -> reading
     error: str = ""
+    busy: bool = False   # not read because a scheduler command of ours still holds the login channel: transient
 
 
 def _state_of(r: meter.Reading, row: dict[str, Any]) -> str:
@@ -230,12 +260,15 @@ def _link_block(app: AppCtx, led: Ledger, jobs: list[dict[str, Any]]) -> None:
         pools[-1]["native_id"] = bj
 
 
-async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known: set[str] | None = None) -> Tick:
+async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known: set[str] | None = None,
+               wait_s: float = 0.0) -> Tick:
     """One meter reading of this facility's envelopes (or `envelope_ids`): ONE login-shape call, then every ledger job
     and every envelope's totals updated. Without a login channel nothing is read (the ledger's last view stands); with
     an accounting read that failed, every job is held at its full walltime and the jobs hpc-bridge did not start keep
     their last count (review B3). `also_known`: jobs being adopted right now — counted by their reservation, not again
-    as unledgered."""
+    as unledgered. `wait_s`: how long to wait for the login channel while an earlier scheduler command of ours still
+    holds it (`_login_free`); a read the channel kept from running, or one still running past its own sync-wait, is
+    `busy` — transient, never a verdict."""
     led = _ledger(app)
     fac = facility_key(app)
     all_envs = led.envelopes(facility=fac)
@@ -249,14 +282,19 @@ async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known
                                                          if j["envelope_id"] in env_ids]) - 120
     cmd = meter.pbs_cmd() if sched == "pbs" else meter.slurm_cmd(time.strftime("%Y-%m-%dT%H:%M:%S",
                                                                                 time.gmtime(since)))
+    if wait_s > 0 and (held := await _login_free(app, wait_s)) is not None:
+        return Tick(False, error=_busy_words(held, wait_s), busy=True)
     try:
         out = await _login(app, cmd)
     except Exception as exc:  # noqa: BLE001 - a cold or failed channel reads nothing; the ledger's view stands
         return Tick(False, error=f"{type(exc).__name__}: {exc}")
     raw = _text(out)
     if meter.END_MARK not in raw:
+        # its own read still running past the sync-wait, or the channel taken again meanwhile: the next call reads it
+        busy = getattr(out, "phase", None) == "running" or (batch.login_busy is not None
+                                                             and batch.login_busy(app) is not None)
         return Tick(False, error=(getattr(out, "notice", None) or raw.strip()[-200:]
-                                  or "the login shape did not answer"))
+                                  or "the login shape did not answer"), busy=busy)
     view = meter.parse_pbs(raw) if sched == "pbs" else meter.parse_slurm(raw)
     now = _now()
     t = Tick(True)
@@ -829,13 +867,15 @@ async def _fill_squeue_only(app: AppCtx, view: meter.SchedView, skip: set[str]) 
                 view.extra[b] = {"rate": whole[0]}
 
 
-async def _held_now(app: AppCtx, accounts: list[str], exclude: list[str], horizon_s: float) -> tuple[
-        bool, list[dict[str, Any]], str]:
+async def _held_now(app: AppCtx, accounts: list[str], exclude: list[str], horizon_s: float, *,
+                    wait_s: float = 0.0) -> tuple[bool, list[dict[str, Any]], str]:
     """What the jobs hpc-bridge did not start hold on this facility right now — the reading a NEW envelope's proposal
     stands on (live 2026-11-01: a proposal at exactly the job's worst case, a leftover job of the user's counted by the
-    yes, and the yes refused itself). (read, those jobs as the meter counts them, why not read)."""
+    yes, and the yes refused itself). (read, those jobs as the meter counts them, why not read). `wait_s`: as tick's."""
     if not _can_reach(app):
         return False, [], "no login channel"
+    if wait_s > 0 and (held := await _login_free(app, wait_s)) is not None:
+        return False, [], _busy_words(held, wait_s)
     led = _ledger(app)
     sched = scheduler_of(app)
     known = {_base(j["native_id"]) for j in led.jobs(envelope_ids=[e["id"] for e in
@@ -977,7 +1017,8 @@ async def _open_and_admit(app: AppCtx, spec: Spec, req: EnvelopeRequest, hours: 
         return _refused(f"the job's walltime ({_hms(spec.walltime_s)}) does not fit before the envelope's deadline "
                         f"({_g(hours)} h): it could never finish in it — ask for a longer deadline or a shorter job")
     accts = req.accounts or ([spec.account] if spec.account else [])
-    read, held, unread = await _held_now(app, accts or [spec.account or ""], list(exclude or []), deadline - now)
+    read, held, unread = await _held_now(app, accts or [spec.account or ""], list(exclude or []), deadline - now,
+                                         wait_s=LOGIN_BUSY_WAIT_S)
     held_sum = sum(float(u.get("charged") or 0) + float(u.get("committed") or 0) for u in held)
     jitter = sum(float(u.get("rate") or 0) for u in held if u.get("state") == "RUNNING") * 60 / 3600
     need = _up(held_sum + spec.worst_case + jitter, 2)
@@ -1089,8 +1130,16 @@ async def _admit(app: AppCtx, e: dict[str, Any], spec: Spec, *, confirm_spend: b
     if spec.walltime_s > deadline - _now():
         return _refused(f"the job's walltime ({_hms(spec.walltime_s)}) does not fit before envelope {e['id']}'s "
                         f"deadline ({_iso(deadline)}): it could never finish")
-    t = await tick(app, envelope_ids=[e["id"]])
+    t = await tick(app, envelope_ids=[e["id"]], wait_s=LOGIN_BUSY_WAIT_S)
     e = led.envelope(e["id"]) or e
+    if not t.ok and not e.get("metered_at") and t.busy:
+        # transient: hpc-bridge's own channel, not the accounting and not the job — retryable, never a refusal
+        return JobStatus(phase="busy", reason="login_channel_busy", terms=terms, envelope=envelope_info(app, e),
+                         notice=(f"Not submitted yet, and not refused: the scheduler's accounting could not be read in "
+                                 f"time ({t.error or 'no answer'}), and envelope {e['id']}'s first job is admitted "
+                                 "only once it has been. The envelope stays open with the user's yes on it: call "
+                                 f"submit_job again with the same arguments in about {LOGIN_BUSY_WAIT_S:.0f} s — no "
+                                 "new yes is needed unless that answer asks for one."))
     if not t.ok and not e.get("metered_at"):
         return JobStatus(phase="refused", reason="meter_unread", terms=terms, envelope=envelope_info(app, e),
                          notice=(f"The scheduler's accounting could not be read just now ({t.error or 'no answer'}), "

@@ -534,3 +534,26 @@ def test_the_exhaustion_script_asks_and_does_not_split(monkeypatch, tmp_path):
     res = _drive(mod.SCRIPT, server)
     assert not res.final.is_error, res.final.result
     assert mod.asks_not_splits(res.trace).ok and jc.exhausted_answered(res.trace).ok
+
+
+def test_submit_calls_again_after_a_busy_answer_as_an_agent_would(monkeypatch, tmp_path):
+    # sweep-20261102 (meter_missing_from_sacct_full_walltime): the yes met hpc-bridge's login channel still busy with
+    # an earlier scheduler command of its own; submit_job answers `busy` (nothing submitted, nothing refused) and the
+    # script — the agent — makes the same call again after a pause, a bounded number of times
+    _stub_sdk(monkeypatch, tmp_path)
+    monkeypatch.setattr(jc, "BUSY_RETRY_S", 0.01, raising=False)
+    busy = {"phase": "busy", "reason": "login_channel_busy", "notice": "call submit_job again shortly"}
+    yes = iter([busy, busy, _job()])
+
+    def submit(a):
+        return next(yes) if a.get("confirm_spend") else _ask()
+
+    async def script(ops):
+        sub = await jc.submit(ops, command="sleep 20", cores=1, walltime="00:10:00", envelope={"cap": 1})
+        return f"{sub.answer.get('phase')} {sub.native}"
+
+    server = _Server({"submit_job": submit})
+    res = _drive(script, server)
+    assert not res.final.is_error and res.final.result == "queued 1001", res.final.result
+    confirms = [c for c in res.trace.calls if c.name == "submit_job" and c.input.get("confirm_spend")]
+    assert len(confirms) == 3 and all(c.input.get("envelope") == {"cap": 1} for c in confirms)

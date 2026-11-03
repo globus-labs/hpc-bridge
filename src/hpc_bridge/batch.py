@@ -107,6 +107,9 @@ _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{1
 # Set by the server at import (no import cycle): the free login-shape channel (`server._login_runner`), for the
 # CANCELLED marker and the block's job state on an SSH endpoint.
 login_runner: Callable[[AppCtx], Callable[[str], Awaitable[ShellOutcome]]] | None = None
+# ...and the task id of a scheduler command of hpc-bridge's own still running on that channel (its internal login
+# session: the next one would fail at once as busy), else None — what Jobs mode's admission reads wait for.
+login_busy: Callable[[AppCtx], str | None] | None = None
 
 
 def _now() -> float:
