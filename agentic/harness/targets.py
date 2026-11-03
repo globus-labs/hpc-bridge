@@ -65,6 +65,11 @@ class Target:
     catalog_cmd: str | None = None
     # MFA profiles: the fixture TOTP secret every pool user is enrolled with ([totp] secret) — handed to the human-sim.
     totp_secret: str | None = None
+    # fake: the NETWORK TOPOLOGY (topology.py, HPCB_FAKE_TOPOLOGY) — where the jail sits relative to the cluster. Its
+    # plan fixes ssh_host and docker_network above; the rest of it (the extra docker args, the ssh configs the jail
+    # writes, the topology's own container) rides along here. None on globus1.
+    topology: str | None = None
+    topology_plan: dict | None = None
 
     def cleanup_argv(self, user: str, key: str) -> list[str]:
         """Host-side ssh as the pool `user` with `key` (the run-scoped cleanup channel)."""
@@ -117,13 +122,18 @@ def meets(requires: dict | None, caps: dict) -> tuple[bool, str]:
     return True, ""
 
 
+def fake_project() -> str:
+    """The fake cluster's compose project (HPCB_FAKE_PROJECT, default hpcb-fake): its network and container names."""
+    return (os.environ.get("HPCB_FAKE_PROJECT") or "hpcb-fake").strip()
+
+
 def _admin_container(caps: dict) -> str:
     """The fake cluster's ADMIN container — root on the scheduler's controller: `slurmctld` on the Slurm stack, the PBS
     server (`pbsserver`: qmgr, and qdel of any user's job) on the PBS stack. Each has its own override, read only on its
     own stack: HPCB_FAKE_CTLD (Slurm) and HPCB_FAKE_PBS_SERVER (PBS) — a Slurm controller's name would never run a qdel."""
     if str(caps.get("scheduler", "slurm")) == "pbs":
-        return os.environ.get("HPCB_FAKE_PBS_SERVER") or "hpcb-fake-pbsserver-1"
-    return os.environ.get("HPCB_FAKE_CTLD") or "hpcb-fake-slurmctld-1"
+        return os.environ.get("HPCB_FAKE_PBS_SERVER") or f"{fake_project()}-pbsserver-1"
+    return os.environ.get("HPCB_FAKE_CTLD") or f"{fake_project()}-slurmctld-1"
 
 
 def get(name: str | None = None) -> Target:
@@ -145,9 +155,15 @@ def get(name: str | None = None) -> Target:
         port = os.environ.get("HPCB_FAKE_SSH_PORT", "2222")
         key = os.environ.get("HPCB_FAKE_KEY", f"{home}/.ssh/hpcb-fake")
         nohostkey = ("-o", "StrictHostKeyChecking=no", "-o", "UserKnownHostsFile=/dev/null", "-o", "LogLevel=ERROR")
+        import topology  # beside this file (the harness dir is on sys.path wherever targets is imported)
+
+        topo = topology.plan(topology.selected(), project=fake_project(), login_hosts=list(caps.get("login_hosts") or []),
+                             ports=[port, os.environ.get("HPCB_FAKE_SSH_PORT2", "2223")],
+                             harness_ssh_port=caps.get("harness_ssh_port", 22),
+                             network=os.environ.get("HPCB_FAKE_NETWORK") or None)
         return Target(
-            name="fake", ssh_host="login", nodes=int(caps.get("nodes", 2)), endpoint_prefix="hpc-bridge-fake",
-            default_key=key, docker_network=os.environ.get("HPCB_FAKE_NETWORK", "hpcb-fake_default"),
+            name="fake", ssh_host=topo.ssh_host, nodes=int(caps.get("nodes", 2)), endpoint_prefix="hpc-bridge-fake",
+            default_key=key, docker_network=topo.network,
             # the (first) login container's sshd on the host port, as a pool user
             probe_argv=("ssh", "-p", port, "-i", key, "-o", "IdentitiesOnly=yes", "-o", "BatchMode=yes",
                         "-o", "ConnectTimeout=10", *nohostkey, "hpcbridge-test-00@localhost"),
@@ -156,6 +172,7 @@ def get(name: str | None = None) -> Target:
             admin_argv=("docker", "exec", _admin_container(caps), "bash", "-lc"),
             catalog_cmd=(man.get("catalog") or {}).get("cmd") or None,
             totp_secret=(man.get("totp") or {}).get("secret") or None,
+            topology=topo.name, topology_plan=json.loads(topo.to_json()),
         )
     raise SystemExit(f"targets: unknown target {name!r} (globus1 | fake)")
 
@@ -175,6 +192,14 @@ def main(argv: list[str]) -> int:
     print(f"HPCB_T_CATALOG_CMD={shlex.quote(t.catalog_cmd) if t.catalog_cmd else ''}")  # empty = the registry is the catalog
     print(f"HPCB_T_HARNESS_SSH_PORT={t.capabilities.get('harness_ssh_port', 22)}")  # the world channel's sshd port
     print(f"HPCB_T_TOTP_SECRET={shlex.quote(t.totp_secret) if t.totp_secret else ''}")  # empty = no MFA fixture
+    # the network topology (fake only; empty on globus1): its name, the plan the jail installs (topology.install), the
+    # extra `docker run` args (a shell-quoted word list), and the container the running stack must have for it
+    plan = t.topology_plan or {}
+    print(f"HPCB_T_TOPOLOGY={t.topology or ''}")
+    print(f"HPCB_T_TOPOLOGY_PLAN={shlex.quote(json.dumps(plan, separators=(',', ':'))) if plan else ''}")
+    print(f"HPCB_T_DOCKER_ARGS={shlex.quote(shlex.join(plan.get('docker_args') or []))}")
+    print(f"HPCB_T_TOPOLOGY_SERVICE={plan.get('service') or ''}")
+    print(f"HPCB_T_TOPOLOGY_ISOLATE={'1' if plan.get('isolate') else ''}")   # the jail joins an isolating netns
     return 0
 
 

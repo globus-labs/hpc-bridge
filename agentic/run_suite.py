@@ -53,8 +53,9 @@ _CELL_ENV_KEEP_PREFIXES = ("HPCB_TEST_", "HPCB_POOL_", "HPCB_NODE_", "HPCB_FAKE_
                            "HPCB_HERMES_ACP",   # drive hermes over one persistent ACP session (not -z replay)
                            "HPCB_BENCHMARK",    # HPCB_BENCHMARK_MODE: operator-preference graders → report-only
                            "HPCB_CLAUDE_ACP",   # the claude-acp operator's model pin (a whole-suite choice, like HPCB_ALCF_*)
-                           "HPCB_RELAUNCH_")    # queued_check_relaunch's knobs (which phase; the watch): set for that cell
+                           "HPCB_RELAUNCH_",    # queued_check_relaunch's knobs (which phase; the watch): set for that cell
                                                 # only — scrubbed, HPCB_RELAUNCH_PHASE=first ran phase `second` (live)
+                           "HPCB_JAIL_IMAGE")   # a side run's own jail image tag (run_smoke.sh): built once, run by every cell
 
 
 class Stagger:
@@ -117,7 +118,7 @@ async def _build_once(waits=BUILD_RETRY_WAITS_S) -> str | None:
             print(f"build failed ({why}); retrying in {wait}s (attempt {attempt + 1})", flush=True)
             await asyncio.sleep(wait)
         proc = await asyncio.create_subprocess_exec(
-            "docker", "build", "--provenance=false", "-t", "hpc-bridge-agentic",
+            "docker", "build", "--provenance=false", "-t", os.environ.get("HPCB_JAIL_IMAGE") or "hpc-bridge-agentic",
             "--build-arg", f"GIT_DESCRIBE={_git_describe()}",
             "-f", str(REPO / "agentic" / "Dockerfile"), str(REPO),
             stdout=asyncio.subprocess.DEVNULL, stderr=asyncio.subprocess.PIPE,

@@ -119,6 +119,8 @@ Two ways to reach the login node:
   (`docker run --network hpcb-fake_default …`) and use `HPC_BRIDGE_SSH_HOST=login` on port 22 — no
   alias, no port mapping. This is how `bin/stretch.sh` does it.
 
+These are two of the client's possible vantage points; the harness can put the jail at four (*Topologies*, below).
+
 ## Profiles — one image, many cluster shapes
 
 A **profile** is a directory under `profiles/<name>/`: `profile.toml` (a manifest whose `[capabilities]` describe the
@@ -151,6 +153,79 @@ test), `{"catalog": "registry"}` … — and `run_suite` skips a cell the target
 replaces the public registry in the jail), `registry` otherwise. The registry scenarios (`zero_config_list`,
 `needs_login_paste`, `registry_over_cache`, `mep_no_account`) need `registry`. Bundles
 record `config.profile` and `config.capabilities`. Postchecks may say `"on": "each_login"` to run on every login node.
+
+## Topologies — where the client sits (`HPCB_FAKE_TOPOLOGY`)
+
+A **topology** says where the agentic jail (the MCP server's vantage point) sits relative to the cluster. It is
+orthogonal to the profile (the cluster's shape) and is defined in `agentic/harness/topology.py`. `bin/up.sh --topology
+<name>` adds what the stack needs; `HPCB_FAKE_TOPOLOGY=<name>` tells run_smoke.sh where to put the jail.
+
+| topology | the jail | `HPC_BRIDGE_SSH_HOST` | the user's `~/.ssh/config` (all the product is told) | the stack adds |
+|---|---|---|---|---|
+| `in_network` (default) | joins `<project>_default` | `login`, port 22 | nothing | nothing |
+| `host_forward` | Docker's default bridge: no cluster network | `hpcb-fake` | `HostName host.docker.internal`, `Port $HPCB_FAKE_SSH_PORT` (the port the host publishes; `--add-host …:host-gateway` for Linux) | nothing |
+| `bastion` | `<project>_edge` only | `hpcb-fake` | `Host bastion` + `HostName login`, `ProxyJump bastion` (the pool key on both hops) | `bastion`: sshd only, on `edge` and the cluster network (`topologies/bastion.yml`) |
+| `vip` | `<project>_edge` only | `hpcb-fake` | `HostName vip` (port 22) | `vip`: haproxy, round-robin over the profile's login nodes on :22 (`topologies/vip.yml`); on `site` it fronts both |
+
+Every cell before 2026-11-03 ran `in_network`. From there every internal address is reachable and SSH is always port
+22, so no cell could see a bug that depends on the client's vantage point. hpc-bridge pins the login node by the address
+`$SSH_CONNECTION` reached (`_routable_pin`). Behind NAT, a bastion or a VIP, that is the node's internal address, which
+the client cannot reach. A user driving the cluster from the host (`hpcb-fake` → localhost:2222) found exactly that.
+
+**Isolation.** Joining another network does not, on its own, put the cluster out of reach. Docker Desktop (29.x) routes
+between the bridge networks of its VM, so a container on `edge` opened the login node's 172.x:22 directly. For every
+topology but `in_network`, run_smoke.sh therefore starts a holder container (`hpcb-netns-<runid>`, on the jail's
+network, image `$HPCB_NETNS_IMAGE` — default `hpcb-fake:latest`, which has `ip`). In it, every subnet of the stack the
+jail is not on gets an `unreachable` route (`topology.py internal <project> <network>`), so a connect there fails with
+"No route to host" as a real client's would. The jail then runs in that holder's network namespace
+(`--network container:…`). It can reach its own network, the host's published ports, the
+topology's way in and the internet, as a real client behind NAT, a bastion or a VIP can. The holder goes with the
+cell (every EXIT trap).
+
+**The harness' own path.** The world channel (SETUP, teardown, per-node checks) needs to reach each login node by name.
+It does so through a second ssh config, `~/.ssh/hpcb-harness.conf` (`ssh -F`, run.py `_ssh_run`). That config holds the
+alias plus one way to each login node: its published port (`host_forward`), `ProxyJump bastion` (`bastion`), or the
+VIP's per-node port, :2201, :2202, … (`vip`). The product never reads it, so a path only the harness has can never
+rescue the product. Its first connection trusts each host key once (`accept-new`), as a user's first `ssh` would.
+
+```bash
+# a stack per topology (a project and ports of its own leave the usual stack alone)
+export HPCB_FAKE_PROJECT=hpcb-topo HPCB_FAKE_SSH_PORT=2242 HPCB_FAKE_SSH_PORT2=2243
+agentic/fakecluster/bin/up.sh --profile default --topology bastion      # in_network / host_forward: no --topology needed
+HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE=default HPCB_FAKE_TOPOLOGY=bastion \
+  HPCB_JAIL_IMAGE=hpc-bridge-agentic-topo ./agentic/run_smoke.sh topology_roundtrip
+agentic/fakecluster/bin/down.sh --profile default --topology bastion --wipe
+agentic/fakecluster/bin/up.sh --profile site --topology vip             # vip fronts site's two login nodes
+agentic/sweep_profiles.sh --profiles topology                           # all four, one boot each
+```
+
+`HPCB_FAKE_PROJECT` names the compose project: its network, containers and volumes. With its own ports it runs beside
+the usual `hpcb-fake` stack. `HPCB_JAIL_IMAGE` gives such a side run its own jail image tag, so it never retags the
+`hpc-bridge-agentic` image another checkout's sweep is using. An MFA profile (`harness_ssh_port` ≠ 22) runs only
+`in_network`: its published port is the key-only harness sshd, and a forward through it would skip the second factor.
+
+`topology_roundtrip` (scripted) exercises every vantage-sensitive path once: connect → a confirmed compute block →
+`run_shell` → `stop_endpoint` → a NEW server on the same state dir (reconnecting with the stored record and pin) →
+`login_shell hostname` → teardown. Its graders:
+- every step succeeds;
+- every recorded pin answers from the jail through hpc-bridge's own target for it (`harness/topology_probe.py`);
+- no pin is an internal-only address;
+- hpc-bridge's own teardown leaves no manager on any login node;
+- the pre-auth command, both as the flow surfaces it and as the product's code builds it, runs from the jail;
+- no SSH destination is authenticated twice.
+
+On `main` (49e342e), 2026-11-03, `agentic/sweep_profiles.sh --profiles topology` (product code unchanged):
+
+| topology | result | what broke |
+|---|---|---|
+| `in_network` | **OK** | — (pin 172.x, reachable from the jail; two masters: the alias and the pin, each opened once) |
+| `host_forward` | **FAILED** | the pin is login's internal 172.x. Every step before the restart passed: the block and `run_shell` go over Globus Compute, not SSH. After the restart `login_shell` and `teardown_endpoint` hit `CANNOT REACH <pin>` (No route to host), and the manager is left running. The pinned target also carries `HostKeyAlias host.docker.internal` without the alias's port. |
+| `bastion` | **FAILED** | the same: the pin is the address the bastion reached, and the pin's ssh has no ProxyJump |
+| `vip` | **FAILED** | the same: the pin is the address haproxy reached (login01 on `site`) |
+
+The rows that broke in each failed cell: `every_step_succeeded`, `no_internal_pin`, `world:pin_reachable`,
+`world:preauth_runnable` and `world:no_manager_after_product_teardown`. `no_reauth` passed: the pin's master never
+opened. The harness' own teardown then removed every manager and registration.
 
 ## Running the agentic harness against it (`--target fake`)
 
@@ -343,7 +418,9 @@ nothing left queued.
   filesystems default, 240 s idle, the facility's own venv on the workers' PATH), with a strict schema where Polaris's
   is open, Python 3.11 workers where Polaris's are 3.13 (the jail's client is 3.11), no `select_options`
   (`system=polaris` has no meaning here), and no project validation by the scheduler.
-- **Topology:** everything shares one kernel/VM; `hostname -f` is single-label; one NIC (`eth0`);
+- **Topology:** everything shares one kernel/VM, and Docker Desktop routes between its bridge networks. The client's
+  vantage point is modelled by *Topologies* above (a network namespace with unreachable routes, not separate hosts). `hostname -f`
+  is single-label; one NIC (`eth0`);
   `srun`/`slurmstepd` work but with no cgroup confinement (`CgroupPlugin=cgroup/v1` as a no-op —
   Ubuntu's 23.11 build has no `disabled` plugin and cgroup/v2 needs systemd/dbus).
 - **Globus is still real.** The endpoint registers with and dispatches through the real Globus
