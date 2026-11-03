@@ -35,9 +35,12 @@
 # agentic/harness/returning_cells.tsv (the pairwise returning-user cells: HPCB_RETURNING_CELL), under the script
 # operator; `nersc` itself runs the three returning-user AGENT cells in its agent wave (any operator: each chain opens
 # with a scripted session), then the Perlmutter report's scripted proofs.
+# `topology` is a SWEEP profile too: one cluster boot per NETWORK TOPOLOGY (topology_cells: where the jail sits relative
+# to the cluster — agentic/harness/topology.py), each running topology_roundtrip once under the script operator, then
+# wiped (`bin/up.sh --profile <its cluster> --topology <name>`).
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
-MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep,slices,nersc,returning"
+MODELS="claude-opus-5"; PROFILES="default,site,totp,pbs,lmod,f2b,totp_f2b,polaris,internal,hostile,mep,pbs_mep,slices,nersc,returning,topology"
 OPERATORS=""; PAID_ONLY=""
 while [ $# -gt 0 ]; do case "$1" in --models) MODELS="$2"; shift 2;; --profiles) PROFILES="$2"; shift 2;;
   --operators) OPERATORS="$2"; shift 2;; --paid-only) PAID_ONLY=1; shift;; *) echo "unknown arg $1"; exit 2;; esac; done
@@ -95,6 +98,7 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
+topology_roundtrip            scripted only: one script_cell per network topology on `topology` (a cluster boot each)
 EXCLUDED
 }
 
@@ -141,20 +145,46 @@ done
 BUILT=""   # set once an image was built in this sweep (by run_suite, or by the first scripted cell's run_smoke)
 script_cell() {  # script_cell <profile> <scenario> [cell]: ONE script-operator cell (no model) on the cluster booted above
   # its row reads "<scenario> (script) — RESULT: …" (two words before the dash, as queued_check_relaunch's: sweep_dash
-  # reads a one-word row as the no-skill ablation); with a returning-user cell, "<scenario> <cell> — RESULT: …"
+  # reads a one-word row as the no-skill ablation); with a cell (a returning-user cell, a topology), "<scenario> <cell> —
+  # RESULT: …"
   # The first one in a sweep that built nothing yet builds the image (run_smoke.sh, with the older releases' export):
   # a script-only sweep (--profiles returning) ran on whatever image was there before (the review of 2026-10-30)
-  local label="$2${3:+ $3}" tag="$2${3:+-$3}" row="$2 ${3:-(script)}" skip="${BUILT:+1}"
+  local label="$2${3:+ $3}" tag="$2${3:+-$3}" row="$2 ${3:-(script)}" skip="${BUILT:+1}" note=" — building the image first"
   BUILT=1
-  echo "    ${TAGGED:+[script] }$label (script operator)${skip:- — building the image first}:" | tee -a "$SUMMARY"
-  env HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$(cluster_of "$1")" ${skip:+HPCB_SKIP_BUILD=1} \
-    ${3:+HPCB_RETURNING_CELL="$3"} "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$tag.log" \
+  [ -z "$skip" ] || note=""   # (`${skip:- …}` printed skip's own "1" after every later cell's label)
+  echo "    ${TAGGED:+[script] }$label (script operator)$note:" | tee -a "$SUMMARY"
+  env HPCB_OPERATOR=script HPCB_TARGET=fake HPCB_FAKE_PROFILE="$(cluster_of "$1" "${3:-}")" ${skip:+HPCB_SKIP_BUILD=1} \
+    ${3:+"$(cell_var "$1")=$3"} "$HERE/agentic/run_smoke.sh" "$2" 2>&1 | tee "$HERE/agentic/runs/sweep-$STAMP-$1-script-$tag.log" \
     | { grep -E "RESULT:" || echo "(no RESULT line)"; } | tail -1 \
     | sed "s/^/    ${TAGGED:+[script] }$row — /" | tee -a "$SUMMARY"
 }
 
-cluster_of() {  # cluster_of <sweep profile>: the fake-cluster profile it boots (a sweep profile may share a cluster)
-  case "$1" in returning) echo nersc ;; *) echo "$1" ;; esac
+cluster_of() {  # cluster_of <sweep profile> [cell]: the fake-cluster profile it boots (a sweep profile may share a cluster)
+  case "$1" in returning) echo nersc ;; topology) topology_cluster "$2" ;; *) echo "$1" ;; esac
+}
+
+cell_var() {  # cell_var <sweep profile>: the env var that names a script_cell's cell to run_smoke.sh
+  case "$1" in topology) echo HPCB_FAKE_TOPOLOGY ;; *) echo HPCB_RETURNING_CELL ;; esac
+}
+
+topology_cells() {  # the `topology` sweep profile's cells: every network topology (harness/topology.py), in this order
+  echo "in_network host_forward bastion vip"
+}
+
+topology_cluster() {  # topology_cluster <topology>: the profile it boots — vip fronts `site`'s two login nodes
+  case "$1" in vip) echo site ;; *) echo default ;; esac
+}
+
+topology_cell() {  # topology_cell <topology>: boot its cluster with that topology, run topology_roundtrip once, wipe it
+  local cp; cp="$(topology_cluster "$1")"
+  if "$HERE/agentic/fakecluster/bin/up.sh" --profile "$cp" --topology "$1" \
+      > "$HERE/agentic/runs/sweep-$STAMP-topology-$1-up.log" 2>&1; then
+    script_cell topology topology_roundtrip "$1"
+  else
+    echo "    ${TAGGED:+[script] }topology_roundtrip $1 — RESULT: INFRA (the cluster did not boot: sweep-$STAMP-topology-$1-up.log)" \
+      | tee -a "$SUMMARY"
+  fi
+  "$HERE/agentic/fakecluster/bin/down.sh" --profile "$cp" --topology "$1" --wipe > /dev/null 2>&1 || true
 }
 
 returning_cells() {  # the returning-user cells' ids, in the table's order (agentic/harness/returning_cells.tsv)
@@ -181,6 +211,7 @@ script_only() {  # script_only <profile>: the scripted cells of a profile no age
   case "$1" in
     slices) echo "slice_request multinode_allocation" ;;   # resource requests (2026-10-24)
     returning) echo "returning_user" ;;   # once per returning-user cell (returning_cells), on the nersc cluster
+    topology) echo "topology_roundtrip" ;;   # once per network topology (topology_cells), a cluster boot each
   esac
 }
 
@@ -189,6 +220,10 @@ for prof in "${PROFS[@]}"; do
   if [ -n "$(script_only "$prof")" ]; then   # no agent wave: boot it here, run its scripted cells, wipe it
     [ -z "$PAID_ONLY" ] || continue
     echo "## $prof (script only) — $(date +%H:%M)" | tee -a "$SUMMARY"
+    if [ "$prof" = topology ]; then   # a boot per cell: each topology is its own stack (topology_cell)
+      for topo in $(topology_cells); do topology_cell "$topo"; done
+      continue
+    fi
     if "$HERE/agentic/fakecluster/bin/up.sh" --profile "$(cluster_of "$prof")" \
         > "$HERE/agentic/runs/sweep-$STAMP-$prof-up.log" 2>&1; then
       for sc in $(script_only "$prof"); do

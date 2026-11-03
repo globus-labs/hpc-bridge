@@ -116,6 +116,13 @@ if [ "$HPCB_T_NAME" = fake ]; then
   if [ -n "$RUNNING_PROFILE" ] && [ "$RUNNING_PROFILE" != "$HPCB_T_PROFILE" ]; then
     echo "ERROR: the fake cluster is up with profile '$RUNNING_PROFILE', but this run declares '$HPCB_T_PROFILE' — set HPCB_FAKE_PROFILE=$RUNNING_PROFILE"; exit 1
   fi
+  # The NETWORK TOPOLOGY (harness/topology.py, HPCB_FAKE_TOPOLOGY): bastion and vip need their own container in the
+  # running stack (bin/up.sh --topology <name>); without it the jail would sit on an edge network with no way in.
+  if [ -n "${HPCB_T_TOPOLOGY_SERVICE:-}" ] && [ -z "$(docker ps -q \
+      --filter "label=com.docker.compose.project=${HPCB_FAKE_PROJECT:-hpcb-fake}" \
+      --filter "label=com.docker.compose.service=$HPCB_T_TOPOLOGY_SERVICE" 2>/dev/null)" ]; then
+    echo "ERROR: topology '$HPCB_T_TOPOLOGY' needs the stack's '$HPCB_T_TOPOLOGY_SERVICE' container — bring it up with: agentic/fakecluster/bin/up.sh --profile $HPCB_T_PROFILE --topology $HPCB_T_TOPOLOGY"; exit 1
+  fi
 fi
 if [ -n "${HPCB_KNOB_REQUIRES:-}" ]; then
   UNMET="$(python3 -c 'import json, sys; sys.path.insert(0, sys.argv[1]); import targets
@@ -133,6 +140,9 @@ if [ -n "${HPCB_KNOB_NO_GLOBUS_DB:-}" ]; then
   echo "globus store: NONE — the scenario runs logged out (expects needs_login)"
 fi
 RUNID="${HPCB_RUNID:-$(date +%s)-$$}"   # run_suite mints it (so it can clean up an abandoned cell); solo runs mint their own
+# The jail image's tag. Every checkout builds `hpc-bridge-agentic` by default, so a worktree's cell retagged the image a
+# sweep in another checkout ran its next cells on (HPCB_SKIP_BUILD); give a side run its own tag.
+JAIL_IMAGE="${HPCB_JAIL_IMAGE:-hpc-bridge-agentic}"
 USER_DIR="/home/agent/run/$RUNID"   # agent-writable (the entrypoint mkdir's it + stages the db)
 RUNS_HOST="$REPO_ROOT/agentic/runs" # per-run provenance bundles land here (gitignored)
 mkdir -p "$RUNS_HOST"
@@ -170,11 +180,11 @@ if [ -z "${HPCB_SKIP_BUILD:-}" ]; then   # the suite runner builds once, then se
   # cells' first session runs one): `previous` (from pyproject's version history) and each pinned version
   python3 "$REPO_ROOT/agentic/harness/prev_release.py" export "$REPO_ROOT" \
     || echo "ERROR: the older hpc-bridge releases could not be exported (the reason is above) — a cell that runs one is SETUP FAILED" >&2
-  echo "building jail image (hpc-bridge-agentic)…"
-  docker build --provenance=false -t hpc-bridge-agentic --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \
+  echo "building jail image ($JAIL_IMAGE)…"
+  docker build --provenance=false -t "$JAIL_IMAGE" --build-arg "GIT_DESCRIBE=$GIT_DESCRIBE" \
     -f "$REPO_ROOT/agentic/Dockerfile" "$REPO_ROOT" >/dev/null
 fi
-IMAGE_ID="$(docker image inspect -f '{{.Id}}' hpc-bridge-agentic 2>/dev/null || echo unknown)"   # pins the code the cell ran
+IMAGE_ID="$(docker image inspect -f '{{.Id}}' "$JAIL_IMAGE" 2>/dev/null || echo unknown)"   # pins the code the cell ran
 
 ARGS=(
   --rm
@@ -243,9 +253,42 @@ for knob in HPCB_RELAUNCH_PHASE HPCB_RELAUNCH_WATCH_S HPCB_RELAUNCH_PILOT_WAIT_S
 done
 # returning_user's cell (a row of agentic/harness/returning_cells.tsv, read in the jail by the scenario): default c01
 [ -n "${HPCB_RETURNING_CELL:-}" ] && ARGS+=( -e HPCB_RETURNING_CELL )
-if [ -n "$HPCB_T_NETWORK" ]; then
-  ARGS+=( --network "$HPCB_T_NETWORK" )   # the fake cluster's compose network: the jail reaches `login:22` directly
+# ---- where the jail sits: its network, and the fake cluster's NETWORK TOPOLOGY (harness/topology.py) ----
+# The plan is installed in the jail as ~/.ssh/config (the user's alias) and the harness' own `ssh -F` config (run.py).
+# HPCB_TOPOLOGY_INTERNAL: the stack's subnets the jail is NOT on — an address there is internal-only from the client.
+# An ISOLATED topology (every one but in_network) runs the jail in a holder container's network namespace where those
+# subnets are `unreachable` routes: Docker Desktop routes between its bridge networks, so joining `edge` (or no cluster
+# network) alone left the login node's internal address reachable — a vantage no client behind NAT, a bastion or a VIP
+# has. A connect there fails "No route to host", as a real client's does. The holder takes the jail's network and
+# --add-host entries (docker refuses them beside `--network container:`); the EXIT traps below remove it (stop_netns).
+NETNS=""
+stop_netns() { [ -z "$NETNS" ] || docker rm -f "$NETNS" >/dev/null 2>&1 || true; NETNS=""; }
+NET_ARGS=( ${HPCB_T_NETWORK:+--network "$HPCB_T_NETWORK"} )   # in_network: the cluster's network (`login:22` directly)
+if [ -n "${HPCB_T_TOPOLOGY:-}" ]; then
+  ARGS+=( -e HPCB_FAKE_TOPOLOGY="$HPCB_T_TOPOLOGY" )
+  [ -z "${HPCB_T_TOPOLOGY_PLAN:-}" ] || ARGS+=( -e HPCB_TOPOLOGY_PLAN="$HPCB_T_TOPOLOGY_PLAN" )
+  eval "TOPO_DOCKER_ARGS=($HPCB_T_DOCKER_ARGS)"
+  NET_ARGS+=( ${TOPO_DOCKER_ARGS[@]+"${TOPO_DOCKER_ARGS[@]}"} )
+  TOPO_INTERNAL="$(python3 "$REPO_ROOT/agentic/harness/topology.py" internal "${HPCB_FAKE_PROJECT:-hpcb-fake}" "$HPCB_T_NETWORK")"
+  ARGS+=( -e HPCB_TOPOLOGY_INTERNAL="$TOPO_INTERNAL" )
+  if [ -n "${HPCB_T_TOPOLOGY_ISOLATE:-}" ]; then
+    KEPT=()   # an --add-host the jail was given (the hermes operator's tunnel) goes to the holder with the rest
+    for a in ${ARGS[@]+"${ARGS[@]}"}; do case "$a" in --add-host=*) NET_ARGS+=( "$a" ) ;; *) KEPT+=( "$a" ) ;; esac; done
+    ARGS=( "${KEPT[@]}" )
+    NETNS="hpcb-netns-$RUNID"
+    trap 'stop_netns' EXIT   # replaced below by the full trap, which removes it too
+    docker run -d --rm --name "$NETNS" ${NET_ARGS[@]+"${NET_ARGS[@]}"} --cap-add NET_ADMIN \
+      --label "hpcb.netns-for=$RUNID" --entrypoint bash "${HPCB_NETNS_IMAGE:-hpcb-fake:latest}" \
+      -c 'for s in $1; do ip route add unreachable "$s" || exit 3; done; touch /run/hpcb-netns-ready; exec sleep infinity' \
+      _ "$TOPO_INTERNAL" >/dev/null || { echo "ERROR: could not start the client's network namespace ($NETNS)"; exit 1; }
+    for _ in $(seq 1 40); do docker exec "$NETNS" test -f /run/hpcb-netns-ready 2>/dev/null && break; sleep 0.5; done
+    docker exec "$NETNS" test -f /run/hpcb-netns-ready 2>/dev/null \
+      || { echo "ERROR: the client's network namespace did not come up: $(docker logs "$NETNS" 2>&1 | tail -3)"; exit 1; }
+    NET_ARGS=( --network "container:$NETNS" )
+  fi
+  echo "topology: $HPCB_T_TOPOLOGY — the jail joins ${HPCB_T_NETWORK:-no cluster network}${NETNS:+ (isolated: ${TOPO_INTERNAL:-nothing} unreachable)}; the server is given $HPCB_T_SSH_HOST"
 fi
+ARGS+=( ${NET_ARGS[@]+"${NET_ARGS[@]}"} )
 if [ -n "${HPCB_T_TOTP_SECRET:-}" ]; then
   ARGS+=( -e HPCB_SIM_TOTP_SECRET="$HPCB_T_TOTP_SECRET" )   # the human-sim's authenticator (HPCB_* — scrubbed from the agent's env)
   echo "mfa: the login sshd wants a one-time code; the human-sim has the authenticator"
@@ -301,7 +344,7 @@ if [ -n "${HPCB_KNOB_NODE_ACTIONS:-}" ]; then
   [ "$HPCB_T_NAME" = fake ] || { echo "ERROR: scenario '$SCENARIO' declares NODE_ACTIONS: the fake target only"; exit 2; }
   NODE_REQ="$RUNS_HOST/.node-actions-$RUNID"
   NODE_HOSTS="$(python3 -c 'import json, sys; print(",".join(json.loads(sys.argv[1]).get("login_hosts") or ["login"]))' "$HPCB_T_CAPS_JSON")"
-  trap 'stop_nodes' EXIT   # replaced below by the full trap; covers an exit between here and there
+  trap 'stop_netns; stop_nodes' EXIT   # replaced below by the full trap; covers an exit between here and there
   python3 "$REPO_ROOT/agentic/harness/node_actions.py" --req "$NODE_REQ" --user "$SSH_USER" --hosts "$NODE_HOSTS" \
     --parent-pid "$$" &
   NODE_PID=$!
@@ -326,7 +369,7 @@ if [ -n "${HPCB_KNOB_ADMIN_TAP:-}" ]; then
   eval "TAP_ARGV=($HPCB_T_ADMIN_ARGV)"
   TAP_FILE="$RUNS_HOST/.admin-tap-$RUNID.jsonl"
   : > "$TAP_FILE"
-  trap 'stop_nodes; stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
+  trap 'stop_netns; stop_nodes; stop_tap' EXIT   # replaced below by the full trap; covers an exit between here and there
   # --parent-pid: a run_smoke.sh killed outright never runs its EXIT trap; the tap then ends itself and removes its files
   python3 "$REPO_ROOT/agentic/harness/admin_tap.py" --out "$TAP_FILE" --user "$SSH_USER" --knob "$HPCB_KNOB_ADMIN_TAP" \
     --parent-pid "$$" -- "${TAP_ARGV[@]}" &
@@ -360,19 +403,19 @@ if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}${HPCB_KNOB_ADMIN_CLEANUP:-}" ]; then
     [ -z "${HPCB_KNOB_ADMIN_CLEANUP:-}" ] || admin_run cleanup "$HPCB_KNOB_ADMIN_CLEANUP" || echo "WARN: admin cleanup incomplete — check the cluster's accounting for $SSH_USER"
   }
   if [ -n "${HPCB_KNOB_ADMIN_SETUP:-}" ]; then
-    trap 'stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_netns; stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
     admin_run setup "$HPCB_KNOB_ADMIN_SETUP" || { echo "ERROR: admin setup failed — not launching the cell"; exit 1; }
   else
-    trap 'stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+    trap 'stop_netns; stop_nodes; stop_tap; admin_cleanup; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
   fi
 else
-  trap 'stop_nodes; stop_tap; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
+  trap 'stop_netns; stop_nodes; stop_tap; [ -z "$CATALOG_FILE" ] || rm -f "$CATALOG_FILE"' EXIT
 fi
 
 # The cell runs as a CHILD so a SIGTERM/SIGINT to this script reaches it (docker run proxies the signal into the
 # jail → run.py's handler → teardown + bundle) and this script then still runs its EXIT trap (admin cleanup).
 # `wait` returns early on a trapped signal; loop until the child has really exited — its rc is the cell's rc.
-docker run "${ARGS[@]}" hpc-bridge-agentic "${RUN_ARGS[@]}" &
+docker run "${ARGS[@]}" "$JAIL_IMAGE" "${RUN_ARGS[@]}" &
 child=$!
 trap 'kill -TERM "$child" 2>/dev/null' TERM INT
 rc=0

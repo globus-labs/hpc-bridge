@@ -34,6 +34,7 @@ from dataclasses import dataclass
 from pathlib import Path
 
 import server_stderr
+import topology
 from acp_trace import capture_crosscheck
 from admin_tap import TAP_ENV, TapReader, read_samples
 from cluster_ops import (
@@ -336,6 +337,28 @@ def _login_hosts() -> list[str]:
     return _LOGIN_HOSTS or list(_capabilities().get("login_hosts") or [])
 
 
+# The fake cluster's NETWORK TOPOLOGY (harness/topology.py): where the jail sits relative to the cluster. Its plan rides
+# in as JSON (run_smoke.sh); `_install_topology` writes the user's ssh config (the alias, all the product is told) and
+# the harness' own (`ssh -F`: the alias and a way to each login node), before anything connects. None: in_network or no
+# topology — the world channel's ssh is as it always was.
+_HARNESS_SSH_CONFIG: str | None = None
+
+
+def _install_topology(home: Path | None = None) -> str | None:
+    global _HARNESS_SSH_CONFIG
+    raw = os.environ.get(topology.PLAN_ENV, "").strip()
+    if not raw:
+        return None
+    spec = json.loads(raw)
+    path = topology.install(spec, home=home or Path.home(), user=os.environ.get("HPC_BRIDGE_SSH_USER", "hpcbridge-test"),
+                            key=os.environ.get("HPC_BRIDGE_SSH_KEY", "") or "~/.ssh/test_key")
+    _HARNESS_SSH_CONFIG = str(path) if path else None
+    print(f"topology: {spec.get('name')} — the server is given {os.environ.get('HPC_BRIDGE_SSH_HOST')!r}"
+          + (f"; the user's ~/.ssh/config: {', '.join(spec.get('user_hosts') or {})}; the world channel: "
+             f"ssh -F {path}" if path else ""), file=sys.stderr, flush=True)
+    return _HARNESS_SSH_CONFIG
+
+
 def _ssh_run(remote: str, *, timeout: int = 60, host: str | None = None) -> tuple[int, str]:
     """Run one command on the cluster as the scenario's test user (creds from env — the same
     scoped identity the agent uses). The harness' world channel: SETUP, POSTCHECKS, teardown.
@@ -348,6 +371,8 @@ def _ssh_run(remote: str, *, timeout: int = 60, host: str | None = None) -> tupl
            # the command output — an `expect_empty` postcheck counted that warning as content (site profile, the
            # round-robin login pool whose per-node keys are new; 2026-09-05). Real errors still come through.
            "-o", "StrictHostKeyChecking=accept-new", "-o", "LogLevel=ERROR"]
+    if _HARNESS_SSH_CONFIG:   # a topology other than in_network: the harness' own way to the alias and each node
+        cmd[1:1] = ["-F", _HARNESS_SSH_CONFIG]
     if key:
         cmd += ["-i", key, "-o", "IdentitiesOnly=yes"]
     # A profile whose port-22 sshd demands a second factor (the fake `totp` profile) runs a second, key-only sshd for
@@ -1614,6 +1639,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         "harness_ssh_port": os.environ.get("HPCB_HARNESS_SSH_PORT") or None,  # the world channel's sshd (MFA profiles)
         "scheduler": _scheduler(scen),                                          # squeue/scancel vs qstat/qdel for the world channel
         "profile": os.environ.get("HPCB_FAKE_PROFILE") or None,
+        "topology": os.environ.get("HPCB_FAKE_TOPOLOGY") or None,   # fake: where the jail sat (harness/topology.py)
         "capabilities": _capabilities(),
         # Code provenance (review 2026-09-05, 2.3): `build` pins what this image was built from; `git_sha` is the
         # host's HEAD when the cell was LAUNCHED (kept as `host_head` too, so drift between the two is visible).
@@ -1649,6 +1675,7 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     except Exception:  # noqa: BLE001 - the end-of-run material and the token shapes still apply
         secrets_at_start = {}
     try:
+        _install_topology()   # the ssh configs a topology's jail starts with: before anything connects
         _seed_facility_cache(scen)
         _trust_host_key(scen)
         _preclean_token_store(scen)

@@ -16,8 +16,12 @@ BATCH_DEFAULT = ["batch_crosses_walltime", "batch_restart_resume", "batch_two_se
                  "hand_sbatch_adopted", "handoff_ssh_shape"]
 BATCH_SITE, BATCH_PBS = ["site_backstop_grptresmins"], ["hand_submit_gated_adopted"]
 BATCH_PBS_MEP = ["handoff_polaris_shape", "handoff_mep_min_blocks_refused"]
+# the `topology` sweep profile: (network topology, the cluster profile it boots), in the sweep's order — one boot and one
+# topology_roundtrip each; vip fronts `site`'s two login nodes
+TOPOLOGY_CELLS = [("in_network", "default"), ("host_forward", "default"), ("bastion", "default"), ("vip", "site")]
 sys.path.insert(0, str(HERE))
 import targets  # noqa: E402
+import topology  # noqa: E402
 
 SWEEP = HERE.parent / "sweep_profiles.sh"
 SCENARIOS = {p.stem for p in (HERE.parent / "scenarios").glob("*.py") if not p.stem.startswith("_")}
@@ -167,9 +171,9 @@ n_ok = sum(s not in infra | setup | crash for s in scen)
 print(f"==== SUITE: {n_ok}/{len(scen) - n_infra} passed" + (f" · {n_infra} infra" if n_infra else "") + " ====")
 '''
 _STUB_SMOKE = r'''#!/usr/bin/env bash
-printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s", "cell": "%s", "skip_build": "%s"}\n' \
+printf '{"tool": "run_smoke", "argv": "%s", "operator": "%s", "phase": "%s", "profile": "%s", "cell": "%s", "skip_build": "%s", "topology": "%s"}\n' \
   "$*" "${HPCB_OPERATOR:-}" "${HPCB_RELAUNCH_PHASE:-}" "${HPCB_FAKE_PROFILE:-}" "${HPCB_RETURNING_CELL:-}" \
-  "${HPCB_SKIP_BUILD:-}" >> "$STUB_LOG"
+  "${HPCB_SKIP_BUILD:-}" "${HPCB_FAKE_TOPOLOGY:-}" >> "$STUB_LOG"
 echo "RESULT: OK"
 '''
 
@@ -440,6 +444,38 @@ def test_the_script_only_profiles_boot_their_own_cluster_and_run_only_their_scri
     assert not [c for c in calls if c["tool"] == "run_smoke"] and "returning (script) — RESULT: INFRA" in summary
     _, calls, _, _ = _sweep(tmp_path / "p", "--paid-only", "--profiles", "returning,slices")
     assert not [c for c in calls if c["tool"] in ("run_smoke", "up.sh")]
+
+
+def test_the_topology_profile_boots_one_cluster_per_topology_and_runs_the_roundtrip_once_each(tmp_path):
+    # every network topology (harness/topology.py) is its own stack: boot it with its overlay, run topology_roundtrip
+    # once under the script operator with HPCB_FAKE_TOPOLOGY naming it, wipe it — the list is pinned here
+    import importlib
+    sys.path.insert(0, str(HERE.parent / "scenarios"))
+    assert tuple(t for t, _ in TOPOLOGY_CELLS) == topology.TOPOLOGIES                     # every topology is swept
+    m = re.search(r'^topology_cells\(\) \{.*?echo "([\w ]+)"', SWEEP.read_text(), re.S | re.M)
+    assert m and m.group(1).split() == [t for t, _ in TOPOLOGY_CELLS]
+    scen = importlib.import_module("topology_roundtrip")
+    for _t, prof in TOPOLOGY_CELLS:   # the cluster each boots can run the cell
+        assert targets.meets(scen.REQUIRES, targets.load_profile(prof)["capabilities"])[0], prof
+    r, calls, summary, root = _sweep(tmp_path, "--operators", "pi,codex", "--profiles", "topology")
+    assert r.returncode == 0, r.stdout + r.stderr
+    assert not [c for c in calls if c["tool"] == "run_suite"]
+    assert [(c["tool"], c["argv"]) for c in calls if c["tool"] in ("up.sh", "down.sh")] == [
+        x for t, p in TOPOLOGY_CELLS
+        for x in (("up.sh", f"--profile {p} --topology {t}"), ("down.sh", f"--profile {p} --topology {t} --wipe"))]
+    assert [(c["argv"], c["operator"], c["profile"], c["topology"], c["cell"]) for c in calls
+            if c["tool"] == "run_smoke"] == [("topology_roundtrip", "script", p, t, "") for t, p in TOPOLOGY_CELLS]
+    for t, _ in TOPOLOGY_CELLS:
+        assert f"    [script] topology_roundtrip {t} — RESULT: OK" in summary
+        assert any((root / "agentic" / "runs").glob(f"sweep-*-topology-script-topology_roundtrip-{t}.log"))
+    assert f"## totals [script] — OK {len(TOPOLOGY_CELLS)} · FAILED 0 " in summary
+    # a stack that does not boot is that topology's INFRA row, its cell not run; --paid-only boots nothing
+    _, calls, summary, _ = _sweep(tmp_path / "f", "--profiles", "topology", STUB_BOOT_FAIL="1")
+    assert not [c for c in calls if c["tool"] == "run_smoke"]
+    assert all(f"topology_roundtrip {t} — RESULT: INFRA" in summary for t, _ in TOPOLOGY_CELLS)
+    _, calls, _, _ = _sweep(tmp_path / "p", "--paid-only", "--profiles", "topology")
+    assert not calls
+    assert "topology" in re.search(r'PROFILES="([\w,]+)"', SWEEP.read_text()).group(1).split(",")   # in the full sweep
 
 
 def test_nersc_runs_the_returning_agent_cells_in_every_wave_then_the_perlmutter_proofs(tmp_path):

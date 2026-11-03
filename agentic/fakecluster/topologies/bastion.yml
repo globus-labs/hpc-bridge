@@ -1,0 +1,18 @@
+# Topology `bastion` (agentic/harness/topology.py; up.sh --topology bastion): a jump host, sshd only (no Slurm, no
+# shared /home), on an `edge` network the jail joins AND on the cluster's own network. The login node(s) stay on the
+# cluster network only, so the jail reaches them through `ProxyJump bastion`, as at many real sites. The pool users and
+# the test key are the login node's, so the one key works on both hops. Layered last, on any profile's stack.
+services:
+  bastion:
+    build: .
+    image: hpcb-fake:latest
+    platform: linux/arm64
+    hostname: bastion
+    entrypoint: ["/bin/bash", "/etc/hpcb/topology/bastion.sh"]
+    volumes:
+      - ${HPCB_FAKE_KEY_PUB:-~/.ssh/hpcb-fake.pub}:/run/hpcb/authorized_keys:ro
+      - ./topologies/bastion.sh:/etc/hpcb/topology/bastion.sh:ro
+    networks: [default, edge]
+    restart: unless-stopped
+networks:
+  edge: {}

@@ -58,7 +58,7 @@ agentic/
                            first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 102 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 103 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -97,6 +97,8 @@ agentic/
                            batch phase 2b — the loam handoff (scripted; two on `pbs_mep`, one on `default`; red on main
                            until export_handoff lands): handoff_polaris_shape · handoff_mep_min_blocks_refused ·
                              handoff_ssh_shape
+                           network topology (scripted, once per HPCB_FAKE_TOPOLOGY — "Network topologies" below; red on
+                           main behind host_forward and bastion until the login pin is fixed): topology_roundtrip
                            manual only (retired from sweeps; run by hand): aurora_pbs_bringup · idle_release_kill
   runs/                  ← per-run provenance bundles (gitignored): record.json ·
                            messages.jsonl (full stream incl. thinking) · transcript.md ·
@@ -422,6 +424,49 @@ journal (0.1.20) has the script's own steps as its record (`script_runner.steps_
 - `returning` is a script-only sweep profile. It boots the `nersc` cluster and runs `returning_user` once per cell,
   each row `returning_user <cell> — RESULT: …`.
 - `nersc` runs the three agent cells in every wave, then the Perlmutter report's scripted proofs.
+
+## Network topologies (`HPCB_FAKE_TOPOLOGY`, `harness/topology.py`)
+
+On the fake target, the profile is the cluster's shape and the **topology** is where the client sits:
+- `in_network` (the default) is how every cell ran before 2026-11-03: the jail joins the cluster's network, with
+  `HPC_BRIDGE_SSH_HOST=login` on port 22.
+- `host_forward` reaches the login node only through the port the host publishes, behind an ssh-config alias. This is
+  NAT or a port-forward, the way a user on the host reaches it.
+- `bastion` reaches it through `ProxyJump bastion`.
+- `vip` reaches it through a haproxy that fronts the login node(s).
+
+Each topology but `in_network` runs the jail in a network namespace where the cluster's internal subnets are
+unreachable.
+Docker Desktop routes between its bridge networks otherwise. The fakecluster README's *Topologies* section has the table,
+the commands and why. What changes per topology:
+- **targets.py** takes the jail's network and `ssh_host` from the topology's plan. run_smoke.sh starts the holder
+  container, mounts nothing new, and passes the plan as `HPCB_TOPOLOGY_PLAN`.
+- **run.py** (`_install_topology`, first thing in the jail) writes two ssh configs. The user's `~/.ssh/config` holds the
+  alias `hpcb-fake`: all hpc-bridge is told. The harness' own `~/.ssh/hpcb-harness.conf` adds a way to each login node,
+  and the world channel uses it through `ssh -F`. The product never reads it, so a path only the harness has cannot
+  rescue the product.
+- **The bundle** records `config.topology`.
+
+`HPCB_FAKE_PROJECT` (a compose project of its own: network, containers, volumes) with its own `HPCB_FAKE_SSH_PORT[2]`
+runs a second stack beside the usual one. `HPCB_JAIL_IMAGE` gives a side run's jail image its own tag, so it never
+retags the `hpc-bridge-agentic` image a sweep elsewhere is running on.
+
+`topology_roundtrip` (scripted, fake only) is the cell that exercises every vantage-sensitive path: connect → a
+confirmed block → `run_shell` → `stop_endpoint` → a new server process on the same state dir (`ops.restart_server()`,
+reconnecting with the stored record and its pin) → `login_shell hostname` → teardown. Its graders:
+- `every_step_succeeded`;
+- `world:pin_reachable`: hpc-bridge's own target for each recorded pin answers from the jail (`harness/topology_probe.py`,
+  in the project's environment);
+- `no_internal_pin`: no pin is on a subnet the jail is not on;
+- `world:no_manager_after_product_teardown`: checked before the harness' own cleanup;
+- `world:preauth_runnable`: every `preauth_command` the flow surfaced, and the one the product builds for the alias and
+  each pin, runs from the jail with BatchMode and a scratch ControlPath;
+- `no_reauth`: each ControlMaster socket opened once, read off `[mux]` process titles; ControlPersist is raised to
+  900 s for the cell, so an idle master's expiry is not counted.
+
+The pin's own master is a second destination by design, so it is reported, not failed. The sweep's `topology` profile
+boots one stack per topology (`in_network`, `host_forward` and `bastion` on `default`; `vip` on `site`), runs the cell
+once under the script operator, and wipes the stack. `test_sweep_script.py` pins that list.
 
 ## Concurrency & isolation (pool users)
 
