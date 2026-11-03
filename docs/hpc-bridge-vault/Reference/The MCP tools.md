@@ -35,15 +35,15 @@
 
 `stop_endpoint` pauses every batch under the lock before anything is released and refuses (`up`) while a batch's tasks are out, naming `cancel(id, 'abort')`; with a batch submit of unknown fate it is `draining`, naming it — on SSH until the block's config is retired and its user endpoint has exited with nothing queued; on a MEP for good. `poll_task` also takes a task's Globus id (`globus_task_id` on a `running` answer), answered from the ledger after a restart.
 
-## The loam handoff (phase 2b: [[handoff]])
+## The endpoint handoff (phase 2b: [[handoff]])
 
 | Tool | Returns | What it does |
 |---|---|---|
-| `export_handoff(user_endpoint_config, expires_hours=24, confirm_spend=False)` | `HandoffResult` | Hand an endpoint to an orchestrator such as loam. The config can use the template's own key names or hpc-bridge's (`partition`), and the facility's defaults fill the rest; a key that is unrendered, refused by the schema, or not data is refused by name. **First call:** `needs_confirmation` with `terms`: the canary's cost, and the pool's worst case until the record expires, in the facility's unit, with `enforced_by: "uec-bounds-only"`. **The yes** (`confirm_spend=True`) sends ONE canary with exactly that config; the answer is `validating` until it returns (call again with the same config; nothing more is sent), then `exported` with the `record` and its `path` (`<state_dir>/handoffs/hoff-…json`, 0600). **Refusals:** on a facility endpoint, `min_blocks ≥ 1` is refused before any terms (`mep_min_blocks`, D6); a failed canary is `canary_failed` and writes no record. Other phases are `needs_account` and `refused` (`invalid`, `schema`, `not_rendered`, `unbounded`, `expires`, `no_facility`, `template_unknown`). |
+| `export_handoff(user_endpoint_config, expires_hours=24, confirm_spend=False)` | `HandoffResult` | Hand an endpoint to an orchestrator (the consumer); the record names no consumer. The config can use the template's own key names or hpc-bridge's (`partition`), and the facility's defaults fill the rest; a key that is unrendered, refused by the schema, or not data is refused by name. **First call:** `needs_confirmation` with `terms`: the canary's cost, and the pool's worst case until the record expires, in the facility's unit, with `enforced_by: "uec-bounds-only"`. **The yes** (`confirm_spend=True`) sends ONE canary with exactly that config; the answer is `validating` until it returns (call again with the same config; nothing more is sent), then `exported` with the `record` and its `path` (`<state_dir>/handoffs/hoff-…json`, 0600). **Refusals:** on a facility endpoint, `min_blocks ≥ 1` is refused before any terms (`mep_min_blocks`, D6); a failed canary is `canary_failed` and writes no record. Other phases are `needs_account` and `refused` (`invalid`, `schema`, `not_rendered`, `unbounded`, `expires`, `no_facility`, `template_unknown`). |
 
 **A stop or teardown with an unexpired handoff:**
 - **On an endpoint hpc-bridge stood up,** it asks first (`needs_confirmation`, `handoffs` naming each one and its expiry) and changes nothing.
-  - `stop_endpoint(handoffs="keep")` releases only the session's blocks: the release spares loam's user endpoint, and the answer is `draining`, naming it.
+  - `stop_endpoint(handoffs="keep")` releases only the session's blocks: the release spares the consumer's user endpoint, and the answer is `draining`, naming it.
   - `"cancel"` ends the handoff, and is `down` only once the scheduler lists nothing of its user endpoint.
   - `teardown_endpoint(handoffs="cancel")` tears down and ends it. `"keep"` cannot be honoured by a teardown, so the answer points to the stop.
   - **Why a separate argument from `jobs`:** two consents, about two owners' work.

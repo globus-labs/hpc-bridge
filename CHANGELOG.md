@@ -6,7 +6,7 @@ installed plugin only when that version changes); git tags mark releases.
 ## Unreleased
 
 ### Added
-- **Batches (phase 2b): `export_handoff`, the loam handoff.** A 17th tool, plus `stop_endpoint(handoffs=…)` and
+- **Batches (phase 2b): `export_handoff`, the endpoint handoff.** A 17th tool, plus `stop_endpoint(handoffs=…)` and
   `teardown_endpoint(handoffs=…)` (vault `Planned/Batch and swarm execution.md` §8, §12 D6; `Modules/handoff.md`).
   - **The terms come first.** `export_handoff(user_endpoint_config, expires_hours=24)` first answers
     `needs_confirmation` with the terms and sends nothing. The terms give the canary's cost and the pool's worst case
@@ -23,14 +23,16 @@ installed plugin only when that version changes); git tags mark releases.
     - the canary's job, host, device pin, mapped identity and user endpoint;
     - a `release` naming the end that works (stop submitting, idle release, then `qdel`/`scancel` of a block — with
       `min_blocks` 0 nothing replaces it);
-    - `loam.env` as data. Loam writes `set_env.sh` itself, quoting each value.
+    - nothing named for one consumer: a consumer (loam, say) maps the endpoint id, the config, the nodes and the
+      facility to its own settings, quoting each value in any shell file it writes (`Modules/handoff.md` has the
+      worked example).
   - **Validation:**
     - Every value is checked: no value becomes shell code.
     - `scheduler_options` may hold only scheduler directives.
     - A key the template does not render, or its schema refuses, is refused by name and never dropped.
   - **D6:** on a facility multi-user endpoint, `min_blocks ≥ 1` is refused before any terms.
   - **On an endpoint hpc-bridge stood up**, a stop or teardown asks first while a handoff of it is unexpired.
-    `handoffs="keep"` releases only the session's blocks (the release spares loam's user endpoint) and answers
+    `handoffs="keep"` releases only the session's blocks (the release spares the consumer's user endpoint) and answers
     `draining`. `"cancel"` ends the handoff and answers `down` only once nothing of it is listed. On a facility
     endpoint the stop names the handoff and its release.
   - **Review round 1:**

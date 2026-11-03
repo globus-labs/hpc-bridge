@@ -32,7 +32,7 @@ from .runner import _RECEIPT, SubmitAnswer, submit_answer
 LoginRunner = Callable[[str], Awaitable[ShellOutcome]]
 
 Scope = tuple[tuple[str, ...], tuple[int, ...]]
-# The user endpoints the release of THIS stop must spare (batch phase 2b: a stop that keeps a loam handoff's pool
+# The user endpoints the release of THIS stop must spare (batch phase 2b: a stop that keeps a handed-off pool
 # running), set by the stop for its own call: a context variable is per task, so a concurrent stop never sees — nor
 # clears — another's scope (review round 1, item 2).
 RELEASE_KEEP: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("hpcb_release_keep", default=None)
@@ -40,7 +40,7 @@ RELEASE_KEEP: contextvars.ContextVar[Scope | None] = contextvars.ContextVar("hpc
 
 def _scope_sh(eid: str, scope: Scope) -> str:
     """Shell that sets `x` to the user endpoint directories (`uep.<eid>.<id>`, space-separated) a scoped release is
-    about (batch phase 2b: a loam handoff's pool): the ids given (UUIDs only), and the user endpoints whose own log
+    about (batch phase 2b: a handed-off pool): the ids given (UUIDs only), and the user endpoints whose own log
     names one of the block requests given (BLOCK_REQUEST_LOG + the number, read to the end of the line — the template's
     endpoint_setup line, as the stop's evidence finds a user endpoint). Built only from a UUID and whole numbers."""
     ueps = [u for u in scope[0] if _UUID.fullmatch(u or "")]
@@ -59,9 +59,9 @@ def _release_cmd(scheduler: str, eid: str, *, keep: Scope | None = None, only: S
     Slurm reads squeue/scancel; PBS reads qstat -f (unwrapping its 80-col line continuations so a
     wrapped Output_Path can't split the marker) and qdel.
 
-    Scoped (batch phase 2b, a loam handoff on this endpoint): `keep` spares the blocks of the user endpoints it names
-    (`_scope_sh`) — a stop that leaves loam's pool running; `only` cancels just theirs — and says it could not find
-    them, never "released none", when it names none it can find."""
+    Scoped (batch phase 2b, an endpoint handoff on this endpoint): `keep` spares the blocks of the user endpoints it
+    names (`_scope_sh`) — a stop that leaves the consumer's pool running; `only` cancels just theirs — and says it
+    could not find them, never "released none", when it names none it can find."""
     if keep is not None or only is not None:
         return _scoped_release_cmd(scheduler, eid, keep=keep, only=only)
     m = shlex.quote(f"uep.{eid}")
@@ -122,7 +122,7 @@ def _release_cmd_for(app: AppCtx, eid: str) -> str:
     """The release one-liner for the bound facility's scheduler. The scheduler lives on the facility's MachineProfile
     (SlurmFacility.profile.scheduler); a facility without one (LocalFacility/dev, or test doubles) has never spoken
     anything but Slurm's squeue/scancel, so default there instead of assuming an attribute that isn't part of the
-    Facility protocol. A stop that keeps a loam handoff's pool running (`RELEASE_KEEP`, set for that stop's own call;
+    Facility protocol. A stop that keeps a handed-off pool running (`RELEASE_KEEP`, set for that stop's own call;
     batch phase 2b) spares its user endpoints' blocks."""
     keep = RELEASE_KEEP.get()
     return _release_cmd(getattr(getattr(app.facility, "profile", None), "scheduler", "slurm"), eid, keep=keep)

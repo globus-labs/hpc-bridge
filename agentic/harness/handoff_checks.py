@@ -1,4 +1,4 @@
-"""Batch phase 2b's graders and world checks: `export_handoff` v1, the loam handoff (vault `Planned/Batch and swarm
+"""Batch phase 2b's graders and world checks: `export_handoff` v1, the endpoint handoff (vault `Planned/Batch and swarm
 execution.md` §8, §10, §12 D6). The scenarios that use them: handoff_polaris_shape and handoff_mep_min_blocks_refused
 (fake `pbs_mep`), handoff_ssh_shape (fake `default`). Hermetic tests: test_handoff_scenarios.py.
 
@@ -17,6 +17,10 @@ from invariants import Result, ToolCall, Trace
 TOOL = "export_handoff"
 SCHEMA = "hpc-bridge.handoff"
 ENFORCED_BY = "uec-bounds-only"
+# The v1 record's sections — hpc-bridge's own contract, named for no consumer (the user's decision before #241 merged)
+V1_SECTIONS = frozenset({"schema", "version", "handoff_id", "created_at", "expires_at", "hpc_bridge_version",
+                         "facility", "endpoint", "user_endpoint_config", "template", "worker", "client_requirements",
+                         "terms", "validation", "release"})
 _UUID = re.compile(r"^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$")
 _PBS_JOB = re.compile(r"^\d+(?:\[\d*\])?\.[A-Za-z0-9][\w.-]*$")
 _SLURM_JOB = re.compile(r"^\d+$")
@@ -142,7 +146,8 @@ def record_shape(t: Trace, *, uec: dict | None = None, scheduler: str, access: s
     `queue` on PBS —, no hpc-bridge marker, `uec`'s values where given); a template digest and every key rendered;
     the terms with `enforced_by: uec-bounds-only` and approved_at; a validation the canary made (ok, a job id of the
     scheduler's shape, the mapped identity, a device pin where `pinned`); the user endpoint seen, not the manager;
-    the client Python; loam's environment."""
+    the client Python; and nothing named for one consumer — only the v1 sections, from which a consumer maps its own
+    settings (the endpoint id, the config, the nodes, the facility)."""
     name = "handoff_record_shape"
     if (m := _main(t)) is not None:
         return Result(name, False, m)
@@ -187,9 +192,11 @@ def record_shape(t: Trace, *, uec: dict | None = None, scheduler: str, access: s
         why.append(f"uep_id_seen {uep!r} (manager {ep.get('manager_id')!r})")
     if not re.fullmatch(r"3\.\d+", str((rec.get("client_requirements") or {}).get("python") or "")):
         why.append(f"client_requirements.python {(rec.get('client_requirements') or {}).get('python')!r}")
-    env = (rec.get("loam") or {}).get("env") or {}
-    if env.get("HPC_GLOBUS_ENDPOINT_ID") != ep.get("manager_id") or not env.get("HPC_ENDPOINT_CONFIG_JSON"):
-        why.append(f"loam env {sorted(env)}")
+    if set(rec) != V1_SECTIONS:   # consumer-neutral: only the v1 contract's own sections, none named for a consumer
+        why.append(f"sections beyond (or missing from) v1: {sorted(set(rec) ^ V1_SECTIONS)}")
+    if not _UUID.match(str(ep.get("manager_id") or "")) or not isinstance(terms.get("nodes_per_block"), int):
+        why.append(f"a consumer cannot map endpoint.manager_id={ep.get('manager_id')!r} / "
+                   f"terms.nodes_per_block={terms.get('nodes_per_block')!r}")
     return Result(name, not why, f"ok: v1 record, job {job} as {v.get('identity')!r}, uep {uep[:8]}…, "
                   f"{len(wire)} keys all rendered" if not why else "; ".join(why))
 

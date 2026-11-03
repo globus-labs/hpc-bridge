@@ -541,7 +541,7 @@ class AppCtx:
     # the envelopes this session proposed and the user has not yet said yes to (jobs._proposal_key -> the cap shown,
     # what was held then): a yes opens at the cap the user saw, or is proposed again when what is held outgrew it
     jobs_proposals: dict[tuple, dict] = field(default_factory=dict)
-    # Batch phase 2b (hpc_bridge.handoff): each loam handoff whose one billed canary is out, by the digest of the
+    # Batch phase 2b (hpc_bridge.handoff): each endpoint handoff whose one billed canary is out, by the digest of the
     # caller's own config and the endpoint (a later export_handoff with that config collects it, never sends another;
     # also on disk, so a restart does too); and the published template each endpoint served this session (read once).
     handoffs: dict[str, Any] = field(default_factory=dict)

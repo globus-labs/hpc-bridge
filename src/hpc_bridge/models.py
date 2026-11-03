@@ -377,9 +377,9 @@ class ShellOutcome(BaseModel):
 
 
 class HandoffRef(BaseModel):
-    """A loam handoff a stop or teardown is about (hpc_bridge.handoff): its id, whether it is exported (loam holds the
-    record) or still validating (its canary is out), when its record expires, where the record is, the user endpoint
-    its canary saw and the scheduler jobs known of it."""
+    """An endpoint handoff a stop or teardown is about (hpc_bridge.handoff): its id, whether it is exported (its
+    consumer holds the record) or still validating (its canary is out), when its record expires, where the record is,
+    the user endpoint its canary saw and the scheduler jobs known of it."""
 
     handoff_id: str
     state: Literal["exported", "validating"]
@@ -446,7 +446,7 @@ class EndpointStatus(BaseModel):
     # what it can still bill. needs_confirmation asks stop_endpoint(jobs="cancel"|"keep"); a stop that kept them names
     # them here (draining, never down).
     jobs: list[JobInfo] = Field(default_factory=list)
-    # stop_endpoint / teardown_endpoint while a loam handoff (export_handoff, batch phase 2b) of this endpoint is
+    # stop_endpoint / teardown_endpoint while an endpoint handoff (export_handoff, batch phase 2b) of this endpoint is
     # unexpired, or its canary is still out: each one. On an endpoint hpc-bridge stood up, needs_confirmation asks
     # handoffs="cancel"|"keep"; a stop that kept one names it (draining). On a facility endpoint it is only named.
     handoffs: list[HandoffRef] = Field(default_factory=list)

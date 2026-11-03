@@ -1,5 +1,5 @@
-"""Batch phase 2b (vault `Planned/Batch and swarm execution.md` §8, §7, §10, §12 D6): `export_handoff` v1, the loam
-handoff. Written failing first: on main (a00952b) the surface does not exist, so every test here is red for that one
+"""Batch phase 2b (vault `Planned/Batch and swarm execution.md` §8, §7, §10, §12 D6): `export_handoff` v1, the endpoint
+handoff (consumer-neutral; loam's config is the example consumer's). Written failing first: on main (a00952b) the surface does not exist, so every test here is red for that one
 reason (`server._export_handoff` / `hpc_bridge.handoff` missing); the build makes them green.
 
 The surface these tests are written against (the stage-A checkpoint fixes it):
@@ -357,7 +357,7 @@ async def test_the_first_call_states_the_terms_and_sends_nothing(tmp_path, monke
     assert t.worst_case >= 2 * 1 * (24 + 0.25) - 1e-9, t
     assert t.worst_case >= t.canary_worst_case
     # the honest limit is said in the terms themselves, and the user's question names the number and its unit
-    assert "loam" in t.binds and "hpc-bridge" in t.binds and "not" in t.binds, t.binds
+    assert "consumer" in t.binds and "hpc-bridge" in t.binds and "not" in t.binds, t.binds
     assert f"{t.worst_case:g}" in (ask.notice or "") and "node-hours" in (ask.notice or ""), ask.notice
     assert ask.user_endpoint_config == {**LOAM_UEC}, ask.user_endpoint_config   # what the canary would send
 
@@ -566,19 +566,40 @@ async def test_no_value_becomes_shell_code(tmp_path, monkeypatch, key, value):
     assert app.runners.built == []
 
 
-async def test_loams_environment_is_escaped_data(tmp_path, monkeypatch):
+V1_SECTIONS = {"schema", "version", "handoff_id", "created_at", "expires_at", "hpc_bridge_version", "facility",
+               "endpoint", "user_endpoint_config", "template", "worker", "client_requirements", "terms", "validation",
+               "release"}
+
+
+async def test_the_record_names_no_consumer(tmp_path, monkeypatch):
+    """Consumer-neutral (the user's decision before #241 merges): every section of the record is hpc-bridge's own v1
+    contract; none is named for, or shaped like, one consumer's settings."""
+    app = await _mep_app(tmp_path, monkeypatch)
+    _ask, out = await _yes(app, LOAM_UEC)
+    raw = json.loads(Path(out.path).read_text())
+    assert set(raw) == V1_SECTIONS, set(raw) ^ V1_SECTIONS
+    text = json.dumps(raw).lower()
+    assert "loam" not in text and "hpc_globus_endpoint_id" not in text and "set_env" not in text, text[:300]
+
+
+async def test_a_consumers_environment_is_built_from_record_fields_and_written_safely(tmp_path, monkeypatch):
+    """The worked example (vault Modules/handoff.md): loam, as one consumer, builds its four variables from the record's
+    own fields, writes set_env.sh quoting each value (shlex, or printf %q), and its preflight checks the template's
+    digest against the facility's published metadata and the expiry — nothing in the record is loam's."""
+    from hpc_bridge import handoff
+
     app = await _mep_app(tmp_path, monkeypatch)
     uec = {**LOAM_UEC, "worker_init": "source /lus/proj/env/bin/activate && export X='a b' Y=\"$HOME\""}
     _ask, out = await _yes(app, uec)
-    rec = out.record
-    env = rec.loam.env
+    rec = handoff.load_record(Path(out.path).read_text())
+    env = {"HPC_GLOBUS_ENDPOINT_ID": rec.endpoint.manager_id,
+           "HPC_ENDPOINT_CONFIG_JSON": json.dumps(rec.user_endpoint_config, sort_keys=True),
+           "HPC_NNODES": str(rec.terms.nodes_per_block), "HPC_SYSTEM": rec.facility.system}
     assert env["HPC_GLOBUS_ENDPOINT_ID"] == MEP_UUID and env["HPC_NNODES"] == "1", env
-    assert env["HPC_SYSTEM"] == rec.facility.system == "fake-pbs-mep", env
-    assert json.loads(env["HPC_ENDPOINT_CONFIG_JSON"]) == rec.user_endpoint_config
-    assert all(isinstance(v, str) for v in env.values()), env
-    # the record carries data, never a script: loam writes set_env.sh itself, quoting each value
-    raw = json.loads(Path(out.path).read_text())
-    assert set(raw["loam"]) == {"env"}, raw["loam"]
+    assert env["HPC_SYSTEM"] == "fake-pbs-mep", env
+    # preflight: the facility's template is the one the canary validated, and the record has not expired
+    assert rec.template.sha256 == facility_fingerprint(app.meta.get_endpoint_metadata(MEP_UUID))["template_sha256"]
+    assert datetime.fromisoformat(rec.expires_at.replace("Z", "+00:00")) > datetime.now(UTC)
     for how in ("shlex", "printf"):
         script = tmp_path / f"set_env_{how}.sh"
         if how == "shlex":   # Python's way, as the vault says
@@ -728,7 +749,7 @@ async def test_a_stop_with_an_unexpired_handoff_asks_first_and_changes_nothing(t
     assert st.status == "needs_confirmation", st
     assert [h.handoff_id for h in st.handoffs] == [out.record.handoff_id], st.handoffs
     assert st.handoffs[0].expires_at == out.record.expires_at and out.record.expires_at in (st.notice or "")
-    assert "cancels loam's blocks" in (st.notice or "") and "user endpoint" in (st.notice or ""), st.notice
+    assert "cancels the consumer's blocks" in (st.notice or "") and "user endpoint" in (st.notice or ""), st.notice
     assert sched.calls("scancel") == [] and sched.job(mine)["state"] == sched.job(loam)["state"] == "RUNNING"
     again = await server._stop_endpoint(app)                      # nothing changed: it asks again
     assert again.status == "needs_confirmation"

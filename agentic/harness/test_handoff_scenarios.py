@@ -7,7 +7,6 @@ from __future__ import annotations
 
 import copy
 import importlib
-import json
 import shlex
 import sys
 from pathlib import Path
@@ -38,7 +37,7 @@ def _terms(**over):
     t = {"facility": "fake-pbs-mep", "scheduler": "pbs", "account": "hpcb", "queue": "debug", "walltime": "00:15:00",
          "nodes_per_block": 1, "init_blocks": 0, "min_blocks": 0, "max_blocks": 2, "unit": "node-hours",
          "canary_worst_case": 0.25, "worst_case": 48.5, "enforced_by": "uec-bounds-only", "approved_at": None,
-         "expires_at": None, "binds": "the user endpoint config bounds loam's pool; hpc-bridge does not police it"}
+         "expires_at": None, "binds": "the config bounds the consumer's pool; hpc-bridge does not police it"}
     t.update(over)
     return t
 
@@ -64,8 +63,6 @@ def _record(uec, *, scheduler="pbs", access="mep", job="12.pbs", user="hpcbmep",
                               f"To end a block sooner once nothing is queued: `{cancel} {job}` — min_blocks is 0, so "
                               "nothing replaces it."],
                     "hpc_bridge_scope": "stop_endpoint cancels every block of this endpoint; teardown_endpoint ends it"},
-        "loam": {"env": {"HPC_GLOBUS_ENDPOINT_ID": manager, "HPC_ENDPOINT_CONFIG_JSON": json.dumps(uec),
-                         "HPC_NNODES": "1", "HPC_SYSTEM": "fake-pbs-mep"}, "set_env_sh": "export X=1\n"},
     }
     for k, v in over.items():
         rec[k] = v
@@ -107,6 +104,9 @@ def test_a_handoff_the_plugin_gets_right_passes_every_gated_grader():
     (lambda rec: rec["template"]["renders"].update(queue=False), "handoff_record_shape"),
     (lambda rec: rec["validation"].update(device_pin={}), "handoff_record_shape"),
     (lambda rec: rec["endpoint"].update(uep_id_seen=MEP), "handoff_record_shape"),
+    (lambda rec: rec.update(loam={"env": {"HPC_GLOBUS_ENDPOINT_ID": MEP}}), "handoff_record_shape"),  # consumer-named
+    (lambda rec: rec.update(set_env_sh="export HPC_NNODES=1\n"), "handoff_record_shape"),   # shell in the record
+    (lambda rec: rec["endpoint"].update(manager_id="not-an-endpoint"), "handoff_record_shape"),
     (lambda rec: rec["validation"].update(identity="someone"), "handoff_record_shape"),
     (lambda rec: rec["release"].update(steps=["qdel 12.pbs"]), "handoff_release_honest"),
     (lambda rec: rec["release"]["steps"].__setitem__(2, "Or `qdel 12.pbs`."), "handoff_release_honest"),

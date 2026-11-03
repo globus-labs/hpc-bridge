@@ -54,7 +54,7 @@ echo "# profile sweep $STAMP — target fake, $MODEL_WORDS" > "$SUMMARY"
 
 cells() {  # cells <profile> -> the scenario list (and concurrency) for that profile
   case "$1" in
-    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs,batch_fanout_collect 2" ;;
+    default)  echo "happy_path,gated_provision,long_task_via_handle,endpoint_reuse,endpoint_reuse_chain,session_persistence,byo_teardown_clean,spend_refusal,unknown_host_key,zero_config_list,orphaned_task,draining_restop,stop_while_running,spend_revoked,block_reaped_resume,long_output,no_facility_first,venv_broken_repair,venv_arch_mismatch,endpoint_upgrade_reuse,reap_replaced_block,esc_mid_call,teardown_slow_fs,batch_fanout_collect,job_promote_track_cancel,envelope_exhausted 2" ;;
     site)     echo "rich_gate,partition_choice,gpu_rule,submit_policy_rejected,login_pin_teardown,slurm_worker_died,gated_provision,happy_path,hand_batch_job,ssh_account_floor 3" ;;
     totp)     echo "otp_preauth,password_pusher 1" ;;
     pbs)      echo "happy_path,gated_provision 2" ;;
@@ -95,21 +95,6 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
-job_promote_track_cancel      batch phase 2a: joins the sweep after its first live proof (by hand), as the default agent wave
-envelope_exhausted            batch phase 2a: joins the sweep after its first live proof (by hand), as the default agent wave
-job_array_terms               batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-hand_submit_gated_adopted     batch phase 2a: joins the sweep after its first live proof (by hand), as a `pbs` script cell
-site_backstop_grptresmins     batch phase 2a: joins the sweep after its first live proof (by hand), as a `site` script cell
-envelope_new_session_reasks   batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-envelope_ceiling_sums         batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-envelope_bypass_counted       batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-meter_missing_from_sacct_full_walltime batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-envelope_leftover_held        batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-envelope_stop_races_submit    batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-hand_sbatch_adopted           batch phase 2a: joins the sweep after its first live proof (by hand), as a batch_cells script cell
-handoff_polaris_shape         batch phase 2b: joins the sweep after its first live proof (by hand), as a `pbs_mep` script cell
-handoff_mep_min_blocks_refused batch phase 2b: joins the sweep after its first live proof (by hand), as a `pbs_mep` script cell
-handoff_ssh_shape             batch phase 2b: joins the sweep after its first live proof (by hand), as a batch_cells script cell
 EXCLUDED
 }
 
@@ -182,10 +167,13 @@ cells_for() {  # cells_for <operator> <scenario list> -> the cells that operator
   else echo "$2"; fi
 }
 
-batch_cells() {  # batch_cells <profile>: batch phase 1's scripted cells, once per sweep with no model
+batch_cells() {  # batch_cells <profile>: the batch phases' scripted cells (1, 2a, 2b), once per sweep with no model
   case "$1" in
-    default) echo "batch_crosses_walltime batch_restart_resume batch_two_servers_one_ledger batch_block_reaped_midrun batch_big_output batch_abort_midrun" ;;
+    default) echo "batch_crosses_walltime batch_restart_resume batch_two_servers_one_ledger batch_block_reaped_midrun batch_big_output batch_abort_midrun job_array_terms envelope_new_session_reasks envelope_ceiling_sums envelope_bypass_counted meter_missing_from_sacct_full_walltime envelope_leftover_held envelope_stop_races_submit hand_sbatch_adopted handoff_ssh_shape" ;;
+    site)    echo "site_backstop_grptresmins" ;;
+    pbs)     echo "hand_submit_gated_adopted" ;;
     mep)     echo "mep_batch_fanout" ;;
+    pbs_mep) echo "handoff_polaris_shape handoff_mep_min_blocks_refused" ;;
   esac
 }
 

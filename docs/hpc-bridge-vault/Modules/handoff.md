@@ -1,7 +1,7 @@
 # handoff.py
 
 > [!abstract] Role
-> Batch phase 2b: `export_handoff` v1, the loam handoff. It builds a wire-ready user endpoint config (UEC) for an orchestrator such as loam, states its terms, validates exactly that config with one billed canary on the user's yes, and writes a data-only record, `hpc-bridge.handoff` version 1. It also tells a stop or teardown which handoffs of the bound endpoint are still live. Design: [[Batch and swarm execution]] §8, §12 D6; tools in [[The MCP tools]].
+> Batch phase 2b: `export_handoff` v1, the endpoint handoff. It builds a wire-ready user endpoint config (UEC) for a consumer (an orchestrator that runs its own agents), states its terms, validates exactly that config with one billed canary on the user's yes, and writes a data-only record, `hpc-bridge.handoff` version 1. It also tells a stop or teardown which handoffs of the bound endpoint are still live. Design: [[Batch and swarm execution]] §8, §12 D6; tools in [[The MCP tools]].
 
 ## What it does
 
@@ -13,7 +13,7 @@
      - The config is fitted to the facility's JSON schema (type, bounds, length, pattern, enum, required, strict `additionalProperties`).
      - Every key must be rendered by the template (`renders`: inside a `{{ … }}` or a `{% … %}`). A caller key that is not rendered, or is refused by the schema, is refused by name. A default key that is not rendered is not sent.
      - Where the template renders them and the caller left them out, the server writes `init_blocks: 0` and `min_blocks: 0`.
-     - On an endpoint hpc-bridge stood up, the config gets a block request of its own (`hpcb_block`), so loam's user endpoint is never the session's.
+     - On an endpoint hpc-bridge stood up, the config gets a block request of its own (`hpcb_block`), so the consumer's user endpoint is never the session's.
   2. **The template's values** (`readings`, `effective`): the literal, the `default(…)` or the value sent, for `min_blocks`, `max_blocks`, `init_blocks`, `nodes_per_block`, `walltime`, `max_idletime`, `idle_heartbeats_soft` and `heartbeat_period`. Where the template never sets one, parsl's default applies. A value it cannot read is `_UNSET`, never a guess.
   3. **D6:** on a facility endpoint, an effective `min_blocks ≥ 1` (sent, the template's default, or its literal) is refused (`mep_min_blocks`) before any terms.
   4. **`terms_of`**, which never understate:
@@ -29,8 +29,8 @@
      - A failed canary writes nothing, and the next call asks again.
 - **The record** (`HandoffRecord` and its parts):
   - **Unknown fields are ignored** at every level. `load_record` refuses another schema or version.
-  - **`template.sha256`** is the registry's verification digest (`catalog.entry.facility_fingerprint`), so loam's preflight can compare it with `get_endpoint_metadata`.
-  - **`loam.env`** is data: `HPC_GLOBUS_ENDPOINT_ID`, `HPC_ENDPOINT_CONFIG_JSON`, `HPC_NNODES`, `HPC_SYSTEM`, each a plain string. Loam writes its `set_env.sh` from it, quoting every value itself: `printf 'export %s=%q\n' "$k" "$v"`, or Python's `f"export {k}={shlex.quote(v)}"`. The record carries no shell.
+  - **`template.sha256`** is the registry's verification digest (`catalog.entry.facility_fingerprint`), so a consumer's preflight can compare it with `get_endpoint_metadata`.
+  - **Consumer-neutral:** no section is named for, or shaped like, one consumer's settings (a test and the `handoff_record_shape` grader hold the sections to the v1 set). The record carries no shell.
 - **`release_of`**, the end that really works:
   1. Stop submitting with this config.
   2. With nothing queued, its blocks idle-release; the release states how long, and whether the user endpoint itself exits.
@@ -48,6 +48,39 @@
 - **The key and the pending file:** a handoff is keyed (`_key`) on the caller's own config, the facility and the endpoint. Its pending canary is written to `pending-<key>.json` with its task id. `_collect` reads it from the service by task id after a restart or a client-side failure.
 - **The sent check:** `_note_check` puts the canary among the endpoint's sent checks, so every stop sees it until it resolves.
 - **The terms:** the minimum-charge factor divides by `min(idle, walltime)`, and `init_blocks > max_blocks` is refused.
+
+## Worked example: a consumer reads the record (loam)
+
+loam is one consumer. Its `hpc-deployment` skill reads four variables from `set_env.sh`; each maps to a field the record already carries:
+
+| loam's variable | From the record |
+|---|---|
+| `HPC_GLOBUS_ENDPOINT_ID` | `endpoint.manager_id` |
+| `HPC_ENDPOINT_CONFIG_JSON` | `user_endpoint_config`, as JSON |
+| `HPC_NNODES` | `terms.nodes_per_block` |
+| `HPC_SYSTEM` | `facility.system` (loam knows `polaris` and `aurora`) |
+
+**Preflight, before anything is submitted:**
+1. Refuse the record if `expires_at` has passed.
+2. Refuse it if `template.sha256` differs from the digest of the facility's published metadata: the same rule as the registry's (`facility_fingerprint`), the template, a newline, then the schema as canonical JSON.
+3. Run a Python whose `major.minor` is `client_requirements.python`.
+
+**Writing `set_env.sh` safely:** quote every value; never paste one in raw, because the config's JSON holds quotes, `$` and spaces.
+
+```python
+import json, shlex
+from hpc_bridge.handoff import load_record
+
+rec = load_record(open(path).read())
+env = {"HPC_GLOBUS_ENDPOINT_ID": rec.endpoint.manager_id,
+       "HPC_ENDPOINT_CONFIG_JSON": json.dumps(rec.user_endpoint_config, sort_keys=True),
+       "HPC_NNODES": str(rec.terms.nodes_per_block), "HPC_SYSTEM": rec.facility.system}
+open("set_env.sh", "w").write("".join(f"export {k}={shlex.quote(v)}\n" for k, v in env.items()))
+```
+
+From a shell, the same values go through `printf 'export %s=%q\n' "$k" "$v"`.
+
+`tests/test_handoff_phase2b.py::test_a_consumers_environment_is_built_from_record_fields_and_written_safely` builds this mapping from a real record, writes the file both ways, sources it and reads the config back.
 
 ## See also
 [[Batch and swarm execution]] · [[The MCP tools]] · [[facility-mep]] · [[scheduler_ops]] · [[runner]]

@@ -1,18 +1,20 @@
-"""Batch phase 2b: `export_handoff` v1, the loam handoff (vault `Planned/Batch and swarm execution.md` §8, §12 D6;
+"""Batch phase 2b: `export_handoff` v1, the endpoint handoff (vault `Planned/Batch and swarm execution.md` §8, §12 D6;
 [[handoff]]).
 
-An orchestrator such as loam wants a Globus Compute endpoint and a user endpoint config (UEC) it can run its own
-agents on. hpc-bridge builds that config from the facility's template and the caller's keys, states its terms, and —
-on the user's yes — validates EXACTLY that config with one billed canary (any other config is another user endpoint),
-then exports a versioned, data-only record: `hpc-bridge.handoff`, version 1.
+A consumer — an orchestrator that runs its own agents — wants a Globus Compute endpoint and a user endpoint config
+(UEC) it can run them on. hpc-bridge builds that config from the facility's template and the caller's keys, states
+its terms, and — on the user's yes — validates EXACTLY that config with one billed canary (any other config is another
+user endpoint), then exports a versioned, data-only record: `hpc-bridge.handoff`, version 1.
 
 The rules this module keeps:
 - **Terms first.** The canary bills, so the first call states the terms and sends nothing; `confirm_spend=True` (the
   user's yes) sends ONE canary, and later calls with the same config collect it — never a second.
-- **The terms never understate.** `worst_case` is what loam's pool can bill from the yes until the record expires:
-  max_blocks × each block's rate × (the horizon × the minimum-charge factor + one block started just before it
+- **The terms never understate.** `worst_case` is what the consumer's pool can bill from the yes until the record
+  expires: max_blocks × each block's rate × (the horizon × the minimum-charge factor + one block started just before it
   expires), in the facility's unit where its billing weights are known, else node-hours.
-- **`enforced_by: "uec-bounds-only"`.** Once loam holds the record, hpc-bridge does not police the endpoint.
+- **`enforced_by: "uec-bounds-only"`.** Once the consumer holds the record, hpc-bridge does not police the endpoint.
+- **Consumer-neutral.** The record names no consumer: a consumer maps its fields (the endpoint id, the wire-ready
+  config, the nodes, the facility) to its own settings itself.
 - **D6.** On a facility multi-user endpoint a pool with `min_blocks >= 1` is refused: parsl replaces a cancelled block
   to keep its minimum, and no client can stop a facility's user endpoint. `release` names the end that really works.
 - **Data, never code.** Every value is validated and bounded; the record carries no shell; the one command it names
@@ -94,7 +96,7 @@ class _Rec(BaseModel):
 
 
 class HandoffTerms(_Rec):
-    """What the user's yes approves: the canary now (`canary_worst_case`) and loam's pool until the record expires
+    """What the user's yes approves: the canary now (`canary_worst_case`) and the consumer's pool until it expires
     (`worst_case`), both in `unit`; `enforced_by` says who keeps the bounds afterwards — only the config's own."""
 
     facility: str | None = None
@@ -152,7 +154,7 @@ class HandoffWorker(_Rec):
 
 
 class HandoffClient(_Rec):
-    python: str | None = None           # the client Python loam must run (the workers', major.minor: dill)
+    python: str | None = None           # the client Python the consumer must run (the workers', major.minor: dill)
     dill: str | None = None
     globus_compute_sdk: str | None = None
 
@@ -188,14 +190,11 @@ class HandoffRelease(_Rec):
     hpc_bridge_scope: str = ""
 
 
-class HandoffLoam(_Rec):
-    """What loam's set_env.sh needs, as DATA (plain strings): loam writes the file itself, quoting each value
-    (`printf 'export %s=%q\\n'` or Python's shlex.quote) — the record carries no shell."""
-
-    env: dict[str, str] = Field(default_factory=dict)
-
-
 class HandoffRecord(_Rec):
+    """The v1 record. Consumer-neutral: nothing in it is named for one consumer; a consumer maps `endpoint.manager_id`,
+    `user_endpoint_config`, `terms.nodes_per_block` and `facility` to its own settings (vault `Modules/handoff.md` has
+    a worked example), and must refuse it past `expires_at` or when the facility's template digest has moved."""
+
     model_config = ConfigDict(extra="ignore", serialize_by_alias=True)
 
     schema_: str = Field(SCHEMA, alias="schema")
@@ -213,7 +212,6 @@ class HandoffRecord(_Rec):
     terms: HandoffTerms
     validation: HandoffValidation
     release: HandoffRelease
-    loam: HandoffLoam = Field(default_factory=HandoffLoam)
 
 
 class HandoffFormatError(ValueError):
@@ -427,7 +425,7 @@ def _schema_problem(key: str, v: Any, prop: dict[str, Any]) -> str | None:
 
 # Scheduler directives a caller's `scheduler_options` may carry (review round 1, item 1): sbatch and qsub take the LAST
 # of a repeated option and parsl writes these after its own, so any directive that sets the block's size, time, queue,
-# account, GPUs, an array, or its output path (by which a stop finds loam's blocks: `uep.<eid>`) would move the very
+# account, GPUs, an array, or its output path (by which a stop finds the consumer's blocks: `uep.<eid>`) would move the
 # bounds the terms and the release are built on. Allow-listed: what changes none of them.
 _SLURM_OK = frozenset({"--job-name", "-J", "--comment", "--mail-type", "--mail-user", "--begin", "--signal",
                        "--requeue", "--no-requeue", "--open-mode", "--export", "--get-user-env"})
@@ -681,12 +679,12 @@ def _hours(v: Any) -> float:
     return float(v)
 
 
-BINDS = ("The user endpoint config bounds loam's pool — at most max_blocks blocks at once, each its nodes for its "
-         "walltime — and nothing else does: once loam holds this record hpc-bridge does not police the endpoint, "
-         "count its spend or stop it at expires_at (loam's preflight must refuse an expired record). The config's "
-         "worker_init is loam's own code and runs as shell in the canary's block and in every block of loam's pool, "
-         "by design. Any task loam runs can submit scheduler jobs of its own; a hard cap needs the site (an sbank "
-         "suballocation, a Slurm GrpTRESMins).")
+BINDS = ("The user endpoint config bounds the consumer's pool — at most max_blocks blocks at once, each its nodes for "
+         "its walltime — and nothing else does: once the consumer holds this record hpc-bridge does not police the "
+         "endpoint, count its spend or stop it at expires_at (the consumer's preflight must refuse an expired "
+         "record). The config's worker_init is the consumer's own code and runs as shell in the canary's block and in "
+         "every block of the consumer's pool, by design. Any task the consumer runs can submit scheduler jobs of its "
+         "own; a hard cap needs the site (an sbank suballocation, a Slurm GrpTRESMins).")
 
 
 def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
@@ -873,9 +871,9 @@ def _task_id(fut: Any) -> str | None:
 def _ask_notice(terms: HandoffTerms, plan: Plan) -> str:
     return (f"Nothing was sent. Exporting this handoff runs ONE billed canary with exactly this config (the "
             f"`user_endpoint_config` above) — up to {terms.canary_worst_case:g} {terms.unit} — and then hands the "
-            f"endpoint to loam: until the record expires ({terms.expires_hours:g} h after the yes) its pool can bill "
-            f"up to {terms.worst_case:g} {terms.unit} ({terms.basis}). {terms.binds} Ask the user; on their yes call "
-            "export_handoff again with the same config and confirm_spend=True.")
+            f"endpoint to its consumer: until the record expires ({terms.expires_hours:g} h after the yes) its pool "
+            f"can bill up to {terms.worst_case:g} {terms.unit} ({terms.basis}). {terms.binds} Ask the user; on their "
+            "yes call export_handoff again with the same config and confirm_spend=True.")
 
 
 async def export(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = DEFAULT_EXPIRES_H,
@@ -1114,9 +1112,6 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
                                      identity=seen.worker_user, remaining_s=seen.worker_remaining_s,
                                      workers=seen.worker_count, queue_checks=checks),
         release=release_of(plan, job, seen.worker_user),
-        loam=HandoffLoam(env={"HPC_GLOBUS_ENDPOINT_ID": pend.eid,
-                              "HPC_ENDPOINT_CONFIG_JSON": json.dumps(plan.wire, sort_keys=True),
-                              "HPC_NNODES": str(terms.nodes_per_block), "HPC_SYSTEM": system}),
     )
     path = _write(rec)
     app.handoffs.pop(pend.key, None)
@@ -1127,9 +1122,10 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
     return HandoffResult(phase="exported", record=rec, path=str(path), task_id=pend.task_id, terms=terms,
                          user_endpoint_config=dict(plan.wire), notice=(
                              f"Exported {rid} to {path}: the canary ran on job {job or '(unknown)'}"
-                             f"{f' on {host}' if host else ''}. Loam reads the record (its loam.env for set_env.sh, "
-                             f"quoting each value itself); it expires at {rec.expires_at}. {terms.binds} The end that "
-                             f"works: {' '.join(rec.release.steps)}"))
+                             f"{f' on {host}' if host else ''}. The consumer reads the record (the endpoint id, the "
+                             "config, the nodes and the facility map to its own settings; any shell file it writes "
+                             f"from them quotes each value); it expires at {rec.expires_at}. {terms.binds} The end "
+                             f"that works: {' '.join(rec.release.steps)}"))
 
 
 def release_of(plan: Plan, job: str | None, user: str | None) -> HandoffRelease:
@@ -1157,7 +1153,8 @@ def release_of(plan: Plan, job: str | None, user: str | None) -> HandoffRelease:
                  "teardown_endpoint stops the manager and every user endpoint it runs, this one included.")
         steps.append(scope)
     else:
-        scope = ("hpc-bridge does not police this user endpoint once loam holds the record: its stop_endpoint names "
+        scope = ("hpc-bridge does not police this user endpoint once the consumer holds the record: its stop_endpoint "
+                 "names "
                  "this handoff and this release, and stops nothing of it (a facility's endpoint gives hpc-bridge no "
                  "cancel channel).")
     return HandoffRelease(min_blocks=int(f["min_blocks"]), ends_by_itself=int(f["min_blocks"]) == 0,
@@ -1270,24 +1267,26 @@ def _named(items: list[Live]) -> str:
             parts.append(f"a handoff still validating (its canary, task {it.ref.task_id or '(no id yet)'}, is out)")
         else:
             jobs = f", block job {', '.join(it.ref.jobs)}" if it.ref.jobs else ""
-            parts.append(f"{it.ref.handoff_id} (loam's pool, user endpoint {it.ref.uep_id_seen or 'unknown'}{jobs}, "
+            parts.append(f"{it.ref.handoff_id} (the consumer's pool, user endpoint {it.ref.uep_id_seen or 'unknown'}"
+                         f"{jobs}, "
                          f"its record expires {it.ref.expires_at})")
     return "; ".join(parts)
 
 
 def question(app: AppCtx, items: list[Live], *, op: Literal["stop", "teardown"]) -> EndpointStatus:
-    """A stop or teardown on an endpoint hpc-bridge stood up, with a loam handoff of it unexpired: ask first, change
+    """A stop or teardown on an endpoint hpc-bridge stood up, with a handoff of it unexpired: ask first, change
     nothing."""
     tool = "stop_endpoint" if op == "stop" else "teardown_endpoint"
-    what = ("A stop with handoffs=\"cancel\" cancels loam's blocks too (and its user endpoint then exits once idle); "
-            "with handoffs=\"keep\" it releases only this session's block and leaves loam's user endpoint running "
-            "(the answer is then draining, naming it)." if op == "stop" else
-            "A teardown stops this endpoint's manager and every user endpoint it runs — loam's included, ending its "
-            "pool: teardown_endpoint(handoffs=\"cancel\") does that. To keep loam's pool, do not tear down: "
-            "stop_endpoint(handoffs=\"keep\") releases only this session's block.")
+    what = ("A stop with handoffs=\"cancel\" cancels the consumer's blocks too (and its user endpoint then exits once "
+            "idle); with handoffs=\"keep\" it releases only this session's block and leaves the consumer's user "
+            "endpoint running (the answer is then draining, naming it)." if op == "stop" else
+            "A teardown stops this endpoint's manager and every user endpoint it runs — the consumer's included, "
+            "ending its pool: teardown_endpoint(handoffs=\"cancel\") does that. To keep the consumer's pool, do not "
+            "tear down: stop_endpoint(handoffs=\"keep\") releases only this session's block.")
     return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                           handoffs=[it.ref for it in items], notice=(
-                              f"Nothing was done: this endpoint has a loam handoff — {_named(items)}. {what} Ask the "
+                              f"Nothing was done: this endpoint was handed off (export_handoff) — {_named(items)}. "
+                              f"{what} Ask the "
                               f"user, then call {tool}(handoffs=\"cancel\")"
                               + (" or stop_endpoint(handoffs=\"keep\")." if op == "stop" else ".")))
 
@@ -1319,9 +1318,9 @@ def mep_note(items: list[Live]) -> str:
     lines = []
     for it in items:
         if it.record is not None:
-            lines.append(f"{it.ref.handoff_id} (loam's, record expires {it.ref.expires_at}): hpc-bridge does not stop "
-                         f"it — {' '.join(it.record.release.steps)}")
+            lines.append(f"{it.ref.handoff_id} (the consumer's, record expires {it.ref.expires_at}): hpc-bridge does "
+                         f"not stop it — {' '.join(it.record.release.steps)}")
         else:
             lines.append(f"a handoff still validating: its canary (task {it.ref.task_id or '(no id yet)'}) is queued "
                          "on the facility's endpoint and starts a block to run once; nothing here can cancel it")
-    return "Loam handoffs of this endpoint: " + " | ".join(lines)
+    return "Handoffs of this endpoint (export_handoff): " + " | ".join(lines)
