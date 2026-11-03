@@ -11,6 +11,9 @@ Sources, re-read on every /status.json request:
   agentic/runs/sweep-<stamp>.md                    plan lines "## <profile> [<op>] — HH:MM — a,b,c" (every stamp >= --since)
   agentic/runs/sweep-<stamp>-<profile>-<op>.log    live "▶ start <scen> ·" and "✓/✗ done <scen> · … — RESULT: …" lines
   the --baseline sweep's summary                   each cell's earlier result, for a cell-by-cell comparison
+  agentic/scenarios/<scen>.py                      what each cell tests (its SUMMARY, else its docstring's first
+                                                   paragraph; parsed, never imported), shown on hover and with failures
+  agentic/harness/returning_cells.tsv              a returning-user cell's factor levels
 """
 from __future__ import annotations
 
@@ -41,6 +44,59 @@ def _kind(res: str) -> str:
 def _detail(res: str) -> str:
     m = re.search(r"critical checks broke: \[(.*?)\]", res)
     return m.group(1).replace("'", "") if m else res.split("—", 1)[-1].strip() if "—" in res else ""
+
+
+_ABOUT: dict[Path, tuple[float, str]] = {}   # scenario file -> (mtime, its one line): re-read only when it changes
+_CELL = re.compile(r"^c\d+$")
+
+
+def _about_file(path: Path) -> str:
+    """A scenario's one line, read without importing it: its SUMMARY constant, else its docstring's first paragraph."""
+    import ast
+    try:
+        mtime = path.stat().st_mtime
+    except OSError:
+        return ""
+    if path in _ABOUT and _ABOUT[path][0] == mtime:
+        return _ABOUT[path][1]
+    text = ""
+    try:
+        mod = ast.parse(path.read_text(errors="replace"))
+        for node in mod.body:
+            if (isinstance(node, ast.Assign) and any(isinstance(t, ast.Name) and t.id == "SUMMARY" for t in node.targets)
+                    and isinstance(node.value, ast.Constant) and isinstance(node.value.value, str)):
+                text = node.value.value
+                break
+        if not text:
+            text = (ast.get_docstring(mod) or "").split("\n\n", 1)[0]
+    except (SyntaxError, ValueError):
+        text = ""
+    text = " ".join(text.split())
+    text = text if len(text) <= 260 else text[:257] + "…"
+    _ABOUT[path] = (mtime, text)
+    return text
+
+
+def context(repo: Path, scen: str) -> str:
+    """What a cell tests, for the dashboard: its scenario's one line. A returning-user cell (`returning_user c07`) adds
+    its factor levels from agentic/harness/returning_cells.tsv; an ablation (`x (ablation)`) is its scenario's line."""
+    words = scen.split()
+    if not words or not re.fullmatch(r"\w+", words[0]):
+        return ""
+    about = _about_file(repo / "agentic" / "scenarios" / f"{words[0]}.py")
+    if len(words) > 1 and _CELL.match(words[1]):
+        tsv = repo / "agentic" / "harness" / "returning_cells.tsv"
+        try:
+            rows = [r.split("\t") for r in tsv.read_text(errors="replace").splitlines() if r and not r.startswith("#")]
+        except OSError:
+            rows = []
+        if rows:
+            head = rows[0]
+            cell = next((r for r in rows[1:] if r and r[0] == words[1]), None)
+            if cell:
+                levels = " · ".join(f"{k}={v}" for k, v in zip(head[1:], cell[1:], strict=False))
+                about = f"{about} — cell {words[1]}: {levels}" if about else f"cell {words[1]}: {levels}"
+    return about
 
 
 def baseline(runs: Path, stamp: str | None) -> dict:
@@ -95,7 +151,7 @@ def status(repo: Path, since: str, base: dict, profiles: list[str], until: str =
         for op in ops:
             g = groups.get((prof, op))
             if g:
-                cols[op] = [{"scen": s, **c, "base": base.get(f"{prof}|{op}|{s}")}
+                cols[op] = [{"scen": s, **c, "base": base.get(f"{prof}|{op}|{s}"), "about": context(repo, s)}
                             for s, c in g["cells"].items()]
         rows.append({"profile": prof, "ops": cols})
     try:
@@ -141,7 +197,8 @@ font-size:12px;font-weight:700;color:#fff;cursor:default}.c.PENDING{background:v
 .c.chg::after{content:"";position:absolute;top:-3px;right:-3px;width:7px;height:7px;border-radius:50%;background:var(--ink);border:2px solid var(--card)}
 @keyframes p{50%{opacity:.55}}.ns{color:var(--mute);font-size:13px}
 #tip{position:fixed;pointer-events:none;background:var(--card);color:var(--ink);border:1px solid var(--line);border-radius:8px;padding:8px 10px;
-font-size:13px;max-width:340px;box-shadow:0 4px 16px rgba(0,0,0,.18);display:none;z-index:9}#tip .k{color:var(--ink2)}
+font-size:13px;max-width:380px;box-shadow:0 4px 16px rgba(0,0,0,.18);display:none;z-index:9}#tip .k{color:var(--ink2)}
+#tip .d,ul.f .d{display:block;color:var(--ink2);font-size:12px;margin:2px 0 4px}
 ul.f{margin:6px 0 0;padding-left:18px}ul.f li{margin:3px 0}ul.f code{font-size:12px;color:var(--ink2)}
 @media (max-width:640px){th.opn{display:none}td.p{display:block;width:auto;border-top:1px solid var(--line)}tr td.o{display:block;border-top:0;padding-top:2px}
 td.o::before{content:attr(data-op);display:block;color:var(--ink2);font-size:12px;margin-bottom:2px}}
@@ -175,10 +232,10 @@ document.getElementById("hd").innerHTML=`<th>Profile</th>`+d.ops.map(o=>`<th cla
 document.getElementById("grid").innerHTML=d.rows.map(r=>`<tr><td class="p">${esc(r.profile)}</td>`+d.ops.map(op=>{const cs=r.ops[op];
 if(!cs)return`<td class="o" data-op="${esc(op)}"><span class="ns">not started</span></td>`;
 return`<td class="o" data-op="${esc(op)}"><div class="cells">`+cs.map(c=>{const s=k(c.state),chg=c.base&&(s==="OK"||s==="FAILED"||s==="INFRA")&&c.base!==s;
-const t=`<b>${esc(c.scen)}</b><br><span class="k">${esc(r.profile)} · ${esc(op)}</span><br>${K[s][1]}${c.detail?`: ${esc(c.detail)}`:""}${c.base?`<br><span class="k">baseline: ${esc(c.base)}</span>`:""}`;
+const t=`<b>${esc(c.scen)}</b>${c.about?`<span class="d">${esc(c.about)}</span>`:"<br>"}<span class="k">${esc(r.profile)} · ${esc(op)}</span><br>${K[s][1]}${c.detail?`: ${esc(c.detail)}`:""}${c.base?`<br><span class="k">baseline: ${esc(c.base)}</span>`:""}`;
 return`<span class="c ${s}${chg?" chg":""}" role="img" aria-label="${esc(c.scen)}: ${K[s][1]}" data-tip="${esc(t)}">${K[s][0]}</span>`}).join("")+`</div></td>`}).join("")+`</tr>`).join("");
 const f=d.rows.flatMap(r=>Object.entries(r.ops).flatMap(([op,cs])=>cs.filter(c=>c.state==="FAILED"||c.state==="INFRA").map(c=>({...c,op,p:r.profile}))));
-document.getElementById("fails").innerHTML=f.length?f.map(c=>`<li>${c.state==="FAILED"?"✗":"!"} <b>${esc(c.p)}</b> · ${esc(c.op)} · ${esc(c.scen)}${c.base?` <code>(baseline ${esc(c.base)})</code>`:""}${c.detail?`<br><code>${esc(c.detail)}</code>`:""}</li>`).join(""):"<li>none yet</li>"}
+document.getElementById("fails").innerHTML=f.length?f.map(c=>`<li>${c.state==="FAILED"?"✗":"!"} <b>${esc(c.p)}</b> · ${esc(c.op)} · ${esc(c.scen)}${c.base?` <code>(baseline ${esc(c.base)})</code>`:""}${c.about?`<span class="d">${esc(c.about)}</span>`:""}${c.detail?`<br><code>${esc(c.detail)}</code>`:""}</li>`).join(""):"<li>none yet</li>"}
 tick();setInterval(tick,5000);
 </script></body></html>"""
 
