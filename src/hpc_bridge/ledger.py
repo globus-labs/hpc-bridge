@@ -7,7 +7,7 @@ attempt, Globus task id and settlement, the lease that makes one process the bat
 the configs a stop or a reap retired.
 
 - **Local filesystems only.** WAL does not work on a network filesystem, and the state dir is on NFS / Lustre / GPFS
-  on login nodes and beside loam: `open` refuses one by its type (`fs_type`), naming HPC_BRIDGE_STATE_DIR.
+  on login nodes and beside an orchestrator: `open` refuses one by its type (`fs_type`), naming HPC_BRIDGE_STATE_DIR.
 - **One admission point.** `reserve` checks the lease holder, the retired configs and the window in ONE
   `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt.
 - **One owner per batch.** A lease row (host, pid, the process's start time, heartbeat). A takeover needs a stale

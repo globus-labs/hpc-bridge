@@ -9,7 +9,13 @@ from pathlib import Path
 HERE = Path(__file__).resolve().parent
 # batch phase 1's scripted cells on `default`, once per sweep with no model (sweep_profiles.sh batch_cells)
 BATCH_DEFAULT = ["batch_crosses_walltime", "batch_restart_resume", "batch_two_servers_one_ledger",
-                 "batch_block_reaped_midrun", "batch_big_output", "batch_abort_midrun"]
+                 "batch_block_reaped_midrun", "batch_big_output", "batch_abort_midrun",
+                 # batch phase 2a's scripted cells and 2b's SSH handoff, after their live proofs (2026-11-02)
+                 "job_array_terms", "envelope_new_session_reasks", "envelope_ceiling_sums", "envelope_bypass_counted",
+                 "meter_missing_from_sacct_full_walltime", "envelope_leftover_held", "envelope_stop_races_submit",
+                 "hand_sbatch_adopted", "handoff_ssh_shape"]
+BATCH_SITE, BATCH_PBS = ["site_backstop_grptresmins"], ["hand_submit_gated_adopted"]
+BATCH_PBS_MEP = ["handoff_polaris_shape", "handoff_mep_min_blocks_refused"]
 sys.path.insert(0, str(HERE))
 import targets  # noqa: E402
 
@@ -258,6 +264,18 @@ def test_paid_only_runs_the_claude_operator_on_paid_cells_and_never_boots_a_prof
     assert "## lmod — SKIPPED (--paid-only: no paid_only() cell here; not booted)" in summary
 
 
+def test_the_batch_phases_scripted_cells_run_on_their_own_profiles():
+    """Batch phases 1, 2a and 2b, after their live proofs (2026-11-02): each scripted cell once per sweep, on the
+    profile it needs — and the two 2a agent cells in default's agent wave, the free operators' too."""
+    m = re.search(r"^batch_cells\(\) \{.*?\n\}", SWEEP.read_text(), re.S | re.M)
+    assert m, "sweep_profiles.sh lost its batch_cells()"
+    got = {p: s.split() for p, s in re.findall(r'^\s+(\w+)\)\s+echo "([\w ]+)" ;;', m.group(0), re.M)}
+    assert got == {"default": BATCH_DEFAULT, "site": BATCH_SITE, "pbs": BATCH_PBS, "mep": ["mep_batch_fanout"],
+                   "pbs_mep": BATCH_PBS_MEP}, got
+    paid = set(_paid_only())
+    assert {"job_promote_track_cancel", "envelope_exhausted"} <= set(_cells()["default"]) - paid
+
+
 def test_paid_only_refuses_a_free_operator(tmp_path):
     r, calls, _, _ = _sweep(tmp_path / "a", "--paid-only", "--operators", "pi", "--profiles", "default")
     assert r.returncode == 2 and "only the claude operator" in r.stdout and not calls
@@ -312,6 +330,7 @@ def test_the_held_and_failed_details_paths_run_once_per_sweep_under_the_script_o
     assert r.returncode == 0, r.stdout + r.stderr
     scripted = [(c["argv"], c["profile"]) for c in calls if c["tool"] == "run_smoke" and c["operator"] == "script"]
     assert scripted == [("polaris_filesystems", "polaris"), ("lmod_bootstrap", "lmod"),
+                        *((b, "site") for b in BATCH_SITE),
                         ("stale_login_pin", "site"), ("kept_entry_after_failure", "site")]
     assert "    [script] polaris_filesystems (script) — RESULT: OK" in summary
     assert any((root / "agentic" / "runs").glob("sweep-*-polaris-script-polaris_filesystems.log"))

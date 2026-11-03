@@ -817,7 +817,7 @@ async def test_status_and_cancel_read_job_and_envelope_ids_and_refuse_others(wor
     unknown = await server._cancel(world.app, "env-000000000000", "abort")
     assert unknown.status == "refused", unknown
     names = {t.name for t in await server.mcp.list_tools()}
-    assert "submit_job" in names and len(names) == 16, sorted(names)
+    assert "submit_job" in names and len(names) == 17, sorted(names)   # 17: phase 2b's export_handoff
 
 
 def test_minimum_charges_are_a_catalog_fact():

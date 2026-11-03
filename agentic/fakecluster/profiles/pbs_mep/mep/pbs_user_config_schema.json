@@ -12,6 +12,7 @@
     "nodes_per_block": {"type": "integer", "minimum": 1, "maximum": 2},
     "cpus_per_node": {"type": "integer", "minimum": 1, "maximum": 4},
     "max_workers_per_node": {"type": "integer", "minimum": 1, "maximum": 4},
+    "available_accelerators": {"type": "integer", "minimum": 1, "maximum": 4},
     "max_idletime": {"type": "number", "minimum": 30, "maximum": 3600},
     "init_blocks": {"type": "integer", "minimum": 0, "maximum": 2},
     "min_blocks": {"type": "integer", "minimum": 0, "maximum": 1},
