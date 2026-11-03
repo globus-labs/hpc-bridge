@@ -57,6 +57,33 @@ def test_a_started_cell_is_running_until_its_result_and_a_bound_keeps_one_sweep(
     assert [r["profile"] for r in st["rows"]] == ["default"]   # the bound left pbs's sweep out
 
 
+def test_each_cell_says_what_it_tests_from_its_scenario_file(tmp_path):
+    repo = _repo(tmp_path)
+    scen = repo / "agentic" / "scenarios"
+    scen.mkdir()
+    (scen / "a.py").write_text('"""a — the long story."""\nSUMMARY = ("first half, "\n           "second half")\n')
+    (scen / "b.py").write_text('"""b: what it checks,\nover two lines.\n\nMore detail."""\nX = 1\n')
+    (scen / "c.py").write_text("raise SystemExit('never imported')\nSUMMARY = 'c line'\n")
+    st = sweep_dash.status(repo, "20261021-0945", {}, ["default"])
+    cells = {c["scen"]: c for c in st["rows"][0]["ops"]["pi"]}
+    assert cells["a"]["about"] == "first half, second half"            # a parenthesised SUMMARY, joined
+    assert cells["b"]["about"] == "b: what it checks, over two lines."   # no SUMMARY: the docstring's first paragraph
+    assert cells["c"]["about"] == "c line"                             # read, never run
+    assert cells["spend_gate_enforced (ablation)"]["about"] == ""        # no such scenario file here
+
+
+def test_a_returning_user_cell_names_its_factor_levels(tmp_path):
+    (tmp_path / "agentic" / "scenarios").mkdir(parents=True)
+    (tmp_path / "agentic" / "harness").mkdir(parents=True)
+    (tmp_path / "agentic" / "scenarios" / "returning_user.py").write_text('SUMMARY = "returning user"\n')
+    (tmp_path / "agentic" / "harness" / "returning_cells.tsv").write_text(
+        "# generated\nid\torigin\tended\nc01\tcurrent\trunning\nc02\tprevious\tkilled_recent\n")
+    assert sweep_dash.context(tmp_path, "returning_user c02") == \
+        "returning user — cell c02: origin=previous · ended=killed_recent"
+    assert sweep_dash.context(tmp_path, "returning_user c99") == "returning user"
+    assert sweep_dash.context(tmp_path, "../etc/passwd") == ""            # only a plain scenario name is looked up
+
+
 def test_the_grid_rows_follow_sweep_profiles_sh(tmp_path):
     assert sweep_dash.default_profiles(_repo(tmp_path)) == "default,pbs"
     assert sweep_dash.default_profiles(tmp_path / "nowhere") == "default"
