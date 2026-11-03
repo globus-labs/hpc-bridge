@@ -115,6 +115,12 @@ Two ways to reach the login node:
 - **From the host** (an interactive Claude Code session, `uv run hpc-bridge`): append
   `ssh_config.example` to `~/.ssh/config` (alias `hpcb-fake` → `localhost:2222`, user
   `hpcbridge-test-00`, the test key, host-key pinning off), then `HPC_BRIDGE_SSH_HOST=hpcb-fake`. hpc-bridge's `SshTarget` has no port field — the alias is what carries the port.
+- **To try the batch workflow by hand** (Claude Code driving this checkout as a plugin): `bin/try_batch.sh`
+  brings the `default` profile up, adds the `hpcb-fake` alias to `~/.ssh/config` with your yes, and writes a set of
+  prompts to `~/hpcb-batch-demo/PROMPTS.md`: connect, a block, `run_batch`, an abort, a `submit_job` array under an
+  envelope, a gated hand `sbatch`, the stop, `export_handoff`, teardown. `--launch` starts
+  `claude --plugin-dir <repo>` in that folder, outside the repo, so `.claude/settings.local.json` doesn't apply.
+  `--down` wipes the cluster.
 - **From a container** (the agentic jail, the stretch driver): join the network
   (`docker run --network hpcb-fake_default …`) and use `HPC_BRIDGE_SSH_HOST=login` on port 22 — no
   alias, no port mapping. This is how `bin/stretch.sh` does it.
