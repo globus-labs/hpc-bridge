@@ -5,6 +5,8 @@
 #   agentic/fakecluster/bin/up.sh            # first run builds the image (~2-4 min)
 #   HPCB_FAKE_SSH_PORT=2223 …/up.sh          # if 2222 is taken
 #   HPCB_FAKE_KEY=~/.ssh/other …/up.sh       # a different (host-side) test key path
+#   …/up.sh --profile site --topology vip    # a network topology too (README "Topologies"; HPCB_FAKE_TOPOLOGY)
+#   HPCB_FAKE_PROJECT=hpcb-topo HPCB_FAKE_SSH_PORT=2242 HPCB_FAKE_SSH_PORT2=2243 …/up.sh   # a second stack beside the first
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 # shellcheck disable=SC1091
@@ -28,6 +30,6 @@ if [ -n "${PROFILE_CATALOG_CMD:-}" ] && [ -z "${HPCB_MEP_EMAIL:-}" ]; then
 fi
 
 cd "$HERE"
-echo "fake cluster: profile '$PROFILE' ($PROFILE_NODES compute nodes; login: $PROFILE_LOGIN_HOSTS)${PROFILE_CATALOG_CMD:+; facility MEP (gce $HPCB_MEP_GCE_VERSION)}"
+echo "fake cluster: profile '$PROFILE' ($PROFILE_NODES compute nodes; login: $PROFILE_LOGIN_HOSTS)${PROFILE_CATALOG_CMD:+; facility MEP (gce $HPCB_MEP_GCE_VERSION)}; topology $TOPOLOGY${HPCB_FAKE_PROJECT:+; project $HPCB_FAKE_PROJECT}"
 "${COMPOSE[@]}" up -d --build --remove-orphans
-exec "$HERE/bin/wait-for-cluster.sh" --profile "$PROFILE"
+exec "$HERE/bin/wait-for-cluster.sh" --profile "$PROFILE" --topology "$TOPOLOGY"

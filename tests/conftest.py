@@ -63,6 +63,21 @@ def _no_dns_in_unit_tests(monkeypatch):
 
 
 @pytest.fixture(autouse=True)
+def _no_client_view_in_unit_tests(monkeypatch, request):
+    """The login-node pin reads the CLIENT's view: its ssh config (`ssh -G`, `remote._ssh_config`) and which hosts take
+    a TCP connection on the alias's port (`remote._tcp_answers`, 2026-11-03). Unit tests must depend on neither the
+    developer's ~/.ssh/config nor the network: no host has an ssh-config block (a name is its own HostName, port 22) and
+    every host answers, so the pin's other rules are what is under test. A test that models the client itself (a fake
+    `ssh` on PATH, a fake `socket.create_connection`) is marked `client_view`."""
+    if request.node.get_closest_marker("client_view"):
+        return
+    from hpc_bridge.facility import remote
+
+    monkeypatch.setattr(remote, "_ssh_config", lambda host: {})
+    monkeypatch.setattr(remote, "_tcp_answers", lambda host, port, timeout_s=3.0: True)
+
+
+@pytest.fixture(autouse=True)
 def _no_startup_pin_leaks(monkeypatch):
     """`binding._PINNED` remembers what HPC_BRIDGE_MACHINE resolved to at a startup pin (process-wide in the server), and
     `_PINNED_ORIGIN` where its default terms came from: each test starts with none, so a pin one test made never names a

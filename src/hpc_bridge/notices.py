@@ -929,7 +929,7 @@ def _needs_preauth_result(facility: str, target, *, otp_ok: bool = False) -> Con
                                      notice=_multiplexing_off_notice(target.host))
     cmd = target.preauth_command()
     pinned = ""
-    alias = getattr(target, "host_key_alias", None)
+    alias = getattr(target, "ssh_alias", None) or getattr(target, "host_key_alias", None)  # the name the user gave
     if alias and alias != target.host:
         pinned = (f"The endpoint runs on login node {target.host} (the facility placed it there); the code opens a "
                   f"shared connection to that node itself, not to {alias} — one code per session, not per command. ")

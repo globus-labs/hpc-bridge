@@ -69,6 +69,17 @@ if [ "$(echo "$PROFILE_LOGIN_HOSTS" | wc -w | tr -d ' ')" -ge 2 ]; then
   done
   say "ssh OK: $("${SSH2[@]}" 'echo "$(whoami)@$(hostname -f)"')  (round-robin name: login)"
 fi
+if [ -n "${TOPOLOGY_SERVICE:-}" ]; then
+  # the topology's own way in (bastion's sshd, the vip's proxy to sshd): an SSH banner through it, read from the login
+  # node, which shares the cluster network with it
+  say "waiting for the $TOPOLOGY topology's $TOPOLOGY_SERVICE (an SSH banner on :22)…"
+  until "${COMPOSE[@]}" exec -T login bash -c "exec 3<>/dev/tcp/$TOPOLOGY_SERVICE/22 && timeout 5 head -c 4 <&3" 2>/dev/null \
+      | grep -q '^SSH-'; do
+    [ "$(left)" -gt 0 ] || { say "TIMEOUT — $TOPOLOGY_SERVICE logs:"; "${COMPOSE[@]}" logs --tail=30 "$TOPOLOGY_SERVICE"; exit 1; }
+    sleep 2
+  done
+  say "$TOPOLOGY_SERVICE answers with sshd's banner"
+fi
 if [ -n "${PROFILE_CATALOG_CMD:-}" ]; then
   say "waiting for the facility MEP(s) to register (catalog: $PROFILE_CATALOG_CMD)…"
   until out="$(eval "$PROFILE_CATALOG_CMD" 2>/dev/null)" && [ -n "$out" ]; do

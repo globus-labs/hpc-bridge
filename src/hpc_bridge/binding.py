@@ -78,7 +78,9 @@ def _ssh_config_user(host: str) -> str:
 def _slurm_facility(profile, *, alias: str, user: str, auth_method: str = "ssh-key") -> Facility:
     """Wire a Slurm `MachineProfile` into a `SlurmFacility` over SSH — shared by the catalog
     and the hardcoded-Anvil paths."""
-    from .facility.remote import RemoteEndpointCLI, SlurmFacility, SshTarget, _routable_pin
+    from dataclasses import replace
+
+    from .facility.remote import RemoteEndpointCLI, SlurmFacility, SshTarget, _alias_answers, _routable_pin, _ssh_route
     from .state import LoginNodeStore
 
     control_dir, persist = config._control_settings()  # multiplex all SSH over one ControlMaster (MFA-once)
@@ -93,12 +95,24 @@ def _slurm_facility(profile, *, alias: str, user: str, auth_method: str = "ssh-k
     cli = RemoteEndpointCLI(target, profile.env_setup)
     store = LoginNodeStore()
     rec = store.get(alias=alias, name=profile.endpoint_name)
-    pin = _routable_pin(rec.login_host) if rec is not None else None
-    if pin is not None:  # reconnect direct-to-node (routable pins only) instead of the round-robin alias
-        # An internal-only pin (e.g. Midway's beagle3-tbd1.rcc.local) is dropped -> stay on the alias.
-        # A routable-but-dead pin fails fast (BatchMode) -> CANNOT REACH, and connect_facility then DROPS
-        # the pin (_drop_dead_pin) so the next attempt resolves the canonical host again.
-        cli.rebind(pin)
+    if rec is not None and rec.login_host:
+        # A recorded pin is checked again, from HERE, on the alias's own path (`_routable_pin`): it may predate the
+        # check (a NAT address pinned before 2026-11-03), or the node may have gone. A usable one pins the node the
+        # manager runs on, as a HostName override on the alias, instead of the round-robin alias.
+        route = _ssh_route(alias)
+        pin = _routable_pin(rec.login_host, route=route)
+        if pin is None and _alias_answers(route) is False:
+            # The alias's own host does not answer either: the CLIENT's outage (VPN off, no network), which no probe
+            # can see past. The recorded pin stays in use, as before the check (review 2): a reuse over the web needs
+            # no SSH, and a teardown once the network is back must still reach the node the manager runs on. Only the
+            # rules that need no network apply (no internal name, no address through a proxy).
+            pin = _routable_pin(rec.login_host, route=route, resolves=lambda h: True, answers=lambda h, p: True)
+        if pin is not None:
+            cli.rebind(pin, route)
+        else:
+            # Unusable from here while the alias's own host answers (or sits behind a proxy no probe reaches past): the
+            # pin is forgotten — the record kept, as it also says who placed the remote token store.
+            store.put(replace(rec, login_host=None))
     return SlurmFacility(profile, cli, store=store, alias=alias, auth_method=auth_method)
 
 def _unsupported_entry_reason(entry) -> str | None:

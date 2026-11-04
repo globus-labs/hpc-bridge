@@ -70,7 +70,7 @@ def test_registry_entry_with_a_bad_host_or_slug_is_refused():
 
 def test_rebind_to_a_pinned_node_keeps_the_trusted_name_as_host_key_alias(monkeypatch):
     # known_hosts is keyed by the RESOLVED HostName: an ssh-config alias resolves through `ssh -G` (live 2026-09-04)
-    monkeypatch.setattr(remote, "_resolved_hostname", lambda h: {"anvil": "anvil.rcac.purdue.edu"}.get(h, h))
+    monkeypatch.setattr(remote, "_ssh_config", lambda h: {"hostname": "anvil.rcac.purdue.edu"} if h == "anvil" else {})
     cli = RemoteEndpointCLI(SshTarget(host="anvil", user="u"), "true")
     cli.rebind("login04.anvil.rcac.purdue.edu")
     argv = cli.target.argv("true")
@@ -80,11 +80,13 @@ def test_rebind_to_a_pinned_node_keeps_the_trusted_name_as_host_key_alias(monkey
     assert "HostKeyAlias=anvil.rcac.purdue.edu" in cli.target.argv("true")
 
 
-def test_resolved_hostname_falls_back_to_the_name_itself(monkeypatch):
+@pytest.mark.client_view   # the real `ssh -G` reader, its subprocess failing
+def test_ssh_route_falls_back_to_the_name_itself(monkeypatch):
     import subprocess
 
     monkeypatch.setattr(subprocess, "run", lambda *a, **k: (_ for _ in ()).throw(FileNotFoundError("no ssh")))
-    assert remote._resolved_hostname("anvil") == "anvil"
+    route = remote._ssh_route("anvil")
+    assert (route.hostname, route.port, route.proxied) == ("anvil", 22, False)   # as ssh would: the name, port 22
 
 
 # ---- the user's paste-and-run line is quoted (A4 / C-9) --------------------------------------------------------

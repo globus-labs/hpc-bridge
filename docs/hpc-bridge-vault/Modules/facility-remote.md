@@ -26,6 +26,13 @@
 
 > [!warning] Login-node pinning
 > The manager lives on ONE login node, but HPC SSH aliases round-robin. `start` (`:708`) captures the FQDN *in the same SSH connection* that launches the daemon (a separate probe could resolve a different node), records it via [[state]]'s `LoginNodeStore`, and the CLI `rebind`s (`:912`) straight there next session. **`_routable_pin` (`:289`) first drops a FQDN that isn't reachable from the client** — an internal suffix (`.local`/`.internal`), a single label, or a **management-plane** name (`hostmgmt`/`cm`/`mgmt`/`ipmi`/`bmc` labels, e.g. Aurora's `aurora-uan-0009.hostmgmt.cm.aurora.alcf.anl.gov`) — falling back to the alias, so a non-routable pin can't break teardown/reconnect ([#33](https://github.com/globus-labs/hpc-bridge/pull/33)).
+>
+> **The client's vantage (2026-11-03).** Everything the login node says about itself — `hostname -f` (`HPCB_HOST`) and `$SSH_CONNECTION`'s server field (`HPCB_ADDR`) — is the NODE's view. Behind NAT, a port-forward, a ProxyJump bastion or a VIP that address is internal: a user driving the fake cluster from the host (`hpcb-fake` → `localhost:2222`, a Docker port-forward) got pinned to `172.20.0.7`, a Docker address the Mac cannot reach, and every later op failed. So `_routable_pin(host, addr, *, route)` is now the ONE gate between facility-side names and an ssh command, and it reads the alias's route as the client's ssh resolves it (`_ssh_route` → `SshRoute`, from `ssh -G`: HostName, Port, ProxyJump, ProxyCommand, HostKeyAlias):
+> - **Direct alias:** a name (after the suffix/label rules, and resolving here) or an address is pinned only if a TCP connect to `(candidate, the alias's port)` answers from the client (`_tcp_answers`, which has no default port). The Docker case: `172.20.0.7:2222` does not answer → no pin.
+> - **ProxyJump, or a ProxyCommand that reads `%h`:** no probe from here means anything. A name is pinned as a HostName override the proxy resolves; an address never. A ProxyCommand that ignores `%h` gets no pin at all (a HostName override would not steer it).
+> - **A pin overrides HostName only.** `rebind` keeps the alias as the ssh destination (`SshTarget.ssh_alias`) and adds `-o HostName=<pin>` to `argv`, `control_argv` and `preauth_argv`, so the alias's Port, User, ProxyJump and IdentityFile still apply; before, it replaced the destination and lost them. The key is checked against `HostKeyAlias=` the name known_hosts keeps the alias's key under (`SshRoute.known_hosts_name`: the alias's own HostKeyAlias, else its HostName, `[HostName]:port` off port 22). `%C` hashes the overridden HostName, so the pinned node still gets its own master, and `ssh -O` finds it.
+> - **A recorded pin is checked again on every facility build** (`binding._slurm_facility`): a usable one is rebound; an unusable one is cleared from the record (the record kept: `seeded_credentials`) when the alias's own host answers or sits behind a proxy. Through a client outage (the alias's own host does not answer either) it is kept AND still used, on the rules that need no network (review 2: a reuse over the web needs no SSH, and the teardown once the network is back must reach the manager's node). So a pin saved before this fix clears itself on the next connect, even one that reuses an online endpoint with zero SSH.
+> - `tests/test_login_pin_nat.py` holds the rules, and an AST scan (the vantage rule) fails any other path from `HPCB_HOST`/`HPCB_ADDR`, `start`'s report or a recorded `login_host` to `rebind`, an `SshTarget` or a re-pointing `replace`.
 
 > [!note] `select_options` — a PBS chunk's resources (2026-10-20)
 > `MachineProfile.select_options` (from the entry's `Defaults.select_options`: a cluster you bring sets it in `details=`, a registry PBS SSH entry may carry it) rides every task's config, and `_PBS_TEMPLATE`'s compute branch renders it as `select_options:` for parsl's `PBSProProvider`, which appends `:<select_options>` to its own `select=<nodes_per_block>:ncpus=<cpus_per_node>` — e.g. `select_options="ngpus=4"`, `cpus_per_node=64` → `#PBS -l select=1:ncpus=64:ngpus=4`. The node count stays hpc-bridge's (a `-l select=` line in scheduler_options is refused for it, [[binding]]). Only endpoints configured after this change render it: `adopt_endpoint` reads the published template (`takes_select_options`) and, where the profile carries select_options a template it READ does not render, sets `select_note` (metadata with no template says nothing either way: no note; review round 4, #7), which the connect says (teardown and connect again to apply them). The Slurm template has no such key.
@@ -90,7 +97,7 @@ did, the endpoint id).
 
 `_ensure_venv_past_a_dead_pin` now retries a check that does not reach the pin at all (`_UNREACHABLE`: ssh's
 connect-to-host verdicts, never a refused login) through the facility's own host. It re-targets the CLI to the alias
-with no HostKeyAlias, as before a pin; the venv is on the shared home.
+with no HostKeyAlias and no HostName override (`ssh_alias=None`), as before a pin; the venv is on the shared home.
 - The pin is dropped once that host answered: its check ran, or asked for the user's login. A host that does not
   answer either is the client's network (connect._drop_dead_pin's rule) and the pin is kept.
 - `_restart_past_a_dead_pin` then reads the pid file through that host. Refreshed within the stale window, the manager
@@ -148,7 +155,8 @@ user's own `ssh` trusts — OpenSSH's default refuses an unknown host under `Bat
 `~/.ssh/config` applies. An unknown/changed key surfaces as `UNKNOWN HOST KEY` (notices) with the remedy in the user's
 own terminal; while a pin is in use the pin is dropped like `CANNOT REACH`. A login-node PIN (`rebind`) sets
 `HostKeyAlias=<resolved HostName of the alias>` (via `ssh -G`, because known_hosts is keyed by the resolved name, found
-live) so a pin can never redirect the seeded credential to a machine whose key differs. `--` precedes the destination
+live; `[HostName]:port` off port 22 since 2026-11-03) so a pin can never redirect the seeded credential to a machine
+whose key differs. The pin is only a `-o HostName=` override on the alias (2026-11-03, above). `--` precedes the destination
 in every argv; hosts are allowlisted at the model boundary (`models.SAFE_HOST`) and again in `SshTarget.__post_init__`;
 `preauth_command` is shell-quoted. `teardown(wipe_credentials=True)` is what `teardown_endpoint` now calls.
 

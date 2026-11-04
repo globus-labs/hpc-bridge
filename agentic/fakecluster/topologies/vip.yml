@@ -1,0 +1,21 @@
+# Topology `vip` (agentic/harness/topology.py; up.sh --topology vip): a TCP proxy (haproxy, round-robin) on an `edge`
+# network the jail joins AND on the cluster's own network, fronting the profile's login node(s) on :22 — so the address
+# the jail connects to is no login node's own, and the node sees the proxy's address, not the client's. On `site` it
+# fronts both login nodes (login01/login02.hpcb.test). It also offers one port per node (:2201, :2202, … in
+# login_hosts order): the HARNESS' path to a given node for its teardown and per-node checks; the product is never told.
+# Layered last, on any profile's stack.
+services:
+  vip:
+    image: haproxy:2.8.31-alpine   # pinned: TCP mode only, nothing version-sensitive
+    hostname: vip
+    user: root                     # binds :22
+    entrypoint: ["/bin/sh", "/etc/hpcb/topology/vip-haproxy.sh"]
+    environment:
+      HPCB_VIP_BACKENDS: ${HPCB_VIP_BACKENDS:-login}
+    volumes:
+      - ./topologies/vip-haproxy.sh:/etc/hpcb/topology/vip-haproxy.sh:ro
+    networks: [default, edge]
+    depends_on: [login]
+    restart: unless-stopped
+networks:
+  edge: {}

@@ -531,8 +531,16 @@ async def test_discover_raises_runtimeerror_on_unreachable_host(monkeypatch):
         await discovery.discover_facility_details(SshTarget(host="midway", control_dir="/tmp/cm"))
 
 
+def _pin_via_a_standard_alias():
+    """`_routable_pin` on a direct port-22 alias (the route `ssh -G` reads; every host answers in the unit tier)."""
+    from functools import partial
+
+    from hpc_bridge.facility.remote import SshRoute, _routable_pin
+    return partial(_routable_pin, route=SshRoute("anvil.rcac.purdue.edu"))
+
+
 def test_routable_pin_drops_internal_hostnames():
-    from hpc_bridge.facility.remote import _routable_pin
+    _routable_pin = _pin_via_a_standard_alias()
     yes, no = (lambda h: True), (lambda h: False)
     assert _routable_pin("login03.anvil.rcac.purdue.edu", resolves=yes) == "login03.anvil.rcac.purdue.edu"  # external FQDN kept
     assert _routable_pin("beagle3-tbd1.rcc.local", resolves=yes) is None  # internal .local dropped (Midway, seen live)
@@ -552,7 +560,7 @@ def test_routable_pin_drops_management_plane_hostnames():
     # ALCF Aurora's `hostname -f` is a management-plane name (seen live) whose `hostmgmt.cm` infix isn't
     # routable through the bastion — pinning it would break teardown/reconnect. Drop it -> fall back to
     # the alias (which the user pins to a specific UAN in ~/.ssh/config).
-    from hpc_bridge.facility.remote import _routable_pin
+    _routable_pin = _pin_via_a_standard_alias()
     assert _routable_pin("aurora-uan-0009.hostmgmt.cm.aurora.alcf.anl.gov") is None  # Aurora, seen live
     assert _routable_pin("x.cm.polaris.alcf.anl.gov") is None                        # ALCF cluster-mgmt plane
     assert _routable_pin("n01.mgmt.example.gov") is None
