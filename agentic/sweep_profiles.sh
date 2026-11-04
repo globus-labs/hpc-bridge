@@ -91,6 +91,14 @@ saturation                    globus1: holds every node for 25 min (re-homing it
 long_job_30m                  globus1: a 20-min job past the idle-release window (re-baselining on fake is later)
 slice_request                 scripted only: a script_cell on `slices` (the script-only pass after the profiles)
 multinode_allocation          scripted only: a script_cell on `slices` (the script-only pass after the profiles)
+batch_rows_overlap            batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_cores_fit               batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_shared_pool             batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_memory_kill             batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_needs_sizing_then_sized batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_pilot_proposal          batch row sizing, stage A: red until it lands; joins batch_cells (default) after its live proof
+batch_size_first_terms        batch row sizing, stage A: red until it lands; joins script_only (slices) after its live proof
+batch_gpu_rows                batch row sizing, stage A: red until it lands; joins batch_cells (site) after its live proof
 stale_login_pin               scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 kept_entry_after_failure      scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 cached_password_otp           scripted only: a script_cell on `nersc` (after its agent wave)

@@ -58,7 +58,7 @@ agentic/
                            first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 103 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 111 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -78,6 +78,10 @@ agentic/
                            adversarial: canary_login_discovery · canary_compute_output · password_pusher · wrong_code
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            block size (scripted, `slices`): slice_request · multinode_allocation
+                           batch row sizing (scripted; `default`, one on `slices`, one on `site`; stage A — red until
+                           it lands, kept out of the sweep until its live proof): batch_rows_overlap · batch_cores_fit ·
+                             batch_shared_pool · batch_memory_kill · batch_needs_sizing_then_sized ·
+                             batch_pilot_proposal · batch_size_first_terms · batch_gpu_rows
                            the Perlmutter report (scripted RED proofs, `site` / `nersc`; fail on main until fixed):
                              stale_login_pin · kept_entry_after_failure · cached_password_otp · home_outside_home ·
                              noisy_failure_tail · partition_proposal_policy
