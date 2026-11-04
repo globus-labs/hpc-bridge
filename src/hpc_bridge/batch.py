@@ -33,6 +33,7 @@ from __future__ import annotations
 import asyncio
 import base64
 import copy
+import dataclasses
 import hashlib
 import json
 import os
@@ -46,6 +47,7 @@ from dataclasses import dataclass, field
 from typing import Any
 
 from . import session_shell, warmth
+from . import sizing as sz
 from .config import _parse_hhmmss, _task_ceiling_s
 from .context import AppCtx, ShapeRuntime, _has_login_shape
 from .ledger import (
@@ -62,13 +64,17 @@ from .ledger import (
 )
 from .models import (
     BatchCounts,
+    BatchSizing,
     BatchStatus,
     BatchTaskResult,
+    BlockFacts,
     BlockLeft,
     CancelResult,
     EndpointStatus,
     LedgerEntry,
     ShellOutcome,
+    SizingCandidate,
+    SizingProposal,
 )
 
 MARGIN_S = float(os.environ.get("HPC_BRIDGE_BATCH_MARGIN_S", "") or 30.0)
@@ -104,9 +110,22 @@ MARKER_WAIT_S = 30.0                   # how long a MEP cancel waits for its mar
 MARKER_MIN_REMAINING_S = 60.0          # a MEP block with less walltime left gets no marker task (it may be ending)
 RESULT_MARK = "HPCB_RESULT"
 CANCEL_MARKER = "CANCELLED"
+# The wrapper's own exit codes — ONE table. `why` in the result is the primary signal; a code is chosen out of 124–128
+# and 137 (timeout's, the shells' and the signals') except where it mirrors exactly what those mean:
+#   75  NO_SPACE_RC   too little free space in the results directory, before the claim (EX_TEMPFAIL); nothing ran
+#   76  NO_SLOT_RC    no free slot (CPUs / GPUs) on the node within the claim wait (batch row sizing); nothing ran
+#   86  (session_shell.WRONG_BLOCK_EXIT) the wrong-block guard: another block than the confirmed one; nothing ran
+#   87  MEMORY_RC     killed at the row's memory (`why: memory`, batch row sizing)
+#   124 TIMEOUT_RC    killed at task_walltime_s (`why: timeout`), as coreutils' timeout says it
+#   143 CANCEL_RC     killed by cancel(abort) (`why: cancelled`): 128 + SIGTERM
 CANCEL_RC = 143
 TIMEOUT_RC = 124
 NO_SPACE_RC = 75
+NO_SLOT_RC = 76
+MEMORY_RC = 87
+CLAIM_WAIT_S = 60                      # how long a row waits for a free slot on its node before it gives way
+SLOT_BUSY_BACKOFF_S = 15.0             # a row a busy slot sent back waits this long × the block's busy streak
+SLOT_BUSY_PAUSE = 3                    # consecutive busy rows on the block: the batch pauses, naming why
 
 _ID = re.compile(r"^batch-[0-9a-f]{12}$")
 # `{name}` — never `${name}`, which is the shell's own parameter expansion
@@ -811,7 +830,22 @@ fi
 if [ -e "$__hb_rd/@@CANCEL@@" ]; then
   echo @@CRC@@ > "$__hb_a/rc"; __hb_out ', "rc": @@CRC@@, "cancelled": true, "ran": false'; exit 0
 fi
+__hb_cpus=""; __hb_gids=""; __hb_lk=""; __hb_fd=20
+@@CLAIM@@
+__hb_oomc() {
+  [ -r /sys/fs/cgroup/cgroup.controllers ] || return 0
+  __hb_om=0; __hb_op=$(awk -F: '$1 == "0" {print $3}' /proc/self/cgroup 2>/dev/null)
+  while [ -n "$__hb_op" ] && [ "$__hb_op" != / ]; do
+    __hb_ov=$(awk '$1 == "oom_kill" {print $2}' "/sys/fs/cgroup$__hb_op/memory.events" 2>/dev/null)
+    case "$__hb_ov" in ''|*[!0-9]*) ;; *) [ "$__hb_ov" -gt "$__hb_om" ] && __hb_om=$__hb_ov;; esac
+    __hb_op=${__hb_op%/*}
+  done
+  echo "$__hb_om"
+}
+__hb_o0=$(__hb_oomc)
+__hb_t0=$(printf %s "${EPOCHREALTIME:-}" | tr , .)
 __hb_start=$(date +%s)
+[ -n "$__hb_t0" ] || __hb_t0=$__hb_start
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
@@ -835,18 +869,34 @@ set -m
 (
   export HPCB_ROW_INDEX=@@I@@ HPCB_ATTEMPT=@@N@@ HPCB_TASK_DIR="$__hb_a"
   @@SESSION@@
+  @@SLOTENV@@
   @@FIELDS@@
+  @@PIN@@
+  (env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc || getconf _NPROCESSORS_ONLN) 2>/dev/null | head -n 1 \
+    > "$__hb_a/.nproc"
+  trap 'times > "$__hb_a/.times"' EXIT
   eval "$(printf %s @@B64@@ | base64 --decode)"
 ) > "$__hb_f.o" 2> "$__hb_f.e" < /dev/null 3>&- 4>&- &
 __hb_c=$!
 set +m
+@@CLAIMED@@
 (
   __hb_dl=$((__hb_start + @@WALL@@))
+  __hb_pk=0; __hb_th=0; __hb_nl=""; [ -d /proc/self ] && __hb_nl="-o nlwp="
   while :; do
     sleep @@POLL@@
     if [ -e "$__hb_rd/@@CANCEL@@" ]; then echo cancelled > "$__hb_a/.why"; break; fi
     if [ "$(date +%s)" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
     kill -0 "$__hb_c" || exit 0
+    # the row's process group, summed: its RSS (kB) and, where ps tells, its threads
+    __hb_s=$(ps -A -o pgid= -o rss= $__hb_nl 2>/dev/null \
+      | awk -v g="$__hb_c" '$1 == g {r += $2; t += $3} END {printf "%d %d\n", r, t}')
+    __hb_r=${__hb_s% *}; __hb_t=${__hb_s#* }
+    case "$__hb_r" in ''|*[!0-9]*) __hb_r=0;; esac
+    case "$__hb_t" in ''|*[!0-9]*) __hb_t=0;; esac
+    if [ "$__hb_r" -gt "$__hb_pk" ]; then __hb_pk=$__hb_r; echo "$__hb_pk" > "$__hb_a/.peak"; fi
+    if [ "$__hb_t" -gt "$__hb_th" ]; then __hb_th=$__hb_t; echo "$__hb_th" > "$__hb_a/.threads"; fi
+    if [ -n "@@MEMKB@@" ] && [ "$__hb_r" -gt "0@@MEMKB@@" ]; then echo memory > "$__hb_a/.why"; break; fi
   done
   kill -TERM -- "-$__hb_c" || kill -TERM "$__hb_c"
   __hb_k=0
@@ -867,8 +917,26 @@ kill "$__hb_g"
 [ -s "$__hb_a/.stderr.tail" ] || tail -c @@ETAIL@@ "$__hb_a/stderr" > "$__hb_a/.stderr.tail"
 rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
 __hb_why=$(cat "$__hb_a/.why")
-case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; esac
+case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; memory) __hb_rc=@@MRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
+__hb_t1=$(printf %s "${EPOCHREALTIME:-}" | tr , .)
+[ -n "$__hb_t1" ] || __hb_t1=$(date +%s)
+__hb_wl=$(LC_ALL=C awk -v a="$__hb_t0" -v b="$__hb_t1" 'BEGIN {printf "%.3f", b - a}')
+__hb_cs=$(LC_ALL=C awk '{for (i = 1; i <= NF; i++) if (split($i, p, "m") == 2) s += p[1] * 60 + p[2]}
+  END {if (NR) printf "%.3f", s}' "$__hb_a/.times" 2>/dev/null)
+__hb_pk=$(cat "$__hb_a/.peak" 2>/dev/null); __hb_th=$(cat "$__hb_a/.threads" 2>/dev/null)
+__hb_np=$(cat "$__hb_a/.nproc" 2>/dev/null)
+__hb_o1=$(__hb_oomc); __hb_od=""
+case "$__hb_o0$__hb_o1" in ''|*[!0-9]*) ;; *) __hb_od=$((__hb_o1 - __hb_o0));; esac
+for __hb_v in __hb_pk __hb_th __hb_np __hb_od; do
+  eval "case \"\$$__hb_v\" in ''|*[!0-9]*) $__hb_v=null;; esac"
+done
+case "$__hb_wl" in ''|*[!0-9.]*) __hb_wl=null;; esac
+case "$__hb_cs" in ''|*[!0-9.]*) __hb_cs=null;; esac
+[ "$__hb_pk" = null ] && __hb_pk=0
+[ "$__hb_th" = 0 ] && __hb_th=null
+__hb_pn=false; [ -f "$__hb_a/.pinned" ] && __hb_pn=true
+@@RELEASE@@
 @@REMAINING@@
 __hb_ob=$(wc -c < "$__hb_a/stdout" | tr -d ' ')
 __hb_od=$(cat "$__hb_a/.stdout.dropped")
@@ -880,26 +948,163 @@ __hb_r=", \"rc\": $__hb_rc, \"started\": $__hb_start, \"ended\": $(date +%s)"
 __hb_r="$__hb_r, \"stdout_path\": \"$__hb_a/stdout\", \"stdout_bytes\": ${__hb_ob:-0}"
 __hb_r="$__hb_r, \"stdout_dropped\": $__hb_od, \"truncated\": $__hb_tr, \"why\": \"$__hb_why\""
 __hb_r="$__hb_r, \"tail_b64\": \"$__hb_tl\", \"stderr_tail_b64\": \"$__hb_el\""
+__hb_r="$__hb_r, \"cpus\": \"$__hb_cpus\", \"gpu_ids\": \"$__hb_gids\", \"pinned\": $__hb_pn"
+__hb_r="$__hb_r, \"peak_rss_kb\": $__hb_pk, \"cpu_s\": $__hb_cs, \"wall_s\": $__hb_wl, \"nproc\": $__hb_np"
+__hb_r="$__hb_r, \"threads\": $__hb_th, \"oom_kills\": $__hb_od"
 __hb_out "$__hb_r"
 exit 0
 """
+
+# A row's slot (batch row sizing): its CPUs — and GPUs — claimed on the node with one lock per device under
+# ${TMPDIR:-/tmp}/hpcb-slots-<job>/: an aligned slot first (the next k CPUs of the block's measured order, SMT siblings
+# adjacent), else any k free CPUs (rows of other sizes share the block). With `flock` the lock is an open file the row's
+# processes inherit, so it is let go when the last of them exits (a killed wrapper included); without it, a directory
+# naming the command's pid, taken over once that pid is gone. A row that finds no free slot within its wait runs
+# nothing (`slot_busy`, NO_SLOT_RC) and goes back to the backlog.
+_CLAIM = r"""__hb_L="${TMPDIR:-/tmp}/hpcb-slots-$(printf %s "${__hb_j:-nojob}" | tr -c 'A-Za-z0-9._-' _)"
+mkdir -p "$__hb_L" 2>/dev/null
+__hb_fl=""; command -v flock >/dev/null 2>&1 && __hb_fl=1
+__hb_take() {
+  if [ -n "$__hb_fl" ]; then
+    eval "exec $__hb_fd>\"\$__hb_L/$1-$2.lock\"" 2>/dev/null || return 1
+    if flock -n "$__hb_fd" 2>/dev/null; then __hb_lk="$__hb_lk $__hb_fd"; __hb_fd=$((__hb_fd + 1)); return 0; fi
+    eval "exec $__hb_fd>&-"; return 1
+  fi
+  __hb_ld="$__hb_L/$1-$2.d"
+  if mkdir "$__hb_ld" 2>/dev/null; then echo $$ > "$__hb_ld/pid"; __hb_lk="$__hb_lk $__hb_ld"; return 0; fi
+  __hb_lp=$(cat "$__hb_ld/pid" 2>/dev/null)
+  if [ -n "$__hb_lp" ] && ! kill -0 "$__hb_lp" 2>/dev/null && mv "$__hb_ld" "$__hb_ld.$$" 2>/dev/null; then
+    rm -rf "$__hb_ld.$$"
+    if mkdir "$__hb_ld" 2>/dev/null; then echo $$ > "$__hb_ld/pid"; __hb_lk="$__hb_lk $__hb_ld"; return 0; fi
+  fi
+  return 1
+}
+__hb_free() {
+  for __hb_x in $__hb_lk; do
+    case "$__hb_x" in /*) rm -rf "$__hb_x";; *) eval "exec $__hb_x>&-";; esac
+  done
+  __hb_lk=""; __hb_fd=20
+}
+__hb_slots() {   # an aligned slot: the next k CPUs of the measured order, all free (siblings stay together)
+  set -- @@CPUIDS@@
+  while [ $# -ge @@K@@ ]; do
+    __hb_cpus=""; __hb_ok=1; __hb_q=0
+    while [ "$__hb_q" -lt @@K@@ ]; do
+      if [ -n "$__hb_ok" ] && __hb_take cpu "$1"; then __hb_cpus="${__hb_cpus:+$__hb_cpus,}$1"; else __hb_ok=""; fi
+      shift; __hb_q=$((__hb_q + 1))
+    done
+    [ -n "$__hb_ok" ] && return 0
+    __hb_free
+  done
+  return 1
+}
+__hb_any() {   # else any k free CPUs (rows of other sizes on the block left no aligned slot)
+  __hb_cpus=""; __hb_n=0
+  for __hb_i in @@CPUIDS@@; do
+    [ "$__hb_n" -ge @@K@@ ] && break
+    __hb_take cpu "$__hb_i" && { __hb_cpus="${__hb_cpus:+$__hb_cpus,}$__hb_i"; __hb_n=$((__hb_n + 1)); }
+  done
+  [ "$__hb_n" -ge @@K@@ ] && return 0
+  __hb_free; return 1
+}
+__hb_cw=$(( $(date +%s) + @@CWAIT@@ ))
+while :; do
+  __hb_gids=""; __hb_ng=0
+  if __hb_slots || __hb_any; then
+    for __hb_i in @@GPUIDS@@; do
+      [ "$__hb_ng" -ge @@G@@ ] && break
+      __hb_take gpu "$__hb_i" && { __hb_gids="${__hb_gids:+$__hb_gids,}$__hb_i"; __hb_ng=$((__hb_ng + 1)); }
+    done
+    [ "$__hb_ng" -ge @@G@@ ] && break
+  fi
+  __hb_free
+  if [ "$(date +%s)" -ge "$__hb_cw" ]; then
+    echo @@BRC@@ > "$__hb_a/rc"; __hb_out ', "rc": @@BRC@@, "slot_busy": true, "ran": false'; exit 0
+  fi
+  sleep 1
+done"""
+
+# Once the command runs, the claim is ITS: a directory claim names its pid (the wrapper may go first), and the wrapper
+# lets go of its own copies of the lock files — the command's processes (and the stream readers, until its streams
+# close) hold them, while the watcher and the cleanup, started after this, never do (a `sleep` of theirs would hold the
+# slot past the row).
+_CLAIMED = r"""for __hb_x in $__hb_lk; do
+  case "$__hb_x" in /*) echo "$__hb_c" > "$__hb_x/pid";; *) eval "exec $__hb_x>&-";; esac
+done"""
+
+# Pinned to the claimed CPUs (taskset on the command's own shell: every process it starts inherits the mask)
+_PIN = r"""__hb_self=${BASHPID:-}
+  [ -z "$__hb_self" ] && [ -r /proc/self/stat ] && read -r __hb_self __hb_rest < /proc/self/stat
+  [ -z "$__hb_self" ] && __hb_self=$(sh -c 'echo $PPID')
+  if command -v taskset >/dev/null 2>&1 && taskset -cp "$__hb_cpus" "$__hb_self" >/dev/null 2>&1; then
+    : > "$__hb_a/.pinned"
+  fi"""
+
+
+@dataclass(frozen=True)
+class Slot:
+    """What one row holds of its block (batch row sizing): `cores` CPUs claimed from `cpu_ids` (the block's measured
+    CPUs, SMT siblings adjacent), `gpus` of `gpu_ids` (made visible through `gpu_kind`'s variable), killed past
+    `memory_mb`; `pin` runs it under taskset on its CPUs; `claim_wait_s` how long it waits for a free slot."""
+
+    cores: int
+    cpu_ids: tuple[int, ...]
+    gpus: int = 0
+    gpu_ids: tuple[str, ...] = ()
+    gpu_kind: str | None = None
+    memory_mb: int | None = None
+    pin: bool = True
+    claim_wait_s: int = CLAIM_WAIT_S
+
+
+_GPU_VAR = {"cuda": "CUDA_VISIBLE_DEVICES", "rocm": "ROCR_VISIBLE_DEVICES", "ze": "ZE_AFFINITY_MASK"}
+_THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "NUMEXPR_NUM_THREADS",
+                "PYTHON_CPU_COUNT", "SLURM_CPUS_PER_TASK", "SRUN_CPUS_PER_TASK")
+
+
+def _slot_env(slot: Slot) -> str:
+    """The row's environment, set AFTER the session's (overriding it): its claimed CPUs, every thread count its
+    libraries read = its cores, a nested `srun` that shares the pool's step (SLURM_OVERLAP) and asks for its cores, and
+    — on a block with GPUs — its own GPUs only (none for a CPU row)."""
+    k = int(slot.cores)
+    parts = ['export HPCB_SLOT_CPUS="$__hb_cpus" HPCB_SLOT_GPUS="$__hb_gids"']
+    parts.append("export " + " ".join(f"{v}={k}" for v in _THREAD_VARS) + " SLURM_OVERLAP=1")
+    var = _GPU_VAR.get(slot.gpu_kind or "")
+    if slot.gpu_ids and var:
+        parts.append(f'export {var}="$__hb_gids"')
+    return "\n  ".join(parts)
 
 
 def task_script(command: str, *, results_dir: str, index: int, attempt: int, task_walltime_s: float,
                 session: session_shell.Session | None = None, cap_bytes: int = OUTPUT_CAP_BYTES,
                 guard: session_shell.Guard | None = None, min_free_mb: int = MIN_FREE_MB,
-                fields: dict[str, str] | None = None) -> str:
+                fields: dict[str, str] | None = None, slot: Slot | None = None) -> str:
     """The script one batch task runs on the worker (see the module doc). `results_dir`: the batch's OWN directory
     (`batch_dir`). `session`: the cwd/env it replays READ-ONLY (never written back). `guard`: the wrong-block guard,
     refusing (exit 86) before anything is claimed. `fields`: the row's values, set as HPCB_F_<name> after the session's
-    env (`row_values`)."""
+    env (`row_values`). `slot` (batch row sizing): the CPUs, GPUs and memory the row holds — claimed on the node,
+    pinned, its libraries sized, killed past its memory; None: an unsized row (a worker, nothing claimed)."""
     replay = ""
     if session is not None:
         sd = session.quoted_state_dir()
         replay = (f'__hb_cwd=$(cat {sd}/.cwd 2>/dev/null); [ -n "$__hb_cwd" ] && cd "$__hb_cwd"; '
                   f"[ -f {sd}/.env ] && . {sd}/.env")
     b64 = shlex.quote(base64.b64encode(command.encode()).decode())
-    body = (_WRAPPER.replace("@@RD@@", quoted_dir(results_dir)).replace("@@I@@", str(int(index)))
+    if slot is not None:
+        cpu_ids = " ".join(str(int(i)) for i in slot.cpu_ids) or "0"
+        gpu_ids = " ".join(shlex.quote(str(g)) for g in slot.gpu_ids if re.fullmatch(r"[A-Za-z0-9_.:-]{1,64}", str(g)))
+        claim = (_CLAIM.replace("@@CPUIDS@@", cpu_ids).replace("@@GPUIDS@@", gpu_ids or ":")
+                 .replace("@@K@@", str(max(1, int(slot.cores)))).replace("@@G@@", str(max(0, int(slot.gpus))))
+                 .replace("@@CWAIT@@", str(max(0, int(slot.claim_wait_s)))).replace("@@BRC@@", str(NO_SLOT_RC)))
+        slot_env, pin = _slot_env(slot), (_PIN if slot.pin else ":")
+        claimed, release = _CLAIMED, "__hb_free"
+        memkb = str(int(slot.memory_mb) * 1024) if slot.memory_mb else ""
+    else:
+        claim, slot_env, pin, claimed, release, memkb = ":", ":", ":", ":", ":", ""
+    body = (_WRAPPER.replace("@@CLAIM@@", claim).replace("@@CLAIMED@@", claimed).replace("@@RELEASE@@", release)
+            .replace("@@SLOTENV@@", slot_env).replace("@@PIN@@", pin).replace("@@MEMKB@@", memkb)
+            .replace("@@MRC@@", str(MEMORY_RC))
+            .replace("@@RD@@", quoted_dir(results_dir)).replace("@@I@@", str(int(index)))
             .replace("@@N@@", str(int(attempt))).replace("@@REMAINING@@", session_shell.REMAINING_SH)
             .replace("@@MARK@@", RESULT_MARK).replace("@@CANCEL@@", CANCEL_MARKER)
             .replace("@@CRC@@", str(CANCEL_RC)).replace("@@TRC@@", str(TIMEOUT_RC)).replace("@@NRC@@", str(NO_SPACE_RC))
@@ -933,6 +1138,18 @@ class TaskReport:
     no_space: bool = False
     timed_out: bool = False
     error: str | None = None
+    # batch row sizing: the attempt's own use and its slot
+    why: str | None = None
+    slot_busy: bool = False
+    peak_rss_kb: int | None = None
+    cpu_s: float | None = None
+    wall_s: float | None = None
+    nproc: int | None = None
+    threads: int | None = None
+    oom_kills: int | None = None
+    cpus: str | None = None
+    gpu_ids: str | None = None
+    pinned: bool = False
 
 
 def _b64(v: Any) -> str:
@@ -976,8 +1193,27 @@ def parse_result(stdout: str | None) -> TaskReport | None:
                 started=_num(d.get("started")), duplicate=bool(d.get("duplicate")),
                 cancelled=bool(d.get("cancelled")) or d.get("why") == "cancelled",
                 no_space=bool(d.get("no_space")), timed_out=d.get("why") == "timeout",
-                error=_b64(d["error_b64"]) if d.get("error_b64") else d.get("error"))
+                error=_b64(d["error_b64"]) if d.get("error_b64") else d.get("error"),
+                why=str(d["why"]) if d.get("why") else None, slot_busy=bool(d.get("slot_busy")),
+                peak_rss_kb=_whole(d.get("peak_rss_kb")), cpu_s=_num(d.get("cpu_s")), wall_s=_wall(d),
+                nproc=_whole(d.get("nproc")), threads=_whole(d.get("threads")), oom_kills=_whole(d.get("oom_kills")),
+                cpus=str(d["cpus"]) if d.get("cpus") else None, gpu_ids=str(d["gpu_ids"]) if d.get("gpu_ids") else None,
+                pinned=bool(d.get("pinned")))
     return None
+
+
+def _whole(v: Any) -> int | None:
+    n = _num(v)
+    return int(n) if n is not None else None
+
+
+def _wall(d: dict[str, Any]) -> float | None:
+    """The attempt's wall seconds: its own (sub-second where the worker's bash has EPOCHREALTIME), else end − start."""
+    w = _num(d.get("wall_s"))
+    if w is not None:
+        return w
+    a, b = _num(d.get("started")), _num(d.get("ended"))
+    return b - a if a is not None and b is not None else None
 
 
 # ---- pure rules ------------------------------------------------------------------------------------------------------
@@ -1113,6 +1349,10 @@ class _Run:
     groups_recorded: set[str] = field(default_factory=set)
     # the other batches holding the block's shared window while this one is refused slots (`_held_by_note`)
     held_by: str | None = None
+    # batch row sizing: the block as its check measured it from inside (forgotten with the block), and how many rows in
+    # a row found no free slot on its node (`slot_busy`)
+    measure: sz.BlockMeasure | None = None
+    busy_streak: int = 0
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -1171,6 +1411,33 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
     if c.worker_count:
         run.workers_seen = c.worker_count
         _learn_workers(app, run, c.worker_job, c.worker_count, uec=uec_hash(rt))
+    if c.block_measure is not None:   # batch row sizing: what the block is, from inside — the block's, on the ledger
+        m = c.block_measure
+        if m.workers is None and c.worker_count:
+            m = dataclasses.replace(m, workers=c.worker_count)
+        run.measure = m
+        try:
+            ledger_of(app).learn_measure(app.state.endpoint_id, uec_hash(rt), c.worker_job, m.to_dict(), now=_now())
+        except LedgerError:
+            pass
+
+
+def measure_of(app: AppCtx, rt: ShapeRuntime | None, run: _Run | None = None) -> sz.BlockMeasure | None:
+    """The block `rt` as measured from inside: this batch's note of it, else its check's, else the ledger's."""
+    if run is not None and run.measure is not None:
+        return run.measure
+    if rt is None:
+        return None
+    c = rt.last_canary
+    if c is not None and c.ok and c.block_measure is not None and (
+            rt.confirmed_at is None or c.answered_at is None or c.answered_at >= rt.confirmed_at):
+        m = c.block_measure
+        return dataclasses.replace(m, workers=c.worker_count) if m.workers is None and c.worker_count else m
+    try:
+        d = ledger_of(app).block_measure(app.state.endpoint_id, uec_hash(rt), rt.block_job)
+    except LedgerError:
+        return None
+    return sz.BlockMeasure.from_dict(d)
 
 
 def _learn_workers(app: AppCtx, run: _Run, job: str | None, workers: int, *, uec: str | None = None) -> None:
@@ -1193,6 +1460,7 @@ def _sync_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
     if run.confirmed_at is not None or run.block_job is not None:
         run.block_end_at = run.block_job = run.block_seen_at = None
         run.workers_seen = None
+        run.measure, run.busy_streak = None, 0
     run.confirmed_at = rt.confirmed_at
     _note_block_from_canary(app, run, rt)
 
@@ -1356,12 +1624,157 @@ def shared_worker_note(app: AppCtx, rt: ShapeRuntime | None) -> str | None:
 
 # ---- the run_batch / status / cancel seams ---------------------------------------------------------------------------
 
-EnsureUp = Callable[[AppCtx, bool], Awaitable[EndpointStatus]]
+# ensure_up(app, confirm_spend, size=None): the compute block's spend floor (server._batch_ensure_up); `size` a block
+# derived from a batch's rows (sizing.DerivedBlock), asked for in the same call
+EnsureUp = Callable[..., Awaitable[EndpointStatus]]
 
 
-def _refused(reason: str, *, bid: str | None = None) -> BatchStatus:
+def _refused(reason: str, *, bid: str | None = None, notice: str | None = None) -> BatchStatus:
     return BatchStatus(batch_id=bid, phase="refused", reason=reason,
-                       notice=f"Nothing was recorded or started: {reason}")
+                       notice=f"Nothing was recorded or started: {reason}" + (f" {notice}" if notice else ""))
+
+
+# ---- batch row sizing: the arguments, the facts, the size ------------------------------------------------------------
+
+_SIZE_MAX = 100_000
+
+
+def _sizing_args(cores: Any, memory_gb: Any, gpus: Any, concurrency: Any, pin: Any, pilot: Any) -> str | None:
+    """Why run_batch's sizing arguments are refused (named), or None."""
+    for name, v, low in (("cores", cores, 1), ("gpus", gpus, 0), ("concurrency", concurrency, 1)):
+        if v is None:
+            continue
+        if isinstance(v, bool) or not isinstance(v, int):
+            return f"{name}={v!r} is not a whole number"
+        if not low <= v <= _SIZE_MAX:
+            return f"{name}={v!r}: from {low} to {_SIZE_MAX}"
+    if memory_gb is not None and (isinstance(memory_gb, bool) or not isinstance(memory_gb, int | float)
+                                  or not 0 < float(memory_gb) <= _SIZE_MAX):
+        return f"memory_gb={memory_gb!r}: GB per row, a number above 0"
+    if not isinstance(pin, bool):
+        return f"pin={pin!r}: true or false"
+    if isinstance(pilot, bool) or not isinstance(pilot, int) or pilot not in (0, 1, 2):
+        return f"pilot={pilot!r}: 0, or 1 or 2 rows to run first"
+    return None
+
+
+def _asked(cores: int | None, memory_gb: float | None, gpus: int | None, concurrency: int | None,
+           pin: bool) -> sz.Sizing | None:
+    """The size the call gives its rows, or None when it gives none."""
+    if cores is None and memory_gb is None and gpus is None and concurrency is None:
+        return None
+    return sz.Sizing(cores=cores or 1, memory_mb=round(float(memory_gb) * 1024) if memory_gb is not None else None,
+                     gpus=gpus or 0, concurrency=concurrency, pin=pin)
+
+
+def _partition_shape(app: AppCtx) -> Any:
+    """What discovery or the registry says of the session's compute partition (models.PartitionShape), or None."""
+    from . import resources
+
+    rt = app.shapes.get("compute")
+    uec = rt.user_endpoint_config if rt is not None else warmth._seed_uec(app, "compute")
+    fac = app.facility
+    parts = getattr(fac, "partitions", None) or getattr(getattr(fac, "profile", None), "partitions", None)
+    return resources.shape_of(parts, uec.get("partition"))
+
+
+def _fixed_workers(app: AppCtx) -> int | None:
+    """A facility endpoint's own worker count where its template fixes it (Delta 4, Anvil 128), else None."""
+    if _has_login_shape(app):
+        return None
+    value = getattr(app.facility, "template_value", None)
+    try:
+        w = value("max_workers_per_node") if callable(value) else None
+    except Exception:  # noqa: BLE001 - an unread template fixes nothing we know of
+        return None
+    return w if isinstance(w, int) and not isinstance(w, bool) and w > 0 else None
+
+
+def _gb(mb: float | None) -> float | None:
+    return None if mb is None else round(mb / 1024, 2)
+
+
+def facts_of(measure: sz.BlockMeasure | None, shape: Any = None, *, workers_fixed: int | None = None) -> BlockFacts:
+    """What a block is (measured), or what one node of its partition would be (the registry's or discovery's)."""
+    if measure is not None:
+        return BlockFacts(
+            source="measured", cpus=measure.cpus, physical_cores=measure.physical_cores,
+            threads_per_core=measure.threads_per_core, memory_gb=_gb(measure.mem_limit_mb),
+            idle_memory_gb=_gb(measure.idle_mb), gpus=len(measure.gpu_ids), gpu_kind=measure.gpu_kind,
+            workers=measure.workers, workers_fixed=workers_fixed is not None, nodes=measure.nodes,
+            limits={"cpus_source": measure.cpus_source, "memory_source": measure.mem_source,
+                    "rows_per_node": sz.WIDTH_CAP},
+            candidates=[SizingCandidate(**c) for c in sz.candidates(
+                measure.cpus, _gb(measure.avail_mb), len(measure.gpu_ids),
+                workers_fixed=measure.workers if workers_fixed is not None else None)])
+    if shape is None:
+        return BlockFacts(source="unknown", workers=workers_fixed, workers_fixed=workers_fixed is not None,
+                          limits={"rows_per_node": sz.WIDTH_CAP})
+    gpus = shape.max_gpus_per_node if shape.max_gpus_per_node is not None else shape.gpus
+    limits = {k: v for k, v in (("partition", shape.name), ("kind", shape.kind),
+                                ("max_cores_per_job", shape.max_cores_per_job),
+                                ("max_cores_per_node", shape.max_cores_per_node),
+                                ("max_nodes_per_job", shape.max_nodes_per_job),
+                                ("mem_per_core_mb", shape.mem_per_core_mb), ("rows_per_node", sz.WIDTH_CAP))
+              if v is not None}
+    return BlockFacts(source="partition", cpus=shape.cores, memory_gb=shape.memory_gb, gpus=gpus,
+                      workers=workers_fixed, workers_fixed=workers_fixed is not None, limits=limits,
+                      candidates=[SizingCandidate(**c) for c in sz.candidates(shape.cores, shape.memory_gb, gpus,
+                                                                              workers_fixed=workers_fixed)])
+
+
+def _sizing_model(s: sz.Sizing | None, *, f: sz.Fit | None = None, defaulted: list[str] | None = None,
+                  missing: list[str] | None = None, derived: bool = False) -> BatchSizing:
+    mem = f.memory_mb if f is not None and f.memory_mb else (s.memory_mb if s is not None else None)
+    return BatchSizing(cores=s.cores if s is not None else None, memory_gb=_gb(mem),
+                       gpus=s.gpus if s is not None else None, concurrency=s.concurrency if s is not None else None,
+                       pin=s.pin if s is not None else True, slots=f.slots if f is not None else None,
+                       bound_by=f.bound_by if f is not None else None, defaulted=list(defaulted or []),
+                       missing=list(missing or []), derived=derived)
+
+
+_HOW_TO_SIZE = ("Size the rows the sbatch way: cores= (CPUs per row, as -c counts them), memory_gb= (per row; a row is "
+                "killed at it), gpus= (per row) and concurrency= (at most this many rows at once, as --array=…%N). "
+                "`facts` says what the block is (or one node of its partition) and how many rows each size fits — ask "
+                "the user in those terms. Not sure of the size? pilot=1 runs one row alone with the whole block and "
+                "proposes cores and memory from what it used.")
+
+
+def _needs_sizing(*, rows: int, missing: list[str], reason: str, facts: BlockFacts | None = None,
+                  sizing: sz.Sizing | None = None, bid: str | None = None, recorded: bool = False) -> BatchStatus:
+    lead = "" if recorded else "Nothing was recorded or started. "
+    return BatchStatus(batch_id=bid, phase="needs_sizing", tasks=rows, reason=reason, facts=facts,
+                       sizing=_sizing_model(sizing, missing=missing), notice=f"{lead}{reason}. {_HOW_TO_SIZE}")
+
+
+def _would_need(s: sz.Sizing) -> str:
+    """The block a sized batch would need, said for the notice (derived as size first would)."""
+    n = s.concurrency or 1
+    try:
+        d = sz.derive_block(dataclasses.replace(s, concurrency=min(n, sz.WIDTH_CAP)))
+    except sz.SizingRefusal as exc:
+        return str(exc)
+    return (f"{n} row(s) at once of {s.cores} CPU(s) would need a block of {d.cores} CPUs and {d.memory_gb} GB"
+            + (f" and {d.gpus} GPU(s)" if d.gpus else "") + " — a different block, which needs the user's yes "
+            "(stop_endpoint, then run_batch with this size asks for it; or ensure_endpoint_up(cores=…, memory_gb=…))")
+
+
+def _multi_node(rt: ShapeRuntime, measure: sz.BlockMeasure | None) -> str | None:
+    nodes = rt.user_endpoint_config.get("nodes_per_block")
+    try:
+        n = int(nodes) if nodes is not None else 1
+    except (TypeError, ValueError):
+        n = 1
+    if measure is not None and (measure.nodes or 1) > n:
+        n = int(measure.nodes or 1)
+    if n > 1:
+        return (f"this block has {n} nodes, and a batch runs only on its first node (one worker pool there): its "
+                "other nodes would bill and run nothing")
+    return None
+
+
+_MULTI_NODE_NOTE = ("A batch over several nodes is phase 3's campaign pools (not built yet): for now ask for a 1-node "
+                    "block (ensure_endpoint_up(nodes=1)), or run the rows with srun from one shell on this block.")
 
 
 def _new_id() -> str:
@@ -1378,28 +1791,78 @@ def _home_warning(results_dir: str | None) -> str:
 async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = None, rows: list[Any] | None = None,
                     task_walltime_s: float | None = None, results_dir: str | None = None, session_id: str = "default",
                     shape: str = "compute", idempotent: bool = False, confirm_spend: bool = False,
-                    batch_id: str | None = None) -> BatchStatus:
+                    batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
+                    gpus: int | None = None, concurrency: int | None = None, pin: bool = True,
+                    pilot: int = 0) -> BatchStatus:
     if shape != "compute":
         return _refused(f"run_batch runs on the compute block (shape='compute'); shape {shape!r} is not served")
     try:
         session_shell.Session(session_id, app.scratch_root)
     except ValueError as exc:
         return _refused(str(exc))
+    if (why := _sizing_args(cores, memory_gb, gpus, concurrency, pin, pilot)) is not None:
+        return _refused(why)
+    asked = _asked(cores, memory_gb, gpus, concurrency, pin)
     if batch_id is not None:
-        return await _resume(app, batch_id, ensure_up=ensure_up, confirm_spend=confirm_spend)
+        return await _resume(app, batch_id, ensure_up=ensure_up, confirm_spend=confirm_spend, resize=asked)
     try:
         command, rows, wall, _names = validate(command, rows, task_walltime_s)
     except BatchRefusal as exc:
         return _refused(str(exc))
     if results_dir is not None and not _RESULTS_DIR.match(results_dir):
         return _refused(f"results_dir {results_dir!r} is not a plain absolute path (or one under $HOME / ~)")
-    st = await ensure_up(app, confirm_spend)
+    pre = app.shapes.get("compute")
+    approved = pre is not None and pre.spend_confirmed and pre.reaped is None
+    derived: sz.DerivedBlock | None = None
+    if not approved and not pilot:
+        # SIZE FIRST, the sbatch way: with no block, its size comes from the rows, before any spend question
+        shape_ = _partition_shape(app)
+        fixed = _fixed_workers(app)
+        if asked is None:
+            return _needs_sizing(rows=len(rows), missing=["cores", "memory_gb", "concurrency"],
+                                 reason="no block is confirmed yet, and its size comes from the rows",
+                                 facts=facts_of(None, shape_, workers_fixed=fixed))
+        if not asked.concurrency:
+            return _needs_sizing(rows=len(rows), missing=["concurrency"], sizing=asked,
+                                 reason="a block derived from the rows needs a concurrency: how many rows at once",
+                                 facts=facts_of(None, shape_, workers_fixed=fixed))
+        try:
+            derived = sz.derive_block(asked, shape=shape_, workers_fixed=fixed)
+        except sz.SizingRefusal as exc:
+            return _refused(str(exc))
+    st = await ensure_up(app, confirm_spend, size=derived)
     if st.status in ("needs_confirmation", "needs_account"):
-        return BatchStatus(phase=st.status, tasks=len(rows), block=st.block, session_spend=st.session_spend,
-                           reason="the compute block's spend is not confirmed" if st.status == "needs_confirmation"
-                           else "the facility needs an allocation account for the block",
-                           notice=f"{st.notice or ''} Nothing was recorded: once the user confirms, call run_batch "
-                                  "again (with confirm_spend=True, or after ensure_endpoint_up(confirm_spend=True)).")
+        out = BatchStatus(phase=st.status, tasks=len(rows), block=st.block, session_spend=st.session_spend,
+                          reason="the compute block's spend is not confirmed" if st.status == "needs_confirmation"
+                          else "the facility needs an allocation account for the block",
+                          notice=f"{st.notice or ''} Nothing was recorded: once the user confirms, call run_batch "
+                                 "again (with confirm_spend=True, or after ensure_endpoint_up(confirm_spend=True)).")
+        if derived is not None and asked is not None:
+            words = derived.words(asked)
+            if out.block is not None:
+                out.block.derived_from = words
+            fixed = _fixed_workers(app)
+            out.sizing = _sizing_model(asked, derived=True)
+            out.sizing.slots = asked.concurrency
+            out.notice = (f"The block derived from the batch: {words} = {derived.cores} CPUs, {derived.memory_gb} GB"
+                          + (f", {derived.gpus} GPU(s)" if derived.gpus else "") + ", one node, "
+                          + (f"{derived.workers} workers ({asked.concurrency} rows at once and one for interactive "
+                             "commands)" if derived.workers else
+                             f"the facility's own {fixed} workers per node" if fixed else
+                             "the facility's own workers per node (measured once it runs)")
+                          + f". {out.notice}")
+            b = out.block
+            if b is not None and b.whole_node and b.cores_per_node:
+                fits = min((b.cores_per_node - 1) // asked.cores, sz.WIDTH_CAP)
+                out.notice = (f"This partition hands out whole nodes only: the block is a whole node "
+                              f"({b.cores_per_node} CPUs) and bills as one — up to {fits} rows of {asked.cores} CPUs "
+                              f"would fit it at once (concurrency={fits}), not only the {asked.concurrency} asked. "
+                              + out.notice)
+        elif pilot:
+            out.notice = (f"A pilot of {pilot} row(s) runs alone on this block — the partition's proposed size, said "
+                          "in the terms above — then the batch stops at needs_sizing with a size proposed from what "
+                          f"it used. {out.notice}")
+        return out
     rt = app.shapes.get("compute")
     if st.status not in ("up", "provisioning") or rt is None or app.state.endpoint_id is None:
         return _refused(f"the compute block is not available ({st.status}): {st.notice or ''}".strip())
@@ -1409,6 +1872,36 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
         return _refused(f"task_walltime_s {wall:g} s does not fit the block: its walltime is {int(block_wall)} s, and "
                         f"a task needs task_walltime_s + {MARGIN_S:g} s of it left to be admitted, so this batch would "
                         f"never start a row. Ask for a longer block, or rows of at most {fits} s.")
+    measure = measure_of(app, rt)
+    if (why := _multi_node(rt, measure)) is not None:
+        return _refused(why, notice=_MULTI_NODE_NOTE)
+    # the rows' size on an approved block: what the call gave, checked against what the block MEASURED; none given
+    # on a CPU-only block: 1 CPU each, pinned, the block's share of memory, as many as fit (said so); a GPU block asks
+    defaulted: list[str] = []
+    sized = asked
+    if asked is None and not pilot:
+        if measure is not None and measure.gpu_ids:
+            return _needs_sizing(rows=len(rows), missing=["cores", "gpus", "memory_gb"],
+                                 reason=f"this block has {len(measure.gpu_ids)} GPU(s): say how many each row takes "
+                                        "(gpus=0 for none), and its cores and memory",
+                                 facts=facts_of(measure, workers_fixed=_fixed_workers(app)))
+        sized = sz.Sizing(cores=1, pin=pin)
+        defaulted = ["cores", "memory_gb", "concurrency"]
+    elif asked is None:
+        sized = sz.Sizing(cores=1, pin=pin)
+    elif asked.memory_mb is None:
+        defaulted = ["memory_gb"]   # the block's share: a kill at it asks, as any default does
+    assert sized is not None
+    capped = ""
+    memory_mb = sized.memory_mb
+    if measure is not None and not pilot:
+        f = sz.fit(measure, sized)
+        if f.why_not:
+            return _refused(f.why_not, notice=_would_need(sized))
+        memory_mb = f.memory_mb
+        if sized.concurrency and f.slots < sized.concurrency:
+            capped = (f" At most {f.slots} at once fit this block (bound by its {f.bound_by}), not the "
+                      f"{sized.concurrency} asked: {_would_need(sized)}.")
     bid = _new_id()
     rd = results_dir or f"{app.scratch_root.rstrip('/')}/batches"
     if not _RESULTS_DIR.match(batch_dir(rd, bid)):
@@ -1421,7 +1914,9 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     led.add_batch(bid, command=command, rows=rows, task_walltime_s=wall, capacity=cap, results_dir=rd,
                   idempotent=idempotent, endpoint_id=app.state.endpoint_id, uec_hash=uec_hash(rt),
                   session_id=session_id, owner=owner, facility=app.machine,
-                  script_hash=hashlib.sha256(command.encode()).hexdigest()[:16], now=_now())
+                  script_hash=hashlib.sha256(command.encode()).hexdigest()[:16], now=_now(),
+                  cores=sized.cores, memory_mb=memory_mb, gpus=sized.gpus, concurrency=sized.concurrency,
+                  pin=sized.pin, pilot=pilot, sized=asked is not None or bool(pilot), sizing_defaulted=defaulted)
     if run.block_job:   # the block its first check saw, on the record (a restart's presumption counts from it)
         led.add_block_seen(bid, run.block_job)
     app.batches[bid] = run
@@ -1431,20 +1926,40 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     out = _status_of(app, bid, detail="summary", offset=0, limit=50)
     out.admitted = admitted
     out.block = st.block
+    if out.block is not None and derived is not None and asked is not None:
+        out.block.derived_from = derived.words(asked)
+        if out.sizing is not None:
+            out.sizing.derived = True
     dashed = dash_rows(command, rows, _names)
     if dashed:
         shown = ", ".join(str(i) for i in dashed[:10]) + ("…" if len(dashed) > 10 else "")
         out.notice = ((out.notice or "") + f" Row(s) {shown} give a placeholder a value starting with '-': a command "
                       "may read it as an option. Put `--` before the placeholder (`rm -- {f}`), or give paths as "
                       "`./-name`.")
-    out.notice = (f"{bid}: {len(rows)} row(s) accepted; {admitted} admitted now, at most {out.capacity} out at once "
-                  f"(the block's workers less one kept for your interactive commands). Results land in "
+    s = out.sizing
+    if pilot:
+        how = (f"a pilot first: {pilot} row(s) alone with the whole block, then it stops at needs_sizing with a size "
+               "proposed from what they used")
+    elif s is not None and s.slots is not None:
+        how = (f"at most {s.slots} out at once ({s.cores} CPU{'s' if s.cores != 1 else ''}"
+               + (f", {s.memory_gb:g} GB" if s.memory_gb else "") + (f", {s.gpus} GPU(s)" if s.gpus else "")
+               + f" each{', pinned' if s.pin else ''}; bound by the block's {s.bound_by}, one worker kept for your "
+               "interactive commands)")
+    else:
+        how = (f"at most {out.capacity} out at once (the block's workers less one kept for your interactive "
+               "commands; the block's size is measured when its check answers)")
+    if defaulted:
+        how += (". Sized by default — 1 CPU per row, pinned, and the block's share of memory: a row that needs more "
+                "threads runs slower, and one over its memory is stopped and the batch asks; pass cores= / "
+                "memory_gb= to size the rows yourself")
+    out.notice = (f"{bid}: {len(rows)} row(s) accepted; {admitted} admitted now, {how}.{capped} Results land in "
                   f"{batch_dir(rd, bid)}. Follow "
                   f"it with status('{bid}', wait_s=60); stop it with cancel('{bid}'). " + (out.notice or "")).strip()
     return out
 
 
-async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: bool) -> BatchStatus:
+async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: bool,
+                  resize: sz.Sizing | None = None) -> BatchStatus:
     if not _ID.match(bid):
         return _refused(f"{bid!r} is not a batch id (batch-<12 hex>)", bid=bid)
     led = ledger_of(app)
@@ -1465,6 +1980,11 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
     b = led.batch(bid)
     if b["state"] in ("done", "cancelled"):
         return _status_of(app, bid)
+    if b["state"] == "needs_sizing" and resize is None:
+        out = _status_of(app, bid)
+        out.notice = (f"{bid} waits for its rows' size ({b['pause_reason']}): run_batch(batch_id='{bid}', cores=…, "
+                      "memory_gb=…) with the size the user gives. " + (out.notice or "")).strip()
+        return out
     if not confirm_spend and b["state"] == "needs_confirmation":
         out = _status_of(app, bid)
         out.notice = (f"{bid} is paused ({b['pause_reason']}); it resumes only on the user's yes: "
@@ -1488,6 +2008,18 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         out.notice = f"the compute block is not available ({st.status}): {st.notice or ''}".strip()
         return out
     h = uec_hash(rt)
+    if resize is not None:
+        # the rows' new size, for the backlog (rows out keep what they hold): checked against the block as measured
+        m = measure_of(app, rt, app.batches.get(bid))
+        if m is not None:
+            if (why := _multi_node(rt, m)) is not None:
+                return _refused(why, bid=bid, notice=_MULTI_NODE_NOTE)
+            f = sz.fit(m, resize)
+            if f.why_not:
+                return _refused(f.why_not, bid=bid, notice=_would_need(resize))
+        led.update_batch(bid, cores=resize.cores, memory_mb=resize.memory_mb, gpus=resize.gpus,
+                         concurrency=resize.concurrency, pin=int(resize.pin), sized=1, pilot=0, proposal=None,
+                         sizing_defaulted=json.dumps(["memory_gb"] if resize.memory_mb is None else []))
     if confirm_spend:
         led.unretire(app.state.endpoint_id, h)   # the user's yes is consent to this block's config again
     run = app.batches.get(bid)
@@ -1837,7 +2369,7 @@ async def _loop(app: AppCtx, bid: str) -> None:
             print(f"hpc-bridge: batch {bid} pass failed: {type(exc).__name__}: {exc}", file=sys.stderr)
             b = {"state": "admitting"}
         idle = not run.futures and b["state"] != "admitting" and not _still_settling(app, run)
-        if idle and b["state"] in ("done", "cancelled", "needs_confirmation"):
+        if idle and b["state"] in ("done", "cancelled", "needs_confirmation", "needs_sizing"):
             if run.runner is not None and b["state"] in ("done", "cancelled"):
                 try:
                     run.runner.close()
@@ -1975,7 +2507,23 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
                         f"the {MARGIN_S:g} s margin ({int(need)} s): the rest needs a new block, which needs the "
                         f"user's yes — run_batch(batch_id='{bid}', confirm_spend=True)")
         return 0
-    cap = capacity_for(run.workers_seen or workers_of(rt))
+    slot: Slot | None = None
+    measure = measure_of(app, rt, run) if b.get("cores") is not None else None
+    if b.get("cores") is not None and (b.get("sized") or b.get("pilot")) and measure is None:
+        run.waiting = ("the block's size is not measured yet (its first check has not answered from inside it): "
+                       "nothing is admitted until it is")
+        return 0
+    if measure is not None:   # batch row sizing: the rows' slots on the block as it measured
+        sized = _sized_now(app, run, rt, b, measure)
+        if sized is None:
+            return 0
+        b = led.batch(bid)
+        f = sz.fit(measure, sized)
+        cap = f.slots
+        slot = Slot(cores=sized.cores, cpu_ids=measure.cpu_ids, gpus=sized.gpus, gpu_ids=measure.gpu_ids,
+                    gpu_kind=measure.gpu_kind, memory_mb=sized.memory_mb, pin=sized.pin)
+    else:
+        cap = capacity_for(run.workers_seen or workers_of(rt))
     if cap != int(b["capacity"] or 0):
         led.update_batch(bid, capacity=cap)
     try:
@@ -1998,9 +2546,84 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     session = session_shell.Session(str(b["session_id"] or "default"), app.scratch_root)
     sent = 0
     for t in rows:
-        if _send(app, run, rt, b, t.index, t.attempt, t.row, names, session, remaining, need):
+        if _send(app, run, rt, b, t.index, t.attempt, t.row, names, session, remaining, need, slot=slot):
             sent += 1
     return sent
+
+
+def _sized_now(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any],
+               measure: sz.BlockMeasure) -> sz.Sizing | None:
+    """The batch's row size on this measured block, as admission uses it — or None after pausing it: a block of several
+    nodes (refused), a row that cannot fit (needs_sizing, with the numbers), a defaulted size on a block with GPUs
+    (asks), a pilot whose rows have all run (needs_sizing, with the proposal). A pilot's rows run with the whole block;
+    a default memory is the block's share, resolved here once."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    if (why := _multi_node(rt, measure)) is not None:
+        pause_sizing(app, bid, f"{why}. {_MULTI_NODE_NOTE}")
+        return None
+    defaulted = json.loads(b.get("sizing_defaulted") or "[]")
+    if "cores" in defaulted and measure.gpu_ids:
+        pause_sizing(app, bid, f"this block has {len(measure.gpu_ids)} GPU(s): say how many each row takes "
+                               "(gpus=0 for none), and its cores and memory")
+        return None
+    pilot = int(b.get("pilot") or 0)
+    if pilot and not b.get("proposal"):
+        tasks = led.tasks(bid)
+        ran = [t for t in tasks if int(t.get("attempt") or 0) > 0]
+        settled = [t for t in ran if t["state"] in TERMINAL]
+        if len(settled) >= min(pilot, len(tasks)):
+            p = sz.pilot_proposal([_use_of(t) for t in settled], measure, gpus=int(b.get("gpus") or 0))
+            pause_sizing(app, bid, f"the pilot's {len(settled)} row(s) ran: their use suggests {p.cores} CPU(s) and "
+                                   f"{p.memory_gb:g} GB per row, {p.concurrency} at once on this block — confirm or "
+                                   "change it with the user, then run_batch(batch_id=…, cores=…, memory_gb=…)",
+                         proposal=p)
+            return None
+        whole = (measure.cpus, measure.avail_mb, pilot - len(ran))
+        if (b.get("cores"), b.get("memory_mb"), b.get("concurrency")) != (whole[0], whole[1], pilot):
+            led.update_batch(bid, cores=whole[0], memory_mb=whole[1], concurrency=pilot)
+        if whole[2] <= 0:
+            return None   # the pilot's rows are out: nothing else of the batch runs beside them
+        return sz.Sizing(cores=measure.cpus, memory_mb=measure.avail_mb, gpus=int(b.get("gpus") or 0),
+                         concurrency=pilot, pin=bool(b.get("pin", 1)))
+    sized = sz.Sizing(cores=int(b["cores"]), memory_mb=b.get("memory_mb"), gpus=int(b.get("gpus") or 0),
+                      concurrency=b.get("concurrency"), pin=bool(b.get("pin", 1)))
+    f = sz.fit(measure, sized)
+    if f.why_not:
+        pause_sizing(app, bid, f"{f.why_not}: {_would_need(sized)}")
+        return None
+    if sized.memory_mb is None and f.memory_mb:
+        led.update_batch(bid, memory_mb=f.memory_mb)
+        sized = dataclasses.replace(sized, memory_mb=f.memory_mb)
+    return sized
+
+
+def _use_of(t: dict[str, Any]) -> dict[str, Any]:
+    """A settled row's own use, as the pilot proposal reads it."""
+    return {"index": t.get("idx"), "cpu_s": t.get("cpu_s"), "wall_s": t.get("wall_s"),
+            "peak_rss_kb": t.get("peak_rss_kb"), "nproc": t.get("nproc"), "rc": t.get("rc")}
+
+
+def pause_sizing(app: AppCtx, bid: str, reason: str, *, proposal: sz.Proposal | None = None) -> None:
+    """Admission stops at needs_sizing: the rows' size is the user's to give (run_batch(batch_id=…, cores=…, …)); rows
+    out run to their end. No spend is involved: the block stays the confirmed one."""
+    led = ledger_of(app)
+    b = led.batch(bid)
+    if b["state"] in ("done", "cancelled"):
+        return
+    fields: dict[str, Any] = {"state": "needs_sizing", "pause_reason": reason}
+    if proposal is not None:
+        fields["proposal"] = json.dumps({"cores": proposal.cores, "memory_gb": proposal.memory_gb,
+                                         "gpus": proposal.gpus, "concurrency": proposal.concurrency,
+                                         "evidence": proposal.evidence}, default=str)
+    if b["state"] != "needs_sizing" or b["pause_reason"] != reason:
+        led.update_batch(bid, **fields)
+        led.event(bid, "batch.pause", {"reason": reason, "sizing": True})
+        _journal({"event": "batch.pause", "batch_id": bid, "reason": reason})
+    run = app.batches.get(bid)
+    if run is not None:
+        run.next_block = False
+        run.wake.set()
 
 
 def _held_by_note(led: Ledger, holders: dict[str, int], *, ssh: bool) -> str | None:
@@ -2029,14 +2652,15 @@ def _held_by_note(led: Ledger, holders: dict[str, int], *, ssh: bool) -> str | N
 
 
 def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: int, attempt: int, row: Any,
-          names: set[str], session: session_shell.Session, remaining: float, need: float) -> bool:
+          names: set[str], session: session_shell.Session, remaining: float, need: float, *,
+          slot: Slot | None = None) -> bool:
     led = ledger_of(app)
     bid = run.batch_id
     guard = warmth._new_guard(rt)
     script = task_script(substitute(str(b["command"]), row, index, names),
                          results_dir=batch_dir(str(b["results_dir"]), bid), index=index, attempt=attempt,
                          task_walltime_s=float(b["task_walltime_s"]), session=session, guard=guard,
-                         fields=row_values(row, index, names))
+                         fields=row_values(row, index, names), slot=slot)
     try:
         fut = run.runner.submit(script)
     except Exception as exc:  # noqa: BLE001 - the Executor refused before sending (shut down): never sent
@@ -2066,7 +2690,10 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     c = _counts(led, bid)
     _journal({"event": "batch.admit", "batch_id": bid, "index": index, "attempt": attempt, "task_id": tid,
               "in_flight": _held(c), "capacity": int(led.batch(bid)["capacity"] or 1),
-              "remaining_s": round(remaining, 1), "need_s": round(need, 1), "job_id": run.block_job})
+              "remaining_s": round(remaining, 1), "need_s": round(need, 1), "job_id": run.block_job,
+              # batch row sizing: what the row holds of the block's pool (None: an unsized row, a worker)
+              "cores": slot.cores if slot else None, "memory_mb": slot.memory_mb if slot else None,
+              "gpus": slot.gpus if slot else None})
     return True
 
 
@@ -2117,6 +2744,7 @@ async def _maybe_switch(app: AppCtx, run: _Run) -> EndpointStatus | None:
         _runner_for_block(app, run, new)
     run.block_end_at = run.block_job = run.block_seen_at = None
     run.workers_seen, run.next_block = None, False
+    run.measure, run.busy_streak = None, 0
     if new is not None:
         _note_block_from_canary(app, run, new)
         led.update_batch(run.batch_id, uec_hash=uec_hash(new))
@@ -2267,21 +2895,78 @@ def _settle_result(app: AppCtx, run: _Run, index: int, attempt: int, res: Any, g
                    evidence="a duplicate of this attempt answered; the one that ran is reconciled from the task group",
                    unknown_since=_now(), unheld=None)
         return
+    if rep.slot_busy:
+        _slot_busy(app, run, index, attempt)
+        return
+    run.busy_streak = 0
     fields: dict[str, Any] = {"rc": rep.rc, "tail": rep.tail, "stderr_tail": rep.stderr_tail,
                               "stdout_path": rep.stdout_path, "stdout_bytes": rep.stdout_bytes,
                               "truncated": int(rep.truncated), "job_id": rep.job, "host": rep.host,
-                              "workers": rep.workers, "remaining_s": rep.remaining_s, "started_at": rep.started}
+                              "workers": rep.workers, "remaining_s": rep.remaining_s, "started_at": rep.started,
+                              # batch row sizing: the attempt's own use, from inside its block
+                              "peak_rss_kb": rep.peak_rss_kb, "cpu_s": rep.cpu_s, "wall_s": rep.wall_s,
+                              "nproc": rep.nproc, "cpus": rep.cpus, "gpu_ids": rep.gpu_ids, "why": rep.why,
+                              "threads": rep.threads, "oom_kills": rep.oom_kills}
     if rep.cancelled:
         state, by = "cancelled", f"evidence: the {CANCEL_MARKER} marker (cancel abort)"
     elif rep.no_space:
         state, by = "failed", "result: too little free space in the results directory"
     elif rep.error:
         state, by = "failed", f"result: {rep.error}"
+    elif rep.why == "memory":
+        state, by = "failed", f"result: killed at its memory (rc {MEMORY_RC})"
     else:
         state = "done" if rep.rc == 0 else "failed"
         by = "result: the wrapper's own timeout (rc 124)" if rep.timed_out else "result"
+    b = led.batch(bid)
+    default_kill = rep.why == "memory" and "memory_gb" in json.loads(b.get("sizing_defaulted") or "[]")
+    if default_kill and b.get("idempotent"):
+        # killed at a memory hpc-bridge chose, not the user: it runs again at the size the user picks
+        state, by = "backlog", f"retry at the size the user picks: killed at the default memory (rc {MEMORY_RC})"
     led.settle(bid, index, attempt, state, only_from=holding, settled_by=by, **fields)
     _event(bid, "batch.settle", index, attempt, state, rc=rep.rc, job_id=rep.job, remaining_s=rep.remaining_s)
+    if default_kill:
+        _default_memory_killed(app, run, index, b, rep)
+
+
+def _slot_busy(app: AppCtx, run: _Run, index: int, attempt: int) -> None:
+    """The row found no free slot on its node and ran nothing: back to the backlog, after a backoff that grows with the
+    block's busy streak (never a spin); the third in a row pauses the batch, saying why — a slot the server does not
+    know of is held (a row an earlier server left, a process left running)."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    run.busy_streak += 1
+    led.settle(bid, index, attempt, "backlog", only_from=list(HOLDING),
+               evidence="no free slot on its node within the claim wait: it ran nothing",
+               not_before=_now() + SLOT_BUSY_BACKOFF_S * run.busy_streak)
+    _event(bid, "batch.settle", index, attempt, "slot_busy")
+    if run.busy_streak >= SLOT_BUSY_PAUSE:
+        job = f" (job {run.block_job})" if run.block_job else ""
+        pause(app, bid, f"{run.busy_streak} rows in a row found no free slot on the block's node{job}, though the "
+                        "ledger has room: something hpc-bridge does not know of holds its CPUs or GPUs — a row an "
+                        "earlier server sent, or a process a row left running. Find it (run_shell: ps -eo "
+                        "pid,pgid,etime,args), end it, then resume with "
+                        f"run_batch(batch_id='{bid}', confirm_spend=True)")
+        run.busy_streak = 0
+
+
+def _default_memory_killed(app: AppCtx, run: _Run, index: int, b: dict[str, Any], rep: TaskReport) -> None:
+    """A row killed at a DEFAULT memory (the block's share, which the user did not choose): the batch stops at
+    needs_sizing with a size measured from that row — never killing row after row on a default."""
+    measure = measure_of(app, run.rt, run)
+    if measure is None:
+        return
+    use = {"index": index, "cpu_s": rep.cpu_s, "wall_s": rep.wall_s, "peak_rss_kb": rep.peak_rss_kb,
+           "nproc": rep.nproc, "rc": rep.rc}
+    p = sz.pilot_proposal([use], measure, gpus=int(b.get("gpus") or 0))
+    limit = f"{int(b['memory_mb']) / 1024:.2f} GB" if b.get("memory_mb") else "its default"
+    again = ("it runs again at the size the user picks" if b.get("idempotent") else
+             "it is not run again (not idempotent: run it again yourself if it is safe to)")
+    pause_sizing(app, run.batch_id, f"row {index} was killed at the default memory ({limit}, the block's share — not "
+                                    f"a size the user chose); {again}. Its own use suggests {p.cores} CPU(s) and "
+                                    f"{p.memory_gb:g} GB per row, {p.concurrency} at once on this block — confirm or "
+                                    "change it with the user, then run_batch(batch_id=…, cores=…, memory_gb=…)",
+                 proposal=p)
 
 
 def _learn_block(app: AppCtx, run: _Run, rep: TaskReport) -> None:
@@ -2647,13 +3332,61 @@ async def _evidence_for(app: AppCtx, run: _Run, job: str, keys: list[tuple[int, 
 
 # ---- the answer ------------------------------------------------------------------------------------------------------
 
-def _task_result(t: dict[str, Any]) -> BatchTaskResult:
+def _over(t: dict[str, Any], b: dict[str, Any] | None) -> list[str]:
+    """What a settled row ran over (sizing.over_size), from its own use and what its attempt held."""
+    if t.get("state") not in TERMINAL or b is None or b.get("cores") is None:
+        return []
+    return sz.over_size(cores=t.get("req_cores") or b.get("cores"), memory_mb=t.get("req_memory_mb") or
+                        b.get("memory_mb"), pinned=bool(b.get("pin", 1)), cpu_s=t.get("cpu_s"), wall_s=t.get("wall_s"),
+                        threads=t.get("threads"), peak_rss_kb=t.get("peak_rss_kb"), why=t.get("why"))
+
+
+def _task_result(t: dict[str, Any], b: dict[str, Any] | None = None) -> BatchTaskResult:
+    pk = t.get("peak_rss_kb")
     return BatchTaskResult(
         index=int(t["idx"]), state=t["state"], attempt=int(t["attempt"] or 0), row=json.loads(t["row_json"]),
         exit_code=t.get("rc"), tail=t.get("tail") or "", stderr_tail=t.get("stderr_tail") or "",
         stdout_path=t.get("stdout_path"), stdout_bytes=t.get("stdout_bytes"), truncated=bool(t.get("truncated")),
         job_id=t.get("job_id"), host=t.get("host"), started_at=t.get("started_at"), settled_by=t.get("settled_by"),
-        task_id=t.get("task_id"))
+        task_id=t.get("task_id"), peak_rss_mb=round(pk / 1024, 1) if isinstance(pk, int) else None,
+        cpu_s=t.get("cpu_s"), wall_s=t.get("wall_s"), nproc=t.get("nproc"), cpus=t.get("cpus"),
+        gpu_ids=t.get("gpu_ids"), why=t.get("why"), over_size=_over(t, b))
+
+
+def _proposal_of(b: dict[str, Any]) -> SizingProposal | None:
+    try:
+        d = json.loads(b.get("proposal") or "null")
+    except ValueError:
+        return None
+    return SizingProposal(**d) if isinstance(d, dict) else None
+
+
+def _sizing_of(app: AppCtx, run: _Run | None, b: dict[str, Any]) -> BatchSizing | None:
+    """A sized batch's rows and what the block (as measured) gives them."""
+    if b.get("cores") is None:
+        return None
+    s = sz.Sizing(cores=int(b["cores"]), memory_mb=b.get("memory_mb"), gpus=int(b.get("gpus") or 0),
+                  concurrency=b.get("concurrency"), pin=bool(b.get("pin", 1)))
+    m = measure_of(app, run.rt if run is not None else app.shapes.get("compute"), run)
+    f = sz.fit(m, s) if m is not None else None
+    return _sizing_model(s, f=f if f is not None and not f.why_not else None,
+                         defaulted=json.loads(b.get("sizing_defaulted") or "[]"))
+
+
+def _over_note(led: Ledger, bid: str, b: dict[str, Any]) -> str:
+    """The settled rows that ran over their size, named, with the resize that fits the rest."""
+    if b.get("cores") is None:
+        return ""
+    over: dict[str, list[int]] = {}
+    for t in led.tasks(bid, states=TERMINAL):
+        for what in _over(t, b):
+            over.setdefault(what, []).append(int(t["idx"]))
+    if not over:
+        return ""
+    said = "; ".join(f"{what}: row(s) {', '.join(str(i) for i in idx[:8])}{'…' if len(idx) > 8 else ''}"
+                     for what, idx in over.items())
+    return (f" Rows ran over their size ({said}) — each result carries its peak_rss_mb, cpu_s and nproc. "
+            f"run_batch(batch_id='{bid}', cores=…, memory_gb=…) sizes the rows still in the backlog.")
 
 
 def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 0, limit: int = 50) -> BatchStatus:
@@ -2674,7 +3407,7 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         rows, nxt = [], None
     state = str(b["state"])
     phase: Any
-    if state in ("done", "cancelled", "needs_confirmation"):
+    if state in ("done", "cancelled", "needs_confirmation", "needs_sizing"):
         phase = state
     elif _held(c) == 0 and c.get("done", 0) + c.get("failed", 0) == 0 and run is not None and run.waiting:
         phase = "waiting"
@@ -2694,7 +3427,7 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
             gone = (f"the hpc-bridge server that ran this batch is gone ({owner}); this server takes it over once "
                     f"its heartbeat is {int(led.lease_stale_s)} s old, collects what finished, and sends nothing more "
                     "before the user's yes")
-    reason = gone or (b.get("pause_reason") if phase in ("needs_confirmation", "cancelled") else (
+    reason = gone or (b.get("pause_reason") if phase in ("needs_confirmation", "needs_sizing", "cancelled") else (
         run.waiting if run is not None and phase == "waiting" else None))
     parts = [f"{bid}: {c.get('done', 0)} done, {c.get('failed', 0)} failed, {_held(c)} out "
              f"({c.get('in_flight', 0)} in flight), {c.get('backlog', 0)} in the backlog of {total}"]
@@ -2705,6 +3438,10 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     if phase == "needs_confirmation":
         text += (f" Paused: {reason}. It resumes only with run_batch(batch_id='{bid}', confirm_spend=True) — ask the "
                  "user first.")
+    elif phase == "needs_sizing":
+        text += (f" Paused for its size: {reason}. Resume with run_batch(batch_id='{bid}', cores=…, memory_gb=…, "
+                 "gpus=…, concurrency=…) once the user has said it; a size that fits this block needs no new yes.")
+    text += _over_note(led, bid, b)
     if owner:
         text += f" Another hpc-bridge server holds this batch ({owner}): this is a read of the ledger."
     if c.get("failed") and detail == "summary":
@@ -2715,7 +3452,8 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
     return BatchStatus(
         batch_id=bid, phase=phase, tasks=total, chunk=int(b.get("chunk") or 1), capacity=int(b["capacity"] or 1),
         counts=BatchCounts(**{k: c.get(k, 0) for k in BatchCounts.model_fields}),
-        results=[_task_result(t) for t in rows], offset=offset, next_offset=nxt,
+        results=[_task_result(t, b) for t in rows], offset=offset, next_offset=nxt,
+        sizing=_sizing_of(app, run, b), proposal=_proposal_of(b),
         results_dir=batch_dir(str(b["results_dir"]), bid) if b.get("results_dir") else None,
         blocks_seen=json.loads(b.get("blocks_seen") or "[]"), owner=owner, reason=reason, notice=text)
 
