@@ -449,9 +449,9 @@ class BatchSizing(BaseModel):
 class SizingProposal(BaseModel):
     """A size measured from rows that ran (a pilot, or a row killed at a default memory): `cores` = ⌈CPU-s ÷ wall⌉,
     `memory_gb` = 1.25 × the peak RSS rounded up to a quarter GB, the `concurrency` the block then fits; `evidence`
-    each row's use."""
+    each row's use. `cores` None: no row's CPU-seconds could be read — no evidence of its cores (ask the user)."""
 
-    cores: int
+    cores: int | None = None
     memory_gb: float
     gpus: int = 0
     concurrency: int = 0
@@ -576,6 +576,9 @@ class BatchTaskResult(BaseModel):
     cpus: str | None = None
     gpu_ids: str | None = None
     why: str | None = None
+    # whether the attempt really ran pinned to its CPUs (False: taskset was missing on the node or refused the mask —
+    # it could use every CPU of the block); None: not known (an unsized row, a result from before row sizing)
+    pinned: bool | None = None
     over_size: list[str] = Field(default_factory=list)
 
 

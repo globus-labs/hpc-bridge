@@ -493,7 +493,7 @@ _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "tru
                 "unknown_since", "unheld",
                 # batch row sizing: the attempt's own use, and when a row a busy slot sent back may go again
                 "peak_rss_kb", "cpu_s", "wall_s", "nproc", "cpus", "gpu_ids", "why", "threads", "oom_kills",
-                "not_before")
+                "not_before", "pinned")
 # Columns a ledger written by an earlier build may lack: added on open (a new ledger too: its tables are created as
 # the first build wrote them, then these are added).
 _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
@@ -501,12 +501,17 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                             # most `concurrency` at once, pinned, the pilot's rows, what was defaulted, a proposal
                             ("cores", "integer"), ("memory_mb", "integer"), ("gpus", "integer"),
                             ("concurrency", "integer"), ("pin", "integer default 1"), ("pilot", "integer default 0"),
-                            ("sized", "integer default 0"), ("sizing_defaulted", "text"), ("proposal", "text")],
+                            ("sized", "integer default 0"), ("sizing_defaulted", "text"), ("proposal", "text"),
+                            # the user's own size while a pilot runs with the whole block (restored at its proposal)
+                            ("pilot_saved", "text")],
                   "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text"),
                            ("req_cores", "integer"), ("req_memory_mb", "integer"), ("req_gpus", "integer"),
                            ("peak_rss_kb", "integer"), ("cpu_s", "real"), ("wall_s", "real"), ("nproc", "integer"),
                            ("cpus", "text"), ("gpu_ids", "text"), ("why", "text"), ("threads", "integer"),
-                           ("oom_kills", "integer"), ("not_before", "real")],
+                           ("oom_kills", "integer"), ("not_before", "real"),
+                           # whether the attempt's memory was the DEFAULT share (a kill at it asks), and whether it
+                           # really ran pinned (the wrapper's own word)
+                           ("req_mem_default", "integer"), ("pinned", "integer")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text")]}
 
@@ -931,6 +936,24 @@ class Ledger:
                     free = (free_all[0] - x * need[0], None if free_all[1] is None else free_all[1] - x * need[1],
                             free_all[2] - x * need[2], free_all[3] - x)
                     return min(caps_w[w], _fits(_need(pr), free))
+
+                # A reservation for the head waiter (as a scheduler holds one for its next big job): a batch ranked
+                # first whose row fits the whole pool but not what is free now — big rows behind small ones, a pilot
+                # wanting the whole block — has its row's room kept: the others admit only beyond it, so it starts as
+                # soon as enough rows settle (a freed CPU going to a small row each time had starved it for good).
+                last0 = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
+                mine0 = (out.get(batch_id, 0), float(last0 or 0.0), batch_id)
+                whole = (cpus, avail, gpus, rows_cap)
+                for w in sorted(rank, key=lambda x: rank[x]):
+                    if rank[w] >= mine0:
+                        break
+                    pr = next(r for r in waiting if str(r["id"]) == w)
+                    hn = _need(pr)
+                    if caps_w[w] > 0 and _fits(hn, whole) >= 1 and room_after(w, 0) == 0:
+                        left = (free_all[0] - hn[0], None if free_all[1] is None else free_all[1] - hn[1],
+                                free_all[2] - hn[2], free_all[3] - 1)
+                        take = min(take, _fits(need, left))
+                        break
             refused = take < own_room   # by the block's other rows, never by its own rows or the window
             last = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
             fair, mine = 0, (out.get(batch_id, 0), float(last or 0.0), batch_id)
@@ -954,12 +977,17 @@ class Ledger:
                                               (batch_id, at, take + len(have)))
                          if r["idx"] not in have]
             got = Reserved([], holders=holds if refused else {})
+            try:
+                mem_default = int("memory_gb" in json.loads(b["sizing_defaulted"] or "[]"))
+            except (ValueError, TypeError):
+                mem_default = 0
             for r in rows[:take]:
                 att = int(r["attempt"] or 0) + 1
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
                           "started_at = null, sent_uec = ?, req_cores = ?, req_memory_mb = ?, req_gpus = ?, "
-                          "not_before = null where batch_id = ? and idx = ?",
-                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], batch_id, r["idx"]))
+                          "req_mem_default = ?, not_before = null, pinned = null where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, batch_id,
+                           r["idx"]))
                 got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
             return got
 

@@ -315,16 +315,23 @@ def parse_measure(text: str | None) -> BlockMeasure | None:
         mems.append((n // 1024, "MemTotal", None))
     limit = min(mems, key=lambda m: m[0]) if mems else None
     idle = None
+    workers = _int(env.get("PARSL_WORKER_COUNT"))
     if limit is not None:
         cur = {d: _int(v) for d, f, v in cg2 if f == "memory.current"}
         cur.update({d: _int(v) for ctl, d, f, v in cg1 if ctl == "memory" and f == "memory.usage_in_bytes"})
         at = limit[2]
-        if at in cur and cur[at] is not None:
+        if at is not None and at in cur and cur[at] is not None:
             idle = int(cur[at] or 0) // 2 ** 20
-        elif at is not None:
-            near = [(_depth(d), n) for d, n in cur.items() if n is not None and at.startswith(d.rstrip("/"))]
-            if near:
-                idle = int(max(near)[1]) // 2 ** 20
+        elif at is not None and (near := [(_depth(d), n) for d, n in cur.items()
+                                          if n is not None and at.startswith(d.rstrip("/"))]):
+            idle = int(max(near)[1]) // 2 ** 20
+        else:
+            # the limit is the scheduler's word (or MemTotal), with no level of its own: the pool's use is still taken
+            # off — the deepest cgroup reading seen (the pool's own), else the pool's estimate. Never none: a share
+            # sized against the whole limit overcommits the job (the site's OOM, OverMemoryKill).
+            deepest = [(_depth(d), n) for d, n in cur.items() if n is not None]
+            idle = (int(max(deepest)[1]) // 2 ** 20 if deepest
+                    else pool_mb(workers if workers and workers > 0 else 1))
     ooms = [_int(v) for _d, f, v in cg2 if f == "memory.events.oom_kill"]
     ooms += [_int(v) for ctl, _d, f, v in cg1 if ctl == "memory" and f == "memory.oom_control.oom_kill"]
     oom = max((o for o in ooms if o is not None), default=None)
@@ -352,7 +359,6 @@ def parse_measure(text: str | None) -> BlockMeasure | None:
     if not gpu_ids:
         kind = None
 
-    workers = _int(env.get("PARSL_WORKER_COUNT"))
     nodes = _int(env.get("SLURM_JOB_NUM_NODES")) or _int(one.get("nodes"))
     return BlockMeasure(cpus=cpus, cpu_ids=cpu_ids, cpus_source=source, physical_cores=physical, threads_per_core=tpc,
                         mem_limit_mb=limit[0] if limit else None, mem_source=limit[1] if limit else None,
@@ -415,16 +421,20 @@ def fit(measure: BlockMeasure, sizing: Sizing) -> Fit:
 @dataclass(frozen=True)
 class DerivedBlock:
     cores: int
-    memory_gb: int
+    memory_gb: int | None           # None: a whole node's (its partition hands out only whole nodes)
     gpus: int
     workers: int | None             # None: the facility fixes its own (the terms say how many)
     nodes: int = 1
+    whole_node: bool = False        # the partition hands out only whole nodes: the block is one, as many rows as fit
 
     def words(self, sizing: Sizing) -> str:
         mem = f", {_gb(sizing.memory_mb)}" if sizing.memory_mb else ""
         gpu = f", {sizing.gpus} GPU" if sizing.gpus else ""
-        return (f"{sizing.concurrency} rows at once × ({sizing.cores} CPU{'s' if sizing.cores != 1 else ''}{mem}{gpu})"
-                " + 1 CPU for interactive commands")
+        row = f"({sizing.cores} CPU{'s' if sizing.cores != 1 else ''}{mem}{gpu})"
+        if self.whole_node:
+            return (f"a whole node (the partition hands out no less): {sizing.concurrency} rows at once × {row}, up to "
+                    f"{(self.workers or 2) - 1} would fit")
+        return f"{sizing.concurrency} rows at once × {row} + 1 CPU for interactive commands"
 
 
 def row_memory_mb(sizing: Sizing, shape: PartitionShape | None) -> int:
@@ -462,6 +472,22 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
     m = row_memory_mb(sizing, shape)
     memory_gb = max(1, math.ceil((n * m + pool_mb(workers or workers_fixed or n + 1)) / 1024))
     gpus = n * g
+    if shape is not None and shape.kind == "whole_node" and shape.cores:
+        # a partition that hands out only whole nodes: the block IS a whole node — as many rows of this size as fit it
+        # run there (its workers: those slots + 1), the concurrency asked bounding the batch, not the block
+        fits = min((shape.cores - 1) // k, WIDTH_CAP)
+        if shape.memory_gb:
+            fits = min(fits, int((shape.memory_gb * 1024 - pool_mb(fits + 1)) // m))
+        node_gpus = shape.max_gpus_per_node if shape.max_gpus_per_node is not None else shape.gpus
+        if g and node_gpus is not None:
+            fits = min(fits, node_gpus // g)
+        if fits < 1:
+            raise SizingRefusal(f"a row of {k} CPUs, {_gb(m)}" + (f", {g} GPU(s)" if g else "") + f" does not fit a "
+                                f"node of {shape.name!r} ({shape.cores} CPUs" + (f", {shape.memory_gb:g} GB"
+                                                                                 if shape.memory_gb else "")
+                                + (f", {node_gpus} GPU(s)" if node_gpus is not None else "") + ")")
+        return DerivedBlock(cores=shape.cores, memory_gb=None, gpus=(node_gpus or 0) if g else 0,
+                            workers=None if workers_fixed is not None else fits + 1, whole_node=True)
     if shape is not None:
         multi = "A batch over several nodes is phase 3's campaign pools."
         if shape.cores and cores > shape.cores:
@@ -509,7 +535,7 @@ def candidates(cpus: int | None, memory_gb: float | None, gpus: int | None, *, w
 
 @dataclass(frozen=True)
 class Proposal:
-    cores: int
+    cores: int | None               # None: no row's CPU-seconds could be read — no evidence, never "1"
     memory_gb: float
     gpus: int = 0
     concurrency: int = 0
@@ -526,14 +552,15 @@ def pilot_proposal(evidence: Iterable[Mapping[str, Any]], measure: BlockMeasure,
     block's CPUs), memory 1.25 × the peak RSS rounded up to a quarter GB (at least a quarter) — the largest over them —
     and the concurrency the block then fits."""
     rows = [dict(e) for e in evidence]
-    cores, mem = 1, 0.25
+    cores: int | None = None
+    mem = 0.25
     for e in rows:
-        wall = float(e.get("wall_s") or 0.0)
-        cpu = float(e.get("cpu_s") or 0.0)
-        k = max(1, math.ceil(cpu / wall - PILOT_TOLERANCE)) if wall > 0 else 1
-        cores = max(cores, min(k, measure.cpus))
+        wall, cpu = e.get("wall_s"), e.get("cpu_s")
+        if cpu is not None:   # a row whose CPU-seconds could not be read is no evidence of its cores — never 0
+            k = max(1, math.ceil(float(cpu) / float(wall) - PILOT_TOLERANCE)) if wall and float(wall) > 0 else 1
+            cores = max(cores or 1, min(k, measure.cpus))
         mem = max(mem, quarter_gb(1.25 * float(e.get("peak_rss_kb") or 0) / 1024))
-    f = fit(measure, Sizing(cores=cores, memory_mb=int(mem * 1024), gpus=gpus))
+    f = fit(measure, Sizing(cores=cores or 1, memory_mb=int(mem * 1024), gpus=gpus))
     return Proposal(cores=cores, memory_gb=mem, gpus=gpus, concurrency=f.slots, evidence=rows)
 
 

@@ -469,6 +469,10 @@ async def _ensure_up_once(
             sizing[resources.WORKERS] = workers
         elif callable(takes_key) and takes_key("max_workers_per_node"):
             sizing["max_workers_per_node"] = workers
+    elif sizing and not bad_size and _has_login_shape(app):
+        # a block asked for by its size alone is no batch's derived block: a derived block's worker count belongs to
+        # that block only (review F1: ensure_endpoint_up(cores=32) after one still ran its 5 workers)
+        sizing[resources.WORKERS] = None
     if partition is not None or account is not None or sizing:
         # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
         # startup-pinned one has not read its template yet (that happens at its first block): read it first.
@@ -2624,9 +2628,20 @@ async def _batch_ensure_up(app: AppCtx, confirm_spend: bool, size: Any = None) -
     if size is None:
         return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False)
     # batch row sizing: the block derived from the rows (sizing.DerivedBlock), asked for as ensure_endpoint_up's size —
-    # its cores, memory and GPUs per node, one node — and its workers (slots + 1) where the template takes them
+    # its cores, memory and GPUs per node (or a whole node, where the partition hands out no less), one node — and its
+    # workers (slots + 1) where the template takes them
+    # one node: named only where the session asked for more (a facility template that renders no nodes_per_block would
+    # refuse the key it already defaults to one)
+    uec = app.shapes["compute"].user_endpoint_config if "compute" in app.shapes else warmth._seed_uec(app, "compute")
+    try:
+        nodes = 1 if int(uec.get("nodes_per_block") or 1) > 1 else None
+    except (TypeError, ValueError):
+        nodes = 1
+    if size.whole_node:
+        return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, whole_node=True,
+                                         gpus=size.gpus, nodes=nodes, recheck=False, workers=size.workers)
     return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, cores=size.cores,
-                                     memory_gb=size.memory_gb, gpus=size.gpus, nodes=1, recheck=False,
+                                     memory_gb=size.memory_gb, gpus=size.gpus, nodes=nodes, recheck=False,
                                      workers=size.workers)
 
 
@@ -2634,7 +2649,7 @@ async def _run_batch(
     app: AppCtx, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
     confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
-    gpus: int | None = None, concurrency: int | None = None, pin: bool = True, pilot: int = 0,
+    gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
 ) -> BatchStatus:
     if _no_facility_bound(app) and batch_id is None:
         return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
@@ -2697,7 +2712,7 @@ async def run_batch(
     ctx: Context, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
     confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
-    gpus: int | None = None, concurrency: int | None = None, pin: bool = True, pilot: int = 0,
+    gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
 ) -> BatchStatus:
     """Run ONE command once per row, many rows, on the session's confirmed compute block — instead of a run_shell
     per row. hpc-bridge keeps the backlog and sends rows as the block's slots free; a durable ledger records every row,
@@ -2713,7 +2728,9 @@ async def run_batch(
     given runs 1-CPU rows, the block's share of memory each, as many as fit (said in `sizing.defaulted`). Each row is
     pinned to its own CPUs (`pin=False`: not pinned) with OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS and PYTHON_CPU_COUNT set
     to its cores. `pilot=1` (or 2): that many rows run alone with the whole block, then phase="needs_sizing" with a
-    `proposal` (cores, memory) from what they used; resume with run_batch(batch_id=…, cores=…, memory_gb=…). Every
+    `proposal` (cores, memory) from what they used; resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
+    resize changes only what it names (memory, unnamed, is the block's share again) and is kept even when the block
+    still needs the user's yes (add confirm_spend=True once they give it). Every
     result carries its peak_rss_mb, cpu_s and nproc; status names rows that ran over their size.
 
     `command`: shell, with `{name}` for each field of a row and `{index}` for the row's number — written BARE, never
