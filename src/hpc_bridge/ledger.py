@@ -40,6 +40,11 @@ BUSY_TIMEOUT_MS = 10_000
 # past the 10 s of an idle batch loop's pass, so a waiting batch stays one; a batch that stopped asking (paused, its
 # walltime gate shut, its server gone) holds nothing back for longer than this.
 WANT_FRESH_S = 30.0
+# How long past its admission (its submit) a row of unknown fate — or one a gone server left in flight — can still hold
+# a worker of the block: task_walltime_s plus this. The batch's admission margin (30 s: the block had at least
+# task_walltime_s + 30 s left, so the task started at once in the slot it was admitted to) plus the wrapper's kill
+# (5 s) and reader (2 s) graces after task_walltime_s; batch passes its own (MARGIN_S may be configured).
+HOLD_MARGIN_S = 37.0
 
 # Network and shared filesystems SQLite's WAL cannot run on (its shared-memory index needs one host's mmap and POSIX
 # locks): Linux's /proc/mounts names and macOS's mount(8) names. Any fuse filesystem counts (sshfs, s3fs, gcsfuse…).
@@ -635,16 +640,73 @@ class Ledger:
         return None if r is None else str(r[0] or "retired")
 
     # -- admission -------------------------------------------------------------------------------------------------
+    def _alive(self, row: sqlite3.Row, owner: Owner | None, seen: dict[tuple[str, int], bool]) -> bool:
+        """Whether a batch's lease holder still runs (`holder_alive`), once per holder; the caller itself does."""
+        key = (str(row["owner_host"] or ""), int(row["owner_pid"] or 0))
+        if owner is not None and key == (owner.host, owner.pid):
+            return True
+        if key not in seen:
+            seen[key] = self.holder_alive(Owner(key[0], key[1], row["owner_start"]))
+        return seen[key]
+
+    def _on_block(self, c: sqlite3.Connection, b: sqlite3.Row, uec_hash: str, block_job: str | None, at: float,
+                  margin_s: float, owner: Owner | None, seen: dict[tuple[str, int], bool]) -> dict[str, int]:
+        """Per batch (the caller's too): its rows that can still hold a worker of THIS block — the batch's endpoint
+        and config `uec_hash` — and none that cannot be shown to (review round 1: an aborted batch's rows of unknown
+        fate and presumed lost had shrunk every later batch's window, at window 1 to nothing, for good):
+        - `in_flight`: while its batch's server runs (it settles or presumes it); a gone server's only until
+          task_walltime_s + `margin_s` past its admission;
+        - `submit_unknown`: only until task_walltime_s + `margin_s` past its admission (its submit) — whatever its
+          batch's state or server. Its task, if the failed POST queued it at all, was sent into a free slot of the
+          window (with at least task_walltime_s + the admission margin of block walltime left), so it started at once,
+          and its wrapper kills the command at task_walltime_s and ends its group and readers within the kill and
+          reader graces (`margin_s` covers the admission margin and both);
+        - `presumed_lost`: only while its batch's server runs and it was sent to the block in front (`block_job`): a
+          row of an earlier block holds none of this block's workers, and one whose block is unknown is not shown to."""
+        hold = ",".join("?" * len(HOLDING))
+        out: dict[str, int] = {}
+        for r in c.execute(
+                "select t.batch_id, t.state, t.sent_job, coalesce(t.admitted_at, t.unknown_since, 0) as sent_at, "
+                "o.task_walltime_s, o.owner_host, o.owner_pid, o.owner_start from task t join batch o on o.id = "
+                f"t.batch_id where o.endpoint_id is ? and coalesce(t.sent_uec, o.uec_hash) = ? and t.state in ({hold})",
+                (b["endpoint_id"], uec_hash, *HOLDING)):
+            young = at - float(r["sent_at"] or 0.0) < float(r["task_walltime_s"] or 0.0) + margin_s
+            if r["state"] == "in_flight":
+                holds = young or self._alive(r, owner, seen)
+            elif r["state"] == "submit_unknown":
+                holds = young
+            else:
+                holds = (block_job is not None and str(r["sent_job"] or "") == str(block_job)
+                         and self._alive(r, owner, seen))
+            if holds:
+                out[str(r["batch_id"])] = out.get(str(r["batch_id"]), 0) + 1
+        return out
+
+    def block_holders(self, batch_id: str, *, uec_hash: str, block_job: str | None = None,
+                      margin_s: float = HOLD_MARGIN_S, now: float | None = None) -> dict[str, int]:
+        """The OTHER batches whose rows hold slots of this batch's block (as `reserve` counts them): {batch: rows}."""
+        at = time.time() if now is None else now
+        b = self._con.execute("select * from batch where id = ?", (batch_id,)).fetchone()
+        if b is None:
+            raise UnknownBatch(batch_id)
+        got = self._on_block(self._con, b, uec_hash, block_job, at, margin_s, None, {})
+        got.pop(batch_id, None)
+        return got
+
     def reserve(self, batch_id: str, owner: Owner, n: int, *, uec_hash: str, now: float | None = None,
-                indices: Iterable[int] | None = None) -> list[TaskRow]:
+                indices: Iterable[int] | None = None, block_job: str | None = None,
+                margin_s: float = HOLD_MARGIN_S) -> list[TaskRow]:
         """THE admission point: in one BEGIN IMMEDIATE transaction, check that `owner` holds the lease, that the config
         is not retired and how many window slots are free, and move up to `n` backlog rows (the lowest indices, or
         `indices` first) to `in_flight` with their next attempt, on the block `uec_hash` names (`sent_uec`).
 
-        The window is the BLOCK's: the batch's own rows out, plus every other batch's rows out on the same block (its
-        endpoint and config), against this batch's `capacity` (the block's workers less one). While another batch on
-        the block waits for a slot (`want_at` within WANT_FRESH_S, still admitting, with a backlog), slots go fewest
-        rows out first, then least recently admitted. A batch refused slots it could use records `want_at`."""
+        The window is the BLOCK's (its endpoint and config; `block_job`: the block in front, when known): the batch's
+        own rows out, plus every other batch's rows that can still hold a worker of this block (`_on_block`), against
+        the smallest `capacity` of the live batches admitting on it (each read the block's workers less one; review
+        round 1: a batch that had not learnt the worker count yet overfilled the window another had learnt). While
+        another batch on the block waits for a slot it could take (`want_at` within WANT_FRESH_S, still admitting,
+        with a backlog and room of its own), slots go fewest rows out on the block first, then least recently
+        admitted. A batch refused slots its own window had room for records `want_at`."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
             b = c.execute("select * from batch where id = ?", (batch_id,)).fetchone()
@@ -657,36 +719,42 @@ class Ledger:
             if why is not None:
                 raise RetiredConfig(str(why[0] or "this block's config was retired"))
             hold = ",".join("?" * len(HOLDING))
-            held = int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
-                                 (batch_id, *HOLDING)).fetchone()[0])
-            # the block's window is SHARED: every other batch's rows out on the same block (its config) hold a slot
-            # of it too (the demo of 2026-11-03: two batches each filled their own window, and the excess queued at
-            # the interchange — #204's pattern)
-            others = {str(r["batch_id"]): int(r["n"]) for r in c.execute(
-                f"select t.batch_id, count(*) as n from task t join batch o on o.id = t.batch_id "
-                f"where t.batch_id != ? and o.endpoint_id is ? and coalesce(t.sent_uec, o.uec_hash) = ? "
-                f"and t.state in ({hold}) group by t.batch_id", (batch_id, b["endpoint_id"], uec_hash, *HOLDING))}
-            cap = int(b["capacity"] or 1)
+
+            def held_by(bid: str) -> int:   # a batch's own window: its rows out, wherever they went
+                return int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
+                                     (bid, *HOLDING)).fetchone()[0])
+
+            seen: dict[tuple[str, int], bool] = {}
+            held = held_by(batch_id)
+            on_block = self._on_block(c, b, uec_hash, block_job, at, margin_s, owner, seen)
+            mine_on = on_block.pop(batch_id, 0)
+            others = sum(on_block.values())
+            peers = [r for r in c.execute(
+                "select o.*, (select max(admitted_at) from task where batch_id = o.id) as last, exists (select 1 from "
+                "task where batch_id = o.id and state = 'backlog') as backlogged from batch o where o.id != ? and "
+                "o.endpoint_id is ? and o.uec_hash = ? and o.state = 'admitting'",
+                (batch_id, b["endpoint_id"], uec_hash)) if self._alive(r, owner, seen)]
+            cap = min([int(b["capacity"] or 1)] + [int(r["capacity"] or 1) for r in peers])
             backlog = int(c.execute("select count(*) from task where batch_id = ? and state = 'backlog'",
                                     (batch_id,)).fetchone()[0])
-            take = min(max(0, n), max(0, cap - held - sum(others.values())), backlog)
-            # fairness: while another batch on the block is waiting for a slot (it asked within WANT_FRESH_S and got
-            # fewer than it could use), a slot goes first to the batch with the fewest rows out, then to the one that
-            # admitted least recently — so one huge batch cannot keep taking back the slots it frees
-            waiting = [(others.get(str(r["id"]), 0), float(r["last"] or 0.0)) for r in c.execute(
-                "select o.id, (select max(admitted_at) from task where batch_id = o.id) as last from batch o "
-                "where o.id != ? and o.endpoint_id is ? and o.uec_hash = ? and o.state = 'admitting' "
-                "and o.want_at is not null and o.want_at >= ? "
-                "and exists (select 1 from task where batch_id = o.id and state = 'backlog')",
-                (batch_id, b["endpoint_id"], uec_hash, at - WANT_FRESH_S))]
+            own_room = max(0, min(n, int(b["capacity"] or 1) - held, backlog))
+            take = min(own_room, max(0, cap - held - others))
+            # fairness: a slot goes first to a waiting batch (it asked within WANT_FRESH_S and was refused by the
+            # others on the block) that has fewer rows out on the block, then admitted less recently — but only to one
+            # that can take it now (its own room on the block): a slot is never left idle for a waiter that cannot
+            waiting = [(on_block.get(str(r["id"]), 0), float(r["last"] or 0.0), str(r["id"]),
+                        int(r["capacity"] or 1)) for r in peers
+                       if r["backlogged"] and r["want_at"] is not None and float(r["want_at"]) >= at - WANT_FRESH_S]
+            room = {bid: min(cap, w_cap) - held_by(bid) - (mine_on + others - w_on)
+                    for w_on, _last, bid, w_cap in waiting}
             last = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
-            mine = (held, float(last or 0.0))
-            fair = 0
-            while fair < take and not any(w < mine for w in waiting):
+            fair, mine = 0, (mine_on, float(last or 0.0))
+            while fair < take and not any(room[bid] - fair > 0 and (w_on, w_last) < mine
+                                          for w_on, w_last, bid, _cap in waiting):
                 fair += 1
-                mine = (held + fair, at)
+                mine = (mine_on + fair, at)
             take = fair
-            wants = backlog > take and take < min(max(0, n), max(0, cap - held))
+            wants = take < own_room   # refused by the others on the block, never by its own rows or capacity
             c.execute("update batch set want_at = ? where id = ?", (at if wants else None, batch_id))
             if take <= 0:
                 return []

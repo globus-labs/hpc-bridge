@@ -439,7 +439,9 @@ async def test_submit_unknown_never_resubmitted():
     assert sum("/tasks/0/attempt-" in c for c in runner.commands) == 1
 
     app2, _rt2, runner2 = await _batch_app(workers=4)
-    app2.state.endpoint_id = "fake-eid-2"   # another block: the first half's rows out (same ledger) share none of it
+    # Another block. On the same endpoint and config this would be the first half's block, whose window (3) its rows
+    # still hold — 3 and 4 in flight, 0 of unknown fate, all from a live server — so it shares none with this batch.
+    app2.state.endpoint_id = "fake-eid-2"
     runner2.fail_submit_of = {0}
     out2 = await _start(app2, n=5, idempotent=True)
     stray = str(uuid.uuid4())

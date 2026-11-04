@@ -319,13 +319,18 @@ def readings(text: str, yaml_key: str) -> list[tuple[str, Any, Any]]:
 
 
 _STMT = re.compile(r"^\s*\{%-?\s*(if|elif|else|endif)\b\s*(.*?)\s*-?%\}\s*$")
-_COND_DEFAULT = re.compile(r"^([A-Za-z_]\w*)\s*\|\s*default\(\s*(.*?)\s*\)$")
+# `x | default(<one literal>)` and nothing more (review round 1: `(.*?)\)$` had swallowed `default(x, true)` — Jinja's
+# boolean default, which turns a falsy value into the default — and `default(a) or (…)` up to the line's last `)`)
+_LIT = r"""(?:"[^"\\]*"|'[^'\\]*'|-?\d+(?:\.\d+)?|[Tt]rue|[Ff]alse|[Nn]one|null)"""
+_COND_DEFAULT = re.compile(rf"^([A-Za-z_]\w*)\s*\|\s*default\(\s*({_LIT})\s*\)$")
 _COND_DEFINED = re.compile(r"^([A-Za-z_]\w*)\s+is\s+defined(?:\s+and\s+([A-Za-z_]\w*)(\s+is\s+not\s+none)?)?$")
 
 
 def _cond(expr: str, wire: dict[str, Any], closed: bool) -> bool | None:
-    """An `{% if %}` condition's value for this config, or None where it cannot be told: only `x | default(lit)`,
-    `x is defined`, `x is defined and x` and `x is defined and x is not none` are read. A string is never judged by its
+    """An `{% if %}` condition's value for this config, or None where it cannot be told: only `x | default(<one
+    literal>)`, `x is defined`, `x is defined and x` and `x is defined and x is not none` are read — anything else
+    (another default argument, an operator after it, a call) is unknown, both branches stay, and the terms take the
+    most of their readings: never less than the template renders. A string is never judged by its
     truth (the endpoint's manager JSON-quotes every string value, so '' arrives truthy). `closed`: the template is
     hpc-bridge's own, rendered with the config alone, so a name the config does not carry is undefined."""
     m = _COND_DEFAULT.match(expr)

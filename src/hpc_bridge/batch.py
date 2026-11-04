@@ -81,6 +81,9 @@ MAX_COMMAND = 64 * 1024
 MAX_WAIT_S = 60.0
 KILL_GRACE_S = 5
 READER_GRACE_S = 2                     # after the leftover group is killed: the stream readers' time to reach EOF
+# how long past its admission another batch's row of unknown fate (or a gone server's row in flight) can hold a worker
+# of the block: task_walltime_s plus this (ledger `_on_block`)
+HOLD_MARGIN_S = MARGIN_S + KILL_GRACE_S + READER_GRACE_S
 TICK_S = 2.0
 IDLE_TICK_S = 10.0
 EVIDENCE_EVERY_S = 30.0                # how often the block's job is looked up while tasks are out (SSH)
@@ -1099,6 +1102,8 @@ class _Run:
     marker_future: Any = None          # a MEP abort's marker task, while it is out: never a second one
     marker_written: bool = False       # …and once it wrote the marker, none again
     groups_recorded: set[str] = field(default_factory=set)
+    # the other batches holding the block's shared window while this one is refused slots (`_held_by_note`)
+    held_by: str | None = None
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -1409,12 +1414,8 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
         out.notice = ((out.notice or "") + f" Row(s) {shown} give a placeholder a value starting with '-': a command "
                       "may read it as an option. Put `--` before the placeholder (`rm -- {f}`), or give paths as "
                       "`./-name`.")
-    sharing = [x["id"] for x in led.batches(endpoint_id=app.state.endpoint_id, states=("admitting",))
-               if x["id"] != bid and x.get("uec_hash") == uec_hash(rt)]
-    shared = (f" That window is the block's, shared with {', '.join(sharing[:5])} on it: a freed slot goes to the "
-              "batch with the fewest rows out." if sharing else "")
     out.notice = (f"{bid}: {len(rows)} row(s) accepted; {admitted} admitted now, at most {out.capacity} out at once "
-                  f"(the block's workers less one kept for your interactive commands).{shared} Results land in "
+                  f"(the block's workers less one kept for your interactive commands). Results land in "
                   f"{batch_dir(rd, bid)}. Follow "
                   f"it with status('{bid}', wait_s=60); stop it with cancel('{bid}'). " + (out.notice or "")).strip()
     return out
@@ -1522,6 +1523,9 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
         wait = max(0.0, min(float(wait_s or 0.0), MAX_WAIT_S))
         deadline = time.monotonic() + wait + CALL_BUDGET_S
         busy = False
+        # the baseline is the batch as the call found it: a change the call's own first pass makes (its last rows
+        # collected, the batch done) ends the wait too (review round 1)
+        before = _change_key(led, bid)
         try:
             await tick(app, bid, deadline=deadline, lock_wait_s=min(CALL_BUDGET_S, LOCK_WAIT_S))
         except PassBusy:
@@ -1529,7 +1533,7 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
         if app.batches.get(bid) is run and isinstance(run, _Run):
             _start_loop(app, run)   # the steps a tool call leaves (a switch, a block check) are the loop's
             if wait > 0 and not busy:
-                busy = await _wait_for_change(app, run, wait, deadline)
+                busy = await _wait_for_change(app, run, wait, deadline, before)
         out = _status_of(app, bid, detail=detail, offset=offset, limit=limit)
         if busy:
             out.notice = (out.notice or "") + _BUSY_NOTE
@@ -1545,13 +1549,26 @@ def _change_key(led: Ledger, bid: str) -> tuple[Any, ...]:
     return (led.batch(bid)["state"], *(c.get(k, 0) for k in ("failed", "lost", "presumed_lost", "submit_unknown")))
 
 
-async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float) -> bool:
-    """Until the phase changes or a row needs the agent (`_change_key`), or `wait` is up — rows that complete cleanly
-    are reported, never waited on. The background loop does the passes when it runs; otherwise this call does, as the
-    loop would. Returns whether a pass was found busy (the answer says so)."""
+def _settled(led: Ledger, run: _Run) -> bool:
+    """Nothing more can happen without the user: the batch admits nothing (done, cancelled, paused or drained) and
+    nothing of it is out (review round 1: a drained or aborted batch's last rows settle `done` / `cancelled`, which
+    `_change_key` does not watch, so its wait slept to the end)."""
+    bid = run.batch_id
+    return led.batch(bid)["state"] != "admitting" and not _out_now(led.counts(bid)) and not run.futures
+
+
+async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float,
+                           before: tuple[Any, ...] | None = None) -> bool:
+    """Until the phase changes or a row needs the agent (`_change_key`, against `before`: the batch as the call found
+    it), or nothing more can happen (`_settled`), or `wait` is up — rows that complete cleanly are reported, never
+    waited on. The background loop does the passes when it runs; otherwise this call does, as the loop would. Returns
+    whether a pass was found busy (the answer says so)."""
     led = ledger_of(app)
     bid = run.batch_id
-    before = _change_key(led, bid)
+    if before is None:
+        before = _change_key(led, bid)
+    if _change_key(led, bid) != before or _settled(led, run):
+        return False
     end = time.monotonic() + wait
     while (left := end - time.monotonic()) > 0 and app.batches.get(bid) is run:
         looping = run.loop is not None and not run.loop.done()
@@ -1565,7 +1582,7 @@ async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float)
                 await tick(app, bid, deadline=deadline)
             except PassBusy:
                 return True
-        if _change_key(led, bid) != before:
+        if _change_key(led, bid) != before or _settled(led, run):
             return False
     return False
 
@@ -1939,13 +1956,19 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     if cap != int(b["capacity"] or 0):
         led.update_batch(bid, capacity=cap)
     try:
-        rows = led.reserve(bid, owner_of(app), cap, uec_hash=uec_hash(rt), now=_now())
+        rows = led.reserve(bid, owner_of(app), cap, uec_hash=uec_hash(rt), now=_now(), block_job=run.block_job,
+                           margin_s=HOLD_MARGIN_S)
     except RetiredConfig as exc:
         pause(app, bid, f"the block's config was retired ({exc}): a new block needs the user's yes")
         return 0
     except NotLeaseHolder:
         app.batches.pop(bid, None)
         return 0
+    # refused slots its own window had room for (`want_at`): name the batches holding the block's, and the remedy
+    run.held_by = (_held_by_note(led, bid, uec_hash(rt), run.block_job)
+                   if led.batch(bid).get("want_at") is not None else None)
+    if run.held_by and not _held(led.counts(bid)):
+        run.waiting = run.held_by
     names = {"index"}
     for row in led.tasks(bid):
         r = json.loads(row["row_json"])
@@ -1956,6 +1979,17 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         if _send(app, run, rt, b, t.index, t.attempt, t.row, names, session, remaining, need):
             sent += 1
     return sent
+
+
+def _held_by_note(led: Ledger, bid: str, uec: str, block_job: str | None) -> str | None:
+    """Which other batches hold the block's shared window while `bid` is refused slots, and the remedy."""
+    holders = led.block_holders(bid, uec_hash=uec, block_job=block_job, margin_s=HOLD_MARGIN_S, now=_now())
+    if not holders:
+        return None
+    named = ", ".join(f"{h} ({n} row(s) out, {led.batch(h)['state']})" for h, n in list(holders.items())[:5])
+    return (f" The block's window is shared, and other batches hold its slots: {named}. Rows here are admitted as "
+            "their slots free. status('<id>') shows such a batch; cancel('<id>', 'abort') ends it if the user no "
+            "longer wants it.")
 
 
 def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: int, attempt: int, row: Any,
@@ -2638,6 +2672,8 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         text += f" Another hpc-bridge server holds this batch ({owner}): this is a read of the ledger."
     if c.get("failed") and detail == "summary":
         text += f" status('{bid}', detail='failed') lists the failed rows with their exit codes."
+    if run is not None and run.held_by and state == "admitting" and c.get("backlog", 0):
+        text += run.held_by
     text += _home_warning(b.get("results_dir"))
     return BatchStatus(
         batch_id=bid, phase=phase, tasks=total, chunk=int(b.get("chunk") or 1), capacity=int(b["capacity"] or 1),

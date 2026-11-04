@@ -198,12 +198,20 @@ The batch demo on the fake cluster (2026-11-03, `agentic/fakecluster/bin/try_bat
 tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
 - **`status(id, wait_s)` waits the whole `wait_s`** unless the batch ends, a row fails, is lost (or presumed so) or is
   of unknown fate, or the phase changes. A row that completes no longer ends the wait: 20 rows took 21 status calls,
-  one agent turn per row. The answer still carries the progress counts; the call's own budget is unchanged.
+  one agent turn per row. The answer still carries the progress counts; the call's own budget is unchanged. It ends
+  at once when nothing more can happen (the batch admits nothing and nothing of it is out: a drained or aborted
+  batch once its last rows settle), and its baseline is the batch as the call found it, so a batch the call's own
+  first pass finished — or one already done — no longer sleeps the whole wait.
 - **One block's window is shared by every batch on it.** `Ledger.reserve` counted held rows per batch, so two batches
   on one block each filled the workers-less-one window, and the excess queued at the interchange (#204's pattern). It
-  now counts every batch's rows out on the same block (its endpoint and config), and while another batch on the block
-  waits for a slot, a freed slot goes to the batch with the fewest rows out (then the one that admitted least
-  recently): one huge batch cannot starve another. `reserve` stays the one admission point.
+  now counts the other batches' rows that can still hold a worker of the block in front (same endpoint and config):
+  a live server's rows in flight; a gone server's, and any row of unknown fate, only until `task_walltime_s` + the
+  admission margin and the wrapper's graces past its submit; a presumed-lost row only on the block it was sent to.
+  The block's window is the smallest capacity of the live batches on it. While another batch on the block waits for a
+  slot it could take, a freed slot goes to the batch with the fewest rows out on the block (then the one that admitted
+  least recently): one huge batch cannot starve another, and no slot is left idle for a waiter that cannot take it. A
+  batch refused slots names the batches holding them, with `status(id)` / `cancel(id, 'abort')`. `reserve` stays the
+  one admission point.
 - **The envelope names the session's own compute block.** A block confirmed BEFORE the envelope opened was counted as
   "not started by hpc-bridge" and offered to `exclude_jobs`. It is still counted (it bills the same allocation), now
   as "the session's compute block, confirmed before this envelope opened", and never offered for exclusion.
@@ -214,7 +222,9 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
 - **"What still bills" lists only what can.** A job that ended with nothing committed (a CANCELLED one, "+ 0") is
   counted in `spent`, not listed there.
 - **`export_handoff`'s terms state what its config sends.** They said `init_blocks` 1 while the config sent 0: the
-  template's readings were maxed across its LOGIN branch too; only the branches the config reaches are read now. The
+  template's readings were maxed across its LOGIN branch too; only the branches the config reaches are read now — a
+  branch is dropped only on a condition read exactly (`x | default(<one literal>)`, `x is defined …`); anything
+  else (`default(x, true)`, an operator after the default) keeps both branches and their most. The
   config also carried the session's own block size (`cores_per_node: 3`, `exclusive: false`, from the session's
   `compute_choice`): a handoff's config no longer inherits it. The terms now carry every size key the config sends
   (`cores_per_node`, `cpus_per_node`, `mem_per_node`, `gpus_per_node`, `exclusive`, `select_options`) and the

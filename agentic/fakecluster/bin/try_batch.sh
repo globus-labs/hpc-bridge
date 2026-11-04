@@ -23,6 +23,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 FC="$REPO/agentic/fakecluster"
 DEMO="${HPCB_DEMO_DIR:-$HOME/hpcb-batch-demo}"
+case "$DEMO" in /*) ;; *) DEMO="$PWD/$DEMO" ;; esac   # absolute: --launch cd's into it, the server gets $STATE
 STATE="$DEMO/state"   # keep it short: ssh's ControlPath (<state>/cm/<40 hex>) must fit ~104 bytes
 ALIAS_FILE="$FC/ssh_config.example"
 LAUNCH=""; DOWN=""

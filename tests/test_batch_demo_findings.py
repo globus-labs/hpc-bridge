@@ -14,12 +14,15 @@ each finding was checked against the raw tool output). Written failing first; ea
 from __future__ import annotations
 
 import asyncio
+import json
 import time
 
 import pytest
 
+from hpc_bridge.ledger import HOLDING
 from tests.test_batch_phase1 import _add, _batch_app, _ledger, _ok_report, _owner, _start
 from tests.test_batch_phase2a import _BASH, _confirmed, _hand_script, _submit, world
+from tests.test_server import _Res
 
 _FIXTURES = (world,)   # a pytest fixture, used by name as a test parameter below
 pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
@@ -175,7 +178,199 @@ async def test_pool_a_second_run_batch_on_the_block_shares_its_window():
     out = sum(led.counts(b).get("in_flight", 0) for b in (first.batch_id, second.batch_id))
     assert first.admitted == 2 and second.admitted == 0 and out == 2, (first.admitted, second.admitted, out)
     assert len(runner.futures) == 2
-    assert f"shared with {first.batch_id}" in (second.notice or ""), second.notice
+    assert f"other batches hold its slots: {first.batch_id} (2 row(s) out" in (second.notice or ""), second.notice
+    assert second.phase == "waiting" and first.batch_id in (second.reason or ""), second
+
+
+# ---- review round 1: the shared window counts only rows that can hold a worker of the block in front ----------------
+# The reviewer's reproductions (red on 36af987), and the bounds the fix states.
+
+def _out_on(led, bids, uec):
+    return sum(1 for b in bids for t in led.tasks(b) if t["state"] in HOLDING and t.get("sent_uec") == uec)
+
+
+def test_r1_1_presumed_lost_rows_of_an_aborted_batch_hold_the_window_a_week_later(tmp_path):
+    """On a facility MEP the block's config hash is the same for every block, and a presumed-lost row never leaves
+    HOLDING without a result: it held every later batch's window on the config — here a week later, its batch aborted.
+    A presumed-lost row holds only the block it was sent to, and only while its batch's server runs."""
+    led = _ledger(tmp_path)
+    me = _owner()
+    old = _add(led, "batch-0000000000a1", n=2, capacity=2, owner=me)
+    for r in led.reserve(old, me, 2, uec_hash="uec-1", now=1_000.0):
+        assert led.settle(old, r.index, r.attempt, "presumed_lost", only_from=("in_flight",))
+    led.update_batch(old, state="cancelled", pause_reason="aborted by cancel")
+    new = _add(led, "batch-0000000000b1", n=4, capacity=2, owner=me)
+    week = 1_000.0 + 7 * 86_400
+    got = led.reserve(new, me, 2, uec_hash="uec-1", now=week)
+    assert len(got) >= 1, "a week later, an aborted batch's presumed-lost rows still take the whole block's window"
+
+
+def test_r1_1_what_holds_a_slot_of_the_block_in_front(tmp_path):
+    """The bounds, row by row (task_walltime_s 60, HOLD_MARGIN_S past the admission): a live server's row in flight
+    holds; a gone server's only until its walltime and the margin have passed; a row of unknown fate only until then
+    too, whoever runs it; a presumed-lost row only on the block it was sent to, while its server runs."""
+    from hpc_bridge.ledger import HOLD_MARGIN_S
+
+    led = _ledger(tmp_path)
+    me = _owner()
+    live = _add(led, "batch-0000000000a1", n=3, capacity=4, owner=me)
+    rows = led.reserve(live, me, 3, uec_hash="uec-1", now=1_000.0, block_job="101")
+    assert led.settle(live, rows[0].index, rows[0].attempt, "presumed_lost", sent_job="101")
+    assert led.settle(live, rows[1].index, rows[1].attempt, "submit_unknown", sent_job="101", unknown_since=1_001.0)
+    gone = _add(led, "batch-0000000000c1", n=1, capacity=4, owner=me)
+    assert len(led.reserve(gone, me, 1, uec_hash="uec-1", now=1_000.0, block_job="101")) == 1
+    led.update_batch(gone, owner_pid=2 ** 22 + 11)            # its server is gone (that pid is dead here)
+    led.pid_alive = lambda pid: pid != 2 ** 22 + 11
+    new = _add(led, "batch-0000000000d1", n=4, capacity=4, owner=me)
+    soon, late = 1_010.0, 1_000.0 + 60 + HOLD_MARGIN_S + 1
+    assert led.block_holders(new, uec_hash="uec-1", block_job="101", now=soon) == {live: 3, gone: 1}
+    assert led.block_holders(new, uec_hash="uec-1", block_job="202", now=soon) == {live: 2, gone: 1}
+    assert led.block_holders(new, uec_hash="uec-1", block_job="101", now=late) == {live: 2}
+    assert led.block_holders(new, uec_hash="uec-1", block_job=None, now=late) == {live: 1}
+
+
+async def test_r1_1_an_aborted_batchs_unknown_submit_holds_the_window_only_for_its_walltime_and_says_so(monkeypatch):
+    """Through the tools, on a MEP: a batch's one row's submit is of unknown fate; the user aborts the batch. A later
+    session's batch on the same endpoint and config is told which batch holds the block's window (status / cancel),
+    and admits once task_walltime_s + the margin have passed since that submit — never held for good."""
+    from hpc_bridge import batch, server
+
+    async def no_marker(*_a, **_k):
+        return True, ""
+
+    monkeypatch.setattr(batch, "write_cancel_marker", no_marker)
+    app, rt, runner = await _batch_app(workers=2, mep=True)              # a window of 1
+    runner.fail_submit_of = {0}
+    first = await _start(app, n=1)
+    await batch.tick(app, first.batch_id)
+    assert (await server._status(app, first.batch_id)).counts.submit_unknown == 1
+    await server._cancel(app, first.batch_id, "abort")
+    assert (await server._status(app, first.batch_id)).phase == "cancelled"
+
+    app2, rt2, _runner2 = await _batch_app(workers=2, mep=True)          # a later session, same endpoint and config
+    assert batch.uec_hash(rt2) == batch.uec_hash(rt)
+    second = await _start(app2, n=4)
+    for _ in range(3):
+        await batch.tick(app2, second.batch_id)
+    st = await server._status(app2, second.batch_id)
+    said = " ".join(x or "" for x in (second.notice, st.notice, st.reason))
+    assert st.counts.in_flight >= 1 or first.batch_id in said, (
+        f"admitted {second.admitted}, counts {st.counts}, phase {st.phase}: starved by {first.batch_id} (aborted) "
+        f"without a word: {said!r}")
+    assert "cancel('<id>', 'abort')" in said and "status('<id>')" in said, said
+    later = time.time() + 60 + batch.HOLD_MARGIN_S + 1                   # task_walltime_s 60 past its submit
+    monkeypatch.setattr(batch, "_now", lambda: later)
+    await batch.tick(app2, second.batch_id)
+    assert batch.ledger_of(app2).counts(second.batch_id)["in_flight"] == 1
+
+
+@pytest.mark.parametrize("trigger", ["waiter_holds_a_row_on_its_old_block", "waiter_has_a_smaller_capacity"])
+def test_r1_2_a_free_slot_is_never_left_idle_for_a_waiter_that_cannot_take_it(tmp_path, trigger):
+    """A defers only to a waiter that can take the slot (its own room on the block), compares rows out on THIS block,
+    and a batch refused by its own rows or capacity never asks. The second case's window is b's (fix 5: the smallest
+    capacity of the live batches on the block): 2, and it is filled."""
+    led = _ledger(tmp_path)
+    me = _owner()
+    smaller = trigger == "waiter_has_a_smaller_capacity"
+    a = _add(led, "batch-00000000000a", n=10, capacity=3 if smaller else 2, owner=me)
+    b = _add(led, "batch-00000000000b", n=10, capacity=2, owner=me)
+    if not smaller:
+        # b ran on an earlier block (a reap, then the user's yes for a new one: a fresh hpcb_block, a new config hash),
+        # and one of its submits there is of unknown fate: it holds b's own window until evidence
+        led.update_batch(b, uec_hash="uec-old")
+        [r] = led.reserve(b, me, 1, uec_hash="uec-old", now=10.0)
+        assert led.settle(b, r.index, r.attempt, "submit_unknown", only_from=("in_flight",), unknown_since=10.0)
+        led.update_batch(b, uec_hash="uec-1")
+    assert len(led.reserve(a, me, 1, uec_hash="uec-1", now=100.0)) == 1   # a: one row out of the block's window of 2
+    for step in range(10):                                                # each batch's loop passes, as it would
+        now = 101.0 + 5 * step
+        led.reserve(b, me, 2, uec_hash="uec-1", now=now)
+        led.reserve(a, me, 3, uec_hash="uec-1", now=now + 1)
+    out = _out_on(led, (a, b), "uec-1")
+    assert out == 2, f"{out} out on the block's window of 2 after 10 rounds with rows waiting in the backlogs"
+
+
+def test_r1_2_a_batch_refused_by_its_own_window_does_not_ask(tmp_path):
+    led = _ledger(tmp_path)
+    me = _owner()
+    a = _add(led, "batch-00000000000a", n=10, capacity=1, owner=me)
+    assert len(led.reserve(a, me, 1, uec_hash="uec-1", now=100.0)) == 1
+    assert led.reserve(a, me, 1, uec_hash="uec-1", now=101.0) == []           # its own window is full
+    assert led.batch(a)["want_at"] is None
+
+
+async def test_r1_3_a_second_batch_overfills_the_window_the_first_learned():
+    """Two batches on ONE block: the first learnt from its results that the block has 3 workers (a window of 2); a
+    second batch started now reads the config's 8 — the block's window is the smaller."""
+    from hpc_bridge import batch
+
+    app, _rt, runner = await _batch_app(workers=8)       # the config says 8 workers; the canary names no count
+    first = await _start(app, n=20)
+    for i, f in enumerate(list(runner.futures)):
+        f.finish(_ok_report(i))                          # each result: workers 3 (PARSL_WORKER_COUNT on the node)
+    await batch.tick(app, first.batch_id)
+    led = batch.ledger_of(app)
+    assert int(led.batch(first.batch_id)["capacity"]) == 2, led.batch(first.batch_id)["capacity"]
+    second = await _start(app, n=20)
+    out = sum(led.counts(b).get("in_flight", 0) for b in (first.batch_id, second.batch_id))
+    assert out <= 2, f"{out} out on a block whose workers (3) give a window of 2 (second admitted {second.admitted})"
+
+
+def _cancelled_report(index: int, attempt: int = 1):
+    """The wrapper's result for a row its CANCELLED marker killed (rc 143)."""
+    rep = {"index": index, "attempt": attempt, "rc": 143, "tail": "", "stderr_tail": "", "cancelled": True,
+           "stdout_path": f"/scratch/u/batches/b/tasks/{index}/attempt-{attempt}/stdout", "stdout_bytes": 0,
+           "truncated": False, "job": "101", "host": "c1", "workers": 3, "remaining_s": 900.0}
+    return _Res(0, "HPCB_RESULT " + json.dumps(rep) + "\n", "")
+
+
+@pytest.mark.parametrize("mode", ["drain", "abort"])
+async def test_r1_4_wait_s_ends_once_a_cancelled_batch_has_nothing_left_out(monkeypatch, mode):
+    """After cancel(drain) (or a stop's refusal: "wait for them (status(id, wait_s=60))") or cancel(abort), the rows
+    still out settle done / cancelled; once nothing is out and the batch admits nothing, the wait ends."""
+    from hpc_bridge import batch, server
+
+    async def marker_written(*_a, **_k):
+        return True, ""
+
+    monkeypatch.setattr(batch, "write_cancel_marker", marker_written)
+    app, _rt, runner = await _batch_app(workers=3)                       # a window of 2
+    out = await _start(app, n=6)
+    c = await server._cancel(app, out.batch_id, mode)
+    assert c.in_flight == 2, c
+    app.batch_autoloop = True
+    batch._start_loop(app, app.batches[out.batch_id])
+    rep = _ok_report if mode == "drain" else _cancelled_report
+    loop = asyncio.get_running_loop()
+    loop.call_later(0.3, lambda: [runner.futures[i].finish(rep(i)) for i in (0, 1)])
+    try:
+        t0 = time.monotonic()
+        st = await server._status(app, out.batch_id, wait_s=8)
+        took = time.monotonic() - t0
+    finally:
+        run = app.batches.get(out.batch_id)
+        if run is not None and run.loop is not None:
+            run.loop.cancel()
+    assert st.counts.in_flight == 0, st.counts
+    assert took < 4, f"status(wait_s=8) on a {mode}ed batch with nothing out slept {took:.1f} s ({st.phase})"
+
+
+async def test_r1_4_wait_s_on_a_batch_its_own_first_pass_finished_returns_at_once():
+    """The baseline is the batch as the call found it: a batch the call's first pass finished — or one already done —
+    returns at once (red on 49e342e too)."""
+    from hpc_bridge import server
+
+    app, _rt, runner = await _batch_app(workers=3)
+    out = await _start(app, n=2)
+    for i, f in enumerate(list(runner.futures)):
+        f.finish(_ok_report(i))
+    t0 = time.monotonic()
+    st = await server._status(app, out.batch_id, wait_s=5)
+    took = time.monotonic() - t0
+    assert st.phase == "done" and took < 2, f"status(wait_s=5) on a done batch slept {took:.1f} s"
+    t0 = time.monotonic()
+    st = await server._status(app, out.batch_id, wait_s=5)
+    assert st.phase == "done" and time.monotonic() - t0 < 2
 
 
 # ---- C: the session's own compute block, confirmed before the envelope ------------------------------------------------
@@ -388,6 +583,79 @@ async def test_G_a_config_that_asks_no_slice_is_costed_as_the_whole_node_it_gets
     assert not {"cores_per_node", "exclusive", "mem_per_node"} & set(ask.user_endpoint_config), ask.user_endpoint_config
     assert ask.terms.rate == pytest.approx(4.0), ask.terms        # the whole 4-core node
     assert ask.terms.canary_worst_case >= 4.0 - 1e-9, ask.terms
+
+
+def _branchy(cond: str) -> str:
+    return (f"provider:\n{{% if {cond} %}}\n  nodes_per_block: 4\n{{% else %}}\n  nodes_per_block: 1\n"
+            "{% endif %}\n")
+
+
+@pytest.mark.parametrize("cond, wire", [
+    ("full_node | default(true, true)", {"full_node": False}),          # Jinja's boolean default: a falsy value -> true
+    ("full_node | default(false) or (nodes_wanted > 1)", {"full_node": False, "nodes_wanted": 2}),
+    ("full_node | default(false) and big", {"full_node": True, "big": False}),
+    ("full_node | default(lookup('x'))", {"full_node": False}),
+], ids=["default_boolean_arg", "default_then_or", "default_then_and", "default_of_a_call"])
+def test_r1_5_taken_never_drops_a_branch_jinja_renders(cond, wire):
+    """Review round 1: `_COND_DEFAULT`'s `(.*?)\\)$` swallowed anything after the default's literal up to the line's last
+    `)`, so `x | default(true, true)` and `x | default(a) or (…)` were read as `x`, and the branch Jinja takes was
+    dropped. Only `default(<one literal>)` is read now; anything else keeps both branches (their max)."""
+    from hpc_bridge import handoff
+
+    jinja2 = pytest.importorskip("jinja2")
+    t = _branchy(cond)
+    rendered = jinja2.Template(t).render(**wire, lookup=lambda _k: True)          # what the endpoint renders
+    got = handoff.effective(t, "nodes_per_block", wire, 1)
+    assert got >= (4 if "nodes_per_block: 4" in rendered else 1), (got, handoff.taken(t, wire))
+    assert got == 4, handoff.taken(t, wire)             # never told apart: both branches, the most of them
+
+
+@pytest.mark.parametrize("cond, wire, want", [
+    ("full_node | default(true)", {"full_node": False}, 1), ("full_node | default(true)", {}, 4),
+    ("full_node is defined and full_node", {"full_node": True}, 4)])
+def test_r1_5_a_condition_it_can_tell_still_picks_the_branch_jinja_renders(cond, wire, want):
+    from hpc_bridge import handoff
+
+    jinja2 = pytest.importorskip("jinja2")
+    t = _branchy(cond)
+    assert f"nodes_per_block: {want}" in jinja2.Template(t).render(**wire)
+    assert handoff.effective(t, "nodes_per_block", wire, 1, closed=True) == want
+
+
+FACILITY_TEMPLATE = """engine:
+  type: GlobusComputeEngine
+  max_workers_per_node: {{ max_workers_per_node|default(4) }}
+  job_status_kwargs:
+    max_idletime: {{ max_idletime|default(240) }}
+  provider:
+    type: PBSProProvider
+    account: {{ account }}
+    queue: {{ queue }}
+    walltime: {{ walltime|default("01:00:00") }}
+{% if full_node | default(true, true) %}
+    nodes_per_block: 4
+{% else %}
+    nodes_per_block: 1
+{% endif %}
+    init_blocks: {{ init_blocks|default(0) }}
+    min_blocks: {{ min_blocks|default(0) }}
+    max_blocks: {{ max_blocks|default(1) }}
+"""
+
+
+async def test_r1_5_export_handoff_terms_never_understate_a_facility_template_branch(tmp_path, monkeypatch):
+    """Through export_handoff on a facility MEP: the template renders 4 nodes per block for this config (Jinja's
+    `default(true, true)` turns the config's false into true); the terms had said 1 — a quarter of the worst case."""
+    from tests.test_handoff_phase2b import POLARIS_SCHEMA, _export, _mep_app
+
+    jinja2 = pytest.importorskip("jinja2")
+    app = await _mep_app(tmp_path, monkeypatch, template=FACILITY_TEMPLATE, schema=POLARIS_SCHEMA)
+    uec = {"queue": "debug", "account": "hpcb", "walltime": "01:00:00", "max_blocks": 1, "full_node": False}
+    ask = await _export(app, uec)
+    assert ask.phase == "needs_confirmation", (ask.phase, ask.reason, ask.notice)
+    rendered = jinja2.Template(FACILITY_TEMPLATE).render(**ask.user_endpoint_config)
+    assert "nodes_per_block: 4" in rendered
+    assert ask.terms.nodes_per_block == 4, (ask.terms.nodes_per_block, ask.terms.worst_case, ask.notice)
 
 
 # ---- status() with no id: what the ledger holds (the user's request after the demo) --------------------------------
