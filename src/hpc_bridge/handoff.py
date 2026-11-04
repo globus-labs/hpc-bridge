@@ -110,6 +110,14 @@ class HandoffTerms(_Rec):
     max_blocks: int = 1
     max_workers_per_node: int | None = None
     available_accelerators: int | list[str | int] | None = None
+    # the block's size as the config sends it (hpc-bridge's names; None: the config does not carry the key) — the rate
+    # is costed from it, and a config with no slice is the whole node parsl asks for
+    cores_per_node: int | None = None
+    cpus_per_node: int | None = None
+    mem_per_node: int | None = None
+    gpus_per_node: int | None = None
+    exclusive: bool | None = None
+    select_options: str | None = None
     max_idletime_s: int | None = None
     unit: str = "node-hours"
     rate: float = 0.0                  # what one block bills per hour, in `unit`
@@ -310,12 +318,77 @@ def readings(text: str, yaml_key: str) -> list[tuple[str, Any, Any]]:
     return out
 
 
-def effective(text: str, yaml_key: str, wire: dict[str, Any], parsl_default: Any, *, pick: str = "max") -> Any:
+_STMT = re.compile(r"^\s*\{%-?\s*(if|elif|else|endif)\b\s*(.*?)\s*-?%\}\s*$")
+_COND_DEFAULT = re.compile(r"^([A-Za-z_]\w*)\s*\|\s*default\(\s*(.*?)\s*\)$")
+_COND_DEFINED = re.compile(r"^([A-Za-z_]\w*)\s+is\s+defined(?:\s+and\s+([A-Za-z_]\w*)(\s+is\s+not\s+none)?)?$")
+
+
+def _cond(expr: str, wire: dict[str, Any], closed: bool) -> bool | None:
+    """An `{% if %}` condition's value for this config, or None where it cannot be told: only `x | default(lit)`,
+    `x is defined`, `x is defined and x` and `x is defined and x is not none` are read. A string is never judged by its
+    truth (the endpoint's manager JSON-quotes every string value, so '' arrives truthy). `closed`: the template is
+    hpc-bridge's own, rendered with the config alone, so a name the config does not carry is undefined."""
+    m = _COND_DEFAULT.match(expr)
+    if m:
+        lit = _literal(m.group(2))
+        v = wire.get(m.group(1), lit if closed else _UNSET)
+    elif (m := _COND_DEFINED.match(expr)) is not None and m.group(2) in (None, m.group(1)):
+        name = m.group(1)
+        if name not in wire:
+            return False if closed else None
+        if m.group(2) is None:
+            return True
+        if m.group(3):
+            return wire[name] is not None
+        v = wire[name]
+    else:
+        return None
+    if v is _UNSET or isinstance(v, str):
+        return None
+    return bool(v)
+
+
+def taken(text: str, wire: dict[str, Any], *, closed: bool = False) -> str:
+    """The template's lines this config can reach: a branch of an `{% if %}` whose condition `_cond` can tell is
+    dropped when it is not taken; every other branch is kept (a reading there still counts). The demo of 2026-11-03:
+    hpc-bridge's own template sets `init_blocks: 1` in its LOGIN branch, and the terms took it over the 0 the compute
+    config sends. Unbalanced statements: the whole text, as it is."""
+    out: list[str] = []
+    stack: list[dict[str, Any]] = []
+    for line in _strip(text).splitlines():
+        m = _STMT.match(line)
+        if m is None:
+            if all(f["cur"] is not False for f in stack):
+                out.append(line)
+            continue
+        kw, expr = m.group(1), m.group(2)
+        if kw == "if":
+            c = _cond(expr, wire, closed)
+            stack.append({"cur": c, "done": c is True, "maybe": c is None})
+            continue
+        if not stack:
+            return text
+        f = stack[-1]
+        if kw == "elif":
+            c = _cond(expr, wire, closed)
+            cur = False if f["done"] else (None if f["maybe"] and c is not False else c)
+            f.update(cur=cur, done=f["done"] or cur is True, maybe=f["maybe"] or cur is None)
+        elif kw == "else":
+            f["cur"] = False if f["done"] else (None if f["maybe"] else True)
+        else:
+            stack.pop()
+    return text if stack else "\n".join(out)
+
+
+def effective(text: str, yaml_key: str, wire: dict[str, Any], parsl_default: Any, *, pick: str = "max",
+              closed: bool = False) -> Any:
     """What the template gives `yaml_key` for this config: the config's value where it renders it, else its default
     or its literal; parsl's default where the template never sets it; _UNSET where it cannot be read (an expression,
-    a key required and not sent, readings that disagree under pick="one")."""
+    a key required and not sent, readings that disagree under pick="one"). Only the branches the config can reach are
+    read (`taken`; `closed`: hpc-bridge's own template); readings left in a branch that cannot be told apart take the
+    most (pick="max")."""
     vals = []
-    for kind, a, b in readings(text, yaml_key):
+    for kind, a, b in readings(taken(text, wire, closed=closed), yaml_key):
         if kind == "lit":
             vals.append(a)
         elif kind == "var":
@@ -578,7 +651,7 @@ def build(app: AppCtx, caller: dict[str, Any], md: dict[str, Any], access: str) 
     raw_schema = md.get("user_config_schema")
     schema: dict[str, Any] = raw_schema if isinstance(raw_schema, dict) else {}
     kmap = _kmap(app, access)
-    base_hb = warmth._seed_uec(app, "compute")
+    base_hb = warmth._seed_uec(app, "compute", session_size=False)   # the session's block size is that block's alone
     base = {kmap.get(k, k): v for k, v in base_hb.items() if k not in RESERVED and v not in (None, "")}
     wire = {**base, **caller}
     raw_props = schema.get("properties")
@@ -641,18 +714,23 @@ def _facts(plan: Plan) -> None:
     t, w = plan.template, plan.wire
     wall_default = "00:20:00" if plan.scheduler == "pbs" else "00:10:00"   # parsl's PBSPro / Slurm providers'
     f = plan.facts
-    f["min_blocks"] = effective(t, "min_blocks", w, 0)
-    f["max_blocks"] = effective(t, "max_blocks", w, 1)
-    f["init_blocks"] = effective(t, "init_blocks", w, 1)
-    f["nodes_per_block"] = effective(t, "nodes_per_block", w, 1)
-    f["walltime"] = effective(t, "walltime", w, wall_default, pick="one")
-    idle = effective(t, "max_idletime", w, None, pick="one")
+    own = plan.access == "ssh"   # hpc-bridge's own template: a name the config does not carry is undefined in it
+
+    def eff(key: str, default: Any, pick: str = "max") -> Any:
+        return effective(t, key, w, default, pick=pick, closed=own)
+
+    f["min_blocks"] = eff("min_blocks", 0)
+    f["max_blocks"] = eff("max_blocks", 1)
+    f["init_blocks"] = eff("init_blocks", 1)
+    f["nodes_per_block"] = eff("nodes_per_block", 1)
+    f["walltime"] = eff("walltime", wall_default, pick="one")
+    idle = eff("max_idletime", None, pick="one")
     f["max_idletime_s"] = int(idle) if isinstance(idle, int | float) and not isinstance(idle, bool) and idle > 0 \
         else None
-    f["max_workers_per_node"] = effective(t, "max_workers_per_node", w, None, pick="one")
+    f["max_workers_per_node"] = eff("max_workers_per_node", None, pick="one")
     f["available_accelerators"] = w.get("available_accelerators")
-    hb = effective(t, "idle_heartbeats_soft", w, None, pick="one")
-    period = effective(t, "heartbeat_period", w, HEARTBEAT_S, pick="one")
+    hb = eff("idle_heartbeats_soft", None, pick="one")
+    period = eff("heartbeat_period", HEARTBEAT_S, pick="one")
     f["uep_idle_exit_s"] = (int(hb * period) if isinstance(hb, int) and hb > 0 and isinstance(period, int | float)
                             else None)
     for k in ("max_workers_per_node", "available_accelerators"):
@@ -703,7 +781,14 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
                                           "template; send walltime= (HH:MM:SS).")
     nodes, max_blocks = int(f["nodes_per_block"]), int(f["max_blocks"])
     sized = {**hb, "nodes_per_block": nodes, "compute": True}
-    size, shape = notices._block_size(app, sized)
+    size_of = getattr(app.facility, "block_size", None)
+    if plan.access == "ssh" and callable(size_of):
+        # the config goes out as it is — no wire mapping gives it D3's proposed slice: what it does not ask for is
+        # parsl's default block (on a per-core partition the terms had costed a 2-core slice parsl never asked for)
+        size = size_of(dict(sized), propose=False)
+        shape = resources.shape_of(getattr(app.facility, "partitions", None), sized.get("partition"))
+    else:
+        size, shape = notices._block_size(app, sized)
     if size.nodes != nodes:
         size = dataclasses.replace(size, nodes=nodes)
     got = resources.charge(size, shape, 3600.0)
@@ -738,13 +823,22 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
                 "(its idle release, or its walltime with work queued)" if factor > 1 else "")
              + f" + {last:g} h for a block started just before it expires)")
     queue = hb.get("partition")
+
+    def sent_int(key: str) -> int | None:
+        v = hb.get(key)
+        return v if isinstance(v, int) and not isinstance(v, bool) else None
+
+    excl, sel = hb.get(resources.WHOLE), hb.get("select_options")
     return HandoffTerms(
         facility=app.machine or getattr(app.facility, "name", None), scheduler=plan.scheduler,
         account=hb.get("account"), queue=str(queue) if queue is not None else None, walltime=wall,
         nodes_per_block=nodes, init_blocks=int(f["init_blocks"]), min_blocks=int(f["min_blocks"]),
         max_blocks=max_blocks,
         max_workers_per_node=f["max_workers_per_node"] if isinstance(f["max_workers_per_node"], int) else None,
-        available_accelerators=f["available_accelerators"], max_idletime_s=idle, unit=unit, rate=rate,
+        available_accelerators=f["available_accelerators"], cores_per_node=sent_int(resources.CORES),
+        cpus_per_node=sent_int("cpus_per_node"), mem_per_node=sent_int(resources.MEM),
+        gpus_per_node=sent_int(resources.GPUS), exclusive=excl if isinstance(excl, bool) else None,
+        select_options=sel if isinstance(sel, str) else None, max_idletime_s=idle, unit=unit, rate=rate,
         min_charge_h=m, canary_worst_case=_up(canary), worst_case=_up(worst), basis=basis, expires_hours=hours,
         binds=BINDS)
 
@@ -868,10 +962,25 @@ def _task_id(fut: Any) -> str | None:
     return str(tid) if tid else None
 
 
+_SIZE_WORDS = ("cores_per_node", "cpus_per_node", "mem_per_node", "gpus_per_node", "exclusive", "select_options")
+
+
+def _block_words(t: HandoffTerms) -> str:
+    """Each block as the config asks for it — every size key it carries, by the value it sends."""
+    said = [f"{t.nodes_per_block} node{'s' if t.nodes_per_block != 1 else ''} for {t.walltime}"]
+    for k in _SIZE_WORDS:
+        v = getattr(t, k)
+        if v is not None:
+            said.append(f"{k} {str(v).lower() if isinstance(v, bool) else v}")
+    return (f"Each block: {', '.join(said)}; init_blocks {t.init_blocks}, min_blocks {t.min_blocks}, max_blocks "
+            f"{t.max_blocks}.")
+
+
 def _ask_notice(terms: HandoffTerms, plan: Plan) -> str:
-    return (f"Nothing was sent. Exporting this handoff runs ONE billed canary with exactly this config (the "
-            f"`user_endpoint_config` above) — up to {terms.canary_worst_case:g} {terms.unit} — and then hands the "
-            f"endpoint to its consumer: until the record expires ({terms.expires_hours:g} h after the yes) its pool "
+    return (f"Nothing was sent. {_block_words(terms)} Exporting this handoff runs ONE billed canary with exactly "
+            f"this config (the `user_endpoint_config` above) — up to {terms.canary_worst_case:g} {terms.unit} — and "
+            f"then hands the endpoint to its consumer: until the record expires ({terms.expires_hours:g} h after the "
+            f"yes) its pool "
             f"can bill up to {terms.worst_case:g} {terms.unit} ({terms.basis}). {terms.binds} Ask the user; on their "
             "yes call export_handoff again with the same config and confirm_spend=True.")
 

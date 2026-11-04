@@ -439,6 +439,7 @@ async def test_submit_unknown_never_resubmitted():
     assert sum("/tasks/0/attempt-" in c for c in runner.commands) == 1
 
     app2, _rt2, runner2 = await _batch_app(workers=4)
+    app2.state.endpoint_id = "fake-eid-2"   # another block: the first half's rows out (same ledger) share none of it
     runner2.fail_submit_of = {0}
     out2 = await _start(app2, n=5, idempotent=True)
     stray = str(uuid.uuid4())
@@ -1735,7 +1736,9 @@ async def test_wait_s_waits_when_nothing_changes():
     assert took >= 3.5, f"status(wait_s=4) returned after {took:.1f} s with nothing settled"
 
 
-async def test_wait_s_returns_when_a_row_settles():
+async def test_wait_s_returns_when_a_row_fails():
+    """A row that FAILS ends the wait (since the 2026-11-03 demo, a row that completes does not:
+    tests/test_batch_demo_findings.py, B)."""
     import asyncio
 
     from hpc_bridge import batch, server
@@ -1745,14 +1748,14 @@ async def test_wait_s_returns_when_a_row_settles():
     app.batch_autoloop = True
     batch._start_loop(app, app.batches[out.batch_id])
     loop = asyncio.get_running_loop()
-    loop.call_later(0.5, lambda: runner.futures[0].finish(_ok_report(0)))
+    loop.call_later(0.5, lambda: runner.futures[0].finish(_ok_report(0, rc=1)))
     try:
         t0 = time.monotonic()
         st = await server._status(app, out.batch_id, wait_s=20)
         took = time.monotonic() - t0
     finally:
         app.batches[out.batch_id].loop.cancel()
-    assert st.counts.done == 1 and took < 5, (took, st.counts)
+    assert st.counts.failed == 1 and took < 5, (took, st.counts)
 
 
 # ---- review round 2 (ff57dcf) ---------------------------------------------------------------------------------------

@@ -172,7 +172,8 @@ installed plugin only when that version changes); git tags mark releases.
     could not be written, and that the tasks out then run to their end. `blocks_left` names every block of ours that
     can still bill. `stop_endpoint` pauses every batch under the lock first, refuses while batch tasks are out (naming
     `cancel(id, 'abort')`), and answers `draining`, naming the batch, while a submit of unknown fate may be queued.
-    `status(wait_s)` waits for a row to settle or the phase to change. A `status` or `cancel` never waits past its
+    `status(wait_s)` waits until the batch ends, a row fails or is lost, or the phase changes (see Fixed). A `status`
+    or `cancel` never waits past its
     budget for the background loop's pass (it answers from the ledger and says so) and never starts a block itself.
   - **`poll_task` takes a Globus task id:** a running answer carries `globus_task_id`, and an agent's command leaves
     its rc and output tail in the session directory. Once the service cannot answer for it, `poll_task` reads them
@@ -185,6 +186,44 @@ installed plugin only when that version changes); git tags mark releases.
     `world:ledger_matches_sacct` check, and eight scenarios: `batch_fanout_collect`, `batch_crosses_walltime`,
     `batch_restart_resume`, `batch_two_servers_one_ledger`, `batch_block_reaped_midrun`, `batch_big_output`,
     `batch_abort_midrun` and `mep_batch_fanout`.
+- **`status()` with no id lists the ledger:** every batch, Jobs-mode job and envelope, active first, then newest first
+  (`kind: "list"`, `entries`, `total`; `offset`/`limit`, at most 200 a page; `facility=` and `active_only=` filter).
+  Each entry gives its id, kind, facility, state and creation time, its counts (a batch's rows done, failed, cancelled
+  and in flight; a job's array tasks; an envelope's spent, committed and cap) and a short command preview. It is a
+  read: nothing is ticked, admitted, collected or leased. An ACTIVE record that looks abandoned says why (`stale`: its
+  server gone, the block it ran on retired, a meter reading hours old, a deadline passed), and is left as it is.
+
+### Fixed
+The batch demo on the fake cluster (2026-11-03, `agentic/fakecluster/bin/try_batch.sh`), each checked against the raw
+tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
+- **`status(id, wait_s)` waits the whole `wait_s`** unless the batch ends, a row fails, is lost (or presumed so) or is
+  of unknown fate, or the phase changes. A row that completes no longer ends the wait: 20 rows took 21 status calls,
+  one agent turn per row. The answer still carries the progress counts; the call's own budget is unchanged.
+- **One block's window is shared by every batch on it.** `Ledger.reserve` counted held rows per batch, so two batches
+  on one block each filled the workers-less-one window, and the excess queued at the interchange (#204's pattern). It
+  now counts every batch's rows out on the same block (its endpoint and config), and while another batch on the block
+  waits for a slot, a freed slot goes to the batch with the fewest rows out (then the one that admitted least
+  recently): one huge batch cannot starve another. `reserve` stays the one admission point.
+- **The envelope names the session's own compute block.** A block confirmed BEFORE the envelope opened was counted as
+  "not started by hpc-bridge" and offered to `exclude_jobs`. It is still counted (it bills the same allocation), now
+  as "the session's compute block, confirmed before this envelope opened", and never offered for exclusion.
+- **An exit code only where the job ended with one.** An adopted job read `exit_code: 0` while RUNNING and after
+  CANCELLED (sacct's `0:0`); only COMPLETED and FAILED carry one now, else it is null.
+- **A mid-run array's counts sum to its tasks.** A task neither `sacct -X` nor squeue's pending ranges list is counted
+  PENDING (it was already held at its full walltime); a requeued job's earlier run is billed but is no task.
+- **"What still bills" lists only what can.** A job that ended with nothing committed (a CANCELLED one, "+ 0") is
+  counted in `spent`, not listed there.
+- **`export_handoff`'s terms state what its config sends.** They said `init_blocks` 1 while the config sent 0: the
+  template's readings were maxed across its LOGIN branch too; only the branches the config reaches are read now. The
+  config also carried the session's own block size (`cores_per_node: 3`, `exclusive: false`, from the session's
+  `compute_choice`): a handoff's config no longer inherits it. The terms now carry every size key the config sends
+  (`cores_per_node`, `cpus_per_node`, `mem_per_node`, `gpus_per_node`, `exclusive`, `select_options`) and the
+  question names them. And on a per-core partition a config that asks for no slice was costed as D3's proposed slice,
+  which only the session's own blocks send: parsl asks for the whole node, and the terms now cost it (they had
+  understated it by half on a 4-core node).
+- **The demo script** gives the session its own hpc-bridge state (`HPC_BRIDGE_STATE_DIR=~/hpcb-batch-demo/state`, the
+  shell's other `HPC_BRIDGE_*` left out), so "connect to a new facility called fake" is new; `--down` offers to remove
+  it. Its abort prompt waits for one running row, not two (a batch runs one row at a time on an SSH block for now).
 
 ### Fixed
 - **The login-node pin is chosen from the client's side, and overrides HostName only.** Found by a user driving the

@@ -9,7 +9,8 @@ the configs a stop or a reap retired.
 - **Local filesystems only.** WAL does not work on a network filesystem, and the state dir is on NFS / Lustre / GPFS
   on login nodes and beside an orchestrator: `open` refuses one by its type (`fs_type`), naming HPC_BRIDGE_STATE_DIR.
 - **One admission point.** `reserve` checks the lease holder, the retired configs and the window in ONE
-  `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt.
+  `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt. The window is the
+  block's, shared by every batch on it (fewest rows out first while another batch waits).
 - **One owner per batch.** A lease row (host, pid, the process's start time, heartbeat). A takeover needs a stale
   heartbeat AND a holder that is gone: its pid dead, or alive but started at another time (the pid was handed on). An
   orphaned server keeps its pid and its start time (`harness:server_orphaned`), so it is never taken over. The ledger is
@@ -35,6 +36,10 @@ from .state import _state_dir
 SCHEMA_VERSION = 1
 LEASE_STALE_S = float(os.environ.get("HPC_BRIDGE_LEASE_STALE_S", "") or 30.0)
 BUSY_TIMEOUT_MS = 10_000
+# How long a batch's last refused ask for a slot (`batch.want_at`) makes it a contender for the block's shared window:
+# past the 10 s of an idle batch loop's pass, so a waiting batch stays one; a batch that stopped asking (paused, its
+# walltime gate shut, its server gone) holds nothing back for longer than this.
+WANT_FRESH_S = 30.0
 
 # Network and shared filesystems SQLite's WAL cannot run on (its shared-memory index needs one host's mmap and POSIX
 # locks): Linux's /proc/mounts names and macOS's mount(8) names. Any fuse filesystem counts (sshfs, s3fs, gcsfuse…).
@@ -265,7 +270,8 @@ create table if not exists batch (
   owner_pid integer,
   owner_start text,
   heartbeat real,
-  cancel_requested text
+  cancel_requested text,
+  want_at real
 );
 create table if not exists task (
   batch_id text not null,
@@ -433,7 +439,7 @@ _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "tru
                 "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job", "sent_uec",
                 "unknown_since", "unheld")
 # Columns a ledger written by an earlier build may lack: added on open.
-_ADDED_COLUMNS = {"batch": [("owner_start", "text")],
+_ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real")],
                   "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text")]}
@@ -633,7 +639,12 @@ class Ledger:
                 indices: Iterable[int] | None = None) -> list[TaskRow]:
         """THE admission point: in one BEGIN IMMEDIATE transaction, check that `owner` holds the lease, that the config
         is not retired and how many window slots are free, and move up to `n` backlog rows (the lowest indices, or
-        `indices` first) to `in_flight` with their next attempt."""
+        `indices` first) to `in_flight` with their next attempt, on the block `uec_hash` names (`sent_uec`).
+
+        The window is the BLOCK's: the batch's own rows out, plus every other batch's rows out on the same block (its
+        endpoint and config), against this batch's `capacity` (the block's workers less one). While another batch on
+        the block waits for a slot (`want_at` within WANT_FRESH_S, still admitting, with a backlog), slots go fewest
+        rows out first, then least recently admitted. A batch refused slots it could use records `want_at`."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
             b = c.execute("select * from batch where id = ?", (batch_id,)).fetchone()
@@ -645,10 +656,38 @@ class Ledger:
                             (b["endpoint_id"], uec_hash)).fetchone()
             if why is not None:
                 raise RetiredConfig(str(why[0] or "this block's config was retired"))
-            held = c.execute(f"select count(*) from task where batch_id = ? and state in ({','.join('?' * 3)})",
-                             (batch_id, *HOLDING)).fetchone()[0]
-            free = max(0, int(b["capacity"] or 1) - int(held))
-            take = min(max(0, n), free)
+            hold = ",".join("?" * len(HOLDING))
+            held = int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
+                                 (batch_id, *HOLDING)).fetchone()[0])
+            # the block's window is SHARED: every other batch's rows out on the same block (its config) hold a slot
+            # of it too (the demo of 2026-11-03: two batches each filled their own window, and the excess queued at
+            # the interchange — #204's pattern)
+            others = {str(r["batch_id"]): int(r["n"]) for r in c.execute(
+                f"select t.batch_id, count(*) as n from task t join batch o on o.id = t.batch_id "
+                f"where t.batch_id != ? and o.endpoint_id is ? and coalesce(t.sent_uec, o.uec_hash) = ? "
+                f"and t.state in ({hold}) group by t.batch_id", (batch_id, b["endpoint_id"], uec_hash, *HOLDING))}
+            cap = int(b["capacity"] or 1)
+            backlog = int(c.execute("select count(*) from task where batch_id = ? and state = 'backlog'",
+                                    (batch_id,)).fetchone()[0])
+            take = min(max(0, n), max(0, cap - held - sum(others.values())), backlog)
+            # fairness: while another batch on the block is waiting for a slot (it asked within WANT_FRESH_S and got
+            # fewer than it could use), a slot goes first to the batch with the fewest rows out, then to the one that
+            # admitted least recently — so one huge batch cannot keep taking back the slots it frees
+            waiting = [(others.get(str(r["id"]), 0), float(r["last"] or 0.0)) for r in c.execute(
+                "select o.id, (select max(admitted_at) from task where batch_id = o.id) as last from batch o "
+                "where o.id != ? and o.endpoint_id is ? and o.uec_hash = ? and o.state = 'admitting' "
+                "and o.want_at is not null and o.want_at >= ? "
+                "and exists (select 1 from task where batch_id = o.id and state = 'backlog')",
+                (batch_id, b["endpoint_id"], uec_hash, at - WANT_FRESH_S))]
+            last = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
+            mine = (held, float(last or 0.0))
+            fair = 0
+            while fair < take and not any(w < mine for w in waiting):
+                fair += 1
+                mine = (held + fair, at)
+            take = fair
+            wants = backlog > take and take < min(max(0, n), max(0, cap - held))
+            c.execute("update batch set want_at = ? where id = ?", (at if wants else None, batch_id))
             if take <= 0:
                 return []
             want = list(indices or [])
@@ -667,7 +706,8 @@ class Ledger:
             for r in rows:
                 att = int(r["attempt"] or 0) + 1
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
-                          "started_at = null where batch_id = ? and idx = ?", (att, at, batch_id, r["idx"]))
+                          "started_at = null, sent_uec = ? where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, batch_id, r["idx"]))
                 out.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
             return out
 

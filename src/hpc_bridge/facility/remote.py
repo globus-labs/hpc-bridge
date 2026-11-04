@@ -1669,14 +1669,15 @@ class SlurmFacility:
             return resources.pbs_wire(uec, size, resources.shape_of(self.profile.partitions, uec.get("partition")))
         return resources.slurm_wire(uec, size)
 
-    def block_size(self, uec: dict) -> Any:
-        """What the compute config `uec` asks for gets on this facility (hpc_bridge.resources.effective)."""
+    def block_size(self, uec: dict, *, propose: bool = True) -> Any:
+        """What the compute config `uec` asks for gets on this facility (hpc_bridge.resources.effective). `propose`
+        False: `uec` is sent as it is (an export_handoff's config), never through `dispatch_uec`'s proposed slice."""
         from .. import resources
 
         shape = resources.shape_of(self.profile.partitions, uec.get("partition"))
         cpus = self.profile.cpus_per_node if self.profile.scheduler == "pbs" else None
         return resources.effective(uec, shape, channel="ssh", takes=self.takes_resources, profile_cpus=cpus,
-                                   scheduler=self.profile.scheduler)
+                                   scheduler=self.profile.scheduler, propose=propose)
 
     def config_template(self, hpc: Profile) -> tuple[str, dict]:
         """Return (jinja_template_str, default_user_opts) for the UEP template.

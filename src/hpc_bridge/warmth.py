@@ -103,10 +103,12 @@ def _shape_reject(app: AppCtx, shape: str) -> str | None:
         )
     return None
 
-def _seed_uec(app: AppCtx, shape: str) -> dict:
+def _seed_uec(app: AppCtx, shape: str, *, session_size: bool = True) -> dict:
     """The user_endpoint_config a NEW runtime of `shape` starts with: the facility's defaults (SlurmFacility) merged
     with the shape's template vars, fitted to a facility MEP's schema, and — on the compute shape — the session's
-    partition/account choice. Builds nothing: connect_facility reads the next block's terms from it too."""
+    partition/account choice and, unless `session_size` is False, its block size (an export_handoff's config is not the
+    session's block: the demo of 2026-11-03 sent the session's cores_per_node with one). Builds nothing:
+    connect_facility reads the next block's terms from it too."""
     defaults: dict = {}
     ct = getattr(app.facility, "config_template", None)
     if ct is not None:
@@ -121,6 +123,8 @@ def _seed_uec(app: AppCtx, shape: str) -> dict:
     uec = getattr(app.facility, "sanitize_uec", lambda d: d)(uec)
     if uec.get("compute"):  # the session's partition/account/size outlive a stop, written as _repoint writes them
         for key, value in app.compute_choice.items():
+            if not session_size and key in resources.SIZE_KEYS:
+                continue
             if value is None:  # a size the session cleared (whole_node=True clears a slice's cores and memory)
                 uec.pop(key, None)
             else:

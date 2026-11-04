@@ -248,7 +248,8 @@ ACTIONS = ("cmd", "interrupt", "interject")
 _SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running")
 _LOGIN_PHASES = ("logged_in", "needs_login", "failed")
 _BATCH_PHASES = ("admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused",
-                 "queued", "running", "failed", "open", "exhausted", "draining", "closed")   # + job- / env- ids (2a)
+                 "queued", "running", "failed", "open", "exhausted", "draining", "closed",   # + job- / env- ids (2a)
+                 "listed")                                                                 # status() with no id
 ANSWER_PHASES: dict[str, tuple[str, ...]] = {
     "run_shell": _SHELL_PHASES, "poll_task": _SHELL_PHASES, "reset_session": _SHELL_PHASES,
     "connect_facility": ("needs_account", "provisioning", "needs_facility_details", "proposed_facility_details",
