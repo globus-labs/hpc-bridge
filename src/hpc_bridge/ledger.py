@@ -203,6 +203,25 @@ def window_for(workers: int | None) -> int:
     return max(1, (workers or 1) - 1)
 
 
+def _need(b: Any) -> tuple[int, int, int]:
+    """A batch's row: (CPUs, memory MB — 0 when not set —, GPUs)."""
+    return int(b["cores"] or 1), int(b["memory_mb"] or 0), int(b["gpus"] or 0)
+
+
+def _fits(need: tuple[int, int, int], free: tuple[int, int | None, int, int]) -> int:
+    """How many rows of `need` fit in `free` (CPUs, memory MB or None — not measured —, GPUs, rows)."""
+    k, mem, g = need
+    c_free, m_free, g_free, r_free = free
+    if r_free <= 0 or c_free < k:
+        return 0
+    n = min(c_free // max(1, k), r_free)
+    if mem and m_free is not None:
+        n = min(n, m_free // mem)
+    if g:
+        n = min(n, g_free // g)
+    return max(0, n)
+
+
 def fs_type_from_mounts(path: str, mounts: str) -> str | None:
     """The filesystem type of `path` from a /proc/mounts-shaped table (`dev mountpoint type opts …`): the mount point
     that is the longest prefix of the path."""
@@ -325,6 +344,14 @@ create table if not exists block_workers (
   uec_hash text not null,
   block_job text not null default '',
   workers integer not null,
+  at real,
+  primary key (endpoint_id, uec_hash, block_job)
+);
+create table if not exists block_measure (
+  endpoint_id text,
+  uec_hash text not null,
+  block_job text not null default '',
+  measure text not null,
   at real,
   primary key (endpoint_id, uec_hash, block_job)
 );
@@ -463,10 +490,23 @@ ENVELOPE_ADMITTING = ("open", "exhausted")
 
 _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "truncated", "job_id", "host", "workers",
                 "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job", "sent_uec",
-                "unknown_since", "unheld")
-# Columns a ledger written by an earlier build may lack: added on open.
-_ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real")],
-                  "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")],
+                "unknown_since", "unheld",
+                # batch row sizing: the attempt's own use, and when a row a busy slot sent back may go again
+                "peak_rss_kb", "cpu_s", "wall_s", "nproc", "cpus", "gpu_ids", "why", "threads", "oom_kills",
+                "not_before")
+# Columns a ledger written by an earlier build may lack: added on open (a new ledger too: its tables are created as
+# the first build wrote them, then these are added).
+_ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
+                            # batch row sizing: each row's size (memory resolved at admission when defaulted), at
+                            # most `concurrency` at once, pinned, the pilot's rows, what was defaulted, a proposal
+                            ("cores", "integer"), ("memory_mb", "integer"), ("gpus", "integer"),
+                            ("concurrency", "integer"), ("pin", "integer default 1"), ("pilot", "integer default 0"),
+                            ("sized", "integer default 0"), ("sizing_defaulted", "text"), ("proposal", "text")],
+                  "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text"),
+                           ("req_cores", "integer"), ("req_memory_mb", "integer"), ("req_gpus", "integer"),
+                           ("peak_rss_kb", "integer"), ("cpu_s", "real"), ("wall_s", "real"), ("nproc", "integer"),
+                           ("cpus", "text"), ("gpu_ids", "text"), ("why", "text"), ("threads", "integer"),
+                           ("oom_kills", "integer"), ("not_before", "real")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text")]}
 
@@ -532,15 +572,24 @@ class Ledger:
     def add_batch(self, batch_id: str, *, command: str, rows: list[Any], task_walltime_s: float, capacity: int,
                   results_dir: str, idempotent: bool, endpoint_id: str | None, uec_hash: str | None,
                   session_id: str, owner: Owner, facility: str | None = None, script_hash: str | None = None,
-                  state: str = "admitting", now: float | None = None) -> str:
+                  state: str = "admitting", now: float | None = None, cores: int | None = None,
+                  memory_mb: int | None = None, gpus: int | None = None, concurrency: int | None = None,
+                  pin: bool = True, pilot: int = 0, sized: bool | None = None,
+                  sizing_defaulted: Iterable[str] = ()) -> str:
+        """`cores` / `memory_mb` / `gpus` / `concurrency` (batch row sizing): each row's size and the most at once;
+        `sized` (default: any of them given) — the batch is admitted against the block's measured pool."""
         at = time.time() if now is None else now
+        if sized is None:
+            sized = any(v is not None for v in (cores, memory_mb, gpus, concurrency)) or bool(pilot)
         with self._tx(immediate=True) as c:
             c.execute("insert into batch (id, created_at, facility, endpoint_id, session_id, uec_hash, command, "
                       "script_hash, task_walltime_s, results_dir, idempotent, capacity, state, owner_host, owner_pid, "
-                      "owner_start, heartbeat) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "owner_start, heartbeat, cores, memory_mb, gpus, concurrency, pin, pilot, sized, "
+                      "sizing_defaulted) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (batch_id, at, facility, endpoint_id, session_id, uec_hash, command, script_hash,
                        float(task_walltime_s), results_dir, int(bool(idempotent)), int(capacity), state, owner.host,
-                       owner.pid, owner.started, at))
+                       owner.pid, owner.started, at, cores, memory_mb, gpus, concurrency, int(bool(pin)),
+                       int(pilot or 0), int(bool(sized)), json.dumps(list(sizing_defaulted))))
             c.executemany("insert into task (batch_id, idx, row_json, state) values (?,?,?,'backlog')",
                           [(batch_id, i, json.dumps(r)) for i, r in enumerate(rows)])
             c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",
@@ -691,12 +740,23 @@ class Ledger:
         `out`, its rows in flight or of unknown fate on the block: the fairness order, the same whoever reads it.
         One scan, on the partial index `task_holding_by_uec` (a row from before `sent_uec` was set at admission is
         read by its batch's config)."""
+        holds, out, _use = self._on_block_use(c, endpoint_id, uec_hash, block_job, at, margin_s, owner, seen)
+        return holds, out
+
+    def _on_block_use(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str, block_job: str | None,
+                      at: float, margin_s: float, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool]
+                      ) -> tuple[dict[str, int], dict[str, int], dict[str, list[int]]]:
+        """`_on_block`, and per batch what its holding rows hold of the block's pool (batch row sizing): [CPUs, memory
+        MB, GPUs] — each attempt's own `req_*`, else its batch's size, else one CPU."""
         states = ", ".join(f"'{s}'" for s in HOLDING)
         cols = ("t.batch_id, t.state, t.sent_job, t.unheld, coalesce(t.admitted_at, t.unknown_since, 0) as sent_at, "
+                "coalesce(t.req_cores, o.cores, 1) as rc, coalesce(t.req_memory_mb, o.memory_mb, 0) as rm, "
+                "coalesce(t.req_gpus, o.gpus, 0) as rg, "
                 "o.task_walltime_s, o.owner_host, o.owner_pid, o.owner_start from task t join batch o on o.id = "
                 f"t.batch_id where o.endpoint_id is ? and t.state in ({states}) and ")
         holds: dict[str, int] = {}
         out: dict[str, int] = {}
+        use: dict[str, list[int]] = {}
         for r in c.execute(f"select {cols} t.sent_uec = ? union all select {cols} t.sent_uec is null and "
                            "o.uec_hash = ?", (endpoint_id, uec_hash, endpoint_id, uec_hash)):
             bid = str(r["batch_id"])
@@ -710,9 +770,13 @@ class Ledger:
                         and self._alive(r, owner, seen))
             if held:
                 holds[bid] = holds.get(bid, 0) + 1
+                u = use.setdefault(bid, [0, 0, 0])
+                u[0] += int(r["rc"] or 1)
+                u[1] += int(r["rm"] or 0)
+                u[2] += int(r["rg"] or 0)
             if r["state"] == "in_flight" or (r["state"] == "submit_unknown" and r["unheld"] is None):
                 out[bid] = out.get(bid, 0) + 1
-        return holds, out
+        return holds, out, use
 
     def block_holders(self, batch_id: str, *, uec_hash: str, block_job: str | None = None, owner: Owner | None = None,
                       margin_s: float = HOLD_MARGIN_S, now: float | None = None) -> dict[str, int]:
@@ -733,6 +797,48 @@ class Ledger:
         with self._tx() as c:
             c.execute("insert or replace into block_workers values (?,?,?,?,?)",
                       (endpoint_id, uec_hash, block_job or "", int(workers), time.time() if now is None else now))
+
+    # -- the block's measure (batch row sizing): what it is, from inside it -----------------------------------------
+    def learn_measure(self, endpoint_id: str | None, uec_hash: str, block_job: str | None, measure: dict[str, Any], *,
+                      now: float | None = None) -> None:
+        """A check (or a task) on the block measured it from inside (sizing.BlockMeasure.to_dict): the block's, for
+        every batch on it, kept per endpoint, config and block job as its worker count is."""
+        with self._tx() as c:
+            c.execute("insert or replace into block_measure values (?,?,?,?,?)",
+                      (endpoint_id, uec_hash, block_job or "", json.dumps(measure),
+                       time.time() if now is None else now))
+
+    def block_measure(self, endpoint_id: str | None, uec_hash: str, block_job: str | None = None
+                      ) -> dict[str, Any] | None:
+        return self._measure_of(self._con, endpoint_id, uec_hash, block_job)
+
+    def _measure_of(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str,
+                    block_job: str | None) -> dict[str, Any] | None:
+        r = c.execute("select measure from block_measure where endpoint_id is ? and uec_hash = ? order by "
+                      "(block_job = ?) desc, at desc limit 1", (endpoint_id, uec_hash, block_job or "")).fetchone()
+        if r is None:
+            return None
+        try:
+            d = json.loads(r[0])
+        except ValueError:
+            return None
+        return d if isinstance(d, dict) and isinstance(d.get("cpus"), int) else None
+
+    def _pool(self, c: sqlite3.Connection, m: dict[str, Any], endpoint_id: str | None, uec_hash: str,
+              block_job: str | None) -> tuple[int, int | None, int, int]:
+        """The block's pool, as measured: (CPUs, memory MB rows may use — the limit less the pool's idle use —, GPUs,
+        rows at once — the workers less the interactive one, at most the width cap)."""
+        from .sizing import WIDTH_CAP
+
+        limit = m.get("mem_limit_mb")
+        avail = None if not isinstance(limit, int) else max(0, limit - int(m.get("idle_mb") or 0))
+        workers = m.get("workers")
+        if not isinstance(workers, int):
+            r = c.execute("select workers from block_workers where endpoint_id is ? and uec_hash = ? order by "
+                          "(block_job = ?) desc, at desc limit 1", (endpoint_id, uec_hash, block_job or "")).fetchone()
+            workers = int(r[0]) if r is not None else None
+        rows = WIDTH_CAP if workers is None else min(WIDTH_CAP, workers - 1 if workers >= 2 else 1)
+        return int(m["cpus"]), avail, len(m.get("gpu_ids") or []), rows
 
     def _learnt_window(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str,
                        block_job: str | None) -> int | None:
@@ -775,34 +881,60 @@ class Ledger:
 
             seen: dict[tuple[str, int, str | None], bool] = {}
             held = held_by(batch_id)
-            holds, out = self._on_block(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen)
+            holds, out, use = self._on_block_use(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen)
             mine_on = holds.pop(batch_id, 0)
+            mine_use = use.pop(batch_id, [0, 0, 0])
             others = sum(holds.values())
             peers = [r for r in c.execute(
                 "select o.*, (select max(admitted_at) from task where batch_id = o.id) as last, exists (select 1 from "
                 "task where batch_id = o.id and state = 'backlog') as backlogged from batch o where o.id != ? and "
                 "o.endpoint_id is ? and o.uec_hash = ? and o.state = 'admitting'",
                 (batch_id, b["endpoint_id"], uec_hash)) if self._alive(r, owner, seen)]
-            caps = [int(b["capacity"] or 1)] + [int(r["capacity"] or 1) for r in peers]
-            if holds:
-                q = ",".join("?" * len(holds))
-                caps += [int(r[0] or 1)
-                         for r in c.execute(f"select capacity from batch where id in ({q})", list(holds))]
-            learnt = self._learnt_window(c, b["endpoint_id"], uec_hash, block_job)
-            window = min(caps + ([learnt] if learnt is not None else []))
-            backlog = int(c.execute("select count(*) from task where batch_id = ? and state = 'backlog'",
-                                    (batch_id,)).fetchone()[0])
-            own_room = max(0, min(n, window - held, backlog))
-            take = min(own_room, max(0, window - held - others))
-            refused = take < own_room   # by the block's other rows, never by its own rows or the window
+            backlog = int(c.execute("select count(*) from task where batch_id = ? and state = 'backlog' and "
+                                    "(not_before is null or not_before <= ?)", (batch_id, at)).fetchone()[0])
             waiting = [r for r in peers if r["backlogged"] and r["want_at"] is not None
                        and float(r["want_at"]) >= at - WANT_FRESH_S]
             rank = {str(r["id"]): (out.get(str(r["id"]), 0), float(r["last"] or 0.0), str(r["id"])) for r in waiting}
-            room = {str(r["id"]): window - held_by(str(r["id"])) - (mine_on + others - holds.get(str(r["id"]), 0))
-                    for r in waiting}
+            measure = self._measure_of(c, b["endpoint_id"], uec_hash, block_job) if b["cores"] is not None else None
+            if measure is None:   # rows a worker each: the block's window (PR 1)
+                caps = [int(b["capacity"] or 1)] + [int(r["capacity"] or 1) for r in peers]
+                if holds:
+                    q = ",".join("?" * len(holds))
+                    caps += [int(r[0] or 1)
+                             for r in c.execute(f"select capacity from batch where id in ({q})", list(holds))]
+                learnt = self._learnt_window(c, b["endpoint_id"], uec_hash, block_job)
+                window = min(caps + ([learnt] if learnt is not None else []))
+                own_room = max(0, min(n, window - held, backlog))
+                take = min(own_room, max(0, window - held - others))
+                room = {str(r["id"]): window - held_by(str(r["id"])) - (mine_on + others - holds.get(str(r["id"]), 0))
+                        for r in waiting}
+
+                def room_after(w: str, x: int) -> int:
+                    return room[w] - x
+            else:   # batch row sizing: the block's measured pool — CPUs, memory, GPUs and workers — shared by them all
+                cpus, avail, gpus, rows_cap = self._pool(c, measure, b["endpoint_id"], uec_hash, block_job)
+                used = [sum(u[i] for u in use.values()) for i in range(3)]
+                free_all = (cpus - used[0] - mine_use[0], None if avail is None else avail - used[1] - mine_use[1],
+                            gpus - used[2] - mine_use[2], rows_cap - others - mine_on)
+                free_mine = (cpus - mine_use[0], None if avail is None else avail - mine_use[1], gpus - mine_use[2],
+                             rows_cap - mine_on)
+                need = _need(b)
+                own = min(n, backlog, int(b["capacity"] or 1) - held)
+                if b["concurrency"]:
+                    own = min(own, int(b["concurrency"]) - held)
+                own_room = max(0, min(own, _fits(need, free_mine)))
+                take = min(own_room, _fits(need, free_all))
+                caps_w = {str(r["id"]): max(0, int(r["capacity"] or 1) - held_by(str(r["id"]))) for r in waiting}
+
+                def room_after(w: str, x: int) -> int:
+                    pr = next(r for r in waiting if str(r["id"]) == w)
+                    free = (free_all[0] - x * need[0], None if free_all[1] is None else free_all[1] - x * need[1],
+                            free_all[2] - x * need[2], free_all[3] - x)
+                    return min(caps_w[w], _fits(_need(pr), free))
+            refused = take < own_room   # by the block's other rows, never by its own rows or the window
             last = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
             fair, mine = 0, (out.get(batch_id, 0), float(last or 0.0), batch_id)
-            while fair < take and not any(room[w] - fair > 0 and rank[w] < mine for w in rank):
+            while fair < take and not any(room_after(w, fair) > 0 and rank[w] < mine for w in rank):
                 fair += 1
                 mine = (out.get(batch_id, 0) + fair, at, batch_id)
             take = fair
@@ -817,15 +949,17 @@ class Ledger:
                                        "order by idx", (batch_id, *want)))
             if len(rows) < take:
                 have = {r["idx"] for r in rows}
-                rows += [r for r in c.execute("select * from task where batch_id = ? and state = 'backlog' "
-                                              "order by idx limit ?", (batch_id, take + len(have)))
+                rows += [r for r in c.execute("select * from task where batch_id = ? and state = 'backlog' and "
+                                              "(not_before is null or not_before <= ?) order by idx limit ?",
+                                              (batch_id, at, take + len(have)))
                          if r["idx"] not in have]
             got = Reserved([], holders=holds if refused else {})
             for r in rows[:take]:
                 att = int(r["attempt"] or 0) + 1
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
-                          "started_at = null, sent_uec = ? where batch_id = ? and idx = ?",
-                          (att, at, uec_hash, batch_id, r["idx"]))
+                          "started_at = null, sent_uec = ?, req_cores = ?, req_memory_mb = ?, req_gpus = ?, "
+                          "not_before = null where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], batch_id, r["idx"]))
                 got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
             return got
 
