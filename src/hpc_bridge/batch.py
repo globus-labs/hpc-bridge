@@ -58,6 +58,7 @@ from .ledger import (
     Owner,
     RetiredConfig,
     UnknownBatch,
+    window_for,
 )
 from .models import (
     BatchCounts,
@@ -81,9 +82,17 @@ MAX_COMMAND = 64 * 1024
 MAX_WAIT_S = 60.0
 KILL_GRACE_S = 5
 READER_GRACE_S = 2                     # after the leftover group is killed: the stream readers' time to reach EOF
-# how long past its admission another batch's row of unknown fate (or a gone server's row in flight) can hold a worker
-# of the block: task_walltime_s plus this (ledger `_on_block`)
-HOLD_MARGIN_S = MARGIN_S + KILL_GRACE_S + READER_GRACE_S
+WATCH_POLL_S = 1                       # the wrapper's watcher: how often it looks at the clock and the marker
+# The longest the wrapper holds its worker past task_walltime_s, by its own arithmetic: the watcher sees the deadline
+# within one poll, TERMs the group and waits the kill grace before KILL; the cleanup then waits the kill grace again,
+# KILLs, and gives the stream readers the reader grace twice (review round 2: 7 s had been assumed, 14 s measured).
+WRAPPER_TAIL_S = WATCH_POLL_S + 2 * KILL_GRACE_S + 2 * READER_GRACE_S
+# A row in flight reaches its worker this long after its admission at most: the submit, the service, the interchange
+# (the window admits a row only into a free slot) — independent of the configurable admission margin (MARGIN_S).
+DELIVERY_S = 60.0
+# How long past its admission a gone server's row in flight can hold a worker of the block: task_walltime_s + this
+# (ledger `_on_block`; ledger.HOLD_MARGIN_S is the same value, a test ties them)
+HOLD_MARGIN_S = WRAPPER_TAIL_S + DELIVERY_S
 TICK_S = 2.0
 IDLE_TICK_S = 10.0
 EVIDENCE_EVERY_S = 30.0                # how often the block's job is looked up while tasks are out (SSH)
@@ -834,7 +843,7 @@ set +m
 (
   __hb_dl=$((__hb_start + @@WALL@@))
   while :; do
-    sleep 1
+    sleep @@POLL@@
     if [ -e "$__hb_rd/@@CANCEL@@" ]; then echo cancelled > "$__hb_a/.why"; break; fi
     if [ "$(date +%s)" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
     kill -0 "$__hb_c" || exit 0
@@ -897,7 +906,7 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@MINKB@@", str(int(min_free_mb) * 1024)).replace("@@CAP@@", str(int(cap_bytes)))
             .replace("@@SESSION@@", replay).replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
             .replace("@@WALL@@", str(max(1, round(task_walltime_s)))).replace("@@GRACE@@", str(KILL_GRACE_S))
-            .replace("@@RGRACE@@", str(READER_GRACE_S))
+            .replace("@@RGRACE@@", str(READER_GRACE_S)).replace("@@POLL@@", str(WATCH_POLL_S))
             .replace("@@TAIL@@", str(TAIL_BYTES)).replace("@@ETAIL@@", str(STDERR_TAIL_BYTES)))
     return session_shell.guard_prefix(guard) + body
 
@@ -1004,7 +1013,7 @@ def workers_of(rt: ShapeRuntime) -> int | None:
 
 def capacity_for(workers: int | None) -> int:
     """The window: the block's workers less one kept for interactive work; 1 when the count is unknown or 1."""
-    return max(1, (workers or 1) - 1)
+    return window_for(workers)
 
 
 @dataclass
@@ -1161,6 +1170,20 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
             pass
     if c.worker_count:
         run.workers_seen = c.worker_count
+        _learn_workers(app, run, c.worker_job, c.worker_count, uec=uec_hash(rt))
+
+
+def _learn_workers(app: AppCtx, run: _Run, job: str | None, workers: int, *, uec: str | None = None) -> None:
+    """The block's worker count, as a check or a task on it reported it: on the ledger, the block's for every batch on
+    it — the window is the smallest of it and each batch's (review round 2: a count one batch had learnt was lost with
+    that batch's admission, and a second batch overfilled the block)."""
+    uec = uec or run.runner_hash or (uec_hash(run.rt) if run.rt is not None else None)
+    if not uec:
+        return
+    try:
+        ledger_of(app).learn_workers(app.state.endpoint_id, uec, job, int(workers), now=_now())
+    except (LedgerError, ValueError, TypeError):
+        pass
 
 
 def _sync_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
@@ -1964,9 +1987,8 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     except NotLeaseHolder:
         app.batches.pop(bid, None)
         return 0
-    # refused slots its own window had room for (`want_at`): name the batches holding the block's, and the remedy
-    run.held_by = (_held_by_note(led, bid, uec_hash(rt), run.block_job)
-                   if led.batch(bid).get("want_at") is not None else None)
+    # refused slots its own window had room for: name the batches holding the block's, and the remedy
+    run.held_by = _held_by_note(led, rows.holders)
     if run.held_by and not _held(led.counts(bid)):
         run.waiting = run.held_by
     names = {"index"}
@@ -1981,9 +2003,9 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     return sent
 
 
-def _held_by_note(led: Ledger, bid: str, uec: str, block_job: str | None) -> str | None:
-    """Which other batches hold the block's shared window while `bid` is refused slots, and the remedy."""
-    holders = led.block_holders(bid, uec_hash=uec, block_job=block_job, margin_s=HOLD_MARGIN_S, now=_now())
+def _held_by_note(led: Ledger, holders: dict[str, int]) -> str | None:
+    """Which other batches hold the block's shared window while this batch is refused slots (`reserve`'s own count,
+    `Reserved.holders`), and the remedy — a row of unknown fate holds until evidence, so never silently."""
     if not holders:
         return None
     named = ", ".join(f"{h} ({n} row(s) out, {led.batch(h)['state']})" for h, n in list(holders.items())[:5])
@@ -2260,6 +2282,7 @@ def _learn_block(app: AppCtx, run: _Run, rep: TaskReport) -> None:
         led.add_block_seen(run.batch_id, rep.job)
     if rep.workers:
         run.workers_seen = rep.workers
+        _learn_workers(app, run, rep.job, rep.workers)
     rt = run.rt
     if rt is not None and app.shapes.get("compute") is rt:
         rt.warm_confirmed_at = time.monotonic()   # a worker of the block answered: liveness, as a task result is

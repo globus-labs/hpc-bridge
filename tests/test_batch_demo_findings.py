@@ -207,8 +207,9 @@ def test_r1_1_presumed_lost_rows_of_an_aborted_batch_hold_the_window_a_week_late
 
 def test_r1_1_what_holds_a_slot_of_the_block_in_front(tmp_path):
     """The bounds, row by row (task_walltime_s 60, HOLD_MARGIN_S past the admission): a live server's row in flight
-    holds; a gone server's only until its walltime and the margin have passed; a row of unknown fate only until then
-    too, whoever runs it; a presumed-lost row only on the block it was sent to, while its server runs."""
+    holds; a gone server's only until its walltime and the margin have passed; a row of unknown fate until evidence
+    (`unheld`), whoever runs it (round 2); a presumed-lost row only on the block it was sent to, while its server
+    runs."""
     from hpc_bridge.ledger import HOLD_MARGIN_S
 
     led = _ledger(tmp_path)
@@ -225,14 +226,24 @@ def test_r1_1_what_holds_a_slot_of_the_block_in_front(tmp_path):
     soon, late = 1_010.0, 1_000.0 + 60 + HOLD_MARGIN_S + 1
     assert led.block_holders(new, uec_hash="uec-1", block_job="101", now=soon) == {live: 3, gone: 1}
     assert led.block_holders(new, uec_hash="uec-1", block_job="202", now=soon) == {live: 2, gone: 1}
-    assert led.block_holders(new, uec_hash="uec-1", block_job="101", now=late) == {live: 2}
+    assert led.block_holders(new, uec_hash="uec-1", block_job="101", now=late) == {live: 3}
+    assert led.block_holders(new, uec_hash="uec-1", block_job=None, now=late) == {live: 2}
+    assert led.settle(live, rows[1].index, rows[1].attempt, "submit_unknown", unheld="evidence: its user endpoint "
+                      "exited with nothing queued")
     assert led.block_holders(new, uec_hash="uec-1", block_job=None, now=late) == {live: 1}
 
 
-async def test_r1_1_an_aborted_batchs_unknown_submit_holds_the_window_only_for_its_walltime_and_says_so(monkeypatch):
+def test_r1_1_hold_margin_is_one_value():
+    from hpc_bridge import batch, ledger
+
+    assert ledger.HOLD_MARGIN_S == batch.HOLD_MARGIN_S == batch.WRAPPER_TAIL_S + batch.DELIVERY_S
+
+
+async def test_r1_1_an_aborted_batchs_unknown_submit_holds_the_window_until_evidence_and_says_so(monkeypatch):
     """Through the tools, on a MEP: a batch's one row's submit is of unknown fate; the user aborts the batch. A later
-    session's batch on the same endpoint and config is told which batch holds the block's window (status / cancel),
-    and admits once task_walltime_s + the margin have passed since that submit — never held for good."""
+    session's batch on the same endpoint and config is told which batch holds the block's window (status / cancel).
+    The row holds until evidence says its task can no longer run (round 2's ruling; round 1 had let it expire after
+    task_walltime_s + a margin) — then the later batch admits."""
     from hpc_bridge import batch, server
 
     async def no_marker(*_a, **_k):
@@ -261,7 +272,14 @@ async def test_r1_1_an_aborted_batchs_unknown_submit_holds_the_window_only_for_i
     later = time.time() + 60 + batch.HOLD_MARGIN_S + 1                   # task_walltime_s 60 past its submit
     monkeypatch.setattr(batch, "_now", lambda: later)
     await batch.tick(app2, second.batch_id)
-    assert batch.ledger_of(app2).counts(second.batch_id)["in_flight"] == 1
+    led = batch.ledger_of(app2)
+    assert led.counts(second.batch_id)["in_flight"] == 0                  # no evidence yet: still held, still named
+    assert first.batch_id in ((await server._status(app2, second.batch_id)).notice or "")
+    [row] = led.tasks(first.batch_id)
+    assert led.settle(first.batch_id, int(row["idx"]), int(row["attempt"]), "submit_unknown",
+                      unheld="evidence: its copy cannot run")
+    await batch.tick(app2, second.batch_id)
+    assert led.counts(second.batch_id)["in_flight"] == 1
 
 
 @pytest.mark.parametrize("trigger", ["waiter_holds_a_row_on_its_old_block", "waiter_has_a_smaller_capacity"])
@@ -314,6 +332,150 @@ async def test_r1_3_a_second_batch_overfills_the_window_the_first_learned():
     second = await _start(app, n=20)
     out = sum(led.counts(b).get("in_flight", 0) for b in (first.batch_id, second.batch_id))
     assert out <= 2, f"{out} out on a block whose workers (3) give a window of 2 (second admitted {second.admitted})"
+
+
+# ---- review round 2 (the reviewer's reproductions, red on 261d843) ----------------------------------------------------
+
+async def test_r2_a_drained_batch_with_rows_out_still_bounds_the_window_it_learnt():
+    """r1_3's case, one step on: the first batch learnt from its results that the block has 3 workers (a window of 2)
+    and has 2 rows out; the user drains it. A second batch reads the config's 8 workers (a window of 7): the learnt
+    count is the BLOCK's (on the ledger), and a batch with rows on the block bounds the window, admitting or not."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(workers=8)       # the config says 8 workers; the canary names no count
+    first = await _start(app, n=20)
+    for i, f in enumerate(list(runner.futures)):
+        f.finish(_ok_report(i))                          # each result: workers 3 (PARSL_WORKER_COUNT on the node)
+    await batch.tick(app, first.batch_id)
+    led = batch.ledger_of(app)
+    assert int(led.batch(first.batch_id)["capacity"]) == 2
+    assert led.counts(first.batch_id).get("in_flight", 0) == 2
+    c = await server._cancel(app, first.batch_id, "drain")
+    assert c.in_flight == 2, c
+    second = await _start(app, n=20)
+    out = sum(led.counts(b).get("in_flight", 0) for b in (first.batch_id, second.batch_id))
+    assert out <= 2, (f"{out} out on a block whose workers (3) give a window of 2: the drained batch's 2 and the "
+                      f"second's {second.admitted} (its capacity {led.batch(second.batch_id)['capacity']})")
+
+
+async def test_r2_the_learnt_count_outlives_the_batch_that_learnt_it():
+    """The first batch finished (done: no rows out, not admitting); the block's 3 workers it learnt still bound the
+    next batch, which reads the config's 8."""
+    from hpc_bridge import batch
+
+    app, _rt, runner = await _batch_app(workers=8)
+    first = await _start(app, n=2)
+    for i, f in enumerate(list(runner.futures)):
+        f.finish(_ok_report(i))
+    await batch.tick(app, first.batch_id)
+    led = batch.ledger_of(app)
+    assert led.batch(first.batch_id)["state"] == "done"
+    second = await _start(app, n=20)
+    assert second.admitted == 2, second.admitted
+
+
+def test_r2_a_restarted_server_with_the_same_pid_holds_no_dead_servers_rows(tmp_path):
+    """The server that ran A died; the new server got its pid (a container restart: same hostname, same small pid).
+    A's row in flight is a gone server's, bounded by its walltime: it never holds the window for good, and what
+    `reserve` counts `block_holders` names."""
+    import os
+
+    from hpc_bridge.ledger import Owner
+
+    led = _ledger(tmp_path)
+    led.proc_start = lambda pid: "linux:200"                 # this process's start, as the OS says now
+    me = Owner("laptop", os.getpid(), "linux:200")
+    dead = Owner("laptop", os.getpid(), "linux:100")         # the server that died: same host, same pid, other start
+    a = _add(led, "batch-0000000000a1", n=2, capacity=1, owner=dead)
+    assert len(led.reserve(a, dead, 1, uec_hash="uec-1", now=1_000.0, block_job="101")) == 1
+    assert not led.holder_alive(led.holder(a).holder)        # the ledger's own word: A's server is gone
+    c = _add(led, "batch-0000000000c1", n=2, capacity=1, owner=me)
+    assert led.block_holders(c, uec_hash="uec-1", block_job="101", owner=me, now=1_010.0) == {a: 1}   # young: holds
+    week = 1_000.0 + 7 * 86_400
+    assert led.block_holders(c, uec_hash="uec-1", block_job="101", owner=me, now=week) == {}
+    assert len(led.reserve(c, me, 1, uec_hash="uec-1", now=week, block_job="101")) == 1
+
+
+def test_r2_a_live_batchs_unknown_submit_holds_the_block_until_evidence(tmp_path):
+    """A's server runs; one of A's submits failed (`submit_unknown`): the service may have queued it, and on a MEP a
+    new submit with the same config is exactly what delivers it. It holds the block — A's own window and every other
+    batch's — until evidence (`unheld`), and B, refused, is told it is A."""
+    from hpc_bridge.ledger import HOLD_MARGIN_S
+
+    led = _ledger(tmp_path)
+    me = _owner()
+    a = _add(led, "batch-0000000000a1", n=2, capacity=1, owner=me)
+    [r] = led.reserve(a, me, 1, uec_hash="uec-1", now=1_000.0, block_job="101")
+    assert led.settle(a, r.index, r.attempt, "submit_unknown", only_from=("in_flight",), sent_job="101",
+                      sent_uec="uec-1", unknown_since=1_001.0)
+    later = 1_000.0 + 60 + HOLD_MARGIN_S + 1
+    assert led.reserve(a, me, 1, uec_hash="uec-1", now=later, block_job="101") == []   # A's own window: still full
+    b = _add(led, "batch-0000000000b1", n=2, capacity=1, owner=me)
+    got = led.reserve(b, me, 1, uec_hash="uec-1", now=later, block_job="101")
+    assert got == [] and got.holders == {a: 1}, (list(got), got.holders)
+    assert _out_on(led, (a, b), "uec-1") == 1
+
+
+def test_r2_fairness_order_is_the_same_for_every_reader_and_two_waiters_never_defer_to_each_other(tmp_path):
+    """The fairness order counted each batch's rows "on this block" from the CALLER's view (presumed-lost rows only on
+    the caller's block_job): two batches whose block_job differ each saw the other with fewer rows out, and each
+    deferred — both refused, every pass, with free slots on the block. The order is now the rows in flight or of
+    unknown fate on the block, then the last admission, then the id; and a batch refused only by fairness asks for
+    nothing, so no one defers to it."""
+    led = _ledger(tmp_path)
+    me = _owner()
+    w = _add(led, "batch-0000000000a1", n=10, capacity=4, owner=me)
+    c = _add(led, "batch-0000000000c1", n=10, capacity=4, owner=me)
+    rows = led.reserve(w, me, 2, uec_hash="uec-1", now=100.0, block_job="J1")
+    for r in rows:                                            # W's two rows on J1: presumed lost, W's server runs
+        assert led.settle(w, r.index, r.attempt, "presumed_lost", only_from=("in_flight",), sent_job="J1")
+    assert len(led.reserve(c, me, 1, uec_hash="uec-1", now=200.0, block_job="J2")) == 1
+    x = _add(led, "batch-0000000000e1", n=3, capacity=4, owner=me)   # a third batch fills the block...
+    xs = led.reserve(x, me, 4, uec_hash="uec-1", now=250.0, block_job="J2")
+    assert len(xs) == 3
+    assert led.reserve(c, me, 4, uec_hash="uec-1", now=260.0, block_job="J2") == []
+    assert led.reserve(w, me, 4, uec_hash="uec-1", now=261.0, block_job="J1") == []
+    assert led.batch(c)["want_at"] and led.batch(w)["want_at"]
+    for r in xs:                                              # ...and its rows finish
+        assert led.settle(x, r.index, r.attempt, "done", only_from=("in_flight",))
+    got_w = got_c = 0
+    for step in range(10):
+        now = 270.0 + 5 * step
+        got_c += len(led.reserve(c, me, 4, uec_hash="uec-1", now=now, block_job="J2"))
+        got_w += len(led.reserve(w, me, 4, uec_hash="uec-1", now=now + 1, block_job="J1"))
+    assert got_c + got_w > 0, "10 rounds, both batches backlogged with free slots in every view, nothing admitted"
+
+
+def test_r2_the_wrapper_holds_its_worker_no_longer_than_its_own_arithmetic_says(tmp_path):
+    """The worker is free task_walltime_s + WRAPPER_TAIL_S after the task starts, by the wrapper's own arithmetic: the
+    watcher's poll, the kill grace twice (the watcher's TERM->KILL wait, the cleanup's) and the reader grace twice. A
+    command that ignores TERM and leaves a child in its own process group holding stdout is that worst case (round 1's
+    bound, 7 s, had been short of it; and it had depended on the configurable admission margin)."""
+    import os
+    import signal
+
+    from hpc_bridge import batch
+    from tests.test_batch_phase1 import _run_wrapper
+
+    rd = tmp_path / "rd"
+    pidf = tmp_path / "esc.pid"
+    wall = 1
+    cmd = f"trap '' TERM; set -m; sleep 40 & echo $! > {pidf}; sleep 40"
+    script = batch.task_script(cmd, results_dir=str(rd), index=0, attempt=1, task_walltime_s=wall)
+    try:
+        _run_wrapper(script, {}, tmp_path)
+        ended = time.time()
+    finally:
+        try:
+            os.kill(int(pidf.read_text()), signal.SIGKILL)
+        except (OSError, ValueError):
+            pass
+    start = json.loads((rd / "tasks" / "0" / "attempt-1" / "meta.json").read_text())["start"]
+    held = ended - start
+    allowed = wall + batch.WRAPPER_TAIL_S + 1      # + 1: meta's start is stamped in whole seconds
+    assert held >= wall + 2 * batch.KILL_GRACE_S, held      # the slow path was really taken
+    assert held <= allowed, f"the worker was held {held:.1f} s past the task's start; the bound is {allowed:g} s"
+    assert batch.HOLD_MARGIN_S >= batch.WRAPPER_TAIL_S + batch.DELIVERY_S
 
 
 def _cancelled_report(index: int, attempt: int = 1):
@@ -656,6 +818,74 @@ async def test_r1_5_export_handoff_terms_never_understate_a_facility_template_br
     rendered = jinja2.Template(FACILITY_TEMPLATE).render(**ask.user_endpoint_config)
     assert "nodes_per_block: 4" in rendered
     assert ask.terms.nodes_per_block == 4, (ask.terms.nodes_per_block, ask.terms.worst_case, ask.notice)
+
+
+LINE_TEMPLATE = """engine:
+  type: GlobusComputeEngine
+  max_workers_per_node: {{ max_workers_per_node|default(4) }}
+  provider:
+    type: PBSProProvider
+    account: {{ account }}
+    queue: {{ queue }}
+    walltime: {{ walltime|default("01:00:00") }}
+    nodes_per_block: {{ nodes_per_block|default(1) }}
+    init_blocks: {{ init_blocks|default(0) }}
+    min_blocks: {{ min_blocks|default(1, true) }}
+    max_blocks: {{ max_blocks|default(1) }}
+"""
+
+
+@pytest.mark.parametrize("line, key, wire", [
+    ("min_blocks: {{ min_blocks|default(1, true) }}", "min_blocks", {"min_blocks": 0}),
+    ("init_blocks: {{ init_blocks | default(1, boolean=true) }}", "init_blocks", {"init_blocks": 0}),
+    ("nodes_per_block: {{ nodes_per_block | d(4, true) }}", "nodes_per_block", {"nodes_per_block": 0}),
+    ("nodes_per_block: {{ nodes_per_block | default(1) or 4 }}", "nodes_per_block", {"nodes_per_block": 0}),
+    ("x: 1\n{% if full_node %}nodes_per_block: 4{% else %}nodes_per_block: 1{% endif %}\n", "nodes_per_block",
+     {"full_node": True}),
+], ids=["default_boolean", "default_boolean_kw", "d_alias", "default_then_or", "inline_if"])
+def test_r2_a_value_line_is_never_read_as_less_than_jinja_renders(line, key, wire):
+    """Review round 2: `readings` (a value line, `key: {{ x | default(lit, true) }}`) read the config's value, though
+    Jinja's boolean default turns a falsy one (the 0 hpc-bridge itself sends for init_blocks / min_blocks) into the
+    default. A value line is read only as `x` or `x | default(<one literal>)` (then `| int` / `| tojson`); anything
+    else — and the key on a line of statements — is unreadable (`_UNSET`: the terms refuse it as unbounded)."""
+    import yaml
+
+    from hpc_bridge import handoff
+
+    jinja2 = pytest.importorskip("jinja2")
+    rendered = yaml.safe_load(jinja2.Template(line).render(**wire))[key]
+    got = handoff.effective(line, key, wire, 1)
+    assert got is handoff._UNSET or (isinstance(got, int) and got >= rendered), (
+        f"{line!r} with {wire}: Jinja renders {key}={rendered}, the terms read {got!r}")
+
+
+@pytest.mark.parametrize("line, wire, want", [
+    ("walltime: {{ walltime | default(\"00:30:00\" | tojson) }}", {}, "00:30:00"),
+    ("init_blocks: {{ init_blocks | default(0) | int }}", {"init_blocks": 2}, 2),
+    ("max_blocks: {{ max_blocks }}", {"max_blocks": 3}, 3)])
+def test_r2_the_value_lines_it_reads_exactly_still_read(line, wire, want):
+    from hpc_bridge import handoff
+
+    key = line.split(":", 1)[0]
+    assert handoff.effective(line, key, wire, None, pick="one") == want
+
+
+async def test_r2_export_handoff_refuses_d6_on_a_template_whose_min_blocks_cannot_be_read_as_0(tmp_path, monkeypatch):
+    """Through export_handoff on a facility MEP: hpc-bridge sends min_blocks 0, and the template's boolean default
+    renders it 1 — a pool parsl keeps at one block and replaces when cancelled, which D6 refuses on a MEP. A min_blocks
+    that cannot be read as 0 is refused as D6, never asked for."""
+    from tests.test_handoff_phase2b import POLARIS_SCHEMA, _export, _mep_app
+
+    jinja2 = pytest.importorskip("jinja2")
+    import yaml
+
+    app = await _mep_app(tmp_path, monkeypatch, template=LINE_TEMPLATE, schema=POLARIS_SCHEMA)
+    uec = {"queue": "debug", "account": "hpcb", "walltime": "01:00:00", "max_blocks": 1}
+    ask = await _export(app, uec)
+    rendered = yaml.safe_load(jinja2.Template(LINE_TEMPLATE).render(**{**uec, "min_blocks": 0}))
+    assert rendered["engine"]["provider"]["min_blocks"] == 1
+    assert ask.phase == "refused" and ask.reason == "mep_min_blocks", (ask.phase, ask.reason, ask.notice)
+    assert app.runners.built == []
 
 
 # ---- status() with no id: what the ledger holds (the user's request after the demo) --------------------------------

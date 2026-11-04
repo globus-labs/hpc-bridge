@@ -283,6 +283,18 @@ def test_the_window_counts_admissions_against_settlements_and_main_run_shell_cal
     assert w.peak == 3 and not bc.window_within_capacity(Trace(shells + polls), workers=2).ok
 
 
+def test_the_window_is_the_blocks_real_workers_not_the_largest_capacity_announced():
+    """Two batches on one 3-worker block (a window of 2): one announced capacity 2, the other 3 (it had not learnt the
+    count). Three out at once overfills the block, whatever either announced (red before: graded against 3)."""
+    evs = [_ev("batch.admit", 1, 0, capacity=2), _ev("batch.admit", 2, 1, capacity=2),
+           {**_ev("batch.admit", 3, 0, capacity=3), "batch_id": "batch-0000000000b2"}]
+    t = Trace([_c("run_batch", {}, _status())], events=evs)
+    assert bc.window(t).peak == 3
+    r = bc.window_within_capacity(t, workers=3)
+    assert not r.ok and "window 2 of 3" in r.detail, r.detail
+    assert bc.window_within_capacity(Trace([_c("run_batch", {}, _status())], events=evs[:2]), workers=3).ok
+
+
 def test_batch_used_and_failures_have_rc():
     rows = [{"index": i, "state": "failed" if i == 7 else "done", "exit_code": 3 if i == 7 else 0} for i in range(10)]
     t = Trace([_c("run_batch", {}, _status()), _c("status", {"id": BID}, _status("done", rows))], ["n=7 exit code 3"])

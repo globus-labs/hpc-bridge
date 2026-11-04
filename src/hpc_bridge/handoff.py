@@ -299,18 +299,25 @@ def _literal(s: str) -> Any:
 
 def readings(text: str, yaml_key: str) -> list[tuple[str, Any, Any]]:
     """Every value the template gives its YAML key `yaml_key`: ("lit", value, None) for a literal, ("var", <config
-    key>, <its default or _UNSET>) for `{{ key | default(…) }}`, ("expr", None, None) for anything else."""
+    key>, <its default or _UNSET>) for `{{ key }}` or `{{ key | default(<one literal>) }}` (then `| int` / `| tojson`
+    at most), ("expr", None, None) for anything else — `default(1, true)` (Jinja's boolean default renders a falsy
+    value as the default), `d(…)`, an operator, a call — and for the key on a line of `{% … %}` statements (review
+    round 2: those had read the config's value and understated what Jinja renders)."""
     out: list[tuple[str, Any, Any]] = []
-    for m in re.finditer(rf"^\s*{re.escape(yaml_key)}:[ \t]*(.*?)[ \t]*$", _strip(text), re.M):
+    key = re.escape(yaml_key)
+    for line in _strip(text).splitlines():
+        m = re.match(rf"^\s*{key}:[ \t]*(.*?)[ \t]*$", line)
+        if m is None:
+            if "{%" in line and re.search(rf"(?<![\w.]){key}\s*:", line):
+                out.append(("expr", None, None))
+            continue
         v = m.group(1)
-        if v.startswith("{{"):
-            inner = v.strip("{}- \t")
-            var = re.match(r"([A-Za-z_]\w*)\b", inner)
-            if var is None or inner[var.end():].lstrip()[:1] not in ("", "|"):
+        if "{{" in v or "{%" in v:
+            vm = _VALUE.fullmatch(v)
+            if vm is None:
                 out.append(("expr", None, None))
                 continue
-            d = re.search(r"default\(\s*(.*?)\s*\)\s*(?:\||$)", inner)
-            out.append(("var", var.group(1), _literal(d.group(1)) if d else _UNSET))
+            out.append(("var", vm.group(1), _literal(vm.group(2)) if vm.group(2) else _UNSET))
         else:
             if v[:1] not in ('"', "'"):
                 v = v.split(" #", 1)[0]
@@ -323,6 +330,9 @@ _STMT = re.compile(r"^\s*\{%-?\s*(if|elif|else|endif)\b\s*(.*?)\s*-?%\}\s*$")
 # boolean default, which turns a falsy value into the default — and `default(a) or (…)` up to the line's last `)`)
 _LIT = r"""(?:"[^"\\]*"|'[^'\\]*'|-?\d+(?:\.\d+)?|[Tt]rue|[Ff]alse|[Nn]one|null)"""
 _COND_DEFAULT = re.compile(rf"^([A-Za-z_]\w*)\s*\|\s*default\(\s*({_LIT})\s*\)$")
+# a value line read exactly (`readings`): `{{ x }}` or `{{ x | default(<one literal>) }}`, then `| int` / `| tojson`
+_VALUE = re.compile(rf"\{{\{{-?\s*([A-Za-z_]\w*)\s*(?:\|\s*default\(\s*({_LIT}(?:\s*\|\s*tojson)?)\s*\))?"
+                    rf"\s*(?:\|\s*(?:int|tojson)\s*)*-?\}}\}}")
 _COND_DEFINED = re.compile(r"^([A-Za-z_]\w*)\s+is\s+defined(?:\s+and\s+([A-Za-z_]\w*)(\s+is\s+not\s+none)?)?$")
 
 
@@ -697,9 +707,12 @@ def build(app: AppCtx, caller: dict[str, Any], md: dict[str, Any], access: str) 
     hb = {back.get(k, k): v for k, v in wire.items()}
     plan = Plan(wire=wire, hb=hb, template=text, access=access, scheduler=sched)
     _facts(plan)
-    if access == "mep" and isinstance(plan.facts["min_blocks"], int | float) and plan.facts["min_blocks"] >= 1:
+    mb0 = plan.facts["min_blocks"]
+    if access == "mep" and (mb0 is _UNSET or (isinstance(mb0, int | float) and mb0 >= 1)):
+        said = (f"min_blocks {mb0}" if mb0 is not _UNSET else
+                "a min_blocks the template computes, which cannot be read as 0 (it may render 1 or more)")
         raise HandoffRefusal("mep_min_blocks", (
-            f"Refused, nothing was sent or asked: min_blocks {plan.facts['min_blocks']} on a facility's multi-user "
+            f"Refused, nothing was sent or asked: {said} on a facility's multi-user "
             "endpoint. Parsl keeps that many blocks running and replaces a cancelled one, and no client can stop a "
             "facility's user endpoint, so such a pool cannot be bounded (design D6, until spike S3 proves the user "
             "endpoint exits when idle). Send min_blocks: 0 — blocks then start on demand and idle-release."))

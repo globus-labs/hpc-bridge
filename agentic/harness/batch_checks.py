@@ -415,14 +415,16 @@ def one_confirmation(t: Trace) -> Result:
 
 
 def window_within_capacity(t: Trace, *, workers: int) -> Result:
-    """The journal never shows more batch work out than the window, and the window never more than the block's workers
-    (less the one kept for interactive work, once there are two or more)."""
+    """The journal never shows more batch work out than the BLOCK's window: its real workers less the one kept for
+    interactive work, once there are two or more — never a capacity some batch announced (review round 2 of the batch
+    demo fixes: graded against the largest announced, two batches on one block overfilling it passed)."""
     w = window(t)
-    cap = w.capacity if w.capacity is not None else max(1, workers - 1 if workers >= 2 else 1)
-    ok = w.peak <= cap <= workers and bool(w.sources)
+    cap = max(1, workers - 1) if workers >= 2 else 1
+    ok = w.peak <= cap and bool(w.sources)
     return Result("window_within_capacity", ok,
                   f"peak {w.peak} out at once ({w.at or 'nothing'}; from {', '.join(w.sources) or 'no record'}), "
-                  f"window {cap}, workers {workers}")
+                  f"window {cap} of {workers} worker(s)"
+                  + (f"; the largest capacity a batch announced: {w.capacity}" if w.capacity is not None else ""))
 
 
 def failures_have_rc(t: Trace, *, failing: dict[int, int]) -> Result:
