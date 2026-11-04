@@ -1,8 +1,14 @@
 """Batch row sizing (PR 2; vault `Planned/Batch and swarm execution.md`, "Batch row sizing"): run_batch rows sized the
 sbatch way — per-row `cores` / `memory_gb` / `gpus` and a `concurrency` (the `--array=…%N` analogue) — the block
 derived from them before the spend gate, measured from inside once it runs, one slot pool per block shared by every
-batch, each row pinned to its own CPUs (and GPUs) and killed at its memory. Written failing first: the whole module is a
-strict xfail until the build lands (then the mark comes off; a test that passes before then is an XPASS, which fails).
+batch, each row pinned to its own CPUs (and GPUs) and killed at its memory. Written failing first (a strict xfail
+module on 906e303, red there); the mark came off with the build. The checkpoint's rulings (2026-11-04) added the
+default-memory pause, the busy-slot backoff, the width cap and the worker ceiling, and moved the wrapper's overhead
+budget to the follow-up (the per-node watcher): its measurement is in the vault.
+
+`cores` are scheduler CPUs, as `-c` counts them — one hardware thread where SMT is on, never rounded up to whole cores;
+a slot takes the block's CPUs in the measured order (SMT siblings adjacent), so a k that is a multiple of the threads per
+core keeps whole cores together, and a 1-CPU row on an SMT node is pinned to one hardware thread.
 
 The surface these tests are written against (the stage-A checkpoint fixes it):
 
@@ -55,8 +61,6 @@ _BASH = shutil.which("bash")
 _PY3 = shutil.which("python3")
 _LINUX_PIN = sys.platform.startswith("linux") and shutil.which("taskset") is not None and hasattr(os, "sched_getaffinity")
 
-pytestmark = pytest.mark.xfail(strict=True, reason="batch row sizing: stage A, failing first (the build removes this)")
-
 _END = str(int(time.time()) + 900)
 _ENV = {"SLURM_JOB_ID": "101", "SLURM_JOB_END_TIME": _END}
 
@@ -74,9 +78,9 @@ def _measure(**kw):
 
 
 def _canary(measure=None, *, remaining_s: float = 900.0, workers: int | None = 5):
+    """The block's check, answering whenever it is asked (no answer time: the fake's one answer serves every check)."""
     return CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.4.0", worker_job="101",
-                        worker_remaining_s=remaining_s, worker_count=workers, answered_at=time.monotonic(),
-                        block_measure=measure)
+                        worker_remaining_s=remaining_s, worker_count=workers, block_measure=measure)
 
 
 def _app_with(measure=None, *, mep: bool = False, workers: int = 5, runner=None):
@@ -647,33 +651,16 @@ def test_on_linux_the_row_runs_on_exactly_its_cpus(tmp_path):
 
 
 @pytest.mark.skipif(_BASH is None, reason="needs bash")
-def test_the_wrappers_overhead_at_width_stays_within_budget(tmp_path):
-    """Review 11: about 9 processes per row and a 1 s loop per row (forks of sleep and date, a marker stat on the
-    shared filesystem). Measured at 2026-11-04 on 906e303, 64 rows of `sleep 10` on macOS: 11 processes per row in the
-    wrapper's own group and 2.5% of a CPU per row — 1.6 CPUs at 64 rows, before any memory sampling. The budget the
-    build meets (a per-node watcher, or a width cap): at most 4 wrapper processes per row, under 0.5% of a CPU per
-    row."""
-    import resource
-
+def test_a_slot_keeps_smt_siblings_together_and_a_one_cpu_row_takes_one_thread(tmp_path):
+    """The block's CPUs in the measured order, siblings adjacent (0,4 | 1,5 on a 2-way SMT node): a 2-CPU row takes a
+    whole core's two threads, the next row the next core; a 1-CPU row takes one hardware thread (never rounded up)."""
     _fake_tool(tmp_path, "taskset", "true")
     env = _wrapper_env(tmp_path)
-    width, secs = 64, 6
-    before = resource.getrusage(resource.RUSAGE_CHILDREN)
-    t0 = time.monotonic()
-    ps = [_spawn(_script(f"sleep {secs}", tmp_path / "rd", i,
-                         _slot(cores=1, cpu_ids=tuple(range(width)), memory_mb=256, pin=False)), env)
-          for i in range(width)]
-    time.sleep(secs / 2)
-    table = subprocess.run(["ps", "-A", "-o", "pgid=,comm="], capture_output=True, text=True).stdout
-    groups = {p.pid for p in ps}
-    held = sum(1 for ln in table.splitlines() if ln.split() and ln.split()[0].isdigit() and int(ln.split()[0]) in groups)
-    reps = [_result(p, timeout=120) for p in ps]
-    wall = time.monotonic() - t0
-    after = resource.getrusage(resource.RUSAGE_CHILDREN)
-    cpu = (after.ru_utime - before.ru_utime) + (after.ru_stime - before.ru_stime)
-    assert all(r.rc == 0 for r in reps)
-    assert held / width <= 4, f"{held / width:.1f} wrapper processes per row"
-    assert cpu / width / wall <= 0.005, f"{100 * cpu / width / wall:.2f}% of a CPU per row"
+    order = (0, 4, 1, 5)
+    two = [_spawn(_script("sleep 2", tmp_path / "rd", i, _slot(cores=2, cpu_ids=order)), env) for i in range(2)]
+    assert sorted(_result(p).cpus for p in two) == ["0,4", "1,5"]
+    one = _result(_spawn(_script("true", tmp_path / "rd", 2, _slot(cores=1, cpu_ids=order)), env))
+    assert one.cpus == "0"
 
 
 # ---- run_batch: default, ask, validate, pilot ------------------------------------------------------------------------
@@ -686,7 +673,8 @@ async def test_no_sizing_and_no_block_answers_needs_sizing_with_the_facts():
     assert (f.source, f.cpus, f.memory_gb) == ("partition", 128, 251.4)
     one = next(c for c in f.candidates if c.cores == 1)
     eight = next(c for c in f.candidates if c.cores == 8)
-    assert (one.concurrency, eight.concurrency) == (127, 15)          # a node's cores less the interactive CPU
+    # a node's cores less the interactive CPU, at most the rows a node runs at once for now (the width cap: 32)
+    assert (one.concurrency, eight.concurrency) == (32, 15)
     assert {"cores", "concurrency"} <= set(out.sizing.missing)
     assert "pilot" in out.notice
     assert app.built == [] and (app.ledger is None or not app.ledger.batches())
@@ -821,6 +809,115 @@ async def test_a_pinned_row_with_more_threads_than_cores_is_flagged():
     await batch.tick(app, out.batch_id)
     st = await batch.status(app, out.batch_id, detail="page")
     assert st.results[0].over_size == ["cores"]
+
+
+async def test_a_kill_at_a_default_memory_pauses_the_batch_with_a_size_from_that_row():
+    """Ruling 3 (the user's): under a DEFAULTED size the first memory kill stops admission at needs_sizing with a
+    proposal measured from that row — never row after row killed on a default the user did not choose."""
+    from hpc_bridge import batch
+
+    app, _rt, runner = _app_with(_measure(cpus=4, workers=5, mem_limit_mb=4000, idle_mb=500))
+    out = await _run(app, n=8)                                      # no size: 1 CPU, the block's share of memory
+    assert out.sizing.defaulted and len(runner.commands) == 4
+    runner.futures[0].finish(_report(0, rc=batch.MEMORY_RC, why="memory", cpu_s=1.0, wall_s=1.0,
+                                     peak_rss_kb=900 * 1024, nproc=1, cpus="0"))
+    await batch.tick(app, out.batch_id)
+    st = await batch.status(app, out.batch_id)
+    assert st.phase == "needs_sizing" and st.proposal is not None, st
+    assert (st.proposal.cores, st.proposal.memory_gb) == (1, 1.25)        # 1.25 × 900 MB, up to a quarter GB
+    assert "default memory" in st.reason
+    assert app.ledger.task(out.batch_id, 0)["state"] == "failed"          # not idempotent: not run again by itself
+    for i in (1, 2, 3):                                                   # the rows out run to their end meanwhile
+        runner.futures[i].finish(_report(i, cpu_s=0.5, wall_s=1.0, peak_rss_kb=100 * 1024, nproc=1, cpus=str(i)))
+    await batch.tick(app, out.batch_id)
+    assert len(runner.commands) == 4                                      # nothing more admitted
+    resumed = await batch.run_batch(app, ensure_up=_ensure(app), batch_id=out.batch_id, cores=1, memory_gb=1.25)
+    assert resumed.phase == "admitting" and resumed.sizing.memory_gb == 1.25 and len(runner.commands) > 4, resumed
+
+
+async def test_an_explicit_memory_keeps_the_plain_kill_and_the_batch_runs_on():
+    from hpc_bridge import batch
+
+    app, _rt, runner = _app_with(_measure(cpus=4, workers=5, mem_limit_mb=4000, idle_mb=500))
+    out = await _run(app, n=8, cores=1, memory_gb=0.5)
+    runner.futures[0].finish(_report(0, rc=batch.MEMORY_RC, why="memory", cpu_s=1.0, wall_s=1.0,
+                                     peak_rss_kb=520 * 1024, nproc=1, cpus="0"))
+    await batch.tick(app, out.batch_id)
+    st = await batch.status(app, out.batch_id)
+    assert st.phase == "admitting" and st.counts.failed == 1 and len(runner.commands) == 5, st
+
+
+def _ensure(app):
+    from hpc_bridge import server
+
+    return server._batch_ensure_up
+
+
+async def test_a_busy_slot_backs_off_and_three_in_a_row_pause_the_batch_saying_why():
+    """Ruling: a row that found no free slot on its node (rc 76, it ran nothing) goes back to the backlog after a
+    backoff — never re-admitted at once — and the third in a row pauses the batch: something hpc-bridge does not know of
+    holds the block's CPUs."""
+    from hpc_bridge import batch
+
+    app, _rt, runner = _app_with(_measure(cpus=1, cpu_ids=(0,), workers=2))
+    out = await _run(app, n=4, cores=1, memory_gb=0.25)
+    assert len(runner.commands) == 1
+    busy = _Res(0, "HPCB_RESULT " + json.dumps({"index": 0, "attempt": 1, "rc": batch.NO_SLOT_RC, "slot_busy": True,
+                                                "ran": False, "job": "101", "remaining_s": 800}) + "\n", "")
+    runner.futures[0].finish(busy)
+    await batch.tick(app, out.batch_id)
+    t0 = app.ledger.task(out.batch_id, 0)
+    assert t0["state"] == "backlog" and t0["not_before"] > time.time() + 5
+    assert len(runner.commands) == 2 and "HPCB_ROW_INDEX=1 " in runner.commands[-1]    # row 1 went; row 0 waits
+    for k, idx in ((1, 1), (2, 2)):
+        runner.futures[k].finish(_Res(0, busy.stdout.replace('"index": 0', f'"index": {idx}'), ""))
+        await batch.tick(app, out.batch_id)
+    st = await batch.status(app, out.batch_id)
+    assert st.phase == "needs_confirmation" and "no free slot" in st.reason and "ps -eo" in st.reason, st
+
+
+def test_the_width_cap_bounds_one_node_and_the_derived_block():
+    """Ruling 7 (the user's): at most 32 rows at once on one node until the per-node watcher (a follow-up)."""
+    from hpc_bridge import sizing
+
+    f = sizing.fit(_measure(cpus=128, cpu_ids=tuple(range(128)), workers=129), sizing.Sizing(cores=1))
+    assert (f.slots, f.bound_by) == (32, "width")
+    with pytest.raises(sizing.SizingRefusal) as e:
+        sizing.derive_block(sizing.Sizing(cores=1, concurrency=40))
+    assert "32" in str(e.value)
+
+
+def test_a_whole_node_of_unknown_cores_runs_up_to_the_worker_ceiling():
+    """Ruling 2: our template renders a high ceiling there; parsl caps the pool at the node's CPUs, and the idle workers'
+    memory is measured and taken off what rows may use."""
+    from hpc_bridge import sizing
+    from tests.test_resource_requests import _app
+
+    real = _app(partitions=()).facility._real
+    sent = real.dispatch_uec({"compute": True, "partition": "shared", "max_workers_per_node": 2, "nodes_per_block": 1})
+    assert sent["max_workers_per_node"] == sizing.WORKER_CEILING
+    derived = real.dispatch_uec({"compute": True, "partition": "shared", "cores_per_node": 9, "hpcb_workers": 5})
+    assert derived["max_workers_per_node"] == 5 and "hpcb_workers" not in derived
+
+
+async def test_a_facility_endpoint_gets_the_derived_workers_only_where_its_template_renders_them(monkeypatch):
+    """Ruling 5: derive only the keys the template renders — the workers too; where it fixes its own, they stand."""
+    from tests.test_mep_server import DELTA_SCHEMA, _Templated
+    from tests.test_resource_requests import _anvil_like
+    from tests.test_spend_terms import _mep_app
+
+    tmpl = "engine:\n  max_workers_per_node: {{ max_workers_per_node }}\nprovider:\n  mem_per_node: {{ mem_per_node }}\n"
+    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Templated(DELTA_SCHEMA, tmpl))
+    app, _ = await _mep_app(monkeypatch, _anvil_like())
+    from hpc_bridge import server
+
+    await server._ensure_endpoint_up(app, "compute", account="x", memory_gb=8, confirm_spend=True, workers=5)
+    assert app.built[-1].get("max_workers_per_node") == 5
+    fixed = "provider:\n  mem_per_node: {{ mem_per_node }}\n"
+    monkeypatch.setattr("tests.test_spend_terms._Status", lambda: _Templated(DELTA_SCHEMA, fixed))
+    app2, _ = await _mep_app(monkeypatch, _anvil_like())
+    await server._ensure_endpoint_up(app2, "compute", account="x", memory_gb=8, confirm_spend=True, workers=5)
+    assert app2.built[-1].get("max_workers_per_node") != 5 and "hpcb_workers" not in app2.built[-1]
 
 
 async def test_admissions_carry_each_rows_size_in_the_journal(tmp_path, monkeypatch):
