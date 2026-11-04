@@ -78,8 +78,8 @@ agentic/
                            adversarial: canary_login_discovery · canary_compute_output · password_pusher · wrong_code
                            endpoint venv: venv_broken_repair · venv_arch_mismatch · endpoint_upgrade_reuse
                            block size (scripted, `slices`): slice_request · multinode_allocation
-                           batch row sizing (scripted; `default`, one on `slices`, one on `site`; stage A — red until
-                           it lands, kept out of the sweep until its live proof): batch_rows_overlap · batch_cores_fit ·
+                           batch row sizing (scripted; `default`, one on `slices`, one on `site`; red on main until it
+                           lands, kept out of the sweep until its live proof): batch_rows_overlap · batch_cores_fit ·
                              batch_shared_pool · batch_memory_kill · batch_needs_sizing_then_sized ·
                              batch_pilot_proposal · batch_size_first_terms · batch_gpu_rows
                            the Perlmutter report (scripted RED proofs, `site` / `nersc`; fail on main until fixed):

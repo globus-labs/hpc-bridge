@@ -33,7 +33,7 @@ from typing import Any
 import batch_checks as bc
 from invariants import Result, Trace, _billed_start_idxs
 
-MEMORY_RC = 125          # the wrapper's rc for a row it killed at its memory (batch.MEMORY_RC)
+MEMORY_RC = 87           # the wrapper's rc for a row it killed at its memory (batch.MEMORY_RC; why "memory")
 
 
 def probe(cores: int, work: str, *, field: str = "n") -> str:

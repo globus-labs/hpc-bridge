@@ -295,6 +295,21 @@ def test_the_window_is_the_blocks_real_workers_not_the_largest_capacity_announce
     assert bc.window_within_capacity(Trace([_c("run_batch", {}, _status())], events=evs[:2]), workers=3).ok
 
 
+def test_the_window_since_row_sizing_is_the_blocks_cpus_and_the_smallest_slots_announced():
+    """Batch row sizing (PR 2): the workers follow the block's cores, so the default profile's 4-CPU block runs more
+    than its old window of 1 — the grader bounds it by the block's CPUs for 1-CPU rows and by the smallest `sizing.slots`
+    any batch on it announced (the sum over batches must stay under it)."""
+    four = [_ev("batch.admit", 1 + i, i, capacity=3) for i in range(3)]
+    sized = _status(sizing={"cores": 1, "slots": 3, "bound_by": "workers"})
+    t = Trace([_c("run_batch", {}, sized)], events=four)
+    assert bc.window_within_capacity(t, block_cpus=4).ok
+    over = Trace([_c("run_batch", {}, sized)], events=four + [_ev("batch.admit", 9, 3, capacity=3)])
+    r = bc.window_within_capacity(over, block_cpus=4)
+    assert not r.ok and "window 3" in r.detail, r.detail
+    five = Trace([_c("run_batch", {}, _status())], events=[_ev("batch.admit", 1 + i, i, capacity=5) for i in range(5)])
+    assert not bc.window_within_capacity(five, block_cpus=4).ok          # past the block's CPUs, whatever was announced
+
+
 def test_batch_used_and_failures_have_rc():
     rows = [{"index": i, "state": "failed" if i == 7 else "done", "exit_code": 3 if i == 7 else 0} for i in range(10)]
     t = Trace([_c("run_batch", {}, _status()), _c("status", {"id": BID}, _status("done", rows))], ["n=7 exit code 3"])

@@ -18,6 +18,21 @@ internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_networ
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
 
+## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — built, live cells next
+
+- `run_batch` sizes rows the sbatch way (`cores`, `memory_gb`, `gpus`, `concurrency`; `pin`, `pilot`): with no block the
+  block is derived from them before the spend question; with no size it answers `needs_sizing` with the block's facts;
+  each row is pinned to its own CPUs/GPUs, its thread counts set, killed past its memory (rc 87). Our SSH template's
+  workers now follow the block (they were a fixed 2: every SSH batch ran one row at a time). Design and rulings: vault
+  `Planned/Batch and swarm execution.md`, "Batch row sizing"; modules `sizing`, `batch`, `ledger`.
+- Live cells to run (scripted, kept out of the sweep until proven): `batch_rows_overlap`, `batch_cores_fit`,
+  `batch_shared_pool`, `batch_memory_kill`, `batch_needs_sizing_then_sized`, `batch_pilot_proposal` (fake `default`),
+  `batch_size_first_terms` (`slices`), `batch_gpu_rows` (`site`; first check that slurmd exports CUDA_VISIBLE_DEVICES for
+  the fake GPUs). The changed graders: `batch_fanout_collect`, `batch_two_servers_one_ledger` (window = 4 CPUs and the
+  slots announced), `batch_crosses_walltime` (27 rows).
+- Follow-up PR: the per-node watcher and one stream helper per row (lifts the 32-rows-per-node cap); a row's own `srun`
+  binding is a documented limitation pending a live check.
+
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
 - **The bug** (`queued_check_relaunch`, phase `second`, fake/default, run 1792120434): on a user endpoint that already

@@ -10,7 +10,8 @@ resume it, run_batch(batch_id=…, confirm_spend=True): refused before anything 
 row and stops.
 
 GRADED: every admission came from one process and B started nothing (`only_holder_admits`); B read the batch
-(`second_server_reads_ledger`); the work out at once never passed the window (`window_never_doubles`); no row ran twice;
+(`second_server_reads_ledger`); the work out at once never passed the window (`window_never_doubles`: since batch row
+sizing the block's 4 CPUs and the slots the batch announced, no longer the old 2 workers less one); no row ran twice;
 the ledger agrees with sacct.
 
 ON MAIN there is no ledger and no lease: the fallback has B do what a second agent would — reconnect, confirm its own
@@ -35,7 +36,7 @@ NEEDS_COMPUTE_NODE = True
 TEARDOWN = "delete"
 EXTRA_ENV = {"HPC_BRIDGE_SYNC_WAIT_S": "10"}
 
-WORKERS = 2
+BLOCK_CPUS = 4   # the default profile's nodes: an unsized batch's 1-CPU rows, at most this many at once
 TASK_WALLTIME_S = 60
 N_ROWS = 10
 COMMAND = "sleep 6; echo row {n}"
@@ -83,7 +84,7 @@ async def SCRIPT(ops) -> str:
 
 
 def window_never_doubles(t: Trace) -> Result:
-    r = bc.window_within_capacity(t, workers=WORKERS)
+    r = bc.window_within_capacity(t, block_cpus=BLOCK_CPUS)
     return Result("window_never_doubles", r.ok, r.detail)
 
 

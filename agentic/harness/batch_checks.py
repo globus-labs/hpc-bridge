@@ -414,16 +414,38 @@ def one_confirmation(t: Trace) -> Result:
     return Result("one_confirmation", ok, f"{len(starts)} confirmation(s) with a receipt (calls {starts})")
 
 
-def window_within_capacity(t: Trace, *, workers: int) -> Result:
-    """The journal never shows more batch work out than the BLOCK's window: its real workers less the one kept for
-    interactive work, once there are two or more — never a capacity some batch announced (review round 2 of the batch
-    demo fixes: graded against the largest announced, two batches on one block overfilling it passed)."""
+def announced_slots(t: Trace) -> list[int]:
+    """The slots each accepted batch said the block gives its rows (`sizing.slots`, batch row sizing)."""
+    out = []
+    for _i, c in batch_answers(t):
+        s = ((c.result or {}).get("sizing") or {}).get("slots")
+        if isinstance(s, int) and s > 0:
+            out.append(s)
+    return out
+
+
+def window_within_capacity(t: Trace, *, workers: int | None = None, block_cpus: int | None = None) -> Result:
+    """The journal never shows more batch work out than the BLOCK's window — never a capacity some batch announced
+    alone (review round 2 of the batch demo fixes: graded against the largest announced, two batches on one block
+    overfilling it passed). The window is the smallest of: the block's workers less the one kept for interactive work
+    (`workers`, where the scenario knows them), its CPUs for 1-CPU rows (`block_cpus`: batch row sizing, PR 2 — the
+    workers follow the block's cores, so the default profile's block runs more than its old 2), and the slots any batch
+    on the block announced (`sizing.slots`: the sum over batches must stay under the smallest)."""
     w = window(t)
-    cap = max(1, workers - 1) if workers >= 2 else 1
+    caps = []
+    if workers is not None:
+        caps.append(max(1, workers - 1) if workers >= 2 else 1)
+    if block_cpus is not None:
+        caps.append(block_cpus)
+    caps += announced_slots(t)
+    cap = min(caps) if caps else 1
     ok = w.peak <= cap and bool(w.sources)
+    said = ", ".join(x for x in (f"{workers} worker(s)" if workers is not None else "",
+                                  f"{block_cpus} CPU(s)" if block_cpus is not None else "",
+                                  f"slots announced {announced_slots(t)}" if announced_slots(t) else "") if x)
     return Result("window_within_capacity", ok,
                   f"peak {w.peak} out at once ({w.at or 'nothing'}; from {', '.join(w.sources) or 'no record'}), "
-                  f"window {cap} of {workers} worker(s)"
+                  f"window {cap} of {said or 'nothing known'}"
                   + (f"; the largest capacity a batch announced: {w.capacity}" if w.capacity is not None else ""))
 
 
