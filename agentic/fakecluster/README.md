@@ -119,8 +119,10 @@ Two ways to reach the login node:
   brings the `default` profile up, adds the `hpcb-fake` alias to `~/.ssh/config` with your yes, and writes a set of
   prompts to `~/hpcb-batch-demo/PROMPTS.md`: connect, a block, `run_batch`, an abort, a `submit_job` array under an
   envelope, a gated hand `sbatch`, the stop, `export_handoff`, teardown. `--launch` starts
-  `claude --plugin-dir <repo>` in that folder, outside the repo, so `.claude/settings.local.json` doesn't apply.
-  `--down` wipes the cluster.
+  `claude --plugin-dir <repo>` in that folder, outside the repo, so `.claude/settings.local.json` doesn't apply, with
+  the demo's own hpc-bridge state (`HPC_BRIDGE_STATE_DIR=~/hpcb-batch-demo/state`, your shell's other `HPC_BRIDGE_*`
+  left out): `fake` is a new facility to it, and `~/.hpc-bridge` is never touched (your Globus login is shared).
+  `--down` wipes the cluster and offers to remove that state.
 - **From a container** (the agentic jail, the stretch driver): join the network
   (`docker run --network hpcb-fake_default …`) and use `HPC_BRIDGE_SSH_HOST=login` on port 22 — no
   alias, no port mapping. This is how `bin/stretch.sh` does it.

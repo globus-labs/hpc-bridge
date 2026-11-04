@@ -3,7 +3,7 @@
 #
 #   agentic/fakecluster/bin/try_batch.sh            # bring the fake cluster up, check the ssh alias, print the prompts
 #   agentic/fakecluster/bin/try_batch.sh --launch   # …then start `claude --plugin-dir <this repo>` in a demo folder
-#   agentic/fakecluster/bin/try_batch.sh --down     # take the fake cluster down (--wipe)
+#   agentic/fakecluster/bin/try_batch.sh --down     # take the fake cluster down (--wipe), offer to drop the demo state
 #
 # What it sets up:
 #   - the fake cluster's `default` profile (Slurm, 2 compute nodes), via bin/up.sh (it makes ~/.ssh/hpcb-fake);
@@ -11,7 +11,10 @@
 #     ~/.ssh/config, so the alias is how it reaches the login node. With your yes, ONE line is added to the top of
 #     ~/.ssh/config: `Include <repo>/agentic/fakecluster/ssh_config.example`;
 #   - a demo folder OUTSIDE the repo (~/hpcb-batch-demo), so the repo's own .claude/settings.local.json (which disables
-#     the dev server) does not apply to the session.
+#     the dev server) does not apply to the session;
+#   - the demo's OWN hpc-bridge state, <demo folder>/state (HPC_BRIDGE_STATE_DIR: the facility cache, the login-node
+#     pins, the batch ledger, sent checks, handoffs, SSH sockets), so `fake` really is a new facility and your
+#     ~/.hpc-bridge is never touched. Your Globus login (~/.globus_compute) is shared, so no new login is asked for.
 #
 # Nothing here is billed: the cluster is local. The endpoint hpc-bridge stands up registers with Globus Compute under
 # YOUR Globus login (the plugin asks you to log in on first use); end the session with teardown_endpoint to remove it.
@@ -20,6 +23,7 @@ set -euo pipefail
 REPO="$(cd "$(dirname "${BASH_SOURCE[0]}")/../../.." && pwd)"
 FC="$REPO/agentic/fakecluster"
 DEMO="${HPCB_DEMO_DIR:-$HOME/hpcb-batch-demo}"
+STATE="$DEMO/state"   # keep it short: ssh's ControlPath (<state>/cm/<40 hex>) must fit ~104 bytes
 ALIAS_FILE="$FC/ssh_config.example"
 LAUNCH=""; DOWN=""
 for a in "$@"; do case "$a" in --launch) LAUNCH=1 ;; --down) DOWN=1 ;; -h|--help) sed -n '2,21p' "$0"; exit 0 ;;
@@ -28,6 +32,14 @@ for a in "$@"; do case "$a" in --launch) LAUNCH=1 ;; --down) DOWN=1 ;; -h|--help
 if [ -n "$DOWN" ]; then
   "$FC/bin/down.sh" --wipe
   echo "Fake cluster down. The Include line in ~/.ssh/config is harmless to keep; remove it by hand if you like."
+  if [ -d "$STATE" ]; then
+    printf 'Remove the demo'"'"'s hpc-bridge state (%s)? [y/N] ' "$STATE"
+    read -r yn
+    case "$yn" in
+      y|Y|yes) rm -rf "$STATE"; echo "removed $STATE" ;;
+      *) echo "kept $STATE (the next --launch reuses it: the facility and endpoint it recorded)" ;;
+    esac
+  fi
   exit 0
 fi
 
@@ -82,7 +94,7 @@ command `echo row={n} host=$(hostname); sleep 5; exit {code}`, with a 60 s task 
 it's done, then tell me which rows failed and their exit codes.
 
 ## 3. Abort a batch mid-run (cancel)
-Start a run_batch of `sleep 120` over n = 1..6 with a 180 s task walltime. Once two are running, cancel it with
+Start a run_batch of `sleep 120` over n = 1..6 with a 180 s task walltime. Once one is running, cancel it with
 mode abort, and show me how each row settled.
 
 ## 4. Tracked jobs under a budget (submit_job, the envelope, the meter)
@@ -104,11 +116,18 @@ Then show me the record's release section.
 ## 8. Clean up
 Tear down the endpoint.
 EOF
+mkdir -p "$STATE"
 echo "Prompts written to $DEMO/PROMPTS.md"
+echo "The demo's hpc-bridge state: $STATE (your ~/.hpc-bridge is not used)"
 echo
-echo "To start:  cd \"$DEMO\" && claude --plugin-dir \"$REPO\""
+echo "To start:  cd \"$DEMO\" && HPC_BRIDGE_STATE_DIR=\"$STATE\" claude --plugin-dir \"$REPO\""
 echo "In the session, /mcp should list plugin:hpc-bridge:endpoint as connected (17 tools)."
 echo "If you also have the hpc-bridge plugin installed from the marketplace, disable it for this session (/plugin)"
 echo "so only this checkout's tools are loaded."
 echo "When done:  $0 --down"
-if [ -n "$LAUNCH" ]; then cd "$DEMO" && exec claude --plugin-dir "$REPO"; fi
+if [ -n "$LAUNCH" ]; then
+  # this shell's own hpc-bridge settings stay out (an HPC_BRIDGE_SSH_HOST or endpoint id would bypass the new facility);
+  # only the demo's state dir goes in. The MCP server inherits claude's environment.
+  STRIP=(); for v in $(env | grep -oE '^HPC_BRIDGE_[A-Z_]+' || true); do STRIP+=(-u "$v"); done
+  cd "$DEMO" && exec env ${STRIP[@]+"${STRIP[@]}"} HPC_BRIDGE_STATE_DIR="$STATE" claude --plugin-dir "$REPO"
+fi
