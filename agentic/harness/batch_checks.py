@@ -253,10 +253,11 @@ def results_dir_for(scenario: str) -> str:
 
 
 async def wait_batch(ops, bid: str, *, until, timeout_s: float = 900.0, wait_s: float = 30.0) -> dict:
-    """status(bid, wait_s=…) until `until(answer)` (or the timeout: the last answer)."""
+    """status(bid, wait_s=…) until `until(answer)` (or the timeout: the last answer) — or the batch waits for its size
+    (`needs_sizing`, batch row sizing: a pilot's proposal, a kill at a default memory), which no wait can change."""
     deadline = time.monotonic() + timeout_s
     st = await ops.call("status", id=bid, wait_s=wait_s)
-    while not until(st) and time.monotonic() < deadline:
+    while not until(st) and st.get("phase") != "needs_sizing" and time.monotonic() < deadline:
         if st.get("is_error"):
             await ops.sleep(POLL_S)
         st = await ops.call("status", id=bid, wait_s=wait_s)

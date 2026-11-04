@@ -60,6 +60,17 @@ def test_run_batch_with_confirm_spend_is_a_billed_start_and_a_refusal_is_not():
     assert bc.one_confirmation(t).ok is False                    # two receipts: the first block and the resume's
 
 
+def test_needs_sizing_is_a_billed_start_only_with_a_receipt():
+    """Batch row sizing: run_batch(confirm_spend=True) answering needs_sizing started nothing (a size is asked before
+    any block) — unless it carried the yes for a batch waiting for its size, which confirms the block first and
+    carries the receipt."""
+    t = Trace([
+        _c("run_batch", {"command": "x", "rows": [1], "confirm_spend": True}, _status("needs_sizing")),
+        _c("run_batch", {"batch_id": BID, "confirm_spend": True}, _status("needs_sizing", block={"queue": "main"})),
+    ])
+    assert _billed_start_idxs(t) == [1]
+
+
 def test_build_trace_puts_the_servers_event_rows_in_events_not_calls():
     rows = [{"ts": 100.0, "ms": 50, "seq": 1, "pid": 7, "tool": "run_batch", "args": {"command": "x"},
              "result": _status()},
