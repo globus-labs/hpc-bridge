@@ -233,6 +233,24 @@ def test_r1_1_what_holds_a_slot_of_the_block_in_front(tmp_path):
     assert led.block_holders(new, uec_hash="uec-1", block_job=None, now=late) == {live: 1}
 
 
+async def test_a_holder_of_unknown_fate_on_ssh_is_named_with_what_frees_it():
+    """On an endpoint hpc-bridge stood up: a batch whose one row's submit is of unknown fate holds the block's window
+    of 1. The batch it refuses is told the row is of unknown fate and that a stop (or the reap) retiring its config
+    frees it once its user endpoint has exited — not that cancelling the holder does."""
+    from hpc_bridge import batch, server
+
+    app, _rt, runner = await _batch_app(workers=2)                       # SSH (a login shape); a window of 1
+    runner.fail_submit_of = {0}
+    first = await _start(app, n=1)
+    await batch.tick(app, first.batch_id)
+    second = await _start(app, n=2)
+    st = await server._status(app, second.batch_id)
+    said = " ".join(x or "" for x in (second.notice, st.notice))
+    assert st.counts.in_flight == 0 and f"{first.batch_id} (1 row(s) out, 1 of them of unknown fate" in said, said
+    assert "stop_endpoint (or the block's reap) that retires its config frees it" in said, said
+    assert "cancelling its batch does not free it" in said and "cancel('<id>', 'abort')" not in said, said
+
+
 def test_r1_1_hold_margin_is_one_value():
     from hpc_bridge import batch, ledger
 
@@ -268,7 +286,9 @@ async def test_r1_1_an_aborted_batchs_unknown_submit_holds_the_window_until_evid
     assert st.counts.in_flight >= 1 or first.batch_id in said, (
         f"admitted {second.admitted}, counts {st.counts}, phase {st.phase}: starved by {first.batch_id} (aborted) "
         f"without a word: {said!r}")
-    assert "cancel('<id>', 'abort')" in said and "status('<id>')" in said, said
+    # a MEP: no evidence can come but the row's result, and cancelling its batch frees nothing — said so, plainly
+    assert "1 of them of unknown fate" in said and "frees only when its result arrives" in said, said
+    assert "cancel('<id>', 'abort')" not in said, said
     later = time.time() + 60 + batch.HOLD_MARGIN_S + 1                   # task_walltime_s 60 past its submit
     monkeypatch.setattr(batch, "_now", lambda: later)
     await batch.tick(app2, second.batch_id)

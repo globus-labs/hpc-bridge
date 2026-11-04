@@ -212,8 +212,10 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
   capacity of every batch with rows on it or admitting on it. While another batch on the block waits for a slot it
   could take, a freed slot goes first by one order whoever reads it (rows in flight or of unknown fate on the block,
   last admission, id): one huge batch cannot starve another, no slot is left idle for a waiter that cannot take it,
-  and two waiters never defer to each other. A batch refused slots names the batches holding them, with `status(id)`
-  / `cancel(id, 'abort')` — never held silently. `reserve` stays the one admission point; its scan uses a partial
+  and two waiters never defer to each other. A batch refused slots names the batches holding them — never held
+  silently: rows in flight free as they settle (`status(id)` / `cancel(id, 'abort')`); a row of unknown fate is said
+  to be one, and that no cancel frees it (on SSH a stop or reap retiring its config does; on a facility endpoint only
+  its result). `reserve` stays the one admission point; its scan uses a partial
   index. The harness's `window_within_capacity` grades against the block's real workers, not the largest capacity a
   batch announced.
 - **The envelope names the session's own compute block.** A block confirmed BEFORE the envelope opened was counted as

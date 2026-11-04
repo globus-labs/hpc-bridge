@@ -1988,7 +1988,7 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         app.batches.pop(bid, None)
         return 0
     # refused slots its own window had room for: name the batches holding the block's, and the remedy
-    run.held_by = _held_by_note(led, rows.holders)
+    run.held_by = _held_by_note(led, rows.holders, ssh=_has_login_shape(app))
     if run.held_by and not _held(led.counts(bid)):
         run.waiting = run.held_by
     names = {"index"}
@@ -2003,15 +2003,29 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     return sent
 
 
-def _held_by_note(led: Ledger, holders: dict[str, int]) -> str | None:
+def _held_by_note(led: Ledger, holders: dict[str, int], *, ssh: bool) -> str | None:
     """Which other batches hold the block's shared window while this batch is refused slots (`reserve`'s own count,
-    `Reserved.holders`), and the remedy — a row of unknown fate holds until evidence, so never silently."""
+    `Reserved.holders`), and what frees them — never silently. A row in flight frees its slot as it settles, and
+    cancel(abort) ends it; a row of unknown fate holds until evidence, which no cancel gives: on SSH, a stop or reap
+    that retires its config once its user endpoint has exited (`_unknown_evidence`); on a facility endpoint only its
+    result arriving (nothing here can tell when it no longer can run)."""
     if not holders:
         return None
-    named = ", ".join(f"{h} ({n} row(s) out, {led.batch(h)['state']})" for h, n in list(holders.items())[:5])
-    return (f" The block's window is shared, and other batches hold its slots: {named}. Rows here are admitted as "
-            "their slots free. status('<id>') shows such a batch; cancel('<id>', 'abort') ends it if the user no "
-            "longer wants it.")
+    unknown = {h: sum(1 for r in led.unknown_holding(h) if r.get("state") == "submit_unknown") for h in holders}
+    named = ", ".join(f"{h} ({n} row(s) out" + (f", {unknown[h]} of them of unknown fate" if unknown[h] else "")
+                      + f", {led.batch(h)['state']})" for h, n in list(holders.items())[:5])
+    text = f" The block's window is shared, and other batches hold its slots: {named}."
+    if any(n > unknown[h] for h, n in holders.items()):
+        text += (" Rows in flight free their slots as they settle, and rows here are admitted then. status('<id>') "
+                 "shows such a batch; cancel('<id>', 'abort') ends its rows in flight if the user no longer wants it.")
+    if any(unknown.values()):
+        text += (" A row of unknown fate (its submit failed; the service may still have queued it) holds its slot "
+                 "until there is evidence it cannot run, and cancelling its batch does not free it: "
+                 + ("a stop_endpoint (or the block's reap) that retires its config frees it once its user endpoint has "
+                    "exited." if ssh else
+                    "on a facility endpoint it frees only when its result arrives; until then the window stays smaller "
+                    "by that row."))
+    return text
 
 
 def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: int, attempt: int, row: Any,
