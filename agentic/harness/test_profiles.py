@@ -23,7 +23,7 @@ def test_mep_layers_on_site_and_merges_capabilities():
     caps = m["capabilities"]
     assert caps["login_hosts"] == ["login01.hpcb.test", "login02.hpcb.test"] and caps["nodes"] == 3   # from site
     assert caps["mep"] == "consent-free" and caps["mep_schemas"] == ["strict", "open"]                    # from mep
-    assert m["catalog"]["cmd"].startswith("docker exec hpcb-fake-login-1 ")
+    assert m["catalog"]["cmd"].startswith("docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 ")
     assert "base" not in m
     assert profile.manifest("site")["layers"] == ["site"] and "catalog" not in profile.manifest("site")
 
@@ -57,7 +57,7 @@ def test_targets_reads_the_layered_profile_and_the_catalog_command(monkeypatch):
     monkeypatch.setenv("HPCB_FAKE_PROFILE", "mep")
     t = targets.get("fake")
     assert t.profile == "mep" and t.nodes == 3 and t.capabilities["mep"] == "consent-free"
-    assert t.catalog_cmd == "docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-mep-catalog"
+    assert t.catalog_cmd == "docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-mep-catalog"
     assert targets.meets({"mep": "consent-free", "accounting": "enforce", "login_nodes": 2}, t.capabilities)[0]
     monkeypatch.setenv("HPCB_FAKE_PROFILE", "site")
     assert targets.get("fake").catalog_cmd is None
@@ -65,7 +65,11 @@ def test_targets_reads_the_layered_profile_and_the_catalog_command(monkeypatch):
     import subprocess
     out = subprocess.run([sys.executable, str(HERE / "targets.py"), "fake"], capture_output=True, text=True, timeout=60,
                          env={**__import__("os").environ, "HPCB_FAKE_PROFILE": "mep"}).stdout
-    assert "HPCB_T_CATALOG_CMD='docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-mep-catalog'" in out
+    assert "HPCB_T_CATALOG_CMD='docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-mep-catalog'" in out
+    # The callers eval it: under another compose project it names THAT stack's login container, never hpcb-fake's.
+    expanded = subprocess.run(["bash", "-c", f'HPCB_FAKE_PROJECT=hpcb-other; echo {t.catalog_cmd}'],
+                              capture_output=True, text=True, timeout=10).stdout.strip()
+    assert expanded == "docker exec hpcb-other-login-1 /usr/local/bin/hpcb-mep-catalog"
 
 
 def test_pbs_profile_selects_its_own_stack_and_declares_the_scheduler(monkeypatch):

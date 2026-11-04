@@ -54,7 +54,7 @@ def test_pbs_mep_layers_on_polaris_and_offers_a_pbs_facility_endpoint():
     assert caps["scheduler"] == "pbs" and caps["site_rule"] == "filesystems" and caps["nodes"] == 2   # inherited
     assert caps["mep"] == "consent-free" and caps["mep_schemas"] == ["pbs-strict"] and caps["mep_mapped_user"] == "hpcbmep"
     assert caps["catalog"] == "local"                       # derived from [catalog] cmd: the registry is replaced
-    assert m["catalog"]["cmd"] == "docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"
+    assert m["catalog"]["cmd"] == "docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"
     assert caps["accounting"] == "none"                     # -A accepted, not validated (the template is the floor)
 
 
@@ -72,7 +72,8 @@ def test_build_materialises_the_mep_fixtures_on_the_pbs_stack(tmp_path):
                        capture_output=True, text=True, timeout=60)
     assert r.returncode == 0, r.stderr
     assert "PROFILE_COMPOSE=docker-compose.pbs.yml" in r.stdout and "PROFILE_SCHEDULER=pbs" in r.stdout
-    assert "PROFILE_CATALOG_CMD='docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-pbs-mep-catalog'" in r.stdout
+    assert "PROFILE_CATALOG_CMD='docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-pbs-mep-catalog'" \
+        in r.stdout
     overlays = re.search(r"^PROFILE_OVERLAYS=(.*)$", r.stdout, re.M).group(1)
     assert overlays.strip("'").endswith("profiles/pbs_mep/compose.override.yml")   # pbs and polaris have none
 
