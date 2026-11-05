@@ -499,6 +499,7 @@ class AppCtx:
     env_seq: int = 0   # each `choose` of an env: one that waited while a later one ran applies nothing (review R2-S6)
     env_pending: Any = None
     env_note: str | None = None
+    env_failed: Any = None   # the pending env whose build failed, for the answer that says so (`env_failed`, once)
     env_known: dict[str, Any] = field(default_factory=dict)
     env_said_install: bool = False
     env_runner: Any = None

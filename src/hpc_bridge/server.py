@@ -398,7 +398,7 @@ async def _ensure_endpoint_up(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -477,6 +477,7 @@ async def _ensure_endpoint_up(
     elif chosen is None and app.env_pending is not None:
         st.env = envs.pending_info(app)
     words = " ".join(x for x in (chosen.notice if chosen is not None else "", envs.take_note(app)) if x)
+    st.env_failed = envs.take_failed(app)   # a pending env failed since the last answer: said, and in its own field
     if words:
         st.notice = f"{words} {st.notice}".strip() if st.notice else words
     if not_looked:
@@ -501,7 +502,7 @@ async def _ensure_up_once(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -927,7 +928,7 @@ async def ensure_endpoint_up(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -2549,6 +2550,8 @@ async def _run_shell(
         out.phase, out.notice = envs.refused(app, ref, use.act, out.stderr_snippet or "")
     if agent_call and (note := envs.take_note(app)):   # a pending env built (or not) since the last answer: said once
         out.notice = f"{out.notice} {note}" if out.notice else note
+    if agent_call:
+        out.env_failed = envs.take_failed(app)   # …and a failed one in its own field too (review G1)
     if shared:
         out.notice = f"{out.notice} {shared}" if out.notice else shared
     return out
@@ -2818,7 +2821,7 @@ async def _cancel(app: AppCtx, id: str, mode: str = "drain") -> CancelResult:  #
 
 async def _submit_job(
     app: AppCtx, command: str | None = None, session_id: str = "default", account: str | None = None,
-    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: dict | None = None,
     confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: Any = None,
@@ -2883,7 +2886,9 @@ async def run_batch(
     Spend: the same floor as ensure_endpoint_up — an unconfirmed block answers phase="needs_confirmation" with `block`
     (nothing recorded); confirm_spend=True confirms ONE block, as there. When the block ends (its walltime, a reap, a
     stop, a server restart) the batch pauses at needs_confirmation with a `reason`; resume it only after the user's yes
-    with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again.
+    with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again; it
+    also decides whether rows killed at the default memory (the block's share, not a size the user chose) run again
+    once the user resizes the batch — without it they stay failed.
     `env` (as ensure_endpoint_up's; omitted: the session's env) is the batch's own: every row runs in it, the session's
     stays the session's, and no new block is asked for; a row whose env is gone from its node runs nothing and waits
     for its rebuild. A batch's env is fixed at its start: env= with batch_id= is refused.
@@ -2900,7 +2905,7 @@ async def run_batch(
 @mcp.tool()
 async def submit_job(
     ctx: Context, command: str | None = None, session_id: str = "default", account: str | None = None,
-    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: EnvelopeRequest | None = None,
     confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: EnvRequest | None = None,

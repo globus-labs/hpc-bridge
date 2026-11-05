@@ -64,6 +64,16 @@ def _add(led, bid: str = "batch-000000000001", *, n: int = 6, capacity: int = 2,
 _GROUPS: dict[str, list[str]] = {}
 
 
+def _block_measure():
+    """What the block's check measured from inside it (batch row sizing): every row of a batch waits for this measure
+    (the Anvil live test's G3). Enough CPUs and memory that the window is the workers' (it names none: the config's
+    max_workers_per_node, or a count a check or a result reported), as PR 1's was."""
+    from hpc_bridge import sizing
+
+    return sizing.BlockMeasure(cpus=16, cpu_ids=tuple(range(16)), cpus_source="SLURM_CPUS_ON_NODE",
+                               mem_limit_mb=64_000, mem_source="SLURM_MEM_PER_NODE", idle_mb=500)
+
+
 class _BatchRunner(_FakeRunner):
     """A runner whose submits stay in flight until the test resolves them; each future gets a Globus-like task id
     once 'sent' (as the SDK's ComputeFuture does), and the runner's executor has a service-minted task group."""
@@ -126,7 +136,7 @@ async def _batch_app(*, remaining_s: float = 900.0, workers: int = 3, mep: bool 
     app.state.endpoint_id = "fake-eid"
     app.batch_autoloop = False
     canary = CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.4.0", worker_job="101",
-                          worker_remaining_s=remaining_s)
+                          worker_remaining_s=remaining_s, block_measure=_block_measure())
     runner = runner or _BatchRunner(canary=canary)
     app.runner_factory = lambda eid, user_endpoint_config=None, **_kw: runner
     rt = _shape_runtime(app, "compute")
@@ -1372,7 +1382,7 @@ class _BashRunner(_BatchRunner):
 
 def _canary():
     return CanaryResult(ok=True, worker_host="c1", worker_python="3.12.3", worker_dill="0.4.0", worker_job="101",
-                        worker_remaining_s=900.0)
+                        worker_remaining_s=900.0, block_measure=_block_measure())
 
 
 def _bash(script, tmp, timeout=60):

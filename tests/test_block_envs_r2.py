@@ -134,9 +134,9 @@ async def _batch_on_a_ready_env(tmp_path):
     """A batch of two rows on the session's built env, built and ready. Returns (app, runner, batch id,
     finish_builds)."""
     from hpc_bridge import envs
-    from tests.test_batch_sizing import _app_with
+    from tests.test_batch_sizing import _app_with, _measure
 
-    app, _rt, runner = _app_with(None)
+    app, _rt, runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
 
     def finish_builds(**extra):
@@ -221,9 +221,9 @@ async def test_ss3_the_rows_sent_once_the_env_is_built_carry_the_arch_it_was_bui
     """`_admit_locked` wrote the record as it stands once the env was built (its path, its arch), then sent the rows
     from the dict it had read before: the activation never knew the arch (review N7's `gone` vs `arch`)."""
     from hpc_bridge import batch, envs
-    from tests.test_batch_sizing import _app_with
+    from tests.test_batch_sizing import _app_with, _measure
 
-    app, _rt, runner = _app_with(None)
+    app, _rt, runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
     out = await server._run_batch(app, command="echo {x}", rows=[{"x": 0}], task_walltime_s=60,
                                   env={"requirements": REQS})

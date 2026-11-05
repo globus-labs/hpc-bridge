@@ -501,7 +501,9 @@ _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "tru
                 "unknown_since", "unheld",
                 # batch row sizing: the attempt's own use, and when a row a busy slot sent back may go again
                 "peak_rss_kb", "cpu_s", "wall_s", "nproc", "cpus", "gpu_ids", "why", "threads", "oom_kills",
-                "not_before", "pinned")
+                "not_before", "pinned",
+                # the Anvil live test: its runnable-thread looks (F1), and whether it ran srun steps (F3)
+                "r_samples", "r_over", "srun")
 # Columns a ledger written by an earlier build may lack: added on open (a new ledger too: its tables are created as
 # the first build wrote them, then these are added).
 _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
@@ -525,7 +527,10 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                            ("oom_kills", "integer"), ("not_before", "real"),
                            # whether the attempt's memory was the DEFAULT share (a kill at it asks), and whether it
                            # really ran pinned (the wrapper's own word)
-                           ("req_mem_default", "integer"), ("pinned", "integer")],
+                           ("req_mem_default", "integer"), ("pinned", "integer"),
+                           # how many of the watcher's looks read its runnable threads, how many saw more than its
+                           # cores (sizing.oversubscribed), and whether a look saw an srun of its own
+                           ("r_samples", "integer"), ("r_over", "integer"), ("srun", "integer")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text"),
                           ("env", "text")]}   # block environments: the env its job.sh activates (as a batch's)
@@ -1027,7 +1032,8 @@ class Ledger:
                 att = int(r["attempt"] or 0) + 1
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
                           "started_at = null, sent_uec = ?, req_cores = ?, req_memory_mb = ?, req_gpus = ?, "
-                          "req_mem_default = ?, not_before = null, pinned = null where batch_id = ? and idx = ?",
+                          "req_mem_default = ?, not_before = null, pinned = null, r_samples = null, r_over = null, "
+                          "srun = null where batch_id = ? and idx = ?",
                           (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, batch_id,
                            r["idx"]))
                 got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))

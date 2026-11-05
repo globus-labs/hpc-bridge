@@ -51,6 +51,7 @@ import time
 from dataclasses import dataclass
 from typing import TYPE_CHECKING, Any, Literal
 
+from . import session_shell
 from .models import EnvInfo
 
 if TYPE_CHECKING:
@@ -384,6 +385,9 @@ class Activation:
 _REFUSE = (
     "__hb_erefuse() {\n"
     "  set +eu\n"
+    # a module line that found no `module` (127) where no module system is initialised: said as such (`NOMODULE`)
+    '  case "$__hb_ew${__hb_em:-}:$__hb_ex" in (activate1:rc=127*)\n'
+    '    type module >/dev/null 2>&1 || type ml >/dev/null 2>&1 || __hb_ex="$__hb_ex @@NOMODULE@@";; esac\n'
     '  __hb_el="@@REFUSED@@ @@NONCE@@ $__hb_ew $__hb_ek $__hb_ex"\n'
     "  printf '%s\\n' \"$__hb_el\" >&2\n"
     '  [ -z "${__hb_env_mark:-}" ] || printf \'%s\\n\' "$__hb_el" >| "$__hb_env_mark" 2>/dev/null\n'
@@ -416,8 +420,47 @@ _TAIL = (
     '[ "$PWD" = "$__hb_ewd" ] || cd -- "$__hb_ewd" 2>/dev/null || :\n'
     "unset -f __hb_erefuse\n"
     "unset __hb_el __hb_ew __hb_ek __hb_ex __hb_erc __hb_etrap __hb_enow __hb_ea __hb_eb __hb_ed __hb_er __hb_eu "
-    "__hb_ey __hb_et __hb_env_mark __hb_eifs __hb_eifz __hb_epf __hb_ewd __hb_eo\n"
+    "__hb_ey __hb_et __hb_env_mark __hb_eifs __hb_eifz __hb_epf __hb_ewd __hb_eo __hb_em __hb_mi\n"
 )
+# A facility worker's shell is not a login shell: on Anvil's multi-user endpoint `module` was not defined there
+# (`module: command not found`, rc 127) where `. /etc/profile.d/modules.sh; module load …` worked (the Anvil live test,
+# F5). So
+# an activate line that uses `module` or `ml`, in a shell where neither is a function or a command, first sources the
+# first of the usual module inits that exists — its output on stderr with the rest of the activation. The system paths
+# are read under $HPCB_SYSROOT when set (MEASURE_SH's read-only seam for the tests). A line that still finds no module
+# command is refused with `nomodule` in its detail (`module_words` says what to add).
+MODULE_INITS = ("$LMOD_PKG/init/bash", "/etc/profile.d/lmod.sh", "/etc/profile.d/modules.sh",
+                "/usr/share/lmod/lmod/init/bash", "/usr/share/Modules/init/bash")
+NOMODULE = "nomodule"
+_MODULE_INIT = (
+    "__hb_em=1; __hb_mi=\n"
+    "if ! type module >/dev/null 2>&1 && ! type ml >/dev/null 2>&1; then\n"
+    '  for __hb_mi in ${LMOD_PKG:+"$LMOD_PKG/init/bash"} "${HPCB_SYSROOT:-}/etc/profile.d/lmod.sh" '
+    '"${HPCB_SYSROOT:-}/etc/profile.d/modules.sh" "${HPCB_SYSROOT:-}/usr/share/lmod/lmod/init/bash" '
+    '"${HPCB_SYSROOT:-}/usr/share/Modules/init/bash"; do\n'
+    '    if [ -r "$__hb_mi" ]; then . "$__hb_mi"; break; fi\n'
+    "    __hb_mi=\n"
+    "  done\n"
+    "fi\n"
+)
+# `module` or `ml` as a command word of the line (after a separator, a pipe, a group or `!`)
+_USES_MODULE = re.compile(r"(?:^|[\s;&|(){}!`])(?:module|ml)(?=\s|$|[;&|)}`])")
+
+
+def uses_module(line: str | None) -> bool:
+    """Whether an activate line runs `module` (or Lmod's `ml`) — then a shell without one gets its init first."""
+    return bool(_USES_MODULE.search(line or ""))
+
+
+def module_words(detail: str | None, line: str | None = None) -> str:
+    """What a refusal says when the node's worker shell has no module system initialised (`nomodule` in its detail)."""
+    if NOMODULE not in (detail or "").split():
+        return ""
+    fix = f". /etc/profile.d/modules.sh; {line}" if line else ". /etc/profile.d/modules.sh; <the module line>"
+    return ("its line uses `module`, and this node's worker shell has no module system initialised: `module` is not "
+            "defined there (a facility's worker runs a non-login shell), and none of the usual inits was found ("
+            + ", ".join(MODULE_INITS) + "). Add the site's own module init before the line — e.g. "
+            f'env={{"activate": "{fix}"}} — or ask the facility which file initialises its modules')
 # The root and the env must be this user's alone (review U1: keys are predictable, so another user could plant an env
 # where ours would be found): owned by the user, writable by neither its group nor anyone — the slot lock dir's rule.
 _UNSAFE = ('find -H @@PATHS@@ -maxdepth 0 \\( ! -user "${EUID:-$(id -u)}" -o -perm -0002 -o -perm -0020 \\) -print '
@@ -496,10 +539,12 @@ def activation_sh(act: Activation, nonce: str) -> str:
         raise ValueError(f"invalid env nonce {nonce!r}")
     if not _HEX16.fullmatch(act.key):
         raise ValueError(f"invalid env key {act.key!r}")
-    refuse = _REFUSE.replace("@@REFUSED@@", REFUSED).replace("@@NONCE@@", nonce).replace("@@RC@@", str(ENV_RC))
+    refuse = (_REFUSE.replace("@@REFUSED@@", REFUSED).replace("@@NONCE@@", nonce).replace("@@RC@@", str(ENV_RC))
+              .replace("@@NOMODULE@@", NOMODULE))
     if act.how == "activate":
         b64 = shlex.quote(base64.b64encode(str(act.line or "").encode()).decode())
-        body = _ACTIVATE_LINE.replace("@@KEY@@", act.key).replace("@@B64@@", b64)
+        body = ((_MODULE_INIT if uses_module(act.line) else "")
+                + _ACTIVATE_LINE.replace("@@KEY@@", act.key).replace("@@B64@@", b64))
     else:
         arch = act.arch if act.arch and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", act.arch) else ""
         body = (_ACTIVATE_BUILT.replace("@@UNSAFE@@", _UNSAFE.replace("@@PATHS@@", '"$__hb_er" "$__hb_ed"'))
@@ -782,7 +827,8 @@ def activate_check_script(line: str) -> str:
     R2-N7). rc 0: it activated; else the activation refused (its refusal line itself is not in what it said)."""
     act = activation_sh(Activation("activate", env_key(EnvSpec(kind="activate", activate=line)), line=line),
                         _CHECK_NONCE)
-    return ("__hb_o=$( (\n" + act + ") 2>&1 ); __hb_rc=$?\n"
+    # (the endpoint venv scrubbed first, as every command's wrapper does: session_shell.ENDPOINT_VENV_SCRUB)
+    return ("__hb_o=$( (\n" + session_shell.ENDPOINT_VENV_SCRUB + act + ") 2>&1 ); __hb_rc=$?\n"
             f"__hb_o=$(printf '%s\\n' \"$__hb_o\" | grep -v '^{REFUSED} ')\n"
             "printf 'HPCB_ENV_ACTIVATE rc=%s out_b64=%s\\n' \"$__hb_rc\" "
             "\"$(printf '%s' \"$__hb_o\" | tail -c 2000 | base64 | tr -d '\\n')\"\n")
@@ -794,8 +840,9 @@ def canary_check(rec: dict[str, Any]) -> str:
     user owns alone (review SS7), or an existing env's line under the same errexit and EXIT-trap rules (review R2-N7);
     else `HPCB_ENV_OK 0`."""
     act = activation_sh(activation_of(rec), _CHECK_NONCE)
-    # (the subshell stands alone, never on the left of `&&`: bash 4+ would ignore the line's errexit there)
-    return ('( \n' + act + ') >/dev/null 2>&1\n'
+    # (the subshell stands alone, never on the left of `&&`: bash 4+ would ignore the line's errexit there; the endpoint
+    # venv scrubbed first, as every command's wrapper does)
+    return ('( \n' + session_shell.ENDPOINT_VENV_SCRUB + act + ') >/dev/null 2>&1\n'
             'if [ "$?" -eq 0 ]; then echo "HPCB_ENV_OK 1"; else echo "HPCB_ENV_OK 0"; fi')
 
 
@@ -1127,9 +1174,11 @@ def _promote(app: AppCtx) -> None:
     label = spec.name or k.key
     if k.info.state == "ready":
         app.env_spec = spec
+        app.env_failed = None
         app.env_note = (f"The env {label} is built and is now the session's env: commands, batch rows and jobs run in "
                         "it from here on.")
     else:
+        app.env_failed = info_for(k, spec.name)   # the answer that says it carries it too (review G1): `env_failed`
         app.env_note = (f"The env {label} was not built, so the session's env was not changed: "
                         f"{failed_words(k.info, k.fault)}")
 
@@ -1384,6 +1433,13 @@ def take_note(app: AppCtx) -> str:
     return note or ""
 
 
+def take_failed(app: AppCtx) -> EnvInfo | None:
+    """A pending env whose build failed since the last answer, as a structured field (`env_failed`; review G1) — given
+    once, with the note that says it (`take_note`, called first)."""
+    failed, app.env_failed = app.env_failed, None
+    return failed
+
+
 @dataclass
 class ForCommand:
     """What a user command gets: the activation (None: no env), or why it cannot run now."""
@@ -1467,9 +1523,11 @@ def refused(app: AppCtx, ref: Refused, act: Activation, stderr: str) -> tuple[Li
                           "own alone with ensure_endpoint_up(env={…, \"root\": …})." + since)
     words = "\n".join(ln for ln in (stderr or "").splitlines() if REFUSED not in ln)
     quoted = said(words, 600)
+    detail = " ".join(w for w in ref.detail.split() if w != NOMODULE)
+    nomodule = module_words(ref.detail, act.line)
     return "failed", (f"Nothing ran: the env could not be activated on this node — its line exited "
-                      f"{ref.detail.removeprefix('rc=')}" + (f", saying (quoted as data): {quoted!r}" if quoted else "")
-                      + "." + since)
+                      f"{detail.removeprefix('rc=')}" + (f", saying (quoted as data): {quoted!r}" if quoted else "")
+                      + (f" — {nomodule}" if nomodule else "") + "." + since)
 
 
 # ---- a batch's or a job's env, on the ledger ------------------------------------------------------------------------

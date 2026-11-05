@@ -434,6 +434,10 @@ class ShellOutcome(BaseModel):
     # envelope it would count against; the confirmed call's answer lists the jobs it adopted (`jobs`, source "adopt").
     envelope: EnvelopeInfo | None = None
     jobs: list[JobInfo] = Field(default_factory=list)
+    # block environments: a built env asked for earlier, which was PENDING (the session's own served meanwhile) and
+    # whose build has failed since — on the answer that first reports it (once): its key, name and `error`. The
+    # session's env is unchanged.
+    env_failed: EnvInfo | None = None
     # Internal, never serialized: a `failed` outcome the worker itself answered (a result over Compute's size limit:
     # it ran the command) — a liveness proof, so warmth must not void the block's confirmation for it.
     _worker_answered: bool = PrivateAttr(default=False)
@@ -579,6 +583,10 @@ class EndpointStatus(BaseModel):
     # block environments: the session's env (the one its commands run in), or — on the call that asked for one whose
     # build failed — that one, saying why (the session's own is then unchanged). None: no env.
     env: EnvInfo | None = None
+    # block environments: a built env asked for by an EARLIER call, which was pending (the session's own served
+    # meanwhile) and whose build has failed since — on the answer that first reports it (once): its key, name and
+    # `error`. `env` stays the session's (unchanged).
+    env_failed: EnvInfo | None = None
     # (not on the wire) the block part refused this call's arguments and set nothing — so the env asked with them is
     # not applied either (block environments, review R2-S1: never read from the notice's words)
     _nothing_set: bool = PrivateAttr(default=False)
@@ -642,6 +650,9 @@ class BatchTaskResult(BaseModel):
     # it could use every CPU of the block); None: not known (an unsized row, a result from before row sizing)
     pinned: bool | None = None
     over_size: list[str] = Field(default_factory=list)
+    # the row ran srun steps of its own (seen while they ran): a step runs on CPUs Slurm picks within the block, not
+    # the row's slot, and outside its memory watch; None: not known (a result from before this was reported)
+    srun_steps: bool | None = None
 
 
 class LedgerEntry(BaseModel):

@@ -19,7 +19,8 @@ import sizing_checks as sc  # noqa: E402
 from invariants import Result, ToolCall, Trace  # noqa: E402
 
 SIZING_SCENARIOS = ["batch_rows_overlap", "batch_cores_fit", "batch_shared_pool", "batch_memory_kill",
-                    "batch_needs_sizing_then_sized", "batch_size_first_terms", "batch_gpu_rows", "batch_pilot_proposal"]
+                    "batch_needs_sizing_then_sized", "batch_size_first_terms", "batch_gpu_rows", "batch_pilot_proposal",
+                    "batch_row_srun"]
 BID = "batch-0123456789ab"
 _BUILTIN = {"agent_engaged", "ends_with_stop", "stop_is_honest"}
 
@@ -222,3 +223,19 @@ def test_block_allocation_reads_this_runs_pilot_from_sacct():
            "78|other|shared|4|4G|1|COMPLETED|sbatch y\nHPCB_RC=0\n")
     a = sc.block_allocation(out, [eid])
     assert a is not None and (a["job"], a["cpus"], a["mem_mb"], a["nodes"]) == ("77", "3", 1024.0, "1")
+
+
+def test_srun_graders_want_each_step_run_and_said():
+    """batch_row_srun (the Anvil live test, F3): each row's step ran (its line, srun's rc 0), each result says it ran
+    srun steps, and an answer says where such a step runs."""
+    note = ("Row(s) 0, 1 ran srun steps: a step runs on CPUs Slurm picks within the block, not the row's slot (it may "
+            "share another row's), and outside the row's memory watch.")
+    ran = [{"index": i, "state": "done", "exit_code": 0, "srun_steps": True,
+            "tail": f"HPCB_ROW {i} k=1\nHPCB_STEP_OK c1\nHPCB_SRUN_RC=0\nHPCB_ROW_END {i} end=2\n"} for i in range(2)]
+    good = Trace([_status_rows(*ran, notice=note)])
+    assert sc.srun_ran(good, rows=2).ok and sc.srun_steps_said(good, rows=2).ok
+    died = [{**r, "tail": f"HPCB_ROW {r['index']} k=1\nHPCB_SRUN_RC=1\n", "srun_steps": False,
+             "stderr_tail": "srun: fatal: cpus-per-task set by two different environment variables"} for r in ran]
+    base = Trace([_status_rows(*died)])                                    # the base: the step died, nothing said
+    assert not sc.srun_ran(base, rows=2).ok and not sc.srun_steps_said(base, rows=2).ok
+    assert not sc.srun_steps_said(Trace([_status_rows(*ran)]), rows=2).ok   # flagged, but where it runs never said

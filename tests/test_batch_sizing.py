@@ -803,12 +803,15 @@ async def test_results_carry_their_use_and_status_flags_rows_over_their_size():
     assert "over their size" in st.notice and "cores=" in st.notice
 
 
-async def test_a_pinned_row_with_more_threads_than_cores_is_flagged():
+async def test_a_pinned_row_with_more_runnable_threads_than_cores_is_flagged():
+    """(The Anvil live test, F1, changed this test's rule: a pinned row is over its cores on runnable threads above its
+    cores in most of the watcher's looks — 16 threads alone, idle ones included, are no evidence.)"""
     from hpc_bridge import batch
 
     app, _rt, runner = _app_with(_measure(cpus=4, workers=5))
     out = await _run(app, n=1, cores=2)
-    runner.futures[0].finish(_report(0, cpu_s=3.9, wall_s=2.0, peak_rss_kb=1024, nproc=2, cpus="0,1", threads=16))
+    runner.futures[0].finish(_report(0, cpu_s=3.9, wall_s=2.0, peak_rss_kb=1024, nproc=2, cpus="0,1", threads=16,
+                                     r_samples=10, r_over=9))
     await batch.tick(app, out.batch_id)
     st = await batch.status(app, out.batch_id, detail="page")
     assert st.results[0].over_size == ["cores"]

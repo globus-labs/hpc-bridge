@@ -53,6 +53,29 @@ REMAINING_SH = (
     '__hb_rem=$((__hb_end - __hb_now));; esac; '
     'fi'
 )
+# hpc-bridge's own endpoint venv — the venv the endpoint's worker runs from, which its env_setup and worker_init
+# activate (endpoint_venv's line: VIRTUAL_ENV, and its `bin` first on PATH; a registry entry's worker venv
+# `…/gce-venv-<gce>-py<X.Y>` the same way) — is never a user command's (the Anvil live test, F4: `uv pip install`
+# targets $VIRTUAL_ENV, and a bare `pip install` the first pip on PATH, so either wrote into the worker's own venv).
+# Known by its arch marker (endpoint_venv.ARCH_MARKER, written by every build) or by hpc-bridge's `gce-venv` names;
+# any other venv — the user's own, a BYO endpoint's — is left as it is. VIRTUAL_ENV goes and the venv's `bin` leaves
+# PATH. Run first (the wrappers' own tools come from the node, never from the venv: nothing of hpc-bridge's in a
+# command needs it), and again after the session's `.env` (a PATH an earlier command persisted with that bin in it),
+# then `ENDPOINT_VENV_DONE`. The canary is never wrapped: it reports the worker's own python and dill.
+ENDPOINT_VENV_SCRUB = (
+    'if [ -n "${VIRTUAL_ENV:-}" ] && { [ -f "$VIRTUAL_ENV/.hpcb-arch" ] || case "${VIRTUAL_ENV%/}" in '
+    "(*/gce-venv|*/gce-venv-*) true;; (*) false;; esac; }; then\n"
+    '  __hb_vb="${VIRTUAL_ENV%/}/bin"; unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT\n'
+    "fi\n"
+    'if [ -n "${__hb_vb:-}" ]; then\n'
+    '  __hb_vp=":$PATH:"\n'
+    '  while :; do case "$__hb_vp" in (*":$__hb_vb:"*) '
+    '__hb_vp="${__hb_vp%%":$__hb_vb:"*}:${__hb_vp#*":$__hb_vb:"}";; (*) break;; esac; done\n'
+    '  __hb_vp=${__hb_vp#:}; PATH=${__hb_vp%:}; unset __hb_vp\n'
+    "fi\n"
+)
+ENDPOINT_VENV_DONE = "unset __hb_vb\n"
+
 # A command sent for one block must not run on another. The block the user confirmed spend for can be replaced
 # (released, cancelled, preempted) between two commands, and a command sent while its last proof of life is fresh
 # (CANARY_TTL_S) is not checked first, so it would run on the replacement unasked (live 2026-10-13: job 112 scancel'd,
@@ -176,7 +199,7 @@ class Session:
         return shlex.quote(self.state_dir)
 
 
-_WRAP_TEMPLATE = r"""umask 077
+_WRAP_TEMPLATE = r"""@@SCRUB@@umask 077
 mkdir -p @@SD@@
 __hb_cwd=$(cat @@SD@@/.cwd 2>/dev/null)
 if [ -n "$__hb_cwd" ]; then cd "$__hb_cwd" 2>/dev/null || cd @@SD@@; else cd @@SD@@; fi
@@ -195,7 +218,7 @@ __hb_snap() {
 }
 __hb_snap __hb_B_ __hb_BN
 [ -f @@SD@@/.env ] && . @@SD@@/.env 2>/dev/null
-@@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
+@@SCRUB@@@@SCRUBDONE@@@@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
 @@RESULT@@pwd >| @@SD@@/.cwd
 # The persist loops run in a known shell state whatever the command left (review NS8: its `set -x` would trace every
@@ -307,7 +330,8 @@ def wrap(command: str, session: Session, *, guard: Guard | None = None, result_k
         env = _ENV_PRE + env_sh.rstrip("\n") + "\n" + _ENV_POST
         keep, gone = _ENV_KEEP, _ENV_GONE
     return _guard(guard) + head.replace("@@SD@@", sd) + (
-        _WRAP_TEMPLATE.replace("@@TEE@@", tee).replace("@@RESULT@@", "")
+        _WRAP_TEMPLATE.replace("@@SCRUB@@", ENDPOINT_VENV_SCRUB).replace("@@SCRUBDONE@@", ENDPOINT_VENV_DONE)
+        .replace("@@TEE@@", tee).replace("@@RESULT@@", "")
         .replace("@@ENV@@", env).replace("@@ENVKEEP@@", keep).replace("@@ENVGONE@@", gone)
         .replace("@@SD@@", sd)
         .replace("@@B64@@", b64)
