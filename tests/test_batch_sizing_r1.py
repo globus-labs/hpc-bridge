@@ -333,7 +333,8 @@ def test_w11_a_row_that_execs_its_program_still_reports_its_cpu_seconds(tmp_path
     _fake_tool(tmp_path, "taskset", "true")
     busy = "exec sh -c 'end=$(( $(date +%s) + 2 )); while [ $(date +%s) -lt $end ]; do :; done'"
     rep = _result(_spawn(_script(busy, tmp_path / "rd", 0, _slot(pin=False)), _wrapper_env(tmp_path)))
-    assert rep.rc == 0 and rep.cpu_s is not None and rep.cpu_s >= 0.8, rep
+    # the loop runs 1-2 s of whole seconds; 0.25 still tells it from the near-zero an exec lost (0.747 seen loaded)
+    assert rep.rc == 0 and rep.cpu_s is not None and rep.cpu_s >= 0.25, rep
     m = _measure(cpus=4, workers=5)
     assert sizing.pilot_proposal([{"cpu_s": None, "wall_s": 2.0, "peak_rss_kb": 1024}], m).cores is None
 
