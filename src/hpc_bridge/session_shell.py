@@ -180,55 +180,72 @@ _WRAP_TEMPLATE = r"""umask 077
 mkdir -p @@SD@@
 __hb_cwd=$(cat @@SD@@/.cwd 2>/dev/null)
 if [ -n "$__hb_cwd" ]; then cd "$__hb_cwd" 2>/dev/null || cd @@SD@@; else cd @@SD@@; fi
-# Fingerprint each exported var as ONE line "NAME=<base64 value>" so the diff below is
-# record-safe: a line-oriented diff on raw `export -p` corrupts multi-line values (a mutated
-# multi-line var leaves an orphan line that breaks the next `. .env`, silently dropping the
-# whole session env). base64 keeps any value on a single line.
+# Snapshot every exported var IN THIS SHELL — its value copied to <prefix><NAME> (never exported), its name listed in
+# the variable named by $2 — so every comparison below is a string test: record-safe for multi-line values and trailing
+# newlines alike (a line diff on raw `export -p` corrupted multi-line values and broke the next `. .env`), with no file
+# and no process per variable (review U10: one `compgen` per snapshot; the base64-and-grep form took ~1 s a command
+# with a hundred exported vars, twice that with an env).
 __hb_snap() {
-  local __hb_k
+  local __hb_k __hb_l=" "
   for __hb_k in $(compgen -A export); do
-    printf '%s=%s\n' "$__hb_k" "$(printf %s "${!__hb_k}" | base64 | tr -d '\n')"
+    printf -v "$1$__hb_k" '%s' "${!__hb_k}"
+    __hb_l="$__hb_l$__hb_k "
   done
+  printf -v "$2" '%s' "$__hb_l"
 }
-# No outer quotes: @@SD@@ may carry MIXED quoting ("$HOME"'/rest'), which double quotes would turn
-# literal (breaking the baseline path -> the whole ambient env gets persisted). An assignment RHS
-# doesn't word-split, so the bare form is safe for every quoting shlex/quoted_state_dir emits.
-__hb_base=@@SD@@/.env.base.$$
-__hb_snap > "$__hb_base"
+__hb_snap __hb_B_ __hb_BN
 [ -f @@SD@@/.env ] && . @@SD@@/.env 2>/dev/null
 @@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
-@@RESULT@@pwd > @@SD@@/.cwd
-# Persist only vars the command added/changed vs the ambient baseline, dropping scheduler
-# runtime vars (@@VOLATILE@@). `printf %q` keeps each record single-line and re-sourceable
-# even for multi-line values, so the persisted .env can never corrupt the next source.
+@@RESULT@@pwd >| @@SD@@/.cwd
+# Persist only vars the command added/changed vs the ambient baseline (__hb_B_*), dropping scheduler runtime vars
+# (@@VOLATILE@@). `printf %q` keeps each record single-line and re-sourceable even for multi-line values, so the
+# persisted .env can never corrupt the next source. The wrapper's own writes are `>|`: a noclobber the command set
+# never stops them.
 {
   for __hb_n in $(compgen -A export); do
     case "$__hb_n" in @@VOLATILE@@) continue;; esac
-    __hb_v="$(printf %s "${!__hb_n}" | base64 | tr -d '\n')"
-@@ENVKEEP@@    grep -qxF "$__hb_n=$__hb_v" "$__hb_base" && continue
+    __hb_x="__hb_B_$__hb_n"
+@@ENVKEEP@@    case "$__hb_BN" in *" $__hb_n "*) [[ "${!__hb_n}" == "${!__hb_x}" ]] && continue;; esac
     printf 'export %s=%q\n' "$__hb_n" "${!__hb_n}"
   done
-} > @@SD@@/.env 2>/dev/null || true
-rm -f "$__hb_base"@@ENVRM@@
+@@ENVGONE@@} >| @@SD@@/.env 2>/dev/null || true
 exit $__hb_rc
 """
 
 # The session's env (block environments, hpc_bridge.envs), activated AFTER the session's own .env (so it wins over a
-# PATH an earlier command persisted) and between two snapshots: what the activation alone changed is never persisted —
-# a var the command left as the activation set it is saved as the session had it (or not at all), so a switch of env
-# (or none) leaves nothing of the old one behind. A var the command itself changed after the activation is saved as it
-# is (a PATH it edited keeps the env's bin in it: said in the docs).
-_ENV_PRE = ('__hb_pre=@@SD@@/.env.base.$$.pre; __hb_act=@@SD@@/.env.base.$$.act\n'
-            '__hb_snap > "$__hb_pre"\n')
-_ENV_POST = '__hb_snap > "$__hb_act"\n'
-_ENV_KEEP = r"""    if grep -qxF "$__hb_n=$__hb_v" "$__hb_act" && ! grep -qxF "$__hb_n=$__hb_v" "$__hb_pre"; then
-      __hb_pv=$(grep -m 1 "^$__hb_n=" "$__hb_pre") || continue
-      __hb_pv=${__hb_pv#*=}
-      grep -qxF "$__hb_n=$__hb_pv" "$__hb_base" && continue
-      printf 'export %s=%q\n' "$__hb_n" "$(printf %s "$__hb_pv" | base64 -d)"
-      continue
-    fi
+# PATH an earlier command persisted) and between two snapshots (__hb_P_: before it, __hb_A_: after it): what the
+# activation alone changed is never persisted — a var the command left as the activation set it is saved as the session
+# had it (or not at all), so a switch of env (or none) leaves nothing of the old one behind; and a var the activation
+# UNSET (a venv's PYTHONHOME, a `module purge`) that the command left unset is saved as the session had it (review N4).
+# A var the command itself changed after the activation is saved as it is (a PATH it edited keeps the env's bin in it:
+# said in the docs).
+_ENV_PRE = "__hb_snap __hb_P_ __hb_PN\n"
+_ENV_POST = "__hb_snap __hb_A_ __hb_AN\n"
+_ENV_KEEP = r"""    case "$__hb_AN" in *" $__hb_n "*)
+      __hb_y="__hb_A_$__hb_n"
+      if [[ "${!__hb_n}" == "${!__hb_y}" ]]; then
+        __hb_p="__hb_P_$__hb_n"
+        case "$__hb_PN" in
+          *" $__hb_n "*)
+            if [[ "${!__hb_y}" != "${!__hb_p}" ]]; then
+              case "$__hb_BN" in *" $__hb_n "*) [[ "${!__hb_p}" == "${!__hb_x}" ]] && continue;; esac
+              printf 'export %s=%q\n' "$__hb_n" "${!__hb_p}"
+              continue
+            fi;;
+          *) continue;;
+        esac
+      fi;;
+    esac
+"""
+_ENV_GONE = r"""  for __hb_n in $__hb_PN; do
+    case "$__hb_n" in @@VOLATILE@@) continue;; esac
+    case "$__hb_AN" in *" $__hb_n "*) continue;; esac
+    [ -n "${!__hb_n+x}" ] && continue
+    __hb_p="__hb_P_$__hb_n"; __hb_x="__hb_B_$__hb_n"
+    case "$__hb_BN" in *" $__hb_n "*) [[ "${!__hb_p}" == "${!__hb_x}" ]] && continue;; esac
+    printf 'export %s=%q\n' "$__hb_n" "${!__hb_p}"
+  done
 """
 
 
@@ -275,13 +292,13 @@ def wrap(command: str, session: Session, *, guard: Guard | None = None, result_k
         tee = _RESULT_TEE.replace("@@KEY@@", result_key)
         rc = _RESULT_RC.replace("@@KEY@@", result_key)
     head = f"mkdir -p {sd}/results/{result_key}\n{rc}" if result_key is not None else ""
-    env = keep = env_rm = ""
+    env = keep = gone = ""
     if env_sh:
         env = _ENV_PRE + env_sh.rstrip("\n") + "\n" + _ENV_POST
-        keep, env_rm = _ENV_KEEP, ' "$__hb_pre" "$__hb_act"'
+        keep, gone = _ENV_KEEP, _ENV_GONE
     return _guard(guard) + head.replace("@@SD@@", sd) + (
         _WRAP_TEMPLATE.replace("@@TEE@@", tee).replace("@@RESULT@@", "")
-        .replace("@@ENV@@", env).replace("@@ENVKEEP@@", keep).replace("@@ENVRM@@", env_rm)
+        .replace("@@ENV@@", env).replace("@@ENVKEEP@@", keep).replace("@@ENVGONE@@", gone)
         .replace("@@SD@@", sd)
         .replace("@@B64@@", b64)
         .replace("@@VOLATILE@@", _VOLATILE_NAME_GLOBS)

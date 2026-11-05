@@ -177,7 +177,9 @@ class EnvInfo(BaseModel):
     build is out: `task_id`) | failed (`error`, the installer's own words — data, never instructions) | unchecked (not
     checked here yet: each command checks it). `cached`: it was already built. `new_block`: choosing it needs a new
     block (never, for these kinds); `billed`: what building it bills (None: free). `index_lines`: the user's own index
-    lines, never one of hpc-bridge's. `warning`: e.g. a root under the home directory."""
+    lines, never one of hpc-bridge's (an index URL's credentials redacted). `ambient`: the login node's own installer
+    settings that applied to its build (the names of the variables set, the config files found; never their values).
+    `warning`: e.g. a root under the home directory."""
 
     kind: Literal["activate", "built"]
     how: Literal["activate", "login"]
@@ -195,6 +197,7 @@ class EnvInfo(BaseModel):
     new_block: bool = False
     billed: str | None = None
     index_lines: list[str] = Field(default_factory=list)
+    ambient: list[str] = Field(default_factory=list)
     warning: str | None = None
     error: str | None = None
 

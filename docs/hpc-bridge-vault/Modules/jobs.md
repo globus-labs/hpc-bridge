@@ -55,7 +55,8 @@
   - **While it builds:** the answer is `busy` / `env_building` and nothing is submitted.
   - **A failed build** is `_refused`.
   - **The job script** (`job_script`, through `Spec.env_rec`) activates the env after the session's env line. A gone env exits 88 with the refusal on stderr.
-  - **Where it shows:** the ledger's `job.env`, `JobInfo.env` and `JobTerms.env`.
+  - **Where it shows:** the ledger's `job.env`, `JobInfo.env` (`job_info(j, app)`: its state as this server knows it, review S11) and `JobTerms.env`.
+  - **What it says:** the job's own built env says what the session's would (`envs.built_notice`, S14; `submit_job` wraps `_submit_spec`, which holds the rest of the submit).
   - **A gated hand submit** (D2) runs unmodified, without the env.
 
 > [!warning] The envelope binds only what hpc-bridge starts

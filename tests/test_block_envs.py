@@ -245,6 +245,23 @@ def _beside(root: Path) -> list[str]:
     return sorted(x.name for x in root.iterdir() if not x.name.endswith(".lock") and x.name != ".uv-cache")
 
 
+def _writable(path: Path | str) -> None:
+    """A built env made writable again (it is read-only by design: review N3), links never followed — what a scratch
+    purge (root's) or a test that changes the env needs first."""
+    for d, dirs, files in os.walk(path):
+        for name in [*dirs, *files]:
+            p = Path(d) / name
+            if not p.is_symlink():
+                p.chmod(p.stat().st_mode | 0o200)
+    Path(path).chmod(Path(path).stat().st_mode | 0o200)
+
+
+def _purge(path: Path | str) -> None:
+    """A scratch purge of a built env (it is read-only by design)."""
+    _writable(path)
+    shutil.rmtree(path)
+
+
 def _bash(script: str, env: dict[str, str], *, cwd: Path | None = None, timeout: float = 60):
     return subprocess.run([_BASH, "-c", script], capture_output=True, text=True, env=env, cwd=cwd, timeout=timeout)
 
@@ -495,9 +512,11 @@ def test_the_users_own_index_lines_are_kept_and_listed_and_none_is_ever_added():
                                                    "-f https://example.org/wheels"]
     plain = envs.parse({"requirements": "six==1.17.0"})
     script = envs.build_script(plain, key=envs.env_key(plain), root="/scratch/u/envs", python="3.11", token="t0")
+    # (the login node's own settings are READ — their names reported, review U2 — never set: that one line aside)
+    sets = "\n".join(ln for ln in script.splitlines() if "sed -nE" not in ln)
     for flag in ("--index-url", "--extra-index-url", "--find-links", "--default-index", "--index ", "UV_INDEX",
                  "PIP_INDEX", "--allow-insecure-host", "--trusted-host"):
-        assert flag not in script, flag
+        assert flag not in sets, flag
 
 
 # ---- 2. where an env is built, and how it is used ----------------------------------------------------------------------
@@ -591,14 +610,16 @@ def test_the_build_makes_a_relocatable_venv_keeps_its_lock_and_marks_its_arch(tm
 def test_the_requirements_text_reaches_the_installer_as_a_file_never_as_shell(tmp_path):
     from hpc_bridge import envs
 
-    evil = 'six==1.17.0\n$(touch PWNED1)\n`touch PWNED2`\n"; touch PWNED3; "\n'
+    with pytest.raises(envs.EnvRefusal):   # a `$` is refused by name (uv expands ${VAR}: review N9)
+        envs.parse({"requirements": "six==1.17.0\n$(touch PWNED1)\n"})
+    evil = 'six==1.17.0\n`touch PWNED2`\n"; touch PWNED3; "\n'
     spec = envs.parse({"requirements": evil})
     script = envs.build_script(spec, key=envs.env_key(spec), root=str(tmp_path / "envs"), python=PY, token="t1")
-    for frag in ("touch PWNED", "$(touch", "`touch"):
+    for frag in ("touch PWNED", "`touch"):
         assert frag not in script, frag
     p = _bash(script, _box(tmp_path), cwd=tmp_path)
     assert p.returncode == 0, p.stderr
-    for name in ("PWNED1", "PWNED2", "PWNED3"):
+    for name in ("PWNED2", "PWNED3"):
         assert not (tmp_path / name).exists() and not (tmp_path / "home" / name).exists(), name
     d = tmp_path / "envs" / f"{envs.env_key(spec)}-{ARCH}"
     assert (d / "requirements.in").read_text().strip() == spec.requirements    # what the installer read, verbatim
@@ -626,6 +647,7 @@ def test_the_check_tells_ready_partial_gone_failed_and_another_arch(tmp_path):
     assert check().state == "ready"
     f = next(d.glob("lib/python*/site-packages/six/__init__.py"))
     text = f.read_text()
+    _writable(d)                                                   # (read-only by design: a purge is root's)
     f.unlink()                                                     # an atime purge took one file of it
     c = check()
     assert c.state == "partial" and c.missing >= 1
@@ -638,7 +660,7 @@ def test_the_check_tells_ready_partial_gone_failed_and_another_arch(tmp_path):
     _fake_arch(tmp_path / "archbin", "fakearch")
     c = check(f"{tmp_path / 'archbin'}:")
     assert c.state == "arch" and c.arch == "fakearch"
-    shutil.rmtree(d)
+    _purge(d)
     assert check().state == "gone"
     (root / f"{key}-{ARCH}.failed").write_text("error: something\n")
     assert check().state == "failed"
@@ -681,7 +703,7 @@ def test_a_purged_failed_or_foreign_arch_env_runs_nothing_and_says_why(tmp_path)
     r = envs.refusal(p.returncode, p.stderr, NONCE)
     assert p.returncode == envs.ENV_RC and "RAN" not in p.stdout and not (sd / ".cwd").exists()
     assert r is not None and (r.why, r.key) == ("arch", key) and "fakearch" in r.detail and ARCH in r.detail
-    shutil.rmtree(root / f"{key}-{ARCH}")                                 # scratch purged
+    _purge(root / f"{key}-{ARCH}")                                        # scratch purged
     p, _sd = _wrap_run(tmp_path, "echo RAN", act)
     assert "RAN" not in p.stdout and envs.refusal(p.returncode, p.stderr, NONCE).why == "gone"
     (root / f"{key}-{ARCH}.failed").write_text("No solution found\n")
@@ -714,7 +736,7 @@ def test_a_batch_row_runs_in_its_env_and_its_slot_still_sizes_the_libraries(tmp_
                                            index=1, attempt=1, task_walltime_s=60, slot=_slot(cores=1, cpu_ids=(0, 1)),
                                            env_sh=envs.activation_sh(mod, NONCE)), _wrapper_env(tmp_path)))
     assert rep.rc == 0 and rep.tail.strip() == "OMP=1 T=act", rep
-    shutil.rmtree(root / f"{key}-{ARCH}")
+    _purge(root / f"{key}-{ARCH}")
     rep = _result(_spawn(batch.task_script("echo RAN", results_dir=str(tmp_path / "rd"), index=2, attempt=1,
                                            task_walltime_s=60, env_sh=envs.activation_sh(built, NONCE)),
                          _wrapper_env(tmp_path)))
@@ -816,14 +838,16 @@ async def test_ssh_a_build_never_takes_the_login_shapes_worker_and_never_holds_t
                                                            for c in app.shapes["login"].runner.commands)
     assert server._busy_session(app, "login", server._INTERNAL_SESSION) is None
     assert (await batch.login_runner(app)("echo internal")).phase == "complete"   # the scheduler ops still run
+    # the env is pending while it builds (review S4): the session's own (none here) serves, on the login shape's free
+    # worker
     mine = await server._run_shell(app, "echo LOGIN", shape="login", session_id="other", agent_call=True)
-    assert mine.phase == "env_building", mine                             # the session's env is not there yet…
-    await server._ensure_endpoint_up(app, "compute", env={})
-    mine = await server._run_shell(app, "echo LOGIN", shape="login", agent_call=True)
-    assert mine.phase == "complete" and "LOGIN" in mine.stdout, mine      # …but the login shape's worker is free
+    assert mine.phase == "complete" and "LOGIN" in mine.stdout, mine
+    assert app.env_spec is None and app.env_pending is not None
+    await server._ensure_endpoint_up(app, "compute", env={})                     # {} drops the pending one too
+    assert app.env_pending is None
     await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})   # the same build, still out
     out = await server._run_shell(app, "echo RAN", agent_call=True)
-    assert out.phase == "env_building" and "RAN" not in out.stdout, out
+    assert out.phase == "complete" and "RAN" in out.stdout, out
     assert len(app.runners.held) == 1                                     # asked again: never a second build
     app.runners.release()
     st = await server._ensure_endpoint_up(app, "compute")
@@ -857,7 +881,7 @@ async def test_ssh_a_stop_during_a_build_is_never_held_by_it_and_the_env_is_whol
 async def test_ssh_a_purged_env_runs_nothing_and_is_rebuilt_on_the_login_node(tmp_path):
     app = await _ssh(tmp_path)
     e = (await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})).env
-    shutil.rmtree(e.path)                                                 # scratch purged
+    _purge(e.path)                                                        # scratch purged
     out = await server._run_shell(app, "echo RAN", agent_call=True)
     assert out.phase == "env_building" and "RAN" not in out.stdout and "purged" in (out.notice or ""), out
     assert len(_builds(app, compute=False)) == 2 and _builds(app, compute=True) == []
@@ -871,6 +895,7 @@ async def test_ssh_a_partly_purged_env_fails_its_check_and_is_rebuilt(tmp_path, 
     app = await _ssh(tmp_path)
     e = (await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})).env
     victim = next(Path(e.path).glob("lib/python*/site-packages/six/__init__.py"))
+    _writable(e.path)
     victim.unlink()                                                       # the marker survived, a module did not
     monkeypatch.setattr(envs, "VERIFY_EVERY_S", 0.0)
     st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
@@ -885,6 +910,7 @@ async def test_ssh_a_block_newly_confirmed_checks_the_sessions_env_again_and_a_c
     st = await server._ensure_endpoint_up(app, "compute", confirm_spend=True)    # the same block, confirmed again
     assert st.status == "up" and len(_builds(app)) == 1, st                       # nothing sent
     victim = next(Path(e.path).glob("lib/python*/site-packages/six/__init__.py"))
+    _writable(e.path)
     victim.unlink()
     app.shapes["compute"].spend_confirmed = False                                  # the block reaped: a new yes
     st = await server._ensure_endpoint_up(app, "compute", confirm_spend=True)
@@ -1011,7 +1037,7 @@ async def test_a_jobs_script_activates_its_env_after_the_sessions_and_runs_in_it
     p = subprocess.run([_BASH, out.job.script_path], capture_output=True, text=True, timeout=60,
                        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")})
     assert p.returncode == 0 and "SIX 1.17.0" in p.stdout, (p.stdout, p.stderr)
-    shutil.rmtree(Path(out.job.env.path))                                  # purged before it ran: it runs nothing
+    _purge(Path(out.job.env.path))                                         # purged before it ran: it runs nothing
     p = subprocess.run([_BASH, out.job.script_path], capture_output=True, text=True, timeout=60,
                        env={"PATH": os.environ["PATH"], "HOME": str(tmp_path / "home")})
     assert p.returncode == envs.ENV_RC and "SIX" not in p.stdout and envs.REFUSED in p.stderr

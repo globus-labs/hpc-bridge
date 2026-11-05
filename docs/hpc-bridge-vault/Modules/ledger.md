@@ -28,6 +28,8 @@
 - **`retire` / `unretire`** — a stop or a reap retires the block's config (on SSH its `hpcb_block` token makes it unique: S5 saw one stray submit with a retired config restart the user endpoint and a block within 18 s); the user's yes on a resume lifts it.
 
 - **Block environments** (PR 3, [[envs]]): `batch` and `job` gain an `env` column (`_ADDED_COLUMNS`). It is JSON, `envs.record`: the env a batch or job runs in, with what activates or rebuilds it after a restart. `add_batch(…, env=)` writes it. A listing shows its label (`LedgerEntry.env`).
+  - Since review round 1, a batch's record also carries `nonce_key` (its rows' refusal nonces), `retried` and `unbuildable` (S1), and `redacted` (U3).
+  - An index URL's credentials are never stored.
 
 > [!warning] Only the lease holder admits or collects
 > Two servers on one task group swallow each other's results (S1), and two admitters double the window. Every admission goes through `reserve`, which re-checks the lease inside its transaction; a server that loses the lease drops the batch from its process and only reads it.

@@ -41,10 +41,10 @@ See [[Block environments]] and [[envs]].
   - `state`: `ready` | `building` | `failed` | `unchecked`
   - `task_id`, `cached`, `lock_sha256`, `size_mb`
   - `new_block` and `billed`: false and None in PR 3
-  - `index_lines`, `warning`, `error`
+  - `index_lines` (credentials redacted), `ambient` (the login node's own installer settings that applied: names only), `warning`, `error`
 - **Where `EnvInfo` appears:** `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env` and `JobTerms.env`.
 - **`LedgerEntry.env`** is the listing's label.
-- **`ShellOutcome.phase`** gains `env_building`: nothing ran, because the session's env is being built or rebuilt on the login node (free).
+- **`ShellOutcome.phase`** gains `env_building`: nothing ran, because the session's own env is being rebuilt on the login node (free). A new env being built is pending instead, and the session's env serves meanwhile. `HandoffResult.phase` gains it too ([[handoff]]).
 
 ## See also
 [[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]] · [[envs]]

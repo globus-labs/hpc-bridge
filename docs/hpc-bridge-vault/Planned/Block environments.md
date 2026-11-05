@@ -6,6 +6,80 @@
 > - **PR 3 (on PR 2, batch row sizing): built 2026-11-05; the live cells are next.** It covers existing envs everywhere, facility endpoints included, and built envs on an endpoint hpc-bridge stood up over SSH. A built env is made on the login node (free) and activated per command, row and job. Module [[envs]].
 > - **PR 4 (branch `feat/block-envs-mep`):** building on a facility endpoint. It comes after a live check; its open items are below.
 
+## Review round 1 (2026-11-05, on `c7fda3d`)
+
+Two reviewers reproduced 29 defects: S1–S17 on the server, N1–N12 on the node. They also found a live-cell grader bug (L1) and raised suspicions that were ruled on without a reproduction (U1–U10). Every one is fixed as ruled. The tests are in `tests/test_block_envs_r1.py`: 78 of its 88 fail on `c7fda3d`, and the other 10 are controls.
+
+### What changed in how it works
+
+- **A new built env is pending until it is ready (S4).**
+  - The session's own env serves meanwhile (or none), and the answer says so.
+  - Once the new env is ready it becomes the session's env, said once.
+  - A failed build leaves the session's env as it was (ruling 9, now also for a build that fails after the call's wait).
+  - `env_building` is now only the session's OWN env being rebuilt (a purge).
+- **A built env is read-only (N3).** Bytecode is compiled at the build, then `chmod a-w`, links never followed.
+  - An install into the activated env fails loudly. To add a package, change the requirements, which makes another env.
+  - A partly purged env is rebuilt BESIDE itself and swapped in. The old one is moved aside to `.broken.*` only once the new one is ready, so work running in it carries on.
+  - A later build sweeps `.build.*` and `.broken.*` leftovers older than `SWEEP_MIN` (240 min), making them writable first (N11).
+  - `HPC_BRIDGE_ENV_BUILD_S` is capped 30 min below that age, so a sweep can never take a live build (U4).
+- **Only the user's own directories are used (U1).** The env root and `<key>-<arch>` must be owned by the user and writable by neither its group nor anyone. This is the slot lock dir's rule: keys are predictable, so another user could plant an env.
+  - The activation refuses otherwise (`why` = `unsafe`, naming the path).
+  - The build refuses too, and writes nothing there.
+  - The check answers `state=unsafe`.
+  - The build itself runs under `umask 022`, so a node whose umask is 002 never makes the root group-writable.
+- **An activate line that ends the shell is still a refusal (N1).** This covers `set -e; false`, `set -u`, `${X:?}` and `exit 0`. The line runs in an `if` with an EXIT trap armed while it runs, and the shell's own trap is restored after.
+- **Around every activation (N5, N8):**
+  - errexit, nounset, noclobber, pipefail and the cwd are as they were before it;
+  - its output goes to stderr;
+  - the wrapper's own writes use `>|`.
+- **The session wrapper snapshots in the shell (U10, N4).** Values are copied with `printf -v`, and every comparison is a string test, with no process per variable.
+  - A variable the activation UNSET (a venv's `PYTHONHOME`, a `module purge`) and the command left unset is saved as the session had it.
+  - Trailing newlines are kept.
+  - The cost, one `true` with 125 exported variables, macOS bash 3.2, 10 runs each:
+    | | before (`c7fda3d`) | after |
+    |---|---|---|
+    | no env | 1.02 s | 0.015 s |
+    | with an env | 2.45 s | 0.025 s |
+- **The requirements text (N6, N9, N10).**
+  - Lines continued with a backslash are joined, so the hash-pinned form `pip-compile --generate-hashes` writes is accepted.
+  - A local path is refused however it is spelled: `pkg @ /path`, `${HOME}/…`, `FILE:///`, or `--find-links /dir`. An `@` must be followed by a URL scheme other than file; index options take URLs only.
+  - A `$` is refused, because uv expands variables on the node.
+  - Every argument check is a full match, so a trailing newline fails.
+- **A root of the home directory itself** (`~/`, `$HOME/`, `${HOME}/`) is `$HOME` (N2).
+- **"Gone" or "another arch" (N7).** The activation knows the architecture the env was built for (`Activation.arch`, the login node's). A missing build for THIS node's own architecture is `gone`, never `arch`.
+- **Credentials in an index URL are never said back (U3):** not in a notice, the terms, the ledger's record, a status or the handoff record. The node still gets the user's text, unchanged.
+  - A record whose text needed redacting is marked `redacted`. Only the server that still holds the text can rebuild it; after a restart that is refused by name.
+- **The login node's own installer settings are named, never their values (U2).** These are the set `UV_*INDEX*`, `UV_INSECURE_HOST`, `PIP_INDEX_URL`, `PIP_EXTRA_INDEX_URL`, `PIP_TRUSTED_HOST` and the config-file variables, plus any uv or pip config file found. The build is never changed for them. They appear in `EnvInfo.ambient` and the notice.
+- **The build runner (S7, S8):**
+  - It is keyed on its endpoint AND config: a runner made before `adopt_endpoint`, or for another endpoint, is closed and replaced (U9).
+  - It is dropped when its submit raises, when its future fails, on a new Globus login and on an endpoint repair.
+  - A build is never sent to no endpoint: an env asked for before the endpoint exists waits for the next call, which says so.
+- **A build that never answers is lost (S5).** That means past `BUILD_S` plus a 5-minute grace, or sent to an endpoint that is no longer the bound one. It is given up and sent again on the next ask.
+- **A re-check of a ready env is quiet (U5).** That covers the 24 h re-verify and a block newly confirmed: the env stays ready while it runs, and only a failed answer changes its state.
+- **A refusal from the node clears what the server believed (S6).** After a `.failed` mark, the next ask sends the build.
+- **A refusal read through `poll_task` is still a command that never ran (S9).** The handle carries the dispatch's (nonce, activation).
+- **Batches:**
+  - **S1:** a failed rebuild is retried ONCE, on the user's yes. If it fails again — or the env cannot be used at all (another arch, a failing line, an unsafe directory, a redacted record after a restart) — the batch pauses saying the user must change the env, and never asks for another yes (`unbuildable` on the record).
+  - **S11:** a batch's or a job's env shows its state as this server knows it.
+  - **N12:** a row's refusal mark is believed only with that attempt's nonce, which is derived from the record's own secret. A restarted server believes its own rows' marks and keeps no table of nonces.
+  - **U7:** `run_batch(batch_id=…, env=…)` is refused by name.
+  - **U8:** a name is its owner's, never stored on the shared env.
+- **One notice for any owner's built env (S14).** The session's, a batch's, a job's and a handoff's built env all say the same things: index lines, ambient settings, the install warning (once a session), and the root's warning (carried in the record).
+- **Handoffs:**
+  - **S2:** the handoff's key is the config's alone. A collect call with the same config, and the same env or none, collects; another env is refused by name.
+  - **S10:** a failed env check makes `validation.ok` false and is said first.
+  - **U6:** an env still building answers phase `env_building`, never `refused`.
+- **The order inside `ensure_endpoint_up`:**
+  - **S16:** a shape the facility does not serve, or no facility, is that answer, and the env is not looked at.
+  - **S15:** the block's own arguments come before the env, so a refused size never sets one.
+  - The env is CHECKED before the block part and APPLIED after it, once the endpoint exists.
+- **Smaller fixes:**
+  - **S12:** an existing env's words are quoted `!r`, as data, and capped.
+  - **S13:** a check still queued is said as such.
+  - **S17:** the low-space warning is built afresh each time.
+  - **U9:** a runner's failure is never called the installer's.
+- **L1, the live grader:** `env_switch_clean` judges against the BUILT envs, never against "no venv". Every command on the real stack runs inside hpc-bridge's own endpoint venv.
+
 ## The user's decisions (2026-11-04)
 
 1. **On an endpoint hpc-bridge stood up over SSH, a built env is a separate user env**, never the worker's env.
@@ -103,14 +177,16 @@ PR 4 covers the pass-through, the R13 pin fix and the `worker_init` fallback.
 - `task_id`, `cached`, `lock_sha256`, `size_mb`
 - `new_block`: always false in PR 3
 - `billed`: None (free) in PR 3
-- `index_lines`, `warning`, `error`
+- `index_lines` (credentials redacted), `ambient` (the login node's own installer settings that applied: names and config files, never values), `warning`, `error`
 
 **Where it appears:**
 - `EnvInfo` is on `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env` and `JobTerms.env`.
 - The ledger keeps `batch.env` and `job.env` as JSON; `LedgerEntry.env` is a label.
 - A handoff gets `HandoffRecord.env` (`HandoffEnv`) and `HandoffValidation.env_ok`.
 
-**`ShellOutcome.phase` gains `env_building`:** nothing ran, because the session's env is being built or rebuilt on the login node (free). Call again.
+**`ShellOutcome.phase` gains `env_building`:** nothing ran, because the session's own env is being rebuilt on the login node (free; a purge). Call again. A NEW env being built is pending instead, and the session's own env serves meanwhile (review S4).
+
+**`HandoffResult.phase` gains `env_building`** too: nothing was sent and nothing is refused; call again (review U6).
 
 **The module, and where it hooks in:** [[envs]] has the parts. The hooks are:
 - `session_shell.wrap(…, env_sh=)`
@@ -119,7 +195,7 @@ PR 4 covers the pass-through, the R13 pin fix and the `worker_init` fallback.
 - `Ledger.add_batch(…, env=)` and the job row's `env`
 
 **On the facility,** `<root>/<key>-<uname -m>/` holds:
-- the venv, which is relocatable. It is built beside its path as `.<key>-<arch>.build.<token>` and claimed by one rename.
+- the venv, which is relocatable and READ-ONLY (review N3: bytecode compiled, then `chmod a-w`). It is built beside its path as `.<key>-<arch>.build.<token>` and claimed by one rename. The root and the env must be the user's alone (review U1).
 - `.hpcb-env`, the marker: key, short key, arch, python, the dist-info set's hash, the lock's hash, build time and host.
 - `requirements.in`: the caller's text, verbatim.
 - `requirements.lock`: the output of `uv pip freeze`.
@@ -147,6 +223,8 @@ These use the checkpoint's numbering. The table and API above say what was built
    - once `VERIFY_EVERY_S` (24 h) has passed;
    - when a block is newly confirmed (`envs.recheck`, from `server._ensure_endpoint_up`).
 
+   A re-check of a ready env is quiet: commands go on while it runs, and only a failed answer changes the env's state (review U5).
+
    A restarted server's first choice is the build script's own check, so an env already there is a cache hit. A partial purge between two checks shows up as an ImportError, not as a refusal.
 6. **A refused command runs nothing.** It exits 88 with `HPCB_ENV_REFUSED <nonce> <why> <key> …`. The nonce is the dispatch's own, so the command's output cannot forge the line.
    - **A gone env** is rebuilt on the login node, and `run_shell` answers the new phase `env_building`.
@@ -170,7 +248,7 @@ These use the checkpoint's numbering. The table and API above say what was built
    - If it fails there, the failure is said (`state=unchecked`, `error`) and the env is kept: login and compute nodes may load different modules.
    - Each command checks it again and runs nothing if it fails.
    - A facility endpoint has no login node, so there each command checks it.
-9. **A failed build** leaves the session's env as it was ("not changed"). It quotes the installer's own words as data, never as instructions, and marks `.failed`.
+9. **A failed build** leaves the session's env as it was ("not changed"). It quotes the installer's own words as data, never as instructions, and marks `.failed`. Since review round 1 (S4) this also holds for a build that fails after the call's wait: a new env is pending until it is ready.
 10. **Changed at the checkpoint: another architecture is refused, not built.**
     - The per-command activation finds no `<key>-<this arch>` beside a build for another arch.
     - It refuses by name: "built for <arch>, this node is <arch>; needs per-architecture endpoint venvs (a follow-up)".
@@ -182,9 +260,16 @@ These use the checkpoint's numbering. The table and API above say what was built
     - A `$HOME/…` root (every facility endpoint's, and a BYO default) is said in `warning`, naming `root`.
     - There is no new catalog field: no `compute.env_root`.
 15. **The ledger.** `batch.env` and `job.env` are JSON, and the listing shows a label. There is no env table.
-    - Every record has kind, how, key and name.
+    - Every record has kind, how, key and name. The name is the owner's (review U8).
     - An existing env's record adds its line.
-    - A built env's record adds the Python built and the Python asked, root, path, arch, the lock's hash and the requirements text. With those, a restarted server can activate the env or rebuild it.
+    - A built env's record adds:
+      - the Python built, and the Python its key was made with (`python_asked`: never a later client's default, review S3);
+      - root, path, arch and the lock's hash;
+      - the root's warning;
+      - the requirements text, with an index URL's credentials redacted (`redacted`: rebuilt only by the server that holds the text, review U3).
+
+      With those, a restarted server can activate the env or rebuild it. It never rebuilds one whose text does not make its key.
+    - A batch's record adds a secret its rows' refusal nonces are made from (`nonce_key`, review N12), and, as it goes, `retried` (the user's one yes after a failed rebuild) and `unbuildable` (a yes cannot mend it: review S1).
 16. **Housekeeping is a follow-up:** listing envs with their sizes, removing one, warning near quota.
     - PR 3 reports `size_mb` and warns when the root's free space is under twice the env.
     - No `env-` id prefix is used anywhere: those ids are envelopes'.
@@ -208,7 +293,7 @@ These use the checkpoint's numbering. The table and API above say what was built
   - The session's env (the choice, and what is known of it) outlives a stop. The next `ensure_endpoint_up` reads the finished build.
 - **A teardown, a binding change, or a reboot or walltime on the login node can cut a build off midway.** A teardown stops the endpoint, and with it the build's user endpoint. `warmth._drop_all_shapes` forgets the env and closes its runner.
   - Nothing is claimed: the env's path never exists half-built, because the rename refuses a target that is not empty.
-  - What is left is the hidden `.<key>-<arch>.build.<token>` tree and its log beside the env. A later build of the same env sweeps them after 240 minutes.
+  - What is left is the hidden `.<key>-<arch>.build.<token>` tree and its log beside the env. A later build of the same env sweeps them after 240 minutes (`SWEEP_MIN`), as it does an env a rebuild moved aside (`.broken.*`), making each writable first. A build's walltime is capped below that age, so a sweep never takes a live build.
   - The next ask sends the build again. Its own check finds nothing there, so it builds from the start.
   - Tested by `test_a_build_cut_off_midway_leaves_no_half_claimed_env`.
 
@@ -239,6 +324,7 @@ These use the checkpoint's numbering. The table and API above say what was built
   - on a facility endpoint: an existing env with no new block, a built env refused by name;
   - handoffs on SSH and on a facility endpoint;
   - the ledger; the tools.
+- **`tests/test_block_envs_r1.py`** (review round 1, 88 tests): the reviewers' reproductions S1–S17 and N1–N12, adapted only where a fix changed the API they called, and a test for each of U1–U10.
 - **`agentic/harness/envs_checks.py` and `test_envs_scenarios.py`:** the scripted cells `env_ssh_build_cache` and `env_ssh_switch`, on the fake `default` profile. They are kept out of the sweep until their live proof. They need PyPI reachable from the fake cluster's login node.
 
 ## See also

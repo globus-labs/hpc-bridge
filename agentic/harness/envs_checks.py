@@ -189,9 +189,19 @@ def env_switch_no_new_block(t: Trace) -> Result:
                   else "; ".join(bad))
 
 
+def _saw_built(p: dict, built: set[str]) -> bool:
+    """A probe that saw a built env: its VIRTUAL_ENV is one, its first PATH entry is one's (bin), or python ran from
+    one."""
+    return (p.get("venv") in built or p.get("prefix") in built
+            or any(str(p.get("first") or "").startswith(b) for b in built))
+
+
 def env_switch_clean(t: Trace, *, tag: str) -> Result:
     """After the switch to the existing env (`activate`, which sets HPCB_TAG), a command saw that env and NOTHING of
-    the built one before it: no VIRTUAL_ENV, the built env's bin not first on PATH; after the switch to no env, neither."""
+    the built one before it: no VIRTUAL_ENV of it, its bin not first on PATH, python not running from it; after the
+    switch to no env, neither. Judged against the BUILT envs, never against "no venv at all": every command on a live
+    stack runs inside hpc-bridge's own endpoint venv (its VIRTUAL_ENV set, its bin first) — the baseline, no sign of a
+    leak (live, env_ssh_switch on c7fda3d, 2026-11-05: the grader had wanted venv=none)."""
     name = "env_switch_clean"
     built = {env_of(c.result).get("path") for c in t.calls if env_of(c.result).get("kind") == "built"} - {None}
     act = [i for i, want, _r in env_calls(t) if "activate" in want]
@@ -201,10 +211,9 @@ def env_switch_clean(t: Trace, *, tag: str) -> Result:
     after_act = [p for i, p in probes(t) if i > act[0] and (not none or i < none[0])]
     after_none = [p for i, p in probes(t) if none and i > none[0]]
     bad = []
-    if not after_act or after_act[0]["tag"] != tag or after_act[0]["venv"] != "none" or any(
-            str(after_act[0]["first"]).startswith(b) for b in built):
+    if not after_act or after_act[0]["tag"] != tag or _saw_built(after_act[0], built):
         bad.append(f"after the switch: {after_act[:1]!r}")
-    if none and (not after_none or after_none[0]["tag"] != "none" or after_none[0]["venv"] != "none"):
+    if none and (not after_none or after_none[0]["tag"] != "none" or _saw_built(after_none[0], built)):
         bad.append(f"after no env: {after_none[:1]!r}")
     return Result(name, not bad, "ok" if not bad else "; ".join(bad))
 

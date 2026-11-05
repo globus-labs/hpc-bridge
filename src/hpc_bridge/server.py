@@ -397,32 +397,54 @@ async def _ensure_endpoint_up(
     env: Any = None,
 ) -> EndpointStatus:
     """ensure_endpoint_up, with the block as its check measured it from inside once it is up (`measured`, batch row
-    sizing), and the session's env (`env`, block environments: hpc_bridge.envs). An env is chosen BEFORE the block's
-    terms are looked at — it never changes them: a built env on the login node is free and activated per command, and
-    an existing one is a line run per command — so the block part answers as it would without it. A refused env changes
-    nothing in this call (`_dropped_term_status`)."""
-    chosen: envs.Chosen | None = None
+    sizing), and the session's env (`env`, block environments: hpc_bridge.envs). The env never changes the block's
+    terms — a built env on the login node is free and activated per command, an existing one is a line run per command
+    — so the block part answers as it would without it. Its order (review round 1): the env is CHECKED first (a refused
+    one changes nothing in this call: `_dropped_term_status`) — after the shape and the facility are (a shape this
+    facility does not serve, or no facility, is that answer, the env not looked at: S16) and before the block's own
+    arguments are (a refused size or queue is that answer, the env not set: S15). It is APPLIED after the block part,
+    once the endpoint exists (S8: a build is never sent to no endpoint; one asked for before the endpoint stood up waits
+    for the next call, which says so)."""
     since = time.monotonic()
-    if _no_facility_bound(app) and env is not None:
-        env = None   # nothing bound: the block part below says so, and no env is chosen on nothing
+    spec: envs.EnvSpec | None = None
+    not_looked = ""
     if env is not None:
-        try:
-            chosen = await envs.choose(app, env)
-        except envs.EnvRefusal as exc:
-            async with app.lock:
-                refused = _dropped_term_status(app, shape, f"{exc}. Nothing in this call was set or started.")
-            refused.env = envs.session_info(app)
-            if refused.block is not None:
-                refused.block.env = refused.env
-            return refused
+        if _no_facility_bound(app) or _shape_reject(app, shape):
+            not_looked = " The env was not looked at."   # the block part below says why (S16)
+        elif _block_args_refused(app, shape, partition, account, cores, memory_gb, gpus, nodes, whole_node):
+            not_looked = " The env was not looked at: nothing in this call was set."   # S15
+        else:
+            try:
+                spec = envs.parse(env)
+                if spec is not None and spec.kind != "none":
+                    envs.delivery(spec, access=envs.access_of(app), client_python=envs.default_python())
+            except envs.EnvRefusal as exc:
+                async with app.lock:
+                    refused = _dropped_term_status(app, shape, f"{exc}. Nothing in this call was set or started.")
+                refused.env = envs.session_info(app)
+                if refused.block is not None:
+                    refused.block.env = refused.env
+                return refused
     rt0 = app.shapes.get(shape)
     before = (rt0, rt0.spend_confirmed, rt0.block_epoch) if rt0 is not None else None
     st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
                                whole_node, recheck=recheck, workers=workers)
+    chosen: envs.Chosen | None = None
+    if spec is not None:
+        if "Nothing in this call was set or started" in (st.notice or ""):
+            not_looked = " The env was not looked at: nothing in this call was set."   # a template refused the size
+        elif app.state.endpoint_id is None:
+            not_looked = (" The env was not applied: no endpoint is up yet to build or check it on — ask for it again "
+                          "once ensure_endpoint_up answers up.")
+        else:
+            try:
+                chosen = await envs.choose(app, spec)
+            except envs.EnvRefusal as exc:   # a facility the call bound only now (a startup pin's first call)
+                not_looked = f" The env was not applied: {exc}."
     rt1 = app.shapes.get(shape)
     if (confirm_spend and shape == DEFAULT_SHAPE and rt1 is not None and rt1.spend_confirmed
             and (before is None or before != (rt1, True, rt1.block_epoch))):
-        await envs.recheck(app, since=since)   # a block newly confirmed: the session's built env checked again
+        await envs.recheck(app, since=since)   # a block newly confirmed: the session's built env checked again (quiet)
     if st.status == "up" and shape == DEFAULT_SHAPE and st.measured is None:
         rt = app.shapes.get(shape)
         c = rt.last_canary if rt is not None else None
@@ -431,15 +453,35 @@ async def _ensure_endpoint_up(
             if m.workers is None and c.worker_count:
                 m = dataclasses.replace(m, workers=c.worker_count)
             st.measured = batch.facts_of(m, workers_fixed=batch._fixed_workers(app))
-    st.env = envs.session_info(app)
-    if chosen is not None:
-        if chosen.info is not None and chosen.info.state == "failed":
-            st.env = chosen.info   # the env asked for, saying why it was not taken (the session's own is unchanged)
-        if chosen.notice:
-            st.notice = f"{chosen.notice} {st.notice}".strip() if st.notice else chosen.notice
+    # `env`: the env this answer is about — the one asked for when it did not become the session's (still being built,
+    # or failed: the session's own serves on, and the notice says which); else the session's (or a pending one's, while
+    # one is being built). `block.env`: the env the block's commands run in now — always the session's.
+    session = envs.session_info(app)
+    st.env = session
+    if chosen is not None and not chosen.taken:
+        st.env = chosen.info
+    elif chosen is None and app.env_pending is not None:
+        st.env = envs.pending_info(app)
+    words = " ".join(x for x in (chosen.notice if chosen is not None else "", envs.take_note(app)) if x)
+    if words:
+        st.notice = f"{words} {st.notice}".strip() if st.notice else words
+    if not_looked:
+        st.notice = f"{st.notice or ''}{not_looked}".strip()
     if st.block is not None:
-        st.block.env = st.env
+        st.block.env = session
     return st
+
+
+def _block_args_refused(app: AppCtx, shape: str, partition: str | None, account: str | None, cores: int | None,
+                        memory_gb: int | None, gpus: int | None, nodes: int | None, whole_node: bool | None) -> bool:
+    """The block arguments `_ensure_up_once` refuses before anything (an invalid queue or account, a size that is no
+    size), read without changing anything — so a call refused for them never sets an env first (review S15). What a
+    facility's template refuses is read from that answer itself."""
+    if partition not in (None, "") and not _VALID_PARTITION.match(partition):
+        return True
+    if account is not None and not _VALID_ACCOUNT.match(account):
+        return True
+    return shape != "login" and bool(resources.requested(cores, memory_gb, gpus, nodes, whole_node)[1])
 
 
 async def _ensure_up_once(
@@ -918,10 +960,12 @@ async def ensure_endpoint_up(
     {"activate": "<shell line>"} for an existing one (`module load pytorch/2.4; conda activate ml`: run before each
     command, on any facility), or {"requirements": "<requirements.txt text>", "python": "3.12"?, "root": "<dir>"?}
     for one hpc-bridge builds — on an endpoint it stood up over SSH, on the login node (free), then activated per
-    command. Neither changes the block: no new spend question. {} drops it. The answer's `env` says its state (a build
-    still running: "building"; a command meanwhile answers env_building and runs nothing). A built env on a facility's
-    multi-user endpoint is not supported yet (refused): use "activate" there. The session's shell never keeps the env —
-    only what a command itself changes (a PATH a command edits keeps the env's bin until it is set again)."""
+    command. Neither changes the block: no new spend question. {} drops it. The answer's `env` says its state: a new
+    built env still "building" takes over once it is ready — commands run in the session's current env (or none)
+    meanwhile; a failed one leaves the session's env as it was. A built env is read-only: to add a package, change the
+    requirements (another env). A built env on a facility's multi-user endpoint is not supported yet (refused): use
+    "activate" there. The session's shell never keeps the env — only what a command itself changes (a PATH a command
+    edits keeps the env's bin until it is set again)."""
     return await _heartbeat(ctx, _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
         whole_node, env=env,
@@ -2343,7 +2387,7 @@ async def _detect_submission(command: str, shape: str) -> Submission | None:
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
     payload: Callable[[], str], *, agent_call: bool, reset: bool = False, submission: Submission | None = None,
-    guard: session_shell.Guard | None = None, result_key: str | None = None,
+    guard: session_shell.Guard | None = None, result_key: str | None = None, env: Any = None,
 ) -> ShellOutcome:
     """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
     lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
@@ -2368,7 +2412,8 @@ async def _dispatch_counted(
     `guard`: the wrong-block guard `payload` carries (session_shell: the block job and this dispatch's nonce). A result
     the guard refused did NOT run: it becomes the reap of the confirmed block (warmth._wrong_block_outcome), here or —
     through the handle, which records the guard — whenever a poll resolves it, a client-cancelled call's command
-    included.
+    included. `env`: the session env's (nonce, activation) the payload carries (block environments), kept on the handle
+    the same way — a refusal polled later is still a command that never ran (review S9).
 
     (A cancel BEFORE the submit — still in _ready_session — propagates from there with nothing counted or sent; the
     submit is synchronous, so once anything was sent the future is in hand.)"""
@@ -2402,7 +2447,7 @@ async def _dispatch_counted(
                     if not tracked():
                         return _released_under_outcome(app, None, runner.walltime)
                     task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, runtime=rt,
-                                             reset=reset, submission=sub, guard=guard)
+                                             reset=reset, submission=sub, guard=guard, env=env)
                     released = app.shapes.get(shape) is not rt
                     out = _with_submission_notice(
                         _running_outcome(app, task_id, runner.walltime, reset=reset,
@@ -2442,7 +2487,7 @@ async def _dispatch_counted(
             counted = None
             if agent_call and fut is not None and not fut.done() and tracked():  # still running and reachable
                 _register_task(app, shape, session_id, command, fut, runner.walltime, client_cancelled=True,
-                               runtime=rt, reset=reset, submission=sub, guard=guard)
+                               runtime=rt, reset=reset, submission=sub, guard=guard, env=env)
         raise
     finally:
         if counted is not None:  # an exception escaped before the count was handed back
@@ -2487,9 +2532,12 @@ async def _run_shell(
     out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
                                   lambda: session_shell.wrap(command, session, guard=guard, result_key=key,
                                                              env_sh=env_sh),
-                                  agent_call=agent_call, submission=sub, guard=guard, result_key=key)
+                                  agent_call=agent_call, submission=sub, guard=guard, result_key=key,
+                                  env=(nonce, use.act) if use.act is not None else None)
     if use.act is not None and (ref := envs.refusal(out.exit_code, out.stderr_snippet, nonce)) is not None:
-        out.phase, out.notice = envs.refused(app, ref, use.act, out.stderr_snippet)
+        out.phase, out.notice = envs.refused(app, ref, use.act, out.stderr_snippet or "")
+    if agent_call and (note := envs.take_note(app)):   # a pending env built (or not) since the last answer: said once
+        out.notice = f"{out.notice} {note}" if out.notice else note
     if shared:
         out.notice = f"{out.notice} {shared}" if out.notice else shared
     return out
@@ -2497,7 +2545,8 @@ async def _run_shell(
 
 def _env_outcome(app: AppCtx, shape: str, use: envs.ForCommand) -> ShellOutcome:
     """run_shell's answer when the session's env cannot take a command now (nothing ran, nothing was counted): still
-    being built on the login node (`env_building`), or its rebuild failed (`failed`, saying why)."""
+    being rebuilt on the login node (`env_building`), or its rebuild failed (`failed`, in the words of what failed:
+    the installer, or the runner — review U9)."""
     rt = app.shapes.get(shape)
     warm = rt is not None and rt.warm_confirmed_at is not None
     if use.building:
@@ -2505,9 +2554,8 @@ def _env_outcome(app: AppCtx, shape: str, use: envs.ForCommand) -> ShellOutcome:
                             session_spend=_total_session_spend(app), notice=envs.building_words(use.info))
     key = use.info.key if use.info is not None else "?"
     return ShellOutcome(phase="failed", block_state="warm" if warm else "cold", session_spend=_total_session_spend(app),
-                        notice=(f"Nothing ran: the session's env {key} could not be built on the login node (the "
-                                f"installer said, quoted as data: {use.failed!r}). Choose another env with "
-                                "ensure_endpoint_up(env=…), or none with env={}."))
+                        notice=(f"Nothing ran: the session's env {key} is not there — {use.failed} Ask for it again "
+                                "with ensure_endpoint_up(env=…), choose another, or none with env={}."))
 
 
 async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, envelope: dict) -> ShellOutcome:
@@ -2823,7 +2871,7 @@ async def run_batch(
     with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again.
     `env` (as ensure_endpoint_up's; omitted: the session's env) is the batch's own: every row runs in it, the session's
     stays the session's, and no new block is asked for; a row whose env is gone from its node runs nothing and waits
-    for its rebuild.
+    for its rebuild. A batch's env is fixed at its start: env= with batch_id= is refused.
     Follow it with status(id, wait_s=60); stop it with cancel(id)."""
     try:
         return await _heartbeat(ctx, _run_batch(
@@ -2948,7 +2996,8 @@ async def export_handoff(ctx: Context, user_endpoint_config: dict[str, Any], exp
 
     `env` (as ensure_endpoint_up's; omitted: none): an env the consumer runs its commands in. The record carries it
     (`env`: a built one's path and bin, or an existing one's line) for the consumer to activate itself; the config is
-    unchanged, and the canary checks the env from inside the block (`validation.env_ok`)."""
+    unchanged, and the canary checks the env from inside the block (`validation.env_ok`; false makes validation.ok
+    false). phase="env_building": the env is still being built on the login node — nothing sent; call again."""
     try:
         return await _heartbeat(ctx, _export_handoff(ctx.request_context.lifespan_context, user_endpoint_config,
                                                      expires_hours, confirm_spend, env), "export_handoff")

@@ -87,9 +87,11 @@ answer until the shape is warm.
 - **A passing check clears a ghost.** `_confirm_worker` removes the endpoint from `AppCtx.ghost_endpoints` (see
   [[connect]]).
 - **Block environments (PR 3, [[envs]]).** `_drop_all_shapes` handles a binding change or a teardown.
-  - It forgets the session's env and what is known of each env (`env_spec`, `env_known`).
-  - It closes the build runner (`env_runner`); a build it cuts off claims nothing.
+  - It forgets the session's env, a pending one and what is known of each env (`env_spec`, `env_pending`, `env_known`).
+  - It closes the build runner (`envs.drop_runner`); a build it cuts off claims nothing.
   - A stop keeps all of them.
+  - `_forget_identity_verdicts` (a new Globus login) and a repaired endpoint drop the build runner too (review S7).
+  - `_resolve_task` reads a polled command's env refusal (`TaskHandle.env`) as `run_shell` does: a command that never ran (review S9).
 
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

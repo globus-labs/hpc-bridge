@@ -266,9 +266,10 @@ class HandoffResult(BaseModel):
     """export_handoff's answer. phase: needs_confirmation (nothing sent: `terms`, and the config the canary would
     send) | validating (the one canary is out: call again with the same config to collect it) | exported (`record`,
     written to `path`) | needs_account | refused (`reason`: mep_min_blocks — D6 — invalid, schema, not_rendered,
-    unbounded, expires, canary_failed, no_facility, template_unknown)."""
+    unbounded, expires, canary_failed, no_facility, template_unknown, env) | env_building (block environments: nothing
+    sent and nothing refused — the env is being built on the login node; call again)."""
 
-    phase: Literal["needs_confirmation", "validating", "exported", "needs_account", "refused"]
+    phase: Literal["needs_confirmation", "validating", "exported", "needs_account", "refused", "env_building"]
     reason: str | None = None
     terms: HandoffTerms | None = None
     user_endpoint_config: dict[str, Any] | None = None
@@ -1030,32 +1031,54 @@ async def export(app: AppCtx, user_endpoint_config: Any = None, expires_hours: A
     try:
         return await _export(app, user_endpoint_config, expires_hours, confirm_spend, env)
     except HandoffRefusal as r:
-        phase: Literal["refused", "needs_account"] = "needs_account" if r.reason == "needs_account" else "refused"
+        phase: Literal["refused", "needs_account", "env_building"] = (
+            "needs_account" if r.reason == "needs_account" else
+            "env_building" if r.reason == "env_building" else "refused")   # busy, never refused (review U6)
         return HandoffResult(phase=phase, reason=r.reason, notice=r.notice)
 
 
-async def _env_record(app: AppCtx, env: Any, access: str) -> dict[str, Any] | None:
+async def _env_record(app: AppCtx, env: Any, access: str) -> tuple[dict[str, Any] | None, str]:
     """The handoff's env (block environments), for the consumer to activate: an existing env's line, or a built one —
-    built on the login node first (free), since the canary checks it. Never the workers' env: the config is unchanged.
-    A built env on a facility endpoint is refused by name (PR 4's)."""
+    built on the login node first (free), since the canary checks it — with what its answer says of it (as the
+    session's would: review S14). Never the workers' env: the config is unchanged. A built env on a facility endpoint
+    is refused by name (PR 4's); one still being built is an honest busy answer, `env_building` (review U6)."""
     try:
         spec = envs.parse(env)
         if spec is None or spec.kind == "none":
-            return None
+            return None, ""
         envs.delivery(spec, access=access, client_python=envs.default_python())
+        said = ""
         if spec.kind == "requirements":
             k = await envs.ensure_built(app, spec)
             if k.info.state == "building":
-                raise HandoffRefusal("env_building", f"Nothing was sent yet: the handoff's env {k.key} is being built "
-                                                     "on the login node (free), and the canary checks it. Call "
-                                                     "export_handoff again with the same arguments once it is ready.")
+                raise HandoffRefusal("env_building", f"Nothing was sent yet, and nothing is refused: the handoff's env "
+                                                     f"{k.key} is being built on the login node (free), and the canary "
+                                                     "checks it. Call export_handoff again with the same arguments "
+                                                     "once it is ready.")
             if k.info.state == "failed":
-                raise HandoffRefusal("env", f"Refused, nothing was sent: the handoff's env {k.key} could not be built "
-                                            "on the login node (the installer said, quoted as data: "
-                                            f"{k.info.error!r}).")
-        return envs.current_record(app, envs.record(app, spec))
+                raise HandoffRefusal("env", f"Refused, nothing was sent: the handoff's env {k.key} is not there — "
+                                            f"{envs.failed_words(k.info, k.fault)}")
+            said = envs.built_notice(app, envs.info_for(k, spec.name)).strip()
+        return envs.current_record(app, envs.record(app, spec)), said
     except envs.EnvRefusal as exc:
         raise HandoffRefusal("env", f"Refused, nothing was sent: {exc}.") from None
+
+
+def _same_env(pend: Pending, env: Any) -> None:
+    """A collect call (the same config) names the env of the handoff that is out, or none (review S2: the env is not
+    in the handoff's key, so the same config without it collects it — never a second billed canary). Another env is
+    refused by name."""
+    try:
+        spec = envs.parse(env)
+    except envs.EnvRefusal as exc:
+        raise HandoffRefusal("env", f"Refused, nothing was sent: {exc}.") from None
+    asked = envs.env_key(spec) if spec is not None and spec.kind != "none" else None
+    held = (pend.plan.env or {}).get("key")
+    if env is not None and asked != held:
+        out = f"env {held}" if held else "no env"
+        raise HandoffRefusal("env", f"Refused, nothing was sent: a handoff of this same config is already validating "
+                                    f"with {out}. Collect it with the same config and env (or no env= at all); another "
+                                    "env is another handoff, once this one is collected.")
 
 
 def _record_env(rec: dict[str, Any] | None) -> HandoffEnv | None:
@@ -1077,9 +1100,8 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
     access = "ssh" if ssh else "mep"
     eid = str(app.state.endpoint_id)
     caller = normalize(app, given, access)
-    env_rec = await _env_record(app, env, access)
-    # another env is another handoff (its canary checks that env): the key carries the env's own
-    key = _key(app, eid, {**caller, "__env__": env_rec.get("key")} if env_rec else caller)
+    # the config's own key, whatever its env (review S2): the same config collects the handoff that is out
+    key = _key(app, eid, caller)
     md = await _metadata(app, eid)
     pend = app.handoffs.get(key)
     if pend is None:   # another life of this server sent it: collect it by its task id, never send another
@@ -1091,15 +1113,18 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
             else:
                 app.handoffs[key] = pend
     if pend is not None:
+        _same_env(pend, env)
         return await _collect(app, pend)
+    env_rec, env_said = await _env_record(app, env, access)
     plan = build(app, caller, md, access)
     plan.env = env_rec
     if getattr(app.facility, "account_required", False) and not plan.hb.get("account"):
         raise HandoffRefusal("needs_account", _NEEDS_ACCOUNT)
     terms = terms_of(app, plan, hours)
     if not confirm_spend:
+        notice = _ask_notice(terms, plan)
         return HandoffResult(phase="needs_confirmation", terms=terms, user_endpoint_config=dict(plan.wire),
-                             notice=_ask_notice(terms, plan))
+                             notice=f"{notice} The handoff's env: {env_said}" if env_said else notice)
     approved = time.time()
     terms = terms.model_copy(update={"approved_at": _iso(approved), "expires_at": _iso(approved + hours * 3600)})
     run = app.runner_factory(eid, user_endpoint_config=dict(plan.wire), walltime=CANARY_WALLTIME_S,
@@ -1144,8 +1169,8 @@ def _validating(pend: Pending, why: str = "") -> HandoffResult:
     return HandoffResult(phase="validating", task_id=pend.task_id, terms=pend.terms,
                          user_endpoint_config=dict(pend.plan.wire), notice=(
                              "The canary is out (one billed task with exactly this config): its block is still queued "
-                             f"or starting{why}. Call export_handoff again with the same config to collect it — "
-                             "nothing more is sent."))
+                             f"or starting{why}. Call export_handoff again with the same config and env to collect "
+                             "it (the env may be left out) — nothing more is sent."))
 
 
 async def _collect(app: AppCtx, pend: Pending) -> HandoffResult:
@@ -1255,7 +1280,10 @@ def _uep_seen(where: list[str], eid: str) -> tuple[str | None, str | None]:
 def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
     out = str(getattr(res, "stdout", "") or "")
     seen = runner._canary_result(res, time.monotonic())
-    ok = runner._CANARY_SENTINEL in out
+    # block environments: the env the record hands over, checked from inside the block — an env the consumer could not
+    # use there makes the whole validation not ok (review S10), and the answer says so first
+    env_ok = _tagged(out, "HPCB_ENV_OK")[-1:] == ["1"] if pend.plan.env else None
+    ok = runner._CANARY_SENTINEL in out and env_ok is not False
     job = seen.worker_job if seen.worker_job and _NATIVE.match(seen.worker_job) else None
     host = seen.worker_host if seen.worker_host and _HOST.match(seen.worker_host) else None
     pins: dict[str, str] = {}
@@ -1295,8 +1323,7 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
         validation=HandoffValidation(ok=ok, task_id=pend.task_id or _task_id(pend.future), job_id=job, host=host,
                                      device_pin=pins,
                                      identity=seen.worker_user, remaining_s=seen.worker_remaining_s,
-                                     workers=seen.worker_count, queue_checks=checks,
-                                     env_ok=_tagged(out, "HPCB_ENV_OK")[-1:] == ["1"] if plan.env else None),
+                                     workers=seen.worker_count, queue_checks=checks, env_ok=env_ok),
         release=release_of(plan, job, seen.worker_user),
         env=_record_env(plan.env),
     )
@@ -1306,8 +1333,16 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
     _close(pend.runner)
     if pend.task_id is not None:
         app.resolved_checks[pend.task_id] = "ok"   # it ran: no stop waits on it any more
+    failed_env = ""
+    if env_ok is False:
+        what = (f"its existing env's line ({envs.said((plan.env or {}).get('line'))!r}) did not run there"
+                if (plan.env or {}).get("kind") == "activate" else
+                f"its built env {(plan.env or {}).get('key')} was not found there for that node's architecture")
+        failed_env = (f"The record's validation is NOT ok: the env check failed from inside the block — {what} "
+                      "(validation.env_ok is false). The consumer cannot run in this env on these nodes: export again "
+                      "with an env that works there. ")
     return HandoffResult(phase="exported", record=rec, path=str(path), task_id=pend.task_id, terms=terms,
-                         user_endpoint_config=dict(plan.wire), notice=(
+                         user_endpoint_config=dict(plan.wire), notice=failed_env + (
                              f"Exported {rid} to {path}: the canary ran on job {job or '(unknown)'}"
                              f"{f' on {host}' if host else ''}. The consumer reads the record (the endpoint id, the "
                              "config, the nodes and the facility map to its own settings; any shell file it writes "

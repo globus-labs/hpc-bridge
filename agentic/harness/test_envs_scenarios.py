@@ -131,16 +131,22 @@ def test_active_in_command_wants_the_envs_own_prefix_and_six():
     assert not ec.env_active_in_command(Trace([_ask(req), _probe()])).ok
 
 
-def _switch_run(*, act_status="up", tag="b", leak=False):
+ENDPOINT_VENV = "/home/u/.hpc-bridge/gce-venv-endpoint-4.18.0-py3.11"   # hpc-bridge's own: every live command's
+
+
+def _switch_run(*, act_status="up", tag="b", leak=False, base=("none", "/usr/bin")):
+    """`base`: what a command sees with no env of the user's — (VIRTUAL_ENV, PATH's first entry). On a live stack that
+    is hpc-bridge's own endpoint venv (L1)."""
     req = {"requirements": ec.REQUIREMENTS}
     act = {"activate": "export HPCB_TAG=b"}
     act_env = _env(kind="activate", how="activate", key="fedcba9876543210", path=None)
+    venv, first = base
     return Trace([
         _confirm(), _ask(req), _probe(prefix=PATH, venv=PATH, first=f"{PATH}/bin"),
         _ask(act, env=act_env, status=act_status),
-        _probe(tag=tag, venv=PATH if leak else "none", first=f"{PATH}/bin" if leak else "/usr/bin"),
+        _probe(tag=tag, venv=PATH if leak else venv, first=f"{PATH}/bin" if leak else first),
         _c("ensure_endpoint_up", {"shape": "compute", "env": {}}, {"status": "up", "env": None}),
-        _probe(),
+        _probe(venv=venv, first=first),
     ])
 
 
@@ -156,6 +162,16 @@ def test_switch_clean_wants_nothing_of_the_old_env():
     assert ec.env_switch_clean(_switch_run(), tag="b").ok
     assert not ec.env_switch_clean(_switch_run(leak=True), tag="b").ok
     assert not ec.env_switch_clean(_switch_run(tag="none"), tag="b").ok
+
+
+def test_switch_clean_judges_against_the_built_env_never_against_no_venv_at_all():
+    """L1 (live, env_ssh_switch on c7fda3d): every command on the real stack runs inside hpc-bridge's own endpoint venv
+    — VIRTUAL_ENV set, its bin first. That baseline is no leak; the built env's path or bin is."""
+    live = (ENDPOINT_VENV, f"{ENDPOINT_VENV}/bin")
+    assert ec.env_switch_clean(_switch_run(base=live), tag="b").ok
+    assert not ec.env_switch_clean(_switch_run(base=live, leak=True), tag="b").ok
+    leaked_after_none = Trace([*_switch_run(base=live).calls[:-1], _probe(venv=PATH, first=f"{PATH}/bin")])
+    assert not ec.env_switch_clean(leaked_after_none, tag="b").ok
 
 
 def test_batch_rows_in_env_wants_every_row_in_the_batchs_env():

@@ -44,6 +44,15 @@ cluster is the real-hardware check.
   `default`). The login node must reach PyPI, as the endpoint venv's build already does. The cells ask for no `python`,
   so the env is built with the client's major.minor: where the login node lacks it, uv fetches a managed CPython
   (GitHub). uv itself comes from `~/.local/bin` (the endpoint venv's) or astral.sh.
+  - On `c7fda3d`, `env_ssh_build_cache` passed. `env_ssh_switch` failed on a grader bug (L1), fixed in review round 1:
+    the grader judges against the built env, never "no venv" — every live command runs inside hpc-bridge's endpoint venv.
+- **Review round 1** (on `c7fda3d`): 29 reproduced defects (S1–S17, N1–N12), L1 and U1–U10, all fixed, with tests in
+  `tests/test_block_envs_r1.py`. Behaviour that changed for the cells:
+  - a new built env is PENDING until it is ready (the session's env serves meanwhile);
+  - a built env is read-only;
+  - the env root must be the user's alone.
+  The session wrapper is ~60× faster: its snapshots are in the shell now. The vault note's "Review round 1" section has
+  the list.
 - **PR 4** (branch `feat/block-envs-mep`, stage A only: `tests/test_block_envs_mep.py`, the cells
   `env_mep_requirements` / `env_mep_fallback`, a second fake `pbs_mep` manager): a facility endpoint's builds — the
   pass-through, the pin fix (R13), the worker_init fallback — after a live Delta / Anvil / Polaris check the user

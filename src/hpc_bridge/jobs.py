@@ -387,7 +387,9 @@ def _hms(secs: float | None) -> str | None:
     return f"{d}-{out}" if d else out
 
 
-def job_info(j: dict[str, Any]) -> JobInfo:
+def job_info(j: dict[str, Any], app: AppCtx | None = None) -> JobInfo:
+    """A ledger job, as an answer states it. `app`: this server, so the job's env says its state as known here (review
+    S11) — without it, as its record says."""
     held = job_hold(j)
     charged = float(j.get("charged") or 0.0)
     state = str(j.get("sched_state") or "") or {"reserved": "RESERVED", "submit_unknown": "SUBMIT_UNKNOWN",
@@ -406,7 +408,7 @@ def job_info(j: dict[str, Any]) -> JobInfo:
                    partition=j.get("partition"), account=j.get("account"), walltime=_hms(j.get("walltime_s")),
                    deadline=_iso(j.get("deadline")), script_path=j.get("script_path"),
                    script_hash=j.get("script_hash"), session_id=j.get("session_id"), unheld=bool(j.get("unheld")),
-                   env=env_mod.info_from_record(batch._env_rec(j)))
+                   env=env_mod.info_of_record(app, batch._env_rec(j)))
 
 
 def envelope_info(app: AppCtx, e: dict[str, Any], *, state: str | None = None) -> EnvelopeInfo:
@@ -420,7 +422,7 @@ def envelope_info(app: AppCtx, e: dict[str, Any], *, state: str | None = None) -
         envelope_id=e["id"], state=state or e["state"], facility=e.get("facility"), account=e.get("account"),  # type: ignore[arg-type]
         unit=e.get("unit") or UNIT, cap=round(cap, 4), spent=round(spent, 4), committed=round(held - spent, 4),
         remaining=_down(cap - held), max_jobs=e.get("max_jobs"),
-        jobs=[job_info(j) for j in jobs if j.get("source") != "pool_block"],
+        jobs=[job_info(j, app) for j in jobs if j.get("source") != "pool_block"],
         tasks=sum(int(j.get("tasks") or 1) for j in jobs),
         max_nodes_per_block=e.get("max_nodes_per_block"), accounts=json.loads(e.get("accounts") or "[]"),
         partitions=json.loads(e.get("partitions") or "[]"), deadline=_iso(float(e["deadline"])) or "",
@@ -1015,7 +1017,9 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
     except JobRefusal as exc:
         return _refused(str(exc))
     # block environments: the job's env (given, else the session's), built on the login node first (free) — the frozen
-    # job.sh activates it, so it must exist before the script is written
+    # job.sh activates it, so it must exist before the script is written; what its answer says of it is what the
+    # session's would (review S14)
+    env_said = ""
     try:
         espec = env_mod.parse(env) if env is not None else app.env_spec
         if espec is not None and espec.kind != "none":
@@ -1029,11 +1033,21 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
                                              "submit_job again with the same arguments once ensure_endpoint_up says "
                                              "it is ready."))
                 if k.info.state == "failed":
-                    return _refused(f"the job's env {k.key} could not be built on the login node (the installer said, "
-                                    f"quoted as data: {k.info.error!r}); nothing was submitted")
+                    return _refused(f"the job's env {k.key} is not there — {env_mod.failed_words(k.info, k.fault)} "
+                                    "Nothing was submitted")
+                env_said = env_mod.built_notice(app, env_mod.info_for(k, espec.name)).strip()
             spec = replace(spec, env_rec=env_mod.record(app, espec))
     except env_mod.EnvRefusal as exc:
         return _refused(str(exc))
+    out = await _submit_spec(app, spec, req, hours, confirm_spend=confirm_spend, exclude_jobs=exclude_jobs)
+    if env_said:
+        out.notice = f"{out.notice or ''} The job's env: {env_said}".strip()
+    return out
+
+
+async def _submit_spec(app: AppCtx, spec: Spec, req: EnvelopeRequest, hours: float, *, confirm_spend: bool,
+                       exclude_jobs: Any) -> JobStatus:
+    """submit_job, its job checked (and its env resolved): the envelope it goes under, and its admission."""
     if getattr(app.facility, "account_required", False) and not spec.account:
         return JobStatus(phase="needs_account", reason="account",
                          notice="The facility charges every job to an allocation account and none is set: pass "
@@ -1309,7 +1323,7 @@ async def _write_and_submit(app: AppCtx, e: dict[str, Any], spec: Spec, job_id: 
                                     f"cancel('{job_id}', 'abort').")))
     terms.script_path = path
     info = envelope_info(app, led.envelope(e["id"]) or e)
-    return JobStatus(phase="queued", job=job_info(row), terms=terms, envelope=info,
+    return JobStatus(phase="queued", job=job_info(row, app), terms=terms, envelope=info,
                      notice=(f"{job_id} submitted as scheduler job {native} ({spec.basis}, at most "
                              f"{_gu(spec.worst_case)} {UNIT}); envelope {e['id']}: {_gd(info.remaining)} of "
                              f"{_g(info.cap)} left, deadline {info.deadline}. Script: {path}. Follow it with "
@@ -1345,7 +1359,7 @@ async def status(app: AppCtx, ident: str) -> BatchStatus:
             t = Tick(False, error="the job's facility is not the one bound here")
         row = led.job(ident) or row
         e = led.envelope(row["envelope_id"]) or e
-        info = job_info(row)
+        info = job_info(row, app)
         note = f"{ident} ({row.get('native_id') or 'not submitted'}): {info.state}"
         if info.reason:
             note += f" ({info.reason})"
