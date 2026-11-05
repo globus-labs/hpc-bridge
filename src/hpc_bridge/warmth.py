@@ -1681,6 +1681,17 @@ def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
 _VALID_PARTITION = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _VALID_ACCOUNT = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
+def _batch_rows_refusal(app: AppCtx, shape: str, what: str) -> str | None:
+    """A block switch (`what`: the change, said) refused while batch rows are in flight on the compute block, naming
+    them and how to end them, as stop_endpoint is (batch.in_flight_note): the run_shell task handles do not count them,
+    and on SSH the old block idles out only after them — two blocks billing (review R2-H). None: nothing holds it."""
+    if shape != "compute":
+        return None
+    from . import batch  # batch imports this module
+
+    held = batch.in_flight_note(app, then="ask for the new block again", paused=False)
+    return None if held is None else f"can't change {what}: {held}."
+
 def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str | None) -> str | None:
     """Point this shape's next provision at `partition`, invalidating a stale runner. Returns a
     rejection notice (and applies nothing) when a task is still running on the shape: the change would
@@ -1707,6 +1718,8 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    if (held := _batch_rows_refusal(app, shape, f"partition to {partition!r}")) is not None:
+        return held
     _repoint(app, shape, rt, {"partition": partition})
     return None
 
@@ -1730,6 +1743,8 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    if (held := _batch_rows_refusal(app, shape, f"account to {account!r}")) is not None:
+        return held
     _repoint(app, shape, rt, {"account": account})
     return None
 
@@ -1745,8 +1760,10 @@ def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[st
         return None
     uec = rt.user_endpoint_config
     changed = {k: v for k, v in updates.items() if uec.get(k) != v}
+    # a batch-derived block's worker count (resources.WORKERS) is that block's alone: never the session's choice
+    chosen = {k: v for k, v in updates.items() if k != resources.WORKERS}
     if not changed:
-        app.compute_choice.update(updates)  # named, though unchanged: the session's choice now (its source)
+        app.compute_choice.update(chosen)  # named, though unchanged: the session's choice now (its source)
         return None
     after = dict(uec)
     for k, v in updates.items():
@@ -1754,7 +1771,8 @@ def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[st
             after.pop(k, None)
         else:
             after[k] = v
-    if _block_size(app, after)[0].key() == _block_size(app, uec)[0].key():
+    if (_block_size(app, after)[0].key() == _block_size(app, uec)[0].key()
+            and after.get(resources.WORKERS) == uec.get(resources.WORKERS)):   # other workers: another block
         # The same block in other words (cores=8 when 8 is the proposed slice; whole_node=True on a whole-node
         # partition): the session's choice now, no switch — the block that is up stays the confirmed one (review
         # round 1: it was taken for a different block, left to idle and billed, and a new one asked for).
@@ -1763,10 +1781,10 @@ def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[st
                 uec.pop(k, None)
             else:
                 uec[k] = v
-        app.compute_choice.update(updates)
+        app.compute_choice.update(chosen)
         return None
     what = ", ".join(f"{resources.KEY_ARGS.get(k, k)}={v!r}" for k, v in updates.items()
-                     if k in changed and (v is not None or k != resources.WHOLE))
+                     if k in changed and (v is not None or k not in (resources.WHOLE, resources.WORKERS)))
     live = _live_task_handles(app, shape)
     if live:
         return (f"can't change the block's size ({what}): a task is still running (task_id={live[0][0]!r}) on shape "
@@ -1774,7 +1792,9 @@ def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[st
     if rt.inflight:
         return (f"can't change the block's size ({what}): a command is still running on shape {shape!r} (inside "
                 "run_shell's wait). Let it return, then change it.")
-    app.compute_choice.update({k: v for k, v in updates.items() if k not in changed})
+    if (held := _batch_rows_refusal(app, shape, f"the block's size ({what})")) is not None:
+        return held
+    app.compute_choice.update({k: v for k, v in chosen.items() if k not in changed})
     _repoint(app, shape, rt, changed)
     return None
 
@@ -1824,12 +1844,17 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any])
         _retire_runner(app, rt)
         rt.runner = None
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
+    if resources.WORKERS not in updates:
+        # a batch-derived block's worker count is that block's alone: ANY other block — another size, partition or
+        # account — runs without it unless its own ask names one (review R2-E)
+        uec.pop(resources.WORKERS, None)
     for key, value in updates.items():
         if value is None:
             uec.pop(key, None)
         else:
             uec[key] = value
-        app.compute_choice[key] = value
+        if key != resources.WORKERS:   # a derived block's workers are that block's alone, never the session's
+            app.compute_choice[key] = value
     rt.runner_stale = True
     rt.warm_confirmed_at = rt.last_proof_at = rt.clock_stopped_at = None
     rt.block_since = rt.block_job = None  # a different partition or account is a different block: not the old one's age

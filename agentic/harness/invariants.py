@@ -188,6 +188,10 @@ def _batch_start_idxs(t: Trace) -> list[int]:
             continue
         if r is not None and (r.get("is_error") or str(r.get("phase")) in _BATCH_NOT_STARTED):
             continue
+        # batch row sizing: `needs_sizing` started nothing — unless the call carried the user's yes for a batch
+        # waiting for its size, which confirms the block first (its answer then carries the receipt, `block`)
+        if r is not None and str(r.get("phase")) == "needs_sizing" and not r.get("block"):
+            continue
         out.append(k)
     return out
 

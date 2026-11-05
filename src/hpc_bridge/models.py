@@ -198,6 +198,9 @@ class BlockTerms(BaseModel):
     # it is reached ("8 cores × 0.5 h"). A size the facility decides is costed as a whole node: never understated.
     max_charge: float | None = None
     charge_basis: str | None = None
+    # batch row sizing: the block was derived from a batch's rows ("4 rows at once × (2 CPUs, 1.5 GB) + 1 CPU for
+    # interactive commands"), and the workers it runs
+    derived_from: str | None = None
     charge_unit: str | None = None
 
 
@@ -394,6 +397,67 @@ class HandoffRef(BaseModel):
     jobs: list[str] = Field(default_factory=list)
 
 
+class SizingCandidate(BaseModel):
+    """One row size on one node, for the user to answer in sbatch terms: `cores` per row, each row's `memory_gb` share,
+    and how many rows run at once (`concurrency`)."""
+
+    cores: int
+    memory_gb: float | None = None
+    concurrency: int
+
+
+class BlockFacts(BaseModel):
+    """What a block is (batch row sizing): measured from inside it (`source` "measured"), else what the partition or
+    the registry says of a node of it. `cpus` are scheduler CPUs (a hardware thread where SMT is on); `memory_gb` the
+    limit, `idle_memory_gb` what the worker pool holds idle; `workers` the pool's (a facility may fix it); `limits` a
+    partition's caps; `candidates` the concurrency each row size gives on one node."""
+
+    source: Literal["measured", "partition", "registry", "unknown"]
+    cpus: int | None = None
+    physical_cores: int | None = None
+    threads_per_core: int | None = None
+    memory_gb: float | None = None
+    idle_memory_gb: float | None = None
+    gpus: int | None = None
+    gpu_kind: str | None = None
+    workers: int | None = None
+    workers_fixed: bool = False
+    nodes: int | None = None
+    limits: dict[str, Any] = Field(default_factory=dict)
+    candidates: list[SizingCandidate] = Field(default_factory=list)
+
+
+class BatchSizing(BaseModel):
+    """A batch's rows and what the block gives them: per row `cores` (scheduler CPUs, as `-c` counts them), `memory_gb`
+    (the row is killed at it) and `gpus`; at most `concurrency` at once; `pin` (each row on its own CPUs). `slots`: how
+    many run at once on this block, `bound_by` what bounds them (concurrency | workers | gpus | memory | cpus | width).
+    `defaulted`: what hpc-bridge chose because the call did not; `missing`: what a `needs_sizing` answer asks for;
+    `derived`: the block was derived from these rows (size first)."""
+
+    cores: int | None = None
+    memory_gb: float | None = None
+    gpus: int | None = None
+    concurrency: int | None = None
+    pin: bool = True
+    slots: int | None = None
+    bound_by: str | None = None
+    defaulted: list[str] = Field(default_factory=list)
+    missing: list[str] = Field(default_factory=list)
+    derived: bool = False
+
+
+class SizingProposal(BaseModel):
+    """A size measured from rows that ran (a pilot, or a row killed at a default memory): `cores` = ⌈CPU-s ÷ wall⌉,
+    `memory_gb` = 1.25 × the peak RSS rounded up to a quarter GB, the `concurrency` the block then fits; `evidence`
+    each row's use. `cores` None: no row's CPU-seconds could be read — no evidence of its cores (ask the user)."""
+
+    cores: int | None = None
+    memory_gb: float
+    gpus: int = 0
+    concurrency: int = 0
+    evidence: list[dict[str, Any]] = Field(default_factory=list)
+
+
 class EndpointStatus(BaseModel):
     # needs_confirmation: a scheduler compute block was requested without an explicit spend
     # acknowledgement — nothing was provisioned; re-call with confirm_spend=True to proceed.
@@ -454,11 +518,14 @@ class EndpointStatus(BaseModel):
     # unexpired, or its canary is still out: each one. On an endpoint hpc-bridge stood up, needs_confirmation asks
     # handoffs="cancel"|"keep"; a stop that kept one names it (draining). On a facility endpoint it is only named.
     handoffs: list[HandoffRef] = Field(default_factory=list)
+    # up: the compute block as its check measured it from inside (batch row sizing) — CPUs, memory, GPUs, workers.
+    measured: BlockFacts | None = None
 
 
 # ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------
 
-BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused",
+BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_sizing", "needs_account", "done", "cancelled",
+                     "refused",
                      # a job- or env- id's (batch phase 2a; status answers them in this one model)
                      "queued", "running", "failed", "open", "exhausted", "draining", "closed",
                      # status() with no id: the ledger's listing
@@ -499,6 +566,20 @@ class BatchTaskResult(BaseModel):
     started_at: float | None = None
     settled_by: str | None = None
     task_id: str | None = None
+    # batch row sizing: the attempt's own use, from inside its block — its peak RSS (sampled each second), CPU-seconds,
+    # wall seconds, what nproc said to it, the CPUs (and GPUs) it ran on; `why` the wrapper ended it (timeout,
+    # cancelled, memory); `over_size` what it ran over (cores, memory)
+    peak_rss_mb: float | None = None
+    cpu_s: float | None = None
+    wall_s: float | None = None
+    nproc: int | None = None
+    cpus: str | None = None
+    gpu_ids: str | None = None
+    why: str | None = None
+    # whether the attempt really ran pinned to its CPUs (False: taskset was missing on the node or refused the mask —
+    # it could use every CPU of the block); None: not known (an unsized row, a result from before row sizing)
+    pinned: bool | None = None
+    over_size: list[str] = Field(default_factory=list)
 
 
 class LedgerEntry(BaseModel):
@@ -562,6 +643,11 @@ class BatchStatus(BaseModel):
     envelope: EnvelopeInfo | None = None
     entries: list[LedgerEntry] = Field(default_factory=list)   # kind list: this page of the ledger
     total: int | None = None                                    # kind list: how many match the filters
+    # batch row sizing: the rows' size and what the block gives them; `facts` (needs_sizing) what the block is or would
+    # be; `proposal` (needs_sizing after a pilot or a memory kill at a default size) the size the rows' own use suggests
+    sizing: BatchSizing | None = None
+    facts: BlockFacts | None = None
+    proposal: SizingProposal | None = None
 
 
 class BlockLeft(BaseModel):

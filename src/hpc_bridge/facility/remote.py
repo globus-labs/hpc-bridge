@@ -1657,14 +1657,21 @@ class SlurmFacility:
         """The config sent with a task: the endpoint's own worker_init when known (see adopt_endpoint), and — on the
         compute shape — the block's size as this scheduler's template renders it (hpc_bridge.resources: a slice's
         cores, memory and GPUs, or whole nodes; the request keeps hpc-bridge's names in the runtime config, mapped only
-        here)."""
+        here). The block's workers follow it (batch row sizing): a block derived from a batch's rows runs its slots + 1
+        (`resources.WORKERS`, carried in the runtime config and mapped here); any other runs one per core it holds —
+        the cores asked, or a whole node's as the partition says — and a whole node of unknown cores the ceiling
+        (sizing.WORKER_CEILING), which parsl caps at the CPUs it counts there."""
         if self.endpoint_worker_init is not None and "worker_init" in uec:
             uec = {**uec, "worker_init": self.endpoint_worker_init}
         if not uec.get("compute"):
             return uec
-        from .. import resources
+        from .. import resources, sizing
 
         size = self.block_size(uec)
+        derived = uec.get(resources.WORKERS)
+        workers = derived if isinstance(derived, int) and not isinstance(derived, bool) and derived > 0 else (
+            size.cores or sizing.WORKER_CEILING)
+        uec = {**{k: v for k, v in uec.items() if k != resources.WORKERS}, "max_workers_per_node": workers}
         if self.profile.scheduler == "pbs":
             return resources.pbs_wire(uec, size, resources.shape_of(self.profile.partitions, uec.get("partition")))
         return resources.slurm_wire(uec, size)

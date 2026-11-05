@@ -49,6 +49,10 @@ from .models import PartitionShape
 NODES, CORES, MEM, GPUS, WHOLE = "nodes_per_block", "cores_per_node", "mem_per_node", "gpus_per_node", "exclusive"
 SIZE_KEYS = (NODES, CORES, MEM, GPUS, WHOLE)
 SLICE_KEYS = (CORES, MEM, GPUS, WHOLE)
+# Batch row sizing: a block derived from a batch's rows runs exactly its slots + 1 workers — carried under this
+# hpc-bridge key in the runtime config (part of the block's identity) and mapped to max_workers_per_node at the wire
+# (facility/remote.py dispatch_uec); never a size of the terms.
+WORKERS = "hpcb_workers"
 # ensure_endpoint_up's argument -> the runtime config key it sets
 ARG_KEYS = {"cores": CORES, "memory_gb": MEM, "gpus": GPUS, "nodes": NODES, "whole_node": WHOLE}
 KEY_ARGS = {v: k for k, v in ARG_KEYS.items()}

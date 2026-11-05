@@ -62,6 +62,13 @@
 > [[resources]] (`block_size`, `slurm_wire` / `pbs_wire`): the runtime config keeps hpc-bridge's keys and the session's
 > choice. An endpoint configured before this change renders none of it: no default slice there, and a size request is
 > refused (teardown and connect again).
+>
+> **The workers follow the block** (batch row sizing, 2026-11-04): `dispatch_uec` renders `max_workers_per_node` as a
+> batch-derived block's slots + 1 ([[resources]] `WORKERS`, `hpcb_workers` in the runtime config, dropped at the wire),
+> else the cores the block holds (asked, or a whole node's as the partition says), else `sizing.WORKER_CEILING` for a
+> whole node of unknown cores — parsl caps the pool at the CPUs it counts there, and the idle workers' memory is
+> measured and taken off what rows may use. It was the profile's fixed 2 before, and every SSH batch ran one row at a
+> time.
 
 ## A pid file a killed manager left (2026-10-30, the returning-user cells)
 A manager killed hard (an OOM kill, a crash) leaves `~/.globus_compute/<name>/daemon.pid` on the shared home.

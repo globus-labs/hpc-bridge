@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 import asyncio
+import dataclasses
 import inspect
 import itertools
 import json
@@ -390,10 +391,43 @@ async def _ensure_endpoint_up(
     whole_node: bool | None = None,
     *,
     recheck: bool = True,
+    workers: int | None = None,
+) -> EndpointStatus:
+    """ensure_endpoint_up, with the block as its check measured it from inside once it is up (`measured`, batch row
+    sizing)."""
+    st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
+                               whole_node, recheck=recheck, workers=workers)
+    if st.status == "up" and shape == DEFAULT_SHAPE and st.measured is None:
+        rt = app.shapes.get(shape)
+        c = rt.last_canary if rt is not None else None
+        if c is not None and c.ok and c.block_measure is not None:
+            m = c.block_measure
+            if m.workers is None and c.worker_count:
+                m = dataclasses.replace(m, workers=c.worker_count)
+            st.measured = batch.facts_of(m, workers_fixed=batch._fixed_workers(app))
+    return st
+
+
+async def _ensure_up_once(
+    app: AppCtx,
+    shape: str = DEFAULT_SHAPE,
+    partition: str | None = None,
+    confirm_spend: bool = False,
+    account: str | None = None,
+    cores: int | None = None,
+    memory_gb: int | None = None,
+    gpus: int | None = None,
+    nodes: int | None = None,
+    whole_node: bool | None = None,
+    *,
+    recheck: bool = True,
+    workers: int | None = None,
 ) -> EndpointStatus:
     """ensure_endpoint_up. `recheck` (the tool's own call): a check is sent even when one passed moments ago — a status
     probe re-verifies the worker. A caller about to send work there (run_batch) passes False: a check that passed
-    within the canary TTL is trusted, as run_shell trusts it — its work carries the wrong-block guard."""
+    within the canary TTL is trusted, as run_shell trusts it — its work carries the wrong-block guard. `workers`
+    (run_batch's derived block): the block runs exactly that many workers — on our own template (resources.WORKERS),
+    on a facility endpoint only where its template renders max_workers_per_node (else its own count stands)."""
     if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
         return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=_no_facility_notice(app))
@@ -429,6 +463,14 @@ async def _ensure_endpoint_up(
             return _dropped_term_status(app, shape, f"{bad_size}. Nothing in this call was set or started.")
     if login_only:
         sizing = {}
+    elif workers is not None and not bad_size:
+        takes_key = getattr(app.facility, "takes_size_key", None)
+        if _has_login_shape(app):
+            sizing[resources.WORKERS] = workers
+        elif callable(takes_key) and takes_key("max_workers_per_node"):
+            sizing["max_workers_per_node"] = workers
+    # (a size asked alone keeps a derived block's worker count only while it IS that block — its own size restated, the
+    # same block (review R2-H); any real switch drops it: warmth._repoint, review F1 / R2-E)
     if partition is not None or account is not None or sizing:
         # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
         # startup-pinned one has not read its template yet (that happens at its first block): read it first.
@@ -2578,16 +2620,34 @@ batch.login_runner = _login_runner   # the free login-shape channel the batch en
 batch.login_busy = lambda app: _busy_session(app, "login", _INTERNAL_SESSION)   # an op of ours still holds it
 
 
-async def _batch_ensure_up(app: AppCtx, confirm_spend: bool) -> EndpointStatus:
+async def _batch_ensure_up(app: AppCtx, confirm_spend: bool, size: Any = None) -> EndpointStatus:
     # a check that passed within the canary TTL stands (`recheck`): run_batch right after ensure_endpoint_up said `up`
     # sent a second one, which under load outlived the canary wait and voided a live block's confirmation
-    return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False)
+    if size is None:
+        return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False)
+    # batch row sizing: the block derived from the rows (sizing.DerivedBlock), asked for as ensure_endpoint_up's size —
+    # its cores, memory and GPUs per node (or a whole node, where the partition hands out no less), one node — and its
+    # workers (slots + 1) where the template takes them
+    # one node: named only where the session asked for more (a facility template that renders no nodes_per_block would
+    # refuse the key it already defaults to one)
+    uec = app.shapes["compute"].user_endpoint_config if "compute" in app.shapes else warmth._seed_uec(app, "compute")
+    try:
+        nodes = 1 if int(uec.get("nodes_per_block") or 1) > 1 else None
+    except (TypeError, ValueError):
+        nodes = 1
+    if size.whole_node:
+        return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, whole_node=True,
+                                         gpus=size.gpus, nodes=nodes, recheck=False, workers=size.workers)
+    return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, cores=size.cores,
+                                     memory_gb=size.memory_gb, gpus=size.gpus, nodes=nodes, recheck=False,
+                                     workers=size.workers)
 
 
 async def _run_batch(
     app: AppCtx, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
-    confirm_spend: bool = False, batch_id: str | None = None,
+    confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
+    gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
 ) -> BatchStatus:
     if _no_facility_bound(app) and batch_id is None:
         return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
@@ -2603,7 +2663,9 @@ async def _run_batch(
                         "work itself on the block."))
     return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
                                  task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
-                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id)
+                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
+                                 cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
+                                 pilot=pilot)
 
 
 async def _status(app: AppCtx, id: str | None = None, detail: str = "summary", offset: int = 0,  # noqa: A002
@@ -2647,11 +2709,27 @@ async def _submit_job(
 async def run_batch(
     ctx: Context, command: str | None = None, rows: list[Any] | None = None, task_walltime_s: float | None = None,
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
-    confirm_spend: bool = False, batch_id: str | None = None,
+    confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
+    gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
 ) -> BatchStatus:
     """Run ONE command once per row, many rows, on the session's confirmed compute block — instead of a run_shell
-    per row. hpc-bridge keeps the backlog and sends at most `capacity` tasks at a time (the block's workers, less one
-    kept for your interactive commands); a durable ledger records every row, so the batch survives this server.
+    per row. hpc-bridge keeps the backlog and sends rows as the block's slots free; a durable ledger records every row,
+    so the batch survives this server.
+
+    SIZE THE ROWS the sbatch way, per row as submit_job's array tasks: `cores` (CPUs per row, as -c counts them),
+    `memory_gb` (per row; a row past it is killed: why "memory"), `gpus` (per row, each its own) and `concurrency` (at
+    most this many at once, as --array=…%N). With NO block confirmed yet the block is DERIVED from them (concurrency ×
+    the row + one CPU and one worker for your interactive commands) and the spend question names it; with no size it
+    answers phase="needs_sizing" with `facts` (the block's or the partition's CPUs, memory, GPUs and how many rows each
+    size fits) — ask the user in those terms. On a confirmed block the size is checked against what the block measured
+    (a row that cannot fit is refused with the numbers; too many at once is capped and said); a CPU block with no size
+    given runs 1-CPU rows, the block's share of memory each, as many as fit (said in `sizing.defaulted`). Each row is
+    pinned to its own CPUs (`pin=False`: not pinned) with OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS and PYTHON_CPU_COUNT set
+    to its cores. `pilot=1` (or 2): that many rows run alone with the whole block, then phase="needs_sizing" with a
+    `proposal` (cores, memory) from what they used; resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
+    resize changes only what it names (memory, unnamed, is the block's share again) and is kept even when the block
+    still needs the user's yes (add confirm_spend=True once they give it). Every
+    result carries its peak_rss_mb, cpu_s and nproc; status names rows that ran over their size.
 
     `command`: shell, with `{name}` for each field of a row and `{index}` for the row's number — written BARE, never
     inside quotes, a here-document, arithmetic, [[ ]], ${…} or backticks (refused): each value reaches the command as
@@ -2675,7 +2753,7 @@ async def run_batch(
     try:
         return await _heartbeat(ctx, _run_batch(
             ctx.request_context.lifespan_context, command, rows, task_walltime_s, results_dir, session_id, shape,
-            idempotent, confirm_spend, batch_id), "run_batch")
+            idempotent, confirm_spend, batch_id, cores, memory_gb, gpus, concurrency, pin, pilot), "run_batch")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
         return BatchStatus(phase="refused", reason=f"{type(exc).__name__}: {exc}",
                            notice=f"run_batch failed: {type(exc).__name__}: {exc}")

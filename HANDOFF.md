@@ -13,10 +13,25 @@ facility requires an allocation), and stop is honest (`down` confirmed / `draini
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
 Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1056 passed** (the CI list: 1032). The live tier has
-**103 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
+**111 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_network host_forward bastion vip`,
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
+
+## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — built, live cells next
+
+- `run_batch` sizes rows the sbatch way (`cores`, `memory_gb`, `gpus`, `concurrency`; `pin`, `pilot`): with no block the
+  block is derived from them before the spend question; with no size it answers `needs_sizing` with the block's facts;
+  each row is pinned to its own CPUs/GPUs, its thread counts set, killed past its memory (rc 87). Our SSH template's
+  workers now follow the block (they were a fixed 2: every SSH batch ran one row at a time). Design and rulings: vault
+  `Planned/Batch and swarm execution.md`, "Batch row sizing"; modules `sizing`, `batch`, `ledger`.
+- Live cells to run (scripted, kept out of the sweep until proven): `batch_rows_overlap`, `batch_cores_fit`,
+  `batch_shared_pool`, `batch_memory_kill`, `batch_needs_sizing_then_sized`, `batch_pilot_proposal` (fake `default`),
+  `batch_size_first_terms` (`slices`), `batch_gpu_rows` (`site`; first check that slurmd exports CUDA_VISIBLE_DEVICES for
+  the fake GPUs). The changed graders: `batch_fanout_collect`, `batch_two_servers_one_ledger` (window = 4 CPUs and the
+  slots announced), `batch_crosses_walltime` (27 rows).
+- Follow-up PR: the per-node watcher and one stream helper per row (lifts the 32-rows-per-node cap); a row's own `srun`
+  binding is a documented limitation pending a live check.
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
@@ -254,7 +269,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`, `server-stderr.log` — the MCP server's own stderr) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
-**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 103 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
+**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 111 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
 **Prerequisites** (one-time, in `agentic/.env` — gitignored): `CLAUDE_CODE_OAUTH_TOKEN` (subscription, from `claude setup-token` — **not** an API key), `HPCB_TEST_GLOBUS_DB` (a Globus `storage.db` whose identity the target facility maps — for the MEP that means `gusellerm@uchicago.edu`; check with `python agentic/whoami_globus.py`), and the scoped SSH test user/key (`HPCB_TEST_SSH_*`, default user `hpcbridge-test`; the pool `hpcbridge-test-00..09` for `run_suite`). `HPCB_TEST_GLOBUS_DB_NOACCOUNT` (a second, unmapped identity's db) feeds `mep_no_account`. The fake cluster's `mep` and `pbs_mep` profiles also need `HPCB_MEP_EMAIL` (a real contact address for the managers they register with Globus). Full setup + the pre-merge regression set are in `agentic/README.md`; the design rationale is `docs/hpc-bridge-vault/Planned/Agentic testing - Plan B (runtime sandbox).md`. **`agentic/fakecluster/`** is a compose Slurm cluster wired into both runners (`--target fake`), with PROFILES (`default`; `site` = 3 nodes / debug,compute,gpu / enforced accounting / fake mybalance / 2 login nodes; `mep` = site + two root-run facility MEPs in login01, strict and open schema — the zero-SSH path, with a per-cluster local catalog via the plugin's `HPC_BRIDGE_CATALOG_FILE` seam; `pbs_mep` = the OpenPBS `polaris` cluster + one facility MEP whose template is shaped like ALCF Polaris's), a cluster-admin channel (`ADMIN_SETUP`/`ADMIN_CLEANUP`), mid-run hooks (`MIDRUN_HOOKS`: a `cmd` after a tool result — on every operator but the ACP ones, the free CLI operators via the server's journal — or, Claude SDK only, an Esc DURING a call; `agentic/README.md` → "Mid-run hooks") and declarative scenario coupling (`TARGETS`/`REQUIRES`). See `agentic/fakecluster/README.md`.
 

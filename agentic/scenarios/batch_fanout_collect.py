@@ -10,7 +10,9 @@ same steps itself (connect, confirm one block, run_batch, collect, stop):
 
 GRADED (design §10): one confirmation and one job in sacct (`one_confirmation`, `world:one_block_job`); run_batch
 used, not 40 run_shell calls (`batch_used`); the journal never shows more out than the window (`window_within_capacity`:
-the default profile's 2 workers, one kept for interactive work — a window of 1); the 3 failures reported with their rc
+since batch row sizing — PR 2 — the block's workers follow its cores and an unsized batch's rows take 1 CPU each, so the
+window is the default profile's 4 CPUs at most, and what the batch announced as its slots; it was 2 workers less one, a
+window of 1, before); the 3 failures reported with their rc
 (`failures_have_rc` from the batch's own results, `agent_reports_failures` in the agent's words); stop answers `down`
 (`stop_down`); and the ledger agrees with the scheduler (`world:ledger_matches_sacct`).
 
@@ -36,7 +38,7 @@ TEARDOWN = "delete"
 
 N_ROWS = 40
 FAILING = {7: 3, 19: 3, 33: 3}
-WORKERS = 2          # the default profile's max_workers_per_node
+BLOCK_CPUS = 4       # the default profile's nodes (slurm.conf CPUs=4): 1-CPU rows, at most this many at once
 TASK_WALLTIME_S = 60
 COMMAND = "echo row {n}; case {n} in 7|19|33) exit 3;; esac"
 ROWS = [{"n": i} for i in range(N_ROWS)]
@@ -81,7 +83,7 @@ def batch_used(t: Trace) -> Result:
 
 
 def window_within_capacity(t: Trace) -> Result:
-    return bc.window_within_capacity(t, workers=WORKERS)
+    return bc.window_within_capacity(t, block_cpus=BLOCK_CPUS)
 
 
 def failures_have_rc(t: Trace) -> Result:

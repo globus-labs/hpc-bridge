@@ -8,6 +8,7 @@ from typing import Any, NamedTuple
 
 from .login import login_expired
 from .session_shell import JOB_ID_EXPR, REMAINING_SH
+from .sizing import MEASURE_SH, BlockMeasure, parse_measure
 
 
 class SubmitAnswer(NamedTuple):
@@ -66,6 +67,9 @@ class CanaryResult:
     worker_remaining_s: float | None = None
     # PARSL_WORKER_COUNT on the worker: how many workers its block runs (a batch's window); None when not set.
     worker_count: int | None = None
+    # The block as the worker measured it from inside (batch row sizing: sizing.MEASURE_SH → sizing.parse_measure) —
+    # its CPUs, memory limit and idle use, GPUs, workers; None when nothing was read.
+    block_measure: BlockMeasure | None = None
 
 
 # A worker that runs this proves the compute block is live (manager_online cannot). A result
@@ -103,7 +107,9 @@ _CANARY_CMD = (
     f'echo "{_CANARY_JOB} {JOB_ID_EXPR}"; '
     # The block's remaining walltime and worker count, from inside it (batch phase 1: the admission gate, the window)
     + REMAINING_SH + "; "
-    f'echo "{_CANARY_REMAINING} ${{__hb_rem:-}}"; echo "{_CANARY_WORKERS} ${{PARSL_WORKER_COUNT:-}}"'
+    f'echo "{_CANARY_REMAINING} ${{__hb_rem:-}}"; echo "{_CANARY_WORKERS} ${{PARSL_WORKER_COUNT:-}}"; '
+    # ...and what the block is, from inside it (batch row sizing): its CPUs, memory, GPUs — last, its own variables
+    + MEASURE_SH
 )
 
 
@@ -302,7 +308,8 @@ def _canary_result(res: object, answered_at: float) -> CanaryResult:
                         worker_job=_parse_canary_tagged(stdout, _CANARY_JOB),
                         worker_user=_parse_canary_user(stdout), answered_at=answered_at,
                         worker_remaining_s=_float_or_none(_parse_canary_tagged(stdout, _CANARY_REMAINING)),
-                        worker_count=_int_or_none(_parse_canary_tagged(stdout, _CANARY_WORKERS)))
+                        worker_count=_int_or_none(_parse_canary_tagged(stdout, _CANARY_WORKERS)),
+                        block_measure=parse_measure(stdout))
 
 
 def _float_or_none(v: str | None) -> float | None:
