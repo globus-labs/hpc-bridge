@@ -87,21 +87,22 @@ The full check reads each RECORD as csv, with the env's own Python (`-I`), so a 
 - **An existing env:** the user's line runs OUTSIDE any condition (R2-N9: bash 4+ ignores errexit inside an `if`), under an EXIT trap armed while it runs, so a line whose own errexit stops it, or one that ENDS the shell, is a refusal.
   - The previous EXIT trap is restored, or the line's own if it set one (NS7).
   - A refusal from the trap runs the shell's own EXIT trap with status 88 first (R2-N6).
+  - **A module line where `module` is not defined** (the Anvil live test, F5: a facility worker's shell is not a login shell; on Anvil's multi-user endpoint `module load …` exited 127 where `. /etc/profile.d/modules.sh; module load …` worked): when the line uses `module` or `ml` (`uses_module`) and neither is a function or command there, the first init that exists is sourced first (`MODULE_INITS`: `$LMOD_PKG/init/bash`, `/etc/profile.d/lmod.sh`, `/etc/profile.d/modules.sh`, `/usr/share/lmod/lmod/init/bash`, `/usr/share/Modules/init/bash`; the system paths read under `$HPCB_SYSROOT` when set, the tests' seam), its output on stderr with the rest. A line that still exits 127 with no module command is refused with `nomodule` in its detail; `module_words` says the worker shell has no module system initialised and names the init line to add — in run_shell's refusal, a batch's pause and a job's status.
 - Every `case` pattern carries its `(`: bash 3.2 misparses a bare `pat)` inside `$( … )`.
 - **A refusal** prints ONE line, `HPCB_ENV_REFUSED <nonce> <why> <key> <detail>`, and exits `ENV_RC` (88) before the command. `why` is `gone`, `failed`, `arch`, `activate` or `unsafe`.
 - **Reading it back:**
   - `refusal(rc, stderr, nonce)` believes the line only with the dispatch's nonce.
   - `refusal_mark(text, nonce)` reads the batch wrapper's `.env_refused` copy, again only with its own nonce (N12).
 
-**`activate_check_script(line)`** runs an existing env's line once, on the login node: the very activation, in a subshell (R2-N7).
+**`activate_check_script(line)`** runs an existing env's line once, on the login node: the very activation, in a subshell (R2-N7), after the endpoint venv's scrub every command has ([[session_shell]] `ENDPOINT_VENV_SCRUB`).
 
-**`canary_check(rec)`** is the handoff canary's env check, which prints `HPCB_ENV_OK 1|0`. It is also the very activation in a subshell, standing alone and never on the left of `&&` (R2-N7, SS7).
+**`canary_check(rec)`** is the handoff canary's env check, which prints `HPCB_ENV_OK 1|0`. It is also the very activation in a subshell (the scrub first), standing alone and never on the left of `&&` (R2-N7, SS7).
 
 ### The state (`AppCtx`)
 
 **The fields:**
 - `env_spec`: the session's env.
-- `env_pending`: a new built env still being built (S4). It becomes the session's once it is ready, and `env_note` says what became of it, once.
+- `env_pending`: a new built env still being built (S4). It becomes the session's once it is ready, and `env_note` says what became of it, once. One whose build failed is also `env_failed` (its info), which the answer that says it carries as `env_failed` (`take_failed`; review G1: the failure had been only words in a later notice, beside the session's unchanged `env`).
 - `env_known`: what this server knows of each env. Each is a `_Known` keyed `root\0key` (or `activate\0key`), holding:
   - its info (no name: a name is its owner's, U8);
   - a build or check out, with when it was sent and to which endpoint;

@@ -30,6 +30,8 @@
   - **A refused activation** (`HPCB_ENV_REFUSED`, rc 88) runs nothing — a line that ends the shell included.
   - **Without `env_sh`** the script carries no env code.
 
+- **`ENDPOINT_VENV_SCRUB`** (the Anvil live test, F4, 2026-11-05): a user command ran with `VIRTUAL_ENV` — and PATH's first entry — naming hpc-bridge's own endpoint venv (the one the worker runs from: its env_setup and worker_init activate it), so `uv pip install x` / `pip install x` wrote into it. Every user command now runs without it: the session wrapper (first thing, before the ambient snapshot, and again after `.env` — a PATH an earlier command persisted with the venv's `bin` in it heals), a batch row's wrapper ([[batch]]: the whole wrapper, and the row after its session replay), a job's `job.sh` ([[jobs]]) and the env checks ([[envs]] `activate_check_script`, `canary_check`). It is hpc-bridge's venv only — its arch marker (`.hpcb-arch`) or the `gce-venv` names hpc-bridge and the registry entries give worker venvs; a venv of the user's own (activated by a command, or a BYO endpoint's) is left as it is. `VIRTUAL_ENV` (and `VIRTUAL_ENV_PROMPT`) go and the venv's `bin` leaves PATH, so a bare `python`/`pip` is the node's (or the env's: a built env sets its own after). Nothing of hpc-bridge's own in a command needs that `bin` (the wrappers use builtins and the node's tools); the canary is never wrapped, and reports the worker's own python and dill.
+
 This is the mechanism behind [[Session continuity]]; both invariants (volatile-var filtering, record-safe multi-line env) are documented there.
 
 > [!warning] Base64-carry the command
