@@ -19,5 +19,13 @@ config the cache rung read from `facilities.json` (id → the `ssh_host` the cal
 lets [[connect]] drop such a config when its bring-up fails or hands off, and re-read the record for that host on the
 next connect (Perlmutter report, left-over local state). A `details=` for the id removes the mark.
 
+**Block environments (PR 3, 2026-11-05; [[envs]]).** These fields hold the session's env state:
+- `AppCtx.env_spec`: the session's env (an `envs.EnvSpec`). It applies to the user's commands on both shapes, and never to the internal session.
+- `env_known`: what this server knows of each env, by root and key (its state, a build or check out, when its full check last passed).
+- `env_said_install`: whether the install warning was said.
+- `env_runner`: the build user endpoint on the login node.
+
+They outlive a stop. A binding change or teardown forgets them ([[warmth]] `_drop_all_shapes`, which also closes the runner).
+
 ## See also
 [[server]] · [[shapes]] · [[lifecycle]] · [[runner]]

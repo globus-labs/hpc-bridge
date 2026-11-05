@@ -170,6 +170,15 @@ def test_batch_rows_in_env_wants_every_row_in_the_batchs_env():
     assert not ec.batch_rows_in_env(Trace([run, page2]), rows=3).ok
 
 
+def test_an_env_building_answer_is_owed_a_retry_as_a_cold_start_is():
+    from invariants import cold_start_is_retried
+
+    building = _c("run_shell", {"command": "echo hi"}, {"phase": "env_building", "block_state": "warm"})
+    again = _c("run_shell", {"command": "echo hi"}, {"phase": "complete", "block_state": "warm", "stdout": "hi\n"})
+    assert cold_start_is_retried(Trace([building, again])).ok
+    assert not cold_start_is_retried(Trace([building])).ok
+
+
 # ---- the world check -------------------------------------------------------------------------------------------------
 
 def _disk(*, arch="x86_64", built=1000.0, extra=""):

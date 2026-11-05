@@ -196,7 +196,7 @@ __hb_snap() {
 __hb_base=@@SD@@/.env.base.$$
 __hb_snap > "$__hb_base"
 [ -f @@SD@@/.env ] && . @@SD@@/.env 2>/dev/null
-eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
+@@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
 @@RESULT@@pwd > @@SD@@/.cwd
 # Persist only vars the command added/changed vs the ambient baseline, dropping scheduler
@@ -206,12 +206,29 @@ __hb_rc=$?
   for __hb_n in $(compgen -A export); do
     case "$__hb_n" in @@VOLATILE@@) continue;; esac
     __hb_v="$(printf %s "${!__hb_n}" | base64 | tr -d '\n')"
-    grep -qxF "$__hb_n=$__hb_v" "$__hb_base" && continue
+@@ENVKEEP@@    grep -qxF "$__hb_n=$__hb_v" "$__hb_base" && continue
     printf 'export %s=%q\n' "$__hb_n" "${!__hb_n}"
   done
 } > @@SD@@/.env 2>/dev/null || true
-rm -f "$__hb_base"
+rm -f "$__hb_base"@@ENVRM@@
 exit $__hb_rc
+"""
+
+# The session's env (block environments, hpc_bridge.envs), activated AFTER the session's own .env (so it wins over a
+# PATH an earlier command persisted) and between two snapshots: what the activation alone changed is never persisted —
+# a var the command left as the activation set it is saved as the session had it (or not at all), so a switch of env
+# (or none) leaves nothing of the old one behind. A var the command itself changed after the activation is saved as it
+# is (a PATH it edited keeps the env's bin in it: said in the docs).
+_ENV_PRE = ('__hb_pre=@@SD@@/.env.base.$$.pre; __hb_act=@@SD@@/.env.base.$$.act\n'
+            '__hb_snap > "$__hb_pre"\n')
+_ENV_POST = '__hb_snap > "$__hb_act"\n'
+_ENV_KEEP = r"""    if grep -qxF "$__hb_n=$__hb_v" "$__hb_act" && ! grep -qxF "$__hb_n=$__hb_v" "$__hb_pre"; then
+      __hb_pv=$(grep -m 1 "^$__hb_n=" "$__hb_pre") || continue
+      __hb_pv=${__hb_pv#*=}
+      grep -qxF "$__hb_n=$__hb_pv" "$__hb_base" && continue
+      printf 'export %s=%q\n' "$__hb_n" "$(printf %s "$__hb_pv" | base64 -d)"
+      continue
+    fi
 """
 
 
@@ -225,12 +242,17 @@ _RESULT_RC = ("__hb_rcf=@@SD@@/results/@@KEY@@/rc\n"
 _RESULT_KEY = re.compile(r"^[A-Za-z0-9_-]{1,64}$")
 
 
-def wrap(command: str, session: Session, *, guard: Guard | None = None, result_key: str | None = None) -> str:
+def wrap(command: str, session: Session, *, guard: Guard | None = None, result_key: str | None = None,
+         env_sh: str | None = None) -> str:
     """Wrap a command so cwd and env persist across calls (invisible to the model).
 
     ``guard``: the scheduler job the command must run in (the confirmed block's) and this dispatch's nonce. On any
     other job the wrapper refuses before touching anything (the wrong-block guard above); with the job unset on the
     worker (a LocalProvider block), or no guard, it runs as before.
+
+    ``env_sh``: the session's env (block environments: envs.activation_sh), run after the session's own .env and before
+    the command; nothing it changed is persisted (`_ENV_KEEP`). When it refuses (the env gone, another architecture,
+    the user's line failed) it exits envs.ENV_RC before the command, and the session's cwd and env stay as they were.
 
     The command is base64-encoded and decoded+`eval`'d in the *current* shell, so
     arbitrary shell (brace groups, quotes, ``${VAR}``) cannot textually break out of
@@ -253,8 +275,13 @@ def wrap(command: str, session: Session, *, guard: Guard | None = None, result_k
         tee = _RESULT_TEE.replace("@@KEY@@", result_key)
         rc = _RESULT_RC.replace("@@KEY@@", result_key)
     head = f"mkdir -p {sd}/results/{result_key}\n{rc}" if result_key is not None else ""
+    env = keep = env_rm = ""
+    if env_sh:
+        env = _ENV_PRE + env_sh.rstrip("\n") + "\n" + _ENV_POST
+        keep, env_rm = _ENV_KEEP, ' "$__hb_pre" "$__hb_act"'
     return _guard(guard) + head.replace("@@SD@@", sd) + (
         _WRAP_TEMPLATE.replace("@@TEE@@", tee).replace("@@RESULT@@", "")
+        .replace("@@ENV@@", env).replace("@@ENVKEEP@@", keep).replace("@@ENVRM@@", env_rm)
         .replace("@@SD@@", sd)
         .replace("@@B64@@", b64)
         .replace("@@VOLATILE@@", _VOLATILE_NAME_GLOBS)

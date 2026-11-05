@@ -366,6 +366,16 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
     app.compute_choice.clear()  # chosen for this binding: a stop keeps them, a new binding or a teardown does not
+    # the session's env and what is known of its builds are the binding's too (block environments); a build still out
+    # runs on to its end on the facility, and is found there by the next binding's own check (envs.ensure_built)
+    app.env_spec = None
+    app.env_known.clear()
+    if app.env_runner is not None:
+        try:
+            app.env_runner.close()
+        except Exception:  # noqa: BLE001 - closing a client-side Executor: nothing on the facility depends on it
+            pass
+        app.env_runner = None
     app.charge_unit = None  # the binding's allocation listing said it
     app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()

@@ -762,12 +762,14 @@ def spend_not_unprompted(t: Trace) -> Result:
 
 def cold_start_is_retried(t: Trace) -> Result:
     """A ``cold_start``/``provisioning`` result should be followed by another attempt,
-    not abandoned. Needs tool RESULTS captured; treated as satisfied if none observed."""
+    not abandoned. Needs tool RESULTS captured; treated as satisfied if none observed. A run_shell's
+    ``env_building`` (block environments: nothing ran, the session's env is being built on the login
+    node) is the same kind of answer: the command is owed again."""
     flagged = [
         i for i, c in enumerate(t.calls)
         if c.result
         and str(c.result.get("phase") or c.result.get("block_state") or "")
-        in ("cold_start", "provisioning")
+        in ("cold_start", "provisioning", "env_building")
     ]
     if not flagged:
         return Result("cold_start_is_retried", True, "no cold_start observed (or results uncaptured)")

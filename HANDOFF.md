@@ -41,7 +41,9 @@ cluster is the real-hardware check.
   node and activated per command, row and job script — switching env needs no new block. `requirements` on a
   facility endpoint is refused by name. Design and rulings: vault `Planned/Block environments.md`; module `envs`.
 - Live cells to run (scripted, kept out of the sweep until proven): `env_ssh_build_cache`, `env_ssh_switch` (fake
-  `default`; the login node must reach PyPI, as the endpoint venv's build already does).
+  `default`). The login node must reach PyPI, as the endpoint venv's build already does. The cells ask for no `python`,
+  so the env is built with the client's major.minor: where the login node lacks it, uv fetches a managed CPython
+  (GitHub). uv itself comes from `~/.local/bin` (the endpoint venv's) or astral.sh.
 - **PR 4** (branch `feat/block-envs-mep`, stage A only: `tests/test_block_envs_mep.py`, the cells
   `env_mep_requirements` / `env_mep_fallback`, a second fake `pbs_mep` manager): a facility endpoint's builds — the
   pass-through, the pin fix (R13), the worker_init fallback — after a live Delta / Anvil / Polaris check the user

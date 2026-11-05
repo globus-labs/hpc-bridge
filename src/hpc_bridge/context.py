@@ -484,6 +484,15 @@ class AppCtx:
     # (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus login keeps them, as it keeps
     # a live shape's.
     compute_choice: dict[str, Any] = field(default_factory=dict)
+    # Block environments (hpc_bridge.envs): the session's env (an envs.EnvSpec, the user's choice for both shapes' user
+    # commands — never hpc-bridge's internal session), what this server knows of each env by root and key (its state, a
+    # build out, when its full check last passed), whether "installing runs build code" was said, and the runner env
+    # builds and checks go to — the login node's own user endpoint for them, never the login shape's one worker. Like
+    # the choice above they outlive a stop, and are forgotten with the binding (warmth._drop_all_shapes).
+    env_spec: Any = None
+    env_known: dict[str, Any] = field(default_factory=dict)
+    env_said_install: bool = False
+    env_runner: Any = None
     # The facility's billing unit, from its allocation listing (connect_facility: e.g. "SU"); None: not known, and the
     # terms' cost says "billing units". Forgotten with the binding's shapes (warmth._drop_all_shapes).
     charge_unit: str | None = None

@@ -46,6 +46,7 @@ from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from typing import Any
 
+from . import envs as env_mod  # block environments (`envs` is a local name below: the ledger's envelopes)
 from . import session_shell, warmth
 from . import sizing as sz
 from .config import _parse_hhmmss, _task_ceiling_s
@@ -916,6 +917,7 @@ set -m
 (
   export HPCB_ROW_INDEX=@@I@@ HPCB_ATTEMPT=@@N@@ HPCB_TASK_DIR="$__hb_a" HPCB_ROW_TOKEN="$__hb_tok"
   @@SESSION@@
+@@ENV@@
   @@SLOTENV@@
   @@FIELDS@@
   @@PIN@@
@@ -1002,6 +1004,11 @@ __hb_r="$__hb_r, \"tail_b64\": \"$__hb_tl\", \"stderr_tail_b64\": \"$__hb_el\""
 __hb_r="$__hb_r, \"cpus\": \"$__hb_cpus\", \"gpu_ids\": \"$__hb_gids\", \"pinned\": $__hb_pn"
 __hb_r="$__hb_r, \"peak_rss_kb\": $__hb_pk, \"cpu_s\": $__hb_cs, \"wall_s\": $__hb_wl, \"nproc\": $__hb_np"
 __hb_r="$__hb_r, \"threads\": $__hb_th, \"oom_kills\": $__hb_oom"
+# block environments: the row's env refused it before its command (gone from its root, another architecture, the
+# user's line failed) — it ran nothing; the mark is the activation's own line
+if [ -f "$__hb_a/.env_refused" ]; then
+  __hb_r="$__hb_r, \"env_refused_b64\": \"$(head -c 400 "$__hb_a/.env_refused" | base64 | tr -d '\n')\", \"ran\": false"
+fi
 __hb_out "$__hb_r"
 exit 0
 """
@@ -1189,17 +1196,23 @@ def _slot_env(slot: Slot) -> str:
 def task_script(command: str, *, results_dir: str, index: int, attempt: int, task_walltime_s: float,
                 session: session_shell.Session | None = None, cap_bytes: int = OUTPUT_CAP_BYTES,
                 guard: session_shell.Guard | None = None, min_free_mb: int = MIN_FREE_MB,
-                fields: dict[str, str] | None = None, slot: Slot | None = None) -> str:
+                fields: dict[str, str] | None = None, slot: Slot | None = None, env_sh: str | None = None) -> str:
     """The script one batch task runs on the worker (see the module doc). `results_dir`: the batch's OWN directory
     (`batch_dir`). `session`: the cwd/env it replays READ-ONLY (never written back). `guard`: the wrong-block guard,
     refusing (exit 86) before anything is claimed. `fields`: the row's values, set as HPCB_F_<name> after the session's
     env (`row_values`). `slot` (batch row sizing): the CPUs, GPUs and memory the row holds — claimed on the node,
-    pinned, its libraries sized, killed past its memory; None: an unsized row (a worker, nothing claimed)."""
+    pinned, its libraries sized, killed past its memory; None: an unsized row (a worker, nothing claimed). `env_sh`
+    (block environments: envs.activation_sh): the batch's env, activated after the session's env and BEFORE the slot's
+    (a module's own OMP_NUM_THREADS cannot widen the row); a refusal there ends the row before its command, with its
+    `.env_refused` mark (`ran: false`)."""
     replay = ""
     if session is not None:
         sd = session.quoted_state_dir()
         replay = (f'__hb_cwd=$(cat {sd}/.cwd 2>/dev/null); [ -n "$__hb_cwd" ] && cd "$__hb_cwd"; '
                   f"[ -f {sd}/.env ] && . {sd}/.env")
+    env = ""
+    if env_sh:
+        env = "\n".join("  " + ln for ln in ['__hb_env_mark="$__hb_a/.env_refused"', *env_sh.rstrip("\n").split("\n")])
     b64 = shlex.quote(base64.b64encode(command.encode()).decode())
     if slot is not None:
         cpu_ids = " ".join(str(int(i)) for i in slot.cpu_ids) or "0"
@@ -1222,7 +1235,8 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@MARK@@", RESULT_MARK).replace("@@CANCEL@@", CANCEL_MARKER)
             .replace("@@CRC@@", str(CANCEL_RC)).replace("@@TRC@@", str(TIMEOUT_RC)).replace("@@NRC@@", str(NO_SPACE_RC))
             .replace("@@MINKB@@", str(int(min_free_mb) * 1024)).replace("@@CAP@@", str(int(cap_bytes)))
-            .replace("@@SESSION@@", replay).replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
+            .replace("@@SESSION@@", replay).replace("@@ENV@@", env or "  :")
+            .replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
             .replace("@@WALL@@", str(max(1, round(task_walltime_s)))).replace("@@GRACE@@", str(KILL_GRACE_S))
             .replace("@@RGRACE@@", str(READER_GRACE_S)).replace("@@POLL@@", str(WATCH_POLL_S))
             .replace("@@TAIL@@", str(TAIL_BYTES)).replace("@@ETAIL@@", str(STDERR_TAIL_BYTES)))
@@ -1264,6 +1278,7 @@ class TaskReport:
     gpu_ids: str | None = None
     pinned: bool | None = None          # the row really ran under taskset on its CPUs; None: not said (unsized)
     ran: bool | None = None             # False: the wrapper said the command never started (a refusal before it)
+    env_refused: str | None = None      # block environments: the row's env refused it (its activation's own line)
 
 
 def _b64(v: Any) -> str:
@@ -1313,7 +1328,8 @@ def parse_result(stdout: str | None) -> TaskReport | None:
                 nproc=_whole(d.get("nproc")), threads=_whole(d.get("threads")), oom_kills=_whole(d.get("oom_kills")),
                 cpus=str(d["cpus"]) if d.get("cpus") else None, gpu_ids=str(d["gpu_ids"]) if d.get("gpu_ids") else None,
                 pinned=d["pinned"] if isinstance(d.get("pinned"), bool) else None,
-                ran=d["ran"] if isinstance(d.get("ran"), bool) else None)
+                ran=d["ran"] if isinstance(d.get("ran"), bool) else None,
+                env_refused=_b64(d["env_refused_b64"]).strip() or None if d.get("env_refused_b64") else None)
     return None
 
 
@@ -1468,6 +1484,8 @@ class _Run:
     # a row found no free slot on its node (`slot_busy`)
     measure: sz.BlockMeasure | None = None
     busy_streak: int = 0
+    # block environments: each attempt's activation nonce (its env's refusal line carries it: `_settle_result`)
+    env_nonces: dict[tuple[int, int], str] = field(default_factory=dict)
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -1936,7 +1954,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                     shape: str = "compute", idempotent: bool = False, confirm_spend: bool = False,
                     batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
                     gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None,
-                    pilot: int = 0) -> BatchStatus:
+                    pilot: int = 0, env: Any = None) -> BatchStatus:
     if shape != "compute":
         return _refused(f"run_batch runs on the compute block (shape='compute'); shape {shape!r} is not served")
     try:
@@ -1957,6 +1975,21 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
         return _refused(str(exc))
     if results_dir is not None and not _RESULTS_DIR.match(results_dir):
         return _refused(f"results_dir {results_dir!r} is not a plain absolute path (or one under $HOME / ~)")
+    # block environments: the batch's own env (given, else the session's), recorded with it; a built one is built on
+    # the login node now (free) — admission waits for it — and never changes the block
+    env_rec: dict[str, Any] | None = None
+    try:
+        espec = env_mod.parse(env) if env is not None else app.env_spec
+        if espec is not None and espec.kind != "none":
+            env_mod.delivery(espec, access=env_mod.access_of(app), client_python=env_mod.default_python())
+            if espec.kind == "requirements":
+                k = await env_mod.ensure_built(app, espec)
+                if k.info.state == "failed":
+                    return _refused(f"the batch's env {k.key} could not be built on the login node (the installer "
+                                    f"said, quoted as data: {k.info.error!r}); nothing was recorded")
+            env_rec = env_mod.record(app, espec)
+    except env_mod.EnvRefusal as exc:
+        return _refused(str(exc))
     pre = app.shapes.get("compute")
     approved = pre is not None and pre.spend_confirmed and pre.reaped is None
     derived: sz.DerivedBlock | None = None
@@ -2074,7 +2107,8 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                   session_id=session_id, owner=owner, facility=app.machine,
                   script_hash=hashlib.sha256(command.encode()).hexdigest()[:16], now=_now(),
                   cores=sized.cores, memory_mb=memory_mb, gpus=sized.gpus, concurrency=sized.concurrency,
-                  pin=sized.pin, pilot=pilot, sized=asked is not None or bool(pilot), sizing_defaulted=defaulted)
+                  pin=sized.pin, pilot=pilot, sized=asked is not None or bool(pilot), sizing_defaulted=defaulted,
+                  env=env_rec)
     if run.block_job:   # the block its first check saw, on the record (a restart's presumption counts from it)
         led.add_block_seen(bid, run.block_job)
     app.batches[bid] = run
@@ -2705,6 +2739,18 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         _note_block_from_canary(app, run, rt)
     if not led.counts(bid).get("backlog", 0):
         return 0   # nothing left to admit: the gate has nothing to hold back, and asks for no block
+    if (rec := _env_rec(b)) is not None:   # block environments: rows go only once their env is there
+        state = env_mod.record_state(app, rec)
+        if state == "building":
+            run.waiting = (f"the batch's env {rec.get('key')} is being built on the login node (free): nothing is "
+                           "admitted until it is ready")
+            return 0
+        if state == "failed":
+            pause(app, bid, f"the batch's env {rec.get('key')} could not be rebuilt on the login node: its rows cannot "
+                            "run — cancel this batch and run one with a working env")
+            return 0
+        if (now := env_mod.current_record(app, rec)) != rec:
+            led.update_batch(bid, env=json.dumps(now))
     remaining = run.remaining()
     need = float(b["task_walltime_s"]) + MARGIN_S
     if remaining is None:
@@ -2909,10 +2955,14 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
     led = ledger_of(app)
     bid = run.batch_id
     guard = warmth._new_guard(rt)
+    env_sh = None
+    if (rec := _env_rec(b)) is not None:   # block environments: the batch's own env, activated in the row
+        run.env_nonces[(index, attempt)] = nonce = secrets.token_hex(8)
+        env_sh = env_mod.activation_sh(env_mod.activation_of(rec), nonce)
     script = task_script(substitute(str(b["command"]), row, index, names),
                          results_dir=batch_dir(str(b["results_dir"]), bid), index=index, attempt=attempt,
                          task_walltime_s=float(b["task_walltime_s"]), session=session, guard=guard,
-                         fields=row_values(row, index, names), slot=slot)
+                         fields=row_values(row, index, names), slot=slot, env_sh=env_sh)
     try:
         fut = run.runner.submit(script)
     except Exception as exc:  # noqa: BLE001 - the Executor refused before sending (shut down): never sent
@@ -2947,6 +2997,15 @@ def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: in
               "cores": slot.cores if slot else None, "memory_mb": slot.memory_mb if slot else None,
               "gpus": slot.gpus if slot else None})
     return True
+
+
+def _env_rec(b: dict[str, Any]) -> dict[str, Any] | None:
+    """The batch's env as the ledger records it (block environments: envs.record), or None."""
+    try:
+        rec = json.loads(b.get("env") or "null")
+    except ValueError:
+        return None
+    return rec if isinstance(rec, dict) and rec.get("key") else None
 
 
 def _fresh_ok(app: AppCtx) -> bool:
@@ -3142,6 +3201,12 @@ def _settle_result(app: AppCtx, run: _Run, index: int, attempt: int, res: Any, g
         _event(bid, "batch.settle", index, attempt, "failed")
         return
     _learn_block(app, run, rep)
+    if rep.rc == env_mod.ENV_RC and (rec := _env_rec(led.batch(bid))) is not None:
+        ref = (env_mod.refusal(rep.rc, rep.stderr_tail or err, run.env_nonces.get((index, attempt), "0" * 16))
+               or env_mod.refusal_mark(rep.env_refused))
+        if ref is not None:   # its env refused it on its node, before its command: it ran nothing
+            _env_refused(app, run, index, attempt, rec, ref)
+            return
     if rep.duplicate:   # this task was a second copy of an attempt that already ran: its own result is elsewhere
         led.settle(bid, index, attempt, "submit_unknown", only_from=("in_flight",),
                    evidence="a duplicate of this attempt answered; the one that ran is reconciled from the task group",
@@ -3212,6 +3277,33 @@ def _slot_busy(app: AppCtx, run: _Run, index: int, attempt: int) -> None:
                         "pid,pgid,etime,args), end it, then resume with "
                         f"run_batch(batch_id='{bid}', confirm_spend=True)")
         run.busy_streak = 0
+
+
+def _env_refused(app: AppCtx, run: _Run, index: int, attempt: int, rec: dict[str, Any],
+                 ref: env_mod.Refused) -> None:
+    """The row's env refused it on its node (block environments): it ran nothing, so it goes back to the backlog, never
+    failed. A built env gone from its root (a scratch purge) is rebuilt on the login node (free) and admission waits
+    for it; anything a rebuild cannot mend — built only for another architecture than the node's, the user's line
+    failing there — pauses the batch saying why, as a lock directory's refusal does."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    led.settle(bid, index, attempt, "backlog", only_from=list(HOLDING),
+               evidence=f"its env {ref.key} refused it on its node ({ref.why}): it ran nothing")
+    _event(bid, "batch.settle", index, attempt, "env_refused")
+    if ref.why == "gone":
+        env_mod.rebuild_record(app, rec)
+        return
+    if ref.why == "arch":
+        here, *built = ref.detail.split() or ["?"]
+        why = (f"the batch's env {ref.key} was built for {', '.join(built) or 'another architecture'}; the block's "
+               f"node is {here}: building an env on a node of another architecture needs per-architecture endpoint "
+               "venvs (a follow-up, not built) — run the batch with an existing env there (env={\"activate\": …})")
+    elif ref.why == "activate":
+        why = (f"the batch's env (an existing one) could not be activated on the block's node ({ref.detail}): its line "
+               "fails there — run the batch with a line that works on the compute nodes")
+    else:
+        why = f"the batch's env {ref.key} failed to build (its mark on the node says so)"
+    pause(app, bid, why)
 
 
 def _lock_dir_refused(app: AppCtx, run: _Run, index: int, attempt: int, rep: TaskReport) -> None:
@@ -3798,14 +3890,18 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         text += f" status('{bid}', detail='failed') lists the failed rows with their exit codes."
     if run is not None and run.held_by and state == "admitting" and c.get("backlog", 0):
         text += run.held_by
+    if run is not None and run.waiting and phase == "admitting" and c.get("backlog", 0) and not run.held_by:
+        text += f" Not admitting now: {run.waiting}."
     text += _home_warning(b.get("results_dir"))
+    rec = _env_rec(b)
     return BatchStatus(
         batch_id=bid, phase=phase, tasks=total, chunk=int(b.get("chunk") or 1), capacity=int(b["capacity"] or 1),
         counts=BatchCounts(**{k: c.get(k, 0) for k in BatchCounts.model_fields}),
         results=[_task_result(t, b) for t in rows], offset=offset, next_offset=nxt,
         sizing=_sizing_of(app, run, b), proposal=_proposal_of(b),
         results_dir=batch_dir(str(b["results_dir"]), bid) if b.get("results_dir") else None,
-        blocks_seen=json.loads(b.get("blocks_seen") or "[]"), owner=owner, reason=reason, notice=text)
+        blocks_seen=json.loads(b.get("blocks_seen") or "[]"), owner=owner, reason=reason, notice=text,
+        env=env_mod.info_from_record(env_mod.current_record(app, rec)) if rec is not None else None)
 
 
 # ---- status() with no id: the ledger's listing -----------------------------------------------------------------------
@@ -3870,7 +3966,8 @@ def listing(app: AppCtx, *, offset: int = 0, limit: int = 50, facility: str | No
         out.append((float(b["created_at"]), LedgerEntry(
             id=b["id"], kind="batch", facility=b.get("facility"), state=str(b["state"]), active=active,
             created_at=_iso(float(b["created_at"])) or "", tasks=sum(c.values()), counts=counts,
-            command=_preview(b.get("command")), stale=_batch_stale(app, led, b, now) if active else None)))
+            command=_preview(b.get("command")), stale=_batch_stale(app, led, b, now) if active else None,
+            env=env_mod.label(_env_rec(b)))))
     envs = {e["id"]: e for e in led.envelopes()}
     for e in envs.values():
         active = e["state"] in _ACTIVE_ENVELOPE
@@ -3893,7 +3990,8 @@ def listing(app: AppCtx, *, offset: int = 0, limit: int = 50, facility: str | No
             id=j["id"], kind="job", facility=(envs.get(j["envelope_id"]) or {}).get("facility"),
             state=str(j.get("sched_state") or j["state"]), active=active, created_at=_iso(float(j["created_at"])) or "",
             tasks=int(j.get("tasks") or 1), counts=json.loads(j.get("array_counts") or "{}"),
-            command=_preview(", ".join(what)), stale=_reading_stale(j.get("metered_at"), now) if active else None)))
+            command=_preview(", ".join(what)), stale=_reading_stale(j.get("metered_at"), now) if active else None,
+            env=env_mod.label(_env_rec(j)))))
     rows = [e for _at, e in sorted(out, key=lambda x: (not x[1].active, -x[0]))
             if (facility is None or e.facility == facility) and (e.active or not active_only)]
     limit = max(1, min(int(limit or 50), LIST_MAX))

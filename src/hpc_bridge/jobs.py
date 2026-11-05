@@ -43,10 +43,11 @@ import re
 import secrets
 import shlex
 import time
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 from typing import Any
 
 from . import batch, meter, resources, session_shell
+from . import envs as env_mod  # block environments
 from .config import _parse_hhmmss
 from .context import AppCtx, _has_login_shape
 from .ledger import (
@@ -404,7 +405,8 @@ def job_info(j: dict[str, Any]) -> JobInfo:
                    throttle=j.get("throttle"), array_counts=json.loads(j.get("array_counts") or "{}"),
                    partition=j.get("partition"), account=j.get("account"), walltime=_hms(j.get("walltime_s")),
                    deadline=_iso(j.get("deadline")), script_path=j.get("script_path"),
-                   script_hash=j.get("script_hash"), session_id=j.get("session_id"), unheld=bool(j.get("unheld")))
+                   script_hash=j.get("script_hash"), session_id=j.get("session_id"), unheld=bool(j.get("unheld")),
+                   env=env_mod.info_from_record(batch._env_rec(j)))
 
 
 def envelope_info(app: AppCtx, e: dict[str, Any], *, state: str | None = None) -> EnvelopeInfo:
@@ -523,6 +525,7 @@ class Spec:
     basis: str
     min_charge_h: float | None
     shape: PartitionShape | None
+    env_rec: dict[str, Any] | None = None   # block environments: the env job.sh activates (envs.record)
 
 
 def _array_count(spec: str) -> tuple[int, int | None]:
@@ -642,7 +645,7 @@ def terms_of(app: AppCtx, spec: Spec, deadline: float, backstop: str | None,
                     tasks=spec.tasks, throttle=spec.throttle, rate=spec.rate, unit=UNIT,
                     worst_case=_up(spec.worst_case), basis=spec.basis, min_charge_h=spec.min_charge_h,
                     deadline=_iso(deadline) or "", script_path=script_path, binds=BINDS,
-                    site_backstop=backstop or "none")
+                    site_backstop=backstop or "none", env=env_mod.info_from_record(spec.env_rec))
 
 
 # ---- the frozen job.sh -----------------------------------------------------------------------------------------------
@@ -707,6 +710,12 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
         'if [ -f "$__hpcb_dir/session.cwd" ]; then cd "$(cat "$__hpcb_dir/session.cwd")" 2>/dev/null '
         '|| cd "$__hpcb_dir"; else cd "$__hpcb_dir"; fi',
         '[ -f "$__hpcb_dir/session.env" ] && . "$__hpcb_dir/session.env"',
+    ]
+    if spec.env_rec:   # block environments: the job's env, frozen in the script (so in its hash); refused: exit 88
+        lines += ["# the job's env (block environments): activated after the session's, before the command",
+                  *env_mod.activation_sh(env_mod.activation_of(spec.env_rec), secrets.token_hex(8)).rstrip("\n")
+                  .split("\n")]
+    lines += [
         f'( eval "$(printf %s {b64} | base64 --decode)" )',
         "__hpcb_rc=$?",
         'echo "$__hpcb_rc" > "$__hpcb_dir/exit_code${__hpcb_task:+.$__hpcb_task}"',
@@ -975,7 +984,7 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
                      partition: Any = None, nodes: Any = None, cores: Any = None, memory_gb: Any = None,
                      gpus: Any = None, whole_node: Any = None, walltime: Any = None, array: Any = None,
                      depends_on: Any = None, adopt: Any = None, envelope: Any = None, confirm_spend: bool = False,
-                     exclude_jobs: Any = None) -> JobStatus:
+                     exclude_jobs: Any = None, env: Any = None) -> JobStatus:
     if not _has_login_shape(app):
         return _refused("Jobs mode is SSH-only: a facility multi-user endpoint has no free status or cancel channel "
                         "for a scheduler job, so hpc-bridge could neither meter nor cancel it. On ALCF, Jobs mode "
@@ -1004,6 +1013,26 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
                        array=array, depends_on=depends_on)
         hours = _deadline_hours(req)
     except JobRefusal as exc:
+        return _refused(str(exc))
+    # block environments: the job's env (given, else the session's), built on the login node first (free) — the frozen
+    # job.sh activates it, so it must exist before the script is written
+    try:
+        espec = env_mod.parse(env) if env is not None else app.env_spec
+        if espec is not None and espec.kind != "none":
+            env_mod.delivery(espec, access=env_mod.access_of(app), client_python=env_mod.default_python())
+            if espec.kind == "requirements":
+                k = await env_mod.ensure_built(app, espec)
+                if k.info.state == "building":
+                    return JobStatus(phase="busy", reason="env_building",
+                                     notice=(f"Not submitted yet, and not refused: the job's env {k.key} is being "
+                                             "built on the login node (free), and its script activates it. Call "
+                                             "submit_job again with the same arguments once ensure_endpoint_up says "
+                                             "it is ready."))
+                if k.info.state == "failed":
+                    return _refused(f"the job's env {k.key} could not be built on the login node (the installer said, "
+                                    f"quoted as data: {k.info.error!r}); nothing was submitted")
+            spec = replace(spec, env_rec=env_mod.record(app, espec))
+    except env_mod.EnvRefusal as exc:
         return _refused(str(exc))
     if getattr(app.facility, "account_required", False) and not spec.account:
         return JobStatus(phase="needs_account", reason="account",
@@ -1196,7 +1225,8 @@ async def _admit(app: AppCtx, e: dict[str, Any], spec: Spec, *, confirm_spend: b
                         scheduler=scheduler_of(app), session_id=spec.session_id, cores=spec.cores,
                         memory_gb=spec.memory_gb, gpus=spec.gpus, walltime_s=spec.walltime_s, array_spec=spec.array,
                         throttle=spec.throttle, depends_on=json.dumps(spec.depends), rate=spec.rate,
-                        min_charge_h=spec.min_charge_h, deadline=deadline)
+                        min_charge_h=spec.min_charge_h, deadline=deadline,
+                        env=json.dumps(spec.env_rec) if spec.env_rec else None)
     except EnvelopeExhausted as exc:
         led.update_envelope(e["id"], state="exhausted")
         info = envelope_info(app, led.envelope(e["id"]) or e)

@@ -31,5 +31,20 @@ opens in their own terminal ([[warmth]] `_repair_handoff`). The agent relays it 
 `needs_preauth` command, and never handles the secret; then it calls ensure_endpoint_up again. A proposal's
 `ConnectFacilityResult.reused` is true when the probe ran through the user's online endpoint ([[connect]]).
 
+## Block environments (PR 3, 2026-11-05)
+See [[Block environments]] and [[envs]].
+- **`EnvRequest`** is the `env` argument of `ensure_endpoint_up`, `run_batch`, `submit_job` and `export_handoff`. Its fields are `activate`, `requirements`, `python`, `root` and `name`. `extra="allow"`, so an unknown key reaches `envs.parse` and is refused by name.
+- **`EnvInfo`** fields:
+  - `kind`: `activate` | `built`
+  - `how`: `activate` | `login`
+  - `key`, `name`, `python`, `path`, `root`, `arch`
+  - `state`: `ready` | `building` | `failed` | `unchecked`
+  - `task_id`, `cached`, `lock_sha256`, `size_mb`
+  - `new_block` and `billed`: false and None in PR 3
+  - `index_lines`, `warning`, `error`
+- **Where `EnvInfo` appears:** `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env` and `JobTerms.env`.
+- **`LedgerEntry.env`** is the listing's label.
+- **`ShellOutcome.phase`** gains `env_building`: nothing ran, because the session's env is being built or rebuilt on the login node (free).
+
 ## See also
-[[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]]
+[[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]] · [[envs]]

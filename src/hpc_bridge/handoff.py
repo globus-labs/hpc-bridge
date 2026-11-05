@@ -40,7 +40,7 @@ from typing import Any, Literal
 
 from pydantic import BaseModel, ConfigDict, Field
 
-from . import resources, runner
+from . import envs, resources, runner
 from .config import _parse_hhmmss
 from .context import AppCtx, _has_login_shape, _no_facility_bound
 from .models import EndpointStatus, HandoffRef
@@ -167,6 +167,24 @@ class HandoffClient(_Rec):
     globus_compute_sdk: str | None = None
 
 
+class HandoffEnv(_Rec):
+    """The env the consumer's commands run in (block environments), for the CONSUMER to activate: a built one by its
+    `bin` (put it first on PATH, VIRTUAL_ENV its `path`) — hpc-bridge built it on the login node, for `arch` — or an
+    existing one by its `activate` line (the user's own shell, run before each command). Never the workers' env: the
+    config is unchanged. Data: a consumer quotes what it puts in a shell file."""
+
+    how: str
+    kind: str
+    key: str
+    name: str | None = None
+    python: str | None = None
+    path: str | None = None
+    bin: str | None = None
+    arch: str | None = None
+    lock_sha256: str | None = None
+    activate: str | None = None
+
+
 class QueueCheck(_Rec):
     check: str
     ok: bool
@@ -182,6 +200,7 @@ class HandoffValidation(_Rec):
     remaining_s: float | None = None
     workers: int | None = None
     queue_checks: list[QueueCheck] = Field(default_factory=list)
+    env_ok: bool | None = None          # the record's env, checked by the canary from inside the block (None: no env)
 
 
 class HandoffRelease(_Rec):
@@ -220,6 +239,7 @@ class HandoffRecord(_Rec):
     terms: HandoffTerms
     validation: HandoffValidation
     release: HandoffRelease
+    env: HandoffEnv | None = None       # block environments: the env the consumer's commands run in (None: none)
 
 
 class HandoffFormatError(ValueError):
@@ -604,6 +624,7 @@ class Plan:
     access: str
     scheduler: str
     facts: dict[str, Any] = field(default_factory=dict)
+    env: dict[str, Any] | None = None   # block environments: the env's record (envs.record), checked by the canary
 
 
 _NEEDS_ACCOUNT = ("Nothing was sent: this facility charges every block to an account, and the config names none. Ask "
@@ -898,7 +919,7 @@ def _persist(p: Pending) -> None:
         d.mkdir(parents=True, exist_ok=True, mode=0o700)
         raw = {"key": p.key, "eid": p.eid, "task_id": p.task_id, "sent_at": p.sent_at, "approved": p.approved,
                "hours": p.hours, "wire": p.plan.wire, "access": p.plan.access, "scheduler": p.plan.scheduler,
-               "terms": p.terms.model_dump(mode="json")}
+               "terms": p.terms.model_dump(mode="json"), "env": p.plan.env}
         tmp = d / f".pending-{p.key[:32]}.tmp"
         fd = os.open(tmp, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o600)
         with os.fdopen(fd, "w") as fh:
@@ -921,7 +942,8 @@ def _from_disk(raw: dict[str, Any], md: dict[str, Any]) -> Pending | None:
     try:
         text = md.get("user_config_template") or ""
         wire = dict(raw["wire"])
-        plan = Plan(wire=wire, hb=wire, template=str(text), access=str(raw["access"]), scheduler=str(raw["scheduler"]))
+        plan = Plan(wire=wire, hb=wire, template=str(text), access=str(raw["access"]), scheduler=str(raw["scheduler"]),
+                    env=raw.get("env") if isinstance(raw.get("env"), dict) else None)
         _facts(plan)
         tid = raw.get("task_id")
         return Pending(key=str(raw["key"]), runner=None, future=None, plan=plan,
@@ -1004,15 +1026,48 @@ def _ask_notice(terms: HandoffTerms, plan: Plan) -> str:
 
 
 async def export(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = DEFAULT_EXPIRES_H,
-                 confirm_spend: bool = False) -> HandoffResult:
+                 confirm_spend: bool = False, *, env: Any = None) -> HandoffResult:
     try:
-        return await _export(app, user_endpoint_config, expires_hours, confirm_spend)
+        return await _export(app, user_endpoint_config, expires_hours, confirm_spend, env)
     except HandoffRefusal as r:
         phase: Literal["refused", "needs_account"] = "needs_account" if r.reason == "needs_account" else "refused"
         return HandoffResult(phase=phase, reason=r.reason, notice=r.notice)
 
 
-async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bool) -> HandoffResult:
+async def _env_record(app: AppCtx, env: Any, access: str) -> dict[str, Any] | None:
+    """The handoff's env (block environments), for the consumer to activate: an existing env's line, or a built one —
+    built on the login node first (free), since the canary checks it. Never the workers' env: the config is unchanged.
+    A built env on a facility endpoint is refused by name (PR 4's)."""
+    try:
+        spec = envs.parse(env)
+        if spec is None or spec.kind == "none":
+            return None
+        envs.delivery(spec, access=access, client_python=envs.default_python())
+        if spec.kind == "requirements":
+            k = await envs.ensure_built(app, spec)
+            if k.info.state == "building":
+                raise HandoffRefusal("env_building", f"Nothing was sent yet: the handoff's env {k.key} is being built "
+                                                     "on the login node (free), and the canary checks it. Call "
+                                                     "export_handoff again with the same arguments once it is ready.")
+            if k.info.state == "failed":
+                raise HandoffRefusal("env", f"Refused, nothing was sent: the handoff's env {k.key} could not be built "
+                                            "on the login node (the installer said, quoted as data: "
+                                            f"{k.info.error!r}).")
+        return envs.current_record(app, envs.record(app, spec))
+    except envs.EnvRefusal as exc:
+        raise HandoffRefusal("env", f"Refused, nothing was sent: {exc}.") from None
+
+
+def _record_env(rec: dict[str, Any] | None) -> HandoffEnv | None:
+    if not rec:
+        return None
+    path = rec.get("path")
+    return HandoffEnv(how=str(rec.get("how")), kind=str(rec.get("kind")), key=str(rec.get("key")),
+                      name=rec.get("name"), python=rec.get("python"), path=path, bin=f"{path}/bin" if path else None,
+                      arch=rec.get("arch"), lock_sha256=rec.get("lock_sha256"), activate=rec.get("line"))
+
+
+async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bool, env: Any = None) -> HandoffResult:
     hours = _hours(expires_hours)
     if _no_facility_bound(app) or app.state.endpoint_id is None:
         raise HandoffRefusal("no_facility", "Refused: no facility is connected — connect_facility first.")
@@ -1022,7 +1077,9 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
     access = "ssh" if ssh else "mep"
     eid = str(app.state.endpoint_id)
     caller = normalize(app, given, access)
-    key = _key(app, eid, caller)
+    env_rec = await _env_record(app, env, access)
+    # another env is another handoff (its canary checks that env): the key carries the env's own
+    key = _key(app, eid, {**caller, "__env__": env_rec.get("key")} if env_rec else caller)
     md = await _metadata(app, eid)
     pend = app.handoffs.get(key)
     if pend is None:   # another life of this server sent it: collect it by its task id, never send another
@@ -1036,6 +1093,7 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
     if pend is not None:
         return await _collect(app, pend)
     plan = build(app, caller, md, access)
+    plan.env = env_rec
     if getattr(app.facility, "account_required", False) and not plan.hb.get("account"):
         raise HandoffRefusal("needs_account", _NEEDS_ACCOUNT)
     terms = terms_of(app, plan, hours)
@@ -1047,7 +1105,7 @@ async def _export(app: AppCtx, given: Any, expires_hours: Any, confirm_spend: bo
     run = app.runner_factory(eid, user_endpoint_config=dict(plan.wire), walltime=CANARY_WALLTIME_S,
                              timeout=WAIT_S)
     try:
-        fut = run.submit(CANARY_CMD)
+        fut = run.submit(CANARY_CMD + (f"; {envs.canary_check(plan.env)}" if plan.env else ""))
     except Exception as exc:  # noqa: BLE001 - the dispatch path refused it: nothing is queued
         return HandoffResult(phase="refused", reason="canary_failed",
                              notice=f"The canary could not be sent: {runner.dispatch_error_text(exc)}")
@@ -1237,8 +1295,10 @@ def _exported(app: AppCtx, pend: Pending, res: Any) -> HandoffResult:
         validation=HandoffValidation(ok=ok, task_id=pend.task_id or _task_id(pend.future), job_id=job, host=host,
                                      device_pin=pins,
                                      identity=seen.worker_user, remaining_s=seen.worker_remaining_s,
-                                     workers=seen.worker_count, queue_checks=checks),
+                                     workers=seen.worker_count, queue_checks=checks,
+                                     env_ok=_tagged(out, "HPCB_ENV_OK")[-1:] == ["1"] if plan.env else None),
         release=release_of(plan, job, seen.worker_user),
+        env=_record_env(plan.env),
     )
     path = _write(rec)
     app.handoffs.pop(pend.key, None)

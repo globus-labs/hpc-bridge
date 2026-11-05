@@ -86,6 +86,10 @@ answer until the shape is warm.
   sync-wait on a runtime a release retired, on the bound endpoint. `server._block_work` uses the same helper.
 - **A passing check clears a ghost.** `_confirm_worker` removes the endpoint from `AppCtx.ghost_endpoints` (see
   [[connect]]).
+- **Block environments (PR 3, [[envs]]).** `_drop_all_shapes` handles a binding change or a teardown.
+  - It forgets the session's env and what is known of each env (`env_spec`, `env_known`).
+  - It closes the build runner (`env_runner`); a build it cuts off claims nothing.
+  - A stop keeps all of them.
 
 ## See also
 [[server]] · [[context]] · [[config]] · [[cost]] · [[notices]] · [[lifecycle]] · [[runner]]

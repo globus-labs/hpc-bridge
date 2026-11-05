@@ -1,51 +1,49 @@
-"""Block environments (PR 3; vault `Planned/Block environments.md`): point work at a software environment — one that
-exists on the facility (`activate`: a shell line) or one built from a requirements list (`requirements`) — for
-interactive commands, batch rows, Jobs-mode jobs and handoffs. Written failing first: the whole module is a strict
-xfail until the build lands (then the mark comes off; a test that passes before then is an XPASS, which fails).
+"""Block environments (PR 3; vault `Planned/Block environments.md`, module `Modules/envs.md`): point work at a software
+environment — one that exists on the facility (`activate`: a shell line) or one built from a requirements list
+(`requirements`) — for interactive commands, batch rows, Jobs-mode jobs and handoffs. Written failing first (a strict
+xfail module at stage A, 2026-11-05); green with the build.
 
-Where a built env is built, and how it is used (the user's decisions 1-3, 2026-11-04):
-- on a facility whose endpoint hpc-bridge stood up over SSH: a SEPARATE user env, built on the login node by the free
-  login worker (its own runner, never the internal session), activated per command, row and job script — never the
+Where a built env is built, and how it is used (the user's decisions 1-3, 2026-11-04, and the checkpoint's rulings,
+2026-11-05):
+- on a facility whose endpoint hpc-bridge stood up over SSH: a SEPARATE user env, built on the login node by a user
+  endpoint of its own (the login shape's config plus `envs.BUILD_UEC_KEY`: it never takes the login shape's ONE worker,
+  so run_shell(shape="login") and a stop go on while it builds), activated per command, row and job script — never the
   worker's env, so switching env never needs a new block (`how="login"`). A compute node of another architecture than
-  the login node builds its own in a task on the confirmed block (`how="block"`: billed);
-- on a facility endpoint whose template reads `requirements` (Delta, Anvil): passed through — the worker's env, built by
-  the facility when the block starts; a new env is a new user endpoint and a new block (`how="facility"`);
-- on one whose template does not (Polaris): built by the block's own `worker_init` under `flock` where the node has it,
-  then activated per command as on SSH; the first build is billed (`how="worker_init"`);
-- an existing env (`activate`) is the user's line, run before each command, row and job (`how="activate"`).
+  the login node is refused by name (a follow-up: per-architecture endpoint venvs);
+- an existing env (`activate`) is the user's line, run before each command, row and job (`how="activate"`), on every
+  kind of facility — a facility's multi-user endpoint too, with no new block;
+- `requirements` on a facility endpoint is refused by name: its builds (the pass-through, the pin, the worker_init
+  fallback) are PR 4's, after a live check (tests/test_block_envs_mep.py, on branch feat/block-envs-mep).
 
-The surface these tests are written against (the stage-A checkpoint fixes it):
+The surface these tests are written against (the checkpoint fixed it):
 
 - `env` on ensure_endpoint_up, run_batch, submit_job and export_handoff (server `_ensure_endpoint_up(…, env=)`,
   `_run_batch(…, env=)`, `_submit_job(…, env=)`, `_export_handoff(…, env=)`): `{"activate": "<shell line>"}` |
   `{"requirements": "<requirements.txt text>", "python": "3.11"?, "root": "<dir>"?}`, either with `name` (a label) |
   `{}` (no env) | omitted (keep the session's). The session's env holds for both shapes of the session's user commands
   (never hpc-bridge's internal ones), as a partition does; run_batch's and submit_job's own env is that batch's or job's.
-- `models.EnvInfo` {kind: activate|built, how: activate|login|block|facility|worker_init, key (16 hex), name, python,
-  path, root, state: ready|building|failed|unchecked, task_id, cached, lock_sha256, size_mb, new_block, billed,
-  index_lines, warning, error} on `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env`,
-  `JobTerms.env`; `LedgerEntry.env` (a label); `ShellOutcome.phase` gains `env_building` (nothing ran: the env is being
-  built or rebuilt; call again); handoff: `HandoffRecord.env`, `HandoffValidation.env_ok`.
+- `models.EnvInfo` {kind: activate|built, how: activate|login, key (16 hex), name, python, path, root, state:
+  ready|building|failed|unchecked, task_id, cached, lock_sha256, size_mb, new_block, billed, index_lines, warning,
+  error} on `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env`, `JobTerms.env`;
+  `LedgerEntry.env` (a label); `ShellOutcome.phase` gains `env_building` (nothing ran: the env is being built or
+  rebuilt on the login node); handoff: `HandoffRecord.env`, `HandoffValidation.env_ok`.
 - `hpc_bridge.envs`: `parse(value) -> EnvSpec | None` (EnvRefusal by name), `EnvSpec(kind, activate, requirements,
   python, root, name)`, `normalize_requirements`, `index_lines`, `default_python()` (the client's major.minor),
   `env_key(spec)` (16 hex: sha256 of "hpcb-env-v1", the Python and the normalized text; the directory on the facility
   is `<root>/<key>-<uname -m>`), `env_root(scratch_root, root=None) -> (root, warning)`, `Activation(how, key, root,
   line)` and `activation_sh(act, nonce)`, `refusal(rc, stderr, nonce) -> Refused(why, key, detail) | None` (why:
   gone|failed|arch|activate; rc `ENV_RC` 88, the line `REFUSED <nonce> <why> <key> …`), `build_script(spec, *, key,
-  root, python, token, probe=False, proxy=None)` (every one carries `BUILD_TAG`), `parse_build`, `check_script(*, key,
-  root)` / `parse_check` (ready|partial|gone|failed|arch), `fallback_worker_init(spec, *, key, root, python,
-  proxy=None)`, `pin_into_active(worker_init)`, `delivery(spec, *, access, reads_requirements, reads_worker_init,
-  client_python)`, `MARKER` (".hpcb-env"), `BUILD_S` (a build's own runner's walltime), `VERIFY_EVERY_S`.
-- `MEPFacility.reads(key) -> bool | None`: the published template uses the key and the schema lets it through (None:
-  the template was not read).
+  root, python, token)` (every one carries `BUILD_TAG`), `parse_build`, `check_script(*, key, root)` / `parse_check`
+  (ready|partial|gone|failed|arch), `delivery(spec, *, access, client_python)`, `MARKER` (".hpcb-env"),
+  `BUILD_UEC_KEY`, `BUILD_S` (a build's own runner's walltime), `VERIFY_EVERY_S`.
 - `session_shell.wrap(…, env_sh=)`, `batch.task_script(…, env_sh=)`: the activation, after the session's own env and
   before the row's slot env; the session never persists what the activation changed. `Ledger.add_batch(…, env=)`.
 
 The world: the facility is this machine's bash (the handoff tests' block: a scheduler's env, HOME in tmp), with a `uv`
 stub first on PATH that makes a venv the real interpreter runs as one (`pyvenv.cfg` home) and "installs" a
 requirement as a package dir with its dist-info RECORD; `nosuchpkg` fails as uv's resolver does. Login and compute run
-on the same machine and are told apart by the runner that sent each command (its config's `compute`); a compute node
-of another architecture is a fake `uname` on that shape's PATH.
+on the same machine and are told apart by the runner that sent each command (its config's `compute`; a build's runner
+carries `BUILD_UEC_KEY`); a compute node of another architecture is a fake `uname` on that shape's PATH.
 """
 from __future__ import annotations
 
@@ -66,6 +64,7 @@ from hpc_bridge import server
 from tests.test_handoff_phase2b import (
     FAKE_SCHEMA,
     FAKE_TEMPLATE,
+    LOAM_UEC,
     SSH_EID,
     _Block,
     _Out,
@@ -76,9 +75,7 @@ from tests.test_server import _PendingFuture, _Res
 
 _BASH = shutil.which("bash")
 _FLOCK = shutil.which("flock")
-pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash"),
-              pytest.mark.xfail(strict=True, reason="block environments: stage A, failing first (the build removes "
-                                                    "this)")]
+pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
 
 PY = f"{sys.version_info.major}.{sys.version_info.minor}"
 ARCH = os.uname().machine          # what `uname -m` prints here
@@ -431,7 +428,7 @@ def test_the_env_argument_takes_three_forms_and_refuses_the_rest_by_name():
         ({"requirements": "# only a comment\n\n"}, "requirements"),
         ({"activate": "   "}, "activate"),
         ({"requirements": 5}, "requirements"),
-        ({"requirements": "six\n" * (envs.MAX_REQUIREMENTS // 4)}, "requirements"),
+        ({"requirements": "six\n" * (envs.MAX_REQUIREMENTS // 4 + 1)}, "requirements"),
         ({"activate": "x" * (envs.MAX_ACTIVATE + 1)}, "activate"),
         ({"requirements": "six", "root": "relative/envs"}, "root"),
         ({"requirements": "six", "root": "/scratch/$(id)/envs"}, "root"),
@@ -487,7 +484,91 @@ def test_the_env_root_is_the_facilitys_scratch_else_home_with_a_size_warning():
     assert root == "/project/abc/envs" and warn is None
 
 
+def test_the_users_own_index_lines_are_kept_and_listed_and_none_is_ever_added():
+    from hpc_bridge import envs
+
+    text = ("--index-url https://mirror.example.org/simple\n--extra-index-url https://download.pytorch.org/whl/cu121\n"
+            "-f https://example.org/wheels\nsix==1.17.0 --hash=sha256:" + "a" * 64 + "\n--only-binary :all:\n")
+    spec = envs.parse({"requirements": text})
+    assert envs.index_lines(spec.requirements) == ["--index-url https://mirror.example.org/simple",
+                                                   "--extra-index-url https://download.pytorch.org/whl/cu121",
+                                                   "-f https://example.org/wheels"]
+    plain = envs.parse({"requirements": "six==1.17.0"})
+    script = envs.build_script(plain, key=envs.env_key(plain), root="/scratch/u/envs", python="3.11", token="t0")
+    for flag in ("--index-url", "--extra-index-url", "--find-links", "--default-index", "--index ", "UV_INDEX",
+                 "PIP_INDEX", "--allow-insecure-host", "--trusted-host"):
+        assert flag not in script, flag
+
+
+# ---- 2. where an env is built, and how it is used ----------------------------------------------------------------------
+
+def test_an_ssh_endpoint_builds_on_its_login_node_and_a_facility_endpoint_takes_existing_envs_only():
+    """PR 3: a built env on an endpoint hpc-bridge stood up over SSH; an existing env anywhere; a facility endpoint's
+    builds are PR 4's (after a live check), refused by name meanwhile — saying what works there instead."""
+    from hpc_bridge import envs
+
+    req, act = envs.parse({"requirements": "six"}), envs.parse({"activate": "module load x"})
+    other = envs.parse({"requirements": "six", "python": "3.9" if PY != "3.9" else "3.10"})
+    assert envs.delivery(req, access="ssh", client_python=PY) == "login"     # built on the login node, free
+    assert envs.delivery(other, access="ssh", client_python=PY) == "login"   # a separate user env: any Python
+    assert envs.delivery(act, access="ssh", client_python=PY) == "activate"
+    assert envs.delivery(act, access="mep", client_python=PY) == "activate"  # nothing to build, nothing to read
+    with pytest.raises(envs.EnvRefusal) as e:
+        envs.delivery(req, access="mep", client_python=PY)
+    assert "facility endpoint" in str(e.value) and "not supported yet" in str(e.value) and "activate" in str(e.value)
+
+
 # ---- 3. the build, its check, its marker (bash, the uv stub) ----------------------------------------------------------
+
+def test_two_login_builds_at_once_leave_one_env_and_nothing_else(tmp_path):
+    """Two servers (or two calls) building one env at once: correctness is the rename (the endpoint venv's rule) — of
+    two builds one claims the path and the other uses it; where the node has `flock` the second waits instead."""
+    from hpc_bridge import envs
+
+    spec = envs.parse({"requirements": REQS})
+    key = envs.env_key(spec)
+    env = _box(tmp_path, HPCB_TEST_UV_SLOW="1.5")
+    procs = [subprocess.Popen([_BASH, "-c", envs.build_script(spec, key=key, root=str(tmp_path / "envs"), python=PY,
+                                                              token=f"t{i}")],
+                              env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True)
+             for i in (1, 2)]
+    outs = [p.communicate(timeout=60)[0] for p in procs]
+    assert all(p.returncode == 0 for p in procs)
+    built = [envs.parse_build(o) for o in outs]
+    assert all(b is not None and b.ok and b.path == str(tmp_path / "envs" / f"{key}-{ARCH}") for b in built), outs
+    assert _beside(tmp_path / "envs") == [f"{key}-{ARCH}"]
+    if _FLOCK:
+        assert _venvs(tmp_path) == 1
+
+
+def test_a_build_cut_off_midway_leaves_no_half_claimed_env(tmp_path):
+    """A build killed in the middle (a teardown stopping the endpoint, the login node's own reaper) leaves only its own
+    hidden build directory beside the root — never a `<key>-<arch>` an activation would take for the env — and the
+    next build claims a whole one."""
+    import signal
+
+    from hpc_bridge import envs
+
+    spec = envs.parse({"requirements": REQS})
+    key, root = envs.env_key(spec), tmp_path / "envs"
+    env = _box(tmp_path, HPCB_TEST_UV_SLOW="3")
+    p = subprocess.Popen([_BASH, "-c", envs.build_script(spec, key=key, root=str(root), python=PY, token="t1")],
+                         env=env, cwd=tmp_path, stdout=subprocess.PIPE, stderr=subprocess.PIPE, text=True,
+                         start_new_session=True)
+    deadline = time.monotonic() + 30
+    while not _uv(tmp_path) and time.monotonic() < deadline:   # inside the install now
+        time.sleep(0.1)
+    os.killpg(p.pid, signal.SIGKILL)
+    p.communicate(timeout=30)
+    assert not (root / f"{key}-{ARCH}").exists()
+    check = envs.parse_check(_bash(envs.check_script(key=key, root=str(root)), _box(tmp_path)).stdout)
+    assert check is not None and check.state == "gone"
+    assert all(n.startswith(".") for n in _beside(root)), _beside(root)   # only its own hidden leftovers
+    _spec, _key2, _root, b, _p = _built(tmp_path, root=root)
+    assert b.ok and not b.cached and (root / f"{key}-{ARCH}" / envs.MARKER).is_file()
+
+
+
 
 def test_the_build_makes_a_relocatable_venv_keeps_its_lock_and_marks_its_arch(tmp_path):
     from hpc_bridge import envs
@@ -716,19 +797,34 @@ async def test_ssh_a_failed_build_says_why_and_keeps_the_env_that_works(tmp_path
     assert "T=old" in out.stdout, out
 
 
-async def test_ssh_the_build_runs_on_its_own_runner_and_never_holds_the_internal_session(tmp_path):
+async def test_ssh_a_build_never_takes_the_login_shapes_worker_and_never_holds_the_internal_session(tmp_path):
+    """Ruling 7 (a): the login shape's user endpoint has ONE worker (shapes.shape_config) — a build there would take it,
+    and run_shell(shape="login") and a stop's scancel would wait behind it. A build goes to the login node's own user
+    endpoint for builds (the login shape's config plus BUILD_UEC_KEY: a worker of its own), with a build's walltime."""
     from hpc_bridge import batch, envs
 
     app = await _ssh(tmp_path)
+    assert (await server._ensure_endpoint_up(app, "login")).status == "up"   # the login shape, its one worker
     app.runners.hold_builds = True                                        # a long install
     st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
     assert st.status == "up" and st.env.state == "building" and st.env.task_id == "build-1", st.env
-    walls = [kw.get("walltime") for uec, kw in app.runners.kwargs if not uec.get("compute", True)]
-    assert envs.BUILD_S in walls                                          # its own runner, a build's own walltime
+    builders = [(uec, kw) for uec, kw in app.runners.kwargs if uec.get(envs.BUILD_UEC_KEY)]
+    assert builders and all(uec.get("compute", True) is False and kw.get("walltime") == envs.BUILD_S
+                            for uec, kw in builders), app.runners.kwargs
+    login_uec = app.shapes["login"].runner.user_endpoint_config
+    assert envs.BUILD_UEC_KEY not in login_uec and not any(envs.BUILD_TAG in c
+                                                           for c in app.shapes["login"].runner.commands)
     assert server._busy_session(app, "login", server._INTERNAL_SESSION) is None
     assert (await batch.login_runner(app)("echo internal")).phase == "complete"   # the scheduler ops still run
+    mine = await server._run_shell(app, "echo LOGIN", shape="login", session_id="other", agent_call=True)
+    assert mine.phase == "env_building", mine                             # the session's env is not there yet…
+    await server._ensure_endpoint_up(app, "compute", env={})
+    mine = await server._run_shell(app, "echo LOGIN", shape="login", agent_call=True)
+    assert mine.phase == "complete" and "LOGIN" in mine.stdout, mine      # …but the login shape's worker is free
+    await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})   # the same build, still out
     out = await server._run_shell(app, "echo RAN", agent_call=True)
     assert out.phase == "env_building" and "RAN" not in out.stdout, out
+    assert len(app.runners.held) == 1                                     # asked again: never a second build
     app.runners.release()
     st = await server._ensure_endpoint_up(app, "compute")
     assert st.env.state == "ready" and st.env.key == _key()
@@ -737,6 +833,25 @@ async def test_ssh_the_build_runs_on_its_own_runner_and_never_holds_the_internal
     assert out.phase == internal.phase == "complete"
     assert envs.REFUSED in app.shapes["compute"].runner.commands[-1]          # the agent's command: activated
     assert envs.REFUSED not in app.shapes["login"].runner.commands[-1]        # hpc-bridge's own: never
+
+
+async def test_ssh_a_stop_during_a_build_is_never_held_by_it_and_the_env_is_whole_after(tmp_path):
+    """Ruling 7 (b): stop_endpoint while a build runs answers at once — the build is no task of a shape, holds no
+    session and no worker of the login shape — and cancels nothing of it: the build runs on to its end on the login
+    node and is claimed whole (one rename), or, cut off, leaves no half-claimed env (the bash test above)."""
+    from hpc_bridge import envs
+
+    app = await _ssh(tmp_path)
+    app.runners.hold_builds = True
+    await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
+    st = await server._stop_endpoint(app)
+    assert st.status in ("down", "draining") and "build" not in (st.notice or "").lower(), st
+    assert not app.runners.held[0][1].done()                              # nothing of the build was cancelled
+    assert not _home_env(tmp_path, _key()).exists()                       # nothing claimed while it runs
+    app.runners.release()
+    st = await server._ensure_endpoint_up(app, "login")
+    assert st.env is not None and st.env.state == "ready", st.env         # the session's env outlived the stop
+    assert (_home_env(tmp_path, _key()) / envs.MARKER).is_file()
 
 
 async def test_ssh_a_purged_env_runs_nothing_and_is_rebuilt_on_the_login_node(tmp_path):
@@ -762,19 +877,36 @@ async def test_ssh_a_partly_purged_env_fails_its_check_and_is_rebuilt(tmp_path, 
     assert st.env.state == "ready" and st.env.cached is False and victim.is_file() and _venvs(tmp_path) == 2, st.env
 
 
-async def test_ssh_a_compute_node_of_another_arch_builds_its_own_env_in_a_task_on_the_block(tmp_path):
+async def test_ssh_a_block_newly_confirmed_checks_the_sessions_env_again_and_a_confirmed_one_does_not(tmp_path):
+    """Ruling 5's third time: the full check runs when the env is chosen, once VERIFY_EVERY_S has passed, and when a
+    block is newly confirmed — a purge between one block and the next is a rebuild before the first command."""
+    app = await _ssh(tmp_path)
+    e = (await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})).env
+    st = await server._ensure_endpoint_up(app, "compute", confirm_spend=True)    # the same block, confirmed again
+    assert st.status == "up" and len(_builds(app)) == 1, st                       # nothing sent
+    victim = next(Path(e.path).glob("lib/python*/site-packages/six/__init__.py"))
+    victim.unlink()
+    app.shapes["compute"].spend_confirmed = False                                  # the block reaped: a new yes
+    st = await server._ensure_endpoint_up(app, "compute", confirm_spend=True)
+    assert st.status == "up" and len(_builds(app, compute=False)) == 2 and _builds(app, compute=True) == [], st
+    assert st.env.state == "ready" and st.env.cached is False and victim.is_file(), st.env
+
+
+async def test_ssh_a_compute_node_of_another_arch_is_refused_by_name_and_nothing_is_built_there(tmp_path):
+    """Ruling 10: the env is built on the login node, for its architecture; a node of another one finds no build of its
+    own and refuses — naming both — never a build on the block (unreachable until per-architecture endpoint venvs: our
+    endpoint venv itself does not run there). The login node still runs in it."""
     app = await _ssh(tmp_path)
     e = (await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})).env   # this machine's arch
     app.runners.block.compute_arch = "fakearch"
     out = await server._run_shell(app, "echo RAN", agent_call=True)
-    assert out.phase == "env_building" and "RAN" not in out.stdout, out
-    assert "fakearch" in (out.notice or "") and "billed" in (out.notice or ""), out.notice
-    assert len(_builds(app, compute=True)) == 1                           # in a task on the confirmed block
-    assert (_home_env(tmp_path, e.key, "fakearch") / ".hpcb-env").is_file()
-    out = await server._run_shell(app, "python -c 'import sys; print(sys.prefix)'", agent_call=True)
-    assert out.stdout.strip() == str(_home_env(tmp_path, e.key, "fakearch")), out
+    assert out.phase == "failed" and out.exit_code == 88 and "RAN" not in out.stdout, out
+    notice = out.notice or ""
+    assert "fakearch" in notice and ARCH in notice and "per-architecture endpoint venvs" in notice, notice
+    assert _builds(app, compute=True) == [] and len(_builds(app)) == 1    # nothing built on the block
+    assert not _home_env(tmp_path, e.key, "fakearch").exists()
     login = await server._run_shell(app, "python -c 'import sys; print(sys.prefix)'", shape="login", agent_call=True)
-    assert login.stdout.strip() == e.path                                 # each node its own arch's build
+    assert login.stdout.strip() == e.path                                 # the login node runs in it
 
 
 async def test_the_env_says_its_users_own_index_lines_its_root_and_installings_cost_once(tmp_path):
@@ -845,8 +977,15 @@ async def test_a_batch_row_whose_env_is_gone_ran_nothing_goes_back_and_the_env_i
     st = await server._status(app, out.batch_id, detail="page")
     by = {r.index: r for r in st.results}
     assert by[0].state == "backlog" and by[1].state == "done" and st.counts.failed == 0, st
-    assert st.phase == "waiting" and "env" in (st.reason or ""), st
+    assert st.phase in ("admitting", "waiting") and "env" in f"{st.reason or ''} {st.notice or ''}", st
     assert sum(envs.BUILD_TAG in c for c in runner.commands) == 2          # rebuilt (SSH: the login node, free)
+    n = len(runner.commands)
+    await batch.tick(app, out.batch_id)
+    assert len(runner.commands) == n                                      # nothing admitted while it rebuilds
+    finish_builds()
+    await batch.tick(app, out.batch_id)
+    again = [c for c in runner.commands[n:] if batch.RESULT_MARK in c]
+    assert len(again) == 1 and envs.REFUSED in again[0]                   # row 0 again, once the env is back
 
 
 # ---- 7. Jobs mode ------------------------------------------------------------------------------------------------------
@@ -889,6 +1028,25 @@ async def test_mep_an_existing_env_is_activated_per_command_with_no_new_block(tm
     assert (st.env.how, st.env.new_block, st.env.state) == ("activate", False, "unchecked")   # no login node here
     out = await server._run_shell(app, 'echo "T=$HPCB_TAG"', agent_call=True)
     assert out.phase == "complete" and "T=m" in out.stdout, out
+    bad = await server._ensure_endpoint_up(app, "compute", env={"activate": "echo not here >&2; false"})
+    assert bad.status == "up" and rt.spend_confirmed                      # still no new block
+    out = await server._run_shell(app, "echo RAN", agent_call=True)
+    assert out.phase == "failed" and "RAN" not in out.stdout and "not here" in (out.notice or ""), out
+
+
+async def test_mep_a_built_env_is_refused_by_name_and_changes_nothing(tmp_path, monkeypatch):
+    """Building on a facility endpoint is PR 4's (after a live check): refused by name, pointing at what works there."""
+    app = await _mep(tmp_path, monkeypatch, template=FAKE_TEMPLATE, schema=FAKE_SCHEMA)
+    rt = app.shapes["compute"]
+    runner, epoch = rt.runner, rt.block_epoch
+    st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
+    notice = st.notice or ""
+    assert "facility endpoint" in notice and '"activate"' in notice, notice
+    assert "Nothing in this call was set or started" in notice and st.env is None, st
+    assert rt.spend_confirmed and rt.block_epoch == epoch and rt.runner is runner
+    out = await server._run_batch(app, command="echo {x}", rows=[{"x": 1}], task_walltime_s=60,
+                                  env={"requirements": REQS})
+    assert out.phase == "refused" and "facility endpoint" in (out.reason or out.notice or ""), out
 
 
 # ---- 9. the handoff --------------------------------------------------------------------------------------------------
@@ -904,6 +1062,21 @@ async def test_a_handoff_on_ssh_carries_the_env_it_was_validated_with(tmp_path):
     assert out.phase == "exported" and rec.env is not None, out
     assert (rec.env.key, rec.env.path, rec.env.how) == (e.key, e.path, "login") and rec.validation.env_ok is True
     assert "requirements" not in rec.user_endpoint_config      # a user env: the consumer activates it, never the worker
+    assert rec.env.bin == f"{e.path}/bin"
+
+
+async def test_a_handoff_on_a_facility_endpoint_carries_an_existing_env_for_the_consumer(tmp_path, monkeypatch):
+    from tests.test_handoff_phase2b import _yes
+
+    app = await _mep(tmp_path, monkeypatch, template=FAKE_TEMPLATE, schema=FAKE_SCHEMA, confirm=False)
+    line = "export HPCB_TAG=consumer"
+    _ask, out = await _yes(app, dict(LOAM_UEC), env={"activate": line})
+    assert out.phase == "exported", out
+    rec = out.record
+    assert (rec.env.how, rec.env.activate) == ("activate", line) and rec.validation.env_ok is True, rec.env
+    assert "worker_init" not in rec.user_endpoint_config and "requirements" not in rec.user_endpoint_config
+    refused = await server._export_handoff(app, user_endpoint_config=dict(LOAM_UEC), env={"requirements": REQS})
+    assert refused.phase == "refused" and "facility endpoint" in (refused.notice or ""), refused
 
 
 # ---- 10. the ledger and the tools -------------------------------------------------------------------------------------

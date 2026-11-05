@@ -12,10 +12,16 @@
 - **`reset_command(session, *, guard=None)`** (`:211`) — clears `.cwd`/`.env` (and any leaked snapshot), behind the same guard.
 - **The wrong-block guard** (`:20`–`:98`). `JOB_ID_EXPR` (`:25`) is `${SLURM_JOB_ID:-${PBS_JOBID:-}}`, the expression the canary reports as `HPCB_JOB` ([[runner]] imports it, so the two cannot drift). A worker on a PBS sister node may not inherit `PBS_JOBID`; there the command runs unguarded. **`Guard`** (`:55`) is one dispatch's guard: the block's job and a fresh hex nonce (`Guard.new`, `secrets.token_hex(8)`; validated as hex because it is spliced into the guard's `printf` format). With the worker's job set and different, the guard prints `HPCB_WRONG_BLOCK <nonce> <job>` (`WRONG_BLOCK_MARKER`) to stderr and exits 86 (`WRONG_BLOCK_EXIT`) before `umask`, `mkdir`, the cd, the session state and the command. It is POSIX sh, and the job is `shlex.quote`d (it comes from the canary's stdout). **`refusal(exit_code, stderr, guard)`** (`:85`) reads it back as a **`Refusal`** (`:72`): exit 86, and a stderr line, wherever it sits, that starts with the marker and this guard's nonce, naming a job other than the expected one. Not by position: a shell's start-up prints before the marker, and the SDK's sandbox warning (an endpoint without task sandboxing), `set -x` and an EXIT trap print after it. The nonce is the protection, since output cannot forge what it never saw. The job is bounded (`_JOB_ID`, `:51`: job-id characters, 96 at most); otherwise `Refusal.job` is None and it is never named. Who builds the guard and what a refusal becomes: [[Cost control]].
 
+- **`wrap(…, env_sh=None)`** handles the session's env ([[envs]], [[Block environments]]). Given `envs.activation_sh`, the wrapper runs the activation AFTER the session's own `.env`, so it wins over a PATH an earlier command persisted. It runs between two snapshots (`_ENV_PRE`: `.env.base.$$.pre` and `.act`).
+  - **What is persisted:** `_ENV_KEEP` saves a variable the command left as the activation set it as the session had it, or not at all. So a switch of env, or to none, leaves nothing of the old one behind.
+  - **What is not reverted:** a variable the command changed after the activation is saved as it is. A PATH the command edited keeps the env's `bin`: the documented leak.
+  - **A refused activation** (`HPCB_ENV_REFUSED`, rc 88) runs nothing.
+  - **Without `env_sh`** the script is exactly as before.
+
 This is the mechanism behind [[Session continuity]]; both invariants (volatile-var filtering, record-safe multi-line env) are documented there.
 
 > [!warning] Base64-carry the command
 > The user command is base64-encoded and decoded+`eval`'d, so arbitrary shell (brace groups, quotes, `${VAR}`) can't textually break out of the wrapper while `cd`/`export` inside it still affect the persisted state.
 
 ## See also
-[[Session continuity]] · [[server]]
+[[Session continuity]] · [[server]] · [[envs]]
