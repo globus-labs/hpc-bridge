@@ -209,19 +209,14 @@ def _code(path: Path) -> str:
     return re.sub(r"#.*", "", path.read_text())
 
 
-def test_pbs_mep_clears_both_managers_user_endpoints_before_either_starts():
+def test_pbs_mep_clears_its_managers_user_endpoints_before_it_starts_the_manager():
     login = _code(FC / "profiles" / "pbs_mep" / "setup.d" / "login-pbsmep.sh")
-    # two managers since block environments (PR 3): one call, with the mapped user's home and both managers' dirs, as
-    # the `mep` profile's
-    call = ('mep_clear_stale_uep_pids "$h" /root/.globus_compute/hpcb-mep-pbs '
-            "/root/.globus_compute/hpcb-mep-pbs-req")
-    assert login.count(call) == 1 and login.count("mep_clear_stale_uep_pids") == 1
+    call = 'mep_clear_stale_uep_pids "$h" "$d"'
+    assert login.count(call) == 1, "one call, with the mapped user's home and the manager's dir"
     assert login.index('source "$PROFILE_DIR/mep/tools.sh"') < login.index(call)
     assert login.index('h="/home/$MEPUSER"') < login.index(call) and login.index("d=\"/root/.globus_compute/$name\"") < login.index(call)
-    assert login.index(call) < login.index('globus-compute-endpoint" start "$name"')   # before a manager can fork one
+    assert login.index(call) < login.index('globus-compute-endpoint" start "$name"')   # before the manager can fork one
     assert re.search(re.escape(call) + r" *\\?\n? *\|\| *echo", login), "guarded: a failure must not stop the entrypoint"
-    for name in ("hpcb-mep-pbs", "hpcb-mep-pbs-req"):                    # the dirs named are the managers'
-        assert f'name={name}; d="/root/.globus_compute/$name"' in login, name
 
 
 def test_mep_clears_both_managers_user_endpoints_on_login01_before_either_starts():

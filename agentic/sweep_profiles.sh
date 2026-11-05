@@ -99,10 +99,8 @@ batch_needs_sizing_then_sized batch row sizing (built, not yet run live): joins 
 batch_pilot_proposal          batch row sizing (built, not yet run live): joins batch_cells (default) after its live proof
 batch_size_first_terms        batch row sizing (built, not yet run live): joins script_only (slices) after its live proof
 batch_gpu_rows                batch row sizing (built, not yet run live): joins batch_cells (site) after its live proof
-env_ssh_build_cache           block envs, stage A: red until it lands; joins batch_cells (default) after its live proof
-env_ssh_switch                block envs, stage A: red until it lands; joins batch_cells (default) after its live proof
-env_mep_requirements          block envs, stage A: red until it lands; joins batch_cells (pbs_mep) after its live proof
-env_mep_fallback              block envs, stage A: red until it lands; joins batch_cells (pbs_mep) after its live proof
+env_ssh_build_cache           block envs (built, not yet run live): joins batch_cells (default) after its live proof
+env_ssh_switch                block envs (built, not yet run live): joins batch_cells (default) after its live proof
 stale_login_pin               scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 kept_entry_after_failure      scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 cached_password_otp           scripted only: a script_cell on `nersc` (after its agent wave)

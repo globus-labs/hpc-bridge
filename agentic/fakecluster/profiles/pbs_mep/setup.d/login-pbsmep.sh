@@ -38,7 +38,6 @@ if [ -z "$EMAIL" ]; then
   echo "[pbs_mep] WARNING: HPCB_MEP_EMAIL is unset — NOT starting the manager (a Globus registration needs a real contact address; set it in agentic/.env)"
   return 0
 fi
-ready=""
 name=hpcb-mep-pbs; d="/root/.globus_compute/$name"
 if mkdir -p "$d" && chmod 700 "$d" \
    && sed -e "s/@@EMAIL@@/$EMAIL/g" "$PROFILE_DIR/mep/pbs_config.yaml" > "$d/config.yaml" \
@@ -47,35 +46,11 @@ if mkdir -p "$d" && chmod 700 "$d" \
    && cp "$PROFILE_DIR/mep/pbs_user_config_template.yaml.j2" "$d/user_config_template.yaml.j2" \
    && cp "$PROFILE_DIR/mep/pbs_user_config_schema.json" "$d/user_config_schema.json"; then
   rm -f "$d/daemon.pid"   # a stale pidfile from a killed container blocks the start for 90 s
-  ready="$ready $name"
+  # ...and so do its user endpoints' (rc 73 at the next cell's first task): they died with this container, and only
+  # this node runs the manager, so none can be alive. Before the manager starts, so it has forked none yet.
+  mep_clear_stale_uep_pids "$h" "$d" || echo "[pbs_mep] WARNING: could not clear stale user-endpoint pid files"
+  ( cd / && nohup "$MEP_GCE/bin/globus-compute-endpoint" start "$name" >"/var/log/$name.log" 2>&1 & ) || true
+  echo "[pbs_mep] started $name (log /var/log/$name.log)"
 else
   echo "[pbs_mep] WARNING: could not write $d — the manager was NOT started"
 fi
-# The SECOND manager (block environments, PR 3): the same Polaris-shaped template, which ALSO builds a client's
-# `requirements` into the workers' env when a block starts (NCSA Delta's and Purdue Anvil's kind, after
-# globus-compute-endpoint 4.17's default) — `fake-pbs-mep-req` in the catalog. Its own endpoint dir and registration,
-# the same identity mapping and mapped account; its template's @@VER@@ is this manager's endpoint version (the venv it
-# builds installs the endpoint at it, so the worker still matches the user endpoint). A failure here leaves the first
-# manager running: only the env cells need this one.
-name=hpcb-mep-pbs-req; d="/root/.globus_compute/$name"
-if mkdir -p "$d" && chmod 700 "$d" \
-   && sed -e "s/@@EMAIL@@/$EMAIL/g" -e "s#/hpcb-mep-pbs/#/$name/#" \
-          -e "s/^display_name: .*/display_name: hpc-bridge fake PBS cluster MEP (Polaris-shaped template + requirements)/" \
-          "$PROFILE_DIR/mep/pbs_config.yaml" > "$d/config.yaml" \
-   && python3 "$PROFILE_DIR/mep/idmap.py" "$IDENTITY" "$MEPUSER" > "$d/identity_mapping.json" \
-   && chmod 600 "$d/identity_mapping.json" \
-   && sed "s/@@VER@@/$VER/g" "$PROFILE_DIR/mep/pbs_user_config_template_req.yaml.j2" > "$d/user_config_template.yaml.j2" \
-   && cp "$PROFILE_DIR/mep/pbs_user_config_schema_req.json" "$d/user_config_schema.json"; then
-  rm -f "$d/daemon.pid"
-  ready="$ready $name"
-else
-  echo "[pbs_mep] WARNING: could not write $d — the manager $name was NOT started"
-fi
-# ...and so do their user endpoints' pid files (rc 73 at the next cell's first task): they died with this container,
-# and only this node runs the managers, so none can be alive. Before either manager starts, so neither has forked one.
-mep_clear_stale_uep_pids "$h" /root/.globus_compute/hpcb-mep-pbs /root/.globus_compute/hpcb-mep-pbs-req \
-  || echo "[pbs_mep] WARNING: could not clear stale user-endpoint pid files"
-for name in $ready; do
-  ( cd / && nohup "$MEP_GCE/bin/globus-compute-endpoint" start "$name" >"/var/log/$name.log" 2>&1 & ) || true
-  echo "[pbs_mep] started $name (log /var/log/$name.log)"
-done

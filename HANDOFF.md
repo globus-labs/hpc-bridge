@@ -13,7 +13,7 @@ facility requires an allocation), and stop is honest (`down` confirmed / `draini
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
 Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1056 passed** (the CI list: 1032). The live tier has
-**115 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
+**113 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_network host_forward bastion vip`,
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
@@ -33,19 +33,19 @@ cluster is the real-hardware check.
 - Follow-up PR: the per-node watcher and one stream helper per row (lifts the 32-rows-per-node cap); a row's own `srun`
   binding is a documented limitation pending a live check.
 
-## Block environments (2026-11-05, branch `feat/block-envs`, PR 3 on PR 2) — stage A: tests and cells, no product code
+## Block environments (2026-11-05, branch `feat/block-envs`, PR 3 on PR 2) — built, live cells next
 
-- `env` on ensure_endpoint_up, run_batch, submit_job and export_handoff: an existing env (`{"activate": "<line>"}`) or
-  one built from a requirements list (`{"requirements": "<text>", "python"?, "root"?}`). On an endpoint hpc-bridge
-  stood up over SSH a built env is a separate user env built on the login node and activated per command, row and job
-  (no new block); on a facility endpoint whose template reads `requirements` it is passed through (a new block); on
-  one whose template does not, the block's worker_init builds it (first build billed). Design, the API and the open
-  rulings: vault `Planned/Block environments.md`.
-- Failing first: `tests/test_block_envs.py` (51, a strict xfail module). Cells (scripted, red until the build, kept out
-  of the sweep): `env_ssh_build_cache`, `env_ssh_switch` (fake `default`), `env_mep_requirements`, `env_mep_fallback`
-  (fake `pbs_mep`). The `pbs_mep` profile now runs a SECOND manager, `hpcb-mep-pbs-req` (catalog `fake-pbs-mep-req`),
-  whose template also builds `requirements`: the stack needs a restart (`up.sh --profile pbs_mep`) before those cells.
-  All four cells need PyPI from the fake cluster (login node; for `pbs_mep`, the moms).
+- `env` on ensure_endpoint_up, run_batch, submit_job and export_handoff: an existing env (`{"activate": "<line>"}`,
+  everywhere, MEPs included, no new block) or, on an endpoint hpc-bridge stood up over SSH, one built from a
+  requirements list (`{"requirements": "<text>", "python"?, "root"?}`): a separate user env built on the free login
+  node and activated per command, row and job script — switching env needs no new block. `requirements` on a
+  facility endpoint is refused by name. Design and rulings: vault `Planned/Block environments.md`; module `envs`.
+- Live cells to run (scripted, kept out of the sweep until proven): `env_ssh_build_cache`, `env_ssh_switch` (fake
+  `default`; the login node must reach PyPI, as the endpoint venv's build already does).
+- **PR 4** (branch `feat/block-envs-mep`, stage A only: `tests/test_block_envs_mep.py`, the cells
+  `env_mep_requirements` / `env_mep_fallback`, a second fake `pbs_mep` manager): a facility endpoint's builds — the
+  pass-through, the pin fix (R13), the worker_init fallback — after a live Delta / Anvil / Polaris check the user
+  approves.
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
@@ -283,7 +283,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`, `server-stderr.log` — the MCP server's own stderr) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
-**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 115 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
+**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 113 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
 **Prerequisites** (one-time, in `agentic/.env` — gitignored): `CLAUDE_CODE_OAUTH_TOKEN` (subscription, from `claude setup-token` — **not** an API key), `HPCB_TEST_GLOBUS_DB` (a Globus `storage.db` whose identity the target facility maps — for the MEP that means `gusellerm@uchicago.edu`; check with `python agentic/whoami_globus.py`), and the scoped SSH test user/key (`HPCB_TEST_SSH_*`, default user `hpcbridge-test`; the pool `hpcbridge-test-00..09` for `run_suite`). `HPCB_TEST_GLOBUS_DB_NOACCOUNT` (a second, unmapped identity's db) feeds `mep_no_account`. The fake cluster's `mep` and `pbs_mep` profiles also need `HPCB_MEP_EMAIL` (a real contact address for the managers they register with Globus). Full setup + the pre-merge regression set are in `agentic/README.md`; the design rationale is `docs/hpc-bridge-vault/Planned/Agentic testing - Plan B (runtime sandbox).md`. **`agentic/fakecluster/`** is a compose Slurm cluster wired into both runners (`--target fake`), with PROFILES (`default`; `site` = 3 nodes / debug,compute,gpu / enforced accounting / fake mybalance / 2 login nodes; `mep` = site + two root-run facility MEPs in login01, strict and open schema — the zero-SSH path, with a per-cluster local catalog via the plugin's `HPC_BRIDGE_CATALOG_FILE` seam; `pbs_mep` = the OpenPBS `polaris` cluster + one facility MEP whose template is shaped like ALCF Polaris's), a cluster-admin channel (`ADMIN_SETUP`/`ADMIN_CLEANUP`), mid-run hooks (`MIDRUN_HOOKS`: a `cmd` after a tool result — on every operator but the ACP ones, the free CLI operators via the server's journal — or, Claude SDK only, an Esc DURING a call; `agentic/README.md` → "Mid-run hooks") and declarative scenario coupling (`TARGETS`/`REQUIRES`). See `agentic/fakecluster/README.md`.
 

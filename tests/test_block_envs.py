@@ -66,10 +66,6 @@ from hpc_bridge import server
 from tests.test_handoff_phase2b import (
     FAKE_SCHEMA,
     FAKE_TEMPLATE,
-    LOAM_UEC,
-    PBS_MEP,
-    POLARIS_SCHEMA,
-    POLARIS_TEMPLATE,
     SSH_EID,
     _Block,
     _Out,
@@ -88,59 +84,8 @@ PY = f"{sys.version_info.major}.{sys.version_info.minor}"
 ARCH = os.uname().machine          # what `uname -m` prints here
 REQS = "six==1.17.0\n"
 NONCE = "a1b2c3d4e5f60718"
-# The fake `pbs_mep` profile's second manager: the same Polaris-shaped template, which also builds `requirements` into
-# the worker's env when the block starts (the Delta/Anvil kind); its schema lists `requirements`.
-REQ_TEMPLATE = (PBS_MEP / "pbs_user_config_template_req.yaml.j2").read_text().replace("@@VER@@", "4.16.0")
-REQ_SCHEMA = json.loads((PBS_MEP / "pbs_user_config_schema_req.json").read_text())
-
-# Delta's kind (4.17+'s default template: the init script before any user worker_init; schema permissive)
-DELTA_TEMPLATE = """engine:
-  type: GlobusComputeEngine
-  provider:
-    type: SlurmProvider
-    partition: {{ partition }}
-    account: {{ account }}
-    walltime: {{ walltime|default("00:30:00") }}
-    worker_init: |
-      export PATH="$HOME/.local/bin:$PATH"
-{%- if requirements %}
-      R=$(mktemp); printf '%s\\n' {{ requirements }} > "$R"
-{%- endif %}
-      {{ worker_init|default("") }}
-"""
-DELTA_SCHEMA = {"type": "object", "additionalProperties": True,
-                "properties": {"worker_init": {"type": "string"}, "endpoint_setup": {"type": "string"}}}
-# Anvil's kind: strict schema listing `requirements` and `venvs_dir`
-ANVIL_TEMPLATE = """engine:
-  type: GlobusComputeEngine
-  provider:
-    type: SlurmProvider
-    partition: {{ partition|default("shared") }}
-    account: {{ account }}
-    walltime: {{ walltime|default("00:15:00") }}
-    cores_per_node: {{ cores_per_node|default(1) }}
-    worker_init: {{ worker_init|default("") }}
-{%- if requirements is defined %}
-    # built into {{ venvs_dir|default("~/.globus_compute/venvs") }}
-{%- endif %}
-"""
-ANVIL_SCHEMA = {"type": "object", "additionalProperties": False, "properties": {k: {"type": "string"} for k in (
-    "account", "partition", "qos", "walltime", "cores_per_node", "mem_per_node", "constraint", "exclusive",
-    "min_blocks", "max_blocks", "init_blocks", "nodes_per_block", "scheduler_options", "resource_specification",
-    "worker_init", "endpoint_setup", "venvs_dir", "requirements")}}
-# neither: no worker_init, no requirements, and a strict schema that lists neither
-NEITHER_TEMPLATE = """engine:
-  type: GlobusComputeEngine
-  provider:
-    type: PBSProProvider
-    queue: {{ queue }}
-    account: {{ account }}
-    walltime: {{ walltime|default("00:30:00") }}
-    {# requirements and worker_init: this facility takes neither #}
-"""
-NEITHER_SCHEMA = {"type": "object", "additionalProperties": False, "required": ["queue", "account"],
-                  "properties": {"queue": {"type": "string"}, "account": {"type": "string"},
-                                 "walltime": {"type": "string"}}}
+# (The facility endpoint's builds — the pass-through, the pin, the worker_init fallback — and their templates are PR 4's:
+# tests/test_block_envs_mep.py.)
 
 
 # ---- the uv stub -------------------------------------------------------------------------------------------------------
@@ -511,24 +456,6 @@ def test_a_line_the_cache_key_cannot_see_or_that_turns_off_checks_is_refused_by_
     assert line in str(e.value)
 
 
-def test_the_users_own_index_lines_are_kept_and_listed_and_none_is_ever_added():
-    from hpc_bridge import envs
-
-    text = ("--index-url https://mirror.example.org/simple\n--extra-index-url https://download.pytorch.org/whl/cu121\n"
-            "-f https://example.org/wheels\nsix==1.17.0 --hash=sha256:" + "a" * 64 + "\n--only-binary :all:\n")
-    spec = envs.parse({"requirements": text})
-    assert envs.index_lines(spec.requirements) == ["--index-url https://mirror.example.org/simple",
-                                                   "--extra-index-url https://download.pytorch.org/whl/cu121",
-                                                   "-f https://example.org/wheels"]
-    plain = envs.parse({"requirements": "six==1.17.0"})
-    for script in (envs.build_script(plain, key=envs.env_key(plain), root="/scratch/u/envs", python="3.11",
-                                     token="t0", probe=True),
-                   envs.fallback_worker_init(plain, key=envs.env_key(plain), root="/scratch/u/envs", python="3.11")):
-        for flag in ("--index-url", "--extra-index-url", "--find-links", "--default-index", "--index ", "UV_INDEX",
-                     "PIP_INDEX", "--allow-insecure-host", "--trusted-host"):
-            assert flag not in script, flag
-
-
 def test_the_cache_key_is_the_hash_of_the_text_and_the_python():
     from hpc_bridge import envs
 
@@ -558,60 +485,6 @@ def test_the_env_root_is_the_facilitys_scratch_else_home_with_a_size_warning():
         assert root == "$HOME/.hpc-bridge/envs" and warn and "home" in warn and "root" in warn, (root, warn)
     root, warn = envs.env_root("$HOME/.hpc-bridge", root="/project/abc/envs")   # the user's own root wins
     assert root == "/project/abc/envs" and warn is None
-
-
-# ---- 2. where an env is built, and how it is used ----------------------------------------------------------------------
-
-def test_where_each_kind_of_facility_builds_an_env_and_how_work_uses_it():
-    from hpc_bridge import envs
-
-    req, act = envs.parse({"requirements": "six"}), envs.parse({"activate": "module load x"})
-    other = envs.parse({"requirements": "six", "python": "3.9" if PY != "3.9" else "3.10"})
-
-    def d(spec, access, reads_requirements, reads_worker_init):
-        return envs.delivery(spec, access=access, reads_requirements=reads_requirements,
-                             reads_worker_init=reads_worker_init, client_python=PY)
-
-    assert d(req, "ssh", None, True) == "login"            # our own endpoint: built on the login node, free
-    assert d(other, "ssh", None, True) == "login"          # a separate user env: any Python
-    assert d(act, "ssh", None, True) == "activate"
-    assert d(act, "mep", None, None) == "activate"         # nothing to build, nothing to read
-    assert d(req, "mep", True, True) == "facility"         # the template builds it into the worker's env
-    assert d(req, "mep", False, True) == "worker_init"     # Polaris: the block's worker_init builds it
-    assert d(other, "mep", False, True) == "worker_init"
-    for spec, rr, rw, words in [
-        (req, False, False, ("requirements", "worker_init")),      # nothing to carry it: refused by name
-        (req, None, True, ("could not be read",)),                 # never a guess about the template
-        (other, True, True, (other.python, PY)),                   # the worker's env runs the client's Python
-    ]:
-        with pytest.raises(envs.EnvRefusal) as e:
-            d(spec, "mep", rr, rw)
-        assert all(w in str(e.value) for w in words), str(e.value)
-
-
-def test_the_gate_reads_the_published_template_and_schema_of_each_kind():
-    from hpc_bridge.facility.mep import MEPFacility
-
-    def fac(template, schema, key_map=None):
-        f = MEPFacility("eid", "fac", {})
-        f.template_text, f.schema, f.key_map = template, schema, dict(key_map or {})
-        return f
-
-    delta, anvil = fac(DELTA_TEMPLATE, DELTA_SCHEMA), fac(ANVIL_TEMPLATE, ANVIL_SCHEMA)
-    polaris, pbs = fac(POLARIS_TEMPLATE, POLARIS_SCHEMA), fac(FAKE_TEMPLATE, FAKE_SCHEMA, {"partition": "queue"})
-    req = fac(REQ_TEMPLATE, REQ_SCHEMA, {"partition": "queue"})
-    assert delta.reads("requirements") is True and delta.reads("worker_init") is True
-    assert anvil.reads("requirements") is True and anvil.reads("venvs_dir") is True and anvil.reads("worker_init")
-    assert req.reads("requirements") is True
-    assert polaris.reads("requirements") is False and polaris.reads("worker_init") is True
-    assert pbs.reads("requirements") is False and pbs.reads("worker_init") is True
-    neither = fac(NEITHER_TEMPLATE, NEITHER_SCHEMA)
-    assert neither.reads("requirements") is False and neither.reads("worker_init") is False   # a comment is no use
-    # a strict schema that does not list it drops it at the wire, whatever the template says
-    strict = fac(DELTA_TEMPLATE, {"type": "object", "additionalProperties": False,
-                                  "properties": {"worker_init": {"type": "string"}}})
-    assert strict.reads("requirements") is False and strict.reads("worker_init") is True
-    assert fac(None, None).reads("requirements") is None                # not read: unknown, never a guess
 
 
 # ---- 3. the build, its check, its marker (bash, the uv stub) ----------------------------------------------------------
@@ -767,104 +640,6 @@ def test_a_batch_row_runs_in_its_env_and_its_slot_still_sizes_the_libraries(tmp_
     r = envs.refusal(rep.rc, rep.stderr_tail, NONCE)
     assert rep.rc == envs.ENV_RC and "RAN" not in rep.tail and r is not None and r.why == "gone", rep
     assert rep.ran is False                                               # the row ran nothing: no failure of its own
-
-
-# ---- 5. the MEP fallback: the block's own worker_init builds it (bash) -------------------------------------------------
-
-def test_the_fallback_worker_init_builds_once_and_never_touches_the_workers_env(tmp_path):
-    from hpc_bridge import envs
-
-    spec = envs.parse({"requirements": REQS})
-    key, root = envs.env_key(spec), tmp_path / "home" / ".hpc-bridge" / "envs"
-    wi = envs.fallback_worker_init(spec, key=key, root="$HOME/.hpc-bridge/envs", python=PY)
-    env = _box(tmp_path)
-    probe = wi + '\necho "P=$PATH|V=${VIRTUAL_ENV:-none}|D=$PWD"'
-    p = _bash(probe, env, cwd=tmp_path)
-    assert p.returncode == 0 and f"P={env['PATH']}|V=none|D={tmp_path}" in p.stdout, (p.stdout, p.stderr)
-    assert (root / f"{key}-{ARCH}" / envs.MARKER).is_file() and _venvs(tmp_path) == 1
-    p = _bash(probe, env, cwd=tmp_path)                                   # the next block: reused, not rebuilt
-    assert p.returncode == 0 and _venvs(tmp_path) == 1
-    # a build that fails is recorded beside it, never fatal to the block (its worker must still start and answer)
-    bad = envs.parse({"requirements": "nosuchpkg==1.0"})
-    kb = envs.env_key(bad)
-    p = _bash(envs.fallback_worker_init(bad, key=kb, root="$HOME/.hpc-bridge/envs", python=PY) + "\necho ALIVE",
-              env, cwd=tmp_path)
-    assert p.returncode == 0 and "ALIVE" in p.stdout
-    assert "nosuchpkg" in (root / f"{kb}-{ARCH}.failed").read_text() and not (root / f"{kb}-{ARCH}").exists()
-
-
-def test_a_build_inside_a_block_probes_the_index_first_and_names_the_proxy_when_it_cannot_reach_it(tmp_path):
-    from hpc_bridge import envs
-
-    spec = envs.parse({"requirements": REQS})
-    key = envs.env_key(spec)
-    env = _box(tmp_path)
-    _tool(tmp_path / "uvbin", "curl", f'echo "proxy=${{https_proxy:-}}" >> {tmp_path / "curl.log"}; exit 7')
-    wi = envs.fallback_worker_init(spec, key=key, root=str(tmp_path / "envs"), python=PY)
-    p = _bash(wi, env, cwd=tmp_path)
-    failed = (tmp_path / "envs" / f"{key}-{ARCH}.failed").read_text()
-    assert p.returncode == 0 and _venvs(tmp_path) == 0                    # nothing was tried that could not work
-    assert "pypi.org" in failed and "proxy" in failed, failed
-    # a facility's proxy, given: the probe and the build go through it
-    (tmp_path / "envs" / f"{key}-{ARCH}.failed").unlink()
-    _tool(tmp_path / "uvbin", "curl", f'echo "proxy=${{https_proxy:-}}" >> {tmp_path / "curl.log"}; exit 0')
-    wi = envs.fallback_worker_init(spec, key=key, root=str(tmp_path / "envs"), python=PY,
-                                   proxy={"https_proxy": "http://proxy.example.org:3128"})
-    p = _bash(wi, env, cwd=tmp_path)
-    assert "proxy=http://proxy.example.org:3128" in (tmp_path / "curl.log").read_text()
-    assert all(c["https_proxy"] == "http://proxy.example.org:3128" for c in _uv(tmp_path)) and _venvs(tmp_path) == 1
-    with pytest.raises(envs.EnvRefusal):
-        envs.fallback_worker_init(spec, key=key, root="/x", python=PY, proxy={"https_proxy": "http://x; rm -rf ~"})
-    with pytest.raises(envs.EnvRefusal):
-        envs.fallback_worker_init(spec, key=key, root="/x", python=PY, proxy={"LD_PRELOAD": "/tmp/x.so"})
-
-
-def test_two_blocks_building_at_once_leave_one_env_and_nothing_else(tmp_path):
-    """Correctness is the rename (the endpoint venv's rule): of two builds, one claims the path and the other uses it.
-    Where the node has `flock`, the second waits for the first instead of building too."""
-    from hpc_bridge import envs
-
-    spec = envs.parse({"requirements": REQS})
-    key = envs.env_key(spec)
-    wi = envs.fallback_worker_init(spec, key=key, root=str(tmp_path / "envs"), python=PY)
-    env = _box(tmp_path, HPCB_TEST_UV_SLOW="1.5")
-    procs = [subprocess.Popen([_BASH, "-c", wi], env=env, cwd=tmp_path, stdout=subprocess.PIPE,
-                              stderr=subprocess.PIPE, text=True) for _ in range(2)]
-    assert all(p.wait(timeout=60) == 0 for p in procs)
-    names = _beside(tmp_path / "envs")
-    assert names == [f"{key}-{ARCH}"], names
-    if _FLOCK:
-        assert _venvs(tmp_path) == 1
-
-
-def test_a_facility_pin_installs_into_the_env_the_template_built_never_over_it(tmp_path):
-    """Delta's and Anvil's entries pin the worker (gce at the facility's version; Delta's parsl too) by a worker_init
-    that makes and activates a venv of its own. A template that builds `requirements` (4.17+'s default) does so BEFORE
-    the user's worker_init: left as it is, the pin's venv would shadow the env just built. With an env active, the pin
-    installs into it instead; with none, it runs as before."""
-    from hpc_bridge import envs
-    from hpc_bridge.facility.mep import MEPFacility
-    from tests.test_resource_review_r2 import _seed
-
-    for fname, eid, pins in (("ncsa-delta.yaml", "delta", ("globus-compute-endpoint==4.16.0", "parsl==2026.8.10")),
-                             ("anvil.yaml", "anvil", ("globus-compute-endpoint==",))):
-        e = _seed(fname, eid)
-        fac = MEPFacility.from_entry(e, client_factory=lambda: None)
-        fac.endpoint_version = "4.16.0"
-        wi = fac.sanitize_uec({"worker_init": e.compute.env_setup})["worker_init"]
-        into = envs.pin_into_active(wi)
-        assert into is not None, eid
-        box = tmp_path / eid
-        env = _box(box)
-        req = box / "req-venv"
-        _bash(f"uv venv -q --python {PY} {req}", env)                    # the env the template built from requirements
-        p = _bash(f'. "{req}/bin/activate"\n{into}\necho "V=$VIRTUAL_ENV"', env, cwd=box)
-        assert p.returncode == 0 and f"V={req}" in p.stdout, (eid, p.stdout, p.stderr)
-        installs = [c for c in _uv(box) if c["argv"][:2] == ["pip", "install"]]
-        assert installs and all(c["venv"] == str(req) for c in installs), (eid, installs)
-        assert all(any(pin in a for a in installs[-1]["argv"]) for pin in pins), (eid, installs[-1])
-        p = _bash(f'{into}\necho "V=$VIRTUAL_ENV"', env, cwd=box)          # no env active: the pin's own venv
-        assert p.returncode == 0 and "V=" + str(box / "home" / "hpc-bridge") in p.stdout, (eid, p.stdout, p.stderr)
 
 
 # ---- 6. the server on a facility hpc-bridge stood up (SSH) ------------------------------------------------------------
@@ -1103,65 +878,7 @@ async def test_a_jobs_script_activates_its_env_after_the_sessions_and_runs_in_it
     assert p.returncode == envs.ENV_RC and "SIX" not in p.stdout and envs.REFUSED in p.stderr
 
 
-# ---- 8. the server on a facility's multi-user endpoint ----------------------------------------------------------------
-
-async def test_mep_a_template_that_builds_requirements_gets_them_and_the_terms_say_a_new_block(tmp_path, monkeypatch):
-    from hpc_bridge import envs
-
-    app = await _mep(tmp_path, monkeypatch, template=REQ_TEMPLATE, schema=REQ_SCHEMA)
-    rt = app.shapes["compute"]
-    ask = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
-    assert ask.status == "needs_confirmation" and not rt.spend_confirmed, ask
-    e = ask.block.env
-    assert (e.how, e.kind, e.new_block, e.python) == ("facility", "built", True, PY), e
-    assert "new user endpoint" in (ask.notice or "") and "new block" in (ask.notice or ""), ask.notice
-    assert "billed" in (e.billed or "") and "package index" in (e.billed or ""), e.billed
-    yes = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS}, confirm_spend=True)
-    assert yes.status == "up" and yes.env.how == "facility" and yes.block is not None, yes
-    sent = app.runners.built[-1].user_endpoint_config
-    assert sent["requirements"] == "six==1.17.0" and "worker_init" not in sent, sent   # the facility builds it
-    await server._run_shell(app, "true", agent_call=True)
-    assert envs.REFUSED not in app.shapes["compute"].runner.commands[-1]      # it IS the worker's env: no activation
-    other = "3.9" if PY != "3.9" else "3.10"
-    st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS, "python": other})
-    assert other in (st.notice or "") and PY in (st.notice or "") and app.shapes["compute"].spend_confirmed, st
-
-
-async def test_mep_without_requirements_the_blocks_worker_init_builds_it_first_build_billed(tmp_path, monkeypatch):
-    from hpc_bridge import envs
-
-    app = await _mep(tmp_path, monkeypatch, template=FAKE_TEMPLATE, schema=FAKE_SCHEMA)
-    ask = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
-    e = ask.block.env
-    assert ask.status == "needs_confirmation" and (e.how, e.new_block) == ("worker_init", True), ask
-    assert "first build" in (e.billed or "") and "billed" in (e.billed or ""), e.billed
-    yes = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS}, confirm_spend=True)
-    assert yes.status == "up", yes
-    sent = app.runners.built[-1].user_endpoint_config
-    key = _key()
-    assert "requirements" not in sent and key in sent["worker_init"] and envs.BUILD_TAG in sent["worker_init"], sent
-    # the block starts: the facility runs our worker_init before its own; it builds, and changes nothing of the worker
-    b = app.runners.block
-    p = subprocess.run([_BASH, "-c", sent["worker_init"] + '\necho "V=${VIRTUAL_ENV:-none}"'], capture_output=True,
-                       text=True, env=b.env(compute=True), cwd=b.cwd, timeout=60)
-    assert p.returncode == 0 and "V=none" in p.stdout, (p.stdout, p.stderr)
-    out = await server._run_shell(app, "python -c 'import six, sys; print(sys.prefix)'", agent_call=True)
-    assert out.phase == "complete" and out.stdout.strip() == str(_home_env(tmp_path, key)), out
-
-
-async def test_mep_a_facility_that_can_carry_neither_is_refused_by_name_and_changes_nothing(tmp_path, monkeypatch):
-    app = await _mep(tmp_path, monkeypatch, template=NEITHER_TEMPLATE, schema=NEITHER_SCHEMA)
-    rt = app.shapes["compute"]
-    st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS})
-    assert "requirements" in (st.notice or "") and "worker_init" in (st.notice or ""), st.notice
-    assert "Nothing in this call was set or started" in (st.notice or "") and rt.spend_confirmed and st.env is None
-
-
-async def test_mep_an_unread_template_is_never_guessed(tmp_path, monkeypatch):
-    app = await _mep(tmp_path, monkeypatch, template=None, schema=FAKE_SCHEMA, confirm=False)
-    st = await server._ensure_endpoint_up(app, "compute", account="hpcb", env={"requirements": REQS})
-    assert "could not be read" in (st.notice or "") and st.env is None, st
-
+# ---- 8. the server on a facility's multi-user endpoint (its builds are PR 4's: tests/test_block_envs_mep.py) ---------
 
 async def test_mep_an_existing_env_is_activated_per_command_with_no_new_block(tmp_path, monkeypatch):
     app = await _mep(tmp_path, monkeypatch, template=FAKE_TEMPLATE, schema=FAKE_SCHEMA)
@@ -1172,19 +889,6 @@ async def test_mep_an_existing_env_is_activated_per_command_with_no_new_block(tm
     assert (st.env.how, st.env.new_block, st.env.state) == ("activate", False, "unchecked")   # no login node here
     out = await server._run_shell(app, 'echo "T=$HPCB_TAG"', agent_call=True)
     assert out.phase == "complete" and "T=m" in out.stdout, out
-
-
-async def test_anvils_pin_survives_a_requirements_pass_through(monkeypatch):
-    from tests.test_resource_review_r2 import _anvil
-
-    app, _res = await _anvil(monkeypatch, ANVIL_TEMPLATE)
-    st = await server._ensure_endpoint_up(app, "compute", account="x-cis250223", confirm_spend=True)
-    assert st.status == "up", st
-    st = await server._ensure_endpoint_up(app, "compute", env={"requirements": REQS}, confirm_spend=True)
-    assert st.status == "up" and st.env.how == "facility", st
-    sent = app.built[-1]
-    assert sent["requirements"] == "six==1.17.0"
-    assert "globus-compute-endpoint==" in sent["worker_init"] and "VIRTUAL_ENV" in sent["worker_init"], sent
 
 
 # ---- 9. the handoff --------------------------------------------------------------------------------------------------
@@ -1200,15 +904,6 @@ async def test_a_handoff_on_ssh_carries_the_env_it_was_validated_with(tmp_path):
     assert out.phase == "exported" and rec.env is not None, out
     assert (rec.env.key, rec.env.path, rec.env.how) == (e.key, e.path, "login") and rec.validation.env_ok is True
     assert "requirements" not in rec.user_endpoint_config      # a user env: the consumer activates it, never the worker
-
-
-async def test_a_handoff_on_a_facility_that_builds_requirements_carries_them_in_the_config(tmp_path, monkeypatch):
-    from tests.test_handoff_phase2b import _yes
-
-    app = await _mep(tmp_path, monkeypatch, template=REQ_TEMPLATE, schema=REQ_SCHEMA, confirm=False)
-    _ask, out = await _yes(app, dict(LOAM_UEC), env={"requirements": REQS})
-    assert out.phase == "exported", out
-    assert out.record.user_endpoint_config["requirements"] == "six==1.17.0" and out.record.env.how == "facility"
 
 
 # ---- 10. the ledger and the tools -------------------------------------------------------------------------------------

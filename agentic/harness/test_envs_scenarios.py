@@ -20,7 +20,7 @@ import envs_checks as ec  # noqa: E402
 import targets  # noqa: E402
 from invariants import Result, ToolCall, Trace  # noqa: E402
 
-ENV_SCENARIOS = ["env_ssh_build_cache", "env_ssh_switch", "env_mep_requirements", "env_mep_fallback"]
+ENV_SCENARIOS = ["env_ssh_build_cache", "env_ssh_switch"]   # PR 4's facility cells: branch feat/block-envs-mep
 _BUILTIN = {"agent_engaged", "ends_with_stop", "stop_is_honest"}
 KEY = "0123456789abcdef"
 PATH = f"/home/u/.hpc-bridge/envs-fake-1/{KEY}-x86_64"
@@ -78,20 +78,13 @@ def test_each_env_scenario_is_wired(name):
         assert isinstance(r, Result) and not r.ok         # nothing to read is never a pass
 
 
-def test_each_env_scenario_runs_only_on_its_profile():
-    caps = {p: targets.load_profile(p)["capabilities"] for p in ("default", "pbs_mep", "mep", "polaris", "site")}
-    want = {"env_ssh_build_cache": "default", "env_ssh_switch": "default", "env_mep_requirements": "pbs_mep",
-            "env_mep_fallback": "pbs_mep"}
-    for name, prof in want.items():
+def test_each_env_scenario_runs_on_an_ssh_slurm_profile_and_never_a_facility_endpoint():
+    caps = {p: targets.load_profile(p)["capabilities"] for p in ("default", "pbs_mep", "mep")}
+    for name in ENV_SCENARIOS:
         mod = importlib.import_module(name)
-        assert targets.meets(mod.REQUIRES, caps[prof])[0], name
-    # the facility cells need the PBS facility endpoint (the requirements one its second manager)
-    for name in ("env_mep_requirements", "env_mep_fallback"):
-        mod = importlib.import_module(name)
-        for prof in ("mep", "polaris", "default"):
-            assert not targets.meets(mod.REQUIRES, caps[prof])[0], (name, prof)
-    assert importlib.import_module("env_mep_requirements").FACILITY_ID == "fake-pbs-mep-req"
-    assert importlib.import_module("env_mep_fallback").FACILITY_ID == "fake-pbs-mep"
+        assert targets.meets(mod.REQUIRES, caps["default"])[0], name
+        assert not getattr(mod, "FACILITY_ID", None), name           # a BYO SSH facility: the probe's proposal
+        assert "mep" not in mod.REQUIRES, name
 
 
 def test_the_switch_cells_batch_command_passes_the_template_reader():
@@ -175,46 +168,6 @@ def test_batch_rows_in_env_wants_every_row_in_the_batchs_env():
     wrong = [*rows[:2], {"index": 2, "state": "done", "tail": "row 2\nHPCB_ENV_PY none\n"}]
     page2 = _c("status", {"id": BID, "detail": "page"}, {"batch_id": BID, "phase": "done", "results": wrong})
     assert not ec.batch_rows_in_env(Trace([run, page2]), rows=3).ok
-
-
-# ---- the facility cells ----------------------------------------------------------------------------------------------
-
-def _mep_run(how, *, words, new_block=True, receipt_how=None, prefix=None, venv="none"):
-    req = {"requirements": ec.REQUIREMENTS}
-    e = _env(how=how, new_block=new_block, billed=f"{words}", path=None if how == "facility" else PATH)
-    ask = _c("ensure_endpoint_up", {"shape": "compute", "env": req},
-             {"status": "needs_confirmation", "block": {"queue": "debug", "env": e},
-              "notice": "A new env is a new user endpoint and a new block."})
-    yes = _c("ensure_endpoint_up", {"shape": "compute", "env": req, "confirm_spend": True},
-             {"status": "provisioning", "block": {"queue": "debug", "env": e}, "env": {**e, "how": receipt_how or how}})
-    return Trace([_confirm(), ask, yes, _probe(prefix=prefix, venv=venv)])
-
-
-def test_env_terms_want_the_how_a_new_block_and_the_words():
-    t = _mep_run("facility", words="the first build is billed; the compute node must reach the package index")
-    assert ec.env_terms(t, how="facility", words=("new user endpoint", "new block", "billed")).ok
-    assert not ec.env_terms(t, how="worker_init", words=("billed",)).ok
-    assert not ec.env_terms(t, how="facility", words=("first build of the moon",)).ok
-    nb = _mep_run("facility", words="billed", new_block=False)
-    assert not ec.env_terms(nb, how="facility", words=("billed",)).ok
-
-
-def test_env_receipt_wants_the_confirming_answer_to_state_the_env():
-    assert ec.env_receipt(_mep_run("worker_init", words="first build billed"), how="worker_init").ok
-    assert not ec.env_receipt(_mep_run("worker_init", words="x", receipt_how="activate"), how="worker_init").ok
-
-
-def test_the_worker_runs_the_env_the_facility_built():
-    venv = "/home/hpcbmep/.globus_compute/venvs/py3.11-gce4.16.0-0a1b2c3d4e5f"
-    assert ec.worker_runs_facility_env(_mep_run("facility", words="billed", prefix=venv, venv=venv)).ok
-    assert not ec.worker_runs_facility_env(_mep_run("facility", words="billed", prefix="/opt/hpcb-mep/gce")).ok
-
-
-def test_the_command_runs_the_env_worker_init_built():
-    t = _mep_run("worker_init", words="first build billed", prefix=PATH, venv=PATH)
-    assert ec.env_built_by_worker_init(t).ok
-    assert not ec.env_built_by_worker_init(_mep_run("worker_init", words="x", prefix=PATH, venv="none")).ok
-    assert not ec.env_built_by_worker_init(_mep_run("worker_init", words="x", prefix="/opt/hpcb-mep/gce")).ok
 
 
 # ---- the world check -------------------------------------------------------------------------------------------------

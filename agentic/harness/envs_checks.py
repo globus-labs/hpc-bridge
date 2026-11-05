@@ -1,16 +1,17 @@
 """Block environments (PR 3; vault `Planned/Block environments.md`): what the env scenarios share — the probe each command
 prints, the script steps that ask for an env, the graders that read a trace, and the world checks that read the
-facility.
+facility. PR 3 is the SSH half (a built env on the free login node, activated per command) and existing envs
+everywhere; a facility endpoint's builds are PR 4's, with their cells (branch `feat/block-envs-mep`).
 
 Pure and SDK-free (scenarios import it on the host, as they import batch_checks).
 
-The tool surface the graders read (the stage-A checkpoint fixes it): `ensure_endpoint_up(…, env=…)`, `run_batch(…,
-env=…)`, `submit_job(…, env=…)` and `export_handoff(…, env=…)`, where env is `{"activate": "<line>"}` |
+The tool surface the graders read (the checkpoint fixed it): `ensure_endpoint_up(…, env=…)`, `run_batch(…, env=…)`,
+`submit_job(…, env=…)` and `export_handoff(…, env=…)`, where env is `{"activate": "<line>"}` |
 `{"requirements": "<text>", "python"?, "root"?}` (+ `name`) | `{}`. Their answers carry `env` (EndpointStatus.env,
 BatchStatus.env, JobInfo.env) and, on a spend answer, `block.env` (BlockTerms.env): {kind: activate|built, how:
-activate|login|block|facility|worker_init, key, name, python, path, root, state: ready|building|failed|unchecked,
-task_id, cached, lock_sha256, size_mb, new_block, billed, index_lines, warning, error}. run_shell answers phase
-`env_building` when nothing ran because the env is being built or rebuilt.
+activate|login, key, name, python, path, root, state: ready|building|failed|unchecked, task_id, cached,
+lock_sha256, size_mb, new_block, billed, index_lines, warning, error}. run_shell answers phase `env_building` when
+nothing ran because the env is being built or rebuilt on the login node.
 
 THE PROBE. Each env scenario's command prints one line of what the command saw, so the graders need nothing from the
 wrapper's internals (they read the same line on main, where they fail on their own terms):
@@ -18,8 +19,8 @@ wrapper's internals (they read the same line on main, where they fail on their o
     HPCB_ENV_PROBE tag=<$HPCB_TAG or none> venv=<$VIRTUAL_ENV or none> first=<the first PATH entry>
     HPCB_ENV_PY <sys.prefix> <six.__version__>        (or `HPCB_ENV_PY none` when python cannot import six)
 
-`six` is the cells' one requirement: small, pure Python, on PyPI since 2010 — the fake cluster's login node (and, for
-the facility cells, its compute nodes) must reach PyPI, as the endpoint venv's own build already needs.
+`six` is the cells' one requirement: small, pure Python, on PyPI since 2010 — the fake cluster's login node must reach
+PyPI, as the endpoint venv's own build already needs.
 """
 from __future__ import annotations
 
@@ -29,11 +30,11 @@ import time
 from typing import Any
 
 import batch_checks as bc
-from invariants import Result, Trace, _billed_start_idxs
+from invariants import Result, Trace
 
 REQUIREMENTS = "six==1.17.0\n"
 SIX = "1.17.0"
-ENV_WAIT_S = 600.0          # a login build of one small package is seconds; a facility's first block, minutes
+ENV_WAIT_S = 600.0          # a login build of one small package is seconds; the wait only bounds a broken one
 POLL_S = 5.0
 PROBE = ('echo "HPCB_ENV_PROBE tag=${HPCB_TAG:-none} venv=${VIRTUAL_ENV:-none} first=${PATH%%:*}"; '
          "python -c 'import sys, six; print(\"HPCB_ENV_PY\", sys.prefix, six.__version__)' 2>/dev/null "
@@ -70,19 +71,6 @@ async def ask_env(ops, env: dict, **args: Any) -> dict:
         r = await ops.call("ensure_endpoint_up", shape="compute")
     ops.say(f"HPCB_ENV {env_of(r)!r}")
     return r
-
-
-async def wait_up(ops, *, timeout_s: float = 900.0) -> dict:
-    """ensure_endpoint_up(shape="compute") — never confirming again: the yes was the env's own call — until the block
-    is up (a facility's first block with an env builds it first: minutes)."""
-    deadline = time.monotonic() + timeout_s
-    e = await ops.call("ensure_endpoint_up", shape="compute")
-    while e.get("status") != "up":
-        if e.get("is_error") or e.get("status") not in ("provisioning", "up") or time.monotonic() > deadline:
-            ops.abort(f"the env's block did not come up: status={e.get('status')!r} {bc._brief(e)!r}")
-        await ops.sleep(POLL_S)
-        e = await ops.call("ensure_endpoint_up", shape="compute")
-    return e
 
 
 async def probe(ops, *, shape: str = "compute") -> dict:
@@ -236,56 +224,6 @@ def batch_rows_in_env(t: Trace, *, rows: int) -> Result:
     ok = bool(e.get("path")) and len(good) == rows
     return Result(name, ok, f"batch {r.get('batch_id')} env {e.get('key')} at {e.get('path')}: {len(good)}/{rows} "
                   "rows ran in it")
-
-
-def env_terms(t: Trace, *, how: str, words: tuple[str, ...]) -> Result:
-    """The first spend question for an env on a facility's endpoint states it: `block.env` with this `how`, a new
-    block (`new_block`), and these words in its notice or its `billed`."""
-    name = "env_terms"
-    asks = [(i, r) for i, want, r in env_calls(t) if want and r.get("status") == "needs_confirmation"]
-    if not asks:
-        return Result(name, False, "no call with an env answered needs_confirmation")
-    i, r = asks[0]
-    e = dict((r.get("block") or {}).get("env") or {})
-    said = f"{r.get('notice') or ''} {e.get('billed') or ''}"
-    missing = [w for w in words if w not in said]
-    ok = e.get("how") == how and e.get("new_block") is True and not missing and i not in _billed_start_idxs(t)
-    return Result(name, ok, f"call {i}: block.env how={e.get('how')!r} new_block={e.get('new_block')!r}; "
-                  f"missing words {missing}; billed {e.get('billed')!r}")
-
-
-def env_receipt(t: Trace, *, how: str) -> Result:
-    """The yes that confirmed the env's block carries it as a receipt: `env.how`, and the block it started."""
-    name = "env_receipt"
-    yes = [(i, r) for i, want, r in env_calls(t) if want and t.calls[i].input.get("confirm_spend")]
-    if not yes:
-        return Result(name, False, "no confirming call named an env")
-    i, r = yes[-1]
-    e = env_of(r)
-    ok = e.get("how") == how and r.get("status") in ("up", "provisioning") and bool(r.get("block"))
-    return Result(name, ok, f"call {i}: status={r.get('status')!r} env.how={e.get('how')!r} block={bool(r.get('block'))}")
-
-
-def worker_runs_facility_env(t: Trace) -> Result:
-    """From inside the block: python is the env the FACILITY built from the requirements (a venv under the mapped
-    user's ~/.globus_compute/venvs/), six imports at its version — the worker's env, never a per-command activation."""
-    name = "worker_runs_facility_env"
-    seen = [p for _i, p in probes(t) if p.get("prefix")]
-    hit = [p for p in seen if "/.globus_compute/venvs/" in p["prefix"] and p["six"] == SIX]
-    return Result(name, bool(hit), f"probes saw {[(p['prefix'], p['six'], p['venv']) for p in seen][:3]}")
-
-
-def env_built_by_worker_init(t: Trace) -> Result:
-    """From inside the block: the env the block's worker_init built (under the env root, `<key>-<arch>`) is the one
-    each command activated — not the worker's own env."""
-    name = "env_built_by_worker_init"
-    want = [env_of(c.result) for c in t.calls if env_of(c.result).get("how") == "worker_init"]
-    keys = {e.get("key") for e in want} - {None}
-    seen = [p for _i, p in probes(t) if p.get("prefix")]
-    hit = [p for p in seen if any(f"/{k}-" in p["prefix"] for k in keys) and p["six"] == SIX
-           and p["venv"] == p["prefix"]]
-    return Result(name, bool(hit) and bool(keys), f"keys {sorted(keys)}; probes saw "
-                  f"{[(p['prefix'], p['six'], p['venv']) for p in seen][:3]}")
 
 
 # ---- world checks (ctx: after the script, before the teardown) -------------------------------------------------------
