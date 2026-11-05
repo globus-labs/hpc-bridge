@@ -3,7 +3,7 @@
 > [!abstract] In one line
 > Point work at a software environment: one that already exists on the facility (`activate`), or one built from a requirements list. It works for interactive commands, batch rows, Jobs-mode jobs and handoffs.
 >
-> - **PR 3 (on PR 2, batch row sizing): built 2026-11-05; the live cells are next.** It covers existing envs everywhere, facility endpoints included, and built envs on an endpoint hpc-bridge stood up over SSH. A built env is made on the login node (free) and activated per command, row and job. Module [[envs]].
+> - **PR 3 (on PR 2, batch row sizing): built and reviewed (two rounds) 2026-11-05; both live cells pass on the fake cluster.** It covers existing envs everywhere, facility endpoints included, and built envs on an endpoint hpc-bridge stood up over SSH. A built env is made on the login node (free) and activated per command, row and job. Module [[envs]].
 > - **PR 4 (branch `feat/block-envs-mep`):** building on a facility endpoint. It comes after a live check; its open items are below.
 
 ## Review round 2 (2026-11-05, on `8e63a6d`)
