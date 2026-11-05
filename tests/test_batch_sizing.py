@@ -633,7 +633,9 @@ def test_every_result_reports_peak_rss_cpu_seconds_wall_and_nproc(tmp_path):
     _fake_tool(tmp_path, "taskset", "true")
     busy = "end=$(( $(date +%s) + 2 )); n=0; while [ $(date +%s) -lt $end ]; do n=$((n + 1)); done; echo $n"
     rep = _result(_spawn(_script(busy, tmp_path / "rd", 0, _slot(pin=False)), _wrapper_env(tmp_path)))
-    assert rep.rc == 0 and rep.cpu_s is not None and rep.cpu_s >= 0.8, rep
+    # 2 s of busy loop: well over the near-zero of CPU time lost on exec (W11), with room for a loaded machine
+    # (0.72 s seen with every CPU contended)
+    assert rep.rc == 0 and rep.cpu_s is not None and rep.cpu_s >= 0.25, rep
     assert rep.wall_s is not None and 1.0 <= rep.wall_s <= 10
     assert isinstance(rep.nproc, int) and rep.nproc >= 1
     assert rep.peak_rss_kb is not None and rep.peak_rss_kb > 0
