@@ -333,7 +333,7 @@ async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known
         state = _state_of(r, j)
         upd = {"charged": r.charged, "committed": r.committed, "meter_source": r.source, "sched_state": r.state,
                "metered_at": now, "array_counts": json.dumps(r.counts), "state": state, "reason": r.reason}
-        if r.exit_code is not None:
+        if r.source not in ("missing", "squeue"):   # read: its exit code only once it ended with one (None until)
             upd["exit_code"] = r.exit_code
         if state not in JOB_LIVE and not j.get("ended_at"):
             upd["ended_at"] = now
@@ -343,8 +343,8 @@ async def tick(app: AppCtx, *, envelope_ids: list[str] | None = None, also_known
         excluded = set(json.loads(e.get("excluded") or "[]"))
         if view.ok:
             accts = {a for a in envelope_accounts(e) if a}
-            un = meter.unledgered(view, known, excluded, accounts=accts or None,
-                                  horizon_s=max(0.0, float(e["deadline"]) - now))
+            un = _mark_session_blocks(app, meter.unledgered(view, known, excluded, accounts=accts or None,
+                                                            horizon_s=max(0.0, float(e["deadline"]) - now)))
         else:   # not read: the jobs it did not start keep their last count, never nothing (review B3)
             un = [u for u in json.loads(e.get("unledgered") or "[]")
                   if _base(u.get("native_id")) not in known and u.get("native_id") not in excluded]
@@ -394,8 +394,11 @@ def job_info(j: dict[str, Any]) -> JobInfo:
                                                                                          str(j["state"]).upper())
     if j.get("state") == "held" and state == "PENDING":
         state = "HELD"
+    # an exit code only for a job that ended with one (a ledger an earlier build wrote may hold sacct's 0:0 for a live
+    # or cancelled job: the demo of 2026-11-03)
+    code = j.get("exit_code") if (state.split() or [""])[0] in meter._EXIT_CODED else None
     return JobInfo(job_id=j["id"], native_id=j.get("native_id"), source=j.get("source") or "submit_job",
-                   state=state, exit_code=j.get("exit_code"), reason=j.get("reason"), charged=round(charged, 4),
+                   state=state, exit_code=code, reason=j.get("reason"), charged=round(charged, 4),
                    committed=round(max(0.0, held - charged), 4), worst_case=_up(float(j.get("worst_case") or 0)),
                    unit=UNIT, meter_source=j.get("meter_source") or "none", tasks=int(j.get("tasks") or 1),
                    throttle=j.get("throttle"), array_counts=json.loads(j.get("array_counts") or "{}"),
@@ -442,23 +445,58 @@ def _limit_words(reason: str, ident: str) -> str:
             f"cancel('{ident}', 'abort') ends it.")
 
 
+SESSION_BLOCK = "the session's compute block, confirmed before this envelope opened"
+
+
+def _ended(state: str | None) -> bool:
+    return (str(state or "").split() or [""])[0] in meter._ENDED
+
+
 def _bills_note(info: EnvelopeInfo) -> str:
+    """What still bills: every job that can — an ended one with nothing committed is counted in `spent`, not listed
+    here (the demo of 2026-11-03 listed a CANCELLED job "+ 0")."""
     live = [j for j in info.jobs if j.committed > 0 or j.state in ("RUNNING", "PENDING", "HELD", "RESERVED")]
     parts = [f"{j.job_id} ({j.native_id or 'not submitted'}, {j.state}"
              + (", appeared while your approved command ran, no envelope deadline" if j.unheld else "")
              + (f", held by a site limit: {j.reason}" if j.state == "PENDING" and site_limit(j.reason) else "")
              + f", {_g(j.charged)} charged, up to {_gu(j.committed)} more)" for j in live]
-    parts += [f"job {u.native_id} ({u.name or '?'}, {u.state}: not started by hpc-bridge, counted {_g(u.charged)} + "
-              f"{_gu(u.committed)})" for u in info.unledgered]
+    parts += [f"job {u.native_id} ({u.name or '?'}, {u.state}: "
+              + (SESSION_BLOCK if u.session_block else "not started by hpc-bridge")
+              + f", counted {_g(u.charged)} + {_gu(u.committed)})"
+              for u in info.unledgered if u.committed > 0 or not _ended(u.state)]
     return "; ".join(parts) or "nothing"
 
 
 def _unledgered_note(info: EnvelopeInfo) -> str:
-    if not info.unledgered:
+    """The jobs hpc-bridge did not start, which the user may say are not theirs to count (never the session's own
+    compute block: it bills the same allocation, and is counted as such)."""
+    theirs = [u for u in info.unledgered if not u.session_block]
+    if not theirs:
         return ""
-    ids = ", ".join(f"{u.native_id} ({u.name or '?'})" for u in info.unledgered)
+    ids = ", ".join(f"{u.native_id} ({u.name or '?'})" for u in theirs)
     return (f" It counts job(s) hpc-bridge did not start: {ids} — if the user says one is not theirs to count here, "
             "pass exclude_jobs=[…] with their yes (confirm_spend=True) and it is never counted again.")
+
+
+def session_blocks(app: AppCtx) -> set[str]:
+    """The scheduler jobs that are this session's own compute blocks on the bound endpoint (their base ids): every job
+    a check of ours proved up there (`job_seen_since`), each shape's confirmed or presumed block, and the blocks a stop
+    or switch left (`left_blocks`). A block confirmed while an envelope is open is that envelope's reservation
+    (`_link_block`); one confirmed before is counted as a job hpc-bridge did not start, and named for what it is."""
+    eid = app.state.endpoint_id
+    jobs = {j for (e, j) in app.job_seen_since if e == eid}
+    for rt in app.shapes.values():
+        jobs |= {j for j in (rt.block_job, rt.presumed_block_job) if j}
+    jobs |= {lb.job for lb in app.left_blocks if lb.job and lb.endpoint_id == eid}
+    return {_base(j) for j in jobs if j}
+
+
+def _mark_session_blocks(app: AppCtx, un: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    mine = session_blocks(app)
+    for u in un:
+        if _base(u.get("native_id")) in mine:
+            u["session_block"] = True
+    return un
 
 
 # ---- the job's spec and terms ----------------------------------------------------------------------------------------
@@ -896,12 +934,15 @@ async def _held_now(app: AppCtx, accounts: list[str], exclude: list[str], horizo
         return False, [], view.error or "the accounting did not answer"
     await _fill_squeue_only(app, view, known | set(exclude))
     accts = {a for a in accounts if a}
-    return True, meter.unledgered(view, known, set(exclude), accounts=accts or None, horizon_s=horizon_s), ""
+    return True, _mark_session_blocks(app, meter.unledgered(view, known, set(exclude), accounts=accts or None,
+                                                            horizon_s=horizon_s)), ""
 
 
 def _held_words(held: list[dict[str, Any]]) -> str:
-    return ", ".join(f"job {u['native_id']} ({u.get('name') or '?'}, {u.get('state')}: "
-                     f"{_gu(float(u.get('charged') or 0) + float(u.get('committed') or 0))})" for u in held)
+    return ", ".join(f"job {u['native_id']} ({u.get('name') or '?'}, {u.get('state')}"
+                     + (", the session's compute block, confirmed before this envelope" if u.get("session_block")
+                        else ", not started by hpc-bridge")
+                     + f": {_gu(float(u.get('charged') or 0) + float(u.get('committed') or 0))})" for u in held)
 
 
 def _limits_refusal(req: EnvelopeRequest | None, e: dict[str, Any] | None, spec: Spec) -> str | None:
@@ -1032,9 +1073,11 @@ async def _open_and_admit(app: AppCtx, spec: Spec, req: EnvelopeRequest, hours: 
     if (why := _limits_refusal(req, None, spec)) is not None:
         return JobStatus(phase="refused" if confirm_spend else "needs_confirmation", reason="envelope_limit",
                          terms=terms, envelope=proposal, notice=f"{why}. Nothing was submitted.")
-    held_note = (f" Already held on this facility and account: {_gu(held_sum)} {UNIT} by job(s) hpc-bridge did not "
-                 f"start, which count against any envelope here — {_held_words(held)}. If one is not the user's to "
-                 "count here, pass exclude_jobs=[…] with their yes and it is never counted." if held else "")
+    held_note = (f" Already held on this facility and account: {_gu(held_sum)} {UNIT}, which counts against any "
+                 f"envelope here — {_held_words(held)}." if held else "")
+    if any(not u.get("session_block") for u in held):   # never the session's own block: it bills this allocation
+        held_note += (" If a job hpc-bridge did not start is not the user's to count here, pass exclude_jobs=[…] "
+                      "with their yes and it is never counted.")
     if not read:
         held_note = (f" What else the user runs could not be read just now ({unread}): the cap covers this job alone, "
                      "and the yes is admitted only once a reading works.")

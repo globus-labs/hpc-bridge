@@ -30,5 +30,6 @@ mep_mapped_user = "hpcbmep"          # every mapped run executes as this account
 
 [catalog]
 # Prints the seed-format catalog naming this cluster's MEP UUID (entry `fake-pbs-mep`). run_smoke.sh runs it on the
-# host per cell and mounts the output into the jail as HPC_BRIDGE_CATALOG_FILE (the plugin's local-catalog seam).
-cmd = "docker exec hpcb-fake-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"
+# host per cell and mounts the output into the jail as HPC_BRIDGE_CATALOG_FILE (the plugin's local-catalog seam). Both
+# callers eval it, so the container follows the stack's compose project (HPCB_FAKE_PROJECT), never another stack's.
+cmd = "docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"

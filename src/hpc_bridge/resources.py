@@ -270,8 +270,10 @@ def _whole(nodes: int, shape: PartitionShape | None, gpus: int | None, **kw: Any
 
 
 def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: Channel, takes: bool | None = True,
-              profile_cpus: int | None = None, scheduler: str | None = "slurm") -> Size:
-    """What the block `uec` asks for gets, with what is known of its partition (`shape`) — never less than it bills:
+              profile_cpus: int | None = None, scheduler: str | None = "slurm", propose: bool = True) -> Size:
+    """What the block `uec` asks for gets, with what is known of its partition (`shape`) — never less than it bills
+    (`propose` False: a config sent as it is, an export_handoff's, which no wire mapping gives D3's proposed slice — on
+    a per-core partition with nothing asked it is parsl's default block):
     - whole nodes when asked (`exclusive` True), when the partition hands out only whole nodes, or when the facility's
       own scheduler_options ask for them (`--exclusive`, `--mem=0`, `--core-spec`, `place=excl`);
     - a slice only on all the evidence (review round 2): a partition known to hand out slices (`per_core`), and —
@@ -313,7 +315,7 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
         return Size(nodes=nodes, whole_node=None, cores=cores or opts.cores, memory_gb=gb, gpus=gpus, send_mem=send,
                     why_whole="unshared" if whole is False and takes is True else None)
     asked = cores is not None or mem is not None or whole is False
-    if asked or (per_core and takes is True):
+    if asked or (per_core and takes is True and propose):
         proposed = cores is None and per_core and takes is True
         if proposed:
             cores = default_slice_cores(shape, nodes)

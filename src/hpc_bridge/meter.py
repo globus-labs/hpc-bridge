@@ -44,6 +44,10 @@ _ENDED = frozenset({"COMPLETED", "FAILED", "CANCELLED", "TIMEOUT", "DEADLINE", "
                     "PREEMPTED", "BOOT_FAIL", "REVOKED", "SPECIAL_EXIT", "REQUEUED"})
 _FAILED = frozenset({"FAILED", "TIMEOUT", "DEADLINE", "NODE_FAIL", "OUT_OF_MEMORY", "PREEMPTED", "BOOT_FAIL",
                      "REVOKED", "SPECIAL_EXIT"})
+# The ended states whose exit code is the job's own: sacct says 0:0 for a job still running, and for one CANCELLED or
+# TIMEOUT (the demo of 2026-11-03: an adopted job read exit_code 0 while RUNNING and after CANCELLED). PBS's are read
+# the same way (`parse_pbs` names an Exit_status of 0 COMPLETED, a qdel CANCELLED, anything else FAILED).
+_EXIT_CODED = frozenset({"COMPLETED", "FAILED"})
 # A bash-native timeout (no coreutils `timeout` assumed): the command in the background, a watcher that TERMs it. The
 # watcher's own output goes nowhere: an orphaned `sleep` must not hold the call's stdout open past the command.
 _BOUND = ('__hb_bound() { "$@" & local p=$!; ( sleep @@S@@; kill -TERM "$p" 2>/dev/null ) </dev/null >/dev/null 2>&1 & '
@@ -372,10 +376,10 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
             states.append("PENDING")
             reason = reason or r.reason
             continue
-        if r.state != "REQUEUED":
-            accounted += 1
         state = r.state
-        counts[state] = counts.get(state, 0) + 1
+        if r.state != "REQUEUED":   # a requeued job's earlier run (sacct -D) is billed, but no task of its own
+            accounted += 1
+            counts[state] = counts.get(state, 0) + 1
         states.append(state)
         started = r.elapsed_s > 0 or state != "PENDING"
         billed = max(r.elapsed_s, min_s) if started and state != "PENDING" else 0.0
@@ -386,7 +390,7 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
             committed += r_rate * max(r_limit, min_s) / 3600
         else:
             committed += r_rate * max(0.0, max(r_limit, min_s) - billed) / 3600
-        if len(finals) == 1 and r.state != "REQUEUED":
+        if len(finals) == 1 and r.state in _EXIT_CODED:
             exit_code = r.exit_code
         reason = reason or (r.reason if state == "PENDING" else None)
     sq_pending = view.pending.get(native, 0)
@@ -396,6 +400,10 @@ def job_reading(job: dict[str, Any], view: SchedView) -> Reading:
     missing = max(0, tasks - accounted)   # tasks the accounting did not list (pending ones, or not seen at all)
     if missing:
         committed += missing * rate * max(limit_s, min_s) / 3600
+    if (rest := tasks - sum(counts.values())) > 0:
+        # a task neither sacct -X nor squeue's pending ranges list (one between the two: the demo of 2026-11-03 read 8
+        # COMPLETED + 1 RUNNING of 10) is held at its full walltime above, and counted PENDING: the counts sum to tasks
+        counts["PENDING"] = counts.get("PENDING", 0) + rest
     state = _phase_state(states)
     if state == "PENDING":   # why it waits, as the scheduler says it now (sacct's Reason may be `None`)
         reason = view.reasons.get(native) or reason

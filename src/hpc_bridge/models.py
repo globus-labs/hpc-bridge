@@ -205,13 +205,16 @@ class BlockTerms(BaseModel):
 
 class UnledgeredJob(BaseModel):
     """A job of the user's the meter's sweep found that hpc-bridge did not start (a script's own sbatch, a subprocess):
-    counted against the envelope until the user says it is not theirs (submit_job(exclude_jobs=[…]))."""
+    counted against the envelope until the user says it is not theirs (submit_job(exclude_jobs=[…])). `session_block`:
+    it is this session's own compute block, confirmed before the envelope opened — counted (it bills the same
+    allocation), never one to exclude."""
 
     native_id: str
     name: str | None = None
     state: str | None = None
     charged: float = 0.0
     committed: float = 0.0
+    session_block: bool = False
 
 
 class JobInfo(BaseModel):
@@ -457,7 +460,9 @@ class EndpointStatus(BaseModel):
 
 BatchPhase = Literal["admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused",
                      # a job- or env- id's (batch phase 2a; status answers them in this one model)
-                     "queued", "running", "failed", "open", "exhausted", "draining", "closed"]
+                     "queued", "running", "failed", "open", "exhausted", "draining", "closed",
+                     # status() with no id: the ledger's listing
+                     "listed"]
 TaskState = Literal["backlog", "in_flight", "submit_unknown", "presumed_lost", "done", "failed", "lost", "cancelled"]
 
 
@@ -496,6 +501,28 @@ class BatchTaskResult(BaseModel):
     task_id: str | None = None
 
 
+class LedgerEntry(BaseModel):
+    """One record of the ledger, as status() with no id lists it — read from the ledger alone (nothing is ticked or
+    collected). `counts`: a batch's rows (done, failed, cancelled, in_flight), a job's array tasks by state. An
+    envelope's `spent` / `committed` / `cap` are its meter's last reading. `stale`: why an ACTIVE record looks abandoned
+    (its server gone, its block's config retired, its last reading old) — status(id) or cancel(id) acts on it."""
+
+    id: str
+    kind: Literal["batch", "job", "envelope"]
+    facility: str | None = None
+    state: str
+    active: bool
+    created_at: str
+    tasks: int | None = None
+    counts: dict[str, int] = Field(default_factory=dict)
+    spent: float | None = None
+    committed: float | None = None
+    cap: float | None = None
+    unit: str | None = None
+    command: str | None = None
+    stale: str | None = None
+
+
 class BatchStatus(BaseModel):
     """run_batch's and status's answer.
 
@@ -507,9 +534,10 @@ class BatchStatus(BaseModel):
 
     status() answers every kind of id in this one model (`kind`): a batch (`batch-…`, the fields above), a job
     (`job-…`: `job`, `envelope`; phase queued | running | done | failed | cancelled) or an envelope (`env-…`:
-    `envelope`; phase open | exhausted | draining | closed)."""
+    `envelope`; phase open | exhausted | draining | closed). With no id it lists the ledger (`kind` list, phase listed:
+    `entries`, `total`, `next_offset`)."""
 
-    kind: Literal["batch", "job", "envelope"] = "batch"
+    kind: Literal["batch", "job", "envelope", "list"] = "batch"
     batch_id: str | None = None
     phase: BatchPhase
     tasks: int = 0
@@ -532,6 +560,8 @@ class BatchStatus(BaseModel):
     notice: str | None = None
     job: JobInfo | None = None
     envelope: EnvelopeInfo | None = None
+    entries: list[LedgerEntry] = Field(default_factory=list)   # kind list: this page of the ledger
+    total: int | None = None                                    # kind list: how many match the filters
 
 
 class BlockLeft(BaseModel):

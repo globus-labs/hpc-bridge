@@ -9,7 +9,8 @@ the configs a stop or a reap retired.
 - **Local filesystems only.** WAL does not work on a network filesystem, and the state dir is on NFS / Lustre / GPFS
   on login nodes and beside an orchestrator: `open` refuses one by its type (`fs_type`), naming HPC_BRIDGE_STATE_DIR.
 - **One admission point.** `reserve` checks the lease holder, the retired configs and the window in ONE
-  `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt.
+  `BEGIN IMMEDIATE` transaction, and moves the rows it takes to `in_flight` with their next attempt. The window is the
+  block's, shared by every batch on it (fewest rows out first while another batch waits).
 - **One owner per batch.** A lease row (host, pid, the process's start time, heartbeat). A takeover needs a stale
   heartbeat AND a holder that is gone: its pid dead, or alive but started at another time (the pid was handed on). An
   orphaned server keeps its pid and its start time (`harness:server_orphaned`), so it is never taken over. The ledger is
@@ -35,6 +36,14 @@ from .state import _state_dir
 SCHEMA_VERSION = 1
 LEASE_STALE_S = float(os.environ.get("HPC_BRIDGE_LEASE_STALE_S", "") or 30.0)
 BUSY_TIMEOUT_MS = 10_000
+# How long a batch's last refused ask for a slot (`batch.want_at`) makes it a contender for the block's shared window:
+# past the 10 s of an idle batch loop's pass, so a waiting batch stays one; a batch that stopped asking (paused, its
+# walltime gate shut, its server gone) holds nothing back for longer than this.
+WANT_FRESH_S = 30.0
+# How long past its admission a row a gone server left in flight can still hold a worker of the block: task_walltime_s
+# plus this — `batch.HOLD_MARGIN_S`, derived from the wrapper's own arithmetic plus a delivery allowance (batch passes
+# it; a test ties the two).
+HOLD_MARGIN_S = 75.0
 
 # Network and shared filesystems SQLite's WAL cannot run on (its shared-memory index needs one host's mmap and POSIX
 # locks): Linux's /proc/mounts names and macOS's mount(8) names. Any fuse filesystem counts (sshfs, s3fs, gcsfuse…).
@@ -180,6 +189,20 @@ class TaskRow:
     task_id: str | None = None
 
 
+class Reserved(list[TaskRow]):
+    """`reserve`'s answer: the rows it moved to in_flight, and — when the block's other rows refused it slots its own
+    window had room for — those batches, {batch id: rows holding the block} (named to the user, never silently held)."""
+
+    def __init__(self, rows: Iterable[TaskRow] = (), *, holders: dict[str, int] | None = None) -> None:
+        super().__init__(rows)
+        self.holders: dict[str, int] = dict(holders or {})
+
+
+def window_for(workers: int | None) -> int:
+    """A block's window: its workers less one kept for interactive work; 1 when the count is unknown or 1."""
+    return max(1, (workers or 1) - 1)
+
+
 def fs_type_from_mounts(path: str, mounts: str) -> str | None:
     """The filesystem type of `path` from a /proc/mounts-shaped table (`dev mountpoint type opts …`): the mount point
     that is the longest prefix of the path."""
@@ -265,7 +288,8 @@ create table if not exists batch (
   owner_pid integer,
   owner_start text,
   heartbeat real,
-  cancel_requested text
+  cancel_requested text,
+  want_at real
 );
 create table if not exists task (
   batch_id text not null,
@@ -296,6 +320,14 @@ create table if not exists task (
   primary key (batch_id, idx)
 );
 create index if not exists task_by_tid on task (task_id);
+create table if not exists block_workers (
+  endpoint_id text,
+  uec_hash text not null,
+  block_job text not null default '',
+  workers integer not null,
+  at real,
+  primary key (endpoint_id, uec_hash, block_job)
+);
 create table if not exists tgroup (
   batch_id text not null,
   group_id text not null,
@@ -433,7 +465,7 @@ _TASK_FIELDS = ("rc", "tail", "stderr_tail", "stdout_path", "stdout_bytes", "tru
                 "remaining_s", "settled_by", "evidence", "started_at", "task_id", "sent_job", "sent_uec",
                 "unknown_since", "unheld")
 # Columns a ledger written by an earlier build may lack: added on open.
-_ADDED_COLUMNS = {"batch": [("owner_start", "text")],
+_ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real")],
                   "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text")]}
@@ -478,6 +510,9 @@ class Ledger:
             for name, kind in cols:
                 if name not in have:
                     con.execute(f"alter table {table} add column {name} {kind}")
+        # after the columns (an earlier build's ledger gets `sent_uec` above): the block window's one scan (`_on_block`)
+        con.execute("create index if not exists task_holding_by_uec on task (sent_uec, state) where state in "
+                    f"({', '.join(repr(s) for s in HOLDING)})")
         con.execute("insert or ignore into meta values ('schema_version', ?)", (str(SCHEMA_VERSION),))
         return cls(path, con)
 
@@ -629,11 +664,98 @@ class Ledger:
         return None if r is None else str(r[0] or "retired")
 
     # -- admission -------------------------------------------------------------------------------------------------
+    def _alive(self, row: sqlite3.Row, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool]) -> bool:
+        """Whether a batch's lease holder still runs (`holder_alive`), once per holder — the caller's own server only
+        when its start time, if on record, is the caller's (review round 2: a restarted server handed the dead one's
+        pid had taken that server's rows for its own, and held them for good)."""
+        key = (str(row["owner_host"] or ""), int(row["owner_pid"] or 0), row["owner_start"])
+        if owner is not None and key[:2] == (owner.host, owner.pid) and key[2] in (None, owner.started):
+            return True
+        if key not in seen:
+            seen[key] = self.holder_alive(Owner(*key))
+        return seen[key]
+
+    def _on_block(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str, block_job: str | None,
+                  at: float, margin_s: float, owner: Owner | None,
+                  seen: dict[tuple[str, int, str | None], bool]) -> tuple[dict[str, int], dict[str, int]]:
+        """Per batch (the caller's too), on THIS block — the endpoint and config `uec_hash` — (holds, out):
+        `holds`, its rows that can still hold a worker of the block, and none that cannot be shown to (review round 1:
+        an aborted batch's presumed-lost rows had shrunk every later window on a MEP's one config, for good):
+        - `in_flight`: while its batch's server runs (it settles or presumes it); a gone server's only until
+          task_walltime_s + `margin_s` past its admission (`HOLD_MARGIN_S`: the wrapper's own end, and delivery);
+        - `submit_unknown`: until EVIDENCE says its task can no longer run (`unheld`, `batch._unknown_evidence`), or
+          reconciliation settles it — whatever its batch's state or server (review round 2: a failed POST may have
+          queued it, and on a MEP the next submit with that config delivers it). Never silently: a batch it holds is
+          told which batch holds it (`Reserved.holders`);
+        - `presumed_lost`: only while its server runs and it was sent to the block in front (`block_job`).
+        `out`, its rows in flight or of unknown fate on the block: the fairness order, the same whoever reads it.
+        One scan, on the partial index `task_holding_by_uec` (a row from before `sent_uec` was set at admission is
+        read by its batch's config)."""
+        states = ", ".join(f"'{s}'" for s in HOLDING)
+        cols = ("t.batch_id, t.state, t.sent_job, t.unheld, coalesce(t.admitted_at, t.unknown_since, 0) as sent_at, "
+                "o.task_walltime_s, o.owner_host, o.owner_pid, o.owner_start from task t join batch o on o.id = "
+                f"t.batch_id where o.endpoint_id is ? and t.state in ({states}) and ")
+        holds: dict[str, int] = {}
+        out: dict[str, int] = {}
+        for r in c.execute(f"select {cols} t.sent_uec = ? union all select {cols} t.sent_uec is null and "
+                           "o.uec_hash = ?", (endpoint_id, uec_hash, endpoint_id, uec_hash)):
+            bid = str(r["batch_id"])
+            if r["state"] == "in_flight":
+                young = at - float(r["sent_at"] or 0.0) < float(r["task_walltime_s"] or 0.0) + margin_s
+                held = young or self._alive(r, owner, seen)
+            elif r["state"] == "submit_unknown":
+                held = r["unheld"] is None
+            else:
+                held = (block_job is not None and str(r["sent_job"] or "") == str(block_job)
+                        and self._alive(r, owner, seen))
+            if held:
+                holds[bid] = holds.get(bid, 0) + 1
+            if r["state"] == "in_flight" or (r["state"] == "submit_unknown" and r["unheld"] is None):
+                out[bid] = out.get(bid, 0) + 1
+        return holds, out
+
+    def block_holders(self, batch_id: str, *, uec_hash: str, block_job: str | None = None, owner: Owner | None = None,
+                      margin_s: float = HOLD_MARGIN_S, now: float | None = None) -> dict[str, int]:
+        """The OTHER batches whose rows hold slots of this batch's block, as `reserve` counts them for `owner`."""
+        at = time.time() if now is None else now
+        b = self._con.execute("select endpoint_id from batch where id = ?", (batch_id,)).fetchone()
+        if b is None:
+            raise UnknownBatch(batch_id)
+        holds, _out = self._on_block(self._con, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, {})
+        holds.pop(batch_id, None)
+        return holds
+
+    # -- the block's worker count, as a task on it reported it ------------------------------------------------------
+    def learn_workers(self, endpoint_id: str | None, uec_hash: str, block_job: str | None, workers: int, *,
+                      now: float | None = None) -> None:
+        """A check or a task on the block reported its worker count (PARSL_WORKER_COUNT): the block's, for every batch
+        on it (review round 2: a count one batch had learnt was lost with that batch's admission)."""
+        with self._tx() as c:
+            c.execute("insert or replace into block_workers values (?,?,?,?,?)",
+                      (endpoint_id, uec_hash, block_job or "", int(workers), time.time() if now is None else now))
+
+    def _learnt_window(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str,
+                       block_job: str | None) -> int | None:
+        r = c.execute("select workers from block_workers where endpoint_id is ? and uec_hash = ? order by "
+                      "(block_job = ?) desc, at desc limit 1", (endpoint_id, uec_hash, block_job or "")).fetchone()
+        return None if r is None else window_for(int(r[0]))
+
     def reserve(self, batch_id: str, owner: Owner, n: int, *, uec_hash: str, now: float | None = None,
-                indices: Iterable[int] | None = None) -> list[TaskRow]:
+                indices: Iterable[int] | None = None, block_job: str | None = None,
+                margin_s: float = HOLD_MARGIN_S) -> Reserved:
         """THE admission point: in one BEGIN IMMEDIATE transaction, check that `owner` holds the lease, that the config
         is not retired and how many window slots are free, and move up to `n` backlog rows (the lowest indices, or
-        `indices` first) to `in_flight` with their next attempt."""
+        `indices` first) to `in_flight` with their next attempt, on the block `uec_hash` names (`sent_uec`).
+
+        The window is the BLOCK's (its endpoint and config; `block_job`: the block in front, when known): the batch's
+        own rows out, plus every other batch's rows that can still hold a worker of this block (`_on_block`), against
+        the smallest of the block's learnt worker count (`learn_workers`) and the `capacity` of every batch with rows
+        on it or admitting on it (review rounds 1-2: a batch that had not learnt the count overfilled the window
+        another had). Fairness: while another batch on the block waits for a slot it could take (`want_at` within
+        WANT_FRESH_S — stamped only when the block's rows refused it, never when fairness did — still admitting, with
+        a backlog and room of its own), a slot goes first to the batch with fewer rows in flight or of unknown fate on
+        the block, then the one that admitted less recently, then the lower id: one order whoever reads it, so two
+        waiters never defer to each other. The answer carries the other batches holding the block (`holders`)."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
             b = c.execute("select * from batch where id = ?", (batch_id,)).fetchone()
@@ -645,12 +767,48 @@ class Ledger:
                             (b["endpoint_id"], uec_hash)).fetchone()
             if why is not None:
                 raise RetiredConfig(str(why[0] or "this block's config was retired"))
-            held = c.execute(f"select count(*) from task where batch_id = ? and state in ({','.join('?' * 3)})",
-                             (batch_id, *HOLDING)).fetchone()[0]
-            free = max(0, int(b["capacity"] or 1) - int(held))
-            take = min(max(0, n), free)
+            hold = ",".join("?" * len(HOLDING))
+
+            def held_by(bid: str) -> int:   # a batch's own window: its rows out, wherever they went
+                return int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
+                                     (bid, *HOLDING)).fetchone()[0])
+
+            seen: dict[tuple[str, int, str | None], bool] = {}
+            held = held_by(batch_id)
+            holds, out = self._on_block(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen)
+            mine_on = holds.pop(batch_id, 0)
+            others = sum(holds.values())
+            peers = [r for r in c.execute(
+                "select o.*, (select max(admitted_at) from task where batch_id = o.id) as last, exists (select 1 from "
+                "task where batch_id = o.id and state = 'backlog') as backlogged from batch o where o.id != ? and "
+                "o.endpoint_id is ? and o.uec_hash = ? and o.state = 'admitting'",
+                (batch_id, b["endpoint_id"], uec_hash)) if self._alive(r, owner, seen)]
+            caps = [int(b["capacity"] or 1)] + [int(r["capacity"] or 1) for r in peers]
+            if holds:
+                q = ",".join("?" * len(holds))
+                caps += [int(r[0] or 1)
+                         for r in c.execute(f"select capacity from batch where id in ({q})", list(holds))]
+            learnt = self._learnt_window(c, b["endpoint_id"], uec_hash, block_job)
+            window = min(caps + ([learnt] if learnt is not None else []))
+            backlog = int(c.execute("select count(*) from task where batch_id = ? and state = 'backlog'",
+                                    (batch_id,)).fetchone()[0])
+            own_room = max(0, min(n, window - held, backlog))
+            take = min(own_room, max(0, window - held - others))
+            refused = take < own_room   # by the block's other rows, never by its own rows or the window
+            waiting = [r for r in peers if r["backlogged"] and r["want_at"] is not None
+                       and float(r["want_at"]) >= at - WANT_FRESH_S]
+            rank = {str(r["id"]): (out.get(str(r["id"]), 0), float(r["last"] or 0.0), str(r["id"])) for r in waiting}
+            room = {str(r["id"]): window - held_by(str(r["id"])) - (mine_on + others - holds.get(str(r["id"]), 0))
+                    for r in waiting}
+            last = c.execute("select max(admitted_at) from task where batch_id = ?", (batch_id,)).fetchone()[0]
+            fair, mine = 0, (out.get(batch_id, 0), float(last or 0.0), batch_id)
+            while fair < take and not any(room[w] - fair > 0 and rank[w] < mine for w in rank):
+                fair += 1
+                mine = (out.get(batch_id, 0) + fair, at, batch_id)
+            take = fair
+            c.execute("update batch set want_at = ? where id = ?", (at if refused else None, batch_id))
             if take <= 0:
-                return []
+                return Reserved([], holders=holds if refused else {})
             want = list(indices or [])
             rows = []
             if want:
@@ -662,14 +820,14 @@ class Ledger:
                 rows += [r for r in c.execute("select * from task where batch_id = ? and state = 'backlog' "
                                               "order by idx limit ?", (batch_id, take + len(have)))
                          if r["idx"] not in have]
-            rows = rows[:take]
-            out = []
-            for r in rows:
+            got = Reserved([], holders=holds if refused else {})
+            for r in rows[:take]:
                 att = int(r["attempt"] or 0) + 1
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
-                          "started_at = null where batch_id = ? and idx = ?", (att, at, batch_id, r["idx"]))
-                out.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
-            return out
+                          "started_at = null, sent_uec = ? where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, batch_id, r["idx"]))
+                got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
+            return got
 
     # -- tasks -----------------------------------------------------------------------------------------------------
     def set_task_id(self, batch_id: str, index: int, attempt: int, task_id: str) -> None:

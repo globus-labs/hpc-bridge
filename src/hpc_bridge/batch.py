@@ -50,6 +50,7 @@ from .config import _parse_hhmmss, _task_ceiling_s
 from .context import AppCtx, ShapeRuntime, _has_login_shape
 from .ledger import (
     HOLDING,
+    JOB_LIVE,
     TERMINAL,
     Ledger,
     LedgerError,
@@ -57,6 +58,7 @@ from .ledger import (
     Owner,
     RetiredConfig,
     UnknownBatch,
+    window_for,
 )
 from .models import (
     BatchCounts,
@@ -65,6 +67,7 @@ from .models import (
     BlockLeft,
     CancelResult,
     EndpointStatus,
+    LedgerEntry,
     ShellOutcome,
 )
 
@@ -79,6 +82,17 @@ MAX_COMMAND = 64 * 1024
 MAX_WAIT_S = 60.0
 KILL_GRACE_S = 5
 READER_GRACE_S = 2                     # after the leftover group is killed: the stream readers' time to reach EOF
+WATCH_POLL_S = 1                       # the wrapper's watcher: how often it looks at the clock and the marker
+# The longest the wrapper holds its worker past task_walltime_s, by its own arithmetic: the watcher sees the deadline
+# within one poll, TERMs the group and waits the kill grace before KILL; the cleanup then waits the kill grace again,
+# KILLs, and gives the stream readers the reader grace twice (review round 2: 7 s had been assumed, 14 s measured).
+WRAPPER_TAIL_S = WATCH_POLL_S + 2 * KILL_GRACE_S + 2 * READER_GRACE_S
+# A row in flight reaches its worker this long after its admission at most: the submit, the service, the interchange
+# (the window admits a row only into a free slot) — independent of the configurable admission margin (MARGIN_S).
+DELIVERY_S = 60.0
+# How long past its admission a gone server's row in flight can hold a worker of the block: task_walltime_s + this
+# (ledger `_on_block`; ledger.HOLD_MARGIN_S is the same value, a test ties them)
+HOLD_MARGIN_S = WRAPPER_TAIL_S + DELIVERY_S
 TICK_S = 2.0
 IDLE_TICK_S = 10.0
 EVIDENCE_EVERY_S = 30.0                # how often the block's job is looked up while tasks are out (SSH)
@@ -829,7 +843,7 @@ set +m
 (
   __hb_dl=$((__hb_start + @@WALL@@))
   while :; do
-    sleep 1
+    sleep @@POLL@@
     if [ -e "$__hb_rd/@@CANCEL@@" ]; then echo cancelled > "$__hb_a/.why"; break; fi
     if [ "$(date +%s)" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
     kill -0 "$__hb_c" || exit 0
@@ -892,7 +906,7 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@MINKB@@", str(int(min_free_mb) * 1024)).replace("@@CAP@@", str(int(cap_bytes)))
             .replace("@@SESSION@@", replay).replace("@@FIELDS@@", _field_exports(fields) or ":").replace("@@B64@@", b64)
             .replace("@@WALL@@", str(max(1, round(task_walltime_s)))).replace("@@GRACE@@", str(KILL_GRACE_S))
-            .replace("@@RGRACE@@", str(READER_GRACE_S))
+            .replace("@@RGRACE@@", str(READER_GRACE_S)).replace("@@POLL@@", str(WATCH_POLL_S))
             .replace("@@TAIL@@", str(TAIL_BYTES)).replace("@@ETAIL@@", str(STDERR_TAIL_BYTES)))
     return session_shell.guard_prefix(guard) + body
 
@@ -999,7 +1013,7 @@ def workers_of(rt: ShapeRuntime) -> int | None:
 
 def capacity_for(workers: int | None) -> int:
     """The window: the block's workers less one kept for interactive work; 1 when the count is unknown or 1."""
-    return max(1, (workers or 1) - 1)
+    return window_for(workers)
 
 
 @dataclass
@@ -1097,7 +1111,8 @@ class _Run:
     marker_future: Any = None          # a MEP abort's marker task, while it is out: never a second one
     marker_written: bool = False       # …and once it wrote the marker, none again
     groups_recorded: set[str] = field(default_factory=set)
-    last_change: tuple[Any, ...] | None = None   # what status(wait_s) waits to see change
+    # the other batches holding the block's shared window while this one is refused slots (`_held_by_note`)
+    held_by: str | None = None
 
     def remaining(self) -> float | None:
         return None if self.block_end_at is None else self.block_end_at - _now()
@@ -1155,6 +1170,20 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
             pass
     if c.worker_count:
         run.workers_seen = c.worker_count
+        _learn_workers(app, run, c.worker_job, c.worker_count, uec=uec_hash(rt))
+
+
+def _learn_workers(app: AppCtx, run: _Run, job: str | None, workers: int, *, uec: str | None = None) -> None:
+    """The block's worker count, as a check or a task on it reported it: on the ledger, the block's for every batch on
+    it — the window is the smallest of it and each batch's (review round 2: a count one batch had learnt was lost with
+    that batch's admission, and a second batch overfilled the block)."""
+    uec = uec or run.runner_hash or (uec_hash(run.rt) if run.rt is not None else None)
+    if not uec:
+        return
+    try:
+        ledger_of(app).learn_workers(app.state.endpoint_id, uec, job, int(workers), now=_now())
+    except (LedgerError, ValueError, TypeError):
+        pass
 
 
 def _sync_block(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
@@ -1517,6 +1546,9 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
         wait = max(0.0, min(float(wait_s or 0.0), MAX_WAIT_S))
         deadline = time.monotonic() + wait + CALL_BUDGET_S
         busy = False
+        # the baseline is the batch as the call found it: a change the call's own first pass makes (its last rows
+        # collected, the batch done) ends the wait too (review round 1)
+        before = _change_key(led, bid)
         try:
             await tick(app, bid, deadline=deadline, lock_wait_s=min(CALL_BUDGET_S, LOCK_WAIT_S))
         except PassBusy:
@@ -1524,7 +1556,7 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
         if app.batches.get(bid) is run and isinstance(run, _Run):
             _start_loop(app, run)   # the steps a tool call leaves (a switch, a block check) are the loop's
             if wait > 0 and not busy:
-                busy = await _wait_for_change(app, run, wait, deadline)
+                busy = await _wait_for_change(app, run, wait, deadline, before)
         out = _status_of(app, bid, detail=detail, offset=offset, limit=limit)
         if busy:
             out.notice = (out.notice or "") + _BUSY_NOTE
@@ -1533,19 +1565,33 @@ async def status(app: AppCtx, bid: str, *, detail: str = "summary", offset: int 
 
 
 def _change_key(led: Ledger, bid: str) -> tuple[Any, ...]:
-    """What status(wait_s) waits to see change: the phase, and every count but the backlog's move into flight (an
-    admission is no settlement)."""
+    """What status(wait_s) waits to see change: the phase (a pause, a drain, the batch's end), and the rows that need
+    the agent — failed, lost (or presumed so), of unknown fate. A row that completes, or one admitted, does not end
+    the wait: the demo of 2026-11-03 spent one status call, and one agent turn, per row of a 20-row batch."""
     c = led.counts(bid)
-    return (led.batch(bid)["state"], *(c.get(k, 0) for k in ("done", "failed", "lost", "cancelled", "presumed_lost",
-                                                              "submit_unknown")))
+    return (led.batch(bid)["state"], *(c.get(k, 0) for k in ("failed", "lost", "presumed_lost", "submit_unknown")))
 
 
-async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float) -> bool:
-    """Until a row settles or the phase changes, or `wait` is up. The background loop does the passes when it runs;
-    otherwise this call does, as the loop would. Returns whether a pass was found busy (the answer says so)."""
+def _settled(led: Ledger, run: _Run) -> bool:
+    """Nothing more can happen without the user: the batch admits nothing (done, cancelled, paused or drained) and
+    nothing of it is out (review round 1: a drained or aborted batch's last rows settle `done` / `cancelled`, which
+    `_change_key` does not watch, so its wait slept to the end)."""
+    bid = run.batch_id
+    return led.batch(bid)["state"] != "admitting" and not _out_now(led.counts(bid)) and not run.futures
+
+
+async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float,
+                           before: tuple[Any, ...] | None = None) -> bool:
+    """Until the phase changes or a row needs the agent (`_change_key`, against `before`: the batch as the call found
+    it), or nothing more can happen (`_settled`), or `wait` is up — rows that complete cleanly are reported, never
+    waited on. The background loop does the passes when it runs; otherwise this call does, as the loop would. Returns
+    whether a pass was found busy (the answer says so)."""
     led = ledger_of(app)
     bid = run.batch_id
-    before = _change_key(led, bid)
+    if before is None:
+        before = _change_key(led, bid)
+    if _change_key(led, bid) != before or _settled(led, run):
+        return False
     end = time.monotonic() + wait
     while (left := end - time.monotonic()) > 0 and app.batches.get(bid) is run:
         looping = run.loop is not None and not run.loop.done()
@@ -1559,7 +1605,7 @@ async def _wait_for_change(app: AppCtx, run: _Run, wait: float, deadline: float)
                 await tick(app, bid, deadline=deadline)
             except PassBusy:
                 return True
-        if _change_key(led, bid) != before:
+        if _change_key(led, bid) != before or _settled(led, run):
             return False
     return False
 
@@ -1933,13 +1979,18 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     if cap != int(b["capacity"] or 0):
         led.update_batch(bid, capacity=cap)
     try:
-        rows = led.reserve(bid, owner_of(app), cap, uec_hash=uec_hash(rt), now=_now())
+        rows = led.reserve(bid, owner_of(app), cap, uec_hash=uec_hash(rt), now=_now(), block_job=run.block_job,
+                           margin_s=HOLD_MARGIN_S)
     except RetiredConfig as exc:
         pause(app, bid, f"the block's config was retired ({exc}): a new block needs the user's yes")
         return 0
     except NotLeaseHolder:
         app.batches.pop(bid, None)
         return 0
+    # refused slots its own window had room for: name the batches holding the block's, and the remedy
+    run.held_by = _held_by_note(led, rows.holders, ssh=_has_login_shape(app))
+    if run.held_by and not _held(led.counts(bid)):
+        run.waiting = run.held_by
     names = {"index"}
     for row in led.tasks(bid):
         r = json.loads(row["row_json"])
@@ -1950,6 +2001,31 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         if _send(app, run, rt, b, t.index, t.attempt, t.row, names, session, remaining, need):
             sent += 1
     return sent
+
+
+def _held_by_note(led: Ledger, holders: dict[str, int], *, ssh: bool) -> str | None:
+    """Which other batches hold the block's shared window while this batch is refused slots (`reserve`'s own count,
+    `Reserved.holders`), and what frees them — never silently. A row in flight frees its slot as it settles, and
+    cancel(abort) ends it; a row of unknown fate holds until evidence, which no cancel gives: on SSH, a stop or reap
+    that retires its config once its user endpoint has exited (`_unknown_evidence`); on a facility endpoint only its
+    result arriving (nothing here can tell when it no longer can run)."""
+    if not holders:
+        return None
+    unknown = {h: sum(1 for r in led.unknown_holding(h) if r.get("state") == "submit_unknown") for h in holders}
+    named = ", ".join(f"{h} ({n} row(s) out" + (f", {unknown[h]} of them of unknown fate" if unknown[h] else "")
+                      + f", {led.batch(h)['state']})" for h, n in list(holders.items())[:5])
+    text = f" The block's window is shared, and other batches hold its slots: {named}."
+    if any(n > unknown[h] for h, n in holders.items()):
+        text += (" Rows in flight free their slots as they settle, and rows here are admitted then. status('<id>') "
+                 "shows such a batch; cancel('<id>', 'abort') ends its rows in flight if the user no longer wants it.")
+    if any(unknown.values()):
+        text += (" A row of unknown fate (its submit failed; the service may still have queued it) holds its slot "
+                 "until there is evidence it cannot run, and cancelling its batch does not free it: "
+                 + ("a stop_endpoint (or the block's reap) that retires its config frees it once its user endpoint has "
+                    "exited." if ssh else
+                    "on a facility endpoint it frees only when its result arrives; until then the window stays smaller "
+                    "by that row."))
+    return text
 
 
 def _send(app: AppCtx, run: _Run, rt: ShapeRuntime, b: dict[str, Any], index: int, attempt: int, row: Any,
@@ -2220,6 +2296,7 @@ def _learn_block(app: AppCtx, run: _Run, rep: TaskReport) -> None:
         led.add_block_seen(run.batch_id, rep.job)
     if rep.workers:
         run.workers_seen = rep.workers
+        _learn_workers(app, run, rep.job, rep.workers)
     rt = run.rt
     if rt is not None and app.shapes.get("compute") is rt:
         rt.warm_confirmed_at = time.monotonic()   # a worker of the block answered: liveness, as a task result is
@@ -2632,6 +2709,8 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         text += f" Another hpc-bridge server holds this batch ({owner}): this is a read of the ledger."
     if c.get("failed") and detail == "summary":
         text += f" status('{bid}', detail='failed') lists the failed rows with their exit codes."
+    if run is not None and run.held_by and state == "admitting" and c.get("backlog", 0):
+        text += run.held_by
     text += _home_warning(b.get("results_dir"))
     return BatchStatus(
         batch_id=bid, phase=phase, tasks=total, chunk=int(b.get("chunk") or 1), capacity=int(b["capacity"] or 1),
@@ -2639,6 +2718,112 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         results=[_task_result(t) for t in rows], offset=offset, next_offset=nxt,
         results_dir=batch_dir(str(b["results_dir"]), bid) if b.get("results_dir") else None,
         blocks_seen=json.loads(b.get("blocks_seen") or "[]"), owner=owner, reason=reason, notice=text)
+
+
+# ---- status() with no id: the ledger's listing -----------------------------------------------------------------------
+
+LIST_MAX = 200                 # entries in one listing page
+PREVIEW_CHARS = 60             # a command's preview
+STALE_READING_S = 3600.0       # an active job or envelope whose meter reading is older than this is said to be stale
+_ACTIVE_ENVELOPE = ("open", "exhausted", "draining")
+
+
+def _ago(secs: float) -> str:
+    s = max(0, int(secs))
+    return (f"{s // 86400} d" if s >= 86400 else f"{s // 3600} h" if s >= 3600 else f"{s // 60} min" if s >= 60
+            else f"{s} s")
+
+
+def _preview(text: Any) -> str | None:
+    line = " ".join(str(text or "").split())
+    return (line if len(line) <= PREVIEW_CHARS else line[:PREVIEW_CHARS - 1] + "…") or None
+
+
+def _batch_stale(app: AppCtx, led: Ledger, b: dict[str, Any], now: float) -> str | None:
+    """Why an active batch looks abandoned, from the ledger alone: its server is gone (the lease's pid dead, its
+    heartbeat stale), or its block's config was retired (a stop or a reap). Never acted on here."""
+    if b["id"] in app.batches:
+        return None   # this server runs it
+    why = []
+    beat = float(b.get("heartbeat") or 0.0)
+    holder = Owner(str(b.get("owner_host") or ""), int(b.get("owner_pid") or 0), b.get("owner_start"))
+    if now - beat > led.lease_stale_s and not led.holder_alive(holder):
+        why.append(f"its server ({holder}) is gone, last heard from {_ago(now - beat)} ago")
+    if b.get("endpoint_id") and b.get("uec_hash") and (r := led.retired(str(b["endpoint_id"]), str(b["uec_hash"]))):
+        why.append(f"the block it ran on is gone (its config was retired: {r})")
+    return "; ".join(why) or None
+
+
+def _reading_stale(read_at: Any, now: float) -> str | None:
+    if read_at is None:
+        return "never read by the meter"
+    age = now - float(read_at)
+    return f"the meter last read it {_ago(age)} ago" if age > STALE_READING_S else None
+
+
+def listing(app: AppCtx, *, offset: int = 0, limit: int = 50, facility: str | None = None,
+            active_only: bool = False) -> BatchStatus:
+    """status() with no id: every batch, Jobs-mode job and envelope in the ledger, active first, then newest first —
+    one page of at most LIST_MAX. A READ of the ledger: nothing is ticked, admitted, collected or leased, so a listing
+    never starts work, and a record that looks abandoned is said to be (`stale`), never changed."""
+    try:
+        led = ledger_of(app)
+    except LedgerError as exc:
+        return _refused(str(exc))
+    now = _now()
+    out: list[tuple[float, LedgerEntry]] = []
+    for b in led.batches():
+        c = led.counts(b["id"])
+        active = b["state"] not in ("done", "cancelled") or _held(c) > 0
+        counts = {"done": c.get("done", 0), "failed": c.get("failed", 0), "cancelled": c.get("cancelled", 0),
+                  "in_flight": _held(c)}
+        if c.get("lost"):
+            counts["lost"] = c["lost"]
+        out.append((float(b["created_at"]), LedgerEntry(
+            id=b["id"], kind="batch", facility=b.get("facility"), state=str(b["state"]), active=active,
+            created_at=_iso(float(b["created_at"])) or "", tasks=sum(c.values()), counts=counts,
+            command=_preview(b.get("command")), stale=_batch_stale(app, led, b, now) if active else None)))
+    envs = {e["id"]: e for e in led.envelopes()}
+    for e in envs.values():
+        active = e["state"] in _ACTIVE_ENVELOPE
+        why = [w for w in (
+            f"its deadline passed {_ago(now - float(e['deadline']))} ago" if float(e["deadline"]) < now else None,
+            _reading_stale(e.get("metered_at"), now)) if w] if active else []
+        out.append((float(e["created_at"]), LedgerEntry(
+            id=e["id"], kind="envelope", facility=e.get("facility"), state=str(e["state"]), active=active,
+            created_at=_iso(float(e["created_at"])) or "", spent=round(float(e.get("spent") or 0.0), 4),
+            committed=round(float(e.get("committed") or 0.0), 4), cap=float(e["cap"]), unit=e.get("unit"),
+            stale="; ".join(why) or None)))
+    for j in led.jobs():
+        active = j["state"] in JOB_LIVE
+        what = [str(j.get("source") or "submit_job")]   # the ledger keeps a job's script, not its command
+        if j.get("array_spec"):
+            what.append(f"array {j['array_spec']}")
+        if j.get("partition"):
+            what.append(f"partition {j['partition']}")
+        out.append((float(j["created_at"]), LedgerEntry(
+            id=j["id"], kind="job", facility=(envs.get(j["envelope_id"]) or {}).get("facility"),
+            state=str(j.get("sched_state") or j["state"]), active=active, created_at=_iso(float(j["created_at"])) or "",
+            tasks=int(j.get("tasks") or 1), counts=json.loads(j.get("array_counts") or "{}"),
+            command=_preview(", ".join(what)), stale=_reading_stale(j.get("metered_at"), now) if active else None)))
+    rows = [e for _at, e in sorted(out, key=lambda x: (not x[1].active, -x[0]))
+            if (facility is None or e.facility == facility) and (e.active or not active_only)]
+    limit = max(1, min(int(limit or 50), LIST_MAX))
+    offset = max(0, int(offset or 0))
+    page = rows[offset:offset + limit]
+    nxt = offset + len(page) if offset + len(page) < len(rows) else None
+    stale = [e for e in rows if e.stale]
+    text = (f"The ledger holds {len(rows)} record(s)" + (f" on {facility}" if facility else "")
+            + f", {sum(e.active for e in rows)} active (listed first, then newest first); this page shows "
+            + (f"{offset + 1}–{offset + len(page)}" if page else "none") + "."
+            + (f" More with status(offset={nxt})." if nxt is not None else ""))
+    if stale:
+        text += (" Active but stale (nothing was changed by listing them): "
+                 + "; ".join(f"{e.id} — {e.stale}" for e in stale[:5]) + ("…" if len(stale) > 5 else "")
+                 + ". status('<id>') reads one again (a batch whose server is gone is taken over: it collects what "
+                   "finished and asks before sending anything more); cancel('<id>') ends it.")
+    return BatchStatus(kind="list", phase="listed", entries=page, total=len(rows), offset=offset, next_offset=nxt,
+                       notice=text)
 
 
 # ---- poll_task by Globus task id -------------------------------------------------------------------------------------

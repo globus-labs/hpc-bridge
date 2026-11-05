@@ -2606,8 +2606,11 @@ async def _run_batch(
                                  shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id)
 
 
-async def _status(app: AppCtx, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
-                  wait_s: float = 0.0) -> BatchStatus:
+async def _status(app: AppCtx, id: str | None = None, detail: str = "summary", offset: int = 0,  # noqa: A002
+                  limit: int = 50, wait_s: float = 0.0, facility: str | None = None,
+                  active_only: bool = False) -> BatchStatus:
+    if id is None or id == "":   # no id: the ledger's listing — a read, which starts nothing
+        return batch.listing(app, offset=offset, limit=limit, facility=facility, active_only=active_only)
     if isinstance(id, str) and id.startswith(("job-", "env-")):   # batch phase 2a: Jobs mode and the envelope
         return await jobmode.status(app, id)
     return await batch.status(app, id, detail=detail, offset=offset, limit=limit, wait_s=wait_s)
@@ -2716,18 +2719,23 @@ async def submit_job(
 
 
 @mcp.tool(name="status")
-async def status_tool(ctx: Context, id: str, detail: str = "summary", offset: int = 0, limit: int = 50,  # noqa: A002
-                      wait_s: float = 0.0) -> BatchStatus:
+async def status_tool(ctx: Context, id: str | None = None, detail: str = "summary",  # noqa: A002
+                      offset: int = 0, limit: int = 50, wait_s: float = 0.0, facility: str | None = None,
+                      active_only: bool = False) -> BatchStatus:
     """How a batch (a `batch-…` id from run_batch) stands: counts by state, and the rows themselves with
     detail="failed" (failed / lost ones, with exit codes) or detail="page" (every row, `offset`/`limit`). `wait_s` (at
-    most 60) waits for something to change first. It collects results and keeps a running batch going; it never
+    most 60) waits until the batch ends, a row fails, is lost or is of unknown fate, or its phase changes — rows that
+    complete cleanly are counted, not waited on. It collects results and keeps a running batch going; it never
     resumes a paused one (phase="needs_confirmation": see `reason`). From another hpc-bridge server it reads the
     ledger (`owner` names the server that runs the batch). A `job-…` id (submit_job) answers kind="job" with `job`
     (state, exit code, charged and still committed, the scheduler's reason) and its `envelope`; an `env-…` id answers
-    kind="envelope": what it holds, what remains, what still bills — each read with one scheduler call."""
+    kind="envelope": what it holds, what remains, what still bills — each read with one scheduler call. With NO id it
+    lists the ledger (kind="list", `entries`): every batch, job and envelope, active first then newest, a page at a
+    time (`offset`/`limit`), optionally only `facility`'s or only active ones (`active_only`); a pure read that starts
+    nothing, and names any active record that looks abandoned (`stale`)."""
     try:
-        return await _heartbeat(ctx, _status(ctx.request_context.lifespan_context, id, detail, offset, limit, wait_s),
-                                "status")
+        return await _heartbeat(ctx, _status(ctx.request_context.lifespan_context, id, detail, offset, limit, wait_s,
+                                             facility, active_only), "status")
     except Exception as exc:  # noqa: BLE001
         return BatchStatus(batch_id=id, phase="refused", reason=f"{type(exc).__name__}: {exc}",
                            notice=f"status failed: {type(exc).__name__}: {exc}")
