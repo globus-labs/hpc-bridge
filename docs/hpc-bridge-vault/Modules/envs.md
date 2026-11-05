@@ -23,7 +23,8 @@
   - The order is kept.
 - **Refused lines (`_line_problem`):**
   - `-r`, `-c`, `-e`;
-  - a local path however spelled: `./`, `/`, `~`, `pkg @ /path`, `FILE:///`, `--find-links /dir`. An `@` or an index option must be followed by a URL whose scheme is not file;
+  - a local path however spelled: `./`, `/`, `~`, `pkg @ /path`, `FILE:///`, `--find-links /dir`. An `@` or an index option must be followed by a URL whose scheme is not file. EVERY option and value on an option line is checked (`_options_problem`, `shlex.split`: review R2-N2);
+  - a bare archive name (`.whl`, `.tar.gz`, `.zip`…), which uv reads as a path (R2-N2);
   - any `$`, because uv expands variables on the node;
   - `--trusted-host`, and any option outside `_ALLOWED_OPTIONS` (a requirement's own `--hash` passes).
 - **Index lines** are listed (`index_lines`) and named in the notice, with a URL's credentials redacted (`redact`). hpc-bridge adds no index anywhere.
@@ -45,17 +46,21 @@ It returns `activate`, or `login` (a built env on SSH). It raises `EnvRefusal("f
 ### The shell
 
 **`build_script(spec, key=, root=, python=, token=)`** carries the requirements as a base64 FILE, so no character of them is shell. The script:
-1. refuses a root that is not the user's alone (U1), writing nothing there;
-2. names the login node's own installer settings: the variables set (names only) and the config files found (U2);
-3. runs in the root, so no project config beside the worker's cwd applies;
+1. runs under the node's umask OR 022, never looser (R2-N3);
+2. refuses a root that is not the user's alone (U1), writing nothing there and naming the owner and mode it saw (NS2);
+3. names the login node's own installer settings: every `UV_*` and `PIP_*` variable set (names only) and the config files that apply (U2, R2-N4, NS5);
 4. runs the full check of an env already there (a cache hit: `cached=1`);
 5. sweeps `.build.*` and `.broken.*` older than `SWEEP_MIN`, made writable first;
-6. builds a uv venv beside its path, `.<key>-<arch>.build.<token>`, with `--compile-bytecode`, `--link-mode=copy` and `UV_CACHE_DIR=<root>/.uv-cache`;
-7. installs `requirements.in`, and writes `requirements.lock` and the marker `.hpcb-env`;
-8. makes the new env READ-ONLY (`chmod a-w`, links never followed);
-9. moves a partly purged env aside (`.broken.<token>`) only now that its rebuild is ready;
-10. claims the env with ONE rename, which refuses a target that is not empty;
-11. checks it again.
+6. runs uv from a fresh, empty `mktemp -d` of the user's own, never in or under the env root (uv reads a project's config from its cwd and every parent), with the lock's descriptor closed (NS9);
+7. builds a uv venv beside its path, `.<key>-<arch>.build.<token>`, with `--compile-bytecode`, `--link-mode=copy` and `UV_CACHE_DIR=<root>/.uv-cache`;
+8. installs `requirements.in` (0600), and writes `requirements.lock` (0600) and the marker `.hpcb-env`;
+9. makes the new env READ-ONLY (`chmod a-w`, links never followed);
+10. re-checks the target: a ready env another build claimed meanwhile stands, and this one is discarded (R2-N8);
+11. moves a partly purged env aside (`.broken.<token>`) only now that its rebuild is ready;
+12. claims the env with ONE rename, which refuses a target that is not empty;
+13. checks it again.
+
+The full check reads each RECORD as csv, with the env's own Python (`-I`), so a quoted path holding a comma counts (R2-N1).
 
 `flock`, where the node has it, only spares a second build its work. The script prints one line:
 - `HPCB_ENV_READY key= dir= arch= python= lock= size_mb= free_mb= cached= ambient= config=`, or
@@ -71,19 +76,26 @@ It returns `activate`, or `login` (a built env on SSH). It raises `EnvRefusal("f
 - `arch` (built only for `others=`)
 - `unsafe` (`dir=` names the directory)
 
-**`activation_sh(Activation, nonce)`** is per command, row and job. It goes into `session_shell.wrap`, `batch.task_script` and the job script.
-- **Around it:** the shell's errexit, nounset, noclobber, pipefail and cwd are saved before it and restored after it. Its output goes to stderr.
+**`activation_sh(Activation, nonce)`** is per command, row and job. It goes into `session_shell.wrap`, `batch.task_script` and the job script, and into the two checks below.
+- **Around it (R2-N5, NS6):**
+  - The shell's errexit, nounset, noclobber, pipefail, allexport, xtrace, IFS and cwd are saved before it and restored after it.
+  - errexit is off while it runs.
+  - Its output goes to stderr.
+  - Nothing of it is left after: not the refusal function, not the nonce.
 - **A built env:** the root and the env must be the user's alone (one `find`), then the marker is grepped, then `VIRTUAL_ENV` is set and the env's `bin` goes first on PATH.
-  - **Not there:** this node's own architecture missing is `gone`. A different architecture is `arch`: `Activation.arch` is the arch the env was built for.
-- **An existing env:** the user's line runs in an `if`, under an EXIT trap armed while it runs, so a line that ENDS the shell is a refusal too. The previous trap is restored.
+  - **Not there:** it is looked at once more after `GONE_RECHECK_S` (a rebuild's swap: NS4). Then this node's own architecture missing is `gone`, and a different architecture is `arch` (`Activation.arch` is the arch the env was built for).
+- **An existing env:** the user's line runs OUTSIDE any condition (R2-N9: bash 4+ ignores errexit inside an `if`), under an EXIT trap armed while it runs, so a line whose own errexit stops it, or one that ENDS the shell, is a refusal.
+  - The previous EXIT trap is restored, or the line's own if it set one (NS7).
+  - A refusal from the trap runs the shell's own EXIT trap with status 88 first (R2-N6).
+- Every `case` pattern carries its `(`: bash 3.2 misparses a bare `pat)` inside `$( … )`.
 - **A refusal** prints ONE line, `HPCB_ENV_REFUSED <nonce> <why> <key> <detail>`, and exits `ENV_RC` (88) before the command. `why` is `gone`, `failed`, `arch`, `activate` or `unsafe`.
 - **Reading it back:**
   - `refusal(rc, stderr, nonce)` believes the line only with the dispatch's nonce.
   - `refusal_mark(text, nonce)` reads the batch wrapper's `.env_refused` copy, again only with its own nonce (N12).
 
-**`activate_check_script(line)`** runs an existing env's line once, in a subshell, on the login node.
+**`activate_check_script(line)`** runs an existing env's line once, on the login node: the very activation, in a subshell (R2-N7).
 
-**`canary_check(rec)`** is the handoff canary's env check, which prints `HPCB_ENV_OK 1|0`.
+**`canary_check(rec)`** is the handoff canary's env check, which prints `HPCB_ENV_OK 1|0`. It is also the very activation in a subshell, standing alone and never on the left of `&&` (R2-N7, SS7).
 
 ### The state (`AppCtx`)
 
@@ -97,8 +109,9 @@ It returns `activate`, or `login` (a built env on SSH). It raises `EnvRefusal("f
   - when its full check last passed;
   - the root's own warning;
   - what kind its last failure was (`fault`).
-- `env_said_install`.
-- `env_runner`, with `env_runner_key`.
+- `env_said_install`: marked by the answer that carries the warning (`mark_said`, R2-S10).
+- `env_seq`: of two `choose` calls at once the later wins (R2-S6).
+- `env_runner`, with `env_runner_key`. A `_Known` keeps the runner its future went out on, and only that one is dropped when it fails (SS5).
 
 **The build runner:**
 - **`_runner(app)`** is the build user endpoint on the login node: the login shape's seed config plus `BUILD_UEC_KEY`, with walltime `BUILD_S`.
@@ -117,6 +130,10 @@ It returns `activate`, or `login` (a built env on SSH). It raises `EnvRefusal("f
   - a pending env is promoted once ready, or dropped once failed.
 - **`ensure_built`** answers from what is known when the full check is under `VERIFY_EVERY_S` old (a cache hit). Otherwise it sends the build, quiet when the env is ready, and waits up to `WAIT_S`.
 - **`recheck(app, since=)`** is quiet, when a block is newly confirmed.
+- **`resume_pending(app)`** sends again a pending env whose build was lost or cancelled, on the next ask (R2-S3).
+- **`believe_refusal(app, k, why)`** is the ONE path for what a node's refusal says — run_shell's, a poll's, a batch row's, a job's (R2-S2, SS2). A `.failed` mark makes the env failed here, so the next ask builds it.
+- **`ready_for_billed(k)`:** a job and a handoff canary go only against an env known ready (SS6).
+- **`nonce_for(rec, *parts)`:** a batch row's or a job's activation nonce, from the record's own `nonce_key`.
 
 **Choosing, and serving commands:**
 - **`choose(app, spec)`** applies ensure_endpoint_up's parsed `env`. `{}` drops the env and any pending one.
@@ -151,6 +168,7 @@ It returns `activate`, or `login` (a built env on SSH). It raises `EnvRefusal("f
 ## Tests
 - `tests/test_block_envs.py`.
 - `tests/test_block_envs_r1.py` (review round 1).
+- `tests/test_block_envs_r2.py` (review round 2; passes under bash 3.2 and 5.2).
 - PR 4's facility half is in `tests/test_block_envs_mep.py`, on branch `feat/block-envs-mep`.
 
 ## See also

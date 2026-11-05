@@ -1989,6 +1989,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     # — and never changes the block. What its answer says of it is what the session's would (review S14).
     env_rec: dict[str, Any] | None = None
     env_said = ""
+    env_mod.refresh(app)   # a pending env built meanwhile is the session's now (review R2-S11)
     try:
         espec = env_mod.parse(env) if env is not None else app.env_spec
         if espec is not None and espec.kind != "none":
@@ -2781,6 +2782,7 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
             return 0
         if (now := env_mod.current_record(app, rec)) != rec:
             led.update_batch(bid, env=json.dumps(now))
+            b = led.batch(bid)   # the rows sent below carry the record as it stands now: its arch included (SS3)
     remaining = run.remaining()
     need = float(b["task_walltime_s"]) + MARGIN_S
     if remaining is None:
@@ -3040,11 +3042,10 @@ def _env_rec(b: dict[str, Any]) -> dict[str, Any] | None:
 
 
 def _env_nonce(bid: str, rec: dict[str, Any], index: int, attempt: int) -> str:
-    """The activation nonce of one attempt's row (block environments): made from the batch record's own secret
-    (`nonce_key`, never sent anywhere), so this server — or one restarted on the same ledger — believes a refusal only
-    from that attempt's activation (review N12), and keeps no table of them (review U9)."""
-    seed = f"{rec.get('nonce_key') or rec.get('key')}\0{bid}\0{int(index)}\0{int(attempt)}"
-    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+    """The activation nonce of one attempt's row (block environments: envs.nonce_for, from the batch record's own
+    secret), so this server — or one restarted on the same ledger — believes a refusal only from that attempt's
+    activation (review N12), and keeps no table of them (review U9)."""
+    return env_mod.nonce_for(rec, bid, int(index), int(attempt))
 
 
 def _fresh_ok(app: AppCtx) -> bool:
@@ -3331,6 +3332,9 @@ def _env_refused(app: AppCtx, run: _Run, index: int, attempt: int, rec: dict[str
     led.settle(bid, index, attempt, "backlog", only_from=list(HOLDING),
                evidence=f"its env {ref.key} refused it on its node ({ref.why}): it ran nothing")
     _event(bid, "batch.settle", index, attempt, "env_refused")
+    # what the node said is believed as run_shell's refusal is (review R2-S2: one path) — a `.failed` mark makes the
+    # env failed here, so the user's yes sends the build once
+    env_mod.believe_refusal(app, env_mod._known_of(app, rec), ref.why)
     if ref.why == "gone":
         if not env_mod.rebuild_record(app, rec):
             _env_unusable(app, bid, rec, "it is gone from its node, and its requirements carry an index's credentials, "

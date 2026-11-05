@@ -44,6 +44,14 @@ from tests.test_server import _PendingFuture, _Res
 pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
 
 
+@pytest.fixture(autouse=True)
+def _quick_gone_recheck(monkeypatch):
+    """A missing env is looked at again after GONE_RECHECK_S before it is refused (review NS4): shortened here."""
+    from hpc_bridge import envs
+
+    monkeypatch.setattr(envs, "GONE_RECHECK_S", 0.05, raising=False)
+
+
 # =====================================================================================================================
 # The server (S1–S17)
 # =====================================================================================================================

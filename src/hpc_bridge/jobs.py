@@ -714,9 +714,12 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
         '[ -f "$__hpcb_dir/session.env" ] && . "$__hpcb_dir/session.env"',
     ]
     if spec.env_rec:   # block environments: the job's env, frozen in the script (so in its hash); refused: exit 88
+        # its refusal writes the job's own mark beside the script, carrying the job's nonce (made from its record's
+        # secret, so a restarted server reads it too): status says the job ran nothing, and why (review SS2)
         lines += ["# the job's env (block environments): activated after the session's, before the command",
-                  *env_mod.activation_sh(env_mod.activation_of(spec.env_rec), secrets.token_hex(8)).rstrip("\n")
-                  .split("\n")]
+                  '__hb_env_mark="$__hpcb_dir/env_refused${__hpcb_task:+.$__hpcb_task}"',
+                  *env_mod.activation_sh(env_mod.activation_of(spec.env_rec),
+                                         env_mod.nonce_for(spec.env_rec, job_id)).rstrip("\n").split("\n")]
     lines += [
         f'( eval "$(printf %s {b64} | base64 --decode)" )',
         "__hpcb_rc=$?",
@@ -1020,23 +1023,24 @@ async def submit_job(app: AppCtx, *, command: Any = None, session_id: str = "def
     # job.sh activates it, so it must exist before the script is written; what its answer says of it is what the
     # session's would (review S14)
     env_said = ""
+    env_mod.refresh(app)   # a pending env built meanwhile is the session's now (review R2-S11)
     try:
         espec = env_mod.parse(env) if env is not None else app.env_spec
         if espec is not None and espec.kind != "none":
             env_mod.delivery(espec, access=env_mod.access_of(app), client_python=env_mod.default_python())
             if espec.kind == "requirements":
                 k = await env_mod.ensure_built(app, espec)
-                if k.info.state == "building":
-                    return JobStatus(phase="busy", reason="env_building",
-                                     notice=(f"Not submitted yet, and not refused: the job's env {k.key} is being "
-                                             "built on the login node (free), and its script activates it. Call "
-                                             "submit_job again with the same arguments once ensure_endpoint_up says "
-                                             "it is ready."))
                 if k.info.state == "failed":
                     return _refused(f"the job's env {k.key} is not there — {env_mod.failed_words(k.info, k.fault)} "
                                     "Nothing was submitted")
+                if not env_mod.ready_for_billed(k):   # building, or unchecked: never billed against (review SS6)
+                    return JobStatus(phase="busy", reason="env_building",
+                                     notice=(f"Not submitted yet, and not refused: the job's env {k.key} is being "
+                                             "built (or checked) on the login node (free), and its script activates "
+                                             "it. Call submit_job again with the same arguments once "
+                                             "ensure_endpoint_up says it is ready."))
                 env_said = env_mod.built_notice(app, env_mod.info_for(k, espec.name)).strip()
-            spec = replace(spec, env_rec=env_mod.record(app, espec))
+            spec = replace(spec, env_rec={**env_mod.record(app, espec), "nonce_key": secrets.token_hex(16)})
     except env_mod.EnvRefusal as exc:
         return _refused(str(exc))
     out = await _submit_spec(app, spec, req, hours, confirm_spend=confirm_spend, exclude_jobs=exclude_jobs)
@@ -1359,6 +1363,8 @@ async def status(app: AppCtx, ident: str) -> BatchStatus:
             t = Tick(False, error="the job's facility is not the one bound here")
         row = led.job(ident) or row
         e = led.envelope(row["envelope_id"]) or e
+        env_said = await _env_refusal_of(app, row)
+        row = led.job(ident) or row
         info = job_info(row, app)
         note = f"{ident} ({row.get('native_id') or 'not submitted'}): {info.state}"
         if info.reason:
@@ -1372,7 +1378,7 @@ async def status(app: AppCtx, ident: str) -> BatchStatus:
         if not t.ok and info.meter_source not in ("missing", "squeue"):
             note += f" (Not read just now: {t.error}; this is the ledger's last view.)"
         return BatchStatus(kind="job", phase=_PHASE.get(str(row["state"]), "queued"), job=info,  # type: ignore[arg-type]
-                           envelope=envelope_info(app, e) if e else None, notice=note + extra)
+                           envelope=envelope_info(app, e) if e else None, notice=note + env_said + extra)
     e = led.envelope(ident)
     if e is None:
         return _status_refused(ident, f"no envelope {ident} in the ledger")
@@ -1387,6 +1393,33 @@ async def status(app: AppCtx, ident: str) -> BatchStatus:
             + _unledgered_note(einfo))
     phase = einfo.state if einfo.state != "proposed" else "open"
     return BatchStatus(kind="envelope", phase=phase, envelope=einfo, notice=note + extra)
+
+
+async def _env_refusal_of(app: AppCtx, row: dict[str, Any]) -> str:
+    """A job that ended with its env's refusal code (block environments, review SS2): its own mark beside its script,
+    believed only with the job's nonce, says it ran nothing and why — never an ordinary failed job — and is believed as
+    run_shell's refusal is (`envs.believe_refusal`), so a resubmit checks or rebuilds the env first, never a 24 h cache
+    hit sending the same billed job to fail again. Read once: the reason is kept on the ledger."""
+    rec = batch._env_rec(row)
+    if rec is None or row.get("exit_code") != env_mod.ENV_RC or not _can_reach(app):
+        return ""
+    said = (f" Exit {env_mod.ENV_RC} is the env's, never the command's: the job ran nothing. A resubmit checks (or "
+            "rebuilds) the env on the login node first.")
+    if str(row.get("reason") or "").startswith("its env refused it"):
+        return said   # read before: its reason is on the ledger
+    nonce = env_mod.nonce_for(rec, row["id"])
+    try:
+        out = await _login(app, f"cat {batch.quoted_dir(job_dir(app, row['id']))}/env_refused* 2>/dev/null "
+                                "| head -c 4000")
+    except Exception:  # noqa: BLE001 - a read that cannot be made: the job reads as the scheduler said
+        return ""
+    ref = next((r for ln in str(out.stdout or "").splitlines()
+                if (r := env_mod.refusal_mark(ln, nonce)) is not None), None)
+    if ref is None:
+        return ""
+    env_mod.believe_refusal(app, env_mod._known_of(app, rec), ref.why)
+    _ledger(app).update_job(row["id"], reason=f"its env refused it on its node ({ref.why}): it ran nothing")
+    return said
 
 
 @dataclass

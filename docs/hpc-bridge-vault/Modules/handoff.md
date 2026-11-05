@@ -52,10 +52,10 @@
 - **The terms:** the minimum-charge factor divides by `min(idle, walltime)`, and `init_blocks > max_blocks` is refused.
 
 **Block environments (PR 3, [[envs]]):** `export_handoff(…, env=)` takes the handoff's env (else none), and `_env_record` resolves it.
-- **While it builds:** phase `env_building` — nothing sent, nothing refused; call again (review U6).
+- **While it builds:** phase `env_building` — nothing sent, nothing refused; call again (review U6). That includes an env left unchecked: no billed canary against an env not known ready (SS6).
 - **Refusals:** a failed build, or a refused env, is `env`.
-- **The key** is the config's alone (review S2). A collect call with the same config, and the same env or none, collects the canary that is out — never a second billed one. Another env is refused by name (`_same_env`).
-- **The canary** runs `envs.canary_check` beside `CANARY_CMD`, from inside the block. That gives `validation.env_ok`. A false one makes `validation.ok` false, and the answer says it first (review S10).
+- **The key** is the config's alone (review S2). A collect call with the same config, and the same env or none, collects the canary that is out — never a second billed one. Another env is refused by name (`_same_env`), compared with the Python the held record's key was made with (`python_asked`, R2-S9).
+- **The canary** runs `envs.canary_check` beside `CANARY_CMD`, from inside the block: the very activation every command runs (R2-N7, SS7). That gives `validation.env_ok`. A false one makes `validation.ok` false, and the answer says it first (review S10).
 - **What it says:** the handoff's own built env says what the session's would, in the ask (`envs.built_notice`, S14).
 - **The record's `env`** (`HandoffEnv`) is for the CONSUMER to activate, and the config is unchanged:
   - a built env: how, kind, key, name, python, path, `bin`, arch and lock_sha256 (on SSH);

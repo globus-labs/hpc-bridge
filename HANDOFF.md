@@ -53,6 +53,18 @@ cluster is the real-hardware check.
   - the env root must be the user's alone.
   The session wrapper is ~60× faster: its snapshots are in the shell now. The vault note's "Review round 1" section has
   the list.
+- **Review round 2** (on `8e63a6d`): both live cells passed. 20 more reproduced defects (R2-S1..S11, R2-N1..N9) and
+  15 ruled suspicions (SS2..SS7, NS2..NS9), all fixed, with tests in `tests/test_block_envs_r2.py`. Every node test
+  passes under bash 3.2 (macOS) and 5.2 (the nodes' bash 4.2–5.x; CI Ubuntu), the latter run read-only in the
+  coordinator's `hpc-bridge-agentic-pr3` image. bash 4+ ignores errexit inside an `if` or on the left of `&&`, so:
+  - an activate line runs outside any condition;
+  - the login node's check and the handoff canary run the very activation every command runs.
+  Also changed:
+  - uv runs from a private `mktemp -d`, and every `UV_*`/`PIP_*` name and applying config file is named;
+  - `requirements.in` is 0400;
+  - a job's env refusal is read from its own mark;
+  - a missing env is looked at again after 2 s.
+  The vault note's "Review round 2" section has the list.
 - **PR 4** (branch `feat/block-envs-mep`, stage A only: `tests/test_block_envs_mep.py`, the cells
   `env_mep_requirements` / `env_mep_fallback`, a second fake `pbs_mep` manager): a facility endpoint's builds — the
   pass-through, the pin fix (R13), the worker_init fallback — after a live Delta / Anvil / Polaris check the user

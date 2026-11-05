@@ -45,6 +45,7 @@ See [[Block environments]] and [[envs]].
 - **Where `EnvInfo` appears:** `EndpointStatus.env`, `BlockTerms.env`, `BatchStatus.env`, `JobInfo.env` and `JobTerms.env`.
 - **`LedgerEntry.env`** is the listing's label.
 - **`ShellOutcome.phase`** gains `env_building`: nothing ran, because the session's own env is being rebuilt on the login node (free). A new env being built is pending instead, and the session's env serves meanwhile. `HandoffResult.phase` gains it too ([[handoff]]).
+- **`EndpointStatus._nothing_set`** (a private attribute, never on the wire; review round 2, R2-S1): the block part refused the call's arguments and set nothing, so the env asked with them is not applied either.
 
 ## See also
 [[The MCP tools]] · [[server]] · [[dispatch]] · [[login]] · [[facility-mep]] · [[envs]]

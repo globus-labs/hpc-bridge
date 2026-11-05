@@ -1049,15 +1049,16 @@ async def _env_record(app: AppCtx, env: Any, access: str) -> tuple[dict[str, Any
         envs.delivery(spec, access=access, client_python=envs.default_python())
         said = ""
         if spec.kind == "requirements":
+            envs.refresh(app)
             k = await envs.ensure_built(app, spec)
-            if k.info.state == "building":
-                raise HandoffRefusal("env_building", f"Nothing was sent yet, and nothing is refused: the handoff's env "
-                                                     f"{k.key} is being built on the login node (free), and the canary "
-                                                     "checks it. Call export_handoff again with the same arguments "
-                                                     "once it is ready.")
             if k.info.state == "failed":
                 raise HandoffRefusal("env", f"Refused, nothing was sent: the handoff's env {k.key} is not there — "
                                             f"{envs.failed_words(k.info, k.fault)}")
+            if not envs.ready_for_billed(k):   # building, or unchecked: no billed canary against it (review SS6)
+                raise HandoffRefusal("env_building", f"Nothing was sent yet, and nothing is refused: the handoff's env "
+                                                     f"{k.key} is being built (or checked) on the login node (free), "
+                                                     "and the canary checks it. Call export_handoff again with the "
+                                                     "same arguments once it is ready.")
             said = envs.built_notice(app, envs.info_for(k, spec.name)).strip()
         return envs.current_record(app, envs.record(app, spec)), said
     except envs.EnvRefusal as exc:
@@ -1072,8 +1073,13 @@ def _same_env(pend: Pending, env: Any) -> None:
         spec = envs.parse(env)
     except envs.EnvRefusal as exc:
         raise HandoffRefusal("env", f"Refused, nothing was sent: {exc}.") from None
+    held_env = pend.plan.env or {}
+    if spec is not None and spec.kind == "requirements" and spec.python is None and held_env.get("python_asked"):
+        # the Python the held env's key was made with — never this server's default (review R2-S9: a server restarted
+        # on another Python collects the very env the canary was sent with)
+        spec = dataclasses.replace(spec, python=str(held_env["python_asked"]))
     asked = envs.env_key(spec) if spec is not None and spec.kind != "none" else None
-    held = (pend.plan.env or {}).get("key")
+    held = held_env.get("key")
     if env is not None and asked != held:
         out = f"env {held}" if held else "no env"
         raise HandoffRefusal("env", f"Refused, nothing was sent: a handoff of this same config is already validating "

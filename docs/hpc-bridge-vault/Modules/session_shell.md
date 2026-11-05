@@ -21,11 +21,12 @@
     | with an env | 2.45 s | 0.025 s |
   - Values keep trailing newlines.
   - The wrapper's own writes are `>|`, so a noclobber the command set never stops them.
+  - **A known shell state (review round 2, NS8).** The persist loops run with `set +x +a +e +u`, a plain IFS and nocasematch off, whatever the command left, restored after. Otherwise a command's `set -x` would trace every value, its `set -a` would export the wrapper's own variables, and an `IFS=:` would join every name into one word. The wrapper's `__hb_*` variables are never persisted, and `__hb_snap` keeps its own IFS.
 - **`wrap(…, env_sh=None)`** handles the session's env ([[envs]], [[Block environments]]). Given `envs.activation_sh`, the wrapper runs the activation AFTER the session's own `.env`, so it wins over a PATH an earlier command persisted. It runs between two snapshots (`_ENV_PRE`: `__hb_P_`, `_ENV_POST`: `__hb_A_`).
   - **What is persisted:** `_ENV_KEEP` saves a variable the command left as the activation set it as the session had it, or not at all. So a switch of env, or to none, leaves nothing of the old one behind.
   - **What the activation unset:** `_ENV_GONE` saves a variable the activation UNSET (a venv's `PYTHONHOME`, a `module purge`'s) that the command left unset, as the session had it (review N4).
   - **What is not reverted:** a variable the command changed after the activation is saved as it is. A PATH the command edited keeps the env's `bin`: the documented leak.
-  - **The activation itself** restores the shell's errexit, nounset, noclobber, pipefail and cwd after it, and its output goes to stderr ([[envs]]).
+  - **The activation itself** restores the shell's errexit, nounset, noclobber, pipefail, allexport, xtrace, IFS and cwd after it, leaves nothing of itself, and its output goes to stderr ([[envs]]). A refusal its EXIT trap makes still writes the kept rc (review R2-N6).
   - **A refused activation** (`HPCB_ENV_REFUSED`, rc 88) runs nothing — a line that ends the shell included.
   - **Without `env_sh`** the script carries no env code.
 

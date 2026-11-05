@@ -496,6 +496,7 @@ class AppCtx:
     # made for (`env_runner_key`: another is a new runner). Like the choice above they outlive a stop, and are
     # forgotten with the binding (warmth._drop_all_shapes).
     env_spec: Any = None
+    env_seq: int = 0   # each `choose` of an env: one that waited while a later one ran applies nothing (review R2-S6)
     env_pending: Any = None
     env_note: str | None = None
     env_known: dict[str, Any] = field(default_factory=dict)

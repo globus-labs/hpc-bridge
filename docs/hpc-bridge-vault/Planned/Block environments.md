@@ -6,6 +6,65 @@
 > - **PR 3 (on PR 2, batch row sizing): built 2026-11-05; the live cells are next.** It covers existing envs everywhere, facility endpoints included, and built envs on an endpoint hpc-bridge stood up over SSH. A built env is made on the login node (free) and activated per command, row and job. Module [[envs]].
 > - **PR 4 (branch `feat/block-envs-mep`):** building on a facility endpoint. It comes after a live check; its open items are below.
 
+## Review round 2 (2026-11-05, on `8e63a6d`)
+
+Round 1 checked out: both live cells passed on the fake cluster, `env_ssh_switch` included once L1 was fixed. Round 2 found 20 more defects, R2-S1..S11 on the server and R2-N1..N9 on the node, and the coordinator ruled on 15 suspicions (SS2..SS7, NS2..NS9). All are fixed as ruled; the tests are in `tests/test_block_envs_r2.py`.
+
+**The nodes run bash 4.2–5.x** (CI: Ubuntu, bash 5.2); macOS is bash 3.2. Every node test passes under both. Two bash differences shaped the fixes:
+- **errexit.** bash 4+ ignores errexit for everything inside an `if` condition, and on the left of `&&` or `||` — subshells included.
+  - So an activate line runs outside any condition (`eval …; __hb_erc=$?`), and errexit is off before it (`_HEAD`), so a `set -e` in the line is the line's own.
+  - A line `set -e; false; export HALF=1` had run half-activated on bash 5 (R2-N9).
+  - A check runs its subshell standalone, never on the left of `&&`.
+- **`case` patterns.** bash 3.2 misparses a bare `pat)` inside `$( … )`, so every `case` in the activation writes `(pat)`.
+
+### What changed in how it works
+
+- **One activation, three uses (R2-N7, SS7).** The login node's check of an existing env (`activate_check_script`) and the handoff canary's env check (`canary_check`) run the very activation every command runs, in a subshell. They never pass a line, or an env, that every command refuses. That covers the root/env ownership check and a line that ends the shell.
+- **What the activation leaves (R2-N5, NS6, NS7, R2-N6):**
+  - It restores allexport, xtrace and IFS too, beside errexit, nounset, noclobber, pipefail and the cwd.
+  - It leaves nothing of itself in the shell: not the refusal function, not the nonce.
+    - **Residual:** the user's own code can read the wrapper's text from `$BASH_EXECUTION_STRING`. That can only make its own row run again.
+  - **A line's own EXIT trap** is kept: it is the one restored after ours.
+    - **Residual:** a line that sets an EXIT trap AND ends the shell runs its own trap, not our refusal.
+  - **A refusal made by the EXIT trap** first runs the shell's own EXIT trap with status 88, so the session's kept rc is written (a poll after a restart reads it).
+- **The wrapper's own loops (NS8).** They run in a known state (`set +x +a +e +u`, a plain IFS, nocasematch off), restored after. The wrapper's `__hb_*` variables are never persisted.
+- **The full check reads RECORD as csv (R2-N1).** It uses the env's own Python (`-I`): a path holding a comma is quoted, as wcwidth's `textwrap.py,cover` is.
+- **Requirements (R2-N2).**
+  - EVERY option and value on an option line is checked (`shlex.split`).
+  - A bare archive name (`.whl`, `.tar.gz`, `.zip`…) is refused: uv reads it as a path.
+- **The build's umask (R2-N3)** is the node's OR 022, never looser.
+  - `requirements.in` (an index URL's credentials included), `requirements.lock` and the build log are 0600, then 0400 once the env is read-only.
+  - A `.failed` mark is 0600.
+- **Where uv runs, and what is named (R2-N4, NS5).** uv runs from a fresh, empty `mktemp -d` of the user's own (under `$HOME`), never in or under the env root: uv reads a project's config from its cwd and every parent. It does not use `--no-config`, since a site's user-level `uv.toml` may hold the mirror a build needs. The answer names:
+  - every `UV_*` and `PIP_*` variable set (names only);
+  - the config files that apply: `UV_CONFIG_FILE`'s, `$XDG_CONFIG_HOME/uv/uv.toml` or `~/.config/uv/uv.toml`, `/etc/uv/uv.toml`, any project config above uv's cwd, and pip's.
+- **Two builds at once without flock (R2-N8).** A build re-checks the target just before it moves anything aside. If another build already claimed a ready env, that one stands and this one is discarded (`cached=1`).
+- **The build lock (NS9):** uv runs with the lock's descriptor closed.
+- **A missing env (NS4)** is looked at once more after `GONE_RECHECK_S` (2 s) before it is refused: a rebuild's swap leaves the path absent for an instant.
+- **An unsafe refusal (NS2/NS3)** names the owner uid and mode it saw, and says a default ACL or an NFSv4 id-mapping can cause it.
+- **One refusal path (R2-S2, SS2).** What a node's refusal says is believed the same way for run_shell, a poll, a batch row and a job (`envs.believe_refusal`).
+  - A `.failed` mark makes the env failed here, so a batch's yes rebuilds it once.
+  - A job's resubmit checks or rebuilds the env first.
+- **Jobs (SS2, SS6).**
+  - A job's record keeps a `nonce_key`. Its refusal writes `env_refused` beside the script, carrying the job's nonce. Status believes only that mark, says the job ran nothing and why, and keeps the reason on the ledger.
+  - A job, and a handoff canary, never run billed work against an env that is not ready (`envs.ready_for_billed`): an unchecked env answers `env_building`.
+- **The pending env:**
+  - **R2-S3:** a pending env whose build was lost, or cancelled when a dropped runner closed, is sent again on the next `ensure_endpoint_up`, env omitted included.
+  - **R2-S5:** a failed newer request drops an older pending one, and says so.
+  - **R2-S6:** of two calls at once the later wins (`AppCtx.env_seq`); the earlier applies nothing and says so.
+  - **R2-S11:** run_batch and submit_job promote a ready pending env before they read the session's.
+- **`retried` (R2-S7)** is cleared once the env is ready again.
+- **The rows (SS3)** carry the arch the env was built for: `_admit_locked` re-reads the batch after updating its record.
+- **The block part says when it set nothing (R2-S1).** `EndpointStatus._nothing_set` is a private attribute, never on the wire. It covers every refusal of the call's arguments: a size, a queue, a template, a partition change a running task holds, the envelope's admission. It replaces round 1's phrase-grep.
+- **Words:**
+  - **R2-S4:** a runner's failure during an existing env's check is "could not be checked", never "its line did not work".
+  - **SS4:** a refusal for a command sent in an env the session has since left is said about that env, and that a resend runs in the current one (nothing is rebuilt for it).
+  - **R2-S10:** the install warning is marked said only by the answer that carries it.
+- **Credentials and Pythons:**
+  - **R2-S8:** the call journal stores an env's requirements and activate line redacted.
+  - **R2-S9:** a handoff's collect compares the env by the record's `python_asked`.
+- **The build runner (SS5):** a failure closes only the runner that failed.
+
 ## Review round 1 (2026-11-05, on `c7fda3d`)
 
 Two reviewers reproduced 29 defects: S1–S17 on the server, N1–N12 on the node. They also found a live-cell grader bug (L1) and raised suspicions that were ruled on without a reproduction (U1–U10). Every one is fixed as ruled. The tests are in `tests/test_block_envs_r1.py`: 78 of its 88 fail on `c7fda3d`, and the other 10 are controls.
@@ -325,6 +384,12 @@ These use the checkpoint's numbering. The table and API above say what was built
   - handoffs on SSH and on a facility endpoint;
   - the ledger; the tools.
 - **`tests/test_block_envs_r1.py`** (review round 1, 88 tests): the reviewers' reproductions S1–S17 and N1–N12, adapted only where a fix changed the API they called, and a test for each of U1–U10.
+- **`tests/test_block_envs_r2.py`** (review round 2, 69 tests):
+  - the reproductions R2-S1..S11 and R2-N1..N8;
+  - R2-N9 in the session, a batch row and a job script;
+  - a test for each of SS2..SS7 and NS2..NS9.
+
+  Its `needs_uv` tests run the REAL uv, offline. Every node test passes under bash 3.2 and 5.2.
 - **`agentic/harness/envs_checks.py` and `test_envs_scenarios.py`:** the scripted cells `env_ssh_build_cache` and `env_ssh_switch`, on the fake `default` profile. They are kept out of the sweep until their live proof. They need PyPI reachable from the fake cluster's login node.
 
 ## See also

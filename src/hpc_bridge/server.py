@@ -322,6 +322,17 @@ mcp = FastMCP("endpoint", lifespan=lifespan, instructions=_server_instructions()
 _JOURNAL_REDACT = {"complete_preauth": ("code",), "complete_login": ("code",)}
 
 
+def _journal_args(name: str, arguments: dict | None) -> dict:
+    """A call's arguments as the journal keeps them: one-time codes redacted, and an `env`'s text — its requirements,
+    its activate line — with every URL's credentials redacted (block environments, review R2-S8)."""
+    safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+    env = safe.get("env")
+    if isinstance(env, dict):
+        safe["env"] = {k: (envs.redact(v) if k in ("requirements", "activate") and isinstance(v, str) else v)
+                       for k, v in env.items()}
+    return safe
+
+
 def _journal_result(res: Any) -> Any:
     if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
         res = res[1]  # (content, structured): the structured payload is the tool's own model
@@ -351,7 +362,7 @@ def _install_journal(server: FastMCP) -> None:
         path = os.environ.get("HPC_BRIDGE_JOURNAL", "").strip()
         if not path:
             return await inner(name, arguments, *args, **kwargs)
-        safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+        safe = _journal_args(name, arguments)
         t0 = time.monotonic()
         # `ts` / `seq` order calls by when they STARTED (the line is written when the call ends, and concurrent calls
         # finish out of order); `ts` also orders rows from several server processes sharing one journal
@@ -401,18 +412,19 @@ async def _ensure_endpoint_up(
     terms — a built env on the login node is free and activated per command, an existing one is a line run per command
     — so the block part answers as it would without it. Its order (review round 1): the env is CHECKED first (a refused
     one changes nothing in this call: `_dropped_term_status`) — after the shape and the facility are (a shape this
-    facility does not serve, or no facility, is that answer, the env not looked at: S16) and before the block's own
-    arguments are (a refused size or queue is that answer, the env not set: S15). It is APPLIED after the block part,
-    once the endpoint exists (S8: a build is never sent to no endpoint; one asked for before the endpoint stood up waits
-    for the next call, which says so)."""
+    facility does not serve, or no facility, is that answer, the env not looked at: S16). It is APPLIED after the block
+    part — never when the block part refused the call's arguments and set nothing (S15, R2-S1: its explicit
+    `_nothing_set`, whatever refused them — a size, a queue, a template, a partition change a running task holds, the
+    envelope's admission), and only once the endpoint exists (S8: a build is never sent to no endpoint; one asked for
+    before the endpoint stood up waits for the next call, which says so). A pending env whose build was lost is sent
+    again on this ask, env omitted included (R2-S3); the install warning is marked said only with this answer
+    (R2-S10)."""
     since = time.monotonic()
     spec: envs.EnvSpec | None = None
     not_looked = ""
     if env is not None:
         if _no_facility_bound(app) or _shape_reject(app, shape):
             not_looked = " The env was not looked at."   # the block part below says why (S16)
-        elif _block_args_refused(app, shape, partition, account, cores, memory_gb, gpus, nodes, whole_node):
-            not_looked = " The env was not looked at: nothing in this call was set."   # S15
         else:
             try:
                 spec = envs.parse(env)
@@ -431,8 +443,8 @@ async def _ensure_endpoint_up(
                                whole_node, recheck=recheck, workers=workers)
     chosen: envs.Chosen | None = None
     if spec is not None:
-        if "Nothing in this call was set or started" in (st.notice or ""):
-            not_looked = " The env was not looked at: nothing in this call was set."   # a template refused the size
+        if st._nothing_set:
+            not_looked = " The env was not looked at: nothing in this call was set."
         elif app.state.endpoint_id is None:
             not_looked = (" The env was not applied: no endpoint is up yet to build or check it on — ask for it again "
                           "once ensure_endpoint_up answers up.")
@@ -441,6 +453,8 @@ async def _ensure_endpoint_up(
                 chosen = await envs.choose(app, spec)
             except envs.EnvRefusal as exc:   # a facility the call bound only now (a startup pin's first call)
                 not_looked = f" The env was not applied: {exc}."
+    if not st._nothing_set:
+        envs.resume_pending(app)   # a pending env whose build was lost: sent again, as its answer promised (R2-S3)
     rt1 = app.shapes.get(shape)
     if (confirm_spend and shape == DEFAULT_SHAPE and rt1 is not None and rt1.spend_confirmed
             and (before is None or before != (rt1, True, rt1.block_epoch))):
@@ -469,19 +483,15 @@ async def _ensure_endpoint_up(
         st.notice = f"{st.notice or ''}{not_looked}".strip()
     if st.block is not None:
         st.block.env = session
+    envs.mark_said(app, st.notice)
     return st
 
 
-def _block_args_refused(app: AppCtx, shape: str, partition: str | None, account: str | None, cores: int | None,
-                        memory_gb: int | None, gpus: int | None, nodes: int | None, whole_node: bool | None) -> bool:
-    """The block arguments `_ensure_up_once` refuses before anything (an invalid queue or account, a size that is no
-    size), read without changing anything — so a call refused for them never sets an env first (review S15). What a
-    facility's template refuses is read from that answer itself."""
-    if partition not in (None, "") and not _VALID_PARTITION.match(partition):
-        return True
-    if account is not None and not _VALID_ACCOUNT.match(account):
-        return True
-    return shape != "login" and bool(resources.requested(cores, memory_gb, gpus, nodes, whole_node)[1])
+def _set_nothing(st: EndpointStatus) -> EndpointStatus:
+    """The block part's answer to a call whose arguments it refused, setting nothing: so marked (block environments,
+    review R2-S1 — the env asked with them is not applied either)."""
+    st._nothing_set = True
+    return st
 
 
 async def _ensure_up_once(
@@ -505,12 +515,12 @@ async def _ensure_up_once(
     (run_batch's derived block): the block runs exactly that many workers — on our own template (resources.WORKERS),
     on a facility endpoint only where its template renders max_workers_per_node (else its own count stands)."""
     if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
-        return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
-                              notice=_no_facility_notice(app))
+        return _set_nothing(EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
+                                           notice=_no_facility_notice(app)))
     if reject := _shape_reject(app, shape):  # compute-only facility: never build a login runtime
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down", block_state="cold", endpoint_id=app.state.endpoint_id, notice=reject,
-        )
+        ))
     if partition == "" and shape != "login":
         # the terms' empty queue sent back: a facility whose details= set partition "" sends none (the scheduler routes
         # the block, as on NERSC); that is already the session's partition, so it is kept, never refused as invalid
@@ -518,25 +528,26 @@ async def _ensure_up_once(
         if uec.get("compute") and uec.get("partition") == "":
             partition = None
     if partition is not None and not _VALID_PARTITION.match(partition):
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down",
             block_state="cold",
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid partition {partition!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
-        )
+        ))
     if account is not None and not _VALID_ACCOUNT.match(account):
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down",
             block_state="cold",
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid account {account!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
-        )
+        ))
     # the block's size (hpc_bridge.resources): cores, memory and GPUs per node, the node count, whole nodes or not
     sizing, bad_size = resources.requested(cores, memory_gb, gpus, nodes, whole_node)
     login_only = shape == "login"  # the login shape is free and has no size: a size named for it is said ignored
     if bad_size and not login_only:
         async with app.lock:
-            return _dropped_term_status(app, shape, f"{bad_size}. Nothing in this call was set or started.")
+            return _set_nothing(_dropped_term_status(app, shape,
+                                                     f"{bad_size}. Nothing in this call was set or started."))
     if login_only:
         sizing = {}
     elif workers is not None and not bad_size:
@@ -577,7 +588,7 @@ async def _ensure_up_once(
                 dropped = _size_refusal(app, after, sizing, named_now)
         if dropped:
             async with app.lock:
-                return _dropped_term_status(app, shape, dropped)
+                return _set_nothing(_dropped_term_status(app, shape, dropped))
     if confirm_spend and shape == DEFAULT_SHAPE:
         # batch phase 2a: while this session's envelope is open, a block it confirms is admitted against it (read off
         # the lock: the meter rides the login shape)
@@ -585,7 +596,7 @@ async def _ensure_up_once(
                                                 sizing=sizing if not login_only else None)
         if refused is not None:
             refused.session_spend = _total_session_spend(app)
-            return refused
+            return _set_nothing(refused)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -603,7 +614,7 @@ async def _ensure_up_once(
         reject = (_apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
                   or warmth._apply_resources(app, shape, rt, sizing))
         if reject:  # a live task blocks repointing the block (the swap would cancel it) — change nothing
-            return EndpointStatus(
+            return _set_nothing(EndpointStatus(
                 status="up",
                 block_state="warm",
                 endpoint_id=app.state.endpoint_id,
@@ -611,7 +622,7 @@ async def _ensure_up_once(
                 partition=rt.user_endpoint_config.get("partition"),
                 account=rt.user_endpoint_config.get("account"),
                 notice=reject,
-            )
+            ))
         active_partition = rt.user_endpoint_config.get("partition")
         active_account = rt.user_endpoint_config.get("account")
         # A switch confirmed in this same call: no needs_confirmation answer said what became of the old block, so the
@@ -2780,11 +2791,13 @@ async def _run_batch(
                         "a billed job outside every envelope and the confirmed block. Use submit_job with array=… "
                         "(one job, every row a task, {index} in the command), or a run_batch template that does the "
                         "work itself on the block."))
-    return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
-                                 task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
-                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
-                                 cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
-                                 pilot=pilot, env=env)
+    out = await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
+                                task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
+                                shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
+                                cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
+                                pilot=pilot, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 async def _status(app: AppCtx, id: str | None = None, detail: str = "summary", offset: int = 0,  # noqa: A002
@@ -2817,11 +2830,13 @@ async def _submit_job(
         if st.status not in ("up", "provisioning") or app.state.endpoint_id is None:
             return JobStatus(phase="refused", reason="login shape",
                              notice=f"The login shape is not up ({st.status}): {st.notice or ''}".strip())
-    return await jobmode.submit_job(
+    out = await jobmode.submit_job(
         app, command=command, session_id=session_id, account=account, partition=partition, nodes=nodes, cores=cores,
         memory_gb=memory_gb, gpus=gpus, whole_node=whole_node, walltime=walltime, array=array,
         depends_on=depends_on, adopt=adopt, envelope=envelope, confirm_spend=confirm_spend,
         exclude_jobs=exclude_jobs, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 @mcp.tool()
@@ -2961,7 +2976,9 @@ async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResul
 
 async def _export_handoff(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = handoff.DEFAULT_EXPIRES_H,
                           confirm_spend: bool = False, env: Any = None) -> handoff.HandoffResult:
-    return await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend, env=env)
+    out = await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 @mcp.tool()

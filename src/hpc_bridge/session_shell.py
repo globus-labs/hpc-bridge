@@ -186,7 +186,7 @@ if [ -n "$__hb_cwd" ]; then cd "$__hb_cwd" 2>/dev/null || cd @@SD@@; else cd @@S
 # and no process per variable (review U10: one `compgen` per snapshot; the base64-and-grep form took ~1 s a command
 # with a hundred exported vars, twice that with an env).
 __hb_snap() {
-  local __hb_k __hb_l=" "
+  local __hb_k __hb_l=" " IFS=$' \t\n'
   for __hb_k in $(compgen -A export); do
     printf -v "$1$__hb_k" '%s' "${!__hb_k}"
     __hb_l="$__hb_l$__hb_k "
@@ -198,18 +198,28 @@ __hb_snap __hb_B_ __hb_BN
 @@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
 @@RESULT@@pwd >| @@SD@@/.cwd
+# The persist loops run in a known shell state whatever the command left (review NS8: its `set -x` would trace every
+# value, `set -a` export the wrapper's own variables, an `IFS=:` join every name into one word, a nocasematch match
+# names loosely), restored after; the wrapper's own `__hb_*` variables are never the session's.
+__hb_so=$-; if [ -n "${IFS+x}" ]; then __hb_sifs=$IFS; __hb_sifz=1; else __hb_sifz=0; fi
+__hb_sncm=0; shopt -q nocasematch 2>/dev/null && __hb_sncm=1
+set +x +a +e +u; IFS=$' \t\n'; shopt -u nocasematch 2>/dev/null
 # Persist only vars the command added/changed vs the ambient baseline (__hb_B_*), dropping scheduler runtime vars
 # (@@VOLATILE@@). `printf %q` keeps each record single-line and re-sourceable even for multi-line values, so the
 # persisted .env can never corrupt the next source. The wrapper's own writes are `>|`: a noclobber the command set
 # never stops them.
 {
   for __hb_n in $(compgen -A export); do
-    case "$__hb_n" in @@VOLATILE@@) continue;; esac
+    case "$__hb_n" in @@VOLATILE@@|__hb_*) continue;; esac
     __hb_x="__hb_B_$__hb_n"
 @@ENVKEEP@@    case "$__hb_BN" in *" $__hb_n "*) [[ "${!__hb_n}" == "${!__hb_x}" ]] && continue;; esac
     printf 'export %s=%q\n' "$__hb_n" "${!__hb_n}"
   done
 @@ENVGONE@@} >| @@SD@@/.env 2>/dev/null || true
+if [ "$__hb_sifz" = 1 ]; then IFS=$__hb_sifs; else unset IFS; fi
+[ "$__hb_sncm" = 0 ] || shopt -s nocasematch
+case "$__hb_so" in *a*) set -a;; esac; case "$__hb_so" in *e*) set -e;; esac; case "$__hb_so" in *u*) set -u;; esac
+case "$__hb_so" in *x*) set -x;; esac
 exit $__hb_rc
 """
 
@@ -239,7 +249,7 @@ _ENV_KEEP = r"""    case "$__hb_AN" in *" $__hb_n "*)
     esac
 """
 _ENV_GONE = r"""  for __hb_n in $__hb_PN; do
-    case "$__hb_n" in @@VOLATILE@@) continue;; esac
+    case "$__hb_n" in @@VOLATILE@@|__hb_*) continue;; esac
     case "$__hb_AN" in *" $__hb_n "*) continue;; esac
     [ -n "${!__hb_n+x}" ] && continue
     __hb_p="__hb_P_$__hb_n"; __hb_x="__hb_B_$__hb_n"

@@ -108,6 +108,11 @@ _TOKEN = re.compile(r"[0-9a-f]{1,32}|t[0-9]{1,3}")
 _ALLOWED_OPTIONS = frozenset({"--index-url", "-i", "--extra-index-url", "--find-links", "-f", "--no-index", "--pre",
                               "--prefer-binary", "--only-binary", "--no-binary"})
 _INDEX_OPTIONS = ("--index-url", "-i", "--extra-index-url", "--find-links", "-f")
+# The options that take a value (the next word, or `=value`)
+_VALUE_OPTIONS = frozenset({*_INDEX_OPTIONS, "--only-binary", "--no-binary", "-r", "--requirement", "-c",
+                            "--constraint", "-e", "--editable", "--trusted-host"})
+# An archive a requirement line names by its file name alone (uv reads it as a path: review R2-N2)
+_ARCHIVE = re.compile(r"\.(whl|tar\.gz|tgz|tar\.bz2|tbz2?|tar\.xz|txz|tar|zip)$", re.IGNORECASE)
 _WHY = ("gone", "failed", "arch", "activate", "unsafe")
 _SCHEME = re.compile(r"([A-Za-z][A-Za-z0-9+.-]*)://\S")
 # An index URL's credentials (`https://user:token@host`): never said back — not in a notice, the terms, the ledger's
@@ -178,7 +183,8 @@ def normalize_requirements(text: str) -> str:
 def index_lines(text: str | None) -> list[str]:
     """The user's own lines that say where packages come from (shown in the terms, credentials redacted; hpc-bridge
     never adds one)."""
-    return [redact(ln) for ln in (text or "").split("\n") if re.split(r"[\s=]", ln, maxsplit=1)[0] in _INDEX_OPTIONS]
+    return [redact(ln) for ln in (text or "").split("\n")
+            if ln.startswith("-") and any(t.split("=", 1)[0] in _INDEX_OPTIONS for t in ln.split())]
 
 
 def _remote(url: str) -> bool:
@@ -190,25 +196,49 @@ def _remote(url: str) -> bool:
 _LOCAL = "a local path, which the env's key (the hash of this text) cannot see change: publish it to an index"
 
 
+def _option_problem(opt: str, val: str) -> str | None:
+    if opt in ("-r", "--requirement", "-c", "--constraint"):
+        return ("it names another file, which the env's key (the hash of this text) cannot see change: paste that "
+                "file's lines here instead")
+    if opt in ("-e", "--editable"):
+        return "an editable install is a local path, which the env's key cannot see change"
+    if opt == "--trusted-host":
+        return "it turns off the index's TLS check"
+    if opt not in _ALLOWED_OPTIONS:
+        return ("an option hpc-bridge does not pass to the installer (a requirements text may say where packages come "
+                f"from and which forms they take: {', '.join(sorted(_ALLOWED_OPTIONS))})")
+    if opt in _INDEX_OPTIONS and not _remote(val):
+        return f"{opt} takes an index's URL here (https://…), never a local path: {_LOCAL}"
+    return None
+
+
+def _options_problem(line: str) -> str | None:
+    """An option line, EVERY option and value on it (review R2-N2: `--no-index --find-links /dir` had passed on its
+    first)."""
+    try:
+        toks = shlex.split(line)
+    except ValueError:
+        return "its quoting cannot be read"
+    i = 0
+    while i < len(toks):
+        tok = toks[i]
+        if not tok.startswith("-"):
+            return f"{tok!r} is neither an option nor an option's value here"
+        opt, eq, val = tok.partition("=")
+        if opt in _VALUE_OPTIONS and not eq:
+            i += 1
+            val = toks[i] if i < len(toks) else ""
+        if (why := _option_problem(opt, val)) is not None:
+            return why
+        i += 1
+    return None
+
+
 def _line_problem(line: str) -> str | None:
     if "$" in line:   # uv expands ${VAR} in a requirements file, on the node: a value the key cannot see (review N9)
         return "it names an environment variable, which the installer expands on the node: the env's key cannot see it"
     if line.startswith("-"):
-        parts = re.split(r"[\s=]+", line, maxsplit=1)
-        opt, val = parts[0], (parts[1].strip() if len(parts) > 1 else "")
-        if opt in ("-r", "--requirement", "-c", "--constraint"):
-            return ("it names another file, which the env's key (the hash of this text) cannot see change: paste "
-                    "that file's lines here instead")
-        if opt in ("-e", "--editable"):
-            return "an editable install is a local path, which the env's key cannot see change"
-        if opt == "--trusted-host":
-            return "it turns off the index's TLS check"
-        if opt not in _ALLOWED_OPTIONS:
-            return ("an option hpc-bridge does not pass to the installer (a requirements text may say where packages "
-                    f"come from and which forms they take: {', '.join(sorted(_ALLOWED_OPTIONS))})")
-        if opt in _INDEX_OPTIONS and not _remote(val):
-            return f"{opt} takes an index's URL here (https://…), never a local path: {_LOCAL}"
-        return None
+        return _options_problem(line)
     if "@" in line:   # a named requirement on a URL (`pkg @ https://…`): a URL with a scheme, never a file (N9)
         target = line.split("@", 1)[1].strip()
         if not _remote(target):
@@ -218,6 +248,8 @@ def _line_problem(line: str) -> str | None:
             return _LOCAL
     elif "/" in line or "\\" in line or line.startswith((".", "~")):
         return _LOCAL
+    elif _ARCHIVE.search(re.split(r"[\s;]", line, maxsplit=1)[0]):
+        return f"a bare archive name is a file the installer reads from its own directory: {_LOCAL}"   # R2-N2
     for m in re.finditer(r"\s(--?[A-Za-z][\w-]*)", line):
         if m.group(1) != "--hash":
             return f"a requirement may carry only --hash, not {m.group(1)}"
@@ -345,41 +377,75 @@ class Activation:
 
 
 # A refusal, written by every activation the same way (a function, so an EXIT trap can call it too): the line on
-# stderr; the batch wrapper's mark when it set one (`__hb_env_mark`: the row ran nothing — the mark carries the nonce,
-# and only a mark with its own nonce is believed: review N12); nothing of the command run.
+# stderr; the batch wrapper's (or a job's) mark when it set one (`__hb_env_mark`: it ran nothing — the mark carries the
+# nonce, and only a mark with its own nonce is believed: review N12); nothing of the command run. Called from the EXIT
+# trap (`trap`), it first runs the shell's own EXIT trap with the refusal's status, so the session's kept rc is still
+# written (review R2-N6: a poll after a restart reads it).
 _REFUSE = (
     "__hb_erefuse() {\n"
+    "  set +eu\n"
     '  __hb_el="@@REFUSED@@ @@NONCE@@ $__hb_ew $__hb_ek $__hb_ex"\n'
     "  printf '%s\\n' \"$__hb_el\" >&2\n"
     '  [ -z "${__hb_env_mark:-}" ] || printf \'%s\\n\' "$__hb_el" >| "$__hb_env_mark" 2>/dev/null\n'
+    '  if [ "${1:-}" = trap ] && [ -n "${__hb_etrap:-}" ]; then\n'
+    '    eval "set -- ${__hb_etrap#trap -- }"; (exit @@RC@@); eval "$1"\n'
+    "  fi\n"
     "  exit @@RC@@\n"
     "}\n"
 )
-# Around every activation: the shell's errexit, nounset, noclobber, pipefail and cwd as they were before it (a setup
-# script's `set -euo pipefail`, a .bashrc's noclobber, an activate line's `cd`: review N5), and its output on stderr — a
-# site banner never lands in a row's results (review N8).
-_HEAD = "__hb_eo=$-; __hb_ewd=$PWD; __hb_epf=0; shopt -qo pipefail 2>/dev/null && __hb_epf=1\n"
+# Around every activation: the shell's errexit, nounset, noclobber, pipefail, allexport, xtrace, IFS and cwd as they
+# were before it (a setup script's `set -euo pipefail`, a .bashrc's noclobber, a dotenv's `set -a`, a debugging `set
+# -x`, a PATH walk's `IFS=:`, an activate line's `cd`: reviews N5, R2-N5), its output on stderr — a site banner never
+# lands in a row's results (review N8) — and, after it, nothing of it left in the shell the command runs in: not the
+# refusal function, not the nonce (review NS6; the user's own code reading the wrapper's text from
+# $BASH_EXECUTION_STRING is a residual that can only make its own row run again). errexit is OFF while it runs: a `set
+# -e` in the user's line is the line's own.
+_HEAD = ("__hb_eo=$-; __hb_ewd=$PWD; __hb_epf=0; shopt -qo pipefail 2>/dev/null && __hb_epf=1\n"
+         'if [ -n "${IFS+x}" ]; then __hb_eifs=$IFS; __hb_eifz=1; else __hb_eifz=0; fi\n'
+         "set +e\n")
+# (every `case` pattern carries its opening parenthesis: bash 3.2 misparses a bare `pat)` inside a `$( … )`, where the
+# login node's check of an existing env runs this — review R2-N7)
 _TAIL = (
-    'case "$__hb_eo" in *e*) set -e;; *) set +e;; esac\n'
-    'case "$__hb_eo" in *u*) set -u;; *) set +u;; esac\n'
-    'case "$__hb_eo" in *C*) set -C;; *) set +C;; esac\n'
+    'case "$__hb_eo" in (*x*) set -x;; (*) set +x;; esac\n'
+    'case "$__hb_eo" in (*a*) set -a;; (*) set +a;; esac\n'
+    'case "$__hb_eo" in (*e*) set -e;; (*) set +e;; esac\n'
+    'case "$__hb_eo" in (*u*) set -u;; (*) set +u;; esac\n'
+    'case "$__hb_eo" in (*C*) set -C;; (*) set +C;; esac\n'
     'if [ "$__hb_epf" = 1 ]; then set -o pipefail; else set +o pipefail; fi\n'
+    'if [ "$__hb_eifz" = 1 ]; then IFS=$__hb_eifs; else unset IFS; fi\n'
     '[ "$PWD" = "$__hb_ewd" ] || cd -- "$__hb_ewd" 2>/dev/null || :\n'
+    "unset -f __hb_erefuse\n"
+    "unset __hb_el __hb_ew __hb_ek __hb_ex __hb_erc __hb_etrap __hb_enow __hb_ea __hb_eb __hb_ed __hb_er __hb_eu "
+    "__hb_ey __hb_et __hb_env_mark __hb_eifs __hb_eifz __hb_epf __hb_ewd __hb_eo\n"
 )
 # The root and the env must be this user's alone (review U1: keys are predictable, so another user could plant an env
 # where ours would be found): owned by the user, writable by neither its group nor anyone — the slot lock dir's rule.
 _UNSAFE = ('find -H @@PATHS@@ -maxdepth 0 \\( ! -user "${EUID:-$(id -u)}" -o -perm -0002 -o -perm -0020 \\) -print '
            "2>/dev/null")
+# What an unsafe directory was seen as: its owner's uid and its mode (a default ACL's mask, or an NFSv4 id-mapping to
+# `nobody`, makes a directory the user created read as not theirs alone: review NS2/NS3).
+_SEEN = "ls -ldn @@PATH@@ 2>/dev/null | awk '{print \"(owner uid \" $3 \", mode \" $1 \")\"}'"
+# A missing env is looked at once more after this many seconds before it is refused: a rebuild swaps a new env in
+# beside the old one, and the path is absent for an instant (review NS4).
+GONE_RECHECK_S = 2.0
 
 _ACTIVATE_BUILT = (
     "__hb_ek=@@KEY@@; __hb_ea=$(uname -m 2>/dev/null); __hb_er=@@ROOT@@; __hb_eb=@@BUILTFOR@@\n"
-    '__hb_ed="$__hb_er/$__hb_ek-$__hb_ea"\n'
-    '__hb_eu=$(@@UNSAFE@@)\n'
-    'if [ -z "$__hb_eu" ] && grep -qx "short=$__hb_ek" "$__hb_ed/@@MARKER@@" 2>/dev/null; then\n'
-    '  unset PYTHONHOME; VIRTUAL_ENV="$__hb_ed"; PATH="$__hb_ed/bin:$PATH"; export VIRTUAL_ENV PATH\n'
-    "else\n"
+    '__hb_ed="$__hb_er/$__hb_ek-$__hb_ea"; __hb_et=0\n'
+    "while :; do\n"
+    '  __hb_eu=$(@@UNSAFE@@)\n'
+    '  if [ -z "$__hb_eu" ] && grep -qx "short=$__hb_ek" "$__hb_ed/@@MARKER@@" 2>/dev/null; then\n'
+    '    unset PYTHONHOME; VIRTUAL_ENV="$__hb_ed"; PATH="$__hb_ed/bin:$PATH"; export VIRTUAL_ENV PATH\n'
+    "    break\n"
+    "  fi\n"
+    '  if [ "$__hb_et" = 0 ] && [ -z "$__hb_eu" ] && [ ! -f "$__hb_ed.failed" ] \\\n'
+    '      && { [ -z "$__hb_eb" ] || [ "$__hb_eb" = "$__hb_ea" ]; }; then\n'
+    "    __hb_et=1; sleep @@RECHECK@@; continue\n"
+    "  fi\n"
     '  __hb_ew=gone; __hb_ex="$__hb_ea"\n'
-    '  if [ -n "$__hb_eu" ]; then __hb_ew=unsafe; __hb_ex=$(printf \'%s\\n\' "$__hb_eu" | head -n 1)\n'
+    '  if [ -n "$__hb_eu" ]; then\n'
+    "    __hb_ew=unsafe; __hb_ey=$(printf '%s\\n' \"$__hb_eu\" | head -n 1)\n"
+    '    __hb_ex="$__hb_ey $(@@SEEN@@)"\n'
     '  elif [ -f "$__hb_ed.failed" ]; then __hb_ew=failed\n'
     '  elif [ -n "$__hb_eb" ]; then\n'
     '    [ "$__hb_eb" = "$__hb_ea" ] || { __hb_ew=arch; __hb_ex="$__hb_ea $__hb_eb"; }\n'
@@ -390,21 +456,31 @@ _ACTIVATE_BUILT = (
     "    done\n"
     "  fi\n"
     "  __hb_erefuse\n"
-    "fi\n"
+    "done\n"
 )
 
-# The user's line, run in an `if` (its errexit cannot end the shell) with an EXIT trap armed while it runs: a line that
-# ends the shell anyway (`exit`, nounset, a `${X:?}` guard) is a refusal too, never a command that ran (review N1). The
-# trap the shell had before is restored after it.
+# The user's line, run OUTSIDE any condition (review R2-N9: bash 4+ ignores errexit for everything inside an `if`, so a
+# line's `set -e` would not stop it at its failing step) with an EXIT trap armed while it runs: a line that ends the
+# shell — its own errexit, nounset, a `${X:?}` guard, `exit` — is a refusal, never a command that ran (review N1). The
+# trap the shell had before is restored after it — or the one the line itself set, which is the line's to keep (review
+# NS7).
 _ACTIVATE_LINE = (
     "__hb_ek=@@KEY@@\n"
     "__hb_etrap=$(trap -p EXIT)\n"
-    "trap '__hb_erc=$?; __hb_ew=activate; __hb_ex=\"rc=$__hb_erc (the line ended the shell)\"; __hb_erefuse' EXIT\n"
-    'if eval "$(printf %s @@B64@@ | base64 --decode)"; then __hb_erc=0; else __hb_erc=$?; fi\n'
+    "trap '__hb_erc=$?; __hb_ew=activate; __hb_ex=\"rc=$__hb_erc (the line ended the shell)\"; __hb_erefuse trap' "
+    "EXIT\n"
+    'eval "$(printf %s @@B64@@ | base64 --decode)"\n'
+    "__hb_erc=$?\n"
+    "set +e\n"
+    "__hb_enow=$(trap -p EXIT)\n"
+    'case "$__hb_enow" in (*"__hb_erefuse trap"*) ;; (*) __hb_etrap=$__hb_enow;; esac\n'
     "trap - EXIT\n"
     '[ -z "$__hb_etrap" ] || eval "$__hb_etrap"\n'
     'if [ "$__hb_erc" -ne 0 ]; then __hb_ew=activate; __hb_ex="rc=$__hb_erc"; __hb_erefuse; fi\n'
 )
+# The nonce of a check's own activation (the login node's check of an existing env, a handoff canary's look at its
+# env): never a dispatch's — its refusal line is read back by its exit status alone.
+_CHECK_NONCE = "c" * 16
 
 
 def activation_sh(act: Activation, nonce: str) -> str:
@@ -427,6 +503,8 @@ def activation_sh(act: Activation, nonce: str) -> str:
     else:
         arch = act.arch if act.arch and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", act.arch) else ""
         body = (_ACTIVATE_BUILT.replace("@@UNSAFE@@", _UNSAFE.replace("@@PATHS@@", '"$__hb_er" "$__hb_ed"'))
+                .replace("@@SEEN@@", _SEEN.replace("@@PATH@@", '"$__hb_ey"'))
+                .replace("@@RECHECK@@", f"{max(0.0, float(GONE_RECHECK_S)):g}")
                 .replace("@@KEY@@", act.key).replace("@@ROOT@@", _qroot(str(act.root)))
                 .replace("@@BUILTFOR@@", shlex.quote(arch)).replace("@@MARKER@@", MARKER))
     inner = "".join("  " + ln + "\n" for ln in body.rstrip("\n").split("\n"))
@@ -487,51 +565,78 @@ __hb_rm() {
   find "$1" ! -type l -exec chmod u+w {} + 2>/dev/null
   rm -rf "$1"
 }
+# what an unsafe path was seen as (review NS2/NS3)
+__hb_seen() {
+  @@SEEN@@
+}
+# the files each RECORD lists that are not there, read as the csv it is — a path holding a comma is quoted (wcwidth
+# ships `textwrap.py,cover`: review R2-N1) — by the env's own Python, isolated from the caller's PYTHON* settings
+__hb_recpy='import csv, glob, os, sys
+n = 0
+for rec in glob.glob(os.path.join(sys.argv[1], "lib", "python*", "site-packages", "*.dist-info", "RECORD")):
+    sp = os.path.dirname(os.path.dirname(rec))
+    with open(rec, newline="", encoding="utf-8", errors="replace") as fh:
+        for row in csv.reader(fh):
+            if row and row[0] and not os.path.exists(os.path.join(sp, row[0])):
+                n += 1
+print(n)'
 __hb_check() {
   [ -d "$1" ] || { echo gone; return 0; }
   __hb_x=$(__hb_unsafe "$__hb_r" "$1")
   [ -z "$__hb_x" ] || { echo "unsafe $__hb_x"; return 0; }
   grep -qx "short=$__hb_k" "$1/@@MARKER@@" 2>/dev/null || { echo "partial 0"; return 0; }
-  __hb_n=0
-  for __hb_rec in "$1"/lib/python*/site-packages/*.dist-info/RECORD; do
-    [ -f "$__hb_rec" ] || continue
-    __hb_sp=${__hb_rec%/*}; __hb_sp=${__hb_sp%/*}
-    while IFS=, read -r __hb_p __hb_q; do
-      [ -z "$__hb_p" ] || [ -e "$__hb_sp/$__hb_p" ] || __hb_n=$((__hb_n + 1))
-    done < "$__hb_rec"
-  done
+  __hb_n=$("$1/bin/python" -I -c "$__hb_recpy" "$1" 2>/dev/null)
+  case "$__hb_n" in ''|*[!0-9]*) echo "partial 0"; return 0;; esac
   if [ "$__hb_n" -eq 0 ] && [ "$(__hb_dists "$1")" = "$(sed -n 's/^dists=//p' "$1/@@MARKER@@")" ]; then echo ready
   else echo "partial $__hb_n"; fi
 }
-""".replace("@@UNSAFE@@", _UNSAFE.replace("@@PATHS@@", '"$@"'))
+""".replace("@@UNSAFE@@", _UNSAFE.replace("@@PATHS@@", '"$@"')).replace("@@SEEN@@", _SEEN.replace("@@PATH@@", '"$1"'))
 
 _BUILD = r"""# @@TAG@@ @@KEY@@ — hpc-bridge builds a user env (hpc_bridge.envs): beside its path, then one rename
 # what it creates is never writable by the group or anyone (a node whose umask is 002 would make the root so, and the
-# root and the env must be the user's alone: review U1)
-umask 022
+# root and the env must be the user's alone: review U1) — and never looser than the node's own umask (review R2-N3: a
+# node's 077 stays 077)
+__hb_um=$(umask)
+umask "$(printf '%o' $(( 8#$__hb_um | 8#22 )))"
 __hb_k=@@KEY@@; __hb_r=@@ROOT@@; __hb_t=@@TOKEN@@
 __hb_a=$(uname -m 2>/dev/null)
 __hb_d="$__hb_r/$__hb_k-$__hb_a"
-__hb_b=""
+__hb_b=""; __hb_cwd=""
 __hb_log="$__hb_r/.$__hb_k-$__hb_a.build.$__hb_t.log"
-@@FNS@@# the login node's own installer settings (review U2): the NAMES of those set, never their values, and the config
-# files that exist — said with the answer, since they apply to this build
-__hb_amb=$(env | sed -nE @@AMBIENT@@ | LC_ALL=C sort -u | tr '\n' ',')
+@@FNS@@# the login node's own installer settings (reviews U2, R2-N4): the NAMES of every UV_* and PIP_* variable set,
+# never their values, and the uv (and pip) config files that apply — said with the answer, never changed
+__hb_amb=$(env | sed -nE 's/^((UV|PIP)_[A-Za-z0-9_]*)=.*/\1/p' | LC_ALL=C sort -u | tr '\n' ',')
 __hb_cfg=""
-__hb_xdg="${XDG_CONFIG_HOME:-$HOME/.config}"
-for __hb_f in "$__hb_xdg/uv/uv.toml" /etc/uv/uv.toml "$__hb_xdg/pip/pip.conf" "$HOME/.pip/pip.conf" /etc/pip.conf; do
-  [ -f "$__hb_f" ] || continue
-  case ",$__hb_cfg" in *",$__hb_f,"*) ;; *) __hb_cfg="$__hb_cfg$__hb_f,";; esac
+__hb_addcfg() {
+  [ -f "$1" ] || return 0
+  case ",$__hb_cfg" in *",$1,"*) ;; *) __hb_cfg="$__hb_cfg$1,";; esac
+}
+[ -z "${UV_CONFIG_FILE:-}" ] || __hb_addcfg "$UV_CONFIG_FILE"
+for __hb_f in "${XDG_CONFIG_HOME:-$HOME/.config}/uv/uv.toml" "$HOME/.config/uv/uv.toml" /etc/uv/uv.toml \
+    "${XDG_CONFIG_HOME:-$HOME/.config}/pip/pip.conf" "$HOME/.pip/pip.conf" /etc/pip.conf; do
+  __hb_addcfg "$__hb_f"
 done
 __hb_fail() {
   __hb_m=$(printf '%s\n' "$1" | tail -c 2000)
   [ -z "$__hb_b" ] || __hb_rm "$__hb_b"
   rm -f "$__hb_log"
-  [ -n "${2:-}" ] || printf '%s\n' "$__hb_m" >| "$__hb_d.failed" 2>/dev/null
+  [ -n "${2:-}" ] || ( umask 077; printf '%s\n' "$__hb_m" >| "$__hb_d.failed" ) 2>/dev/null
   printf 'HPCB_ENV_FAILED key=%s arch=%s ambient=%s config=%s error_b64=%s\n' "$__hb_k" "$__hb_a" "${__hb_amb%,}" \
     "${__hb_cfg%,}" "$(printf '%s' "$__hb_m" | base64 | tr -d '\n')"
   exit 0
 }
+# uv runs from a fresh, empty directory of the user's own: uv reads a project's uv.toml or pyproject.toml from its cwd
+# and every parent — the env root's included (review R2-N4) — so it is moved off them; a user- or site-level uv.toml
+# still applies (a site's mirror may need it), and any project file above this directory too is named with the answer
+__hb_cwd=$(mktemp -d "$HOME/.hpcb-uv.XXXXXX" 2>/dev/null || mktemp -d "${TMPDIR:-/tmp}/hpcb-uv.XXXXXX" 2>/dev/null)
+trap '[ -z "$__hb_cwd" ] || rmdir "$__hb_cwd" 2>/dev/null' EXIT
+__hb_p=$__hb_cwd
+while [ -n "$__hb_p" ]; do
+  __hb_addcfg "$__hb_p/uv.toml"
+  grep -qs '^\[tool\.uv' "$__hb_p/pyproject.toml" && __hb_addcfg "$__hb_p/pyproject.toml"
+  [ "$__hb_p" = / ] && break
+  __hb_p=${__hb_p%/*}; [ -n "$__hb_p" ] || __hb_p=/
+done
 __hb_ready() {
   printf 'HPCB_ENV_READY key=%s dir=%s arch=%s python=%s lock=%s size_mb=%s free_mb=%s cached=%s ambient=%s '\
 'config=%s\n' "$__hb_k" "$__hb_d" "$__hb_a" "$(sed -n 's/^python=//p' "$__hb_d/@@MARKER@@")" \
@@ -540,11 +645,11 @@ __hb_ready() {
 }
 mkdir -p "$__hb_r" 2>/dev/null || __hb_fail "cannot create the env root $__hb_r" nomark
 __hb_x=$(__hb_unsafe "$__hb_r")
-[ -z "$__hb_x" ] || __hb_fail "the env root $__hb_x is not yours alone (owned by another user, or writable by its \
-group or anyone): hpc-bridge builds envs only where no one else can change them — pass root=… on a directory of your \
-own" nomark
-# in the root, so a project's uv.toml or pyproject.toml beside the worker's own cwd never applies to the build
-cd "$__hb_r" 2>/dev/null || :
+[ -z "$__hb_x" ] || __hb_fail "the env root $__hb_x $(__hb_seen "$__hb_x") is not yours alone (owned by another user, \
+or writable by its group or anyone — a default ACL, or an NFSv4 id-mapping to nobody, can make a directory you created \
+read so): hpc-bridge builds envs only where no one else can change them — pass root=… on a directory you own alone" \
+nomark
+[ -n "$__hb_cwd" ] || __hb_fail "cannot make a private working directory for the installer (mktemp)"
 # where the node has flock, a second build of the same env waits for the first, then finds it built
 if command -v flock >/dev/null 2>&1; then
   { exec 9>"$__hb_r/$__hb_k-$__hb_a.lock" && flock -w @@CAP@@ 9; } 2>/dev/null || true
@@ -552,24 +657,34 @@ fi
 __hb_s=$(__hb_check "$__hb_d")
 case "$__hb_s" in
   ready) __hb_ready 1; exit 0;;
-  unsafe*) __hb_fail "the env ${__hb_s#unsafe } is not yours alone (owned by another user, or writable by its group or \
-anyone): hpc-bridge never uses or replaces it — remove it, or pass root=… on a directory of your own" nomark;;
+  unsafe*) __hb_fail "the env ${__hb_s#unsafe } $(__hb_seen "${__hb_s#unsafe }") is not yours alone (owned by another \
+user, or writable by its group or anyone — a default ACL, or an NFSv4 id-mapping to nobody, can make a directory you \
+created read so): hpc-bridge never uses or replaces it — remove it, or pass root=… on a directory you own alone" \
+nomark;;
 esac
 rm -f "$__hb_d.failed"
 # what builds cut off and rebuilds moved aside left beside it (review N11), once older than any build can run
 find "$__hb_r" -maxdepth 1 \( -name ".$__hb_k-$__hb_a.build.*" -o -name ".$__hb_k-$__hb_a.broken.*" \) \
   -mmin +@@SWEEP@@ 2>/dev/null | while IFS= read -r __hb_x; do __hb_rm "$__hb_x"; done
 export PATH="$HOME/.local/bin:$PATH" UV_CACHE_DIR="$__hb_r/.uv-cache"
-command -v uv >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh \
-  | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh >/dev/null 2>&1; } || true
+cd "$__hb_cwd" || __hb_fail "cannot enter the installer's working directory $__hb_cwd"
+# (uv, and the installer that fetches it, run with the lock's descriptor closed: a child left running never holds the
+# lock — review NS9)
+command -v uv >/dev/null 2>&1 || { curl -LsSf https://astral.sh/uv/install.sh 9>&- \
+  | env UV_INSTALL_DIR="$HOME/.local/bin" UV_NO_MODIFY_PATH=1 sh >/dev/null 2>&1 9>&-; } || true
 command -v uv >/dev/null 2>&1 || __hb_fail "no uv on the login node, and astral.sh's installer could not install one"
 __hb_u=$(command -v uv)
 __hb_b="$__hb_r/.$__hb_k-$__hb_a.build.$__hb_t"
-"$__hb_u" venv -q --relocatable --python @@PY@@ "$__hb_b" > "$__hb_log" 2>&1 || __hb_fail "$(tail -n 20 "$__hb_log")"
-printf %s @@B64@@ | base64 --decode > "$__hb_b/requirements.in" || __hb_fail "cannot write $__hb_b/requirements.in"
+# the requirements (an index URL's credentials included) and what the installer says are the user's alone: 0600, then
+# 0400 once the env is made read-only (review R2-N3)
+( umask 077; : >| "$__hb_log" ) 2>/dev/null
+"$__hb_u" venv -q --relocatable --python @@PY@@ "$__hb_b" > "$__hb_log" 2>&1 9>&- \
+  || __hb_fail "$(tail -n 20 "$__hb_log")"
+( umask 077; printf %s @@B64@@ | base64 --decode >| "$__hb_b/requirements.in" ) \
+  || __hb_fail "cannot write $__hb_b/requirements.in"
 "$__hb_u" pip install -q --compile-bytecode --link-mode=copy --python "$__hb_b/bin/python" \
-  -r "$__hb_b/requirements.in" > "$__hb_log" 2>&1 || __hb_fail "$(tail -n 20 "$__hb_log")"
-"$__hb_u" pip freeze --python "$__hb_b/bin/python" > "$__hb_b/requirements.lock" 2> "$__hb_log" \
+  -r "$__hb_b/requirements.in" > "$__hb_log" 2>&1 9>&- || __hb_fail "$(tail -n 20 "$__hb_log")"
+( umask 077; "$__hb_u" pip freeze --python "$__hb_b/bin/python" >| "$__hb_b/requirements.lock" 2> "$__hb_log" 9>&- ) \
   || __hb_fail "$(tail -n 20 "$__hb_log")"
 {
   printf 'key=%s\nshort=%s\narch=%s\n' @@KEY64@@ "$__hb_k" "$__hb_a"
@@ -580,6 +695,12 @@ printf %s @@B64@@ | base64 --decode > "$__hb_b/requirements.in" || __hb_fail "ca
 # read-only from here (review N3): an install into the activated env fails loudly, never changing it under its key —
 # adding a package is a change of the requirements (another env); links are never followed
 find "$__hb_b" ! -type l -exec chmod a-w {} + 2>/dev/null
+# another build of this env (no flock on the node, or its wait ran out) may have claimed a whole one meanwhile: that one
+# stands — rows may already run in it — and this one is discarded (review R2-N8)
+if [ "$(__hb_check "$__hb_d")" = ready ]; then
+  __hb_rm "$__hb_b"; __hb_b=""; rm -f "$__hb_log"
+  __hb_ready 1; exit 0
+fi
 # a partly purged env is moved aside only now that its rebuild is ready: work still running in it keeps its files, and
 # a later build sweeps it once it is old (its age counted from now)
 if [ -e "$__hb_d" ]; then
@@ -595,10 +716,6 @@ case "$(__hb_check "$__hb_d")" in
   *) __hb_fail "the env claimed at $__hb_d does not check out";;
 esac
 """
-
-# The installer settings a login node may set itself (review U2), matched by NAME: `sed` keeps a name, never a value.
-_AMBIENT = shlex.quote("s/^((UV_[A-Z_]*INDEX[A-Z_]*)|UV_INSECURE_HOST|UV_CONFIG_FILE|PIP_INDEX_URL|PIP_EXTRA_INDEX_URL|"
-                       "PIP_TRUSTED_HOST|PIP_CONFIG_FILE)=.*/\\1/p")
 
 _CHECK = r"""__hb_k=@@KEY@@; __hb_r=@@ROOT@@
 __hb_a=$(uname -m 2>/dev/null)
@@ -644,7 +761,7 @@ def build_script(spec: EnvSpec, *, key: str, root: str, python: str, token: str)
     return (_BUILD.replace("@@FNS@@", _FNS).replace("@@TAG@@", BUILD_TAG).replace("@@KEY64@@", full)
             .replace("@@KEY@@", key).replace("@@ROOT@@", _qroot(root)).replace("@@TOKEN@@", token)
             .replace("@@PY@@", shlex.quote(python)).replace("@@B64@@", b64).replace("@@CAP@@", str(int(BUILD_S)))
-            .replace("@@SWEEP@@", str(SWEEP_MIN)).replace("@@AMBIENT@@", _AMBIENT).replace("@@MARKER@@", MARKER))
+            .replace("@@SWEEP@@", str(SWEEP_MIN)).replace("@@MARKER@@", MARKER))
 
 
 def check_script(*, key: str, root: str) -> str:
@@ -659,26 +776,27 @@ def check_script(*, key: str, root: str) -> str:
 
 
 def activate_check_script(line: str) -> str:
-    """An existing env's line, run once on the login node in a subshell (nothing of it stays), printing
-    `HPCB_ENV_ACTIVATE rc=<n> out_b64=<the end of what it said>`."""
-    b64 = shlex.quote(base64.b64encode(line.encode()).decode())
-    return (f'__hb_o=$( ( eval "$(printf %s {b64} | base64 --decode)" ) 2>&1 ); __hb_rc=$?; '
+    """An existing env's line, run once on the login node, printing `HPCB_ENV_ACTIVATE rc=<n> out_b64=<the end of what
+    it said>`: the very activation every command runs (`activation_sh`), in a subshell (nothing of it stays) — so a
+    line every command would refuse (one that ends the shell, one whose own errexit stops it) never passes here (review
+    R2-N7). rc 0: it activated; else the activation refused (its refusal line itself is not in what it said)."""
+    act = activation_sh(Activation("activate", env_key(EnvSpec(kind="activate", activate=line)), line=line),
+                        _CHECK_NONCE)
+    return ("__hb_o=$( (\n" + act + ") 2>&1 ); __hb_rc=$?\n"
+            f"__hb_o=$(printf '%s\\n' \"$__hb_o\" | grep -v '^{REFUSED} ')\n"
             "printf 'HPCB_ENV_ACTIVATE rc=%s out_b64=%s\\n' \"$__hb_rc\" "
-            "\"$(printf '%s' \"$__hb_o\" | tail -c 2000 | base64 | tr -d '\\n')\"")
+            "\"$(printf '%s' \"$__hb_o\" | tail -c 2000 | base64 | tr -d '\\n')\"\n")
 
 
 def canary_check(rec: dict[str, Any]) -> str:
-    """A handoff canary's look at its env from inside the block: `HPCB_ENV_OK 1` when the built env's marker is there
-    for this node, in a directory the user owns, or the existing env's line runs (in a subshell); else
-    `HPCB_ENV_OK 0`."""
-    act = activation_of(rec)
-    if act.how == "activate":
-        b64 = shlex.quote(base64.b64encode(str(act.line or "").encode()).decode())
-        test = f'( eval "$(printf %s {b64} | base64 --decode)" ) >/dev/null 2>&1'
-    else:
-        d = f'{_qroot(str(act.root))}/{act.key}-"$(uname -m 2>/dev/null)"'
-        test = f'[ -O {d} ] && grep -qx "short={act.key}" {d}/{MARKER} 2>/dev/null'
-    return f'{test} && echo "HPCB_ENV_OK 1" || echo "HPCB_ENV_OK 0"'
+    """A handoff canary's look at its env from inside the block: `HPCB_ENV_OK 1` when the very activation every command
+    runs (`activation_sh`, in a subshell) takes it — a built env's marker for this node, in a root and a directory the
+    user owns alone (review SS7), or an existing env's line under the same errexit and EXIT-trap rules (review R2-N7);
+    else `HPCB_ENV_OK 0`."""
+    act = activation_sh(activation_of(rec), _CHECK_NONCE)
+    # (the subshell stands alone, never on the left of `&&`: bash 4+ would ignore the line's errexit there)
+    return ('( \n' + act + ') >/dev/null 2>&1\n'
+            'if [ "$?" -eq 0 ]; then echo "HPCB_ENV_OK 1"; else echo "HPCB_ENV_OK 0"; fi')
 
 
 @dataclass
@@ -789,8 +907,9 @@ class _Known:
     or a check still out (`future`, sent at `sent_at` to `sent_to`), whether that one is a QUIET re-check of an env
     that stays ready while it runs (review U5), when its full check last passed (monotonic), the root's own warning
     (the low-space one is added afresh from each answer: review S17), and what kind of failure its last one was
-    (`fault`: installer | runner | lost — the words differ: review U9). Its `info` carries no name: a name is the
-    owner's (the session's, a batch's), never the shared env's (review U8)."""
+    (`fault`: installer | runner | lost | mark — the words differ: review U9). Its `info` carries no name: a name is
+    the owner's (the session's, a batch's), never the shared env's (review U8). `sent_runner`: the runner `future`
+    went out on — only that one is dropped when it fails (review SS5)."""
 
     spec: EnvSpec
     root: str
@@ -804,6 +923,7 @@ class _Known:
     quiet: bool = False
     root_warning: str | None = None
     fault: str | None = None
+    sent_runner: Any = None
 
 
 def access_of(app: AppCtx) -> str:
@@ -837,9 +957,12 @@ def info_for(k: _Known, name: str | None) -> EnvInfo:
     return k.info.model_copy(update={"name": name})
 
 
-def drop_runner(app: AppCtx) -> None:
+def drop_runner(app: AppCtx, only: Any = None) -> None:
     """Close and forget the build runner (its Executor shut down by the SDK, a new Globus login, an endpoint repaired,
-    adopted or changed: review S7): the next build gets a fresh one."""
+    adopted or changed: review S7): the next build gets a fresh one. `only`: drop it only when it is that runner — a
+    failure of an older one never closes a newer (review SS5)."""
+    if only is not None and app.env_runner is not only:
+        return
     r, app.env_runner, app.env_runner_key = app.env_runner, None, None
     if r is not None:
         try:
@@ -882,14 +1005,17 @@ def start_build(app: AppCtx, k: _Known, *, quiet: bool = False) -> None:
     runner refuses is a failure said in its own words, and that runner is replaced (review S7)."""
     script = build_script(k.spec, key=k.key, root=k.root, python=k.spec.python or default_python(),
                           token=secrets.token_hex(4))
+    runner = None
     try:
-        fut = _runner(app).submit(script)
+        runner = _runner(app)
+        fut = runner.submit(script)
     except Exception as exc:  # noqa: BLE001 - the Executor shut down, no endpoint: said, never raised out of a tool
-        drop_runner(app)
+        drop_runner(app, only=runner)
         k.future = None
         _fail(k, f"its build could not be sent to the login node: {type(exc).__name__}: {exc}", "runner")
         return
     k.future, k.kind, k.sent_at, k.sent_to = fut, "build", time.monotonic(), str(app.state.endpoint_id)
+    k.sent_runner = runner
     k.quiet = quiet and k.info.state == "ready"
     upd: dict[str, Any] = {"task_id": getattr(fut, "task_id", None)}
     if not k.quiet:
@@ -908,7 +1034,12 @@ def _absorb(app: AppCtx, k: _Known) -> None:
         return
     exc = fut.exception()
     if exc is not None:   # the runner's own failure (the SDK shut its Executor down): never reused (review S7)
-        drop_runner(app)
+        drop_runner(app, only=k.sent_runner)
+        if k.kind == "activate":   # the line was never run: not checked, never "its line did not work" (R2-S4)
+            k.fault = "runner"
+            k.info = k.info.model_copy(update={"state": "unchecked", "task_id": None, "error": said(
+                f"its check could not be run on the login node: {type(exc).__name__}: {exc}")})
+            return
         _fail(k, f"it could not be run on the login node: {type(exc).__name__}: {exc}", "runner")
         return
     res = fut.result()
@@ -918,6 +1049,7 @@ def _absorb(app: AppCtx, k: _Known) -> None:
         words = _b64text(m.group(2)).strip() if m else out.strip()[-300:]
         ok = m is not None and m.group(1) == "0"
         err = None if ok else (said(words) or "its line failed and said nothing")
+        k.fault = None if ok else "line"
         k.info = k.info.model_copy(update={"state": "ready" if ok else "unchecked", "task_id": None, "error": err})
         return
     b = parse_build(out)
@@ -990,7 +1122,7 @@ def _promote(app: AppCtx) -> None:
         return
     k = _known(app, spec)
     if k.future is not None or k.info.state not in ("ready", "failed"):
-        return   # still out — or lost, and sent again on the next ask: it stays pending
+        return   # still out — or lost, and sent again on the next ask (`resume_pending`): it stays pending
     app.env_pending = None
     label = spec.name or k.key
     if k.info.state == "ready":
@@ -1051,18 +1183,48 @@ async def _check_activate(app: AppCtx, spec: EnvSpec, wait_s: float = WAIT_S) ->
         return k
     refresh(app)
     if k.future is None:
+        runner = None
         try:
-            fut = _runner(app).submit(activate_check_script(str(spec.activate)))
+            runner = _runner(app)
+            fut = runner.submit(activate_check_script(str(spec.activate)))
         except Exception as exc:  # noqa: BLE001 - said: each command checks the line anyway
-            drop_runner(app)
+            drop_runner(app, only=runner)
             k.fault = "runner"
             k.info = k.info.model_copy(update={"state": "unchecked", "error": said(
                 f"its check could not be sent to the login node: {type(exc).__name__}: {exc}")})
             return k
         k.future, k.kind, k.sent_at, k.sent_to = fut, "activate", time.monotonic(), str(app.state.endpoint_id)
+        k.sent_runner = runner
     await _wait(k.future, wait_s)
     refresh(app)
     return k
+
+
+def resume_pending(app: AppCtx) -> None:
+    """A pending env whose build was lost, or whose future a dropped runner cancelled, is sent again — on the next ask,
+    as the pending answer promised (review R2-S3): ensure_endpoint_up, env omitted included."""
+    refresh(app)
+    spec = app.env_pending
+    if spec is None or app.state.endpoint_id is None:
+        return
+    k = _known(app, spec)
+    if k.future is None and k.info.state == "unchecked":
+        start_build(app, k)
+        _promote(app)
+
+
+def believe_refusal(app: AppCtx, k: _Known | None, why: str) -> None:
+    """What a node's refusal of an env says, believed — run_shell's, a poll's, a batch row's and a job's alike (review
+    R2-S2: one path): its full check is due again (gone, failed); a `.failed` mark there makes the env failed here, so
+    the next ask — the user's yes for a batch, a resubmit — sends the build (the build itself clears the mark)."""
+    if k is None or k.spec.kind == "activate" or why not in ("gone", "failed"):
+        return
+    k.verified_at = None
+    if why == "failed" and (k.future is None or k.quiet):
+        k.quiet = False
+        k.fault = "mark"
+        k.info = k.info.model_copy(update={"state": "failed", "error": "its build failed on the node: its .failed mark "
+                                                                       "there says so"})
 
 
 @dataclass
@@ -1082,13 +1244,19 @@ def failed_words(info: EnvInfo | None, fault: str | None) -> str:
         return f"its build failed on the login node (the installer said, quoted as data: {err!r})."
     if fault == "lost":
         return f"its build never answered ({err})."
+    if fault == "mark":
+        return "its build failed on the node: its .failed mark there says so."
     return f"it could not be built on the login node (quoted as data: {err!r})."
+
+
+INSTALL_SAID = "Installing runs each package's build code as you, on your allocation's facility."
 
 
 def built_notice(app: AppCtx, info: EnvInfo) -> str:
     """What a built env's answer says — the session's, a batch's, a job's or a handoff's alike (review S14): the user's
     own index lines (credentials redacted), the login node's own installer settings that applied (review U2), that
-    installing runs build code (once a session), and its root's warning."""
+    installing runs build code (once a session: marked said only by the answer that carries it, `mark_said` — review
+    R2-S10), and its root's warning."""
     out = ""
     if info.index_lines:
         out += f" Its packages come from your own index lines: {'; '.join(info.index_lines)}."
@@ -1096,11 +1264,17 @@ def built_notice(app: AppCtx, info: EnvInfo) -> str:
         out += (f" The login node's own installer settings applied to this build: {', '.join(info.ambient)} — "
                 "hpc-bridge names them and never changes them.")
     if not app.env_said_install:
-        app.env_said_install = True
-        out += " Installing runs each package's build code as you, on your allocation's facility."
+        out += f" {INSTALL_SAID}"
     if info.warning:
         out += f" Note: {info.warning}."
     return out
+
+
+def mark_said(app: AppCtx, notice: str | None) -> None:
+    """The install warning is said once a session: marked when an answer that carries it is returned (review R2-S10 —
+    never when it is composed for an answer that drops it)."""
+    if INSTALL_SAID in (notice or ""):
+        app.env_said_install = True
 
 
 def _words(info: EnvInfo) -> str:
@@ -1120,22 +1294,31 @@ async def choose(app: AppCtx, spec: EnvSpec | None) -> Chosen:
     """ensure_endpoint_up's `env` (parsed: `parse`): the session's env from now on, for its commands on both shapes —
     never hpc-bridge's internal session. `{}` drops it (and any pending one). A built env still being built is PENDING
     (review S4): the session's own env (or none) serves meanwhile, and the new one takes over once it is ready — a
-    failed build leaves the session's env as it was, saying why (ruling 9). Raises EnvRefusal (nothing set)."""
+    failed build leaves the session's env as it was, saying why (ruling 9), and drops any older pending one (review
+    R2-S5). Of two calls at once the LATER wins: one that waited on its build while a later choose ran applies nothing
+    (review R2-S6). Raises EnvRefusal (nothing set)."""
     if spec is None:
         return Chosen(session_info(app))
+    app.env_seq += 1
+    mine = app.env_seq
     if spec.kind == "none":
         app.env_spec = app.env_pending = None
         return Chosen(None, "No env: commands run in the session's own shell as it stands.")
     delivery(spec, access=access_of(app), client_python=default_python())
     if spec.kind == "activate":
         k = await _check_activate(app, spec)
-        app.env_spec, app.env_pending = spec, None
         info = info_for(k, spec.name)
+        if app.env_seq != mine:
+            return _superseded(info)
+        app.env_spec, app.env_pending = spec, None
         if info.state == "ready":
             words = "it activates on the login node; each command, batch row and job runs it first."
         elif k.future is not None:   # its check is queued behind a build on the build worker (review S13)
             words = ("its check on the login node is still queued behind a build: it is kept, and each command checks "
                      "it as it runs (nothing runs where its line does not work).")
+        elif access_of(app) == "ssh" and info.error and k.fault == "runner":   # never the line's fault (R2-S4)
+            words = (f"it could not be checked on the login node (quoted as data: {said(info.error)!r}): it is kept, "
+                     "and each command checks it as it runs (nothing runs where its line does not work).")
         elif access_of(app) == "ssh" and info.error:
             words = (f"its line did not work on the login node, saying (quoted as data): {said(info.error)!r} — login "
                      "and compute nodes may load different modules, so it is kept and checked again with each command, "
@@ -1146,13 +1329,19 @@ async def choose(app: AppCtx, spec: EnvSpec | None) -> Chosen:
                             "No new block.")
     k = await ensure_built(app, spec)
     info = info_for(k, spec.name)
+    if app.env_seq != mine:
+        return _superseded(info)
     cur = app.env_spec
     same = cur is not None and cur.kind == "requirements" and _known(app, cur) is k
     if info.state == "failed":
-        if app.env_pending is not None and _known(app, app.env_pending) is k:
-            app.env_pending = None
-        return Chosen(info, f"The session's env was not changed: env {info.key} {failed_words(info, k.fault)}",
-                      taken=same)
+        dropped = ""
+        if app.env_pending is not None and _known(app, app.env_pending) is not k:
+            older = app.env_pending
+            dropped = (f" The env {older.name or env_key(older)} that was still being built is dropped too: this ask "
+                       "superseded it.")
+        app.env_pending = None
+        return Chosen(info, f"The session's env was not changed: env {info.key} {failed_words(info, k.fault)}"
+                            + dropped, taken=same)
     if info.state == "ready":
         app.env_spec, app.env_pending = spec, None
         return Chosen(info, _words(info) + built_notice(app, info))
@@ -1166,6 +1355,11 @@ async def choose(app: AppCtx, spec: EnvSpec | None) -> Chosen:
     return Chosen(info, (f"The env {info.name or info.key} is being built on the login node (free){where}: "
                          f"{serving}, and it becomes the session's env once it is ready (ensure_endpoint_up says "
                          "when).") + built_notice(app, info), taken=False)
+
+
+def _superseded(info: EnvInfo) -> Chosen:
+    return Chosen(info, "A later call changed the session's env while this one waited on its env: this call's env was "
+                        "not applied (the later call's stands).", taken=False)
 
 
 def session_info(app: AppCtx) -> EnvInfo | None:
@@ -1231,13 +1425,18 @@ def refused(app: AppCtx, ref: Refused, act: Activation, stderr: str) -> tuple[Li
     """A command its env refused: (the phase, the notice). A built env gone from its root (a scratch purge) is rebuilt
     on the login node — `env_building`; anything a rebuild cannot mend now (built only for another architecture, its
     build failed, a directory not the user's alone, the user's line failed) is `failed`, saying why. What the node said
-    clears what this server believed (review S6): a `.failed` mark makes the next ask send the build. Never runs the
-    command again by itself."""
+    clears what this server believed — the one path batch rows and jobs take too (`believe_refusal`: reviews S6,
+    R2-S2): a `.failed` mark makes the next ask send the build. A command that ran in an env the session has since
+    left is said about THAT env, and that a resend runs in the current one (review SS4). Never runs the command again
+    by itself."""
     k = _known_built(app, act.key, act.root) if act.how == "built" else None
-    if k is not None and ref.why in ("gone", "failed"):
-        k.verified_at = None
+    believe_refusal(app, k, ref.why)
+    cur = app.env_spec
+    left = cur is None or env_key(cur) != act.key
+    since = (" The session's env has changed since this command was sent: sending it again runs it in the current "
+             "one." if left else "")
     if ref.why == "gone" and act.how == "built":
-        if k is not None:
+        if k is not None and not left:
             refresh(app)
             if k.future is None or k.quiet:
                 k.quiet = False
@@ -1245,30 +1444,32 @@ def refused(app: AppCtx, ref: Refused, act: Activation, stderr: str) -> tuple[Li
                     start_build(app, k)
                 else:
                     k.info = k.info.model_copy(update={"state": "building"})
+        if left:
+            return "failed", (f"Nothing ran: the env {act.key} this command was sent with was not found under "
+                              f"{act.root} on this node — purged from scratch, or removed.{since}")
         return "env_building", (f"Nothing ran: the session's env {act.key} was not found under {act.root} on this node "
                                 "— purged from scratch, or removed. It is being rebuilt on the login node (free); send "
                                 "the command again once ensure_endpoint_up says it is ready.")
     if ref.why == "arch":
         here, *built = ref.detail.split() or ["?"]
-        return "failed", (f"Nothing ran: the session's env {act.key} was built for {', '.join(built) or 'another '}"
+        return "failed", (f"Nothing ran: the env {act.key} was built for {', '.join(built) or 'another '}"
                           f"architecture; this node is {here}. Building an env on a node of another architecture than "
                           "the login node's needs per-architecture endpoint venvs (a follow-up, not built): use an "
-                          'existing env here with env={"activate": "<shell line>"}.')
+                          'existing env here with env={"activate": "<shell line>"}.' + since)
     if ref.why == "failed":
-        if k is not None and k.future is None:
-            k.info = k.info.model_copy(update={"state": "unchecked"})
-        return "failed", (f"Nothing ran: the session's env {act.key} failed to build here (its mark on the node says "
-                          "so). Ask for it again with ensure_endpoint_up(env=…) to build it again, or choose another.")
+        return "failed", (f"Nothing ran: the env {act.key} failed to build here (its mark on the node says so). Ask "
+                          "for it again with ensure_endpoint_up(env=…) to build it again, or choose another." + since)
     if ref.why == "unsafe":
-        return "failed", (f"Nothing ran: the session's env {act.key} is in a directory that is not yours alone "
-                          f"({said(ref.detail)!r}: owned by another user, or writable by its group or anyone). "
-                          "hpc-bridge never runs in an env someone else could change: remove it, or choose a root of "
-                          "your own with ensure_endpoint_up(env={…, \"root\": …}).")
+        return "failed", (f"Nothing ran: the env {act.key} is in a directory that is not yours alone "
+                          f"({said(ref.detail)!r}: owned by another user, or writable by its group or anyone — a "
+                          "default ACL, or an NFSv4 id-mapping to nobody, can make a directory you created read so). "
+                          "hpc-bridge never runs in an env someone else could change: remove it, or choose a root you "
+                          "own alone with ensure_endpoint_up(env={…, \"root\": …})." + since)
     words = "\n".join(ln for ln in (stderr or "").splitlines() if REFUSED not in ln)
     quoted = said(words, 600)
-    return "failed", (f"Nothing ran: the session's env could not be activated on this node — its line exited "
+    return "failed", (f"Nothing ran: the env could not be activated on this node — its line exited "
                       f"{ref.detail.removeprefix('rc=')}" + (f", saying (quoted as data): {quoted!r}" if quoted else "")
-                      + ".")
+                      + "." + since)
 
 
 # ---- a batch's or a job's env, on the ledger ------------------------------------------------------------------------
@@ -1394,8 +1595,9 @@ def rebuild_record(app: AppCtx, rec: dict[str, Any]) -> bool:
 
 
 def current_record(app: AppCtx, rec: dict[str, Any]) -> dict[str, Any]:
-    """`rec` with what has been learnt since it was recorded (its path, its Python, its lock, its warning, once
-    built)."""
+    """`rec` with what has been learnt since it was recorded (its path, its Python, its lock, its warning, once built)
+    — and, the env ready again, without `retried`: the user's one retry is spent only on the failure it was asked for
+    (review R2-S7)."""
     if rec.get("kind") == "activate":
         return rec
     refresh(app)
@@ -1403,9 +1605,25 @@ def current_record(app: AppCtx, rec: dict[str, Any]) -> dict[str, Any]:
     if k is None or k.info.state != "ready":
         return rec
     info = k.info
-    return {**rec, **{n: v for n, v in (("path", info.path), ("python", info.python), ("arch", info.arch),
-                                       ("lock_sha256", info.lock_sha256), ("warning", info.warning))
-                      if v is not None}}
+    out = {**rec, **{n: v for n, v in (("path", info.path), ("python", info.python), ("arch", info.arch),
+                                      ("lock_sha256", info.lock_sha256), ("warning", info.warning))
+                     if v is not None}}
+    out.pop("retried", None)
+    return out
+
+
+def nonce_for(rec: dict[str, Any], *parts: Any) -> str:
+    """The activation nonce of one dispatch of a ledger record's env — a batch row's attempt, a job: made from the
+    record's own secret (`nonce_key`, never sent anywhere), so this server, or one restarted on the same ledger,
+    believes a refusal mark only from that dispatch's activation (reviews N12, SS2) and keeps no table of them."""
+    seed = "\0".join([str(rec.get("nonce_key") or rec.get("key")), *(str(p) for p in parts)])
+    return hashlib.sha256(seed.encode()).hexdigest()[:16]
+
+
+def ready_for_billed(k: _Known) -> bool:
+    """A job's or a handoff's billed work goes only against an env known ready here (review SS6): never one that is
+    unchecked — a build lost, a future its runner's close cancelled — taken as built."""
+    return k.spec.kind == "activate" or (k.info.state == "ready" and (k.future is None or k.quiet))
 
 
 def label(rec: dict[str, Any] | None) -> str | None:

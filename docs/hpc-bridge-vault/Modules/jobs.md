@@ -52,7 +52,8 @@
   - **After any stop** the facility's envelopes admit nothing more.
 
 - **The job's env** (block environments, PR 3; [[envs]]). `submit_job(…, env=)` takes the job's own env, else the session's.
-  - **While it builds:** the answer is `busy` / `env_building` and nothing is submitted.
+  - **While it builds:** the answer is `busy` / `env_building` and nothing is submitted. That includes an env left unchecked: billed work never goes against an env not known ready (`envs.ready_for_billed`, review SS6). A ready pending env is promoted before the session's is read (R2-S11).
+  - **Its refusal on the node (SS2).** The job's record keeps a `nonce_key`; its script's activation writes `env_refused` beside it, carrying the job's nonce. A job that ends with exit 88 has that mark read (`_env_refusal_of`, believed only with its nonce): status says the job ran nothing and why, the reason is kept on the ledger, and the refusal is believed as run_shell's (`envs.believe_refusal`), so a resubmit checks or rebuilds the env first.
   - **A failed build** is `_refused`.
   - **The job script** (`job_script`, through `Spec.env_rec`) activates the env after the session's env line. A gone env exits 88 with the refusal on stderr.
   - **Where it shows:** the ledger's `job.env`, `JobInfo.env` (`job_info(j, app)`: its state as this server knows it, review S11) and `JobTerms.env`.

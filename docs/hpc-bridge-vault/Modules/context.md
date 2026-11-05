@@ -22,6 +22,7 @@ next connect (Perlmutter report, left-over local state). A `details=` for the id
 **Block environments (PR 3, 2026-11-05; [[envs]]).** These fields hold the session's env state:
 - `AppCtx.env_spec`: the session's env (an `envs.EnvSpec`). It applies to the user's commands on both shapes, and never to the internal session.
 - `env_pending` and `env_note` (review round 1, S4): a new built env still being built, and what became of it, said once.
+- `env_seq` (review round 2, R2-S6): of two env choices at once the later wins; one that waited applies nothing.
 - `env_known`: what this server knows of each env, by root and key (its state, a build or check out, when its full check last passed).
 - `env_said_install`: whether the install warning was said.
 - `env_runner` and `env_runner_key`: the build user endpoint on the login node, and the endpoint and config it was made for.

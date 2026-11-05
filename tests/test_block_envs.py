@@ -77,6 +77,14 @@ _BASH = shutil.which("bash")
 _FLOCK = shutil.which("flock")
 pytestmark = [pytest.mark.skipif(_BASH is None, reason="needs bash")]
 
+@pytest.fixture(autouse=True)
+def _quick_gone_recheck(monkeypatch):
+    """A missing env is looked at again after GONE_RECHECK_S before it is refused (review NS4): shortened here."""
+    from hpc_bridge import envs
+
+    monkeypatch.setattr(envs, "GONE_RECHECK_S", 0.05, raising=False)
+
+
 PY = f"{sys.version_info.major}.{sys.version_info.minor}"
 ARCH = os.uname().machine          # what `uname -m` prints here
 REQS = "six==1.17.0\n"

@@ -579,6 +579,9 @@ class EndpointStatus(BaseModel):
     # block environments: the session's env (the one its commands run in), or — on the call that asked for one whose
     # build failed — that one, saying why (the session's own is then unchanged). None: no env.
     env: EnvInfo | None = None
+    # (not on the wire) the block part refused this call's arguments and set nothing — so the env asked with them is
+    # not applied either (block environments, review R2-S1: never read from the notice's words)
+    _nothing_set: bool = PrivateAttr(default=False)
 
 
 # ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------
