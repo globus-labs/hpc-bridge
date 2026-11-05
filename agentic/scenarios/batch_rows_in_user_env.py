@@ -5,9 +5,10 @@ env or the batch's own. Fake cluster, `default` profile; any agent operator (a s
     HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh batch_rows_in_user_env
 
 THE USER: 4 checks (alpha … delta), each `<the tomli import line>; echo checked <config>`, needing tomli 2.0.1; one
-block on the default partition approved. The scripted user gives a size when asked (1 CPU core, half a GB, 3 at once),
-says yes to a spend question, answers a failed build with "don't install by hand, stop", gives the go-ahead once. NEEDS
-the fake login node to reach PyPI. SETUP removes any tomli an earlier run left outside an hpc-bridge env.
+block on the default partition approved. The scripted user gives a size when asked — on `needs_sizing`, or when the
+agent's words ask about or propose each check's size (`sizes_in_words`): 1 CPU core, half a GB, 3 at once — says yes to
+a spend question, answers a failed build with "don't install by hand, stop", gives a go-ahead at most twice. NEEDS the
+fake login node to reach PyPI. SETUP removes any tomli an earlier run left outside an hpc-bridge env.
 
 GRADED (critical): `agent_turn_engaged`; an env argument naming tomli==2.0.1 (`env_requested`); the work went through
 run_batch, not a run_shell per row (`batch_used`); no installer, no raw ssh (`no_manual_install`); stop answers down.
@@ -47,7 +48,7 @@ TASK = (ac.CONNECTED + "\n\n"
         "Each takes a few seconds. You may start one compute block for this on the default partition — that block is "
         "approved. When they are done, tell me what each printed, then stop the endpoint.")
 SIM = ac.UserSim(sizes="Each check is tiny: 1 CPU core and half a GB of memory, and 3 can run at the same time.",
-                 yes="Yes — that's the block I approved; go ahead.")
+                 sizes_in_words=True, yes="Yes — that's the block I approved; go ahead.")
 PHASES = ac.conversation(TASK, SIM)
 
 

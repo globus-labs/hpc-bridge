@@ -233,6 +233,14 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
   - **A new MCP server per turn** forgets the spend acknowledgement: a batch carried over asks for the yes again. The
     answers that carry one over say the approved block still stands; the cells whose batch spans turns report, not
     gate, the number of blocks.
+  - **First live pass (pi on qwen, fake `default`, 2026-11-05): 4 of 7 OK; the three failures were the harness's.**
+    Fixed: `no_manual_install` reads each simple command for an install (a config grep and a dry-run resolve are
+    diagnosis); a careful agent asks in WORDS first, so the user can answer a turn's words about sizes
+    (`UserSim.sizes_in_words`) and gives a go-ahead up to twice; and a premise must come from the WORLD, never the
+    agent's choice — `batch_memory_kill_resized` now seeds the default-memory kill in its scripted phase,
+    `asked_for_sizes` passes on sizes asked in words, `terms_shown_before_yes` / `world:block_as_confirmed` grade
+    the block that started however the agent got there, and `env_unbuildable_asks` accepts an agent that checks the
+    version itself and asks before building anything.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

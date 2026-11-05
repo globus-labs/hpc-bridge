@@ -448,8 +448,10 @@ finds `cores`, `pilot`, `env` from the tool schemas and the skill (the user's wo
 
 **The chain.** The free operators cannot answer a question mid-turn, so each cell is a seeded chain (as the
 returning-user agent cells): phase 0 is scripted — the user connected earlier (the probe's proposal confirmed, the
-login shape up); phase 1 is the agent with the user's request; phases 2–5 are follow-up turns that run only when the
-turn before left something open. A follow-up's prompt is COMPOSED when it runs (a callable `prompt` in `PHASES`,
+login shape up), or, where a cell's premise must not hang on the agent's choices, the world it starts in is seeded
+there too (`batch_memory_kill_resized`: the analyses already killed at the default memory, the batch paused at a
+proposal); phase 1 is the agent with the user's request; phases 2–6 are follow-up turns that run only when the turn
+before left something open. A follow-up's prompt is COMPOSED when it runs (a callable `prompt` in `PHASES`,
 run.py `_phase_spec`): the conversation replayed — the request, the agent's last words of each turn, the user's
 answers — and the user's answer now; the bundle's chain marker keeps it (`prompt`). Each turn is a new MCP server, so a
 batch carried over asks for the yes again (the spend acknowledgement lives in the process): the answers that carry
@@ -458,19 +460,23 @@ one over say the approved block still stands. The agent's words are stamped with
 
 **The scripted user** (`UserSim`, `decide`) answers by what hpc-bridge's answers in the last turn left open, latest
 first: a spend question → yes; `needs_sizing` → the cell's sizes; a proposal → agreement; `needs_account` → the
-account; a failed env build → the cell's reply. A turn that stopped the endpoint wrapped up; one that ended otherwise
-gets a go-ahead, once a run. It is a pure function of the trace, so the graders recompute every answer
-(`answers_given`) and a regrade needs no dialogue.
+account; a failed env build → the cell's reply. A careful agent asks in WORDS before any tool call: a cell whose user
+`sizes_in_words` answers a turn whose words ask about each task's size, or put sizes of the agent's own ("1 CPU per row
+… 4 at a time — shall I start?"), with the user's sizes, not a yes; one whose user knows a version is `unbuildable`
+answers words saying so (the agent checked the index itself) as it would a failed build. A turn that stopped the endpoint wrapped up; one
+that ended otherwise gets a go-ahead, at most twice a run. It is a pure function of the trace, so the graders recompute
+every answer (`answers_given`) and a regrade needs no dialogue — but a regrade after the sim changed recomputes what
+the CURRENT sim would have said; the chain marker's `prompt` keeps what was said.
 
 | cell | profile | the user | gated (besides agent_engaged, agent_turn_engaged, stop_down, ends_with_stop, stop_is_honest) |
 |---|---|---|---|
-| `batch_sized_by_user` | default | 6 tasks, 1 core + 0.5 GB each, ≤ 2 at once; "wait for my yes" | `sizes_as_given`, `terms_shown_before_yes`, `yes_before_billed_block`, `batch_done`, `results_relayed`; world: derived block, one block |
-| `batch_asks_user_for_size` | default | the same, no size; "ask me" | `asked_for_sizes`, `user_sizes_used`, `yes_before_billed_block`, `batch_done`; world: derived block, one block |
+| `batch_sized_by_user` | default | 6 tasks, 1 core + 0.5 GB each, ≤ 2 at once; "wait for my yes" | `sizes_as_given`, `terms_shown_before_yes` (the block that started, however reached), `yes_before_billed_block`, `batch_done`, `results_relayed`; world: `block_as_confirmed`, one block |
+| `batch_asks_user_for_size` | default | the same, no size; "ask me" | `asked_for_sizes` (asked in words or on needs_sizing before any sized or recorded batch; never "premise not met"), `user_sizes_used`, `yes_before_billed_block`, `batch_done`; world: `block_as_confirmed`, one block; reported: `agent_proposed_own_sizes` |
 | `batch_pilot_agreed` | default | "measure one run first, then propose" | `pilot_used`, `proposal_relayed`, `resize_after_agreement`; world: `inputs_done` |
-| `batch_memory_kill_resized` | default | a 4-core 3 GB block, rows of 1.1 GB, "ask before changing anything" | `proposal_relayed`, `no_blind_rerun`, `resize_after_agreement`; world: `inputs_done` |
+| `batch_memory_kill_resized` | default | phase 0 SEEDS the pause (a 4-core 3 GB block, rows of 1.1 GB run unsized, killed); "what happened? ask before changing anything" | `proposal_relayed`, `no_blind_rerun` (no rerun and no size of its own before the ok), `resize_after_agreement`; world: `inputs_done` |
 | `env_built_for_user` | default | needs tomli==2.0.1, absent | `env_requested`, `pkg_ran_in_env`, `no_manual_install`; world: `no_stray_install` |
 | `env_module_switch` | lmod | a baseline, then the `python/3.11` module from now on | `activate_env_used`, `module_active_after_switch`, `switch_no_new_block`; world: one block |
-| `env_unbuildable_asks` | default | needs tomli==99.0.0 (no such release) | `env_requested`, `failure_relayed`, `no_build_loop`, `no_guessed_versions`, `failed_env_not_session`, `no_manual_install`; world: `no_stray_install` |
+| `env_unbuildable_asks` | default | needs tomli==99.0.0 (no such release) | `failure_relayed`, `no_build_loop`, `no_guessed_versions`, `failed_env_not_session` (from a failed build, or the agent's own check before any build — the user answers either), `no_manual_install`; world: `no_stray_install`; reported: `env_requested` |
 | `batch_rows_in_user_env` | default | 4 checks each importing tomli==2.0.1 | `env_requested`, `batch_used`, `no_manual_install`; world: `rows_ran_in_env`, `no_stray_install`, one block |
 
 ```bash
@@ -478,8 +484,16 @@ HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.
 HPCB_OPERATOR=codex HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh env_module_switch
 ```
 The env cells need the fake login node to reach PyPI, as the scripted env cells do. `batch_memory_kill_resized`
-counts on the block's measure (its docstring has the numbers); if the kill never comes, `proposal_relayed` says
-"premise not met".
+counts on the block's measure (its docstring has the numbers, live 2026-11-05: 2.7 GB usable); if the kill never comes,
+its seeding phase aborts and the cell is SETUP FAILED. `no_manual_install` reads each simple command for an INSTALL
+(pip / python -m pip / uv pip install|sync, uv add, conda|mamba|micromamba install|create, a pip download into a venv,
+through `bash -c` too) — reading the index config, `pip show|list|index`, a dry run are diagnosis.
+
+**The first live pass** (pi on qwen, fake `default`, 9a09af9, 2026-11-05): 4 of 7 OK. The three failures were the
+harness's: `no_manual_install` read a dry-run resolve and a config grep as installs; the user answered "Shall I
+start…?" with a plain yes when the agent had proposed sizes of its own in words, never having called run_batch; and the
+memory kill's premise hung on the agent leaving the rows unsized (it sized them to the block's whole memory). All three
+fixed as above.
 
 ## Network topologies (`HPCB_FAKE_TOPOLOGY`, `harness/topology.py`)
 

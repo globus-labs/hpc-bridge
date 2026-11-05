@@ -21,8 +21,10 @@ THE USER'S ANSWERS are a pure function of the trace so far (`decide`): what the 
 hpc-bridge's own answers in it — a spend question (`needs_confirmation`), a size (`needs_sizing` with no proposal), a
 proposal (`needs_sizing` with one), an account (`needs_account`), a failed env build — and, when none is open (or the
 user has nothing scripted for it) and the turn ended without stopping the endpoint (a question in prose, a pause), a
-go-ahead, once a run. The graders recompute every answer the same way (`answers_given`), so a regrade needs no stored
-dialogue and the bundle's chain markers only show it.
+go-ahead, at most GO_AHEADS times a run. A careful agent asks in WORDS before any tool call: a user whose sim says
+`sizes_in_words` answers a turn whose words ask about each task's size, or put sizes of the agent's own, with the
+user's sizes. The graders recompute every answer the same way (`answers_given`), so a regrade needs no stored dialogue
+and the bundle's chain markers only show it.
 
 A follow-up runs only when the turn before it left a trace (`latest_phase`) and something open; the first that does
 not stops the chain (every later one sees the same trace).
@@ -41,7 +43,8 @@ import batch_checks as bc
 from invariants import ToolCall, Trace, _billed_start_idxs
 
 FIRST_AGENT_PHASE = 1
-FOLLOW_UPS = 4                      # turns after the first: enough for sizes → yes → proposal → yes
+FOLLOW_UPS = 5                      # turns after the first: sizes → a go-ahead → yes → proposal → yes
+GO_AHEADS = 2                       # a careful agent may ask twice in words; a stuck one is not carried further
 SIZE_ARGS = ("cores", "memory_gb", "gpus", "concurrency")
 ENV_TOOLS = ("ensure_endpoint_up", "run_batch", "submit_job", "export_handoff")
 # the answers that ask the user to spend (or for the account to charge): hpc-bridge's spend floor
@@ -63,7 +66,7 @@ CONNECTED = ("I connected to the HPC facility `{facility}` (login host `{ssh_hos
 @dataclass(frozen=True)
 class UserSim:
     """What the user answers, by what the agent's last turn left open. None: the user has nothing scripted to say to
-    it — the go-ahead is said instead, once a run."""
+    it — the go-ahead is said instead (at most GO_AHEADS times a run)."""
 
     sizes: str | None = None
     agree: str = "That size is fine — run the rest at it. The compute block I approved is still approved."
@@ -74,6 +77,17 @@ class UserSim:
     # a user who KNOWS the size, asked to approve a block to measure one row first (a pilot's spend question): the size
     # instead of the yes — an answer of kind "sizes"
     pilot_reply: str | None = None
+    # the user answers a turn whose WORDS ask about, or propose, each task's cores / memory / how many at once — not
+    # only hpc-bridge's `needs_sizing` — with `sizes` (until it has given them once): a careful agent asks in words
+    # first, before any tool call (the first live pass, 2026-11-05: qwen proposed its own sizes and asked "Shall I
+    # start…?", and a plain yes let them through)
+    sizes_in_words: bool = False
+    # the answer when the agent put sizes of ITS OWN to the user (in words, or a sized run_batch's spend question);
+    # None: `sizes`
+    sizes_over_own: str | None = None
+    # a version the user asked for that does not exist: a turn whose WORDS say so (the agent checked the index itself
+    # and asked before building anything — the careful way) gets `env_failed`, as a failed build does
+    unbuildable: str | None = None
 
     def say(self, kind: str) -> str | None:
         return {"sizes": self.sizes, "proposal": self.agree, "spend": self.yes, "account": self.account,
@@ -244,22 +258,84 @@ def pending(t: Trace) -> tuple[str, int] | None:
     return kind, open_[kind]
 
 
+# What the agent's WORDS say about each task's size. Its own: a number with a unit per task ("1 CPU per row", "0.5 GB
+# each"), or how many at once ("4 rows at a time"). A question: how many / how much / what … cores, memory, at once.
+_PER = r"(?:per\s+(?:row|task|run|job|check|sample|input|word|dataset|analysis|item)s?|each)"
+_UNIT = r"(?:v?cpus?|cores?|threads?|gb|gib|mb|mib|g)\b"
+_OWN_SIZE = re.compile(
+    rf"\d+(?:\.\d+)?\s*-?\s*{_UNIT}[^.\n?]{{0,40}}?\b{_PER}\b"
+    rf"|\b{_PER}\b[^.\n?]{{0,40}}?\d+(?:\.\d+)?\s*-?\s*{_UNIT}"
+    r"|\b\d+\s+(?:\w+\s+){0,2}?(?:at (?:a|one) time|at once|in parallel|concurrently|simultaneously)\b", re.I)
+_ASKS_SIZE = re.compile(r"\b(?:how many|how much|what)\b[^.?\n]{0,60}?\b(?:v?cpus?|cores?|memory|ram|gb|threads?|"
+                        r"sizes?|resources|at (?:a|one) time|at once|in parallel|concurrent\w*)", re.I)
+
+
+def own_sizes_said(text: str) -> bool:
+    """The words put a size of the agent's own: a number with a unit per task, or how many at once."""
+    return bool(_OWN_SIZE.search(text or ""))
+
+
+def own_sizes_snippet(text: str) -> str:
+    """Where the words put a size of the agent's own, with a little around it ("" when they do not)."""
+    m = _OWN_SIZE.search(text or "")
+    return text[max(0, m.start() - 30): m.end() + 30] if m else ""
+
+
+def asks_sizes(text: str) -> bool:
+    """The words ASK about each task's size (a question on cores, memory or how many at once)."""
+    return "?" in (text or "") and bool(_ASKS_SIZE.search(text or ""))
+
+
+# Why a version cannot be built, in the agent's words: no such version, does not exist, unsatisfiable, …
+UNBUILDABLE_WORDS = re.compile(
+    r"no (?:matching |such )?(?:version|release|distribution)|(?:does|do|did)\s*n[o']?t exist|doesn'?t exist|not exist"
+    r"|not (?:be )?found|unsatisfiable|no solution|not available|isn'?t available|unavailable|not on pypi|"
+    r"not published|never (?:been )?released|(?:could ?n[o']?t|cannot|can'?t) (?:find|resolve)|invalid version", re.I)
+
+
+def says_unbuildable(text: str, version: str) -> bool:
+    """The words name `version` and why it cannot be built."""
+    return version in (text or "") and bool(UNBUILDABLE_WORDS.search(text or ""))
+
+
+def _put_own_sizes(t: Trace, phase: int) -> bool:
+    """In `phase` the agent put sizes of its own to the user: in its last words, or a run_batch it sized itself whose
+    spend question the turn ended on."""
+    sized = any(is_new_batch(c) and size_args(c) and answer_state(c) == "needs_confirmation"
+                for _i, c in calls_in(t, phase))
+    return sized or own_sizes_said(final_text(t, phase))
+
+
 def decide(t: Trace, sim: UserSim) -> tuple[str, str] | None:
     """The user's answer to the agent's last turn: (kind, words), or None — nothing to say, the chain ends. A turn that
     stopped the endpoint wrapped up (every request here ends with a stop); one that ended otherwise, on a question in
-    prose or a pause, gets the go-ahead — once a run, so a stuck agent is not carried along."""
+    prose or a pause, gets the go-ahead — at most GO_AHEADS times a run, so a stuck agent is not carried along. With
+    `sizes_in_words`, a turn whose words ask about each task's size, or put sizes of the agent's own, gets the user's
+    sizes (once) — before a spend question's yes, which would let the agent's own sizes through."""
     last = latest_phase(t)
     if last < FIRST_AGENT_PHASE:
         return None
     p = pending(t)
-    if (p is not None and p[0] == "spend" and sim.pilot_reply and is_pilot(t.calls[p[1]])
-            and not any(k == "sizes" for _q, k, _w in answers_given(t, sim))):
+    given = answers_given(t, sim)
+    sized = any(k == "sizes" for _q, k, _w in given)
+    if (p is not None and p[0] == "spend" and sim.pilot_reply and is_pilot(t.calls[p[1]]) and not sized):
         return "sizes", sim.pilot_reply
+    measured = any(c.name in ("run_batch", "status") and answer_state(c) == "needs_sizing"
+                   and (c.result or {}).get("proposal") for c in t.calls)   # then the talk is of hpc-bridge's proposal
+    if (sim.sizes_in_words and sim.sizes and not sized and not measured and (p is None or p[0] == "spend")
+            and not any(c.name in _ENDS for _i, c in calls_in(t, last))):
+        if _put_own_sizes(t, last):
+            return "sizes", sim.sizes_over_own or sim.sizes
+        if asks_sizes(final_text(t, last)):
+            return "sizes", sim.sizes
     if p is not None and sim.say(p[0]):
         return p[0], str(sim.say(p[0]))
     if any(c.name in _ENDS for _i, c in calls_in(t, last)):
         return None
-    if not any(k == "go_ahead" for _q, k, _w in answers_given(t, sim)):
+    if (sim.unbuildable and sim.env_failed and says_unbuildable(final_text(t, last), sim.unbuildable)
+            and not any(k == "env_failed" for _q, k, _w in given)):
+        return "env_failed", sim.env_failed
+    if sum(1 for _q, k, _w in given if k == "go_ahead") < GO_AHEADS:
         return "go_ahead", sim.go_ahead
     return None
 

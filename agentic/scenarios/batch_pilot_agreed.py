@@ -8,7 +8,8 @@ THE USER: 4 simulation runs, `bash ~/hpcb-agent-work/simulate.sh <sample>` (SETU
 ~200 MB, then the sample's digest); "measure one run first, tell me the size you'd propose, run the rest at it once I
 agree"; one compute block on the default partition is approved. The scripted user agrees to a proposal (the block
 still approved: a follow-up turn is a new server, whose batch asks for the yes again), says yes to a spend question,
-answers a size question with "that's why I asked you to measure one", and gives the go-ahead once.
+answers a size question — hpc-bridge's, or the agent's own words asking about or proposing each run's size before any
+measurement (`sizes_in_words`) — with "that's why I asked you to measure one", and gives a go-ahead at most twice.
 
 GRADED (critical): `agent_turn_engaged`; a run_batch with pilot ≥ 1 recorded its batch (`pilot_used`); the proposal's
 memory and cores were named to the user in the turn it came, nothing was resized there, and the user's next answer
@@ -52,8 +53,9 @@ TASK = (ac.CONNECTED + "\n\n"
         "block for this on the default partition — that block is approved. When everything is done, tell me each "
         "sample's output, then stop the endpoint.")
 SIM = ac.UserSim(sizes="I don't know what one run needs — that's why I asked you to measure one first.",
-                 agree="That size is fine — run the rest of the samples at it. The compute block I approved is still "
-                       "approved.",
+                 sizes_in_words=True,
+                 agree="That size is fine — run the rest of the samples at the size measured from that run. The "
+                       "compute block I approved is still approved.",
                  yes="Yes — that's the block I approved; go ahead.")
 PHASES = ac.conversation(TASK, SIM)
 
