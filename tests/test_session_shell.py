@@ -91,8 +91,8 @@ def test_wrap_hardens_permissions_and_persists_state():
     assert "umask 077" in w  # .cwd/.env created 0600, dir 0700
     assert f"mkdir -p {sd}" in w
     assert f"{sd}/.cwd" in w and f"{sd}/.env" in w
-    assert f"pwd > {sd}/.cwd" in w
-    assert f"> {sd}/.env 2>/dev/null" in w  # env persisted
+    assert f"pwd >| {sd}/.cwd" in w
+    assert f">| {sd}/.env 2>/dev/null" in w  # env persisted (`>|`: a noclobber the command set never stops it)
 
 
 def test_wrap_first_call_defaults_into_session_dir():
@@ -108,13 +108,14 @@ def test_wrap_persists_only_command_changed_env_not_runtime_vars():
     # .env and replayed into a later, different allocation. The wrapper fingerprints the
     # ambient env first and persists only what differs (and never the volatile names).
     w = wrap("echo hi", Session("s", "/r"))
-    assert '__hb_snap > "$__hb_base"' in w  # ambient fingerprint captured...
-    assert w.index('__hb_snap > "$__hb_base"') < w.index(". /r/sessions/s/.env")  # ...before sourcing
+    assert "__hb_snap __hb_B_ __hb_BN" in w  # ambient snapshot captured (in the shell: review U10)...
+    assert w.index("__hb_snap __hb_B_ __hb_BN") < w.index(". /r/sessions/s/.env")  # ...before sourcing
     assert "compgen -A export" in w  # per-var enumeration (record-safe, not a line diff)
-    assert 'grep -qxF "$__hb_n=$__hb_v" "$__hb_base"' in w  # skip vars unchanged vs ambient
+    assert '[[ "${!__hb_n}" == "${!__hb_x}" ]] && continue' in w  # skip vars unchanged vs ambient
     assert "SLURM*|HOSTNAME" in w  # drop scheduler runtime vars by name
     assert r"printf 'export %s=%q\n'" in w  # single-line, re-sourceable (multi-line safe)
-    assert 'rm -f "$__hb_base"' in w  # baseline snapshot cleaned up
+    code = "\n".join(ln for ln in w.splitlines() if not ln.lstrip().startswith("#"))
+    assert ".env.base" not in code and "grep" not in code  # no snapshot file, no process per variable
 
 
 @bash_only
@@ -186,7 +187,7 @@ def test_behaviour_home_root_with_quoted_remainder_keeps_env_fingerprint_intact(
     # form fixes it: only the command's own export lands in .env, and nothing hits stderr.
     sess = Session("default", "$HOME/sub dir/.hpc-bridge")
     script = wrap("export HB_ONLY=1; echo HB_OK", sess)
-    assert '__hb_base="$HOME"' in script and '__hb_base=""' not in script
+    assert "__hb_base" not in script   # (the snapshot is in the shell now: no path for the quoting to break)
     r = subprocess.run(["bash", "-c", script], capture_output=True, text=True,
                        env={**os.environ, "HOME": str(tmp_path)})
     assert r.returncode == 0 and "HB_OK" in r.stdout

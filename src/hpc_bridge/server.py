@@ -23,6 +23,7 @@ from . import (
     config,
     connect,
     dispatch,
+    envs,
     handoff,
     login_gate,
     notices,
@@ -102,6 +103,7 @@ from .models import (
     ConnectFacilityResult,
     EndpointStatus,
     EnvelopeRequest,
+    EnvRequest,
     FacilityDetails,
     JobStatus,
     LoginShellResult,
@@ -320,6 +322,17 @@ mcp = FastMCP("endpoint", lifespan=lifespan, instructions=_server_instructions()
 _JOURNAL_REDACT = {"complete_preauth": ("code",), "complete_login": ("code",)}
 
 
+def _journal_args(name: str, arguments: dict | None) -> dict:
+    """A call's arguments as the journal keeps them: one-time codes redacted, and an `env`'s text — its requirements,
+    its activate line — with every URL's credentials redacted (block environments, review R2-S8)."""
+    safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+    env = safe.get("env")
+    if isinstance(env, dict):
+        safe["env"] = {k: (envs.redact(v) if k in ("requirements", "activate") and isinstance(v, str) else v)
+                       for k, v in env.items()}
+    return safe
+
+
 def _journal_result(res: Any) -> Any:
     if isinstance(res, tuple) and len(res) == 2 and isinstance(res[1], dict):
         res = res[1]  # (content, structured): the structured payload is the tool's own model
@@ -349,7 +362,7 @@ def _install_journal(server: FastMCP) -> None:
         path = os.environ.get("HPC_BRIDGE_JOURNAL", "").strip()
         if not path:
             return await inner(name, arguments, *args, **kwargs)
-        safe = {k: ("<redacted>" if k in _JOURNAL_REDACT.get(name, ()) else v) for k, v in (arguments or {}).items()}
+        safe = _journal_args(name, arguments)
         t0 = time.monotonic()
         # `ts` / `seq` order calls by when they STARTED (the line is written when the call ends, and concurrent calls
         # finish out of order); `ts` also orders rows from several server processes sharing one journal
@@ -392,11 +405,60 @@ async def _ensure_endpoint_up(
     *,
     recheck: bool = True,
     workers: int | None = None,
+    env: Any = None,
 ) -> EndpointStatus:
     """ensure_endpoint_up, with the block as its check measured it from inside once it is up (`measured`, batch row
-    sizing)."""
+    sizing), and the session's env (`env`, block environments: hpc_bridge.envs). The env never changes the block's
+    terms — a built env on the login node is free and activated per command, an existing one is a line run per command
+    — so the block part answers as it would without it. Its order (review round 1): the env is CHECKED first (a refused
+    one changes nothing in this call: `_dropped_term_status`) — after the shape and the facility are (a shape this
+    facility does not serve, or no facility, is that answer, the env not looked at: S16). It is APPLIED after the block
+    part — never when the block part refused the call's arguments and set nothing (S15, R2-S1: its explicit
+    `_nothing_set`, whatever refused them — a size, a queue, a template, a partition change a running task holds, the
+    envelope's admission), and only once the endpoint exists (S8: a build is never sent to no endpoint; one asked for
+    before the endpoint stood up waits for the next call, which says so). A pending env whose build was lost is sent
+    again on this ask, env omitted included (R2-S3); the install warning is marked said only with this answer
+    (R2-S10)."""
+    since = time.monotonic()
+    spec: envs.EnvSpec | None = None
+    not_looked = ""
+    if env is not None:
+        if _no_facility_bound(app) or _shape_reject(app, shape):
+            not_looked = " The env was not looked at."   # the block part below says why (S16)
+        else:
+            try:
+                spec = envs.parse(env)
+                if spec is not None and spec.kind != "none":
+                    envs.delivery(spec, access=envs.access_of(app), client_python=envs.default_python())
+            except envs.EnvRefusal as exc:
+                async with app.lock:
+                    refused = _dropped_term_status(app, shape, f"{exc}. Nothing in this call was set or started.")
+                refused.env = envs.session_info(app)
+                if refused.block is not None:
+                    refused.block.env = refused.env
+                return refused
+    rt0 = app.shapes.get(shape)
+    before = (rt0, rt0.spend_confirmed, rt0.block_epoch) if rt0 is not None else None
     st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
                                whole_node, recheck=recheck, workers=workers)
+    chosen: envs.Chosen | None = None
+    if spec is not None:
+        if st._nothing_set:
+            not_looked = " The env was not looked at: nothing in this call was set."
+        elif app.state.endpoint_id is None:
+            not_looked = (" The env was not applied: no endpoint is up yet to build or check it on — ask for it again "
+                          "once ensure_endpoint_up answers up.")
+        else:
+            try:
+                chosen = await envs.choose(app, spec)
+            except envs.EnvRefusal as exc:   # a facility the call bound only now (a startup pin's first call)
+                not_looked = f" The env was not applied: {exc}."
+    if not st._nothing_set:
+        envs.resume_pending(app)   # a pending env whose build was lost: sent again, as its answer promised (R2-S3)
+    rt1 = app.shapes.get(shape)
+    if (confirm_spend and shape == DEFAULT_SHAPE and rt1 is not None and rt1.spend_confirmed
+            and (before is None or before != (rt1, True, rt1.block_epoch))):
+        await envs.recheck(app, since=since)   # a block newly confirmed: the session's built env checked again (quiet)
     if st.status == "up" and shape == DEFAULT_SHAPE and st.measured is None:
         rt = app.shapes.get(shape)
         c = rt.last_canary if rt is not None else None
@@ -405,6 +467,30 @@ async def _ensure_endpoint_up(
             if m.workers is None and c.worker_count:
                 m = dataclasses.replace(m, workers=c.worker_count)
             st.measured = batch.facts_of(m, workers_fixed=batch._fixed_workers(app))
+    # `env`: the env this answer is about — the one asked for when it did not become the session's (still being built,
+    # or failed: the session's own serves on, and the notice says which); else the session's (or a pending one's, while
+    # one is being built). `block.env`: the env the block's commands run in now — always the session's.
+    session = envs.session_info(app)
+    st.env = session
+    if chosen is not None and not chosen.taken:
+        st.env = chosen.info
+    elif chosen is None and app.env_pending is not None:
+        st.env = envs.pending_info(app)
+    words = " ".join(x for x in (chosen.notice if chosen is not None else "", envs.take_note(app)) if x)
+    if words:
+        st.notice = f"{words} {st.notice}".strip() if st.notice else words
+    if not_looked:
+        st.notice = f"{st.notice or ''}{not_looked}".strip()
+    if st.block is not None:
+        st.block.env = session
+    envs.mark_said(app, st.notice)
+    return st
+
+
+def _set_nothing(st: EndpointStatus) -> EndpointStatus:
+    """The block part's answer to a call whose arguments it refused, setting nothing: so marked (block environments,
+    review R2-S1 — the env asked with them is not applied either)."""
+    st._nothing_set = True
     return st
 
 
@@ -429,12 +515,12 @@ async def _ensure_up_once(
     (run_batch's derived block): the block runs exactly that many workers — on our own template (resources.WORKERS),
     on a facility endpoint only where its template renders max_workers_per_node (else its own count stands)."""
     if _no_facility_bound(app):  # nothing pinned or connected: never stand up a local endpoint in its place
-        return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
-                              notice=_no_facility_notice(app))
+        return _set_nothing(EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
+                                           notice=_no_facility_notice(app)))
     if reject := _shape_reject(app, shape):  # compute-only facility: never build a login runtime
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down", block_state="cold", endpoint_id=app.state.endpoint_id, notice=reject,
-        )
+        ))
     if partition == "" and shape != "login":
         # the terms' empty queue sent back: a facility whose details= set partition "" sends none (the scheduler routes
         # the block, as on NERSC); that is already the session's partition, so it is kept, never refused as invalid
@@ -442,25 +528,26 @@ async def _ensure_up_once(
         if uec.get("compute") and uec.get("partition") == "":
             partition = None
     if partition is not None and not _VALID_PARTITION.match(partition):
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down",
             block_state="cold",
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid partition {partition!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
-        )
+        ))
     if account is not None and not _VALID_ACCOUNT.match(account):
-        return EndpointStatus(
+        return _set_nothing(EndpointStatus(
             status="down",
             block_state="cold",
             endpoint_id=app.state.endpoint_id,
             notice=f"invalid account {account!r}: must match [A-Za-z0-9_.:-]{{1,64}}",
-        )
+        ))
     # the block's size (hpc_bridge.resources): cores, memory and GPUs per node, the node count, whole nodes or not
     sizing, bad_size = resources.requested(cores, memory_gb, gpus, nodes, whole_node)
     login_only = shape == "login"  # the login shape is free and has no size: a size named for it is said ignored
     if bad_size and not login_only:
         async with app.lock:
-            return _dropped_term_status(app, shape, f"{bad_size}. Nothing in this call was set or started.")
+            return _set_nothing(_dropped_term_status(app, shape,
+                                                     f"{bad_size}. Nothing in this call was set or started."))
     if login_only:
         sizing = {}
     elif workers is not None and not bad_size:
@@ -501,7 +588,7 @@ async def _ensure_up_once(
                 dropped = _size_refusal(app, after, sizing, named_now)
         if dropped:
             async with app.lock:
-                return _dropped_term_status(app, shape, dropped)
+                return _set_nothing(_dropped_term_status(app, shape, dropped))
     if confirm_spend and shape == DEFAULT_SHAPE:
         # batch phase 2a: while this session's envelope is open, a block it confirms is admitted against it (read off
         # the lock: the meter rides the login shape)
@@ -509,7 +596,7 @@ async def _ensure_up_once(
                                                 sizing=sizing if not login_only else None)
         if refused is not None:
             refused.session_spend = _total_session_spend(app)
-            return refused
+            return _set_nothing(refused)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -527,7 +614,7 @@ async def _ensure_up_once(
         reject = (_apply_partition(app, shape, rt, partition) or _apply_account(app, shape, rt, account)
                   or warmth._apply_resources(app, shape, rt, sizing))
         if reject:  # a live task blocks repointing the block (the swap would cancel it) — change nothing
-            return EndpointStatus(
+            return _set_nothing(EndpointStatus(
                 status="up",
                 block_state="warm",
                 endpoint_id=app.state.endpoint_id,
@@ -535,7 +622,7 @@ async def _ensure_up_once(
                 partition=rt.user_endpoint_config.get("partition"),
                 account=rt.user_endpoint_config.get("account"),
                 notice=reject,
-            )
+            ))
         active_partition = rt.user_endpoint_config.get("partition")
         active_account = rt.user_endpoint_config.get("account")
         # A switch confirmed in this same call: no needs_confirmation answer said what became of the old block, so the
@@ -844,6 +931,7 @@ async def ensure_endpoint_up(
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
+    env: EnvRequest | None = None,
 ) -> EndpointStatus:
     """Ensure the personal HPC endpoint is up; report whether its pilot block is warm.
 
@@ -877,10 +965,21 @@ async def ensure_endpoint_up(
     shows a partition shares nodes they say a whole node (parsl's default), and its cost. A size the partition cannot
     give (more than a node has, over a QOS per-job cap, a slice of a whole-node partition — on a facility's endpoint
     too) or that the facility's template does not take, and several nodes on a facility's endpoint, are refused before
-    anything is submitted, saying why. Ignored for shape="login"."""
+    anything is submitted, saying why. Ignored for shape="login".
+
+    `env` points the session's commands (both shapes), batch rows and jobs at a software environment, from now on:
+    {"activate": "<shell line>"} for an existing one (`module load pytorch/2.4; conda activate ml`: run before each
+    command, on any facility), or {"requirements": "<requirements.txt text>", "python": "3.12"?, "root": "<dir>"?}
+    for one hpc-bridge builds — on an endpoint it stood up over SSH, on the login node (free), then activated per
+    command. Neither changes the block: no new spend question. {} drops it. The answer's `env` says its state: a new
+    built env still "building" takes over once it is ready — commands run in the session's current env (or none)
+    meanwhile; a failed one leaves the session's env as it was. A built env is read-only: to add a package, change the
+    requirements (another env). A built env on a facility's multi-user endpoint is not supported yet (refused): use
+    "activate" there. The session's shell never keeps the env — only what a command itself changes (a PATH a command
+    edits keeps the env's bin until it is set again)."""
     return await _heartbeat(ctx, _ensure_endpoint_up(
         ctx.request_context.lifespan_context, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
-        whole_node,
+        whole_node, env=env,
     ), "ensure_endpoint_up")
 
 
@@ -2299,7 +2398,7 @@ async def _detect_submission(command: str, shape: str) -> Submission | None:
 async def _dispatch_counted(
     app: AppCtx, rt: ShapeRuntime, runner: GlobusRunner, shape: str, session_id: str, command: str,
     payload: Callable[[], str], *, agent_call: bool, reset: bool = False, submission: Submission | None = None,
-    guard: session_shell.Guard | None = None, result_key: str | None = None,
+    guard: session_shell.Guard | None = None, result_key: str | None = None, env: Any = None,
 ) -> ShellOutcome:
     """Submit `payload()` — a dispatch _ready_session counted in `rt.inflight` — wait the bounded sync-wait OFF the
     lock, and hand the count back on EVERY path. A failed submit is a dispatch failure like any other. A command still
@@ -2324,7 +2423,8 @@ async def _dispatch_counted(
     `guard`: the wrong-block guard `payload` carries (session_shell: the block job and this dispatch's nonce). A result
     the guard refused did NOT run: it becomes the reap of the confirmed block (warmth._wrong_block_outcome), here or —
     through the handle, which records the guard — whenever a poll resolves it, a client-cancelled call's command
-    included.
+    included. `env`: the session env's (nonce, activation) the payload carries (block environments), kept on the handle
+    the same way — a refusal polled later is still a command that never ran (review S9).
 
     (A cancel BEFORE the submit — still in _ready_session — propagates from there with nothing counted or sent; the
     submit is synchronous, so once anything was sent the future is in hand.)"""
@@ -2358,7 +2458,7 @@ async def _dispatch_counted(
                     if not tracked():
                         return _released_under_outcome(app, None, runner.walltime)
                     task_id = _register_task(app, shape, session_id, command, fut, runner.walltime, runtime=rt,
-                                             reset=reset, submission=sub, guard=guard)
+                                             reset=reset, submission=sub, guard=guard, env=env)
                     released = app.shapes.get(shape) is not rt
                     out = _with_submission_notice(
                         _running_outcome(app, task_id, runner.walltime, reset=reset,
@@ -2398,7 +2498,7 @@ async def _dispatch_counted(
             counted = None
             if agent_call and fut is not None and not fut.done() and tracked():  # still running and reachable
                 _register_task(app, shape, session_id, command, fut, runner.walltime, client_cancelled=True,
-                               runtime=rt, reset=reset, submission=sub, guard=guard)
+                               runtime=rt, reset=reset, submission=sub, guard=guard, env=env)
         raise
     finally:
         if counted is not None:  # an exception escaped before the count was handed back
@@ -2425,6 +2525,11 @@ async def _run_shell(
         return jobmode.gated_outcome(app, gate, sub)  # type: ignore[arg-type]
     if gate is not None:
         return await _run_held(app, command, session_id, shape, gate)
+    # block environments: the session's env, for the agent's own commands only (never hpc-bridge's internal session).
+    # One still being built on the login node runs nothing yet — answered before anything is counted or sent.
+    use = envs.for_command(app) if agent_call else envs.ForCommand()
+    if use.building or use.failed is not None:
+        return _env_outcome(app, shape, use)
     ready = await _ready_session(app, shape, session_id)
     if isinstance(ready, ShellOutcome):
         return ready
@@ -2432,13 +2537,36 @@ async def _run_shell(
     # an agent's command also leaves its rc and output tail in the session dir (poll_task by Globus task id outlives
     # the service's 30-minute window and a restart that lost the handle: batch phase 1)
     key = secrets.token_hex(8) if agent_call else None
+    nonce = secrets.token_hex(8)
+    env_sh = envs.activation_sh(use.act, nonce) if use.act is not None else None
     shared = batch.shared_worker_note(app, rt) if agent_call and shape == DEFAULT_SHAPE else None
     out = await _dispatch_counted(app, rt, runner, shape, session_id, command,
-                                  lambda: session_shell.wrap(command, session, guard=guard, result_key=key),
-                                  agent_call=agent_call, submission=sub, guard=guard, result_key=key)
+                                  lambda: session_shell.wrap(command, session, guard=guard, result_key=key,
+                                                             env_sh=env_sh),
+                                  agent_call=agent_call, submission=sub, guard=guard, result_key=key,
+                                  env=(nonce, use.act) if use.act is not None else None)
+    if use.act is not None and (ref := envs.refusal(out.exit_code, out.stderr_snippet, nonce)) is not None:
+        out.phase, out.notice = envs.refused(app, ref, use.act, out.stderr_snippet or "")
+    if agent_call and (note := envs.take_note(app)):   # a pending env built (or not) since the last answer: said once
+        out.notice = f"{out.notice} {note}" if out.notice else note
     if shared:
         out.notice = f"{out.notice} {shared}" if out.notice else shared
     return out
+
+
+def _env_outcome(app: AppCtx, shape: str, use: envs.ForCommand) -> ShellOutcome:
+    """run_shell's answer when the session's env cannot take a command now (nothing ran, nothing was counted): still
+    being rebuilt on the login node (`env_building`), or its rebuild failed (`failed`, in the words of what failed:
+    the installer, or the runner — review U9)."""
+    rt = app.shapes.get(shape)
+    warm = rt is not None and rt.warm_confirmed_at is not None
+    if use.building:
+        return ShellOutcome(phase="env_building", block_state="warm" if warm else "cold",
+                            session_spend=_total_session_spend(app), notice=envs.building_words(use.info))
+    key = use.info.key if use.info is not None else "?"
+    return ShellOutcome(phase="failed", block_state="warm" if warm else "cold", session_spend=_total_session_spend(app),
+                        notice=(f"Nothing ran: the session's env {key} is not there — {use.failed} Ask for it again "
+                                "with ensure_endpoint_up(env=…), choose another, or none with env={}."))
 
 
 async def _run_held(app: AppCtx, command: str, session_id: str, shape: str, envelope: dict) -> ShellOutcome:
@@ -2562,7 +2690,8 @@ async def run_shell(
     hpc-bridge's tracking, so it needs the user's spend confirmation first. Sessions (cwd/env)
     persist per session_id within a shape. A billed shape whose spend is not confirmed answers
     phase="needs_confirmation" (nothing runs), with `block`: the block's queue and account, each with
-    where it came from, and its size — name them to the user.
+    where it came from, and its size — name them to the user. Commands run in the session's env (ensure_endpoint_up's
+    `env`); phase="env_building": nothing ran, that env is being built (or rebuilt) on the login node.
 
     LONG WORK: run it as a normal (foreground) command — do NOT background/detach it. A command
     still running past the sync-wait comes back phase="running" with a task_id; poll it with
@@ -2648,6 +2777,7 @@ async def _run_batch(
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
     confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
+    env: Any = None,
 ) -> BatchStatus:
     if _no_facility_bound(app) and batch_id is None:
         return BatchStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
@@ -2661,11 +2791,13 @@ async def _run_batch(
                         "a billed job outside every envelope and the confirmed block. Use submit_job with array=… "
                         "(one job, every row a task, {index} in the command), or a run_batch template that does the "
                         "work itself on the block."))
-    return await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
-                                 task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
-                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
-                                 cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
-                                 pilot=pilot)
+    out = await batch.run_batch(app, ensure_up=_batch_ensure_up, command=command, rows=rows,
+                                task_walltime_s=task_walltime_s, results_dir=results_dir, session_id=session_id,
+                                shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
+                                cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
+                                pilot=pilot, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 async def _status(app: AppCtx, id: str | None = None, detail: str = "summary", offset: int = 0,  # noqa: A002
@@ -2689,7 +2821,7 @@ async def _submit_job(
     partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: dict | None = None,
-    confirm_spend: bool = False, exclude_jobs: list[str] | None = None,
+    confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: Any = None,
 ) -> JobStatus:
     if _no_facility_bound(app):
         return JobStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
@@ -2698,11 +2830,13 @@ async def _submit_job(
         if st.status not in ("up", "provisioning") or app.state.endpoint_id is None:
             return JobStatus(phase="refused", reason="login shape",
                              notice=f"The login shape is not up ({st.status}): {st.notice or ''}".strip())
-    return await jobmode.submit_job(
+    out = await jobmode.submit_job(
         app, command=command, session_id=session_id, account=account, partition=partition, nodes=nodes, cores=cores,
         memory_gb=memory_gb, gpus=gpus, whole_node=whole_node, walltime=walltime, array=array,
         depends_on=depends_on, adopt=adopt, envelope=envelope, confirm_spend=confirm_spend,
-        exclude_jobs=exclude_jobs)
+        exclude_jobs=exclude_jobs, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 @mcp.tool()
@@ -2711,6 +2845,7 @@ async def run_batch(
     results_dir: str | None = None, session_id: str = "default", shape: str = DEFAULT_SHAPE, idempotent: bool = False,
     confirm_spend: bool = False, batch_id: str | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, concurrency: int | None = None, pin: bool | None = None, pilot: int = 0,
+    env: EnvRequest | None = None,
 ) -> BatchStatus:
     """Run ONE command once per row, many rows, on the session's confirmed compute block — instead of a run_shell
     per row. hpc-bridge keeps the backlog and sends rows as the block's slots free; a durable ledger records every row,
@@ -2749,11 +2884,14 @@ async def run_batch(
     (nothing recorded); confirm_spend=True confirms ONE block, as there. When the block ends (its walltime, a reap, a
     stop, a server restart) the batch pauses at needs_confirmation with a `reason`; resume it only after the user's yes
     with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again.
+    `env` (as ensure_endpoint_up's; omitted: the session's env) is the batch's own: every row runs in it, the session's
+    stays the session's, and no new block is asked for; a row whose env is gone from its node runs nothing and waits
+    for its rebuild. A batch's env is fixed at its start: env= with batch_id= is refused.
     Follow it with status(id, wait_s=60); stop it with cancel(id)."""
     try:
         return await _heartbeat(ctx, _run_batch(
             ctx.request_context.lifespan_context, command, rows, task_walltime_s, results_dir, session_id, shape,
-            idempotent, confirm_spend, batch_id, cores, memory_gb, gpus, concurrency, pin, pilot), "run_batch")
+            idempotent, confirm_spend, batch_id, cores, memory_gb, gpus, concurrency, pin, pilot, env), "run_batch")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
         return BatchStatus(phase="refused", reason=f"{type(exc).__name__}: {exc}",
                            notice=f"run_batch failed: {type(exc).__name__}: {exc}")
@@ -2765,7 +2903,7 @@ async def submit_job(
     partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: EnvelopeRequest | None = None,
-    confirm_spend: bool = False, exclude_jobs: list[str] | None = None,
+    confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: EnvRequest | None = None,
 ) -> JobStatus:
     """Run `command` as a SCHEDULER JOB that outlives any endpoint (long walltime, arrays, dependencies) — SSH
     facilities only. The job carries the session's cwd and env (`session_id`); hpc-bridge writes it a frozen job.sh
@@ -2785,12 +2923,13 @@ async def submit_job(
     scheduler command of its own): nothing was submitted or refused — make the same call again shortly, no new yes.
     `exclude_jobs`: scheduler ids of jobs the meter counts that the user
     says are not theirs to count (with confirm_spend=True). Follow a job with status("job-…"), the envelope with
-    status("env-…"); end them with cancel(id, "abort")."""
+    status("env-…"); end them with cancel(id, "abort"). `env` (as ensure_endpoint_up's; omitted: the session's env):
+    the env the job's script activates before its command (frozen in it)."""
     try:
         return await _heartbeat(ctx, _submit_job(
             ctx.request_context.lifespan_context, command, session_id, account, partition, nodes, cores, memory_gb,
             gpus, whole_node, walltime, array, depends_on, adopt,
-            envelope.model_dump() if envelope is not None else None, confirm_spend, exclude_jobs), "submit_job")
+            envelope.model_dump() if envelope is not None else None, confirm_spend, exclude_jobs, env), "submit_job")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
         return JobStatus(phase="refused", reason=f"{type(exc).__name__}: {exc}"[:200],
                          notice=f"submit_job failed: {type(exc).__name__}: {exc}"[:400])
@@ -2836,13 +2975,15 @@ async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResul
 # ---- batch phase 2b: export_handoff, the endpoint handoff (hpc_bridge.handoff; design §8) ----------------------------
 
 async def _export_handoff(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = handoff.DEFAULT_EXPIRES_H,
-                          confirm_spend: bool = False) -> handoff.HandoffResult:
-    return await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend)
+                          confirm_spend: bool = False, env: Any = None) -> handoff.HandoffResult:
+    out = await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend, env=env)
+    envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
+    return out
 
 
 @mcp.tool()
 async def export_handoff(ctx: Context, user_endpoint_config: dict[str, Any], expires_hours: float = 24.0,
-                         confirm_spend: bool = False) -> handoff.HandoffResult:
+                         confirm_spend: bool = False, env: EnvRequest | None = None) -> handoff.HandoffResult:
     """Hand a Globus Compute endpoint to an orchestrator (the consumer) that runs its own work on it: validate the
     consumer's EXACT user endpoint config with one billed canary, then export a data-only record (`hpc-bridge.handoff`
     v1) the consumer reads.
@@ -2868,10 +3009,15 @@ async def export_handoff(ctx: Context, user_endpoint_config: dict[str, Any], exp
     cancelled block, and nothing can stop a facility's user endpoint): send min_blocks 0. The record's `release` says
     how the pool really ends: stop submitting, then its blocks idle-release; a block can be cancelled sooner. The record
     names no consumer: the consumer maps its endpoint id, config, nodes and facility to its own settings, quoting each
-    value itself in any shell file it writes."""
+    value itself in any shell file it writes.
+
+    `env` (as ensure_endpoint_up's; omitted: none): an env the consumer runs its commands in. The record carries it
+    (`env`: a built one's path and bin, or an existing one's line) for the consumer to activate itself; the config is
+    unchanged, and the canary checks the env from inside the block (`validation.env_ok`; false makes validation.ok
+    false). phase="env_building": the env is still being built on the login node — nothing sent; call again."""
     try:
         return await _heartbeat(ctx, _export_handoff(ctx.request_context.lifespan_context, user_endpoint_config,
-                                                     expires_hours, confirm_spend), "export_handoff")
+                                                     expires_hours, confirm_spend, env), "export_handoff")
     except Exception as exc:  # noqa: BLE001 - never crash the tool; return a structured refusal
         return handoff.HandoffResult(phase="refused", reason=f"{type(exc).__name__}"[:80],
                                      notice=f"export_handoff failed: {type(exc).__name__}: {exc}"[:400])

@@ -13,25 +13,62 @@ facility requires an allocation), and stop is honest (`down` confirmed / `draini
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
 Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1056 passed** (the CI list: 1032). The live tier has
-**111 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
+**113 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_network host_forward bastion vip`,
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
 
-## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — built, live cells next
+## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — PR #246; all 11 live cells pass
 
 - `run_batch` sizes rows the sbatch way (`cores`, `memory_gb`, `gpus`, `concurrency`; `pin`, `pilot`): with no block the
   block is derived from them before the spend question; with no size it answers `needs_sizing` with the block's facts;
   each row is pinned to its own CPUs/GPUs, its thread counts set, killed past its memory (rc 87). Our SSH template's
   workers now follow the block (they were a fixed 2: every SSH batch ran one row at a time). Design and rulings: vault
   `Planned/Batch and swarm execution.md`, "Batch row sizing"; modules `sizing`, `batch`, `ledger`.
-- Live cells to run (scripted, kept out of the sweep until proven): `batch_rows_overlap`, `batch_cores_fit`,
+- Live cells (scripted, passing on the fake cluster, kept out of the sweep for now): `batch_rows_overlap`, `batch_cores_fit`,
   `batch_shared_pool`, `batch_memory_kill`, `batch_needs_sizing_then_sized`, `batch_pilot_proposal` (fake `default`),
   `batch_size_first_terms` (`slices`), `batch_gpu_rows` (`site`; first check that slurmd exports CUDA_VISIBLE_DEVICES for
   the fake GPUs). The changed graders: `batch_fanout_collect`, `batch_two_servers_one_ledger` (window = 4 CPUs and the
   slots announced), `batch_crosses_walltime` (27 rows).
 - Follow-up PR: the per-node watcher and one stream helper per row (lifts the 32-rows-per-node cap); a row's own `srun`
   binding is a documented limitation pending a live check.
+
+## Block environments (2026-11-05, branch `feat/block-envs`, PR 3 on PR 2) — two review rounds; both live cells pass
+
+- `env` on ensure_endpoint_up, run_batch, submit_job and export_handoff: an existing env (`{"activate": "<line>"}`,
+  everywhere, MEPs included, no new block) or, on an endpoint hpc-bridge stood up over SSH, one built from a
+  requirements list (`{"requirements": "<text>", "python"?, "root"?}`): a separate user env built on the free login
+  node and activated per command, row and job script — switching env needs no new block. `requirements` on a
+  facility endpoint is refused by name. Design and rulings: vault `Planned/Block environments.md`; module `envs`.
+- Live cells to run (scripted, kept out of the sweep until proven): `env_ssh_build_cache`, `env_ssh_switch` (fake
+  `default`). The login node must reach PyPI, as the endpoint venv's build already does. The cells ask for no `python`,
+  so the env is built with the client's major.minor: where the login node lacks it, uv fetches a managed CPython
+  (GitHub). uv itself comes from `~/.local/bin` (the endpoint venv's) or astral.sh.
+  - On `c7fda3d`, `env_ssh_build_cache` passed. `env_ssh_switch` failed on a grader bug (L1), fixed in review round 1:
+    the grader judges against the built env, never "no venv" — every live command runs inside hpc-bridge's endpoint venv.
+- **Review round 1** (on `c7fda3d`): 29 reproduced defects (S1–S17, N1–N12), L1 and U1–U10, all fixed, with tests in
+  `tests/test_block_envs_r1.py`. Behaviour that changed for the cells:
+  - a new built env is PENDING until it is ready (the session's env serves meanwhile);
+  - a built env is read-only;
+  - the env root must be the user's alone.
+  The session wrapper is ~60× faster: its snapshots are in the shell now. The vault note's "Review round 1" section has
+  the list.
+- **Review round 2** (on `8e63a6d`): both live cells passed. 20 more reproduced defects (R2-S1..S11, R2-N1..N9) and
+  15 ruled suspicions (SS2..SS7, NS2..NS9), all fixed, with tests in `tests/test_block_envs_r2.py`. Every node test
+  passes under bash 3.2 (macOS) and 5.2 (the nodes' bash 4.2–5.x; CI Ubuntu), the latter run read-only in the
+  coordinator's `hpc-bridge-agentic-pr3` image. bash 4+ ignores errexit inside an `if` or on the left of `&&`, so:
+  - an activate line runs outside any condition;
+  - the login node's check and the handoff canary run the very activation every command runs.
+  Also changed:
+  - uv runs from a private `mktemp -d`, and every `UV_*`/`PIP_*` name and applying config file is named;
+  - `requirements.in` is 0400;
+  - a job's env refusal is read from its own mark;
+  - a missing env is looked at again after 2 s.
+  The vault note's "Review round 2" section has the list.
+- **PR 4** (branch `feat/block-envs-mep`, stage A only: `tests/test_block_envs_mep.py`, the cells
+  `env_mep_requirements` / `env_mep_fallback`, a second fake `pbs_mep` manager): a facility endpoint's builds — the
+  pass-through, the pin fix (R13), the worker_init fallback — after a live Delta / Anvil / Polaris check the user
+  approves.
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
@@ -269,7 +306,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`, `server-stderr.log` — the MCP server's own stderr) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
-**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 111 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
+**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 113 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
 **Prerequisites** (one-time, in `agentic/.env` — gitignored): `CLAUDE_CODE_OAUTH_TOKEN` (subscription, from `claude setup-token` — **not** an API key), `HPCB_TEST_GLOBUS_DB` (a Globus `storage.db` whose identity the target facility maps — for the MEP that means `gusellerm@uchicago.edu`; check with `python agentic/whoami_globus.py`), and the scoped SSH test user/key (`HPCB_TEST_SSH_*`, default user `hpcbridge-test`; the pool `hpcbridge-test-00..09` for `run_suite`). `HPCB_TEST_GLOBUS_DB_NOACCOUNT` (a second, unmapped identity's db) feeds `mep_no_account`. The fake cluster's `mep` and `pbs_mep` profiles also need `HPCB_MEP_EMAIL` (a real contact address for the managers they register with Globus). Full setup + the pre-merge regression set are in `agentic/README.md`; the design rationale is `docs/hpc-bridge-vault/Planned/Agentic testing - Plan B (runtime sandbox).md`. **`agentic/fakecluster/`** is a compose Slurm cluster wired into both runners (`--target fake`), with PROFILES (`default`; `site` = 3 nodes / debug,compute,gpu / enforced accounting / fake mybalance / 2 login nodes; `mep` = site + two root-run facility MEPs in login01, strict and open schema — the zero-SSH path, with a per-cluster local catalog via the plugin's `HPC_BRIDGE_CATALOG_FILE` seam; `pbs_mep` = the OpenPBS `polaris` cluster + one facility MEP whose template is shaped like ALCF Polaris's), a cluster-admin channel (`ADMIN_SETUP`/`ADMIN_CLEANUP`), mid-run hooks (`MIDRUN_HOOKS`: a `cmd` after a tool result — on every operator but the ACP ones, the free CLI operators via the server's journal — or, Claude SDK only, an Esc DURING a call; `agentic/README.md` → "Mid-run hooks") and declarative scenario coupling (`TARGETS`/`REQUIRES`). See `agentic/fakecluster/README.md`.
 

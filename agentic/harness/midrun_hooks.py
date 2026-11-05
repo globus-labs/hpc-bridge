@@ -245,7 +245,8 @@ ACTIONS = ("cmd", "interrupt", "interject")
 # What each hpc-bridge tool's answer carries (server.py's return types; test_midrun_hooks pins both to the product's
 # models): a `phase` with these values (ShellOutcome, ConnectResult, LoginStatus, PreauthStatus) — or, for the
 # EndpointStatus tools, a `status` and an `endpoint_id` and no phase.
-_SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running")
+_SHELL_PHASES = ("complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running",
+                 "env_building")                                                           # block environments
 _LOGIN_PHASES = ("logged_in", "needs_login", "failed")
 _BATCH_PHASES = ("admitting", "waiting", "needs_confirmation", "needs_account", "done", "cancelled", "refused",
                  "queued", "running", "failed", "open", "exhausted", "draining", "closed",   # + job- / env- ids (2a)

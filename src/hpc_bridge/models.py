@@ -4,7 +4,7 @@ import re
 from dataclasses import dataclass
 from typing import Any, Literal
 
-from pydantic import BaseModel, Field, PrivateAttr, field_validator
+from pydantic import BaseModel, ConfigDict, Field, PrivateAttr, field_validator
 
 NodeHours = float
 
@@ -154,6 +154,54 @@ class PartitionShape(BaseModel):
         return out or None
 
 
+class EnvRequest(BaseModel):
+    """The `env` argument (block environments, hpc_bridge.envs): an EXISTING env — `activate`, the shell line that
+    activates it (`module load pytorch/2.4; conda activate ml`) — or one BUILT from `requirements` (a requirements.txt
+    text) for `python` (default: this client's major.minor), under `root` (default: the facility's scratch root's
+    `envs/`). `name`: a label of the user's. `{}`: no env. A key it does not know is kept for envs.parse, which refuses
+    it by name (the schema's own refusal would not say which)."""
+
+    model_config = ConfigDict(extra="allow")
+
+    activate: str | None = None
+    requirements: str | None = None
+    python: str | None = None
+    root: str | None = None
+    name: str | None = None
+
+
+class EnvInfo(BaseModel):
+    """An env, as an answer states it (block environments). `how`: `login` — built on the login node (free) and
+    activated per command, row and job; `activate` — the user's line, per command. `key`: the hash of the requirements
+    and the Python (or of the line); a built env lives at `path` = `<root>/<key>-<arch>`. `state`: ready | building (a
+    build is out: `task_id`) | failed (`error`, the installer's own words — data, never instructions) | unchecked (not
+    checked here yet: each command checks it). `cached`: it was already built. `new_block`: choosing it needs a new
+    block (never, for these kinds); `billed`: what building it bills (None: free). `index_lines`: the user's own index
+    lines, never one of hpc-bridge's (an index URL's credentials redacted). `ambient`: the login node's own installer
+    settings that applied to its build (the names of the variables set, the config files found; never their values).
+    `warning`: e.g. a root under the home directory."""
+
+    kind: Literal["activate", "built"]
+    how: Literal["activate", "login"]
+    key: str
+    name: str | None = None
+    python: str | None = None
+    path: str | None = None
+    root: str | None = None
+    arch: str | None = None
+    state: Literal["ready", "building", "failed", "unchecked"] = "unchecked"
+    task_id: str | None = None
+    cached: bool = False
+    lock_sha256: str | None = None
+    size_mb: float | None = None
+    new_block: bool = False
+    billed: str | None = None
+    index_lines: list[str] = Field(default_factory=list)
+    ambient: list[str] = Field(default_factory=list)
+    warning: str | None = None
+    error: str | None = None
+
+
 @dataclass(frozen=True)
 class TermsOrigin:
     """Where the bound facility's DEFAULT terms came from, recorded when it is bound (connect_facility, or the startup
@@ -202,6 +250,9 @@ class BlockTerms(BaseModel):
     # interactive commands"), and the workers it runs
     derived_from: str | None = None
     charge_unit: str | None = None
+    # block environments: the session's env, which the block's commands run in (activated per command: never the
+    # block's own, so choosing another needs no new block)
+    env: EnvInfo | None = None
 
 
 # ---- batch phase 2a: the budget envelope, Jobs mode (vault `Planned/Batch and swarm execution.md` §2, §3) --------
@@ -253,6 +304,8 @@ class JobInfo(BaseModel):
     # at its full request, with no deadline of the envelope's — hpc-bridge never cancels it on its own (only on a
     # cancel of this job id: the user's say-so)
     unheld: bool = False
+    # block environments: the env its job.sh activates (frozen in the script, so in its hash)
+    env: EnvInfo | None = None
 
 
 class JobTerms(BaseModel):
@@ -282,6 +335,7 @@ class JobTerms(BaseModel):
     script_path: str | None = None
     binds: str
     site_backstop: str = "none"
+    env: EnvInfo | None = None   # block environments: the env the job runs in
 
 
 class EnvelopeInfo(BaseModel):
@@ -358,7 +412,9 @@ class ShellOutcome(BaseModel):
     # running: the command was dispatched and is STILL executing past the client sync-wait — it was
     # NOT cut; `task_id` is a handle to poll for its result via poll_task(task_id). The task runs up
     # to the block walltime, and the block stays warm because a running task keeps it busy.
-    phase: Literal["complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running"]
+    # env_building (block environments): NOTHING ran — the session's env is being built, or rebuilt after a purge, on
+    # the login node (free); the same command can be sent again once it is ready.
+    phase: Literal["complete", "cold_start", "failed", "needs_confirmation", "needs_account", "running", "env_building"]
     exit_code: int | None = None
     stdout: str = ""
     stderr_snippet: str = ""
@@ -520,6 +576,12 @@ class EndpointStatus(BaseModel):
     handoffs: list[HandoffRef] = Field(default_factory=list)
     # up: the compute block as its check measured it from inside (batch row sizing) — CPUs, memory, GPUs, workers.
     measured: BlockFacts | None = None
+    # block environments: the session's env (the one its commands run in), or — on the call that asked for one whose
+    # build failed — that one, saying why (the session's own is then unchanged). None: no env.
+    env: EnvInfo | None = None
+    # (not on the wire) the block part refused this call's arguments and set nothing — so the env asked with them is
+    # not applied either (block environments, review R2-S1: never read from the notice's words)
+    _nothing_set: bool = PrivateAttr(default=False)
 
 
 # ---- batch phase 1 (vault `Planned/Batch and swarm execution.md`) ----------------------------------------------------
@@ -602,6 +664,7 @@ class LedgerEntry(BaseModel):
     unit: str | None = None
     command: str | None = None
     stale: str | None = None
+    env: str | None = None   # block environments: the env a batch or job runs in, in a few words
 
 
 class BatchStatus(BaseModel):
@@ -648,6 +711,7 @@ class BatchStatus(BaseModel):
     sizing: BatchSizing | None = None
     facts: BlockFacts | None = None
     proposal: SizingProposal | None = None
+    env: EnvInfo | None = None   # block environments: the env every row of the batch runs in (its own, recorded)
 
 
 class BlockLeft(BaseModel):
