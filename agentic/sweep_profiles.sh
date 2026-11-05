@@ -101,6 +101,14 @@ batch_size_first_terms        batch row sizing (built, not yet run live): joins 
 batch_gpu_rows                batch row sizing (built, not yet run live): joins batch_cells (site) after its live proof
 env_ssh_build_cache           block envs (built, not yet run live): joins batch_cells (default) after its live proof
 env_ssh_switch                block envs (built, not yet run live): joins batch_cells (default) after its live proof
+batch_sized_by_user           agent cell, sizing (built, not yet run live): joins cells() default after its live proof
+batch_asks_user_for_size      agent cell, sizing (built, not yet run live): joins cells() default after its live proof
+batch_pilot_agreed            agent cell, sizing (built, not yet run live): joins cells() default after its live proof
+batch_memory_kill_resized     agent cell, sizing (built, not yet run live): joins cells() default after its live proof
+env_built_for_user            agent cell, envs (built, not yet run live): joins cells() default after its live proof
+env_module_switch             agent cell, envs (built, not yet run live): joins cells() lmod after its live proof
+env_unbuildable_asks          agent cell, envs (built, not yet run live): joins cells() default after its live proof
+batch_rows_in_user_env        agent cell, envs (built, not yet run live): joins cells() default after its live proof
 stale_login_pin               scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 kept_entry_after_failure      scripted only: a script_cell on `site` (the Perlmutter report, 2026-10-29)
 cached_password_otp           scripted only: a script_cell on `nersc` (after its agent wave)

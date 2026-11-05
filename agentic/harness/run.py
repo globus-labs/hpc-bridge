@@ -94,23 +94,29 @@ def _endpoint_name(facility: str) -> str:
     return f"hpc-bridge-{key}"
 
 
-def _combine(results: list[RunResult], labels: list[str] | None = None) -> RunResult:
+def _combine(results: list[RunResult], labels: list[str] | None = None,
+             prompts: list[str | None] | None = None) -> RunResult:
     """Merge a chain's per-phase RunResults into one for grading: concatenated calls / messages /
     dialogue, and a `final` that surfaces the FIRST errored phase — so an early-phase failure
     can't hide behind a healthy last phase's result. Each call is stamped with its 0-based
     phase index (`ToolCall.phase`) so chain graders can key on "phase 2's first connect" rather
     than infer the boundary from call order (`trace_adapter.trace_from_bundle` recovers the same
-    stamp offline from the per-session `init` messages).
+    stamp offline from the per-session `init` messages). Each of the agent's texts is stamped too
+    (`Trace.text_phase`): a text said before a phase's first call has the same place among the
+    calls as the last words of the phase before it, and only the stamp tells them apart.
 
     `labels` (a chain whose phases have different operators — `_phase_spec`): each phase's messages open with a marker
     row, `{"chain_phase": k, "operator": <label>}`, since each phase's record is its own operator's layout (a script's
     or a CLI's steps-and-journal rows, the Claude SDK's stream) and no one sniff reads them all; regrade.bundle_trace
-    splits the bundle on the markers and rebuilds each phase with its own reader."""
-    calls, text_at = [], []
+    splits the bundle on the markers and rebuilds each phase with its own reader. `prompts`: the prompt a phase was
+    given when it was COMPOSED from the conversation so far (a callable phase prompt — the agent cells' follow-up
+    turns, agent_cells.py), kept in its marker as `prompt` so the bundle shows what the agent was told."""
+    calls, text_at, text_phase = [], [], []
     for k, r in enumerate(results):
         at = getattr(r.trace, "text_at", None) or []
         if len(at) == len(r.trace.texts):   # positions, shifted past the earlier phases' calls
             text_at += [len(calls) + n for n in at]
+        text_phase += [k] * len(getattr(r.trace, "texts", []))
         for c in r.trace.calls:
             c.phase = k
             calls.append(c)
@@ -118,8 +124,10 @@ def _combine(results: list[RunResult], labels: list[str] | None = None) -> RunRe
     if len(text_at) != len(texts):
         text_at = []   # a phase without positions: unknown for the whole chain
     if labels is not None and len(labels) == len(results):
-        messages = [m for k, r in enumerate(results)
-                    for m in [{"chain_phase": k, "operator": labels[k]}, *r.messages]]
+        def marker(k: int) -> dict:
+            said = (prompts or [])[k] if k < len(prompts or []) else None
+            return {"chain_phase": k, "operator": labels[k], **({"prompt": said} if said else {})}
+        messages = [m for k, r in enumerate(results) for m in [marker(k), *r.messages]]
     else:
         messages = [m for r in results for m in r.messages]
     # stamps restart per session (each phase is its own agent session); a result without stamps pads with None
@@ -127,8 +135,8 @@ def _combine(results: list[RunResult], labels: list[str] | None = None) -> RunRe
     dialogue = [d for r in results for d in (r.dialogue or [])]
     errored = [r for r in results if r.final is None or getattr(r.final, "is_error", False)]
     final = (errored[0] if errored else results[-1]).final
-    return RunResult(trace=Trace(calls, texts, text_at), final=final, messages=messages, dialogue=dialogue,
-                     arrivals=arrivals)
+    return RunResult(trace=Trace(calls, texts, text_at, text_phase=text_phase), final=final, messages=messages,
+                     dialogue=dialogue, arrivals=arrivals)
 
 
 def _phase_spec(phase, fill=lambda x: x) -> dict:
@@ -140,7 +148,11 @@ def _phase_spec(phase, fill=lambda x: x) -> dict:
     -> bool` runs the phase only when it holds (the returning-user agent cells' follow-up turn, after the agent stopped
     to ask the user to act). `"premise": True`: the phases after it are graded against what it leaves, so when it does
     not finish the chain stops and the run is SETUP FAILED (the review of 2026-10-30: session 1's failure was graded
-    FAILED on session 2's rows). `label` names it in the output."""
+    FAILED on session 2's rows). `label` names it in the output.
+
+    `prompt` may be a callable, `fn(trace so far) -> str`: the prompt is then COMPOSED when the phase runs — the agent
+    cells' follow-up turns (agent_cells.py) replay the conversation so far and add the simulated user's answer to
+    what the agent's last turn left open. The run's tokens are filled into what it returns."""
     if isinstance(phase, str):
         return {"prompt": fill(phase)}
     spec = dict(phase)
@@ -148,7 +160,11 @@ def _phase_spec(phase, fill=lambda x: x) -> dict:
         raise ValueError(f"a phase with a script runs under the script operator, not {spec.get('operator')!r}")
     if spec.get("script") is not None:
         spec["operator"] = "script"
-    if spec.get("prompt"):
+    if callable(spec.get("prompt")):
+        compose = spec["prompt"]
+        spec["prompt"] = lambda trace, _compose=compose: fill(_compose(trace))
+        spec["composed"] = True
+    elif spec.get("prompt"):
         spec["prompt"] = fill(spec["prompt"])
     from prev_release import PINNED, PREVIOUS
     if spec.get("server", "current") not in ("current", PREVIOUS, *PINNED):
@@ -251,7 +267,9 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
     one with a `script` — under the script operator on the server it names, whatever the cell's operator is: so a
     returning-user cell scripts the session that leaves the world behind, on the plugin the user had before, and puts
     the cell's agent in the session after it. A phase whose `when` does not hold on the trace so far is skipped (said,
-    not graded). The INTERPHASE_SETUP world changes run before every phase but the first that runs.
+    not graded). A phase whose prompt is COMPOSED (`_phase_spec`: a callable) gets it from the trace so far, and the
+    bundle's marker keeps what it was given. The INTERPHASE_SETUP world changes run before every phase but the first
+    that runs.
 
     A failed interphase, or a `premise` phase that did not finish, stops the chain: the combined result's
     `chain_failure` says which and why, and run.py reports the cell SETUP FAILED (the phases after it would be graded
@@ -261,6 +279,7 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
     mixed = any(spec.get("script") is not None or spec.get("when") is not None for spec in phases)
     results: list[RunResult] = []
     labels: list[str] = []
+    prompts: list[str | None] = []
     agent_ran = False
     failure: str | None = None
     for i, spec in enumerate(phases):
@@ -280,11 +299,16 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
                 await asyncio.sleep(delay)
         label = _phase_label(spec, operator)
         print(f"\n=== CHAIN PHASE {i + 1}/{len(phases)} ({name}; {label}; fresh MCP server) ===")
+        composed = None
         if spec.get("script") is not None:
             r = await _script_phase(spec, facility=facility, ssh_host=ssh_host,
                                     extra_env=getattr(scen, "EXTRA_ENV", None) or None)
         else:
-            r = await run_agent(spec["prompt"], repo_root=REPO_ROOT, model=model, effort=effort,
+            prompt = spec["prompt"]
+            if callable(prompt):   # a follow-up turn: composed from the conversation so far
+                composed = prompt = prompt(_combine(results).trace if results else Trace([]))
+                print(f"  composed prompt ({len(prompt)} chars): …{prompt[-300:]!r}")
+            r = await run_agent(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
                                 persona=persona, user_goal=user_goal, ablate_skill=no_skill,
                                 max_turns=getattr(scen, "MAX_TURNS", 40),
                                 extra_env=getattr(scen, "EXTRA_ENV", None) or None,
@@ -293,6 +317,7 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
             agent_ran = True
         results.append(r)
         labels.append(label)
+        prompts.append(composed)
         print(f"  {name}: {len(r.trace.calls)} calls · is_error={getattr(r.final, 'is_error', None)}")
         if spec.get("premise") and (r.final is None or getattr(r.final, "is_error", False)):
             said = str(getattr(r.final, "result", "") or "").strip() or _phase_error(r)
@@ -301,7 +326,7 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
             break
     total = sum((getattr(r.final, "total_cost_usd", 0) or 0) for r in results)
     print(f"chain total cost ≈ ${total:.4f} across {len(results)} phases")
-    out = _combine(results, labels if mixed else None)
+    out = _combine(results, labels if mixed else None, prompts)
     out.chain_failure = failure
     return out
 
@@ -1540,7 +1565,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
     # braces (e.g. a #21 probe's `f'{x}'`), which str.format would choke on with a KeyError.
     fill = lambda s: fill_prompt(s, facility=facility, ssh_host=ssh_host)  # noqa: E731 - two tokens, one place
     phases = [_phase_spec(p, fill) for p in (getattr(scen, "PHASES", []) or [])]
-    agent_prompts = [p["prompt"] for p in phases if p.get("script") is None and p.get("prompt")]
+    agent_prompts = [p["prompt"] for p in phases if p.get("script") is None and isinstance(p.get("prompt"), str)
+                     and p.get("prompt")]
     prompt = agent_prompts[0] if agent_prompts else fill(getattr(scen, "PROMPT", "") or "")
     # Interactive mode: persona from the CLI override, else the scenario's default.
     persona = persona or getattr(scen, "PERSONA", None)
@@ -1606,7 +1632,9 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         "ssh_host": ssh_host,
         "endpoint_name": _endpoint_name(facility),
         "prompt": prompt,
-        "phases": [p.get("prompt") or f"({_phase_label(p, operator)}: {getattr(p.get('script'), '__name__', '?')})"
+        "phases": [("(composed when it runs: the conversation so far and the user's answer — the bundle's chain "
+                    "marker keeps it)" if p.get("composed") else p.get("prompt"))
+                   or f"({_phase_label(p, operator)}: {getattr(p.get('script'), '__name__', '?')})"
                    for p in phases] or None,
         "persona": persona,
         "user_goal": user_goal,

@@ -169,7 +169,7 @@ def chain_trace(rows: list) -> Trace:
             phases.append((int(m["chain_phase"]), []))
         elif phases:
             phases[-1][1].append(m)
-    calls, texts, text_at = [], [], []
+    calls, texts, text_at, text_phase = [], [], [], []
     for k, seg in phases:
         head = next((m for m in seg if isinstance(m, dict)), {})
         t = trace_from_bundle_messages(seg) if "harness" in head and "rc" in head else trace_from_rows(seg)
@@ -179,7 +179,8 @@ def chain_trace(rows: list) -> Trace:
             c.phase = k
             calls.append(c)
         texts += t.texts
-    return Trace(calls, texts, text_at if len(text_at) == len(texts) else [])
+        text_phase += [k] * len(t.texts)
+    return Trace(calls, texts, text_at if len(text_at) == len(texts) else [], text_phase=text_phase)
 
 
 def _rows(d: Path) -> list:

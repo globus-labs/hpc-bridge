@@ -593,6 +593,10 @@ class Trace:
     # server's clock (cli_runner._stamped) — so an event's `ts` or a result's epoch compares with a call. None:
     # unstamped.
     t0: float | None = None
+    # Parallel to `texts` in a chain (run.py `_combine`, regrade.chain_trace): the 0-based phase each text was said in.
+    # Its place among the calls (`text_at`) cannot tell the last words of one phase from words said before the next
+    # phase's first call; this can. Empty when unknown (a single session, an older bundle).
+    text_phase: list[int] = field(default_factory=list)
 
     def texts_after(self, i: int) -> list[str]:
         """The agent's words after call `i` (e.g. what it told the user after an Esc) — every text when the positions

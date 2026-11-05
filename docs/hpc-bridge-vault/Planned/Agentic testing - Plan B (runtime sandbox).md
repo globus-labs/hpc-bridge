@@ -218,6 +218,21 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     - Results: 21 of 22 scripted cells OK, the six #236 proofs OK, the three agent cells OK.
     - c08 reaches hello world. It still fails `ru_policy_surfaced`: on the previous release's long-lived compute user
       endpoint the site's refusal arrives as a task traceback, never the scheduler's words — left open.
+- **Agent cells for batch row sizing and block environments (2026-11-05, branch `harness/agent-sizing-env-cells`,
+  built, not yet run live).** The 13 sizing and env cells were scripted; eight agent cells ask whether a model uses the
+  tools well (`agentic/harness/agent_cells.py`, `agent_checks.py`; `agentic/README.md`, "Agent cells").
+  - **A scripted user for the free operators.** Each cell is a seeded chain: a scripted connect, the user's request,
+    then up to four follow-up turns. A follow-up runs only when the turn before left something open in hpc-bridge's
+    answers (a spend question, a size, a proposal, an account, a failed build) or ended without a stop (a go-ahead,
+    once). Its prompt is composed when it runs: `PHASES` may give a callable `prompt(trace)` (`run._phase_spec`); the
+    conversation is replayed, as the hermes runner's one-shot turns replay it, and the chain marker keeps it.
+  - **The answers are a pure function of the trace**, so the graders recompute them (`answers_given`): "the user's yes
+    came before the billed block" is the phase of the yes against the phase of each billed start.
+  - **`Trace.text_phase`** stamps each of the agent's texts with its phase (`_combine`, `regrade.chain_trace`): a text
+    said before a phase's first call sits, by `text_at`, where the last words of the phase before it do.
+  - **A new MCP server per turn** forgets the spend acknowledgement: a batch carried over asks for the yes again. The
+    answers that carry one over say the approved block still stands; the cells whose batch spans turns report, not
+    gate, the number of blocks.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.
