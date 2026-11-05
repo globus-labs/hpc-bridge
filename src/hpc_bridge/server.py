@@ -469,10 +469,8 @@ async def _ensure_up_once(
             sizing[resources.WORKERS] = workers
         elif callable(takes_key) and takes_key("max_workers_per_node"):
             sizing["max_workers_per_node"] = workers
-    elif sizing and not bad_size and _has_login_shape(app):
-        # a block asked for by its size alone is no batch's derived block: a derived block's worker count belongs to
-        # that block only (review F1: ensure_endpoint_up(cores=32) after one still ran its 5 workers)
-        sizing[resources.WORKERS] = None
+    # (a size asked alone keeps a derived block's worker count only while it IS that block — its own size restated, the
+    # same block (review R2-H); any real switch drops it: warmth._repoint, review F1 / R2-E)
     if partition is not None or account is not None or sizing:
         # a facility endpoint whose schema has no such setting drops it at the wire: never set what is not sent. A
         # startup-pinned one has not read its template yet (that happens at its first block): read it first.

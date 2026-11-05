@@ -21,6 +21,7 @@ from __future__ import annotations
 
 import json
 import os
+import secrets
 import socket
 import sqlite3
 import subprocess
@@ -355,6 +356,13 @@ create table if not exists block_measure (
   at real,
   primary key (endpoint_id, uec_hash, block_job)
 );
+create table if not exists slot_token (
+  endpoint_id text not null default '',
+  uec_hash text not null,
+  token text not null,
+  at real,
+  primary key (endpoint_id, uec_hash)
+);
 create table if not exists tgroup (
   batch_id text not null,
   group_id text not null,
@@ -503,7 +511,10 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                             ("concurrency", "integer"), ("pin", "integer default 1"), ("pilot", "integer default 0"),
                             ("sized", "integer default 0"), ("sizing_defaulted", "text"), ("proposal", "text"),
                             # the user's own size while a pilot runs with the whole block (restored at its proposal)
-                            ("pilot_saved", "text")],
+                            ("pilot_saved", "text"),
+                            # the rows' size is still the user's to give (a sizing pause; cleared by a resize), and
+                            # why the user's yes is owed as well while it waits for it (a reap, a restart, a drain)
+                            ("size_owed", "integer default 0"), ("needs_yes", "text")],
                   "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text"),
                            ("req_cores", "integer"), ("req_memory_mb", "integer"), ("req_gpus", "integer"),
                            ("peak_rss_kb", "integer"), ("cpu_s", "real"), ("wall_s", "real"), ("nproc", "integer"),
@@ -807,15 +818,40 @@ class Ledger:
     def learn_measure(self, endpoint_id: str | None, uec_hash: str, block_job: str | None, measure: dict[str, Any], *,
                       now: float | None = None) -> None:
         """A check (or a task) on the block measured it from inside (sizing.BlockMeasure.to_dict): the block's, for
-        every batch on it, kept per endpoint, config and block job as its worker count is."""
-        with self._tx() as c:
+        every batch on it, kept per endpoint, config and block job as its worker count is. The block's slot token is
+        made here, the first time (`slot_token`)."""
+        at = time.time() if now is None else now
+        with self._tx(immediate=True) as c:
             c.execute("insert or replace into block_measure values (?,?,?,?,?)",
-                      (endpoint_id, uec_hash, block_job or "", json.dumps(measure),
-                       time.time() if now is None else now))
+                      (endpoint_id, uec_hash, block_job or "", json.dumps(measure), at))
+            self._token_of(c, endpoint_id, uec_hash, at)
 
     def block_measure(self, endpoint_id: str | None, uec_hash: str, block_job: str | None = None
                       ) -> dict[str, Any] | None:
-        return self._measure_of(self._con, endpoint_id, uec_hash, block_job)
+        """The block as measured, with its slot token (`slot_token`) when it has one."""
+        d = self._measure_of(self._con, endpoint_id, uec_hash, block_job)
+        if d is not None:
+            r = self._con.execute("select token from slot_token where endpoint_id = ? and uec_hash = ?",
+                                  (endpoint_id or "", uec_hash)).fetchone()
+            if r is not None:
+                d["slot_token"] = str(r[0])
+        return d
+
+    def slot_token(self, endpoint_id: str | None, uec_hash: str, *, now: float | None = None) -> str:
+        """The block's slot token: random, made by this server the first time the block is measured (or asked here,
+        whichever is first) and kept, so that every row of every batch on the block names the same node lock directory
+        (`hpcb-slots-<uid>-<job>-<token>`), a name another user on the node cannot guess and make first. Kept per
+        block config: the job id in the name already sets one block's directory apart from the next's."""
+        with self._tx(immediate=True) as c:
+            return self._token_of(c, endpoint_id, uec_hash, time.time() if now is None else now)
+
+    @staticmethod
+    def _token_of(c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str, at: float) -> str:
+        c.execute("insert or ignore into slot_token values (?,?,?,?)",
+                  (endpoint_id or "", uec_hash, secrets.token_hex(8), at))
+        r = c.execute("select token from slot_token where endpoint_id = ? and uec_hash = ?",
+                      (endpoint_id or "", uec_hash)).fetchone()
+        return str(r[0])
 
     def _measure_of(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str,
                     block_job: str | None) -> dict[str, Any] | None:
@@ -977,8 +1013,8 @@ class Ledger:
                                               (batch_id, at, take + len(have)))
                          if r["idx"] not in have]
             got = Reserved([], holders=holds if refused else {})
-            try:
-                mem_default = int("memory_gb" in json.loads(b["sizing_defaulted"] or "[]"))
+            try:   # a pilot's rows hold the whole block: no default memory of theirs (review R2-A2)
+                mem_default = 0 if b["pilot_saved"] else int("memory_gb" in json.loads(b["sizing_defaulted"] or "[]"))
             except (ValueError, TypeError):
                 mem_default = 0
             for r in rows[:take]:

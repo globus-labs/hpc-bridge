@@ -102,7 +102,7 @@ def test_w2_a_lock_dir_another_user_could_have_made_is_refused(tmp_path):
     planted.chmod(0o777)                                   # open to anyone: not ours alone
     side = tmp_path / "ran"
     rep = _result(_spawn(_script(f"touch {side}", tmp_path / "rd", 0, _slot()), env))
-    assert (rep.rc, rep.why) == (batch.LOCK_DIR_RC, "lock_dir") and "unsafe" in (rep.error or ""), rep
+    assert (rep.rc, rep.why) == (batch.LOCK_DIR_RC, "lock_dir") and "not private to this user" in (rep.error or ""), rep
     assert not side.exists()
     planted.chmod(0o700)
     planted.rmdir()
@@ -343,29 +343,35 @@ def test_w11_a_row_that_execs_its_program_still_reports_its_cpu_seconds(tmp_path
 async def test_f1_a_block_asked_by_cores_after_a_derived_one_runs_one_worker_per_core():
     """A derived block's hpcb_workers outlived it: the refusal's own advice for a bigger block,
     ensure_endpoint_up(cores=32), still dispatched 5 workers. They belong to the derived block only: cleared by a block
-    asked without derivation, never kept in the session's choice."""
-    from hpc_bridge import server
+    asked without derivation, never kept in the session's choice. (Its row settles first: a switch under batch rows in
+    flight is refused, review R2-H.)"""
+    from hpc_bridge import batch, server
     from hpc_bridge.resources import CORES, WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
     out = await _run(app, n=1, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
     assert out.batch_id and app.built[-1]["max_workers_per_node"] == 5
     assert WORKERS not in app.compute_choice
+    await batch.tick(app, out.batch_id)
+    assert not app.ledger.counts(out.batch_id)["in_flight"]
     st = await server._ensure_endpoint_up(app, "compute", cores=32, memory_gb=40, confirm_spend=True)
     assert st.status == "up" and app.built[-1][CORES] == 32
     assert app.built[-1]["max_workers_per_node"] == 32, app.built[-1]
 
 
-async def test_f1_the_derived_workers_dropped_alone_is_another_block_not_a_silent_change():
-    """The same cores asked again by size alone drop the derived workers: that is another user endpoint, so another
-    block — asked again, never swapped under the confirmed one."""
+async def test_f1_the_derived_blocks_own_size_restated_is_that_block():
+    """Review round 2 (R2-H) reverses round 1's reading: the derived block's own size asked again by size alone is the
+    SAME block — its workers kept, no question, nothing started (round 1 had dropped them: another user endpoint, a
+    second billed block)."""
     from hpc_bridge import server
+    from hpc_bridge.resources import WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
     await _run(app, n=1, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
     built = len(app.built)
     st = await server._ensure_endpoint_up(app, "compute", cores=9, memory_gb=7)
-    assert st.status == "needs_confirmation" and len(app.built) == built, st
+    assert st.status == "up" and len(app.built) == built, st
+    assert app.shapes["compute"].user_endpoint_config.get(WORKERS) == 5
 
 
 async def test_f2_size_first_yes_on_a_whole_node_partition_starts_the_whole_node():

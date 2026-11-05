@@ -41,6 +41,7 @@ DEFAULT_ROW_MB = 1024       # a derived row's memory when neither the call nor t
 PILOT_TOLERANCE = 0.1       # ⌈CPU-s ÷ wall − this⌉: a pilot that used 2.05 CPUs asks for 2
 OVER_CPU = 1.25             # an unpinned row over cores × this is flagged over its size
 NEAR_MEMORY = 0.9           # a row whose peak reached this share of its limit is flagged
+KILLED = frozenset({"memory", "timeout", "cancelled"})   # a row's `why` when it was killed before its end
 QUARTER_MB = 256
 _UNLIMITED = 2 ** 60        # cgroup v1's "no limit" is PAGE_COUNTER_MAX (9223372036854771712) bytes
 # bound_by on a tie: the most specific first — and CPUs before memory, which a default share divides by the slots
@@ -550,12 +551,15 @@ def quarter_gb(mb: float) -> float:
 def pilot_proposal(evidence: Iterable[Mapping[str, Any]], measure: BlockMeasure, *, gpus: int = 0) -> Proposal:
     """seff's pattern over the pilot rows' own use: cores ⌈CPU-s ÷ wall − PILOT_TOLERANCE⌉ (at least 1, at most the
     block's CPUs), memory 1.25 × the peak RSS rounded up to a quarter GB (at least a quarter) — the largest over them —
-    and the concurrency the block then fits."""
+    and the concurrency the block then fits. A row killed before its end (memory, timeout, abort) is no evidence of its
+    cores, whatever CPU-seconds it reported: its killed processes' CPU time is lost with them (review R2-G)."""
     rows = [dict(e) for e in evidence]
     cores: int | None = None
     mem = 0.25
     for e in rows:
         wall, cpu = e.get("wall_s"), e.get("cpu_s")
+        if e.get("why") in KILLED:
+            cpu = None
         if cpu is not None:   # a row whose CPU-seconds could not be read is no evidence of its cores — never 0
             k = max(1, math.ceil(float(cpu) / float(wall) - PILOT_TOLERANCE)) if wall and float(wall) > 0 else 1
             cores = max(cores or 1, min(k, measure.cpus))

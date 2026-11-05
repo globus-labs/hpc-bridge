@@ -1681,6 +1681,17 @@ def _fresh_block(app: AppCtx, shape: str, rt: ShapeRuntime) -> None:
 _VALID_PARTITION = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 _VALID_ACCOUNT = re.compile(r"^[A-Za-z0-9_.:-]{1,64}$")
 
+def _batch_rows_refusal(app: AppCtx, shape: str, what: str) -> str | None:
+    """A block switch (`what`: the change, said) refused while batch rows are in flight on the compute block, naming
+    them and how to end them, as stop_endpoint is (batch.in_flight_note): the run_shell task handles do not count them,
+    and on SSH the old block idles out only after them — two blocks billing (review R2-H). None: nothing holds it."""
+    if shape != "compute":
+        return None
+    from . import batch  # batch imports this module
+
+    held = batch.in_flight_note(app, then="ask for the new block again", paused=False)
+    return None if held is None else f"can't change {what}: {held}."
+
 def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str | None) -> str | None:
     """Point this shape's next provision at `partition`, invalidating a stale runner. Returns a
     rejection notice (and applies nothing) when a task is still running on the shape: the change would
@@ -1707,6 +1718,8 @@ def _apply_partition(app: AppCtx, shape: str, rt: ShapeRuntime, partition: str |
     if rt.inflight:
         return (f"can't change partition to {partition!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    if (held := _batch_rows_refusal(app, shape, f"partition to {partition!r}")) is not None:
+        return held
     _repoint(app, shape, rt, {"partition": partition})
     return None
 
@@ -1730,6 +1743,8 @@ def _apply_account(app: AppCtx, shape: str, rt: ShapeRuntime, account: str | Non
     if rt.inflight:
         return (f"can't change account to {account!r}: a command is still running on shape {shape!r} "
                 "(inside run_shell's wait). Let it return, then change it.")
+    if (held := _batch_rows_refusal(app, shape, f"account to {account!r}")) is not None:
+        return held
     _repoint(app, shape, rt, {"account": account})
     return None
 
@@ -1777,6 +1792,8 @@ def _apply_resources(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[st
     if rt.inflight:
         return (f"can't change the block's size ({what}): a command is still running on shape {shape!r} (inside "
                 "run_shell's wait). Let it return, then change it.")
+    if (held := _batch_rows_refusal(app, shape, f"the block's size ({what})")) is not None:
+        return held
     app.compute_choice.update({k: v for k, v in chosen.items() if k not in changed})
     _repoint(app, shape, rt, changed)
     return None
@@ -1827,6 +1844,10 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any])
         _retire_runner(app, rt)
         rt.runner = None
     _bank_warm_interval(rt, app)  # (a no-op once the block was left)
+    if resources.WORKERS not in updates:
+        # a batch-derived block's worker count is that block's alone: ANY other block — another size, partition or
+        # account — runs without it unless its own ask names one (review R2-E)
+        uec.pop(resources.WORKERS, None)
     for key, value in updates.items():
         if value is None:
             uec.pop(key, None)

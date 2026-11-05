@@ -607,6 +607,7 @@ def test_rows_claim_different_cpus_a_full_pool_is_reported_and_a_dead_row_releas
     d = _spawn(_script("sleep 2", rd, 3, _slot(cpu_ids=(0,))), env)
     time.sleep(0.8)
     os.killpg(d.pid, signal.SIGKILL)                                      # the wrapper dies; its command ends soon
+    d.wait()   # …and its parent reaps it, as the worker does (a zombie answers kill -0: the claim names the wrapper too)
     e = _spawn(_script("echo $HPCB_SLOT_CPUS", rd, 4, _slot(cpu_ids=(0,), claim_wait_s=15)), env)
     assert _result(e).cpus == "0"
 
@@ -824,8 +825,9 @@ async def test_a_kill_at_a_default_memory_pauses_the_batch_with_a_size_from_that
     await batch.tick(app, out.batch_id)
     st = await batch.status(app, out.batch_id)
     assert st.phase == "needs_sizing" and st.proposal is not None, st
-    assert (st.proposal.cores, st.proposal.memory_gb) == (1, 1.25)        # 1.25 × 900 MB, up to a quarter GB
-    assert "default memory" in st.reason
+    # 1.25 × 900 MB, up to a quarter GB; a killed row's CPU time is no evidence (review R2-G): the cores are asked for
+    assert (st.proposal.cores, st.proposal.memory_gb) == (None, 1.25)
+    assert "default memory" in st.reason and "cores=" in st.reason
     assert app.ledger.task(out.batch_id, 0)["state"] == "failed"          # not idempotent: not run again by itself
     for i in (1, 2, 3):                                                   # the rows out run to their end meanwhile
         runner.futures[i].finish(_report(i, cpu_s=0.5, wall_s=1.0, peak_rss_kb=100 * 1024, nproc=1, cpus=str(i)))
