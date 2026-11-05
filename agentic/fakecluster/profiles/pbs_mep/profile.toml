@@ -7,6 +7,12 @@
 # own /opt/hpcb-mep/gce, mounted read-only on the moms — the worker matches the user endpoint by construction, so the
 # catalog entry sends no worker_init, as Polaris's does); max_idletime 240 s.
 #
+# A SECOND manager on the same node, `hpcb-mep-pbs-req` (block environments, PR 3; catalog entry `fake-pbs-mep-req`),
+# runs the same template, which ALSO builds a client's `requirements` into the workers' env when a block starts (NCSA
+# Delta's and Purdue Anvil's kind, after globus-compute-endpoint 4.17's default). The first manager's template does not
+# read `requirements` (Polaris 4.9's kind: hpc-bridge builds the env through the block's worker_init), the second's
+# does (passed through). Both build on the compute nodes, so their env cells need the moms to reach PyPI.
+#
 # One deliberate difference from Polaris: the schema is STRICT (additionalProperties:false, Anvil's/NeSI's contract)
 # where Polaris's is open, so the plugin's `compute.key_map` rename (partition -> queue) must survive the schema filter
 # as well as reach the wire — the combination NeSI's entry needs — and a key the plugin forgets to rename is refused
@@ -25,7 +31,9 @@ base = "polaris"
 
 [capabilities]
 mep = "consent-free"                 # a root-run Globus Compute MEP; the mapped user needs no fresh consent
-mep_schemas = ["pbs-strict"]         # one manager: hpcb-mep-pbs (strict schema, queue + account required)
+# two managers: hpcb-mep-pbs (strict schema, queue + account required) and hpcb-mep-pbs-req (the same, and its template
+# builds `requirements` into the workers' env when a block starts: block environments, PR 3)
+mep_schemas = ["pbs-strict", "pbs-req"]
 mep_mapped_user = "hpcbmep"          # every mapped run executes as this account (WARM_BLOCK_USER for the node gate)
 
 [catalog]

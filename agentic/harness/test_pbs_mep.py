@@ -52,7 +52,8 @@ def test_pbs_mep_layers_on_polaris_and_offers_a_pbs_facility_endpoint():
     assert m["layers"] == ["pbs", "polaris", "pbs_mep"] and m["compose"] == "docker-compose.pbs.yml"
     caps = m["capabilities"]
     assert caps["scheduler"] == "pbs" and caps["site_rule"] == "filesystems" and caps["nodes"] == 2   # inherited
-    assert caps["mep"] == "consent-free" and caps["mep_schemas"] == ["pbs-strict"] and caps["mep_mapped_user"] == "hpcbmep"
+    assert caps["mep"] == "consent-free" and caps["mep_mapped_user"] == "hpcbmep"
+    assert caps["mep_schemas"] == ["pbs-strict", "pbs-req"]   # the second builds `requirements` (block envs, PR 3)
     assert caps["catalog"] == "local"                       # derived from [catalog] cmd: the registry is replaced
     assert m["catalog"]["cmd"] == "docker exec ${HPCB_FAKE_PROJECT:-hpcb-fake}-login-1 /usr/local/bin/hpcb-pbs-mep-catalog"
     assert caps["accounting"] == "none"                     # -A accepted, not validated (the template is the floor)
@@ -63,6 +64,7 @@ def test_build_materialises_the_mep_fixtures_on_the_pbs_stack(tmp_path):
     _profile_mod().build("pbs_mep", out)
     for rel in ("deregister.sh", "mep/hpcb-pbs-mep-catalog", "mep/tools.sh", "mep/idmap.py", "mep/pbs_config.yaml",
                 "mep/pbs_user_config_template.yaml.j2", "mep/pbs_user_config_schema.json",
+                "mep/pbs_user_config_template_req.yaml.j2", "mep/pbs_user_config_schema_req.json",
                 "setup.d/server.sh", "setup.d/server-polaris.sh", "polaris/require_filesystems.py",   # the base layers
                 "setup.d/server-pbsmep.sh", "setup.d/mom-pbsmep.sh", "setup.d/login-pbsmep.sh"):
         assert (out / rel).is_file(), rel
@@ -114,11 +116,19 @@ def test_the_compose_overlay_gives_the_moms_the_facility_install_read_only():
     assert set(ov["volumes"]) == {"pbs-mep-state", "pbs-mep-tools"} and not set(ov["volumes"]) & set(mep["volumes"])
 
 
-def test_the_manager_fixtures_name_one_manager_and_one_install():
-    name = "hpcb-mep-pbs"
+def test_the_manager_fixtures_name_two_managers_and_one_install():
+    name, req = "hpcb-mep-pbs", "hpcb-mep-pbs-req"
     catalog = (MEPDIR / "hpcb-pbs-mep-catalog").read_text()
     login = (PROF / "setup.d" / "login-pbsmep.sh").read_text()
     assert f'NAME = "{name}"' in catalog and f"name={name};" in login
+    # the second (block environments, PR 3): its own dir, config (its own identity-mapping path) and registration,
+    # the template that builds `requirements` at the manager's version, its schema
+    assert f'REQ_NAME = "{req}"' in catalog and f"name={req};" in login
+    assert '-e "s#/hpcb-mep-pbs/#/$name/#"' in login
+    assert ('sed "s/@@VER@@/$VER/g" "$PROFILE_DIR/mep/pbs_user_config_template_req.yaml.j2" '
+            '> "$d/user_config_template.yaml.j2"') in login
+    assert '"$PROFILE_DIR/mep/pbs_user_config_schema_req.json" "$d/user_config_schema.json"' in login
+    assert "@@VER@@" in (MEPDIR / "pbs_user_config_template_req.yaml.j2").read_text()
     assert f"/root/.globus_compute/{name}/identity_mapping.json" in (MEPDIR / "pbs_config.yaml").read_text()
     assert "for d in /root/.globus_compute/hpcb-mep-*/" in (PROF / "deregister.sh").read_text()   # finds it
     # the manager's dir gets the template + schema under the names globus-compute-endpoint reads
@@ -240,6 +250,91 @@ def test_the_template_refuses_what_polaris_requires_and_keeps_polaris_traps():
     assert wi == 'module load x; echo "hi"; export TMPDIR=/tmp; export PATH=$PATH:/opt/hpcb-mep/gce/bin'
 
 
+# --- the second manager: its template builds `requirements` into the workers' env (block environments, PR 3) ---------
+
+EID_REQ = "1a2b3c4d-5e6f-4a7b-8c9d-0e1f2a3b4c5d"
+
+
+def _render_req(user_opts: dict, version: str = "4.16.0") -> dict:
+    """_render for the second manager: its own schema, its template with the manager's version (setup.d's sed)."""
+    import jinja2
+    import jsonschema
+    from jinja2.sandbox import SandboxedEnvironment
+
+    jsonschema.validate(instance=user_opts, schema=json.loads((MEPDIR / "pbs_user_config_schema_req.json").read_text()))
+    opts = {k: json.dumps(v) if isinstance(v, str) else ("null" if v is None else v) for k, v in user_opts.items()}
+    text = (MEPDIR / "pbs_user_config_template_req.yaml.j2").read_text().replace("@@VER@@", version)
+    return yaml.safe_load(SandboxedEnvironment(undefined=jinja2.StrictUndefined).from_string(text).render(**opts))
+
+
+def test_the_second_catalog_entry_follows_once_its_manager_registered(tmp_path):
+    from hpc_bridge.catalog.bundled import BundledCatalog
+
+    path = _catalog(tmp_path)                                   # the second manager not registered (yet, or failed)
+    assert [e["id"] for e in yaml.safe_load(path.read_text())] == ["fake-pbs-mep"]
+    (tmp_path / "state" / "hpcb-mep-pbs-req").mkdir()
+    (tmp_path / "state" / "hpcb-mep-pbs-req" / "endpoint.json").write_text(json.dumps({"endpoint_id": EID_REQ}))
+    r = subprocess.run([sys.executable, str(MEPDIR / "hpcb-pbs-mep-catalog")], capture_output=True, text=True,
+                       timeout=30, env={**os.environ, "HPCB_MEP_STATE_DIR": str(tmp_path / "state")})
+    assert r.returncode == 0 and r.stderr == "", r.stderr
+    first, second = yaml.safe_load(r.stdout)
+    assert second["id"] == "fake-pbs-mep-req" and second["compute_mep_uuid"] == EID_REQ
+    # the same contract as the first: only its name, its id, its uuid and its words differ
+    same = ("facility_key", "facility", "ssh_host", "auth_method", "allocation", "account_required", "account_hint",
+            "defaults", "provenance")
+    assert {k: first[k] for k in same} == {k: second[k] for k in same}
+    assert {**first["compute"], "endpoint_name": "-"} == {**second["compute"], "endpoint_name": "-"}
+    out = tmp_path / "both.yaml"
+    out.write_text(r.stdout)
+    e = asyncio.run(BundledCatalog(out).get("hpcb-mep-pbs-req"))
+    assert e is not None and e.id == "fake-pbs-mep-req" and e.compute_mep_uuid == EID_REQ
+
+
+def test_the_second_template_is_the_first_until_requirements_come(tmp_path):
+    import jsonschema
+
+    good = {"queue": "debug", "account": "hpcb"}
+    assert _render_req(good) == _render(good)                   # no requirements: the Polaris-shaped template exactly
+    wi = _render_req({**good, "worker_init": 'echo "user"'})["engine"]["provider"]["worker_init"]
+    assert wi == _render({**good, "worker_init": 'echo "user"'})["engine"]["provider"]["worker_init"].replace(
+        'echo "user"; export TMPDIR=/tmp', 'export TMPDIR=/tmp; echo "user"')   # the user's after the facility's init
+    with pytest.raises(jsonschema.ValidationError):
+        _render_req({**good, "requirements": ["six"]})
+    with pytest.raises(jsonschema.ValidationError):
+        _render({**good, "requirements": "six"})                 # the first manager's schema refuses it by name
+
+
+def test_the_second_template_builds_the_requirements_verbatim_once_before_the_users_worker_init(tmp_path):
+    good = {"queue": "debug", "account": "hpcb"}
+    text = 'six==1.17.0\n$(touch PWNED) "q" \\back\nnumpy>=2'
+    wi = _render_req({**good, "requirements": text, "worker_init": 'echo "user"'})["engine"]["provider"]["worker_init"]
+    assert wi.index("GC_REQUIREMENTS_EOF") < wi.index('echo "user"') < wi.rindex("export PATH=$PATH:/opt/hpcb-mep/gce/bin")
+    # run it as a pilot's job script would: a uv stub keeps the file the installer was given and makes the venv
+    bindir, keep, log = tmp_path / "bin", tmp_path / "given.txt", tmp_path / "uv.log"
+    bindir.mkdir()
+    (bindir / "uv").write_text(
+        '#!/bin/sh\necho "$*" >> "$UV_LOG"\n'
+        'case "$1" in\n'
+        '  venv) for a; do d=$a; done; mkdir -p "$d/bin" && printf "#!/bin/sh\\n" > "$d/bin/process_worker_pool.py" '
+        '&& chmod +x "$d/bin/process_worker_pool.py";;\n'
+        '  pip) while [ $# -gt 0 ]; do [ "$1" = -r ] && cp "$2" "$KEEP"; shift; done;;\n'
+        'esac\n')
+    (bindir / "uv").chmod(0o755)
+    (tmp_path / "home").mkdir()
+    env = {"PATH": f"{bindir}:{os.environ['PATH']}", "HOME": str(tmp_path / "home"), "UV_LOG": str(log),
+           "KEEP": str(keep)}
+    run = wi + '\necho "V=$VIRTUAL_ENV"'
+    p = subprocess.run(["bash", "-c", run], capture_output=True, text=True, env=env, cwd=tmp_path, timeout=30)
+    assert p.returncode == 0 and "user" in p.stdout, (p.stdout, p.stderr)
+    assert keep.read_text() == text + "\n" and not (tmp_path / "PWNED").exists()   # the text, never shell
+    venv = re.search(r"^V=(\S+)$", p.stdout, re.M).group(1)
+    assert re.fullmatch(re.escape(str(tmp_path / "home")) + r"/\.globus_compute/venvs/py3\.11-gce4\.16\.0-[0-9a-f]{12}",
+                        venv), venv
+    assert "globus-compute-endpoint==4.16.0" in log.read_text()   # the worker still matches the user endpoint
+    p = subprocess.run(["bash", "-c", run], capture_output=True, text=True, env=env, cwd=tmp_path, timeout=30)
+    assert p.returncode == 0 and log.read_text().count("venv ") == 1   # the next block reuses it
+
+
 # --- the scenario: wiring -------------------------------------------------------------------------------------------
 
 def test_the_scenario_runs_only_on_pbs_mep_and_only_it_does_there():
@@ -260,7 +355,9 @@ def test_the_scenario_runs_only_on_pbs_mep_and_only_it_does_there():
             continue
         fid = str(getattr(mod, "FACILITY_ID", ""))
         if targets.meets(req, caps["pbs_mep"])[0]:
-            assert fid == "fake-pbs-mep", (p.stem, fid)
+            assert fid in ("fake-pbs-mep", "fake-pbs-mep-req"), (p.stem, fid)
+            # the second manager's entry only where the cell says it needs that manager
+            assert (fid == "fake-pbs-mep-req") == ("pbs-req" in (req.get("mep_schemas") or [])), (p.stem, fid)
         if targets.meets(req, caps["mep"])[0]:
             assert fid.startswith("fake-mep-"), (p.stem, fid)
 
