@@ -20,7 +20,6 @@ import time
 import pytest
 
 from tests.test_anvil_live_findings_node import (
-    _BUSY,
     _CHILDREN,
     _LINUX,
     _PY3,
