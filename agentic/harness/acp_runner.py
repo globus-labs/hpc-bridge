@@ -98,6 +98,7 @@ async def run_scenario(
     extra_env: dict[str, str] | None = None,
     midrun_hooks: list[dict] | None = None,
     hook_runner=None,
+    user_between_turns: bool = False,
 ) -> RunResult:
     if midrun_hooks:
         raise NotImplementedError("the claude-acp operator does not support mid-run chaos hooks yet")
@@ -111,7 +112,8 @@ async def run_scenario(
         server_env["HPC_BRIDGE_OMIT_INSTRUCTIONS"] = "1"     # the guidance ablation: no pointer, no resource nudge
     mcp = [acp_client.hpc_bridge_mcp(repo, server_env, operator="claude-acp")]
     interactive = persona is not None
-    full_prompt = _lead(ablate_skill, interactive=interactive) + "\n\n" + prompt
+    # a chain phase whose user answers between turns (agent_cells.py) is never told there is no human (hermes_runner)
+    full_prompt = _lead(ablate_skill, interactive=interactive, between_turns=user_between_turns) + "\n\n" + prompt
     model_id = os.environ.get("HPCB_CLAUDE_ACP_MODEL", "").strip() or (model if model and model != "default" else None)
 
     human = None
