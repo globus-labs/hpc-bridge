@@ -139,6 +139,17 @@ connect released both. Fixed test-first (`tests/test_restart_block_record.py`; m
     `draining`; the cold lead says whether it reached the endpoint; export_handoff names an earlier block; an
     unreachable record is "recorded, not reachable from here", with the user's own cancel; the ledger adds columns
     in one immediate transaction (concurrent opens).
+- **Review round 2** (branch `fix/restart-block-record-r2`, `tests/test_restart_block_record_r2.py`):
+  - liveness keys on a stable machine identity (`owner_machine`: /etc/machine-id, macOS IOPlatformUUID), never the
+    hostname — a laptop's network change had hidden every record of this machine; unknown means this machine's;
+    another machine's record is still read against the scheduler and closed when gone (a cold stop reads it first);
+  - a pinned session reads only ITS facility's records; a spend question never bootstraps (over the web when the
+    endpoint answers, else named unverified and read after the yes); the yes brings the login shape up once — a
+    failed bootstrap is that call's answer, never a second SSH attempt;
+  - a cold stop's failed ask still releases that endpoint, answered `draining` unconfirmed; a cold question adds no
+    MEP stop (it paused batches); a combined answer keeps every part's `jobs` and `handoffs`;
+  - on a MEP a gone server's presumed-lost row keeps its slot (`reserve(by_sender=False)`): a late delivery can run;
+  - a facility endpoint's record is named "not verified" and "may have ended".
 - Not done: `teardown_endpoint` with nothing bound; a cold stop finds an endpoint only through a block record (a
   leftover handoff alone needs a connect first).
 
