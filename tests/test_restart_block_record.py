@@ -288,6 +288,34 @@ async def test_3_a_cold_stop_releases_the_earlier_sessions_block(monkeypatch):
     assert again.status == "down" and again.notice == "no endpoint was up"
 
 
+async def test_3_a_cold_stop_reaches_every_recorded_endpoint_and_is_down_only_when_each_is(monkeypatch):
+    fac = _Slurm()
+    await _session_1(monkeypatch, fac)
+    entry = _open(EID)[0]["entry"]
+    other = "22222222-0000-0000-0000-000000000002"
+    led = Ledger.open()
+    led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
+                     partition=None, account=None, walltime_s=None, session="gone", owner_host="h", owner_pid=1,
+                     owner_start=None)
+    led.block_up(other, "9", "7")
+    s2 = _server(monkeypatch, fac, bound=False)
+    log = _scripted_login(monkeypatch, releases=["released 40\n", "released 7\n"])
+    st = await _stop_endpoint(s2)
+    assert st.status == "down" and st.spend_stopped is True and " Also: " in st.notice
+    assert sorted(c for k, c in log if k == "release") == sorted(
+        [scheduler_ops._release_cmd("slurm", EID), scheduler_ops._release_cmd("slurm", other)])
+    assert _open() == []
+    # one of them not confirmed: the whole answer is not `down`
+    await _session_1(monkeypatch, fac)
+    led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
+                     partition=None, account=None, walltime_s=None, session="gone", owner_host="h", owner_pid=1,
+                     owner_start=None)
+    monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
+    _scripted_login(monkeypatch, releases=["released 40\n", None, None, None])
+    st = await _stop_endpoint(_server(monkeypatch, fac, bound=False))
+    assert st.status == "draining" and st.spend_stopped is not True
+
+
 async def test_3_a_cold_stop_whose_release_is_not_confirmed_is_draining_and_keeps_the_record(monkeypatch):
     fac = _Slurm()
     await _session_1(monkeypatch, fac)

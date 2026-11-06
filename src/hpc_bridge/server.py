@@ -1955,7 +1955,9 @@ async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = N
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
     the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
-    compute block.
+    compute block. In a new session with nothing connected yet it still works: it releases the blocks an earlier
+    session of hpc-bridge left running (from hpc-bridge's own record, checked against the scheduler), with the same
+    `down` / `draining` meaning.
 
     Jobs (submit_job's, or hand submits it adopted) that can still bill make a stop ASK first: it answers
     `needs_confirmation`, names each job (`jobs`) and does nothing. Ask the user, then call stop_endpoint(jobs="cancel")

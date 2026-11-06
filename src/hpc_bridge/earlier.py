@@ -527,9 +527,10 @@ Stopper = Callable[[AppCtx], Awaitable[EndpointStatus]]
 
 async def stop_cold(app: AppCtx, stop_ssh: Stopper, stop_mep: Stopper) -> EndpointStatus | None:
     """stop_endpoint with no endpoint bound (a fresh server's first call, a startup pin before its first block): the
-    blocks the record names — this server's, and earlier servers' that are gone — are reached again, one endpoint at a
-    time, and released by the stop a bound endpoint gets (`stop_ssh`: server._stop_endpoint_blocks, on a scratch
-    context bound to that endpoint, so nothing stays bound here); a facility endpoint's are named (`stop_mep`). A block
+    blocks the record names — this server's, and earlier servers' that are gone — are reached again, every endpoint at
+    once (each stop bounded on its own), and released by the stop a bound endpoint gets (`stop_ssh`:
+    server._stop_endpoint_blocks, on a scratch context bound to that endpoint, so nothing stays bound here); a
+    facility endpoint's are named (`stop_mep`). A block
     another server that still runs holds is named and left to it. None: nothing on record (the old "no endpoint was
     up"). `down` with spend_stopped true only when every endpoint's stop said so."""
     rows, problem = _records(app)
@@ -541,19 +542,21 @@ async def stop_cold(app: AppCtx, stop_ssh: Stopper, stop_mep: Stopper) -> Endpoi
     if not rows:
         return None
     held = {r["endpoint_id"] for r in rows if whose[(r["endpoint_id"], r["request"])] == "live"}
-    parts: list[EndpointStatus] = []
-    for eid in dict.fromkeys(r["endpoint_id"] for r in rows):
+
+    async def one(eid: str) -> EndpointStatus:
         recs = [r for r in rows if r["endpoint_id"] == eid]
         if eid in held:
             live = [_block(r, verified=False) for r in recs if whose[(eid, r["request"])] == "live"]
-            parts.append(EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
-                                        block_job_id=next((b.job for b in live if b.job), None),
-                                        notice=notices._earlier_live_stop(live)))
-        elif any(r.get("mep") for r in recs):
-            parts.append(await _stop_mep_cold(app, eid, recs, stop_mep))
-        else:
-            parts.append(await _stop_ssh_cold(app, eid, recs, stop_ssh))
-    return _combined(parts)
+            return EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
+                                  block_job_id=next((b.job for b in live if b.job), None),
+                                  notice=notices._earlier_live_stop(live))
+        if any(r.get("mep") for r in recs):
+            return await _stop_mep_cold(app, eid, recs, stop_mep)
+        return await _stop_ssh_cold(app, eid, recs, stop_ssh)
+
+    # every endpoint at once: each stop is bounded on its own (config.STOP_CALL_BUDGET_S), and together they stay
+    # within one tool call
+    return _combined(list(await asyncio.gather(*(one(e) for e in dict.fromkeys(r["endpoint_id"] for r in rows)))))
 
 
 async def _facility(app: AppCtx, recs: list[dict]) -> tuple[Any, str | None]:
@@ -594,6 +597,9 @@ async def _stop_ssh_cold(app: AppCtx, eid: str, recs: list[dict], stop_ssh: Stop
     scratch = _scratch(app, fac, eid, facility)
     try:
         st = await stop_ssh(scratch)
+    except Exception as exc:  # noqa: BLE001 - said: never a stop that fails without naming what may still bill
+        return _unreachable(blocks, facility, eid, host,
+                            f"the stop there failed ({type(exc).__name__}: {str(exc)[:160]})")
     finally:
         await _close(scratch)
     ok = st.status == "down" and st.spend_stopped is True
