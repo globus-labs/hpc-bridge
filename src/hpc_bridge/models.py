@@ -404,6 +404,9 @@ class JobStatus(BaseModel):
     terms: JobTerms | None = None
     envelope: EnvelopeInfo | None = None
     notice: str | None = None
+    # block environments: a pending env whose build failed since the last answer, on the answer that first reports it
+    # (as ensure_endpoint_up's and run_shell's): the job runs in the session's unchanged env
+    env_failed: EnvInfo | None = None
 
 
 class ShellOutcome(BaseModel):
@@ -723,6 +726,9 @@ class BatchStatus(BaseModel):
     facts: BlockFacts | None = None
     proposal: SizingProposal | None = None
     env: EnvInfo | None = None   # block environments: the env every row of the batch runs in (its own, recorded)
+    # a pending env whose build failed since the last answer, on the answer that first reports it (as
+    # ensure_endpoint_up's): a batch with no env of its own runs in the session's unchanged one
+    env_failed: EnvInfo | None = None
 
 
 class BlockLeft(BaseModel):

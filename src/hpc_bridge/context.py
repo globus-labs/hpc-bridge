@@ -551,6 +551,9 @@ class AppCtx:
     ledger: Any = None
     batch_owner: Any = None
     batch_autoloop: bool = True
+    # the block re-derived for a batch whose block is gone, as an answer of THIS process last quoted its terms (by batch
+    # id): a resume's yes starts only that block (review round 1: one call could start a block no answer had shown)
+    batch_quoted: dict[str, Any] = field(default_factory=dict)
     # Batch phase 2a (hpc_bridge.jobs): this server's session — minted once per server lifespan, it is what an envelope
     # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
     session_token: str = field(default_factory=lambda: secrets.token_hex(8))

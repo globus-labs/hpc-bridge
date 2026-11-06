@@ -2373,6 +2373,11 @@ def _rederive(app: AppCtx, b: dict[str, Any], pre: ShapeRuntime | None) -> tuple
         return None
 
 
+def _derived_key(d: sz.DerivedBlock) -> tuple[Any, ...]:
+    """A derived block, comparable: what an answer quoted is what a yes starts (`AppCtx.batch_quoted`)."""
+    return (d.cores, d.memory_gb, d.gpus, d.workers, d.nodes, d.whole_node)
+
+
 async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: bool,
                   resize: dict[str, Any] | None = None) -> BatchStatus:
     if not _ID.match(bid):
@@ -2444,28 +2449,43 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         b = led.batch(bid)
     if sizing_wanted and not confirm_spend:
         out = _status_of(app, bid)
-        both = (f"run_batch(batch_id='{bid}', cores=…, memory_gb=…{', gpus=…' if b.get('gpus') else ''}, "
-                "confirm_spend=True) — its size and the user's yes for the block, in one call" if unconfirmed else
-                _resize_call(bid, int(b.get("gpus") or 0)))
+        # never the size and the yes in one call where the block is not confirmed: the size first — its answer quotes
+        # the block it needs — then the user's yes for THAT block (review round 1: the one-call form started a block no
+        # answer had shown)
+        both = (f"its size first, {_resize_call(bid, int(b.get('gpus') or 0))} — the answer quotes the block it needs —"
+                f" then the user's yes for that block: run_batch(batch_id='{bid}', confirm_spend=True)" if unconfirmed
+                else _resize_call(bid, int(b.get("gpus") or 0)))
         out.notice = (f"{bid} waits for its rows' size ({b['pause_reason']}): {both}. " + (out.notice or "")).strip()
         return out
     # its block gone (no block confirmed in this session: a server restart, a stop), a batch whose rows the user sized
     # asks for the block derived from them again, as size first did — never the session's default (review G2)
     again = _rederive(app, b, pre)
     derived, sized_as = again if again is not None else (None, None)
-    if not confirm_spend and b["state"] == "needs_confirmation" and not resumes:
+    quoted = derived is not None and app.batch_quoted.get(bid) == _derived_key(derived)
+    asked_yes = not confirm_spend and b["state"] == "needs_confirmation" and not resumes
+    if derived is not None and sized_as is not None and (asked_yes or (confirm_spend and not quoted)):
+        # the yes is asked for THAT block: its terms first, and a yes starts only a block an answer of this process
+        # showed (review round 1: after a restart, a new size and the yes in one call had started a 65-CPU block
+        # nobody saw) — a yes for another, or for none shown, is answered with the terms
+        st0 = await ensure_up(app, False, size=derived)
+        if st0.block is None or not _is_derived(st0.block, derived):
+            return _refused("the block derived from the batch's rows cannot be asked for here", bid=bid,
+                            notice=st0.notice)
+        app.batch_quoted[bid] = _derived_key(derived)
+        out = _status_of(app, bid)
+        out.phase, out.block = "needs_confirmation", st0.block
+        out.block.derived_from = derived.words(sized_as)
+        kept = " Its new size is recorded." if resize is not None else ""
+        unseen = (" This yes was for a block no answer had shown yet, so nothing started." if confirm_spend else "")
+        out.notice = (f"{bid}'s block is gone; it resumes on the block derived from its rows again — "
+                      f"{derived.words(sized_as)} (`block`: its terms) — once the user says yes to THAT block: "
+                      f"run_batch(batch_id='{bid}', confirm_spend=True).{kept}{unseen} {st0.notice or ''}").strip()
+        return out
+    if asked_yes:
         out = _status_of(app, bid)
         kept = " Its new size is recorded." if resize is not None else ""
-        terms = ""
-        if derived is not None and sized_as is not None:   # the yes is asked for THAT block: its terms, before it
-            st0 = await ensure_up(app, False, size=derived)
-            if st0.block is not None and _is_derived(st0.block, derived):
-                out.block = st0.block
-                out.block.derived_from = derived.words(sized_as)
-                terms = (f" Its block is gone; the yes asks for the block derived from its rows again: "
-                         f"{derived.words(sized_as)} (`block`).")
         out.notice = (f"{bid} is paused ({b['pause_reason']}); it resumes only on the user's yes: "
-                      f"run_batch(batch_id='{bid}', confirm_spend=True).{kept}{terms} " + (out.notice or "")).strip()
+                      f"run_batch(batch_id='{bid}', confirm_spend=True).{kept} " + (out.notice or "")).strip()
         return out
     if (confirm_spend and pre is not None and pre.reaped and b["state"] in ("needs_confirmation", "needs_sizing")
             and "reaped" in str(b["pause_reason"] or "")):
