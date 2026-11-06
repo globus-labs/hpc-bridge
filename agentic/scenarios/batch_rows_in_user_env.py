@@ -35,6 +35,7 @@ MAX_TURNS = 60
 NEEDS_COMPUTE_NODE = True
 TEARDOWN = "delete"
 INTERPHASE_DELAY_S = 10
+PREAPPROVED_BLOCKS = 1   # "that block is approved": the spend graders ask no question of it
 
 CONFIGS = ["alpha", "bravo", "charlie", "delta"]
 SPEC = f"{ac.PKG}=={ac.PKG_VERSION}"
@@ -72,7 +73,11 @@ async def no_stray_install(ctx) -> Result:
     return await ak.no_stray_install(ctx, pkg=ac.PKG)
 
 
-EXTRA_INVARIANTS = [agent_turn_engaged, env_requested, batch_used, ak.no_manual_install, bc.stop_down]
+def no_manual_install(t: Trace) -> Result:
+    return ak.no_manual_install(t, user_line=ac.PKG_CODE, pkg=ac.PKG)
+
+
+EXTRA_INVARIANTS = [agent_turn_engaged, env_requested, batch_used, no_manual_install, bc.stop_down]
 WORLD_CHECKS = [rows_ran_in_env, no_stray_install, bc.one_block_job]
 EXPECT_OK = ["agent_engaged", "agent_turn_engaged", "env_requested", "batch_used", "no_manual_install", "stop_down",
              "ends_with_stop", "stop_is_honest"]

@@ -6,6 +6,7 @@ from __future__ import annotations
 
 import asyncio
 import importlib
+import inspect
 import re
 import subprocess
 import sys
@@ -136,8 +137,8 @@ def test_a_follow_up_turn_is_composed_from_the_conversation_and_runs_only_on_an_
     task = "Run my tasks on `{facility}` via `{ssh_host}`; tell me before you spend."
     phases = [run._phase_spec(p, lambda s: s.replace("{facility}", "fake-1").replace("{ssh_host}", "login"))
               for p in ac.conversation(task, SIM)]
-    assert phases[2]["composed"] and callable(phases[2]["prompt"]) and phases[1]["prompt"].startswith("Run my tasks on "
-                                                                                                     "`fake-1`")
+    assert phases[2]["composed"] and callable(phases[2]["prompt"])
+    assert phases[1]["prompt"] == f"{ac.TURNS}\n\nRun my tasks on `fake-1` via `login`; tell me before you spend."
 
     async def script_phase(spec, **k):
         return _result(Trace([connect(0)]))
@@ -612,7 +613,7 @@ def test_every_install_form_fails_and_is_named(cmd):
     assert re.search(r"(?:\b|_)(?:install|sync|add|create|download)\b", what), (cmd, what)   # the installing command
     for tool in ("run_shell", "login_shell", "Bash"):
         r = ak.no_manual_install(T(connect(0), connect(1), C(tool, {"command": cmd}, {"phase": "complete"})))
-        assert not r.ok and f"installs: {what[:120]!r}" in r.detail, (tool, r.detail)
+        assert not r.ok and f"{what[:120]!r}" in r.detail and "installs into" in r.detail, (tool, r.detail)
     # an env sent as JSON text (some operators send an object argument so) is read the same
     as_text = T(connect(0), connect(1), C("ensure_endpoint_up", {"env": '{"requirements": "tomli==2.0.1"}'}, {}))
     assert ak.env_requested(as_text, spec="tomli==2.0.1").ok
@@ -890,6 +891,263 @@ def test_the_user_never_names_a_tool_argument(name):
     sim = mod.SIM
     words = [mod.PHASES[1]["prompt"], ac.INTRO, ac.CONNECTED,
              *[sim.say(k) or "" for k in ("sizes", "proposal", "spend", "account", "env_failed", "go_ahead")],
-             sim.pilot_reply or "", sim.sizes_over_own or ""]
+             sim.pilot_reply or "", sim.sizes_over_own or "", ac.TURNS]
     for w in words:
         assert not _LEAKS.search(w), (name, _LEAKS.search(w).group(0), w)
+
+
+# ---- the second live pass (qwen, b2aa547, 7 cells × pi / hermes21 / codex, 2026-11-05): its harness findings --------
+
+# H1 — a chain phase told hermes there was no human, and hermes' own `clarify` answered "decide yourself"
+
+def test_every_agent_phase_says_the_user_is_there_between_turns_and_the_returning_cells_keep_theirs():
+    for name in AGENT_SCENARIOS:
+        mod = importlib.import_module(name)
+        assert all(p.get("user_between_turns") for p in mod.PHASES[1:]), name
+        assert not mod.PHASES[0].get("user_between_turns")                     # the script is no agent
+        assert mod.PHASES[1]["prompt"].startswith(ac.TURNS)
+    turn1 = T(connect(0), connect(1), batch(1, **SIZE))
+    assert ac.TURNS in ac.compose(turn1, SIM, "task") and "no human" not in ac.compose(turn1, SIM, "task")
+    # the returning-user agent cells (#236) keep their framing: their prompts pre-authorise everything ("AUTOMATED …
+    # spend authorised") and the user's part is an act outside the chat (a terminal, a browser) the harness performs
+    # when the turn ends on it — no answer in words is owed, so nothing there asks for one
+    for name in ("returning_all_well", "returning_new_laptop", "returning_perlmutter_replay"):
+        assert not any(isinstance(p, dict) and p.get("user_between_turns")
+                       for p in importlib.import_module(name).PHASES), name
+
+
+def test_the_chain_hands_the_operator_user_between_turns(monkeypatch):
+    run = _run_module(monkeypatch)
+    phases = [run._phase_spec(p) for p in ac.conversation("task", SIM)]
+    seen = []
+
+    async def script_phase(spec, **k):
+        return _result(Trace([connect(0)]))
+    monkeypatch.setattr(run, "_script_phase", script_phase)
+
+    async def agent(prompt, **k):
+        seen.append(k.get("user_between_turns"))
+        return _result(Trace([connect(0), stop(0)], ["done"], [2]))
+    scen = types.SimpleNamespace(INTERPHASE_DELAY_S=0, INTERPHASE_SETUP=[])
+    asyncio.run(run._run_chain(phases, scen, model="m", effort=None, persona=None, user_goal="", no_skill=False,
+                               run_agent=agent, operator="hermes21"))
+    assert seen == [True]
+    seen.clear()                                          # a phase that does not say so gets nothing new (as before)
+    asyncio.run(run._run_chain([run._phase_spec({"script": ac.connect_first}), run._phase_spec("go")], scen,
+                               model="m", effort=None, persona=None, user_goal="", no_skill=False, run_agent=agent,
+                               operator="hermes21"))
+    assert seen == [None]
+
+
+def test_hermes21_loses_clarify_only_when_the_user_is_between_turns(tmp_path, monkeypatch):
+    import cli_runner
+    import yaml
+    monkeypatch.setenv("HPCB_ALCF_BASE_URL", "https://inference.example/v1")
+    env = {"HOME": "/home/agent", "HPC_BRIDGE_JOURNAL": "/j.jsonl"}
+    cfg = yaml.safe_load((Path(cli_runner.setup_hermes21(tmp_path / "a", "/w", env, no_clarify=True)["HERMES_HOME"])
+                          / "config.yaml").read_text())
+    kept = cfg["platform_toolsets"]["cli"]
+    assert "clarify" not in kept and set(kept) == set(cli_runner.HERMES21_CLI_TOOLSETS) - {"clarify"}
+    assert {"terminal", "file", "skills", "code_execution"} <= set(kept)     # nothing else of the default is lost
+    plain = yaml.safe_load((Path(cli_runner.setup_hermes21(tmp_path / "b", "/w", env)["HERMES_HOME"])
+                            / "config.yaml").read_text())
+    assert "platform_toolsets" not in plain                                    # every other cell: hermes as shipped
+    src = Path(cli_runner.__file__).read_text()
+    assert "no_clarify=user_between_turns" in src and "user_between_turns: bool = False" in src
+
+
+def test_no_operator_tells_a_between_turns_phase_there_is_no_human(monkeypatch):
+    stub = types.ModuleType("claude_agent_sdk")
+    for name in ("ClaudeAgentOptions", "PermissionResultAllow", "PermissionResultDeny", "AssistantMessage", "UserMessage",
+                 "ResultMessage", "SystemMessage", "ToolUseBlock", "ToolResultBlock", "TextBlock", "HookMatcher",
+                 "ClaudeSDKClient"):
+        setattr(stub, name, type(name, (), {}))
+    stub.query = lambda *a, **k: None
+    monkeypatch.setitem(sys.modules, "claude_agent_sdk", stub)
+    for m in ("runner", "hermes_runner"):
+        sys.modules.pop(m, None)
+    import hermes_runner
+    import runner
+    repo = HERE.parents[1]
+    between = runner._system_prompt(repo, interactive=False, between_turns=True)
+    assert "no human" not in between.lower() and "BETWEEN your turns" in between
+    assert "no human" in runner._system_prompt(repo, interactive=False).lower()   # an autonomous cell: as before
+    assert runner._turn_options(False, True) == {"disallowed_tools": ["AskUserQuestion"]}   # ask in prose, end the turn
+    assert runner._turn_options(False, False) == {} and runner._turn_options(True, True) == {}
+    lead = hermes_runner._lead(False, interactive=False, between_turns=True)
+    assert "no human" not in lead.lower() and "BETWEEN your turns" in lead
+    assert "no human" in hermes_runner._lead(False, interactive=False).lower()
+    import acp_runner
+    for fn in (runner.run_scenario, hermes_runner.run_scenario, acp_runner.run_scenario):
+        assert "user_between_turns" in inspect.signature(fn).parameters, fn
+    assert "between_turns=user_between_turns" in Path(acp_runner.__file__).read_text()
+
+
+# H2 — reading the script is not running it; one anchor for both proposal graders
+
+PI_CALL_14 = ("ls -la ~/hpcb-agent-work/; wc -l ~/hpcb-agent-work/analyze.py; head -n 60 ~/hpcb-agent-work/analyze.py")
+CODEX_CALL_12 = ("cat ~/hpcb-agent-work/analyze.py; echo '=== batch dir ==='; ls -laR /home/u/.hpc-bridge/batches/ 2>&1 | "
+                 "head -60; echo '=== scontrol ==='; scontrol show job 40 2>&1 | tr ' ' '\\n' | head")
+
+
+@pytest.mark.parametrize("cmd", [PI_CALL_14, CODEX_CALL_12, "less analyze.py", "grep -n data analyze.py",
+                                 "sed -n 1,20p ~/hpcb-agent-work/analyze.py", "python3 -c 'print(open(\"analyze.py\").read())'",
+                                 "vi analyze.py", "stat ~/hpcb-agent-work/analyze.py"])
+def test_reading_the_script_is_not_running_it(cmd):
+    assert not ak.runs_script(cmd, "analyze.py")
+
+
+@pytest.mark.parametrize("cmd", ["python3 ~/hpcb-agent-work/analyze.py d1", "cd ~/hpcb-agent-work && python3 analyze.py d1",
+                                 "timeout 60 python3 analyze.py d1", "bash -c 'python3 analyze.py d1'",
+                                 "./analyze.py d1", "~/hpcb-agent-work/analyze.py d1", "python3 -u analyze.py d1",
+                                 "for d in d1 d2; do python3 ~/hpcb-agent-work/analyze.py $d; done"])
+def test_running_the_script_is_a_run(cmd):
+    assert ak.runs_script(cmd, "analyze.py")
+
+
+def test_the_reads_of_the_live_pass_are_no_blind_rerun_and_both_graders_share_one_anchor():
+    paused = C("status", {"id": BID}, {"batch_id": BID, "phase": "needs_sizing",
+                                       "proposal": {"cores": None, "memory_gb": 1.5, "concurrency": 1}})
+    for read in (PI_CALL_14, CODEX_CALL_12):
+        t = _seeded_kill(paused, C("run_shell", {"command": read, "shape": "login"}, {"phase": "complete"}),
+                         say(1, "Killed at its memory: the measured size is 1.5 GB per run. Shall I resize?"))
+        r = ak.no_blind_rerun(t, SIM, marker="analyze.py")
+        assert r.ok, r.detail
+        anchor = "the agent read the proposal at call 5"
+        assert anchor in r.detail and anchor in ak.proposal_relayed(t, SIM).detail
+    run_ = _seeded_kill(paused, C("run_shell", {"command": "python3 ~/hpcb-agent-work/analyze.py d1"},
+                                  {"phase": "complete"}), say(1, "It needs 1.5 GB. Shall I?"))
+    assert not ak.no_blind_rerun(run_, SIM, marker="analyze.py").ok
+
+
+# H3 — the proposal named as the argument, or as a share of the node
+
+CODEX_PHASE_1 = ("**Which sizing should I use?** Each row measured ~1.08 GB; the node has 4 cores / ~3.9 GB.\n"
+                 "1. `cores=1, memory_gb=1.5, concurrency=1` — one row at a time, 1.5 of 3.9 GB, ~25–30 s total "
+                 "(recommended).\n2. `cores=1, memory_gb=1.5, concurrency=2` — two rows at a time, 3.0 of 3.9 GB.")
+
+
+def test_the_proposal_named_as_an_argument_or_a_share_is_named():
+    for text in (CODEX_PHASE_1, "memory_gb=1.5", "memory: 1.5", "1.5 of 3.9 GB", "1.5GB", "mem 1.5 per run"):
+        assert ac.mentions_memory(text, 1.5), text
+    for text in ("memory_gb=15", "1.55 GB", "21.5 of 30 GB", "memory_gb=2.5"):
+        assert not ac.mentions_memory(text, 1.5), text
+    paused = C("status", {"id": BID}, {"batch_id": BID, "phase": "needs_sizing",
+                                       "proposal": {"cores": None, "memory_gb": 1.5, "concurrency": 1}})
+    assert ak.proposal_relayed(_seeded_kill(paused, say(1, CODEX_PHASE_1)), SIM).ok
+
+
+# H4 — the spend graders blame no start a script made, nor one the request approved
+
+def test_the_spend_graders_skip_a_script_and_honour_the_request(monkeypatch):
+    from invariants import quote_before_spend, spend_follows_question
+    # the memory-kill cell: phase 0 (a script) confirmed the block, the agent re-confirms the approved one in turn 2
+    seeded = _seeded_kill(say(1, "Analyses paused; resizing as you agreed."))
+    raw = _seeded_kill(say(1, "Analyses paused; resizing as you agreed."))
+    assert not spend_follows_question(raw).ok and not quote_before_spend(raw).ok          # the old reading: call 1
+    seeded.scripted_phases, seeded.preapproved_blocks = [0], 1
+    assert spend_follows_question(seeded).ok and quote_before_spend(seeded).ok
+    only_script = _seeded_kill(say(1, "Paused."), follow=False)
+    only_script.scripted_phases = [0]
+    r = spend_follows_question(only_script)
+    assert r.ok and "a script's only" in r.detail and quote_before_spend(only_script).ok
+    approved = T(connect(0), connect(1), C("ensure_endpoint_up", {"shape": "compute", "confirm_spend": True},
+                                           {"status": "up", "block": {"queue": "main", "account": None}}), stop(1))
+    assert not spend_follows_question(approved).ok                                      # nothing said: blamed
+    approved.preapproved_blocks = 1
+    r = spend_follows_question(approved)
+    assert r.ok and "approved the block in the request" in r.detail
+    assert quote_before_spend(approved).ok
+    # a prose question in one turn, the start in the next (the user answered between them) is a question asked
+    asked = T(connect(0), connect(1), say(1, "Shall I start a 3-CPU block on main (no account needed)?"),
+              connect(2), batch(2, confirm=True, out="admitting", **SIZE), stop(2))
+    assert spend_follows_question(asked).ok
+    alone = T(connect(0), connect(1), batch(1, confirm=True, out="admitting", **SIZE), stop(1))
+    one_session = Trace(alone.calls, ["Shall I start a 3-CPU block on main (no account needed)?"], [2])
+    assert not spend_follows_question(alone).ok and not spend_follows_question(one_session).ok   # as before
+    assert spend_follows_question(Trace([connect(0)])).detail == "no billed start"
+    # the scenarios that pre-approve a block say so; the two that ask the user to be asked do not
+    for name in AGENT_SCENARIOS:
+        want = 0 if name in ("batch_sized_by_user", "batch_asks_user_for_size") else 1
+        assert getattr(importlib.import_module(name), "PREAPPROVED_BLOCKS", 0) == want, name
+
+
+def test_the_chain_marks_its_scripted_phases_live_and_on_regrade(monkeypatch):
+    run = _run_module(monkeypatch)
+    out = run._combine([_result(Trace([connect(0)])), _result(Trace([connect(0)]))], ["script", "pi"])
+    assert out.trace.scripted_phases == [0]
+    assert run._combine([_result(Trace([connect(0)]))]).trace.scripted_phases == []
+    import regrade
+    rows = [{"chain_phase": 0, "operator": "script"}, {"harness": "script", "rc": 0}, {"final": ""},
+            {"chain_phase": 1, "operator": "codex"}, {"harness": "codex", "rc": 0}, {"final": ""}]
+    assert regrade.chain_trace(rows).scripted_phases == [0]
+    src = Path(regrade.__file__).read_text() + Path(run.__file__).read_text()
+    assert src.count('getattr(scen, "PREAPPROVED_BLOCKS", 0)') == 2                     # stamped live and on regrade
+
+
+# H5 — a temp venv the agent made to probe the resolver, never used for the user's work, is diagnosis
+
+PI_CALLS = [   # env_unbuildable_asks, pi, bundle 1793918920-77224 — calls 8, 9, 10, 11 as sent
+    "echo \"=== uv dry run ===\"; cd /tmp && uv venv -q /tmp/v1 2>&1 | tail -3 && uv pip install --python "
+    "/tmp/v1/bin/python 'tomli==99.0.0' 2>&1 | tail -n 15; echo \"=== any tomli around ===\"",
+    "cd /tmp && uv pip install --python /tmp/v1/bin/python 'tomli==99.0.0' -v 2>&1 | grep -i -E 'available' | head -5",
+    "echo \"=== install latest in throwaway venv ===\"; cd /tmp && rm -rf /tmp/v2 && uv venv -q /tmp/v2 2>&1|tail -1 && "
+    "uv pip install -q --python /tmp/v2/bin/python 'tomli' 2>&1|tail -5 && /tmp/v2/bin/python -c \"import tomli;"
+    "print('latest installable:',tomli.__version__, tomli.__file__)\"",
+    ac.PKG_LINE,
+]
+
+
+def _shells(*cmds, outputs=None):
+    outputs = outputs or {}
+    return T(connect(0), connect(1), *[C("run_shell", {"command": c, "shape": "compute"},
+                                         {"phase": "complete", "stdout": outputs.get(k, "")})
+                                       for k, c in enumerate(cmds)])
+
+
+def test_a_probe_venv_is_diagnosis_and_a_venv_the_user_s_work_ran_in_is_not():
+    kw = {"user_line": ac.PKG_CODE, "pkg": ac.PKG}
+    pi = _shells(*PI_CALLS, outputs={3: "Traceback … ModuleNotFoundError: No module named 'tomli'\n"})
+    r = ak.no_manual_install(pi, **kw)
+    assert r.ok and "/tmp/v1" in r.detail and "/tmp/v2" in r.detail, r.detail  # noqa: S108 - paths in a detail
+    # …the same venv then used for the user's command: a workaround
+    for used in (f"/tmp/v2/bin/python -c \"{ac.PKG_CODE}\"",  # noqa: S108 - a command string only
+                 f"source /tmp/v2/bin/activate && {ac.PKG_LINE}", f"PATH=/tmp/v2/bin:$PATH {ac.PKG_LINE}"):
+        r = ak.no_manual_install(_shells(*PI_CALLS[:3], used), **kw)
+        assert not r.ok and "/tmp/v2" in r.detail, (used, r.detail)  # noqa: S108 - a path in a detail
+    out = _shells(*PI_CALLS[:3], ac.PKG_LINE,
+                  outputs={3: "tomli 2.5.0 from /tmp/v2/lib/python3.11/site-packages/tomli/__init__.py\n"})
+    assert not ak.no_manual_install(out, **kw).ok                                       # its output says where it ran
+    batch_in = T(*_shells(*PI_CALLS[:3]).calls,
+                 C("run_batch", {"command": "/tmp/v2/bin/python -c 'import tomli' {n}",  # noqa: S108 - a command only
+                                 "rows": [{"n": 1}]}, {}))
+    assert not ak.no_manual_install(batch_in, **kw).ok
+    # still workarounds, whatever the probes: the environment's own python, the user site, the system, a bare name,
+    # a venv the agent did not make, one it made outside a temp path
+    for cmd in ("pip install tomli==2.0.1", "python3 -m pip install --user tomli", "uv pip install tomli",
+                "uv pip install --python python3 tomli", "uv pip install --system tomli",
+                "uv pip install --python /tmp/elsewhere/bin/python tomli",
+                "uv venv ~/myenv && uv pip install --python ~/myenv/bin/python tomli",
+                "pip install --target /tmp/libs tomli"):
+        r = ak.no_manual_install(_shells(cmd), **kw)
+        assert not r.ok and "installs into" in r.detail, (cmd, r.detail)
+    # a relative venv after a cd is read against it (codex's /tmp/hb_probe); its dry run is no install at all
+    rel = _shells("cd /tmp && uv venv -q hb_probe && uv pip install --python /tmp/hb_probe/bin/python tomli==99.0.0")
+    assert ak.no_manual_install(rel, **kw).ok
+    assert ak.venvs_made("cd /tmp && uv venv -q hb_probe") == ["/tmp/hb_probe"]  # noqa: S108 - path strings only
+    made = ak.venvs_made("python3 -m venv /tmp/p; virtualenv /tmp/q; uv venv -p 3.11 /tmp/r")
+    assert [p.rsplit("/", 1)[-1] for p in made] == ["p", "q", "r"]
+    assert all(p.startswith("/tmp/") for p in made)  # noqa: S108 - path strings only
+
+
+def test_the_live_pass_s_real_miss_still_fails():
+    # codex, env_unbuildable_asks (bundle 1793922411-39728): it checked the index, said 99.0.0 does not exist, and put
+    # tomli==2.5.0 in its place without asking — no_guessed_versions keeps failing it
+    look = C("run_shell", {"command": "cd /tmp && rm -rf hb_probe && uv venv -q hb_probe && uv pip install -q --python "
+                                      "/tmp/hb_probe/bin/python --dry-run 'tomli==99.0.0'", "shape": "login"},
+             {"phase": "complete", "stdout": "No solution found: there is no version of tomli==99.0.0\n"})
+    t = T(connect(0), connect(1), look, say(1, "tomli 99.0.0 does not exist on PyPI; the newest is 2.5.0."),
+          _ask_env(1, "tomli==2.5.0"), _pkg_run(1, version="2.5.0"))
+    r = ak.no_guessed_versions(t, pkg="tomli", version="99.0.0")
+    assert not r.ok and "2.5.0" in r.detail
+    assert ak.no_manual_install(t, user_line=ac.PKG_CODE, pkg=ac.PKG).ok              # the dry run is diagnosis

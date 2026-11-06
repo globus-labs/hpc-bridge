@@ -37,6 +37,7 @@ MAX_TURNS = 60
 NEEDS_COMPUTE_NODE = True
 TEARDOWN = "delete"
 INTERPHASE_DELAY_S = 10
+PREAPPROVED_BLOCKS = 1   # "that block is approved": the spend graders ask no question of it
 
 SPEC = f"{ac.PKG}=={ac.PKG_VERSION}"
 SETUP = [ak.stray_scan_cmd(ac.PKG, remove=True)]
@@ -68,7 +69,11 @@ async def no_stray_install(ctx) -> Result:
     return await ak.no_stray_install(ctx, pkg=ac.PKG)
 
 
-EXTRA_INVARIANTS = [agent_turn_engaged, env_requested, pkg_ran_in_env, ak.no_manual_install, ak.env_pending_followed,
+def no_manual_install(t: Trace) -> Result:
+    return ak.no_manual_install(t, user_line=ac.PKG_CODE, pkg=ac.PKG)
+
+
+EXTRA_INVARIANTS = [agent_turn_engaged, env_requested, pkg_ran_in_env, no_manual_install, ak.env_pending_followed,
                     bc.stop_down]
 WORLD_CHECKS = [no_stray_install]
 EXPECT_OK = ["agent_engaged", "agent_turn_engaged", "env_requested", "pkg_ran_in_env", "no_manual_install",

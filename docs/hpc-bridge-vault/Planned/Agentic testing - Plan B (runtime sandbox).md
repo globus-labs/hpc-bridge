@@ -241,6 +241,12 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     `asked_for_sizes` passes on sizes asked in words, `terms_shown_before_yes` / `world:block_as_confirmed` grade
     the block that started however the agent got there, and `env_unbuildable_asks` accepts an agent that checks the
     version itself and asks before building anything.
+  - **Second live pass (b2aa547, 7 cells × pi / hermes21 / codex): 12 of 21 OK; 8 of 9 failures the harness's.**
+    A chain phase is now framed as a conversation for every operator (`user_between_turns`): never the autonomous "no
+    human" lead, no AskUserQuestion for Claude, no `clarify` for Hermes (in `-z` mode it answered "decide yourself",
+    and hermes21 did). A temp venv the agent made to probe the resolver is diagnosis; reading a script is not running
+    it; the spend graders skip a script's starts (`Trace.scripted_phases`) and a block the request approved
+    (`PREAPPROVED_BLOCKS`). Offline regrade: 15 of 21 OK.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

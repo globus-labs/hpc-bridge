@@ -39,6 +39,7 @@ MAX_TURNS = 60
 NEEDS_COMPUTE_NODE = True
 TEARDOWN = "delete"
 INTERPHASE_DELAY_S = 10
+PREAPPROVED_BLOCKS = 1   # "one compute block … is approved": the spend graders ask no question of it
 
 SAMPLES = ["s1", "s2", "s3", "s4"]
 TOKENS = ac.simulate_digests(SAMPLES)

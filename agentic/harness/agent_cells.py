@@ -61,6 +61,12 @@ INTRO = ("We are in the middle of a task on the HPC facility `{facility}` (login
          "starting over. Our conversation so far:")
 CONNECTED = ("I connected to the HPC facility `{facility}` (login host `{ssh_host}`) with hpc-bridge earlier today, "
              "so it is set up: connect to it again (no need to probe it or confirm a configuration).")
+# How the conversation works, said by the user at the top of every turn: they are there BETWEEN turns. The operators'
+# own framing agrees (`user_between_turns` on every agent phase: no "no human" lead, no tool that answers for the
+# user — hermes' `clarify` answered "decide yourself" in the qwen pass of 2026-11-05).
+TURNS = ("How we work: I'm here, between your turns. When you need something from me — a yes, a size, a choice — ask "
+         "me in plain text and end your turn; my answer comes at the start of your next turn. Don't decide those for "
+         "me.")
 
 
 @dataclass(frozen=True)
@@ -139,7 +145,8 @@ def prefix(t: Trace, n: int) -> Trace:
     calls = [c for c in t.calls if c.phase < n]
     placed = len(t.text_at) == len(t.texts)
     return Trace(calls, [t.texts[k] for k in keep], [t.text_at[k] for k in keep] if placed else [],
-                 events=list(t.events), t0=t.t0, text_phase=[phases[k] for k in keep])
+                 events=list(t.events), t0=t.t0, text_phase=[phases[k] for k in keep],
+                 scripted_phases=[p for p in t.scripted_phases if p < n], preapproved_blocks=t.preapproved_blocks)
 
 
 def calls_in(t: Trace, phase: int) -> list[tuple[int, ToolCall]]:
@@ -363,7 +370,7 @@ def _clip(text: str) -> str:
 
 def compose(t: Trace, sim: UserSim, task: str) -> str:
     """A follow-up turn's prompt: the conversation so far, replayed, and the user's answer to the last turn."""
-    parts = [INTRO, f"ME (my request): {task}"]
+    parts = [INTRO, TURNS, f"ME (my request): {task}"]
     given = {q: w for q, _k, w in answers_given(t, sim)}
     for k in range(FIRST_AGENT_PHASE, latest_phase(t) + 1):
         if k in given:
@@ -381,14 +388,16 @@ def _follow_up(q: int, sim: UserSim, task: str) -> dict:
 
     def prompt(t: Trace) -> str:
         return compose(t, sim, task)
-    return {"prompt": prompt, "when": when, "label": f"turn {q}: the user answers"}
+    return {"prompt": prompt, "when": when, "label": f"turn {q}: the user answers", "user_between_turns": True}
 
 
 def conversation(task: str, sim: UserSim, *, follow_ups: int = FOLLOW_UPS,
                  connect: Callable[..., Any] = connect_first) -> list[dict]:
-    """A cell's PHASES: the scripted connect (the premise), the user's request, then up to `follow_ups` answers."""
+    """A cell's PHASES: the scripted connect (the premise), the user's request, then up to `follow_ups` answers. Every
+    agent phase says the user answers between turns (TURNS, and `user_between_turns` for the operator)."""
     phases: list[dict] = [{"script": connect, "premise": True, "label": "earlier: the user connected (scripted)"},
-                          {"prompt": task, "label": "turn 1: the user's request"}]
+                          {"prompt": f"{TURNS}\n\n{task}", "label": "turn 1: the user's request",
+                           "user_between_turns": True}]
     phases += [_follow_up(q, sim, task) for q in range(FIRST_AGENT_PHASE + 1, FIRST_AGENT_PHASE + 1 + follow_ups)]
     return phases
 
@@ -412,17 +421,22 @@ def mentions_count(text: str, n: float | int | None, unit: str = _CPU) -> bool:
 
 
 def mentions_memory(text: str, gb: float | None) -> bool:
-    """`text` names `gb` of memory — in GB ("0.5 GB", "0.50 GiB", "half a GB") or in MB (512 or 500 per GB)."""
+    """`text` names `gb` of memory — in GB ("0.5 GB", "0.50 GiB", "1.5GB", "half a GB"), in MB (512 or 500 per GB),
+    as the argument or field it is (`memory_gb=1.5`, "memory: 1.5"), or as a share of a whole ("1.5 of 3.9 GB" — codex
+    offered the proposal so, 2026-11-05)."""
     if gb is None:
         return False
     forms = {f"{gb:g}", f"{gb:.2f}"} | ({f"{gb:.1f}"} if float(f"{gb:.1f}") == gb else set())
     if float(gb).is_integer():
         forms.add(str(int(gb)))
-    gb_pat = rf"(?<![\w.])(?:{'|'.join(re.escape(f) for f in forms)})\s*(?:gb|gib|g\b|gigabytes?)"
+    num = rf"(?<![\w.])(?:{'|'.join(re.escape(f) for f in forms)})(?![\d])"
+    gb_pat = rf"{num}\s*(?:gb|gib|g\b|gigabytes?)"
+    field = rf"\b(?:memory(?:_gb)?|mem|ram)\b\W{{0,4}}{num}(?!\.\d)"
+    share = rf"{num}\s*(?:of|/)\s*~?\d+(?:\.\d+)?\s*(?:gb|gib|g\b)"
     mb = {round(gb * 1024), round(gb * 1000)}
     mb_pat = rf"(?<![\w.])(?:{'|'.join(str(m) for m in mb)})\s*(?:mb|mib|m\b|megabytes?)"
     half = gb == 0.5 and re.search(r"\bhalf (?:a )?(?:gb|gigabyte|gib)\b", text, re.I)
-    return bool(re.search(gb_pat, text, re.I) or re.search(mb_pat, text, re.I) or half)
+    return bool(any(re.search(p, text, re.I) for p in (gb_pat, field, share, mb_pat)) or half)
 
 
 # ---- what the cells give the agent to run (the user's work) ---------------------------------------------------------
@@ -477,4 +491,5 @@ def analyze_digests(names: list[str]) -> dict[str, str]:
 
 PKG, PKG_VERSION = "tomli", "2.0.1"    # small, pure Python, a wheel on PyPI; in neither the endpoint venv (Python 3.11:
 #                                        only older Pythons pull it in) nor the fake nodes' system Python
-PKG_LINE = "python3 -c \"import tomli; print('tomli', tomli.__version__, 'from', tomli.__file__)\""
+PKG_CODE = "import tomli; print('tomli', tomli.__version__, 'from', tomli.__file__)"   # the user's own code
+PKG_LINE = f'python3 -c "{PKG_CODE}"'

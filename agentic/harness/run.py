@@ -135,8 +135,9 @@ def _combine(results: list[RunResult], labels: list[str] | None = None,
     dialogue = [d for r in results for d in (r.dialogue or [])]
     errored = [r for r in results if r.final is None or getattr(r.final, "is_error", False)]
     final = (errored[0] if errored else results[-1]).final
-    return RunResult(trace=Trace(calls, texts, text_at, text_phase=text_phase), final=final, messages=messages,
-                     dialogue=dialogue, arrivals=arrivals)
+    scripted = [k for k, label in enumerate(labels or []) if str(label).startswith("script")]
+    return RunResult(trace=Trace(calls, texts, text_at, text_phase=text_phase, scripted_phases=scripted), final=final,
+                     messages=messages, dialogue=dialogue, arrivals=arrivals)
 
 
 def _phase_spec(phase, fill=lambda x: x) -> dict:
@@ -152,7 +153,9 @@ def _phase_spec(phase, fill=lambda x: x) -> dict:
 
     `prompt` may be a callable, `fn(trace so far) -> str`: the prompt is then COMPOSED when the phase runs — the agent
     cells' follow-up turns (agent_cells.py) replay the conversation so far and add the simulated user's answer to
-    what the agent's last turn left open. The run's tokens are filled into what it returns."""
+    what the agent's last turn left open. The run's tokens are filled into what it returns. `"user_between_turns":
+    True` says the user answers in the NEXT phase: the operator is then never told there is no human, and loses any
+    tool that would answer for the user (`_run_chain` passes it on)."""
     if isinstance(phase, str):
         return {"prompt": fill(phase)}
     spec = dict(phase)
@@ -308,12 +311,15 @@ async def _run_chain(phases, scen, *, model, effort, persona, user_goal, no_skil
             if callable(prompt):   # a follow-up turn: composed from the conversation so far
                 composed = prompt = prompt(_combine(results).trace if results else Trace([]))
                 print(f"  composed prompt ({len(prompt)} chars): …{prompt[-300:]!r}")
+            # a phase whose user answers between turns (agent_cells.py): the operator must not say there is no human,
+            # nor keep a tool that answers for the user (hermes' clarify in -z mode)
+            between = {"user_between_turns": True} if spec.get("user_between_turns") else {}
             r = await run_agent(prompt, repo_root=REPO_ROOT, model=model, effort=effort,
                                 persona=persona, user_goal=user_goal, ablate_skill=no_skill,
                                 max_turns=getattr(scen, "MAX_TURNS", 40),
                                 extra_env=getattr(scen, "EXTRA_ENV", None) or None,
                                 midrun_hooks=(getattr(scen, "MIDRUN_HOOKS", None) if not agent_ran else None),
-                                hook_runner=_run_hook)
+                                hook_runner=_run_hook, **between)
             agent_ran = True
         results.append(r)
         labels.append(label)
@@ -1758,6 +1764,8 @@ async def _run(scenario: str, model: str, effort: str | None, persona: str | Non
         # ask whether the user said something (the adversarial personas: did the password_pusher offer its password?).
         res.trace.user_said = dialogue_words(res.dialogue)
         res.trace.user_said_at = dialogue_positions(res.dialogue)
+        # blocks the user approved in the request itself (the agent cells): the spend graders do not ask for more
+        res.trace.preapproved_blocks = int(getattr(scen, "PREAPPROVED_BLOCKS", 0) or 0)
         # Universal trace invariants + the scenario's own bespoke graders (EXTRA_INVARIANTS).
         results = check_all(res.trace)
         # a SCRIPT's staged failures (the scenario's STAGED_FAILED_CONNECTS, script operator only): the #39 row and its

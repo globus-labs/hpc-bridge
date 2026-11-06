@@ -52,6 +52,7 @@ MAX_TURNS = 60
 NEEDS_COMPUTE_NODE = True
 TEARDOWN = "delete"
 INTERPHASE_DELAY_S = 40      # past the batch lease's 30 s (ledger.LEASE_STALE_S): the agent's server takes it over
+PREAPPROVED_BLOCKS = 1       # "that block is approved": the agent re-confirming it (a new session) asks nothing new
 
 HOG_MB = 1100
 BLOCK_CORES, BLOCK_GB = 4, 3
