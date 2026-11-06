@@ -424,11 +424,11 @@ _TAIL = (
 )
 # A facility worker's shell is not a login shell: on Anvil's multi-user endpoint `module` was not defined there
 # (`module: command not found`, rc 127) where `. /etc/profile.d/modules.sh; module load …` worked (the Anvil live test,
-# F5). So
-# an activate line that uses `module` or `ml`, in a shell where neither is a function or a command, first sources the
-# first of the usual module inits that exists — its output on stderr with the rest of the activation. The system paths
-# are read under $HPCB_SYSROOT when set (MEASURE_SH's read-only seam for the tests). A line that still finds no module
-# command is refused with `nomodule` in its detail (`module_words` says what to add).
+# F5). So an activate line that uses `module` or `ml`, in a shell where neither is a function or a command, first
+# sources the first of the usual module inits that exists — its output on stderr with the rest of the activation, and
+# under the line's EXIT trap (review round 1: an init that calls `exit` ended the shell before it, and the row read as
+# one that ran). The system paths are read under $HPCB_SYSROOT when set (MEASURE_SH's read-only seam for the tests). A
+# line that still finds no module command is refused with `nomodule` in its detail (`module_words` says what to add).
 MODULE_INITS = ("$LMOD_PKG/init/bash", "/etc/profile.d/lmod.sh", "/etc/profile.d/modules.sh",
                 "/usr/share/lmod/lmod/init/bash", "/usr/share/Modules/init/bash")
 NOMODULE = "nomodule"
@@ -443,8 +443,9 @@ _MODULE_INIT = (
     "  done\n"
     "fi\n"
 )
-# `module` or `ml` as a command word of the line (after a separator, a pipe, a group or `!`)
-_USES_MODULE = re.compile(r"(?:^|[\s;&|(){}!`])(?:module|ml)(?=\s|$|[;&|)}`])")
+# `module` or `ml` as a COMMAND word of the line: at a line's start, or after `;`, `&&`, `||`, `|`, `(`, `{`, `!`, a
+# backquote, or `then` / `do` / `else` — never an argument (review round 1: `conda activate ml`, `python -m module`)
+_USES_MODULE = re.compile(r"(?:^|[;&|({!`]|\b(?:then|do|else)\b)[ \t]*(?:module|ml)(?=[ \t]|$|[;&|)}`])", re.M)
 
 
 def uses_module(line: str | None) -> bool:
@@ -512,6 +513,7 @@ _ACTIVATE_LINE = (
     "__hb_etrap=$(trap -p EXIT)\n"
     "trap '__hb_erc=$?; __hb_ew=activate; __hb_ex=\"rc=$__hb_erc (the line ended the shell)\"; __hb_erefuse trap' "
     "EXIT\n"
+    "@@MODINIT@@"
     'eval "$(printf %s @@B64@@ | base64 --decode)"\n'
     "__hb_erc=$?\n"
     "set +e\n"
@@ -543,8 +545,8 @@ def activation_sh(act: Activation, nonce: str) -> str:
               .replace("@@NOMODULE@@", NOMODULE))
     if act.how == "activate":
         b64 = shlex.quote(base64.b64encode(str(act.line or "").encode()).decode())
-        body = ((_MODULE_INIT if uses_module(act.line) else "")
-                + _ACTIVATE_LINE.replace("@@KEY@@", act.key).replace("@@B64@@", b64))
+        body = (_ACTIVATE_LINE.replace("@@KEY@@", act.key).replace("@@B64@@", b64)
+                .replace("@@MODINIT@@", _MODULE_INIT if uses_module(act.line) else ""))
     else:
         arch = act.arch if act.arch and re.fullmatch(r"[A-Za-z0-9_.-]{1,32}", act.arch) else ""
         body = (_ACTIVATE_BUILT.replace("@@UNSAFE@@", _UNSAFE.replace("@@PATHS@@", '"$__hb_er" "$__hb_ed"'))
@@ -827,10 +829,12 @@ def activate_check_script(line: str) -> str:
     R2-N7). rc 0: it activated; else the activation refused (its refusal line itself is not in what it said)."""
     act = activation_sh(Activation("activate", env_key(EnvSpec(kind="activate", activate=line)), line=line),
                         _CHECK_NONCE)
-    # (the endpoint venv scrubbed first, as every command's wrapper does: session_shell.ENDPOINT_VENV_SCRUB)
+    # (the endpoint venv scrubbed first, as every command's wrapper does: session_shell.ENDPOINT_VENV_SCRUB; a refusal
+    # for no module system is said as such — ` nomodule` after the rc — before its line is taken out: review round 1)
     return ("__hb_o=$( (\n" + session_shell.ENDPOINT_VENV_SCRUB + act + ") 2>&1 ); __hb_rc=$?\n"
+            f"__hb_nm=; printf '%s\\n' \"$__hb_o\" | grep -q '^{REFUSED} .* {NOMODULE}$' && __hb_nm=' {NOMODULE}'\n"
             f"__hb_o=$(printf '%s\\n' \"$__hb_o\" | grep -v '^{REFUSED} ')\n"
-            "printf 'HPCB_ENV_ACTIVATE rc=%s out_b64=%s\\n' \"$__hb_rc\" "
+            "printf 'HPCB_ENV_ACTIVATE rc=%s%s out_b64=%s\\n' \"$__hb_rc\" \"$__hb_nm\" "
             "\"$(printf '%s' \"$__hb_o\" | tail -c 2000 | base64 | tr -d '\\n')\"\n")
 
 
@@ -1092,11 +1096,13 @@ def _absorb(app: AppCtx, k: _Known) -> None:
     res = fut.result()
     out = str(getattr(res, "stdout", "") or "")
     if k.kind == "activate":
-        m = re.search(r"^HPCB_ENV_ACTIVATE rc=(\d+) out_b64=(\S*)\s*$", out, re.M)
-        words = _b64text(m.group(2)).strip() if m else out.strip()[-300:]
+        m = re.search(rf"^HPCB_ENV_ACTIVATE rc=(\d+)( {NOMODULE})? out_b64=(\S*)\s*$", out, re.M)
+        words = _b64text(m.group(3)).strip() if m else out.strip()[-300:]
         ok = m is not None and m.group(1) == "0"
         err = None if ok else (said(words) or "its line failed and said nothing")
         k.fault = None if ok else "line"
+        if not ok and m is not None and m.group(2):   # no module system on the login node: said in hpc-bridge's words
+            k.fault, err = "nomodule", module_words(NOMODULE, k.spec.activate)
         k.info = k.info.model_copy(update={"state": "ready" if ok else "unchecked", "task_id": None, "error": err})
         return
     b = parse_build(out)
@@ -1360,22 +1366,8 @@ async def choose(app: AppCtx, spec: EnvSpec | None) -> Chosen:
         if app.env_seq != mine:
             return _superseded(info)
         app.env_spec, app.env_pending = spec, None
-        if info.state == "ready":
-            words = "it activates on the login node; each command, batch row and job runs it first."
-        elif k.future is not None:   # its check is queued behind a build on the build worker (review S13)
-            words = ("its check on the login node is still queued behind a build: it is kept, and each command checks "
-                     "it as it runs (nothing runs where its line does not work).")
-        elif access_of(app) == "ssh" and info.error and k.fault == "runner":   # never the line's fault (R2-S4)
-            words = (f"it could not be checked on the login node (quoted as data: {said(info.error)!r}): it is kept, "
-                     "and each command checks it as it runs (nothing runs where its line does not work).")
-        elif access_of(app) == "ssh" and info.error:
-            words = (f"its line did not work on the login node, saying (quoted as data): {said(info.error)!r} — login "
-                     "and compute nodes may load different modules, so it is kept and checked again with each command, "
-                     "which runs nothing if it fails there.")
-        else:
-            words = "it is checked with each command (a facility endpoint has no login node to try it on first)."
-        return Chosen(info, f"The session's env is the existing one{f' {info.name}' if info.name else ''}: {words} "
-                            "No new block.")
+        return Chosen(info, f"The session's env is the existing one{f' {info.name}' if info.name else ''}: "
+                            f"{_activate_words(app, k, info)} No new block.")
     k = await ensure_built(app, spec)
     info = info_for(k, spec.name)
     if app.env_seq != mine:
@@ -1404,6 +1396,26 @@ async def choose(app: AppCtx, spec: EnvSpec | None) -> Chosen:
     return Chosen(info, (f"The env {info.name or info.key} is being built on the login node (free){where}: "
                          f"{serving}, and it becomes the session's env once it is ready (ensure_endpoint_up says "
                          "when).") + built_notice(app, info), taken=False)
+
+
+def _activate_words(app: AppCtx, k: _Known, info: EnvInfo) -> str:
+    """What choose() says of an existing env, from its check on the login node (if any)."""
+    if info.state == "ready":
+        return "it activates on the login node; each command, batch row and job runs it first."
+    if k.future is not None:   # its check is queued behind a build on the build worker (review S13)
+        return ("its check on the login node is still queued behind a build: it is kept, and each command checks it as "
+                "it runs (nothing runs where its line does not work).")
+    if access_of(app) == "ssh" and info.error and k.fault == "runner":   # never the line's fault (R2-S4)
+        return (f"it could not be checked on the login node (quoted as data: {said(info.error)!r}): it is kept, and "
+                "each command checks it as it runs (nothing runs where its line does not work).")
+    if access_of(app) == "ssh" and info.error and k.fault == "nomodule":   # hpc-bridge's own words (review round 1)
+        return (f"its line did not work on the login node — {info.error}. Compute nodes may differ, so it is kept and "
+                "checked again with each command, which runs nothing if it fails there.")
+    if access_of(app) == "ssh" and info.error:
+        return (f"its line did not work on the login node, saying (quoted as data): {said(info.error)!r} — login and "
+                "compute nodes may load different modules, so it is kept and checked again with each command, which "
+                "runs nothing if it fails there.")
+    return "it is checked with each command (a facility endpoint has no login node to try it on first)."
 
 
 def _superseded(info: EnvInfo) -> Chosen:

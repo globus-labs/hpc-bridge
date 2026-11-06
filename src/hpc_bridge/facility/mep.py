@@ -1,7 +1,6 @@
 from __future__ import annotations
 
 import asyncio
-import math
 import re
 import sys
 from typing import Any
@@ -362,13 +361,11 @@ class MEPFacility:
                     uec[resources.WHOLE] = True
                 else:
                     uec.pop(resources.WHOLE, None)
-            # the template's memory key takes whole GB (parsl's mem_per_node): a fraction goes rounded UP, as the terms
-            # say it (resources.effective, channel "mep"; review G4)
+            # the template's memory key takes whole GB (parsl's mem_per_node): rounded UP by the one rule the terms use
+            # too (resources.whole_gb; resources.effective, channel "mep"; review G4 and its round 1)
             mem = uec.get(resources.MEM)
-            if isinstance(mem, float) and not mem.is_integer():
-                uec[resources.MEM] = math.ceil(mem)
-            elif isinstance(mem, float):
-                uec[resources.MEM] = int(mem)
+            if isinstance(mem, int | float) and not isinstance(mem, bool) and mem > 0:
+                uec[resources.MEM] = resources.whole_gb(mem)
         for src, dst in self.key_map.items():
             if src in uec:
                 val = uec.pop(src)

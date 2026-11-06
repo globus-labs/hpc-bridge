@@ -60,6 +60,7 @@ KEY_ARGS = {v: k for k, v in ARG_KEYS.items()}
 DEFAULT_SLICE_CORES = 8        # D3: "a few cores" — and never more than half a node, nor a per-job cap allows
 UNKNOWN_NODE_SLICE_CORES = 4   # the same when the node's core count is not known
 MAX_COUNT = 100_000            # a sanity bound on every count (cores, GB, GPUs, nodes)
+MIN_MEMORY_GB = 1 / 1024       # a memory under a megabyte is refused (no scheduler gives less; the terms said "0 GB")
 
 Channel = Literal["ssh", "mep", "other"]
 
@@ -86,9 +87,10 @@ def requested(cores: Any = None, memory_gb: Any = None, gpus: Any = None, nodes:
             if not isinstance(v, bool):
                 return {}, f"invalid whole_node {v!r}: true or false"
             continue
-        if arg == "memory_gb":
-            if isinstance(v, bool) or not isinstance(v, int | float) or not 0 < v <= MAX_COUNT:   # NaN fails too
-                return {}, f"invalid memory_gb {v!r}: GB, a number above 0 (1.5 is fine) and at most {MAX_COUNT}"
+        if arg == "memory_gb":   # NaN fails the range too; under a megabyte is no amount (review round 1: "0 GB")
+            if isinstance(v, bool) or not isinstance(v, int | float) or not MIN_MEMORY_GB <= v <= MAX_COUNT:
+                return {}, (f"invalid memory_gb {v!r}: GB, a number above 0 (1.5 is fine; at least 1 MB) and at most "
+                            f"{MAX_COUNT}")
             continue
         if isinstance(v, bool) or not isinstance(v, int):
             return {}, f"invalid {arg} {v!r}: a whole number"
@@ -194,7 +196,14 @@ def _mem(v: Any) -> float | None:
 
 def mem_mb(gb: float) -> int:
     """GB as the scheduler's MB, never less than asked."""
-    return max(1, math.ceil(gb * 1024 - 1e-9))
+    return max(1, math.ceil(gb * 1024))
+
+
+def whole_gb(gb: float) -> int:
+    """GB as a template's whole-GB memory key takes it (parsl's mem_per_node): rounded UP, at least 1 — the ONE rule
+    the terms (`effective`, channel "mep") and the facility endpoint's wire (facility/mep.py) share (review round 1:
+    two rules had the terms say 2 GB while 3 were sent)."""
+    return max(1, math.ceil(gb))
 
 
 @dataclass(frozen=True)
@@ -334,7 +343,7 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
         if mem is not None:
             # a facility template's memory key takes whole GB (parsl's mem_per_node): a fraction goes rounded UP, and
             # the terms say what is sent — never less than asked (review G4)
-            send = float(math.ceil(mem - 1e-9))
+            send = float(whole_gb(mem))
             gb, mem_default = send, False
         elif whole is False and per_core and cores and shape is not None and shape.mem_per_core_mb:
             gb, mem_default, send = round(cores * shape.mem_per_core_mb / 1024, 1), True, None

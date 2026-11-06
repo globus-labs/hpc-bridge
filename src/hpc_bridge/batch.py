@@ -1976,9 +1976,11 @@ def _sizing_args(cores: Any, memory_gb: Any, gpus: Any, concurrency: Any, pin: A
             return f"{name}={v!r} is not a whole number"
         if not low <= v <= _SIZE_MAX:
             return f"{name}={v!r}: from {low} to {_SIZE_MAX}"
+    from .resources import MIN_MEMORY_GB
+
     if memory_gb is not None and (isinstance(memory_gb, bool) or not isinstance(memory_gb, int | float)
-                                  or not 0 < float(memory_gb) <= _SIZE_MAX):
-        return f"memory_gb={memory_gb!r}: GB per row, a number above 0"
+                                  or not MIN_MEMORY_GB <= float(memory_gb) <= _SIZE_MAX):
+        return f"memory_gb={memory_gb!r}: GB per row, a number above 0 (at least 1 MB)"
     if not isinstance(pin, bool):
         return f"pin={pin!r}: true or false"
     if isinstance(pilot, bool) or not isinstance(pilot, int) or pilot not in (0, 1, 2):
