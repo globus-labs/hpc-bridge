@@ -27,7 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -552,7 +552,10 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                            ("req_mem_default", "integer"), ("pinned", "integer"),
                            # how many of the watcher's looks read its runnable threads, how many saw more than its
                            # cores (sizing.oversubscribed), and whether a look saw an srun of its own
-                           ("r_samples", "integer"), ("r_over", "integer"), ("srun", "integer")],
+                           ("r_samples", "integer"), ("r_over", "integer"), ("srun", "integer"),
+                           # the server that sent the attempt (`reserve`): whose liveness a slot it holds follows —
+                           # never the batch's later lease holder (the restart block review, item 6)
+                           ("sent_host", "text"), ("sent_pid", "integer"), ("sent_start", "text")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text"),
                           ("env", "text")]}   # block environments: the env its job.sh activates (as a batch's)
@@ -762,7 +765,8 @@ class Ledger:
         return None if r is None else str(r[0] or "retired")
 
     # -- admission -------------------------------------------------------------------------------------------------
-    def _alive(self, row: sqlite3.Row, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool]) -> bool:
+    def _alive(self, row: sqlite3.Row | Mapping[str, Any], owner: Owner | None,
+               seen: dict[tuple[str, int, str | None], bool]) -> bool:
         """Whether a batch's lease holder still runs (`holder_alive`), once per holder — the caller's own server only
         when its start time, if on record, is the caller's (review round 2: a restarted server handed the dead one's
         pid had taken that server's rows for its own, and held them for good)."""
@@ -779,13 +783,14 @@ class Ledger:
         """Per batch (the caller's too), on THIS block — the endpoint and config `uec_hash` — (holds, out):
         `holds`, its rows that can still hold a worker of the block, and none that cannot be shown to (review round 1:
         an aborted batch's presumed-lost rows had shrunk every later window on a MEP's one config, for good):
-        - `in_flight`: while its batch's server runs (it settles or presumes it); a gone server's only until
-          task_walltime_s + `margin_s` past its admission (`HOLD_MARGIN_S`: the wrapper's own end, and delivery);
+        - `in_flight`: while the server that SENT it runs (it settles or presumes it; a row recorded before its sender
+          was: its batch's lease holder); a gone server's only until task_walltime_s + `margin_s` past its admission
+          (`HOLD_MARGIN_S`: the wrapper's own end, and delivery) — also once another server took the batch over;
         - `submit_unknown`: until EVIDENCE says its task can no longer run (`unheld`, `batch._unknown_evidence`), or
           reconciliation settles it — whatever its batch's state or server (review round 2: a failed POST may have
           queued it, and on a MEP the next submit with that config delivers it). Never silently: a batch it holds is
           told which batch holds it (`Reserved.holders`);
-        - `presumed_lost`: only while its server runs and it was sent to the block in front (`block_job`).
+        - `presumed_lost`: only while the server that sent it runs and it was sent to the block in front (`block_job`).
         `out`, its rows in flight or of unknown fate on the block: the fairness order, the same whoever reads it.
         One scan, on the partial index `task_holding_by_uec` (a row from before `sent_uec` was set at admission is
         read by its batch's config)."""
@@ -798,11 +803,18 @@ class Ledger:
         """`_on_block`, and per batch what its holding rows hold of the block's pool (batch row sizing): [CPUs, memory
         MB, GPUs] — each attempt's own `req_*`, else its batch's size, else one CPU."""
         states = ", ".join(f"'{s}'" for s in HOLDING)
+        # whose liveness a row's slot follows: the server that SENT it (`sent_*`, set by `reserve`), else — a row from
+        # before that was recorded — its batch's lease holder. Never the holder that took the lease over: a dead
+        # server's row past its walltime cannot still hold a worker, whoever collects the batch now (live 2026-11-06,
+        # batch_restart_resume: the resume took the killed server's block over, Globus answered every REST pull with a
+        # 500, and its three ended rows held the block's whole window until it idled out)
         cols = ("t.batch_id, t.state, t.sent_job, t.unheld, coalesce(t.admitted_at, t.unknown_since, 0) as sent_at, "
                 "coalesce(t.req_cores, o.cores, 1) as rc, coalesce(t.req_memory_mb, o.memory_mb, 0) as rm, "
-                "coalesce(t.req_gpus, o.gpus, 0) as rg, "
-                "o.task_walltime_s, o.owner_host, o.owner_pid, o.owner_start from task t join batch o on o.id = "
-                f"t.batch_id where o.endpoint_id is ? and t.state in ({states}) and ")
+                "coalesce(t.req_gpus, o.gpus, 0) as rg, o.task_walltime_s, "
+                "case when t.sent_pid is null then o.owner_host else t.sent_host end as owner_host, "
+                "case when t.sent_pid is null then o.owner_pid else t.sent_pid end as owner_pid, "
+                "case when t.sent_pid is null then o.owner_start else t.sent_start end as owner_start "
+                f"from task t join batch o on o.id = t.batch_id where o.endpoint_id is ? and t.state in ({states}) and ")
         holds: dict[str, int] = {}
         out: dict[str, int] = {}
         use: dict[str, list[int]] = {}
@@ -948,12 +960,28 @@ class Ledger:
             if why is not None:
                 raise RetiredConfig(str(why[0] or "this block's config was retired"))
             hold = ",".join("?" * len(HOLDING))
-
-            def held_by(bid: str) -> int:   # a batch's own window: its rows out, wherever they went
-                return int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
-                                     (bid, *HOLDING)).fetchone()[0])
-
             seen: dict[tuple[str, int, str | None], bool] = {}
+
+            def held_by(bid: str) -> int:
+                """A batch's own window: its rows out, wherever they went — but not one a server that is GONE sent
+                (in flight or presumed lost) past task_walltime_s + `margin_s` since its admission: the wrapper's own
+                end, so it holds no worker any more, whoever holds the lease now (the restart block review, item 6:
+                the killed server's three rows, uncollectable through a Globus outage, held the resumed batch's whole
+                window). A submit of unknown fate always holds; a row recorded before its sender was, too."""
+                tw = c.execute("select task_walltime_s from batch where id = ?", (bid,)).fetchone()
+                bound = float((tw[0] if tw is not None else 0.0) or 0.0) + margin_s
+                n = 0
+                for t in c.execute(f"select state, coalesce(admitted_at, unknown_since, 0) as sent_at, sent_host, "
+                                   f"sent_pid, sent_start from task where batch_id = ? and state in ({hold})",
+                                   (bid, *HOLDING)):
+                    if (t["state"] != "submit_unknown" and t["sent_pid"] is not None
+                            and at - float(t["sent_at"] or 0.0) >= bound
+                            and not self._alive({"owner_host": t["sent_host"], "owner_pid": t["sent_pid"],
+                                                 "owner_start": t["sent_start"]}, owner, seen)):
+                        continue
+                    n += 1
+                return n
+
             held = held_by(batch_id)
             holds, out, use = self._on_block_use(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen)
             mine_on = holds.pop(batch_id, 0)
@@ -1055,9 +1083,9 @@ class Ledger:
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
                           "started_at = null, sent_uec = ?, req_cores = ?, req_memory_mb = ?, req_gpus = ?, "
                           "req_mem_default = ?, not_before = null, pinned = null, r_samples = null, r_over = null, "
-                          "srun = null where batch_id = ? and idx = ?",
-                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, batch_id,
-                           r["idx"]))
+                          "srun = null, sent_host = ?, sent_pid = ?, sent_start = ? where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, owner.host,
+                           owner.pid, owner.started, batch_id, r["idx"]))
                 got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
             return got
 
