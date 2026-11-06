@@ -760,6 +760,7 @@ async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict,
         t.scratch = _scratch(app, fac, eid, facility, left_blocks=[_left(_block(r, verified=False)) for r in recs
                                                                    if r.get("mep")] if mep else [])
     held = [r for r in recs if whose[(eid, r["request"])] in ("live", "elsewhere")]
+    problem: str | None = None
     if (held and t.scratch is not None and login_of is not None and _has_login_shape(t.scratch)
             and not any(whose[(eid, r["request"])] == "live" for r in held)):
         # another machine's records: read against the scheduler, so one whose block is gone is closed, not left to
@@ -768,16 +769,19 @@ async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict,
             await verify(t.scratch, eid, login_of(t.scratch))
         except Exception:  # noqa: BLE001 - unread: they stay named
             pass
-        left, _problem = _records(app, eid)
-        still = {r["request"] for r in left}
-        held = [r for r in held if r["request"] in still]
-        t.recs = [r for r in recs if r["request"] in still]
+        left, problem = _records(app, eid)
+        if problem is None:   # a record that cannot be read again keeps every row: never `down` on a read that failed
+            still = {r["request"] for r in left}
+            held = [r for r in held if r["request"] in still]
+            t.recs = [r for r in recs if r["request"] in still]
     if held:
         here = all(whose[(eid, r["request"])] == "live" for r in held)
         blocks = [_block(r, verified=False) for r in held]
         notice = notices._earlier_live_stop(blocks, here=here)
         if not here:   # another machine's: the user can still end it by its id
             notice += notices._earlier_user_cancel(blocks, recs[-1].get("scheduler"), host)
+        if problem is not None:
+            notice += f" The record of billed blocks could not be read again ({problem})."
         t.part = EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
                                 block_job_id=next((b.job for b in blocks if b.job), None), notice=notice)
         return t
