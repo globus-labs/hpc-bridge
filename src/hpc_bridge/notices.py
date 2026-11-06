@@ -889,6 +889,14 @@ def _earlier_unread_stop(problem: str) -> str:
             f"started could not be read ({problem}): one may still bill. Spend is NOT confirmed stopped — "
             "connect_facility to the facility, then stop_endpoint, releases its blocks.")
 
+
+def _earlier_record_unread(why: str | None) -> str:
+    """The record of billed blocks could not be read (hpc_bridge.earlier: a `record_unread` view) — never "nothing is
+    billed" in its place."""
+    why = why or "the record of billed blocks could not be read"
+    return (f"{why[:1].upper()}{why[1:]}: a block an earlier hpc-bridge session started may still bill on this "
+            "endpoint, and nothing new is started here until the record reads again. ")
+
 def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
     """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
     spend is asked again if it is, then what to do. After a reap a check found (`reap_kicked`), a replacement may

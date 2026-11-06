@@ -200,11 +200,13 @@ class EarlierBlock:
 class EarlierView:
     """What this process last read of the blocks earlier servers left on one endpoint (hpc_bridge.earlier.verify):
     when (time.monotonic()), the ones still billing or still asked for, and why the scheduler could not be read
-    (`unread`; the records are then named unverified)."""
+    (`unread`; the records are then named unverified). `record_unread`: the record itself could not be read — the
+    blocks are the last good read's, unverified, and no billed block starts there until it reads again."""
 
     at: float
     blocks: tuple[EarlierBlock, ...] = ()
     unread: str | None = None
+    record_unread: bool = False
 
 
 @dataclass(frozen=True)

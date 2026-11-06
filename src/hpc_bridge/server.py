@@ -683,7 +683,8 @@ async def _ensure_up_once(
         if block == "needs_confirmation" and rt.earlier_unread:   # read off the lock, then decided again (the caller)
             return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                                   session_spend=_total_session_spend(app), partition=active_partition,
-                                  account=active_account, notice=notices._EARLIER_UNREAD)
+                                  account=active_account,
+                                  notice=earlier.unread_note(app) + notices._EARLIER_UNREAD)
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             terms = _block_terms(app, rt, named=named)
             rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the size this question names

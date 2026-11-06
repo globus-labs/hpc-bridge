@@ -330,11 +330,15 @@ async def verify(app: AppCtx, eid: str, run_login: LoginRunner) -> EarlierView:
     endpoint was started for); a record matches its job, or a pilot of its block request (a pilot the endpoint started
     again for it). A record whose block is gone — its job no longer listed, a pilot of it finished, or no pilot of it
     long after it was asked for — is closed quietly. A facility endpoint is named from its records alone (no scheduler
-    channel there). A listing that cannot be read names the records unverified."""
+    channel there). A listing that cannot be read names the records unverified. A record that cannot be read keeps
+    what the last good read saw, unverified, and marks the view `record_unread` (review round 4: an empty view had
+    wiped a verified block, and connect and the next yes went on as if nothing billed); a good read clears it."""
     rows, problem = _records(app, eid)
     now = time.monotonic()
     if problem is not None:
-        view = EarlierView(at=now, unread=f"the record of earlier blocks could not be read ({problem})")
+        prev = app.earlier.get(eid)
+        view = EarlierView(at=now, blocks=tuple(replace(b, verified=False) for b in (prev.blocks if prev else ())),
+                           unread=f"the record of billed blocks could not be read ({problem})", record_unread=True)
         app.earlier[eid] = view
         return view
     whose = {str(r["request"]): _whose(app, r) for r in rows}
@@ -414,7 +418,7 @@ async def refresh(app: AppCtx, eid: str | None, run_login: LoginRunner | None, *
         _name_unbound(app)
         return None
     view = app.earlier.get(eid)
-    if not force and view is not None and time.monotonic() - view.at < VIEW_TTL_S:
+    if not force and view is not None and not view.record_unread and time.monotonic() - view.at < VIEW_TTL_S:
         return view
     rows, problem = _records(app, eid)
     if problem is None and not any(_whose(app, r) in ("earlier", "elsewhere") for r in rows):
@@ -430,9 +434,13 @@ def unread(app: AppCtx, eid: str | None) -> bool:
     whatever path led to it — a connect, a startup pin, a connect whose login bring-up failed, a fresh session): a
     record of another server is open there that this process has not read since it knew the endpoint. Then nothing is
     started: the caller reads it (off the lock) and decides the yes again — reuse, ask, or a fresh block (review round
-    3: the record had been read only for a pin whose facility string matched exactly). A ledger read only."""
-    if eid is None or eid in app.earlier:
+    3: the record had been read only for a pin whose facility string matched exactly) — and while the record itself
+    could not be read, every time (review round 4: a stored unread view had passed for a read one). A ledger read
+    only."""
+    if eid is None:
         return False
+    if (view := app.earlier.get(eid)) is not None:
+        return view.record_unread
     rows, problem = _records(app, eid)
     return problem is not None or any(_whose(app, r) in ("earlier", "elsewhere") for r in rows)
 
@@ -574,7 +582,7 @@ def spend_lead(app: AppCtx, rt: ShapeRuntime, *, yes: bool = False) -> str:
     named. `yes`: the call carried confirm_spend=True, and a block it did not know of made it ask."""
     blocks = _billing(app)
     if not blocks:
-        return ""
+        return unread_note(app)
     view = _view(app)
     asked = yes and must_ask(app, rt)
     note = _note(app, blocks, rt.user_endpoint_config, unread=view.unread if view is not None else None, ask=asked)
@@ -612,8 +620,15 @@ def connect_note(app: AppCtx) -> str:
 
     view = _view(app)
     if view is None or not view.blocks:
-        return ""
+        return unread_note(app)
     return _note(app, list(view.blocks), warmth._seed_uec(app, "compute"), unread=view.unread)
+
+
+def unread_note(app: AppCtx) -> str:
+    """While the record itself could not be read: that it could not, and that an earlier block may still bill — never
+    nothing (review round 4: connect said "Nothing is started or billed yet" while job 40 ran)."""
+    view = _view(app)
+    return notices._earlier_record_unread(view.unread) if view is not None and view.record_unread else ""
 
 
 def receipt(app: AppCtx, rt: ShapeRuntime) -> str:
@@ -664,7 +679,11 @@ def mep_left(app: AppCtx, eid: str | None) -> str:
     app.lock."""
     if eid is None:
         return ""
-    rows, _problem = _records(app, eid)
+    rows, problem = _records(app, eid)
+    if problem is not None:   # fail closed: said, and no billed block starts here until it reads (review round 4)
+        why = f"the record of billed blocks could not be read ({problem})"
+        app.earlier[eid] = EarlierView(at=time.monotonic(), unread=why, record_unread=True)
+        return notices._earlier_record_unread(why)
     blocks = [_block(r, verified=False) for r in rows if r.get("mep") and _whose(app, r) == "earlier"]
     app.earlier[eid] = EarlierView(at=time.monotonic(), blocks=tuple(blocks))
     if not blocks:
