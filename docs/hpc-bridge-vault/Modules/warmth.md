@@ -38,6 +38,8 @@ session's choice with no switch. `_provision` reads the size again after `adopt_
 and, when it differs, drops the confirmation before anything starts (`ShapeRuntime.resized`, said by the re-ask).
 `_repoint` records whether a switch moved the size (`switched_size`) for the re-ask's words.
 
+**A block an earlier server left (2026-11-06, [[earlier]]).** `_provision` writes every NEW billed block request to the ledger (`earlier.record_request`) once its block request number is drawn and before its check is sent, and its scheduler job where the block is first confirmed warm (`earlier.record_up`); `_void_rejected` closes the record of a rejected one. At the spend floor, a yes that would start a block while an earlier server's block bills on this endpoint, that this yes would not reuse and no spend question of this process named, answers `needs_confirmation` (`earlier.must_ask`). In place of `_fresh_block`, under the same guard (no block of ours up, no work on it), a block an earlier server left on exactly these terms — the config it would send, with that block's request in it, hashes to the recorded one — is taken over (`earlier.reuse_for` / `adopt`: its `hpcb_block`, its age through `AppCtx.job_seen_since`), so the check lands on it and no second block starts.
+
 ## A broken endpoint environment (2026-10-30, the returning-user cells)
 `_provision`, after `_confirm_worker`: when the block is not warm and the dispatch failure is an import failure
 (`notices.broken_endpoint_env`: `No module named …`, an ImportError), `_repair_broken_env` runs the facility's

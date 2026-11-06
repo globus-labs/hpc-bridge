@@ -23,7 +23,7 @@ This vault has two halves:
 - [[Facility catalog]] — the public registry (a Globus Search index, read anonymously) → `MachineProfile` or `MEPFacility`; `list_facilities` / `connect_facility`; the resolution precedence
 
 ## Modules — `src/hpc_bridge/`
-**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]] · [[batch]] · [[sizing]] · [[jobs]] · [[meter]] · [[handoff]] · [[envs]]
+**Server & runtime:** [[server]] · [[login]] · [[login_flow_manager]] · [[runner]] · [[dispatch]] · [[lifecycle]] · [[session_shell]] · [[cost]] · [[models]] · [[profile]] · [[shapes]] · [[discovery]] · [[resources]] · [[batch]] · [[sizing]] · [[jobs]] · [[meter]] · [[handoff]] · [[envs]] · [[earlier]] (billed blocks an earlier server process left)
 **Facility seam:** [[facility-base]] · [[facility-local]] · [[facility-remote]] · [[facility-endpoint_venv]] · [[facility-mep]]
 **Bootstrap & state:** [[endpoint]] · [[credentials]] · [[state]] · [[ledger]]
 *(The `catalog/` package — `entry` · `search` · `bundled` · `ingest` · `parsers` — is documented in [[Facility catalog]].)*

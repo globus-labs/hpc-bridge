@@ -1,7 +1,7 @@
 # ledger.py
 
 > [!abstract] Role
-> The durable batch ledger: SQLite at `<state_dir>/ledger.sqlite3` (0600, WAL, a busy timeout) beside [[state]]'s stores — the rows and the command of each batch, every attempt with its Globus task id and settlement, the lease that makes one server the batch's only admitter and collector, the retired block configs, and the interactive task ids `poll_task` answers after a restart. Design: [[Batch and swarm execution]] §4.
+> The durable batch ledger: SQLite at `<state_dir>/ledger.sqlite3` (0600, WAL, a busy timeout) beside [[state]]'s stores — the rows and the command of each batch, every attempt with its Globus task id and settlement, the lease that makes one server the batch's only admitter and collector, the retired block configs, the interactive task ids `poll_task` answers after a restart, and every billed block request a server confirmed (`block`, read by a later server: [[earlier]]). Design: [[Batch and swarm execution]] §4.
 
 ## What it does
 
@@ -27,6 +27,7 @@
 - **`settle(…, only_from=…)`** — moves one attempt's row (its CURRENT attempt only) to a state, with its result fields.
 - **`retire` / `unretire`** — a stop or a reap retires the block's config (on SSH its `hpcb_block` token makes it unique: S5 saw one stray submit with a retired config restart the user endpoint and a block within 18 s); the user's yes on a resume lifts it.
 
+- **`block`** (2026-11-06, [[earlier]]): every billed block request a server confirmed, keyed (endpoint, block request — its `hpcb_block`, else `cfg:` + its config's hash): the facility id and the catalog entry the binding was built from (JSON: how to reach the endpoint again), `mep`, the scheduler, the hash of the config as sent, partition, account, `walltime_s`, `confirmed_at`, its scheduler `job` and `up_at` once a check reported it, the server that asked (`session`, `owner_host` / `owner_pid` / `owner_start`), and `ended_at` / `ended_how` once closed. `record_block` (an upsert: the same request asked again — a later server reusing the block — takes the record over, keeping its job and `up_at`, open again), `block_up` (a different job is a new `up_at`), `open_blocks`, `end_blocks`. Times are the wall clock.
 - **Block environments** (PR 3, [[envs]]): `batch` and `job` gain an `env` column (`_ADDED_COLUMNS`). It is JSON, `envs.record`: the env a batch or job runs in, with what activates or rebuilds it after a restart. `add_batch(…, env=)` writes it. A listing shows its label (`LedgerEntry.env`).
   - Since review round 1, a batch's record also carries `nonce_key` (its rows' refusal nonces), `retried` and `unbuildable` (S1), and `redacted` (U3).
   - An index URL's credentials are never stored.
