@@ -55,8 +55,10 @@ def _threads_py(n: int, secs: int, *, report: bool = False) -> str:
 def test_r1_1_a_row_of_six_thousand_threads_still_gets_its_full_look_and_is_flagged(tmp_path):
     """The reviewer's run: 6000 threads and 4 busy loops on 1 core read over_size [] — while 100 threads read
     ['cores'] — the most oversubscribed rows went unflagged."""
-    busy = " & ".join([_BUSY.format(s=8)] * 4)
-    rep = _row(tmp_path, f"{busy} & {_threads_py(6000, 8)}; wait", _slot(cores=1, memory_mb=4000))
+    # the 4 loops spin for exactly the python's life: on a slow runner its 6000 thread starts, sharing the one pinned
+    # core with them, outlast a fixed 8 s of spinning (CI: 6 of 14 looks over) — then the row's busy part was the minority
+    busy = " & ".join(["(while kill -0 $p 2>/dev/null; do :; done)"] * 4)
+    rep = _row(tmp_path, f"{_threads_py(6000, 6)} & p=$!; {busy} & wait", _slot(cores=1, memory_mb=4000))
     assert rep.rc == 0, (rep.rc, rep.stderr_tail)
     assert rep.threads is not None and rep.threads >= 6000, rep.threads
     assert (rep.r_samples or 0) >= 3 and rep.peak_rss_kb, (rep.r_samples, rep.peak_rss_kb)
