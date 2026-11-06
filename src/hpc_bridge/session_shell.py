@@ -58,23 +58,33 @@ REMAINING_SH = (
 # `…/gce-venv-<gce>-py<X.Y>` the same way) — is never a user command's (the Anvil live test, F4: `uv pip install`
 # targets $VIRTUAL_ENV, and a bare `pip install` the first pip on PATH, so either wrote into the worker's own venv).
 # Known by its arch marker (endpoint_venv.ARCH_MARKER, written by every build) or by hpc-bridge's `gce-venv` names;
-# any other venv — the user's own, a BYO endpoint's — is left as it is. VIRTUAL_ENV goes and the venv's `bin` leaves
-# PATH. Run first (the wrappers' own tools come from the node, never from the venv: nothing of hpc-bridge's in a
-# command needs it), and again after the session's `.env` (a PATH an earlier command persisted with that bin in it),
-# then `ENDPOINT_VENV_DONE`. The canary is never wrapped: it reports the worker's own python and dill.
+# any other venv — the user's own, a BYO endpoint's — is left as it is. VIRTUAL_ENV goes when it names one, and EVERY
+# PATH entry `<d>/bin` whose `<d>` is one leaves PATH — not only the current venv's (review round 1: a `.env` an earlier
+# command persisted — before this fix, or before an endpoint version or Python bump — carries an OLDER keyed venv's
+# bin). PATH is rewritten only when an entry goes. Run first (the wrappers' own tools come from the node, never from
+# the venv: nothing of hpc-bridge's in a command needs it), and again after the session's `.env`. Globbing is off and
+# IFS restored (or left unset) around it. The canary is never wrapped: it reports the worker's own python and dill.
 ENDPOINT_VENV_SCRUB = (
     'if [ -n "${VIRTUAL_ENV:-}" ] && { [ -f "$VIRTUAL_ENV/.hpcb-arch" ] || case "${VIRTUAL_ENV%/}" in '
     "(*/gce-venv|*/gce-venv-*) true;; (*) false;; esac; }; then\n"
-    '  __hb_vb="${VIRTUAL_ENV%/}/bin"; unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT\n'
+    "  unset VIRTUAL_ENV VIRTUAL_ENV_PROMPT\n"
     "fi\n"
-    'if [ -n "${__hb_vb:-}" ]; then\n'
-    '  __hb_vp=":$PATH:"\n'
-    '  while :; do case "$__hb_vp" in (*":$__hb_vb:"*) '
-    '__hb_vp="${__hb_vp%%":$__hb_vb:"*}:${__hb_vp#*":$__hb_vb:"}";; (*) break;; esac; done\n'
-    '  __hb_vp=${__hb_vp#:}; PATH=${__hb_vp%:}; unset __hb_vp\n'
-    "fi\n"
+    '__hb_vp=""; __hb_vd=""; __hb_vf=0; case $- in (*f*) __hb_vf=1;; esac\n'
+    'if [ -n "${IFS+x}" ]; then __hb_vo=$IFS; __hb_vz=1; else __hb_vz=0; fi\n'
+    "set -f; IFS=:\n"
+    "for __hb_vx in $PATH; do\n"
+    '  case "${__hb_vx%/}" in (*/bin)\n'
+    '    __hb_vy=${__hb_vx%/}; __hb_vy=${__hb_vy%/bin}\n'
+    '    if [ -f "$__hb_vy/.hpcb-arch" ]; then __hb_vd=1; continue; fi\n'
+    '    case "$__hb_vy" in (*/gce-venv|*/gce-venv-*) __hb_vd=1; continue;; esac;;\n'
+    "  esac\n"
+    '  __hb_vp="$__hb_vp:$__hb_vx"\n'
+    "done\n"
+    'if [ "$__hb_vz" = 1 ]; then IFS=$__hb_vo; else unset IFS; fi\n'
+    '[ "$__hb_vf" = 1 ] || set +f\n'
+    '[ -z "$__hb_vd" ] || PATH=${__hb_vp#:}\n'
+    "unset __hb_vp __hb_vd __hb_vf __hb_vo __hb_vz __hb_vx __hb_vy\n"
 )
-ENDPOINT_VENV_DONE = "unset __hb_vb\n"
 
 # A command sent for one block must not run on another. The block the user confirmed spend for can be replaced
 # (released, cancelled, preempted) between two commands, and a command sent while its last proof of life is fresh
@@ -218,7 +228,7 @@ __hb_snap() {
 }
 __hb_snap __hb_B_ __hb_BN
 [ -f @@SD@@/.env ] && . @@SD@@/.env 2>/dev/null
-@@SCRUB@@@@SCRUBDONE@@@@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
+@@SCRUB@@@@ENV@@eval "$(printf %s @@B64@@ | base64 -d)"@@TEE@@
 __hb_rc=$?
 @@RESULT@@pwd >| @@SD@@/.cwd
 # The persist loops run in a known shell state whatever the command left (review NS8: its `set -x` would trace every
@@ -330,7 +340,7 @@ def wrap(command: str, session: Session, *, guard: Guard | None = None, result_k
         env = _ENV_PRE + env_sh.rstrip("\n") + "\n" + _ENV_POST
         keep, gone = _ENV_KEEP, _ENV_GONE
     return _guard(guard) + head.replace("@@SD@@", sd) + (
-        _WRAP_TEMPLATE.replace("@@SCRUB@@", ENDPOINT_VENV_SCRUB).replace("@@SCRUBDONE@@", ENDPOINT_VENV_DONE)
+        _WRAP_TEMPLATE.replace("@@SCRUB@@", ENDPOINT_VENV_SCRUB)
         .replace("@@TEE@@", tee).replace("@@RESULT@@", "")
         .replace("@@ENV@@", env).replace("@@ENVKEEP@@", keep).replace("@@ENVGONE@@", gone)
         .replace("@@SD@@", sd)

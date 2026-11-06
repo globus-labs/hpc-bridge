@@ -17,7 +17,6 @@ pure tests: tests/test_anvil_live_findings.py.
 """
 from __future__ import annotations
 
-import base64
 import os
 import resource
 import shutil
@@ -168,6 +167,8 @@ def test_f1_the_pilots_own_shape_is_not_over_its_cores(tmp_path):
             "python3 -c \"import time; time.sleep(4)\"; wait'")
     rep = _row(tmp_path, work, _slot(cores=2))
     assert rep.rc == 0, (rep.rc, rep.stderr_tail)
+    if _LINUX:   # judged on its looks, never left unjudged (review round 1: with no looks it passed vacuously)
+        assert (getattr(rep, "r_samples", None) or 0) >= 3, getattr(rep, "r_samples", None)
     assert _judged(rep, 2) == [], (rep.threads, getattr(rep, "r_over", None), getattr(rep, "r_samples", None))
 
 
@@ -222,7 +223,8 @@ def test_f2_the_watchers_cost_stays_small(tmp_path):
     watched, wall = cost(1, 512)         # a memory limit: fast quick looks while young
     print(f"\nwatcher cost: {watched:.3f} CPU-s over {wall:.2f} s ({100 * watched / wall:.1f}% of a CPU); the same "
           f"row with no memory limit {plain:.3f} CPU-s")
-    assert watched / wall < 0.15, f"the wrapper of a sleeping row used {watched:.2f} CPU-s over {wall:.2f} s"
+    if _LINUX:   # a node's cost (macOS's `ps -A` alone grows with every process of the desktop: no node runs there)
+        assert watched / wall < 0.15, f"the wrapper of a sleeping row used {watched:.2f} CPU-s over {wall:.2f} s"
     assert watched - plain < 0.4, f"the young row's fast looks cost {watched - plain:.2f} CPU-s more"
 
 
@@ -477,12 +479,22 @@ def test_f4_the_wrappers_own_tools_never_came_from_the_venv(tmp_path):
     assert rep.rc == 0 and rep.tail.strip() == "ok" and rep.wall_s is not None, (rep.rc, rep.stderr_tail)
 
 
-def test_f4_the_venv_is_named_only_by_its_marker_or_hpc_bridges_name():
+@pytest.mark.parametrize(("name", "marker", "scrubbed"), [
+    ("gce-venv-endpoint-4.18.0-py3.13", True, True),     # hpc-bridge's keyed endpoint venv
+    ("gce-venv", False, True),                           # the unkeyed one older plugins built
+    ("gce-venv-4.18.0-py3.13", False, True),             # a registry entry's worker venv
+    ("custom-endpoint-venv", True, True),                # HPC_BRIDGE_REMOTE_VENV elsewhere: its marker names it
+    ("analysis", False, False),                          # the user's own
+    ("my-gce-venv-copy", False, False),                  # a name that only contains hpc-bridge's
+])
+def test_f4_the_venv_is_named_only_by_its_marker_or_hpc_bridges_name(tmp_path, name, marker, scrubbed):
     """Which VIRTUAL_ENV is hpc-bridge's own: its endpoint venv's arch marker, or the gce-venv names hpc-bridge and its
-    registry entries give the worker venvs — never a venv of the user's."""
-    from hpc_bridge import session_shell
-
-    sh = session_shell.ENDPOINT_VENV_SCRUB
-    assert ".hpcb-arch" in sh and "gce-venv" in sh
-    b64 = base64.b64encode(sh.encode()).decode()
-    assert b64   # spliced as shell text, never through a format string
+    registry entries give the worker venvs — never a venv of the user's (review round 1: tested by what it does)."""
+    v = tmp_path / "home" / "venvs" / name
+    (v / "bin").mkdir(parents=True)
+    if marker:
+        (v / ".hpcb-arch").write_text("x86_64\n")
+    p = _session(tmp_path, 'echo "VE=[${VIRTUAL_ENV-}]"; echo "P=$PATH"', None, VIRTUAL_ENV=str(v),
+                 PATH=f"{v / 'bin'}:{os.environ['PATH']}")
+    gone = "VE=[]" in p.stdout and f"{v / 'bin'}:" not in p.stdout
+    assert gone is scrubbed, p.stdout

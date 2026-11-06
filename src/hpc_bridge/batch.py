@@ -95,6 +95,10 @@ WATCH_POLL_S = 1                       # the wrapper's watcher: how often it loo
 WATCH_FAST_S = 0.2
 WATCH_YOUNG = 10
 WATCH_GROW_SHARE = 10
+# The full look reads the states of at most this many threads of each process of a row (review round 1: a row of
+# thousands of threads), and the runnable counts reach the results directory every this many looks and at the end
+WATCH_THREAD_CAP = 256
+WATCH_FLUSH_LOOKS = 30
 # The longest the wrapper holds its worker past task_walltime_s, by its own arithmetic: the watcher sees the deadline
 # within one poll, TERMs the group and waits the kill grace before KILL; the cleanup then waits the kill grace again,
 # KILLs, and gives the stream readers the reader grace twice (review round 2: 7 s had been assumed, 14 s measured).
@@ -890,17 +894,17 @@ __hb_members() {
         if (nm != "") print P[i], rs, th, nm } }'
   fi
 }
-# The row's tree from the command's own shell, as pids in `__hb_all` (Linux: /proc/<pid>/task/<tid>/children, read with
-# the shell's builtins — no process started, no scan of every process)
+# The row's tree from the command's own shell, as pids in `__hb_all` (Linux: the children each process's MAIN thread
+# started, /proc/<pid>/task/<pid>/children, read with the shell's builtins — no process started, no scan of every
+# process, and one read per process however many threads it has: review round 1, a row of 6000 threads. A child
+# another thread started is the full look's, through `ps`, and its token's.)
 __hb_tree() {
   __hb_q=$__hb_c; __hb_all=""
   while [ -n "$__hb_q" ]; do
     __hb_n=""
     for __hb_x in $__hb_q; do
       __hb_all="$__hb_all $__hb_x"
-      for __hb_y in /proc/"$__hb_x"/task/[0-9]*/children; do
-        __hb_z=""; read -r __hb_z < "$__hb_y"; __hb_n="$__hb_n $__hb_z"
-      done
+      __hb_z=""; read -r __hb_z < "/proc/$__hb_x/task/$__hb_x/children"; __hb_n="$__hb_n $__hb_z"
     done
     case "$__hb_n" in *[0-9]*) __hb_q=$__hb_n;; *) __hb_q="";; esac
   done
@@ -911,30 +915,35 @@ __hb_tree() {
 # thread of the row's. Then, on Linux, how many of its threads are RUNNABLE — state R in /proc/<pid>/task/<tid>/stat:
 # running, or waiting for a CPU; an idle shell, `timeout` or a sleeping interpreter is not (the Anvil live test, F1)
 # — or -1 where that cannot be read; and whether a process of it is `srun` (a step of the row's own: it runs where
-# Slurm places it, not on the row's slot, and outside this watch — F3). "kB threads runnable srun", one line, with no
-# process more than the memory's own.
+# Slurm places it, not on the row's slot, and outside this watch — F3). "kB threads runnable srun", one line.
+# The thread states are read for at most @@RCAP@@ threads of each process (review round 1: a row of thousands of
+# threads — an idle pool — cost the watcher a quarter to half a CPU, and their paths in one awk argument passed Linux's
+# 128 KiB cap, so the look printed nothing): a process's busy threads beyond them are not counted — a lower bound,
+# which still sees an oversubscribed row's processes of few threads each (OpenMP, a pool of processes). The paths go
+# to awk on its standard input, never in an argument.
 __hb_sample() {
   __hb_ms=$(__hb_members)
-  __hb_sf=""
-  if [ -r /proc/self/stat ]; then
-    while read -r __hb_x __hb_y; do
-      for __hb_y in /proc/"$__hb_x"/task/[0-9]*/stat; do __hb_sf="$__hb_sf $__hb_y"; done
-    done <<__HB_EOF
+  { printf '%s\n' "$__hb_ms"
+    if [ -r /proc/self/stat ]; then
+      while read -r __hb_x __hb_y; do
+        [ -n "$__hb_x" ] || continue
+        __hb_n=0
+        for __hb_y in /proc/"$__hb_x"/task/[0-9]*; do
+          __hb_n=$((__hb_n + 1)); [ "$__hb_n" -gt @@RCAP@@ ] && break
+          printf '%s/stat\n' "$__hb_y"
+        done
+      done <<__HB_EOF
 $__hb_ms
 __HB_EOF
-  fi
-  printf '%s\n' "$__hb_ms" | awk -v g="$__hb_c" -v sf="$__hb_sf" '
+    fi; } | awk -v g="$__hb_c" '
+    /^\// { lx = 1; if ((getline l < $0) > 0) { sub(/^.*\) /, "", l); if (substr(l, 1, 1) == "R") rn++ }
+      close($0); next }
     NF >= 4 { m = $2; f = "/proc/" $1 "/smaps_rollup"
       while ((getline l < f) > 0) if (l ~ /^Pss:/) { split(l, x, " "); m = x[2] }
       close(f); mem += m
       if (!($1 == g && $4 ~ /(^|\/)-?(ba|da|k)?sh$/)) thr += $3
       if ($4 ~ /(^|\/)srun$/) sr = 1 }
-    END { rn = -1
-      if (sf != "") { rn = 0; n = split(sf, F, " ")
-        for (i = 1; i <= n; i++) {
-          if ((getline l < F[i]) > 0) { sub(/^.*\) /, "", l); if (substr(l, 1, 1) == "R") rn++ }
-          close(F[i]) } }
-      printf "%d %d %d %d\n", mem, thr, rn, sr }'
+    END { printf "%d %d %d %d\n", mem, thr, (lx ? rn : -1), sr }'
 }
 # A quick look (Linux; the fast looks between the full ones, F2): the memory of the row's tree alone (`__hb_tree`), read
 # by one awk — no scan of every process, no environ read (a look every 0.2 s must cost next to nothing). A process that
@@ -962,7 +971,7 @@ __hb_start=$(date +%s)
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q" "$__hb_f.go"
 mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
 tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" 3>&- 4>&- &
 __hb_p1=$!
@@ -989,6 +998,7 @@ set -m
   @@PIN@@
   (env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc || getconf _NPROCESSORS_ONLN) 2>/dev/null | head -n 1 \
     > "$__hb_a/.nproc"
+  : > "$__hb_f.go" 2>/dev/null   # the user's command starts now: its young window counts from here (node-local)
   eval "$(printf %s @@B64@@ | base64 --decode)"
 ) > "$__hb_f.o" 2> "$__hb_f.e" < /dev/null 3>&- 4>&- &
 __hb_c=$!
@@ -1000,23 +1010,35 @@ set +m
 # 1 s look saw it). The fast looks are quick (`__hb_quick`; one in @@FASTN@@ is full) and need a node whose /proc lists
 # each task's children (Linux); elsewhere, or where `sleep` takes no fraction, the looks stay a second apart. A burst
 # within one look can still pass the limit.
+# - The young window counts from the user's command, not from the watcher: a slow env activation never eats it (review
+#   round 1) — the row marks its start node-locally (`$__hb_f.go`).
+# - Growth is judged against the last look of the same kind, per second: a quick look sees the row's tree, a full one
+#   more (a reparented process, the group), so the two never read as growth between them.
+# - The runnable-thread counts (F1) stay in the watcher, and go to the results directory every @@FLUSH@@ looks and when
+#   the watch ends — its end, the command's, or the wrapper's TERM: never a write a look (review round 1: GPFS on
+#   Anvil, ~127 metadata writes a second for a full node). Its sleeps are waited on, so a TERM is taken at once.
 (
   __hb_dl=$((__hb_start + @@WALL@@))
-  __hb_pk=0; __hb_th=0; __hb_ns=0; __hb_no=0; __hb_sr=0; __hb_pr=0; __hb_fq=0
+  __hb_pk=0; __hb_th=0; __hb_ns=0; __hb_no=0; __hb_lw=0; __hb_sr=0; __hb_fq=0
+  __hb_u=0; __hb_pq=""; __hb_uq=0; __hb_pf=""; __hb_uf=0
   __hb_fs=""; __hb_yn=0
   if [ -n "@@MEMKB@@" ] && [ -r "/proc/$__hb_c/task/$__hb_c/children" ]; then __hb_fs=@@FAST@@; __hb_yn=@@YOUNG@@; fi
+  __hb_flush() { [ "$__hb_ns" -gt 0 ] && [ "$__hb_ns" != "$__hb_lw" ] && echo "$__hb_ns $__hb_no" > "$__hb_a/.rq"
+    __hb_lw=$__hb_ns; }
+  trap '__hb_flush; exit 0' TERM
   __hb_nx=${__hb_fs:-@@POLL@@}
   while :; do
-    __hb_m=1; [ "$__hb_nx" = "$__hb_fs" ] && __hb_m=@@FASTN@@
-    sleep "$__hb_nx" || { __hb_fs=""; __hb_m=1; sleep @@POLL@@; }
+    __hb_du=@@FASTN@@; [ "$__hb_nx" = "$__hb_fs" ] && __hb_du=1
+    sleep "$__hb_nx" & wait $! || { __hb_fs=""; __hb_du=@@FASTN@@; sleep @@POLL@@ & wait $!; }
+    __hb_u=$((__hb_u + __hb_du))
     if [ -e "$__hb_rd/@@CANCEL@@" ]; then echo cancelled > "$__hb_a/.why"; break; fi
     if [ "${EPOCHSECONDS:-$(date +%s)}" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
-    kill -0 "$__hb_c" || exit 0
+    kill -0 "$__hb_c" || { __hb_flush; exit 0; }
     __hb_fq=$((__hb_fq + 1))
-    if [ "$__hb_m" != 1 ] && [ $((__hb_fq % @@FASTN@@)) != 0 ]; then
-      set -- $(__hb_quick) -1 -1 -1
+    if [ "$__hb_du" = 1 ] && [ $((__hb_fq % @@FASTN@@)) != 0 ]; then
+      __hb_kd=q; set -- $(__hb_quick) -1 -1 -1
     else
-      set -- $(__hb_sample)
+      __hb_kd=f; set -- $(__hb_sample)
     fi
     __hb_r=${1:-0}; __hb_t=${2:-0}; __hb_rn=${3:--1}; __hb_su=${4:-0}
     case "$__hb_r" in ''|*[!0-9]*) __hb_r=0;; esac
@@ -1027,17 +1049,20 @@ set +m
     # a sized row's runnable threads against its cores (F1): how many looks saw them, and how many saw more
     if [ -n "@@KR@@" ] && [ "$__hb_rn" -ge 0 ]; then
       __hb_ns=$((__hb_ns + 1)); [ "$__hb_rn" -gt 0@@KR@@ ] && __hb_no=$((__hb_no + 1))
-      echo "$__hb_ns $__hb_no" > "$__hb_a/.rq"
+      [ $((__hb_ns - __hb_lw)) -ge @@FLUSH@@ ] && __hb_flush
     fi
     if [ "$__hb_su" = 1 ] && [ "$__hb_sr" = 0 ]; then __hb_sr=1; : > "$__hb_a/.srun"; fi
     if [ -n "@@MEMKB@@" ] && [ "$__hb_r" -gt "0@@MEMKB@@" ]; then echo memory > "$__hb_a/.why"; break; fi
+    if [ "$__hb_kd" = q ]; then __hb_p=$__hb_pq; __hb_pu=$__hb_uq; __hb_pq=$__hb_r; __hb_uq=$__hb_u
+    else __hb_p=$__hb_pf; __hb_pu=$__hb_uf; __hb_pf=$__hb_r; __hb_uf=$__hb_u; fi
     __hb_nx=@@POLL@@
     if [ -n "$__hb_fs" ]; then
-      if [ "$__hb_yn" -gt 0 ]; then __hb_yn=$((__hb_yn - 1)); __hb_nx=$__hb_fs
-      elif [ $(( (__hb_r - __hb_pr) * __hb_m )) -ge @@GROWKB@@ ]; then __hb_nx=$__hb_fs; fi
+      if [ "$__hb_yn" -gt 0 ]; then [ -e "$__hb_f.go" ] && __hb_yn=$((__hb_yn - 1)); __hb_nx=$__hb_fs
+      elif [ -n "$__hb_p" ] && [ $(( (__hb_r - __hb_p) * @@FASTN@@ )) -ge $(( @@GROWKB@@ * (__hb_u - __hb_pu) )) ]
+      then __hb_nx=$__hb_fs; fi
     fi
-    __hb_pr=$__hb_r
   done
+  __hb_flush
   __hb_kill TERM
   __hb_k=0
   while [ "$__hb_k" -lt @@GRACE@@ ] && kill -0 "$__hb_c"; do sleep 1; __hb_k=$((__hb_k + 1)); done
@@ -1054,9 +1079,10 @@ __hb_kill TERM
 __hb_g=$!
 wait "$__hb_t1" "$__hb_t2" "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
 kill "$__hb_g"
+wait "$__hb_w"   # the watcher's TERM wrote its counts (`.rq`): at once, or after its kill grace's current second
 [ -s "$__hb_a/.stdout.tail" ] || tail -c @@TAIL@@ "$__hb_a/stdout" > "$__hb_a/.stdout.tail"
 [ -s "$__hb_a/.stderr.tail" ] || tail -c @@ETAIL@@ "$__hb_a/stderr" > "$__hb_a/.stderr.tail"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q" "$__hb_f.go"
 __hb_why=$(cat "$__hb_a/.why")
 case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; memory) __hb_rc=@@MRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
@@ -1361,8 +1387,9 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
             .replace("@@SLOTENV@@", slot_env).replace("@@PIN@@", pin).replace("@@MEMKB@@", memkb)
             .replace("@@KR@@", kr).replace("@@FAST@@", f"{WATCH_FAST_S:g}").replace("@@YOUNG@@", str(WATCH_YOUNG))
             .replace("@@FASTN@@", str(max(1, round(1 / WATCH_FAST_S)))).replace("@@GROWKB@@", str(grow))
+            .replace("@@RCAP@@", str(WATCH_THREAD_CAP)).replace("@@FLUSH@@", str(WATCH_FLUSH_LOOKS))
             .replace("@@SCRUB@@", session_shell.ENDPOINT_VENV_SCRUB)
-            .replace("@@RESCRUB@@", session_shell.ENDPOINT_VENV_SCRUB + session_shell.ENDPOINT_VENV_DONE)
+            .replace("@@RESCRUB@@", session_shell.ENDPOINT_VENV_SCRUB)
             .replace("@@MRC@@", str(MEMORY_RC)).replace("@@TOKEN@@", secrets.token_hex(8))
             .replace("@@RD@@", quoted_dir(results_dir)).replace("@@I@@", str(int(index)))
             .replace("@@N@@", str(int(attempt))).replace("@@REMAINING@@", session_shell.REMAINING_SH)

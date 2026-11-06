@@ -14,11 +14,8 @@ its fix. The node side (the generated bash, run for real): tests/test_anvil_live
 """
 from __future__ import annotations
 
-import inspect
 import json
 import os
-
-import pytest
 
 from hpc_bridge import server
 from tests.test_batch_sizing import _app_with, _canary, _measure, _report, _run, _sized_app
@@ -202,13 +199,27 @@ async def test_g3_an_unsized_batch_waits_for_the_measure_and_then_runs_with_a_me
 # G4 — memory_gb is a number everywhere
 # =====================================================================================================================
 
-@pytest.mark.parametrize("tool", ["ensure_endpoint_up", "submit_job", "run_batch", "export_handoff"])
-def test_g4_every_tools_memory_gb_takes_a_fraction(tool):
-    fn = getattr(server, tool)
-    params = inspect.signature(fn).parameters
-    if "memory_gb" not in params:
-        pytest.skip(f"{tool} takes no memory_gb")
-    assert "float" in str(params["memory_gb"].annotation), (tool, params["memory_gb"].annotation)
+async def test_g4_every_tools_memory_gb_takes_a_fraction(tmp_path):
+    """Each tool that takes memory_gb is called with 1.5 GB and takes it (review round 1: an annotation grep proved
+    nothing), and the schema an agent sees says a number."""
+    from tests.fake_sched import FakeSched
+    from tests.test_batch_phase2a import SLICED, _submit
+    from tests.test_batch_phase2a import _app as _jobs_app
+    from tests.test_resource_requests import _app
+
+    schemas = {t.name: t.inputSchema for t in await server.mcp.list_tools()}
+    for tool in ("ensure_endpoint_up", "submit_job", "run_batch"):
+        prop = schemas[tool]["properties"]["memory_gb"]
+        types = {x.get("type") for x in prop.get("anyOf", [prop])}
+        assert "number" in types and "integer" not in types, (tool, prop)
+    st = await server._ensure_endpoint_up(_app(), "compute", cores=2, memory_gb=1.5)
+    assert st.status == "needs_confirmation" and st.block.memory_gb == 1.5, (st.status, st.notice)
+    jobs_app = _jobs_app(tmp_path, FakeSched(tmp_path / "sched", user="u"), partitions=[SLICED])
+    job = await _submit(jobs_app, partition="shared", cores=2, memory_gb=1.5)
+    assert job.phase != "refused" and job.terms is not None and job.terms.memory_gb == 1.5, (job.phase, job.notice)
+    app, _rt, _runner = _app_with(_measure(cpus=4, workers=5, mem_limit_mb=8000))
+    out = await _run(app, n=2, cores=1, memory_gb=1.5)
+    assert out.batch_id and out.sizing.memory_gb == 1.5, (out.phase, out.notice)
 
 
 def test_g4_the_request_takes_a_fraction_and_refuses_what_is_no_amount():

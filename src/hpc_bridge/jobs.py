@@ -718,7 +718,6 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
         '|| cd "$__hpcb_dir"; else cd "$__hpcb_dir"; fi',
         '[ -f "$__hpcb_dir/session.env" ] && . "$__hpcb_dir/session.env"',
         *scrub,
-        session_shell.ENDPOINT_VENV_DONE.rstrip("\n"),
     ]
     if spec.env_rec:   # block environments: the job's env, frozen in the script (so in its hash); refused: exit 88
         # its refusal writes the job's own mark beside the script, carrying the job's nonce (made from its record's
