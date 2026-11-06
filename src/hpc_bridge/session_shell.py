@@ -71,8 +71,9 @@ ENDPOINT_VENV_SCRUB = (
     "fi\n"
     '__hb_vp=""; __hb_vd=""; __hb_vf=0; case $- in (*f*) __hb_vf=1;; esac\n'
     'if [ -n "${IFS+x}" ]; then __hb_vo=$IFS; __hb_vz=1; else __hb_vz=0; fi\n'
-    "set -f; IFS=:\n"
-    "for __hb_vx in $PATH; do\n"
+    # one `:` more, so splitting keeps a trailing empty entry (the current directory): it drops a trailing empty field
+    "set -f; IFS=:; __hb_vq=$PATH:\n"
+    "for __hb_vx in $__hb_vq; do\n"
     '  case "${__hb_vx%/}" in (*/bin)\n'
     '    __hb_vy=${__hb_vx%/}; __hb_vy=${__hb_vy%/bin}\n'
     '    if [ -f "$__hb_vy/.hpcb-arch" ]; then __hb_vd=1; continue; fi\n'
@@ -83,7 +84,7 @@ ENDPOINT_VENV_SCRUB = (
     'if [ "$__hb_vz" = 1 ]; then IFS=$__hb_vo; else unset IFS; fi\n'
     '[ "$__hb_vf" = 1 ] || set +f\n'
     '[ -z "$__hb_vd" ] || PATH=${__hb_vp#:}\n'
-    "unset __hb_vp __hb_vd __hb_vf __hb_vo __hb_vz __hb_vx __hb_vy\n"
+    "unset __hb_vp __hb_vd __hb_vf __hb_vo __hb_vz __hb_vx __hb_vy __hb_vq\n"
 )
 
 # A command sent for one block must not run on another. The block the user confirmed spend for can be replaced

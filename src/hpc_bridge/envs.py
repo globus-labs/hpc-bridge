@@ -443,9 +443,19 @@ _MODULE_INIT = (
     "  done\n"
     "fi\n"
 )
-# `module` or `ml` as a COMMAND word of the line: at a line's start, or after `;`, `&&`, `||`, `|`, `(`, `{`, `!`, a
-# backquote, or `then` / `do` / `else` — never an argument (review round 1: `conda activate ml`, `python -m module`)
-_USES_MODULE = re.compile(r"(?:^|[;&|({!`]|\b(?:then|do|else)\b)[ \t]*(?:module|ml)(?=[ \t]|$|[;&|)}`])", re.M)
+# `module` or `ml` as a COMMAND word of the line — never an argument (review round 1: `conda activate ml`, `python -m
+# module`), a word inside `${…}` or a path (round 3: `${ml}`, `"${module}/…"`, `cd ~/do ml`). A command starts at a
+# line's start, after `;`, `&`, `|`, `(`, a backquote, `!`, or a group's `{ `, or after a case pattern's `)` (`in a*)`,
+# `;; b)`, a pattern opening its line); then any run of reserved words (`if`, `elif`, `then`, `else`, `do`, `while`,
+# `until`, `time`, `!`), `command`, and assignments (`x=1 module …`) comes before it. Round 3: `if module load X; then`
+# was missed, and on a worker shell with no module system its rc 127 was swallowed — the env silently not loaded.
+_CASE_PAT = r"[^\s;&|()`]+"
+_USES_MODULE = re.compile(
+    r"(?:(?:^|[;&|(`!]|(?<![$\w])\{(?=[ \t]))[ \t]*"
+    rf"|(?:^|\bin[ \t]|;;)[ \t]*\(?{_CASE_PAT}(?:[ \t]*\|[ \t]*{_CASE_PAT})*\)[ \t]*)"
+    r"(?:(?:if|elif|then|else|do|while|until|time|command|!)[ \t]+"
+    r"|[A-Za-z_]\w*=(?:\"[^\"]*\"|'[^']*'|[^\s;&|\"'`])*[ \t]+)*"
+    r"(?:module|ml)(?=[ \t]|$|[;&|)}`])", re.M)
 
 
 def uses_module(line: str | None) -> bool:
