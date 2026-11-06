@@ -487,6 +487,28 @@ create table if not exists meter_reading (
   unledgered text default '[]',
   detail text
 );
+create table if not exists block (
+  endpoint_id text not null,
+  request text not null,
+  facility text,
+  entry text,
+  mep integer default 0,
+  scheduler text,
+  uec_hash text,
+  partition text,
+  account text,
+  walltime_s real,
+  confirmed_at real not null,
+  job text,
+  up_at real,
+  session text,
+  owner_host text,
+  owner_pid integer,
+  owner_start text,
+  ended_at real,
+  ended_how text,
+  primary key (endpoint_id, request)
+);
 """
 
 # A Jobs-mode job's states (batch phase 2a). Admission holds a reservation from `reserved` on; a job the scheduler can
@@ -1118,6 +1140,61 @@ class Ledger:
     def itask(self, task_id: str) -> dict[str, Any] | None:
         r = self._con.execute("select * from itask where task_id = ?", (task_id,)).fetchone()
         return None if r is None else dict(r)
+
+    # -- billed blocks a server asked for (a later server names, reuses or releases them: hpc_bridge.earlier) -------
+    def record_block(self, endpoint_id: str, request: str, *, facility: str | None, entry: str | None, mep: bool,
+                     scheduler: str | None, uec_hash: str | None, partition: str | None, account: str | None,
+                     walltime_s: float | None, session: str, owner_host: str, owner_pid: int, owner_start: str | None,
+                     now: float | None = None) -> None:
+        """A billed block request, recorded when spend is confirmed for it — before its check is sent: the endpoint,
+        the block request (`hpcb_block`, else the config's hash), how to reach the endpoint again (the facility id and
+        the catalog entry it was bound from), its terms and the server that asked. The same request asked again (a
+        later server reusing the block, a facility endpoint's same config) takes the record over: its job and when it
+        came up stay, the owner and terms are the new confirmation's, and it is open again."""
+        at = time.time() if now is None else now
+        with self._tx() as c:
+            c.execute(
+                "insert into block (endpoint_id, request, facility, entry, mep, scheduler, uec_hash, partition, "
+                "account, walltime_s, confirmed_at, session, owner_host, owner_pid, owner_start) "
+                "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict (endpoint_id, request) do update set "
+                "facility = excluded.facility, entry = coalesce(excluded.entry, block.entry), mep = excluded.mep, "
+                "scheduler = coalesce(excluded.scheduler, block.scheduler), uec_hash = excluded.uec_hash, "
+                "partition = excluded.partition, account = excluded.account, walltime_s = excluded.walltime_s, "
+                "confirmed_at = excluded.confirmed_at, session = excluded.session, owner_host = excluded.owner_host, "
+                "owner_pid = excluded.owner_pid, owner_start = excluded.owner_start, ended_at = null, ended_how = null",
+                (endpoint_id, request, facility, entry, int(bool(mep)), scheduler, uec_hash, partition, account,
+                 walltime_s, at, session, owner_host, owner_pid, owner_start))
+
+    def block_up(self, endpoint_id: str, request: str, job: str, *, at: float | None = None) -> None:
+        """The block asked for under `request` came up as scheduler job `job` (a check reported it). When it came up
+        is kept for the job it was first seen for: a block met again keeps its age (its walltime)."""
+        when = time.time() if at is None else at
+        with self._tx() as c:
+            c.execute("update block set up_at = case when job is ? then coalesce(up_at, ?) else ? end, job = ? "
+                      "where endpoint_id = ? and request = ?", (job, when, when, job, endpoint_id, request))
+
+    def open_blocks(self, endpoint_id: str | None = None) -> list[dict[str, Any]]:
+        """The block records not known to have ended (every endpoint's, or one's), oldest first."""
+        q = "select * from block where ended_at is null"
+        args: tuple[Any, ...] = ()
+        if endpoint_id is not None:
+            q, args = q + " and endpoint_id = ?", (endpoint_id,)
+        return [dict(r) for r in self._con.execute(q + " order by confirmed_at", args).fetchall()]
+
+    def end_blocks(self, endpoint_id: str, requests: Iterable[str] | None = None, *, how: str,
+                   now: float | None = None) -> int:
+        """Close records: every open one of the endpoint, or those of `requests` — their blocks are gone (released by
+        a stop, torn down, rejected, no longer in the scheduler, past their walltime)."""
+        at = time.time() if now is None else now
+        with self._tx() as c:
+            if requests is None:
+                return c.execute("update block set ended_at = ?, ended_how = ? where endpoint_id = ? and ended_at is "
+                                 "null", (at, how, endpoint_id)).rowcount
+            n = 0
+            for r in set(requests):
+                n += c.execute("update block set ended_at = ?, ended_how = ? where endpoint_id = ? and request = ? "
+                               "and ended_at is null", (at, how, endpoint_id, r)).rowcount
+            return n
 
     # -- envelopes (batch phase 2a) --------------------------------------------------------------------------------
     def add_envelope(self, envelope_id: str, *, facility: str | None, account: str | None, unit: str, cap: float,

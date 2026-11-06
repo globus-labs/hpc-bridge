@@ -159,7 +159,8 @@ async def test_g2_a_size_first_batch_resumed_after_a_restart_asks_for_its_derive
     asked = await server._run_batch(app2, batch_id=out.batch_id)
     assert asked.block is not None and asked.block.cores_per_node == 9, (asked.phase, asked.block, asked.notice)
     assert asked.block.derived_from and "4 rows at once" in asked.block.derived_from, asked.block
-    assert app2.built == []                                       # nothing started before the yes
+    # nothing billed started before the yes (the restarted server's read of the scheduler is a free login runner)
+    assert [u for u in app2.built if u.get("compute")] == []
     res = await server._run_batch(app2, batch_id=out.batch_id, confirm_spend=True)
     assert app2.built and app2.built[-1][CORES] == 9 and app2.built[-1][MEM] >= 6, app2.built
     assert res.block is not None and res.block.derived_from, (res.phase, res.block, res.notice)

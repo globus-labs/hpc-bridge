@@ -18,6 +18,12 @@ import pytest
 from hpc_bridge import server
 from tests.test_batch_sizing import _canary, _measure, _run, _sized_app, _yes
 
+
+def _blocks(app) -> list[dict]:
+    """The BILLED runners built (compute configs): since 2026-11-06 a restarted server reads the scheduler through the
+    free login shape for a block the killed one recorded (hpc_bridge.earlier) — a login runner, no block."""
+    return [u for u in app.built if u.get("compute")]
+
 # =====================================================================================================================
 # R1-3 — no billed block starts on terms the answers never showed
 # =====================================================================================================================
@@ -56,7 +62,7 @@ async def test_r1_3_a_new_size_and_the_yes_in_one_call_never_start_an_unquoted_b
     first = await server._run_batch(app, batch_id=bid)
     assert "its size and the user's yes, in one call" not in (first.notice or ""), first.notice
     res = await server._run_batch(app, batch_id=bid, cores=8, memory_gb=4, concurrency=8, confirm_spend=True)
-    assert app.built == [], f"a block started on terms no answer showed: {app.built}"
+    assert _blocks(app) == [], f"a block started on terms no answer showed: {app.built}"
     assert res.phase == "needs_confirmation" and res.block is not None, (res.phase, res.notice)
     assert res.block.cores_per_node == 65 and res.block.derived_from, res.block
     yes = await server._run_batch(app, batch_id=bid, confirm_spend=True)
@@ -69,7 +75,7 @@ async def test_r1_3_a_yes_alone_after_a_restart_first_shows_the_block_it_would_s
 
     app, bid = await _restarted(size_owed=False)
     res = await server._run_batch(app, batch_id=bid, confirm_spend=True)
-    assert app.built == [] and res.phase == "needs_confirmation", (res.phase, res.notice, app.built)
+    assert _blocks(app) == [] and res.phase == "needs_confirmation", (res.phase, res.notice, app.built)
     assert res.block is not None and res.block.cores_per_node == 9 and res.block.derived_from, res.block
     await server._run_batch(app, batch_id=bid, confirm_spend=True)
     assert app.built and app.built[-1][CORES] == 9, app.built

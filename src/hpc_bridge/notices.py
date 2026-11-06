@@ -19,6 +19,7 @@ from .config import SYNC_WAIT_S, _parse_hhmmss, _task_ceiling_s
 from .context import (
     AppCtx,
     DroppedConfigError,
+    EarlierBlock,
     LeftBlock,
     SeenPilots,
     SentCheck,
@@ -687,6 +688,174 @@ def _ssh_left_note(app: AppCtx, old_eid: str, *, same: bool, queued: int, left: 
     return ("This connect cancels nothing on this endpoint, and this endpoint still has work in its scheduler: "
             + "; ".join(parts) + ". stop_endpoint cancels every block of this endpoint, these included, and says when "
             f"none is left (teardown_endpoint ends them too). {_END_NOW} ")
+
+
+# --- blocks an EARLIER hpc-bridge server process left (hpc_bridge.earlier) -------------------------------------------
+
+def _wall_clock(wall: float) -> str:
+    """A wall-clock instant as the user's clock time (with the date when it is not today)."""
+    return _clock_time(time.monotonic() - (time.time() - wall), time.monotonic(), rel=False)
+
+
+def _earlier_job_words(jobs: tuple[tuple[str, str, str, str], ...]) -> str:
+    """'block job 40 (RUNNING)', 'block jobs 40 (RUNNING) and 42 (PENDING, reason 'Resources')' — each in its
+    scheduler's own words."""
+    def one(job: str, word: str, reason: str) -> str:
+        said = word if len(word) > 1 else _STATE_LETTERS.get(word.upper(), word)
+        why = f", reason {reason[:60]!r}" if reason and reason.lower() != "none" else ""
+        return f"{job} ({said}{why})"
+    shown = [one(j, w, r) for j, _s, r, w in jobs[:4]]
+    if len(shown) == 1:
+        return f"block job {shown[0]}"
+    more = f" and {len(jobs) - 4} more" if len(jobs) > 4 else ""
+    return "block jobs " + ", ".join(shown[:-1]) + f" and {shown[-1]}{more}"
+
+
+_STATE_LETTERS = {"Q": "queued", "W": "waiting for its start time", "R": "running", "H": "held", "S": "suspended"}
+
+
+def _earlier_fate(app: AppCtx, b: EarlierBlock) -> str:
+    """What becomes of an earlier block, by its pilots' states (scheduler_ops._pilot_state's letters)."""
+    states = {s for _j, s, _r, _w in b.jobs}
+    end = b.walltime_end
+    wall = f" by {_wall_clock(end)}" if end is not None else ""
+    if "R" in states:
+        return (f"still billing: it idle-releases {_idle_window_text(app)} after its last task, or ends at its "
+                f"walltime{wall}")
+    if states and states <= {"H", "N"}:
+        return ("it never starts on its own (held, or not startable as submitted) and stays queued until it is "
+                "cancelled")
+    return "once it starts it bills until it idle-releases after its last task"
+
+
+def _earlier_note(app: AppCtx, items: list[tuple[EarlierBlock, str | None]], *, unread: str | None = None) -> str:
+    """What earlier hpc-bridge server processes left billing on the bound SSH endpoint, as this process read it from
+    the scheduler (hpc_bridge.earlier.verify): connect_facility and the spend question say it, so neither says
+    "Nothing is started or billed yet" while one runs. Each block as (block, why a yes to the next block's terms would
+    NOT reuse it — "terms", "held", "unverified" — or None: it would). Empty: nothing."""
+    word = _queue_word(app)
+    out = []
+    for b, why_not in items:
+        where = _terms(b.partition, b.account, word)
+        if not b.verified:
+            what = f"block job {b.job}" if b.job else f"block request (asked for at {_wall_clock(b.confirmed_at)})"
+            why = f" ({unread})" if unread else ""
+            out.append(f"An earlier hpc-bridge session's {what} is on record for this endpoint, on {where}; whether it "
+                       f"still runs could not be read from the scheduler{why}, so it may still bill. stop_endpoint "
+                       "cancels every block of this endpoint and says when none is left.")
+        elif not b.jobs:
+            out.append(f"An earlier hpc-bridge session asked for a block on this endpoint at "
+                       f"{_wall_clock(b.confirmed_at)}, on {where}, and the scheduler lists no pilot of it yet: its "
+                       "check may still be queued, and the endpoint can start a billed block for it. stop_endpoint "
+                       "cancels every block of this endpoint and says when none is left.")
+        else:
+            out.append(f"An earlier hpc-bridge session left {_earlier_job_words(b.jobs)} on this endpoint, on {where} "
+                       f"— {_earlier_fate(app, b)}. stop_endpoint cancels it (every block of this endpoint) and says "
+                       "when none is left.")
+        if why_not is None:
+            out.append("It is on the next block's terms: a yes to them reuses it instead of starting a second block.")
+        elif why_not == "terms":
+            out.append("Its terms differ from the next block's: a yes to those starts a second block beside it, and "
+                       "both bill — to end this one first, call stop_endpoint.")
+        else:   # held, or not read from the scheduler: never reused
+            out.append("A yes to the next block's terms starts a second block beside it, and both bill — to end this "
+                       "one first, call stop_endpoint.")
+    return " ".join(out) + " " if out else ""
+
+
+def _earlier_mep_note(b: EarlierBlock, scheduler: str | None) -> str:
+    """An earlier server's block on a facility multi-user endpoint, from its record alone: hpc-bridge has no scheduler
+    channel there, so it is named unverified, with the user's own commands."""
+    cancel, check, _by_user = _scheduler_cmds(scheduler)
+    end = b.walltime_end
+    until = (f", at the latest until its walltime ends at {_wall_clock(end)}" if end is not None else
+             " (its walltime's end is unknown here)")
+    where = f", partition {b.partition!r}" if b.partition else ""
+    if not b.job:
+        return (f"An earlier hpc-bridge session asked this facility endpoint for a block at "
+                f"{_wall_clock(b.confirmed_at)}{where} and never saw it come up: the facility may still start one for "
+                "its check, which then bills until the facility's idle-release. hpc-bridge cannot read this facility's "
+                "scheduler, so this is not verified; stop_endpoint here cannot cancel it. ")
+    return (f"An earlier hpc-bridge session's block on this facility endpoint is on record: scheduler job {b.job} (up "
+            f"at {_wall_clock(b.up_at or b.confirmed_at)}{where}). hpc-bridge cannot read this facility's scheduler, "
+            f"so it is not verified: it may bill until the facility's idle-release{until}. The user checks with "
+            f"`{check.format(job=b.job)}` and ends it with `{cancel.format(job=b.job)}` on the facility; stop_endpoint "
+            "here cannot cancel it. ")
+
+
+_EARLIER_ASK = ("This yes came before that was said, so nothing was started: ask the user again — with their yes, the "
+                "same call starts a second block beside it; stop_endpoint first ends the earlier one. ")
+
+
+def _earlier_reused_note(b: EarlierBlock) -> str:
+    """The answer that confirmed a block by reusing an earlier server's (hpc_bridge.earlier.adopt)."""
+    job = b.jobs[0][0] if b.jobs else b.job
+    since = f" (up since {_wall_clock(b.up_at)})" if b.up_at is not None and job == b.job else ""
+    return (f"Reused block job {job}, which an earlier hpc-bridge session left running on these terms{since}: no "
+            "second block was started; it is this session's block now. ")
+
+
+def _earlier_beside_note(blocks: list[EarlierBlock]) -> str:
+    """The answer that confirmed a NEW block while earlier servers' blocks still bill on the endpoint."""
+    jobs = [j for b in blocks for j in b.job_ids]
+    which = f"job {jobs[0]} still bills" if len(jobs) == 1 else f"jobs {', '.join(jobs)} still bill"
+    return (f"An earlier hpc-bridge session's block {which} beside this one: stop_endpoint cancels every block of this "
+            "endpoint, both included. ")
+
+
+def _earlier_released_note(jobs: list[str]) -> str:
+    return (f" Job {jobs[0]} was the block an earlier hpc-bridge session had left running." if len(jobs) == 1 else
+            f" Jobs {', '.join(jobs)} were blocks an earlier hpc-bridge session had left running.")
+
+
+def _earlier_what(blocks: list[EarlierBlock]) -> str:
+    jobs = [b.job for b in blocks if b.job]
+    if not jobs:
+        return "a block request an earlier hpc-bridge session made"
+    return (f"block job {jobs[0]}" if len(jobs) == 1 else f"block jobs {', '.join(jobs)}") + \
+        ", which an earlier hpc-bridge session started"
+
+
+def _earlier_cold_lead(blocks: list[EarlierBlock], facility: str | None, eid: str) -> str:
+    """A stop with no endpoint bound reached a recorded one: what it found on record, then that stop's own answer."""
+    where = f"{facility!r} (endpoint {eid})" if facility else f"endpoint {eid}"
+    return (f"No endpoint was bound in this session; hpc-bridge's record names {_earlier_what(blocks)} on {where}, so "
+            "this stop reached that endpoint over the login endpoint (AMQP, no SSH): ")
+
+
+def _earlier_user_cancel(blocks: list[EarlierBlock], scheduler: str | None, host: str | None) -> str:
+    cancel, check, _u = _scheduler_cmds(scheduler)
+    jobs = [b.job for b in blocks if b.job]
+    if not jobs:
+        return ""
+    on = f"on {host}" if host else "on the login node"
+    return (f" The record names job {', '.join(jobs)}: the user checks with `{check.format(job=jobs[0])}` and ends it "
+            f"with `{cancel.format(job=' '.join(jobs))}` {on}.")
+
+
+def _earlier_unreachable(blocks: list[EarlierBlock], facility: str | None, eid: str, host: str | None,
+                         why: str) -> str:
+    sched = next((b.scheduler for b in blocks if b.scheduler), None)
+    where = f"{facility!r} (endpoint {eid})" if facility else f"endpoint {eid}"
+    again = f"connect_facility({facility!r})" if facility else "connect_facility to its facility"
+    login = " (it asks for the login)" if "Globus login" in why else ""
+    return (f"Spend is NOT confirmed stopped: hpc-bridge's record names {_earlier_what(blocks)} on {where}, and {why}. "
+            f"{again}{login}, then stop_endpoint, releases it." + _earlier_user_cancel(blocks, sched, host))
+
+
+def _earlier_live_stop(blocks: list[EarlierBlock]) -> str:
+    owner = blocks[0].owner if blocks else "another process"
+    jobs = [b.job for b in blocks if b.job]
+    what = (f"block job {', '.join(jobs)}" if jobs else "a block request") + f" on endpoint {blocks[0].endpoint_id}"
+    return (f"Spend is NOT confirmed stopped: {what} belongs to another hpc-bridge session that is still running "
+            f"({owner}); this stop leaves another session's work alone — that session's stop_endpoint releases it (or "
+            "end that session, then call stop_endpoint here).")
+
+
+def _earlier_unread_stop(problem: str) -> str:
+    return (f"No endpoint was bound in this session, and hpc-bridge's record of the billed blocks earlier sessions "
+            f"started could not be read ({problem}): one may still bill. Spend is NOT confirmed stopped — "
+            "connect_facility to the facility, then stop_endpoint, releases its blocks.")
 
 def _needs_confirmation_notice(app: AppCtx, rt: ShapeRuntime, terms: BlockTerms | None = None) -> str:
     """The spend-floor notice: the block's terms first (queue and account with their sources, size, walltime), then why
@@ -1374,6 +1543,7 @@ _UNTIL_WHY = {
     "idle": "",
     "walltime": " (its walltime: the facility's idle window is unknown here)",
     "busy": " (its walltime: work of ours may still be running on it)",
+    "earlier": " (its walltime: when the earlier session last used it is unknown here)",
 }
 
 # At most this many earlier queued checks are named one by one (most recent first); the rest are counted.
@@ -1468,7 +1638,7 @@ def _no_cancel_notice(app: AppCtx, blocks: list[LeftBlock], now: float, *, curre
         more = f", and {len(checks) - _CHECKS_NAMED} more" if len(checks) > _CHECKS_NAMED else ""
         one = len(checks) == 1
         out.append(f"{'A check' if one else 'Checks'} of ours {'was' if one else 'were'} still queued there "
-                   f"({'; '.join(named)}{more}) when an earlier stop, detach, reconnect or switch left "
+                   f"({'; '.join(named)}{more}) when an earlier stop, detach, reconnect, switch or session left "
                    f"{'it' if one else 'them'}; {'it' if one else 'each'} may have run since, and a block "
                    f"{'it' if one else 'one'} started bills until its idle window passes — session_spend does not "
                    f"count it. The user finds {'it' if one else 'them'} with {find}, started after "

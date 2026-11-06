@@ -23,6 +23,7 @@ from . import (
     config,
     connect,
     dispatch,
+    earlier,
     envs,
     handoff,
     login_gate,
@@ -604,6 +605,11 @@ async def _ensure_up_once(
         if refused is not None:
             refused.session_spend = _total_session_spend(app)
             return _set_nothing(refused)
+    if shape == DEFAULT_SHAPE and app.state.endpoint_id is not None and not getattr(app.shapes.get(shape),
+                                                                                    "spend_confirmed", False):
+        # a spend question or a new block may follow: what an EARLIER server left billing on this endpoint, read from
+        # the scheduler again when the last read is stale (off the lock: the read rides the login shape)
+        await earlier.refresh(app, app.state.endpoint_id, _login_runner(app) if _has_login_shape(app) else None)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -667,6 +673,8 @@ async def _ensure_up_once(
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             terms = _block_terms(app, rt, named=named)
             rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the size this question names
+            # what an earlier server left billing here, first: this question names it, and a yes after it is informed
+            lead = earlier.spend_lead(app, rt, yes=confirm_spend)
             return EndpointStatus(
                 status="needs_confirmation",
                 block_state="provisioning" if rt.reap_kicked else "cold",
@@ -675,7 +683,7 @@ async def _ensure_up_once(
                 partition=active_partition,
                 account=active_account,
                 block=terms,
-                notice=_needs_confirmation_notice(app, rt, terms),
+                notice=lead + _needs_confirmation_notice(app, rt, terms),
             )
         if block == "needs_account":  # the account floor (account_required facility, no account) — nothing was started
             terms = _block_terms(app, rt, named=named)
@@ -780,6 +788,8 @@ async def _ensure_up_once(
                     "check its status page, then try again."
                 )
             notice = repaired + notice + _dispatch_error_suffix(rt.last_canary)
+        if receipt_terms is not None:   # the earlier server's block it reused, or those still billing beside it
+            notice = earlier.receipt(app, rt) + (notice or "")
         if ignored:
             notice = f"{notice or ''} (login shape has no partition; ignored {partition!r})".strip()
         if ignored_size:
@@ -1477,6 +1487,13 @@ async def _stop_endpoint_blocks(app: AppCtx) -> EndpointStatus:
     if eid is None and not _has_login_shape(app) and warmth._prune_left(app):
         return await _stop_mep(app, None)  # detached, but a block it left may still bill: name it again (#178)
     if eid is None:
+        # Nothing bound (a fresh server's first call, a startup pin before its first block): the blocks the record names
+        # — an earlier server's, or this one's left by a re-bind — are reached again and released by the stop below, on
+        # a context bound to their endpoint for this stop alone (hpc_bridge.earlier); a facility endpoint's are named
+        cold = await earlier.stop_cold(app, _stop_endpoint_blocks, lambda s: _stop_mep(s, None))
+        if cold is not None:
+            cold.session_spend = _total_session_spend(app)
+            return cold
         return EndpointStatus(status="down", block_state="cold", notice="no endpoint was up")
     if not _has_login_shape(app):  # a facility MEP: no release channel exists — drain honestly
         return await _stop_mep(app, eid)
@@ -1595,13 +1612,17 @@ async def _stop_endpoint_blocks(app: AppCtx) -> EndpointStatus:
             notice=(f"{detail}. Spend is NOT confirmed stopped: {unknown_batch}. Call stop_endpoint again once they "
                     "are settled. The login endpoint stays online for reuse."))
     if confirmed and not pending:
+        # every block of this endpoint is gone (the release read them all by its marker): their records close — an
+        # earlier server's included, which the answer names
+        theirs = earlier.released_note(app, eid, detail)
+        earlier.end_endpoint(app, eid, "stop")
         return EndpointStatus(
             status="down",  # the cancel CONFIRMED, and no task of ours is left that could start a block
             block_state="cold",
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
             spend_stopped=True,  # the one result that may say so
-            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran, lost=lost),
+            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran, lost=lost) + theirs,
         )
     if confirmed:  # the scheduler holds nothing of ours now, but a task still queued can start a block
         released = detail if detail != "released none" else None
@@ -2133,6 +2154,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
         warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
         app.ssh_left.pop(eid, None)
+        earlier.end_endpoint(app, eid, "teardown")   # its blocks were released with it: their records close
     await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",
@@ -2331,7 +2353,9 @@ async def _ready_session(
     # The spend floors report the session spend, as ensure_endpoint_up's do: a reap this call found has just banked the
     # old block.
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
-        return _with_spend(app, _needs_confirmation_outcome(app, rt))
+        out = _needs_confirmation_outcome(app, rt)
+        out.notice = earlier.spend_lead(app, rt) + (out.notice or "")   # an earlier server's block still billing here
+        return _with_spend(app, out)
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _with_spend(app, _needs_account_outcome(app, rt))
     if not_warm is not None:
