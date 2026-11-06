@@ -7,8 +7,8 @@
    still read against the scheduler, and closed when gone.
 2. A pinned session's pre-bring-up swallowed a failed bootstrap and the billed bring-up tried again: two SSH logins.
 3. That pre-bring-up ran for an unconfirmed call too, and for records of any facility: a spend question ran the
-   bootstrap. Now only for the pinned facility's records; an unconfirmed call reads them over the web only (zero
-   SSH), else names them unverified and reads them after the yes.
+   bootstrap. A spend question names the session's facility's records unverified and brings nothing up; the record
+   is read after the yes, once the bring-up knows the endpoint id (round 3: warmth._provision's one choke point).
 4. One endpoint's failed ask left it unreleased while the others were: it is released and answered unconfirmed.
 5. A cold question also ran the session's own MEP stop (which pauses batches), and `combined` dropped its jobs and
    handoffs.
@@ -65,10 +65,10 @@ async def test_1_a_hostname_change_does_not_hide_this_machines_record(monkeypatc
     assert stop.status == "down" and stop.spend_stopped is True and "released 40" in stop.notice
 
 
-async def test_1_a_record_with_no_machine_identity_is_this_machines_when_it_can_be_read(monkeypatch):
+async def test_1_a_record_with_no_machine_identity_is_this_machines_when_its_hostname_is_this_one(monkeypatch):
     fac = _Slurm()
     await _session_1(monkeypatch, fac)
-    _set(owner_machine=None, owner_host="somewhere-else")       # unknown identity: verified here, never "elsewhere"
+    _set(owner_machine=None, owner_host=earlier._me().host)     # unknown identity, this hostname (round 3's spec)
     s2 = _server(monkeypatch, fac, bound=False)
     _scripted_login(monkeypatch, releases=["released 40\n"])
     stop = await _stop_endpoint(s2)
@@ -155,14 +155,14 @@ async def test_3_a_spend_question_with_the_endpoint_offline_brings_nothing_up(mo
     assert st.status == "needs_confirmation" and "block job 40" in st.notice and "could not be read" in st.notice
 
 
-async def test_3_a_spend_question_with_the_endpoint_online_reads_it_with_no_ssh_and_no_block(monkeypatch):
+async def test_3_a_spend_question_with_the_endpoint_online_brings_nothing_up_either(monkeypatch):
     fac = _Counted()
     s2, n = await _pinned(monkeypatch, fac, online=True)
     log = _scripted_login(monkeypatch, probes=[_listing(n=n)])
     st = await _ensure_endpoint_up(s2)
-    assert fac.attempts == 0 and [k for k, _c in log] == ["probe"]
+    assert fac.attempts == 0 and log == []                        # round 3: no web shortcut to bind it either
     assert not [u for u in s2.built if u.get("compute")]          # no compute runner: nothing billed is near
-    assert st.status == "needs_confirmation" and "block job 40 (RUNNING)" in st.notice
+    assert st.status == "needs_confirmation" and "block job 40" in st.notice and "could not be read" in st.notice
 
 
 async def test_3_a_record_of_another_facility_never_brings_a_pinned_session_up(monkeypatch):
@@ -183,7 +183,8 @@ async def test_3_after_the_yes_the_record_is_read_before_reuse_or_a_second_block
     fac.manager_up = None                                   # by the yes the endpoint answers over the web: no SSH
     log = _scripted_login(monkeypatch, probes=[_listing(n=n)])
     st = await _ensure_endpoint_up(s2, confirm_spend=True)
-    assert fac.attempts == 0 and [k for k, _c in log] == ["probe"]
+    # one bring-up: the facility's own, which finds the endpoint online over the web before any SSH (round 3)
+    assert fac.attempts == 1 and [k for k, _c in log] == ["probe"]
     assert s2.shapes["compute"].user_endpoint_config["hpcb_block"] == n and "Reused block job 40" in st.notice
 
 
