@@ -23,7 +23,8 @@ GRADED:
 - `cold_stop_honest` (gated): no phase-1 stop claims `down` without `spend_stopped` true, nor before one of them said it
   released phase 0's job.
 - `world:cold_stop_block_gone`: phase 0's job is no longer queued or running when the chain is done (an ending job,
-  Slurm's CG, waited out), read before the teardown; beside the universal world:stop_honesty_no_pilot_left.
+  Slurm's CG, waited out), read before the teardown; a squeue that fails otherwise than "Invalid job id" is
+  UNVERIFIABLE, never gone (review round 1); beside the universal world:stop_honesty_no_pilot_left.
 
 ON MAIN (before the fix) phase 1's stop answers `down`, "no endpoint was up", and releases nothing: `cold_stop_released`
 and `world:cold_stop_block_gone` fail (the block bills until it idle-releases).

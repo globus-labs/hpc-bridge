@@ -122,8 +122,25 @@ connect released both. Fixed test-first (`tests/test_restart_block_record.py`; m
 - Live cell to run (scripted chain, kept out of the sweep until its proof): `HPCB_OPERATOR=script HPCB_TARGET=fake
   HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh restart_cold_stop`. Worth re-running too: the free chain cells that
   showed it, and `batch_restart_resume` (its resume now takes the killed server's block over when its config matches).
-- Not done: `teardown_endpoint` with nothing bound; a startup pin's first billed start (no endpoint id before its
-  bring-up) does not read the record first; a cold stop with live Jobs-mode jobs answers as before.
+- **Review round 1** (branch `fix/restart-block-record-r1`, `tests/test_restart_block_record_r1.py`):
+  - blocker: a cold stop ran the block release alone and cancelled a handoff consumer's pool unasked; it now runs the
+    WHOLE stop on the scratch context (handoff question and scope, Jobs-mode keep/cancel, busy refusal), asks first for
+    every endpoint, and holds the session's lock;
+  - a startup pin's first billed call brings up the free login shape first, so the record is read before any block
+    (it had started a second block beside job 40), and a pinned session's records carry its catalog entry;
+  - a record re-opened after it ended drops the ended block's job and age; with no scheduler read a record closes only
+    past its walltime (never seen up: three days of queue allowance plus its walltime; two days when unknown);
+  - `restart_cold_stop`'s world check keeps squeue's stderr and exit status: a failing squeue is UNVERIFIABLE;
+  - live `batch_restart_resume` FAILED on d205841: Globus answered every REST pull with a 500 (StorageException), and
+    on the reused block the killed server's three ended rows held the whole window until the block idled out (then
+    read as a reap). A row's slot now follows the server that SENT it (`task.sent_*`): a gone sender's frees after
+    task_walltime_s + HOLD_MARGIN_S. Re-run it live;
+  - nits: a record of another host or pid namespace is never taken for gone; one endpoint's failure is its own
+    `draining`; the cold lead says whether it reached the endpoint; export_handoff names an earlier block; an
+    unreachable record is "recorded, not reachable from here", with the user's own cancel; the ledger adds columns
+    in one immediate transaction (concurrent opens).
+- Not done: `teardown_endpoint` with nothing bound; a cold stop finds an endpoint only through a block record (a
+  leftover handoff alone needs a connect first).
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
