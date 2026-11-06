@@ -83,7 +83,9 @@ def test_r1_1_the_watchers_cost_on_a_row_of_three_thousand_idle_threads_stays_sm
     watcher = (r1.ru_utime - r0.ru_utime) + (r1.ru_stime - r0.ru_stime) - row
     print(f"\nwatcher on 3000 threads: {watcher:.2f} CPU-s over {wall:.1f} s ({100 * watcher / wall:.1f}% of a CPU)")
     assert rep.threads is not None and rep.threads >= 3000 and (rep.r_samples or 0) >= 3, rep
-    assert watcher / wall < 0.10, f"the watcher used {watcher:.2f} CPU-s over {wall:.1f} s"
+    # (6% measured alone in the test container; the bound leaves room for a loaded machine, and stays far under the
+    # 28% the uncapped look cost)
+    assert watcher / wall < 0.15, f"the watcher used {watcher:.2f} CPU-s over {wall:.1f} s"
 
 
 # ---- R1-2: an older endpoint venv in a persisted PATH -------------------------------------------------------------------
