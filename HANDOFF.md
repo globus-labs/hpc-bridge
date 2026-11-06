@@ -86,6 +86,10 @@ Fixed test-first (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests
   with its block gone asks for its derived block; **G3** every batch waits for the block's measure; **G4**
   `memory_gb` a number everywhere (1.5 GB → `--mem=1536M`); **G5** run_batch's `idempotent` said.
 - Still to re-check live on Anvil: F3 (the step on Anvil's task/affinity), F5 (the MEP's worker shell), F4.
+- **Review round 1** (`tests/test_anvil_live_findings_r1*.py`): a row of thousands of threads keeps its full look (and
+  costs 6–8% of a CPU, not 28–50%); no billed block starts on terms no answer showed (a resumed batch's re-derived block
+  is quoted first); `env_failed` on run_batch / submit_job answers too; every hpc-bridge venv's bin leaves PATH; the
+  runnable counts are not written a look; one whole-GB rounding rule; `module` as a command word only.
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
