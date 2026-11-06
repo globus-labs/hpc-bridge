@@ -155,6 +155,9 @@ class ShapeRuntime:
     # The block an earlier hpc-bridge server left running that this confirmation took over, on the same terms
     # (hpc_bridge.earlier: its block request, so the check lands on it): the answer that confirmed says so, once.
     earlier_reused: EarlierBlock | None = None
+    # A yes stopped at the choke point before its block (warmth._provision: the bring-up learnt an endpoint whose
+    # record this process had not read): the caller reads it off the lock and decides the yes again, once.
+    earlier_unread: bool = False
 
 
 @dataclass(frozen=True)

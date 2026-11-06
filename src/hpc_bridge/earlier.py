@@ -406,8 +406,11 @@ async def refresh(app: AppCtx, eid: str | None, run_login: LoginRunner | None, *
                   force: bool = False) -> EarlierView | None:
     """Before a spend question or a billed start: the view of `eid`, read again when it is older than VIEW_TTL_S or
     was never read (`force`: a connect, which reads it afresh) — only when a record of an earlier server is open there
-    (a ledger read; nothing else otherwise)."""
+    (a ledger read; nothing else otherwise). No endpoint id yet (a startup pin, a connect whose login bring-up failed):
+    the session's facility's records are only NAMED, unverified (`_name_unbound`) — nothing is brought up for them; the
+    record is read once the bring-up knows the endpoint (`unread`, at warmth._provision's one choke point)."""
     if eid is None:
+        _name_unbound(app)
         return None
     view = app.earlier.get(eid)
     if not force and view is not None and time.monotonic() - view.at < VIEW_TTL_S:
@@ -421,47 +424,47 @@ async def refresh(app: AppCtx, eid: str | None, run_login: LoginRunner | None, *
     return await verify(app, eid, run_login or _no_runner)
 
 
-def pinned_records(app: AppCtx) -> list[dict]:
-    """The open records of earlier servers of THIS startup pin's facility (HPC_BRIDGE_MACHINE), newest last — what a
-    pinned session that has no endpoint id yet must read before it decides a block (review round 2: any facility's
-    record had made a spend question run the bootstrap). A ledger read only."""
-    pin = config.machine() or ""
-    if not pin or app.machine is not None:
-        return []
+def unread(app: AppCtx, eid: str | None) -> bool:
+    """THE check before a billed block starts on `eid` (warmth._provision, once the bring-up knows the endpoint id,
+    whatever path led to it — a connect, a startup pin, a connect whose login bring-up failed, a fresh session): a
+    record of another server is open there that this process has not read since it knew the endpoint. Then nothing is
+    started: the caller reads it (off the lock) and decides the yes again — reuse, ask, or a fresh block (review round
+    3: the record had been read only for a pin whose facility string matched exactly). A ledger read only."""
+    if eid is None or eid in app.earlier:
+        return False
+    rows, problem = _records(app, eid)
+    return problem is not None or any(_whose(app, r) in ("earlier", "elsewhere") for r in rows)
+
+
+def _name_unbound(app: AppCtx) -> None:
+    """A session's spend question before its endpoint id is known: the records of its facility — by the recorded catalog
+    entry's identity, never a facility string (review round 3: a pin of `example:mine` missed a record of `mine`) —
+    named unverified."""
+    if not _has_login_shape(app) or _no_facility_bound(app):
+        return
     rows, _problem = _records(app)
-    return [r for r in rows if r.get("facility") == pin and _whose(app, r) == "earlier"]
+    blocks = tuple(_block(r, verified=False) for r in rows if _whose(app, r) == "earlier" and _of_session(app, r))
+    app.earlier[_unbound_key(app)] = EarlierView(at=time.monotonic(), blocks=blocks, unread=(
+        "the endpoint is not up in this session yet: it is read once the user's yes brings it up") if blocks else None)
 
 
-async def reach_pinned(app: AppCtx, rows: list[dict]) -> bool:
-    """A pinned session with no endpoint id: is the endpoint its records name online over the web? Then it is bound as
-    a reuse — what the bring-up would find — with zero SSH, and its record can be read through the free login shape.
-    Never without a stored Globus login (the SDK must not prompt on the MCP transport). Callers do not hold the
-    lock."""
-    if not rows or app.state.endpoint_id is not None:
-        return app.state.endpoint_id is not None
-    if app.login_flow is not None and await asyncio.to_thread(app.login_flow.login_required):
-        return False
-    eid = str(rows[-1]["endpoint_id"])
+def _of_session(app: AppCtx, r: dict) -> bool:
+    """A record of the facility this session is bound to: its catalog entry is the one connect bound (same subject), or
+    one the startup pin names (binding._names_machine: its id, subject, or the alias the pin resolved)."""
     try:
-        online = bool(await app.facility.manager_online(eid))
-    except Exception:  # noqa: BLE001 - not reached over the web: read after the yes
+        entry = CatalogEntry.model_validate_json(r["entry"]) if r.get("entry") else None
+    except Exception:  # noqa: BLE001 - a record that cannot be read as an entry is named once the endpoint is known
         return False
-    if online:
-        async with app.lock:
-            if app.state.endpoint_id is None:
-                app.state = EndpointState(endpoint_id=eid, reused=True)
-    return online
+    if entry is None:
+        return False
+    if app.bound_entry is not None:
+        return entry.subject == app.bound_entry.subject
+    return app.machine is None and binding._names_machine(entry)
 
 
-def unverified_pin(app: AppCtx, rows: list[dict], why: str) -> None:
-    """A pinned session's spend question with its endpoint not reachable without SSH: the records are named
-    unverified (`why`), and read against the scheduler after the user's yes, before reuse or a second block."""
-    app.earlier[_pin_key(app)] = EarlierView(at=time.monotonic(), blocks=tuple(_block(r, verified=False)
-                                                                              for r in rows), unread=why)
-
-
-def _pin_key(app: AppCtx) -> str:
-    return f"pin:{config.machine() or ''}"
+def _unbound_key(app: AppCtx) -> str:
+    bound = app.bound_entry
+    return f"unbound:{bound.subject if bound is not None else config.machine() or ''}"
 
 
 async def _no_runner(cmd: str) -> ShellOutcome:   # a facility endpoint's verify reads no scheduler
@@ -478,10 +481,10 @@ def bound_eid(app: AppCtx) -> str | None:
 
 
 def _view(app: AppCtx) -> EarlierView | None:
-    """What this process last read of the bound endpoint's earlier blocks — or, a pinned session not yet bound, what
-    its spend question named of its facility's records (`unverified_pin`)."""
+    """What this process last read of the bound endpoint's earlier blocks — or, no endpoint id yet, what its spend
+    question named of its facility's records (`_name_unbound`)."""
     eid = bound_eid(app)
-    return app.earlier.get(eid) if eid is not None else app.earlier.get(_pin_key(app))
+    return app.earlier.get(eid) if eid is not None else app.earlier.get(_unbound_key(app))
 
 
 def _forget(app: AppCtx, eid: str, request: str) -> None:
@@ -559,8 +562,10 @@ def _second(app: AppCtx, b: EarlierBlock, uec: dict) -> bool:
 
 def must_ask(app: AppCtx, rt: ShapeRuntime) -> bool:
     """A yes that would start a block while an earlier server's block bills on this endpoint, and no spend question of
-    this process has named that block: ask first (never a second block unasked)."""
-    return any(_second(app, b, rt.user_endpoint_config) and not _told(app, b) for b in _billing(app))
+    this process has named that block: ask first (never a second block unasked). No endpoint id yet: decided once the
+    bring-up knows it and its record is read (`unread`)."""
+    return bound_eid(app) is not None and any(_second(app, b, rt.user_endpoint_config) and not _told(app, b)
+                                              for b in _billing(app))
 
 
 def spend_lead(app: AppCtx, rt: ShapeRuntime, *, yes: bool = False) -> str:

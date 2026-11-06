@@ -443,6 +443,16 @@ async def _ensure_endpoint_up(
     before = (rt0, rt0.spend_confirmed, rt0.block_epoch) if rt0 is not None else None
     st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
                                whole_node, recheck=recheck, workers=workers)
+    if (unread := app.shapes.get(shape)) is not None and unread.earlier_unread:
+        # the bring-up learnt an endpoint whose record no read of this process covers: read now (off the lock), and
+        # this yes decided again — reused, asked about, or a fresh block (hpc_bridge.earlier.unread)
+        unread.earlier_unread = False
+        await earlier.refresh(app, app.state.endpoint_id, _login_runner(app) if _has_login_shape(app) else None,
+                              force=True)
+        st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
+                                   whole_node, recheck=recheck, workers=workers)
+        if (again := app.shapes.get(shape)) is not None:
+            again.earlier_unread = False   # (once: a second miss answers as it stands — nothing started)
     chosen: envs.Chosen | None = None
     if spec is not None:
         if st._nothing_set:
@@ -500,32 +510,6 @@ def _set_nothing(st: EndpointStatus) -> EndpointStatus:
     review R2-S1 — the env asked with them is not applied either)."""
     st._nothing_set = True
     return st
-
-
-async def _pinned_records_first(app: AppCtx, confirm_spend: bool) -> EndpointStatus | None:
-    """A startup pin learns its endpoint only in its bring-up; its facility's records (`earlier.pinned_records`: that
-    facility's alone) are read before any block is decided (review round 1: its first yes started a second block
-    beside an earlier one, unasked). Over the web first — the recorded endpoint online is a zero-SSH reuse, read
-    through the free login shape —; else a spend question names them unverified and brings nothing up (review round 2:
-    it ran the bootstrap), and only the user's yes brings the endpoint up, ONCE: what that raises is this call's answer,
-    never a second attempt by the billed bring-up (round 2: two SSH logins, twice the auth failures fail2ban counts).
-    None: go on."""
-    if app.state.endpoint_id is not None or not _has_login_shape(app) or _no_facility_bound(app):
-        return None
-    pinned = earlier.pinned_records(app)
-    if not pinned or await earlier.reach_pinned(app, pinned):
-        return None
-    if not confirm_spend:
-        earlier.unverified_pin(app, pinned, "the endpoint did not answer over the web, and a spend question brings "
-                               "nothing up over SSH: it is read after the user's yes")
-        return None
-    try:
-        async with app.lock:
-            await warmth._ensure_warm_runner(app, "login")
-    except Exception as exc:  # noqa: BLE001 - the bring-up's own failure, answered as the bring-up answers it
-        return EndpointStatus(status="down", block_state="cold", endpoint_id=app.state.endpoint_id,
-                              session_spend=_total_session_spend(app), notice=_hpc_bridge_error(exc))
-    return None
 
 
 async def _ensure_up_once(
@@ -633,10 +617,8 @@ async def _ensure_up_once(
             return _set_nothing(refused)
     if shape == DEFAULT_SHAPE and not getattr(app.shapes.get(shape), "spend_confirmed", False):
         # a spend question or a new block may follow: what an EARLIER server left billing on this endpoint, read from
-        # the scheduler again when the last read is stale (off the lock: the read rides the login shape)
-        failed = await _pinned_records_first(app, confirm_spend)
-        if failed is not None:
-            return failed
+        # the scheduler again when the last read is stale (off the lock: the read rides the login shape); no endpoint id
+        # yet, its facility's records are only named — warmth._provision reads them once the bring-up knows the id
         await earlier.refresh(app, earlier.bound_eid(app), _login_runner(app) if _has_login_shape(app) else None)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
@@ -698,6 +680,10 @@ async def _ensure_up_once(
                 account=active_account,
                 notice=said(_hpc_bridge_error(exc)),
             )
+        if block == "needs_confirmation" and rt.earlier_unread:   # read off the lock, then decided again (the caller)
+            return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                                  session_spend=_total_session_spend(app), partition=active_partition,
+                                  account=active_account, notice=notices._EARLIER_UNREAD)
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             terms = _block_terms(app, rt, named=named)
             rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the size this question names

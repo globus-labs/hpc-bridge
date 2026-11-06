@@ -785,6 +785,8 @@ def _earlier_mep_note(b: EarlierBlock, scheduler: str | None) -> str:
             "facility; stop_endpoint here cannot cancel it. ")
 
 
+_EARLIER_UNREAD = ("Nothing was started: what earlier hpc-bridge sessions left billing on this endpoint could not be "
+                   "read before its block. Call ensure_endpoint_up again; it reads that first.")
 _EARLIER_ASK = ("This yes came before that was said, so nothing was started: ask the user again — with their yes, the "
                 "same call starts a second block beside it; stop_endpoint first ends the earlier one. ")
 

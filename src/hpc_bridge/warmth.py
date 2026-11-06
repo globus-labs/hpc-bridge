@@ -715,6 +715,13 @@ async def _provision(
         adopt = getattr(app.facility, "adopt_endpoint", None)
         if app.state.endpoint_id and inspect.iscoroutinefunction(adopt):
             await adopt(app.state.endpoint_id)
+        if new_request and earlier.unread(app, app.state.endpoint_id):
+            # THE one check before a billed block starts: other servers' records of the endpoint this bring-up knows
+            # now (by its id, whatever path led here) are read first — off the lock, by the caller, which then decides
+            # this yes again (review round 3: a failed connect, and a pin by another name, started a second block)
+            rt.spend_confirmed, rt.earlier_unread = False, True
+            _bank_warm_interval(rt, app)
+            return "needs_confirmation"
         if (stale := _stale_size(app, rt)) is not None:
             # the size was asked before this endpoint's template was known (a startup pin, before its bootstrap), and
             # the endpoint it reached renders none of it: refuse before any check is sent, never drop it silently
