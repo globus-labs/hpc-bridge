@@ -765,7 +765,8 @@ def _earlier_note(app: AppCtx, items: list[tuple[EarlierBlock, str | None]], *, 
 
 def _earlier_mep_note(b: EarlierBlock, scheduler: str | None) -> str:
     """An earlier server's block on a facility multi-user endpoint, from its record alone: hpc-bridge has no scheduler
-    channel there, so it is named unverified, with the user's own commands."""
+    channel there, so it is named unverified — and as possibly ended (review round 2: its record is closed only by the
+    clock, so it is named until its block cannot still run) —, with the user's own commands."""
     cancel, check, _by_user = _scheduler_cmds(scheduler)
     end = b.walltime_end
     until = (f", at the latest until its walltime ends at {_wall_clock(end)}" if end is not None else
@@ -773,14 +774,15 @@ def _earlier_mep_note(b: EarlierBlock, scheduler: str | None) -> str:
     where = f", partition {b.partition!r}" if b.partition else ""
     if not b.job:
         return (f"An earlier hpc-bridge session asked this facility endpoint for a block at "
-                f"{_wall_clock(b.confirmed_at)}{where} and never saw it come up: the facility may still start one for "
-                "its check, which then bills until the facility's idle-release. hpc-bridge cannot read this facility's "
-                "scheduler, so this is not verified; stop_endpoint here cannot cancel it. ")
+                f"{_wall_clock(b.confirmed_at)}{where} and never saw it come up: it may have ended, or never started, "
+                "or the facility may still start one for its check, which then bills until the facility's "
+                "idle-release. hpc-bridge cannot read this facility's scheduler, so this is not verified; "
+                "stop_endpoint here cannot cancel it. ")
     return (f"An earlier hpc-bridge session's block on this facility endpoint is on record: scheduler job {b.job} (up "
             f"at {_wall_clock(b.up_at or b.confirmed_at)}{where}). hpc-bridge cannot read this facility's scheduler, "
-            f"so it is not verified: it may bill until the facility's idle-release{until}. The user checks with "
-            f"`{check.format(job=b.job)}` and ends it with `{cancel.format(job=b.job)}` on the facility; stop_endpoint "
-            "here cannot cancel it. ")
+            f"so it is not verified: it may have ended already, or may bill until the facility's idle-release{until}. "
+            f"The user checks with `{check.format(job=b.job)}` and ends it with `{cancel.format(job=b.job)}` on the "
+            "facility; stop_endpoint here cannot cancel it. ")
 
 
 _EARLIER_ASK = ("This yes came before that was said, so nothing was started: ask the user again — with their yes, the "
