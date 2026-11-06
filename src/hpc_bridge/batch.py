@@ -2200,8 +2200,9 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             return _refused(str(exc))
     # a yes starts a block derived from the rows only when an answer of this process quoted exactly it (review round
     # 2: an agent's FIRST call, with the yes the user gave to the session's default terms, had started a derived block
-    # no answer named — smaller there; 8 cores × 8 at once is 65 CPUs): otherwise this call quotes it, starting nothing
-    unseen = derived is not None and confirm_spend and _derived_key(derived) not in app.batch_quoted
+    # no answer named — smaller there; 8 cores × 8 at once is 65 CPUs): otherwise this call quotes it, starting nothing.
+    # Exactly it: on this facility, endpoint, partition and account too (`_quote_key`, review round 3)
+    unseen = derived is not None and confirm_spend and _quote_key(app, derived) not in app.batch_quoted
     st = await ensure_up(app, confirm_spend and not unseen, size=derived)
     if (derived is not None and st.status in ("needs_confirmation", "needs_account")
             and not _is_derived(st.block, derived)):
@@ -2218,7 +2219,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             words = derived.words(asked)
             if out.block is not None:
                 out.block.derived_from = words
-                app.batch_quoted.add(_derived_key(derived))   # these terms are now shown: the next yes starts them
+                app.batch_quoted.add(_quote_key(app, derived))   # these terms are now shown: the next yes starts them
             fixed = _fixed_workers(app)
             out.sizing = _sizing_model(asked, derived=True)
             out.sizing.slots = asked.concurrency
@@ -2410,8 +2411,19 @@ def _pilot_done_proposal(app: AppCtx, run: _Run, b: dict[str, Any]) -> None:
 
 
 def _derived_key(d: sz.DerivedBlock) -> tuple[Any, ...]:
-    """A derived block, comparable: what an answer quoted is what a yes starts (`AppCtx.batch_quoted`)."""
+    """A derived block's size, comparable (`_quote_key`)."""
     return (d.cores, d.memory_gb, d.gpus, d.workers, d.nodes, d.whole_node)
+
+
+def _quote_key(app: AppCtx, d: sz.DerivedBlock) -> tuple[Any, ...]:
+    """The terms a yes to a derived block would start it on, comparable: the facility and the endpoint bound, the
+    partition and account the block goes out with, and its size — what an answer quoted is what a yes starts
+    (`AppCtx.batch_quoted`). Review round 3: keyed by the size alone, a quote outlived its facility, account and
+    partition (a yes after a re-bind started 65 CPUs on another account that no answer of that binding had named)."""
+    rt = app.shapes.get("compute")
+    uec = rt.user_endpoint_config if rt is not None else warmth._seed_uec(app, "compute")
+    return (app.machine or getattr(app.facility, "name", None), app.state.endpoint_id, uec.get("partition"),
+            uec.get("account"), *_derived_key(d))
 
 
 async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: bool,
@@ -2497,7 +2509,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
     # asks for the block derived from them again, as size first did — never the session's default (review G2)
     again = _rederive(app, b, pre)
     derived, sized_as = again if again is not None else (None, None)
-    quoted = derived is not None and _derived_key(derived) in app.batch_quoted
+    quoted = derived is not None and _quote_key(app, derived) in app.batch_quoted
     asked_yes = not confirm_spend and b["state"] == "needs_confirmation" and not resumes
     if derived is not None and sized_as is not None and (asked_yes or (confirm_spend and not quoted)):
         # the yes is asked for THAT block: its terms first, and a yes starts only a block an answer of this process
@@ -2507,7 +2519,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         if st0.block is None or not _is_derived(st0.block, derived):
             return _refused("the block derived from the batch's rows cannot be asked for here", bid=bid,
                             notice=st0.notice)
-        app.batch_quoted.add(_derived_key(derived))
+        app.batch_quoted.add(_quote_key(app, derived))
         out = _status_of(app, bid)
         out.phase, out.block = "needs_confirmation", st0.block
         out.block.derived_from = derived.words(sized_as)

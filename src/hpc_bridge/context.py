@@ -551,9 +551,11 @@ class AppCtx:
     ledger: Any = None
     batch_owner: Any = None
     batch_autoloop: bool = True
-    # every block derived from a batch's rows whose terms an answer of THIS process quoted (`batch._derived_key`): a yes
-    # starts a derived block only when it is one of them — a new sized batch's (review round 2) and a resumed one's
-    # (round 1): one call had started a block no answer had shown
+    # every block derived from a batch's rows whose terms an answer of THIS process quoted (`batch._quote_key`: the
+    # facility, endpoint, partition, account and size): a yes starts a derived block only when it is one of them — a new
+    # sized batch's (review round 2) and a resumed one's (round 1): one call had started a block no answer had shown.
+    # Cleared by a re-bind or a teardown (`warmth._drop_all_shapes`) and by any switch of the terms (`warmth._repoint`):
+    # a quote is for the terms it showed (round 3); a stop keeps them, as it keeps `compute_choice`
     batch_quoted: set[Any] = field(default_factory=set)
     # Batch phase 2a (hpc_bridge.jobs): this server's session — minted once per server lifespan, it is what an envelope
     # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
