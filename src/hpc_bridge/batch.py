@@ -4253,6 +4253,11 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         if c.get(k):
             parts.append(f"{c[k]} {k.replace('_', ' ')}")
     text = "; ".join(parts) + "."
+    if c.get("presumed_lost") and c.get("backlog") and state not in ("done", "cancelled") and not _has_login_shape(app):
+        # by design (Ledger.reserve's by_sender): a facility endpoint can still deliver it late, and then it runs
+        text += (" On a facility endpoint a presumed-lost row keeps its slot (a late delivery can still run it): while "
+                 f"such rows fill this batch's window nothing more is admitted — cancel('{bid}') or stop_endpoint ends "
+                 "the wait.")
     rec = _env_rec(b)
     if phase == "needs_confirmation" and rec is not None and rec.get("unbuildable") and not gone:
         # block environments: a yes cannot mend it — never ask for one that cannot work (review S1)

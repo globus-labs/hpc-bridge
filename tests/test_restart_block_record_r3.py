@@ -272,7 +272,7 @@ async def test_c_a_record_read_that_fails_in_the_cold_stop_is_draining_never_dow
 def test_d_combined_and_questions_keep_each_job_once_by_its_id():
     def part(status, *ids):
         return EndpointStatus(status=status, block_state="cold", notice=status, jobs=[JobInfo(job_id=i) for i in ids],
-                              handoffs=[HandoffRef(handoff_id="h-" + ids[0], state="exported")])
+                              handoffs=[HandoffRef(handoff_id="h-" + status, state="exported")])
 
     out = earlier.combined([part("down", "job-1"), part("draining", "job-1", "job-2")])
     assert [j.job_id for j in out.jobs] == ["job-1", "job-2"] and len(out.handoffs) == 2

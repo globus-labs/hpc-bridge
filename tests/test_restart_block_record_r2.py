@@ -18,13 +18,12 @@
 from __future__ import annotations
 
 import time
-from types import SimpleNamespace
 
 from hpc_bridge import batch, binding, earlier, server
 from hpc_bridge.context import AppCtx, LeftBlock
 from hpc_bridge.facility.mep import MEPFacility
 from hpc_bridge.ledger import Ledger
-from hpc_bridge.models import EndpointStatus
+from hpc_bridge.models import EndpointStatus, HandoffRef, JobInfo
 from hpc_bridge.profile import Profile
 from hpc_bridge.server import _ensure_endpoint_up, _stop_endpoint
 from tests.fakes import FakeCatalog, fake_entry, fake_mep_entry
@@ -238,24 +237,22 @@ async def test_5_a_cold_question_runs_no_other_stop_and_keeps_its_jobs(monkeypat
     async def hands(a, budget_s=20.0, adopt=True):
         return []
 
-    asked = EndpointStatus.model_construct(status="needs_confirmation", block_state="cold", notice="choose",
-                                           jobs=[SimpleNamespace(id="job-1")], handoffs=[], spend_stopped=None)
+    asked = EndpointStatus(status="needs_confirmation", block_state="cold", notice="choose",
+                           jobs=[JobInfo(job_id="job-1")])
     monkeypatch.setattr(jobmode, "billing_jobs", live)
     monkeypatch.setattr(jobmode, "hand_results", hands)
     monkeypatch.setattr(jobmode, "stop_question", lambda a, rows, h: asked.model_copy())
     st = await _stop_endpoint(app)
     assert st.status == "needs_confirmation" and paused == [], "the question changed state (a batch paused)"
-    assert [getattr(j, "id", None) for j in st.jobs] == ["job-1"]
+    assert [j.job_id for j in st.jobs] == ["job-1"]
 
 
 def test_5_combined_keeps_every_parts_jobs_and_handoffs():
-    a = EndpointStatus.model_construct(status="down", block_state="cold", spend_stopped=True, notice="a",
-                                       block_job_id=None, jobs=[SimpleNamespace(id="job-1")],
-                                       handoffs=[SimpleNamespace(handoff_id="h1")])
-    b = EndpointStatus.model_construct(status="draining", block_state="cold", spend_stopped=None, notice="b",
-                                       block_job_id=None, jobs=[SimpleNamespace(id="job-2")], handoffs=[])
+    a = EndpointStatus(status="down", block_state="cold", spend_stopped=True, notice="a",
+                       jobs=[JobInfo(job_id="job-1")], handoffs=[HandoffRef(handoff_id="h1", state="exported")])
+    b = EndpointStatus(status="draining", block_state="cold", notice="b", jobs=[JobInfo(job_id="job-2")])
     out = earlier.combined([a, b])
-    assert [j.id for j in out.jobs] == ["job-1", "job-2"] and [h.handoff_id for h in out.handoffs] == ["h1"]
+    assert [j.job_id for j in out.jobs] == ["job-1", "job-2"] and [h.handoff_id for h in out.handoffs] == ["h1"]
 
 
 # --- 6. a facility endpoint keeps a dead server's presumed-lost slot ---------------------------------------------------

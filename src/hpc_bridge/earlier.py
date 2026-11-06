@@ -852,14 +852,20 @@ def _questions(qs: list[EndpointStatus]) -> EndpointStatus:
     """What the cold stop asks before changing anything anywhere: every endpoint's question, its handoffs and jobs."""
     if len(qs) == 1:
         return qs[0]
-    jobs: dict[str, Any] = {}
-    for q in qs:   # the same Jobs-mode jobs are every endpoint's question: each once
-        for j in q.jobs or []:
-            jobs.setdefault(str(getattr(j, "id", None) or id(j)), j)
     notices_ = list(dict.fromkeys((q.notice or "").strip() for q in qs))
-    return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=None,
-                          handoffs=[h for q in qs for h in (q.handoffs or [])], jobs=list(jobs.values()),
-                          notice=" Also: ".join(notices_))
+    out = EndpointStatus(status="needs_confirmation", block_state="cold", notice=" Also: ".join(notices_))
+    out.jobs, out.handoffs = _jobs_and_handoffs(qs)
+    return out
+
+
+def _jobs_and_handoffs(parts: list[EndpointStatus]) -> tuple[list[Any], list[Any]]:
+    """Every part's Jobs-mode jobs — each once, by its `job_id` (the same jobs are every endpoint's answer) — and
+    handoffs."""
+    jobs: dict[str, Any] = {}
+    for p in parts:
+        for j in p.jobs or []:
+            jobs.setdefault(str(getattr(j, "job_id", None) or id(j)), j)
+    return list(jobs.values()), [h for p in parts for h in (p.handoffs or [])]
 
 
 def combined(parts: list[EndpointStatus]) -> EndpointStatus:
@@ -930,10 +936,5 @@ def _combined(parts: list[EndpointStatus]) -> EndpointStatus:
         block_job_id=next((p.block_job_id for p in parts if p.block_job_id), None),
         spend_stopped=True if all(s is True for s in stopped) else (False if False in stopped else None),
         notice=" Also: ".join((p.notice or "").strip() for p in parts))
-    jobs: dict[str, Any] = {}
-    for p in parts:
-        for j in getattr(p, "jobs", None) or []:
-            jobs.setdefault(str(getattr(j, "id", None) or id(j)), j)
-    out.jobs = list(jobs.values())
-    out.handoffs = [h for p in parts for h in (getattr(p, "handoffs", None) or [])]
+    out.jobs, out.handoffs = _jobs_and_handoffs(parts)
     return out
