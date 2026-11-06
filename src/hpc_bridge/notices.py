@@ -864,8 +864,9 @@ def _earlier_unreachable(blocks: list[EarlierBlock], facility: str | None, eid: 
 
 
 def _earlier_live_stop(blocks: list[EarlierBlock], *, here: bool = True) -> str:
-    """A recorded block a cold stop leaves alone: another server of this host that still runs holds it (`here`), or a
-    server of another host (or another pid namespace sharing the state directory) whose state cannot be read here."""
+    """A recorded block a cold stop leaves alone: another server of this machine that still runs holds it (`here`), or
+    a server of another machine (or another pid namespace sharing the state directory) whose state cannot be read
+    here — and whose block the scheduler still lists, or could not be read."""
     jobs = [b.job for b in blocks if b.job]
     what = (f"block job {', '.join(jobs)}" if jobs else "a block request") + f" on endpoint {blocks[0].endpoint_id}"
     if here:
@@ -873,7 +874,7 @@ def _earlier_live_stop(blocks: list[EarlierBlock], *, here: bool = True) -> str:
                  "another session's work alone — that session's stop_endpoint releases it (or end that session, then "
                  "call stop_endpoint here)")
     else:
-        whose = (f"was started by an hpc-bridge server on another host ({blocks[0].owner_host or 'unknown'}), or in "
+        whose = (f"was started by an hpc-bridge server on another machine ({blocks[0].owner_host or 'unknown'}), or in "
                  "another process namespace sharing this state directory: whether it still runs cannot be told from "
                  "here, so this stop leaves it alone — that session's stop_endpoint releases it")
     return f"Spend is NOT confirmed stopped: {what} {whose}."

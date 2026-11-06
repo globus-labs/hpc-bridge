@@ -87,3 +87,13 @@ def _no_startup_pin_leaks(monkeypatch):
     monkeypatch.setattr(binding, "_PINNED", {})
     monkeypatch.setattr(binding, "_PINNED_ORIGIN", {})
     monkeypatch.setattr(binding, "_PINNED_ENTRY", {})
+
+
+@pytest.fixture(autouse=True)
+def _a_known_machine_identity(monkeypatch):
+    """This machine's identity (`earlier._machine_id`) is the same known one in every test: a container with no
+    /etc/machine-id reads it as unknown — every record this machine's — and another machine's record would not read
+    as another's there (review round 2's tests ran green on macOS, red in the Linux image)."""
+    from hpc_bridge import earlier
+
+    monkeypatch.setattr(earlier, "_MACHINE", "this-test-machine", raising=False)

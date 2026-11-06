@@ -93,6 +93,43 @@ def _me() -> Owner:
     return _OWNER
 
 
+_MACHINE: str | None = None   # this machine's identity, read once ("" once read and unknown)
+
+
+def _read_machine_id() -> str | None:
+    """A STABLE identity of this machine — never its hostname, which a laptop's network changes (review round 2: a
+    macOS hostname with no `scutil HostName` set follows the network, and every record of this machine read as another
+    host's): Linux's /etc/machine-id (or D-Bus's copy), macOS's IOPlatformUUID; None when there is none to read."""
+    import re
+    import subprocess
+    from pathlib import Path
+
+    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+        try:
+            value = Path(path).read_text().strip()
+        except OSError:
+            continue
+        if value:
+            return value
+    if sys.platform == "darwin":
+        try:
+            out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, text=True,
+                                 timeout=5, stdin=subprocess.DEVNULL).stdout
+        except (OSError, subprocess.SubprocessError):
+            return None
+        m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out or "")
+        return m.group(1) if m else None
+    return None
+
+
+def _machine_id() -> str | None:
+    """`_read_machine_id`, cached for the process (ioreg is a subprocess)."""
+    global _MACHINE
+    if _MACHINE is None:
+        _MACHINE = _read_machine_id() or ""
+    return _MACHINE or None
+
+
 def _me_ns() -> str | None:
     """This process's pid namespace (Linux), so a pid of another namespace sharing the state dir (a container) is never
     read here as dead or alive; None where there is none to read (macOS)."""
@@ -163,7 +200,8 @@ def record_request(app: AppCtx, rt: ShapeRuntime) -> None:
             mep=not _has_login_shape(app), scheduler=_scheduler(app), uec_hash=wire_hash(app, uec),
             partition=uec.get("partition"), account=uec.get("account"),
             walltime_s=config._parse_hhmmss(uec.get("walltime")) or None, session=app.session_token,
-            owner_host=me.host, owner_pid=me.pid, owner_start=me.started, owner_ns=_me_ns())
+            owner_host=me.host, owner_pid=me.pid, owner_start=me.started, owner_ns=_me_ns(),
+            owner_machine=_machine_id())
     except NetworkFilesystemError:
         return   # the ledger cannot live there (batch says so); nothing can be recorded
     except Exception as exc:  # noqa: BLE001 - a record is never a reason a call fails
@@ -251,13 +289,19 @@ def _records(app: AppCtx, eid: str | None = None) -> tuple[list[dict], str | Non
 
 def _whose(app: AppCtx, r: dict) -> str:
     """"mine" (this server's), "live" (another server that still runs here: its own session's), "elsewhere" (a server
-    of another host, or of another pid namespace sharing the state dir: whether it runs cannot be told from here, so it
-    is treated as live — never reused or released), or "earlier" (a server of this host that is gone). Only this
-    host's dead pid is gone (review round 1)."""
+    of another MACHINE — its stable identity known and different —, or of another pid namespace sharing the state dir:
+    whether it runs cannot be told from here, so it is never reused or released; it is still read against the
+    scheduler, and closed when gone), or "earlier" (a server of this machine that is gone). The hostname is never
+    consulted (review round 2: a laptop's network renames it, and round 1's host test hid every record of this machine
+    after a network change); an identity unknown on either side is this machine's, so a record it can verify through
+    the scheduler is verified."""
     if r.get("session") == app.session_token:
         return "mine"
-    ns = r.get("owner_ns")
-    if str(r.get("owner_host") or "") != _me().host or (ns is not None and ns != _me_ns()):
+    theirs, ours = r.get("owner_machine"), _machine_id()
+    if theirs and ours and theirs != ours:
+        return "elsewhere"
+    ns, my_ns = r.get("owner_ns"), _me_ns()
+    if ns is not None and my_ns is not None and ns != my_ns:
         return "elsewhere"
     holder = Owner(str(r.get("owner_host") or ""), int(r.get("owner_pid") or 0), r.get("owner_start"))
     try:
@@ -292,13 +336,19 @@ async def verify(app: AppCtx, eid: str, run_login: LoginRunner) -> EarlierView:
         view = EarlierView(at=now, unread=f"the record of earlier blocks could not be read ({problem})")
         app.earlier[eid] = view
         return view
-    rows = [r for r in rows if _whose(app, r) == "earlier"]
+    whose = {str(r["request"]): _whose(app, r) for r in rows}
+    # an "elsewhere" record (another machine's) is read too, so one whose block is gone is closed — never named, reused
+    # or released here (review round 2: they lingered for days and kept every cold stop draining)
+    rows = [r for r in rows if whose[str(r["request"])] in ("earlier", "elsewhere")]
+    named = {str(r["request"]) for r in rows if whose[str(r["request"])] == "earlier"}
     if not rows:
         view = EarlierView(at=now)
     elif not _has_login_shape(app):
-        view = EarlierView(at=now, blocks=tuple(_block(r, verified=False) for r in rows))
+        view = EarlierView(at=now, blocks=tuple(_block(r, verified=False) for r in rows
+                                                if str(r["request"]) in named))
     else:
         view = await _read_scheduler(app, eid, rows, now, run_login)
+        view = replace(view, blocks=tuple(b for b in view.blocks if b.request in named))
     app.earlier[eid] = view
     return view
 
@@ -363,7 +413,7 @@ async def refresh(app: AppCtx, eid: str | None, run_login: LoginRunner | None, *
     if not force and view is not None and time.monotonic() - view.at < VIEW_TTL_S:
         return view
     rows, problem = _records(app, eid)
-    if problem is None and not any(_whose(app, r) == "earlier" for r in rows):
+    if problem is None and not any(_whose(app, r) in ("earlier", "elsewhere") for r in rows):
         app.earlier[eid] = EarlierView(at=time.monotonic())
         return app.earlier[eid]
     if run_login is None and _has_login_shape(app):

@@ -560,8 +560,9 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                           ("hand", "text"),
                           ("env", "text")],   # block environments: the env its job.sh activates (as a batch's)
                   # the asking server's pid namespace (Linux: /proc/self/ns/pid) — a pid of another namespace sharing
-                  # the state dir is never read here as gone (the restart block review's liveness nit)
-                  "block": [("owner_ns", "text")]}
+                  # the state dir is never read here as gone (the restart block review's liveness nit) — and its
+                  # machine's stable identity (review round 2: never the hostname, which a laptop's network changes)
+                  "block": [("owner_ns", "text"), ("owner_machine", "text")]}
 
 
 class Ledger:
@@ -1190,7 +1191,7 @@ class Ledger:
     def record_block(self, endpoint_id: str, request: str, *, facility: str | None, entry: str | None, mep: bool,
                      scheduler: str | None, uec_hash: str | None, partition: str | None, account: str | None,
                      walltime_s: float | None, session: str, owner_host: str, owner_pid: int, owner_start: str | None,
-                     owner_ns: str | None = None, now: float | None = None) -> None:
+                     owner_ns: str | None = None, owner_machine: str | None = None, now: float | None = None) -> None:
         """A billed block request, recorded when spend is confirmed for it — before its check is sent: the endpoint,
         the block request (`hpcb_block`, else the config's hash), how to reach the endpoint again (the facility id and
         the catalog entry it was bound from), its terms and the server that asked. The same request asked again (a
@@ -1203,8 +1204,9 @@ class Ledger:
         with self._tx() as c:
             c.execute(
                 "insert into block (endpoint_id, request, facility, entry, mep, scheduler, uec_hash, partition, "
-                "account, walltime_s, confirmed_at, session, owner_host, owner_pid, owner_start, owner_ns) "
-                "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict (endpoint_id, request) do update set "
+                "account, walltime_s, confirmed_at, session, owner_host, owner_pid, owner_start, owner_ns, "
+                "owner_machine) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "on conflict (endpoint_id, request) do update set "
                 "job = case when block.ended_at is null then block.job else null end, "
                 "up_at = case when block.ended_at is null then block.up_at else null end, "
                 "facility = excluded.facility, entry = coalesce(excluded.entry, block.entry), mep = excluded.mep, "
@@ -1212,9 +1214,9 @@ class Ledger:
                 "partition = excluded.partition, account = excluded.account, walltime_s = excluded.walltime_s, "
                 "confirmed_at = excluded.confirmed_at, session = excluded.session, owner_host = excluded.owner_host, "
                 "owner_pid = excluded.owner_pid, owner_start = excluded.owner_start, owner_ns = excluded.owner_ns, "
-                "ended_at = null, ended_how = null",
+                "owner_machine = excluded.owner_machine, ended_at = null, ended_how = null",
                 (endpoint_id, request, facility, entry, int(bool(mep)), scheduler, uec_hash, partition, account,
-                 walltime_s, at, session, owner_host, owner_pid, owner_start, owner_ns))
+                 walltime_s, at, session, owner_host, owner_pid, owner_start, owner_ns, owner_machine))
 
     def block_up(self, endpoint_id: str, request: str, job: str, *, at: float | None = None) -> None:
         """The block asked for under `request` came up as scheduler job `job` (a check reported it). When it came up
