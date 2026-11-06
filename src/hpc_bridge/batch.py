@@ -2241,8 +2241,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                               + out.notice)
         elif pilot:
             out.notice = (f"A pilot of {pilot} row(s) runs alone on this block — the partition's proposed size, said "
-                          "in the terms above — then the batch stops at needs_sizing with a size proposed from what "
-                          f"it used. {out.notice}")
+                          f"in the terms above — then {_pilot_then(pilot, len(rows))}. {out.notice}")
         return out
     rt = app.shapes.get("compute")
     if st.status not in ("up", "provisioning") or rt is None or app.state.endpoint_id is None:
@@ -2326,8 +2325,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                       "`./-name`.")
     s = out.sizing
     if pilot:
-        how = (f"a pilot first: {pilot} row(s) alone with the whole block, then it stops at needs_sizing with a size "
-               "proposed from what they used")
+        how = f"a pilot first: {pilot} row(s) alone with the whole block, then {_pilot_then(pilot, len(rows))}"
     elif s is not None and s.slots is not None:
         how = (f"at most {s.slots} out at once ({s.cores} CPU{'s' if s.cores != 1 else ''}"
                + (f", {s.memory_gb:g} GB" if s.memory_gb else "") + (f", {s.gpus} GPU(s)" if s.gpus else "")
@@ -2382,6 +2380,33 @@ def _rederive(app: AppCtx, b: dict[str, Any], pre: ShapeRuntime | None) -> tuple
         return sz.derive_block(s, shape=_partition_shape(app), workers_fixed=_fixed_workers(app)), s
     except sz.SizingRefusal:
         return None
+
+
+def _pilot_then(pilot: int, rows: int) -> str:
+    """What a pilot's batch does once its pilot rows ran (review round 2's addendum: a pilot of every row had been said
+    to stop for a size, and ran to `done` with no proposal)."""
+    if pilot >= rows:
+        return ("the batch runs to its end (the pilot is every row): its result reports each row's use (peak_rss_mb, "
+                "cpu_s, wall_s) and the size that use suggests (`proposal`) — a size for the next batch")
+    return "it stops at needs_sizing with a size proposed from what they used"
+
+
+def _pilot_done_proposal(app: AppCtx, run: _Run, b: dict[str, Any]) -> None:
+    """A pilot batch that ran to its end with its pilot never closed (the pilot was every row): the user's own size
+    restored, and the size its rows' use suggests recorded as its `proposal` — the done answer carries it, as a pilot's
+    pause does (sizing.pilot_proposal)."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    saved = json.loads(b.get("pilot_saved") or "null")
+    if saved:
+        _restore_pilot(led, bid, saved)
+    measure = measure_of(app, run.rt, run)
+    ran = [t for t in led.tasks(bid, states=TERMINAL) if int(t.get("attempt") or 0) > 0]
+    if measure is None or not ran:
+        return
+    p = sz.pilot_proposal([_use_of(t) for t in ran], measure, gpus=int((saved or b).get("gpus") or 0))
+    led.update_batch(bid, proposal=json.dumps({"cores": p.cores, "memory_gb": p.memory_gb, "gpus": p.gpus,
+                                               "concurrency": p.concurrency, "evidence": p.evidence}, default=str))
 
 
 def _derived_key(d: sz.DerivedBlock) -> tuple[Any, ...]:
@@ -3713,6 +3738,8 @@ def _maybe_done(app: AppCtx, run: _Run) -> None:
     if c.get("backlog", 0) == 0 and _held(c) == 0 and not run.futures:
         b = led.batch(run.batch_id)
         if b["state"] not in ("done", "cancelled"):
+            if b.get("pilot") and not b.get("proposal"):   # a pilot of every row: its size, on the done answer
+                _pilot_done_proposal(app, run, b)
             led.update_batch(run.batch_id, state="done", pause_reason=None)
             led.event(run.batch_id, "batch.done", c)
 
@@ -4208,6 +4235,10 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         text += (f" Paused for its size: {reason}. Resume with run_batch(batch_id='{bid}', cores=…, memory_gb=…, "
                  "gpus=…, concurrency=…) once the user has said it; a size that fits this block needs no new yes.")
     text += _over_note(led, bid, b) + gpu_note(app, run, b)
+    if phase == "done" and b.get("pilot") and (p := _proposal_of(b)) is not None:
+        cores = f"{p.cores} CPU(s)" if p.cores is not None else "no CPU count (no row's CPU-seconds could be read)"
+        text += (f" Its rows' use suggests {cores} and {p.memory_gb:g} GB per row (`proposal`; {p.concurrency} at once "
+                 "on this block): a size for the next batch.")
     if owner:
         text += f" Another hpc-bridge server holds this batch ({owner}): this is a read of the ledger."
     if c.get("failed") and detail == "summary":

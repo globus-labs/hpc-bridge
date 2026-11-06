@@ -93,7 +93,8 @@ Fixed test-first (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests
 - **Review round 2** (`tests/test_anvil_live_findings_r2.py`): a NEW sized batch's `confirm_spend=True` starts its
   derived block only when an answer of this process quoted exactly it; else the call quotes it and starts nothing (a
   free agent cell had started a derived 3-CPU block no answer named, on its first call, with the yes the user gave to
-  connect_facility's default terms).
+  connect_facility's default terms). And a pilot of every row says it runs to its end, and its done answer carries the
+  `proposal` (it had promised a stop for the size, and ended `done` with no proposal: `batch_pilot_agreed`).
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 

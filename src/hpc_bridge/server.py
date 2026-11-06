@@ -2890,7 +2890,8 @@ async def run_batch(
     given runs 1-CPU rows, the block's share of memory each, as many as fit (said in `sizing.defaulted`). Each row is
     pinned to its own CPUs (`pin=False`: not pinned) with OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS and PYTHON_CPU_COUNT set
     to its cores. `pilot=1` (or 2): that many rows run alone with the whole block, then phase="needs_sizing" with a
-    `proposal` (cores, memory) from what they used; resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
+    `proposal` (cores, memory) from what they used (a pilot of EVERY row runs to "done", its answer carrying the
+    `proposal` for the next batch); resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
     resize changes only what it names (memory, unnamed, is the block's share again) and is kept even when the block
     still needs the user's yes (add confirm_spend=True once they give it). Every
     result carries its peak_rss_mb, cpu_s and nproc; status names rows that ran over their size.

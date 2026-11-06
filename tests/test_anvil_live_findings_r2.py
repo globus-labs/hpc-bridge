@@ -6,12 +6,16 @@ first call was run_batch(rows=6, cores=1, memory_gb=0.5, concurrency=2, confirm_
 3-CPU / 2 GB block no answer had named. Smaller there; 8 cores × 8 at once is 65 cores after a yes to a small slice.
 A sized batch's yes starts its derived block only when an answer of this process quoted exactly it; otherwise the call
 quotes it (needs_confirmation, `derived_from`) and starts nothing, and the next yes starts it.
+
+The addendum (a live free cell, `batch_pilot_agreed`, rows=[s1], pilot=1): a pilot that covers every row was said to
+"stop at needs_sizing with a size proposed" — the batch ran to `done` with `proposal: null`. It says the batch runs to
+its end now, and the done answer carries the size its rows' use suggests (`proposal`).
 """
 from __future__ import annotations
 
 from hpc_bridge import server
 from hpc_bridge.resources import CORES
-from tests.test_batch_sizing import _canary, _measure, _run, _sized_app
+from tests.test_batch_sizing import _app_with, _canary, _measure, _report, _run, _sized_app
 
 _CANARY = _canary(_measure(cpus=65, cpu_ids=tuple(range(65)), workers=9, mem_limit_mb=40_000))
 
@@ -70,3 +74,34 @@ async def test_r2_the_size_first_answers_tell_the_agent_size_first_then_the_yes(
     assert "quotes the block" in (need.notice or "") and "then" in (need.notice or ""), need.notice
     asked = await _run(app, n=4, cores=2, memory_gb=1.5, concurrency=4)
     assert "confirm_spend=True" in (asked.notice or "") and "derived" in (asked.notice or ""), asked.notice
+
+
+# ---- the addendum: a pilot of every row ------------------------------------------------------------------------------
+
+async def test_r2_a_pilot_of_every_row_says_it_runs_to_its_end_and_its_done_answer_proposes_a_size():
+    from hpc_bridge import batch
+
+    app, _rt, runner = _app_with(_measure(cpus=4, workers=5, mem_limit_mb=4000, idle_mb=500))
+    out = await _run(app, n=1, pilot=1)
+    assert "stops at needs_sizing" not in (out.notice or ""), out.notice
+    assert "runs to its end" in (out.notice or "") and "proposal" in (out.notice or ""), out.notice
+    runner.futures[0].finish(_report(0, cpu_s=3.9, wall_s=2.0, peak_rss_kb=400 * 1024, nproc=4, cpus="0,1,2,3"))
+    await batch.tick(app, out.batch_id)
+    st = await batch.status(app, out.batch_id)
+    assert st.phase == "done", (st.phase, st.notice)
+    assert st.proposal is not None, "the pilot's own row ran, and the done answer proposes no size"
+    assert (st.proposal.cores, st.proposal.memory_gb) == (2, 0.5), st.proposal
+    assert "suggests" in (st.notice or "") and "next batch" in (st.notice or ""), st.notice
+
+
+async def test_r2_a_pilot_of_some_rows_still_stops_for_its_size():
+    app, _rt, _runner = _app_with(_measure(cpus=4, workers=5, mem_limit_mb=4000, idle_mb=500))
+    out = await _run(app, n=8, pilot=1)
+    assert "stops at needs_sizing" in (out.notice or ""), out.notice
+
+
+async def test_r2_a_pilot_of_every_row_with_no_block_says_so_in_its_spend_question():
+    app = _sized_app()
+    out = await _run(app, n=1, pilot=1)
+    assert out.phase == "needs_confirmation" and app.built == [], out
+    assert "stops at needs_sizing" not in (out.notice or "") and "runs to its end" in (out.notice or ""), out.notice
