@@ -646,20 +646,25 @@ class _Target:
     recs: list[dict]
     scratch: AppCtx | None = None
     part: EndpointStatus | None = None
-    failed: bool = False   # its ask or stop raised: `part` says so
+    failed: bool = False   # its stop raised: `part` says so
+    ask_error: str | None = None   # its ask failed: its stop still runs, answered unconfirmed (as a bound stop's)
+    done: bool = False     # a read closed every record there: nothing to stop
 
 
-async def stop_cold(app: AppCtx, stop: Stopper, ask: Asker | None = None) -> EndpointStatus | None:
+async def stop_cold(app: AppCtx, stop: Stopper, ask: Asker | None = None,
+                    login_of: Callable[[AppCtx], LoginRunner] | None = None) -> EndpointStatus | None:
     """stop_endpoint with no endpoint bound (a fresh server's first call, a startup pin before its first block): the
     blocks the record names — this server's, and earlier servers' that are gone — are reached again, each endpoint on a
     scratch context bound to it for this call alone (nothing stays bound here), and get the WHOLE stop a bound endpoint
     gets (`stop`: server._stop_endpoint with the call's own jobs= and handoffs= — its handoff question and scope, its
     Jobs-mode keep/cancel, its busy refusal; review round 1's blocker: the block release alone had cancelled a
     handoff consumer's pool unasked). What any of them would ASK (`ask`, read only) is asked first, for all of them, and
-    then nothing is changed anywhere. A block of another server that still runs, or of another host, is named and left
-    alone. The session's lock is held throughout: a connect and a confirmation meanwhile cannot have their new block
-    released under them. None: nothing on record, or an endpoint got bound meanwhile (the caller's bound stop).
-    `down` with spend_stopped true only when every endpoint's stop said so."""
+    then nothing is changed anywhere; an ask that fails still lets that endpoint's stop run, answered unconfirmed, as a
+    bound stop does (review round 2). A block of another server that still runs, or of another machine, is named and
+    left alone — another machine's is first read against the scheduler (`login_of`: the scratch's login runner), and
+    closed when gone. The session's lock is held throughout: a connect and a confirmation meanwhile cannot have their
+    new block released under them. None: nothing on record, or an endpoint got bound meanwhile (the caller's bound
+    stop). `down` with spend_stopped true only when every endpoint's stop said so."""
     rows, problem = _records(app)
     if problem is not None:
         return EndpointStatus(status="draining", block_state="cold", notice=notices._earlier_unread_stop(problem))
@@ -671,10 +676,11 @@ async def stop_cold(app: AppCtx, stop: Stopper, ask: Asker | None = None) -> End
     async with app.lock:
         if app.state.endpoint_id is not None:
             return None
-        targets = [await _target(app, eid, [r for r in rows if r["endpoint_id"] == eid], whose)
-                   for eid in dict.fromkeys(r["endpoint_id"] for r in rows)]
+        targets: list[_Target] = []
         try:
-            reach = [t for t in targets if t.scratch is not None]
+            for eid in dict.fromkeys(r["endpoint_id"] for r in rows):
+                targets.append(await _target(app, eid, [r for r in rows if r["endpoint_id"] == eid], whose, login_of))
+            reach = [t for t in targets if t.scratch is not None and t.part is None]
             if ask is not None:
                 questions = [q for q in await asyncio.gather(*(_guarded(t, ask, read=True) for t in reach))
                              if q is not None and q.status == "needs_confirmation"]
@@ -684,25 +690,20 @@ async def stop_cold(app: AppCtx, stop: Stopper, ask: Asker | None = None) -> End
             done = await asyncio.gather(*(_guarded(t, stop) for t in reach))
             for t, st in zip(reach, done, strict=True):
                 t.part = _cold_part(t, st)
-            return _combined([t.part for t in targets if t.part is not None])
+            parts = [t.part for t in targets if t.part is not None]
+            return _combined(parts) if parts else None   # every record closed by its read: nothing was on record
         finally:
             for t in targets:
                 if t.scratch is not None:
                     await _close(t.scratch)
 
 
-async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict) -> _Target:
-    """A recorded endpoint: held by a server that still runs (or of another host) — named, left alone; reachable — a
-    scratch context bound to it; else why it cannot be reached from here."""
+async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict,
+                  login_of: Callable[[AppCtx], LoginRunner] | None) -> _Target:
+    """A recorded endpoint: reachable — a scratch context bound to it; held by a server that still runs, or of another
+    machine (read first against the scheduler where it can be, and closed when gone) — named, left alone; else why it
+    cannot be reached from here (`part`)."""
     t = _Target(eid, recs)
-    blocks = [_block(r, verified=False) for r in recs]
-    held = [b for r, b in zip(recs, blocks, strict=True) if whose[(eid, r["request"])] in ("live", "elsewhere")]
-    if held:
-        here = all(whose[(eid, r["request"])] == "live" for r in recs if whose[(eid, r["request"])] != "earlier")
-        t.part = EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
-                                block_job_id=next((b.job for b in held if b.job), None),
-                                notice=notices._earlier_live_stop(held, here=here))
-        return t
     facility, host = recs[-1].get("facility"), _host(recs)
     try:
         fac, why = await _facility(app, recs)
@@ -710,29 +711,64 @@ async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict) -> _Targ
             fac, why = None, "this session has no Globus login to reach it"
     except Exception as exc:  # noqa: BLE001 - said: the endpoint is named, never a tool error
         fac, why = None, f"checking how to reach it failed ({type(exc).__name__}: {str(exc)[:160]})"
-    if fac is None:
-        t.part = _unreachable(blocks, facility, eid, host, why or "the record does not say how to reach it")
+    if fac is not None:
+        mep = any(r.get("mep") for r in recs)
+        t.scratch = _scratch(app, fac, eid, facility, left_blocks=[_left(_block(r, verified=False)) for r in recs
+                                                                   if r.get("mep")] if mep else [])
+    held = [r for r in recs if whose[(eid, r["request"])] in ("live", "elsewhere")]
+    if (held and t.scratch is not None and login_of is not None and _has_login_shape(t.scratch)
+            and not any(whose[(eid, r["request"])] == "live" for r in held)):
+        # another machine's records: read against the scheduler, so one whose block is gone is closed, not left to
+        # keep every cold stop draining (review round 2)
+        try:
+            await verify(t.scratch, eid, login_of(t.scratch))
+        except Exception:  # noqa: BLE001 - unread: they stay named
+            pass
+        left, _problem = _records(app, eid)
+        still = {r["request"] for r in left}
+        held = [r for r in held if r["request"] in still]
+        t.recs = [r for r in recs if r["request"] in still]
+    if held:
+        here = all(whose[(eid, r["request"])] == "live" for r in held)
+        blocks = [_block(r, verified=False) for r in held]
+        notice = notices._earlier_live_stop(blocks, here=here)
+        if not here:   # another machine's: the user can still end it by its id
+            notice += notices._earlier_user_cancel(blocks, recs[-1].get("scheduler"), host)
+        t.part = EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
+                                block_job_id=next((b.job for b in blocks if b.job), None), notice=notice)
         return t
-    mep = any(r.get("mep") for r in recs)
-    t.scratch = _scratch(app, fac, eid, facility,
-                         left_blocks=[_left(b) for b in blocks if b.mep] if mep else [])
+    if not t.recs:   # every record there was closed by the read: nothing of it is left to stop
+        t.part = None
+        if t.scratch is not None:
+            await _close(t.scratch)
+            t.scratch = None
+        t.done = True
+        return t
+    if t.scratch is None:
+        blocks = [_block(r, verified=False) for r in t.recs]
+        t.part = _unreachable(blocks, facility, eid, host, why or "the record does not say how to reach it")
     return t
 
 
 async def _guarded(t: _Target, call: Callable[[AppCtx], Awaitable[EndpointStatus | None]], *,
                    read: bool = False) -> EndpointStatus | None:
-    """One endpoint's ask or stop: what it raised is that endpoint's `draining`, with the reason — never a tool error
-    that leaves the others unsaid (review round 1)."""
+    """One endpoint's ask or stop: what its stop raised is that endpoint's `draining`, with the reason — never a tool
+    error that leaves the others unsaid (review round 1). An ask that failed (a read of what can still bill that timed
+    out) asks nothing: that endpoint's stop runs all the same and is answered unconfirmed, as a bound stop's read
+    timing out is (review round 2: it had been left unreleased while the others were released)."""
     assert t.scratch is not None
     try:
         return await call(t.scratch)
     except Exception as exc:  # noqa: BLE001
+        why = f"{type(exc).__name__}: {str(exc)[:160]}" if str(exc) else type(exc).__name__
+        if read:
+            t.ask_error = why
+            return None
         blocks = [_block(r, verified=False) for r in t.recs]
-        what = "asking what to keep" if read else "the stop there"
         t.part = _unreachable(blocks, t.recs[-1].get("facility"), t.eid, _host(t.recs),
-                              f"{what} failed ({type(exc).__name__}: {str(exc)[:160]})")
+                              f"the stop there failed ({why})")
         t.failed = True
-        return None if read else t.part
+        return t.part
 
 
 def _cold_part(t: _Target, st: EndpointStatus | None) -> EndpointStatus | None:
@@ -746,10 +782,15 @@ def _cold_part(t: _Target, st: EndpointStatus | None) -> EndpointStatus | None:
         st.notice = notices._earlier_cold_lead(blocks, t.recs[-1].get("facility"), t.eid, reached=None) + (
             st.notice or "")
         return st
-    ok = st.status == "down" and st.spend_stopped is True
     out = st.model_copy()
-    out.notice = notices._earlier_cold_lead(blocks, t.recs[-1].get("facility"), t.eid,
-                                            reached=ok or st.status in ("up", "needs_confirmation")) + (st.notice or "")
+    reached = (st.status == "down" and st.spend_stopped is True) or st.status in ("up", "needs_confirmation")
+    if t.ask_error is not None and out.status == "down":   # what of ours can still bill there was not read first
+        out.status, out.spend_stopped = "draining", None
+        out.notice = (f"{out.notice or ''} The stop could not first read what of ours can still bill there "
+                      f"({t.ask_error}): spend is NOT confirmed stopped — call stop_endpoint again.").strip()
+    ok = out.status == "down" and out.spend_stopped is True
+    out.notice = notices._earlier_cold_lead(blocks, t.recs[-1].get("facility"), t.eid, reached=reached
+                                            ) + (out.notice or "")
     if not ok and st.status not in ("up", "needs_confirmation"):
         out.status, out.spend_stopped = "draining", None   # not reached, or not confirmed: never `down`
         if "NOT confirmed" not in out.notice:
@@ -829,13 +870,22 @@ def _unreachable(blocks: list[EarlierBlock], facility: str | None, eid: str, hos
 
 
 def _combined(parts: list[EndpointStatus]) -> EndpointStatus:
+    """Several stops as one answer: the worst status, spend_stopped true only when every part's was, and every part's
+    Jobs-mode jobs (each once) and handoffs (review round 2: they had been dropped)."""
     if len(parts) == 1:
         return parts[0]
     rank = {"up": 0, "draining": 1, "down": 2}
     worst = min(parts, key=lambda p: rank.get(p.status, 1))
     stopped = [p.spend_stopped for p in parts]
-    return EndpointStatus(
+    out = EndpointStatus(
         status=worst.status, block_state=worst.block_state, endpoint_id=None,
         block_job_id=next((p.block_job_id for p in parts if p.block_job_id), None),
         spend_stopped=True if all(s is True for s in stopped) else (False if False in stopped else None),
         notice=" Also: ".join((p.notice or "").strip() for p in parts))
+    jobs: dict[str, Any] = {}
+    for p in parts:
+        for j in getattr(p, "jobs", None) or []:
+            jobs.setdefault(str(getattr(j, "id", None) or id(j)), j)
+    out.jobs = list(jobs.values())
+    out.handoffs = [h for p in parts for h in (getattr(p, "handoffs", None) or [])]
+    return out

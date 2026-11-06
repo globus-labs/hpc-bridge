@@ -1370,9 +1370,11 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None, handoffs: str | N
         # busy refusal; what any would ask is asked first, and nothing changes (review round 1: the block release alone
         # had cancelled a handoff consumer's pool unasked)
         cold = await earlier.stop_cold(app, lambda s: _stop_endpoint(s, jobs, handoffs),
-                                       ask=lambda s: _stop_question(s, jobs, handoffs))
+                                       ask=lambda s: _stop_question(s, jobs, handoffs), login_of=_login_runner)
         if cold is not None:
-            if not _has_login_shape(app) and warmth._prune_left(app):   # the session's own detached blocks, too
+            # the session's own detached blocks, too — but never while the answer only ASKS: that stop pauses batches
+            # (review round 2: a question had changed state)
+            if (cold.status != "needs_confirmation" and not _has_login_shape(app) and warmth._prune_left(app)):
                 cold = earlier.combined([cold, await _stop_mep(app, None)])
             cold.session_spend = _total_session_spend(app)
             return cold
