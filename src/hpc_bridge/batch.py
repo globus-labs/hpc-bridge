@@ -3123,8 +3123,9 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
     if cap != int(b["capacity"] or 0):
         led.update_batch(bid, capacity=cap)
     try:
+        # on a facility endpoint a gone server's row can still be delivered late and run: it holds its slot there
         rows = led.reserve(bid, owner_of(app), cap, uec_hash=uec_hash(rt), now=_now(), block_job=run.block_job,
-                           margin_s=HOLD_MARGIN_S)
+                           margin_s=HOLD_MARGIN_S, by_sender=_has_login_shape(app))
     except RetiredConfig as exc:
         pause(app, bid, f"the block's config was retired ({exc}): a new block needs the user's yes")
         return 0
@@ -3915,12 +3916,16 @@ async def _group_tasks(client: Any, bid: str, groups: list[str]) -> list[str] | 
 
 
 def _presume(app: AppCtx, run: _Run) -> None:
-    """A task out past its clock (block evidence + task_walltime_s + the grace) is presumed lost — it keeps its slot, is
-    never retried, and only unblocks a stop or a cancel; a later result still wins. On a MEP every row out (no evidence
-    channel exists there); on SSH only a row this process holds no future for (a dead server sent it: its evidence may
-    never come). Never a submit of unknown fate: its task may be queued where no clock of ours can see it
-    (`_unknown_evidence`). The block evidence is this process's, else the ledger's (a block seen before the restart:
-    any admission needed one)."""
+    """A task out past its clock (block evidence + task_walltime_s + the grace) is presumed lost — never retried, it
+    only unblocks a stop or a cancel; a later result still wins. On a MEP every row out (no evidence channel exists
+    there); on SSH only a row this process holds no future for (a dead server sent it: its evidence may never come).
+    Never a submit of unknown fate: its task may be queued where no clock of ours can see it (`_unknown_evidence`). The
+    block evidence is this process's, else the ledger's (a block seen before the restart: any admission needed one).
+
+    Its slot (Ledger.reserve): on SSH it follows the server that SENT it — held while that sender runs and the row was
+    sent to the block in front; a gone sender's row, past task_walltime_s + HOLD_MARGIN_S since its admission, holds
+    nothing (its wrapper has ended), whoever holds the lease now. On a facility endpoint it holds its slot for the
+    batch's own window whoever sent it, as before the sender was recorded: a late delivery there can still run."""
     led = ledger_of(app)
     wall = float(led.batch(run.batch_id)["task_walltime_s"])
     seen = run.block_seen_at
@@ -4248,6 +4253,11 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         if c.get(k):
             parts.append(f"{c[k]} {k.replace('_', ' ')}")
     text = "; ".join(parts) + "."
+    if c.get("presumed_lost") and c.get("backlog") and state not in ("done", "cancelled") and not _has_login_shape(app):
+        # by design (Ledger.reserve's by_sender): a facility endpoint can still deliver it late, and then it runs
+        text += (" On a facility endpoint a presumed-lost row keeps its slot (a late delivery can still run it): while "
+                 f"such rows fill this batch's window nothing more is admitted — cancel('{bid}') or stop_endpoint ends "
+                 "the wait.")
     rec = _env_rec(b)
     if phase == "needs_confirmation" and rec is not None and rec.get("unbuildable") and not gone:
         # block environments: a yes cannot mend it — never ask for one that cannot work (review S1)

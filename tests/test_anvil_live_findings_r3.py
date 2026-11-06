@@ -91,14 +91,14 @@ async def test_r3_1_a_quote_on_the_same_terms_still_starts_on_the_first_yes():
 async def test_r3_1_a_resumed_batchs_quote_does_not_outlive_its_binding():
     """The same gap on the resume path (`_resume`): a batch's re-derived block quoted, then a re-bind — its yes started
     the block on the new binding's terms, unquoted there."""
-    from tests.test_anvil_live_findings_r1 import _restarted
+    from tests.test_anvil_live_findings_r1 import _blocks, _restarted
 
     app, bid = await _restarted(size_owed=False)
     quoted = await server._run_batch(app, batch_id=bid)
-    assert quoted.phase == "needs_confirmation" and quoted.block.derived_from and app.built == [], quoted
+    assert quoted.phase == "needs_confirmation" and quoted.block.derived_from and _blocks(app) == [], quoted
     await _rebind(app)
     yes = await server._run_batch(app, batch_id=bid, confirm_spend=True)
-    assert app.built == [], f"a block started on terms no answer of this binding showed: {app.built}"
+    assert _blocks(app) == [], f"a block started on terms no answer of this binding showed: {app.built}"
     assert yes.phase == "needs_confirmation" and yes.block.account == "other-acct", (yes.phase, yes.notice)
 
 

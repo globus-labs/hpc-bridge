@@ -22,7 +22,7 @@ import os
 import time
 from dataclasses import dataclass
 
-from . import binding, config, login_gate, warmth
+from . import binding, config, earlier, login_gate, warmth
 from .catalog.entry import CatalogEntry
 from .catalog.parsers import PARSERS
 from .context import (
@@ -623,12 +623,14 @@ async def _connect(
         app.scratch_root = binding._resolve_scratch_root(fac)
         if not _has_login_shape(app):  # a facility-run multi-user endpoint: attach, don't provision
             checks_note = _left_checks_note(app, old_eid, queued_left, ssh_left)
-            res = await _connect_mep(app, facility, fac, left=bool(checks_note) or left is not None)
+            # blocks an EARLIER server left on it, from their records (no scheduler channel here): named, never billed
+            mep_note = earlier.mep_left(app, here)
+            res = await _connect_mep(app, facility, fac, left=bool(checks_note or mep_note) or left is not None)
             if res.phase == "needs_account":  # attached, on another config: the details= that failed is history
                 app.failed_details.pop(facility, None)
             if prior_spend > 0 or left is not None:  # the number, and a block left billing, must not vanish
                 res.notice = _prior_note(prior_spend, left, sched, same=here is not None and here == old_eid, old_mep=old_mep) + (res.notice or "")  # noqa: E501
-            res.notice = login_note + presets_note + checks_note + (res.notice or "")
+            res.notice = login_note + presets_note + checks_note + mep_note + (res.notice or "")
             return res
         # An MFA facility (curated `auth_method: mfa-otp`) with no shared connection yet: don't burn a failing
         # SSH attempt (and a fail2ban strike) to learn what the entry already says — hand off first. But ONLY
@@ -699,6 +701,14 @@ async def _connect(
             notice=reuse_note + "bringing up the login node; call connect_facility again shortly"
             + (" to read your allocations" if entry.allocation is not None else "") + ".",
         )
+    # Blocks an EARLIER server process left on this endpoint (hpc_bridge.earlier): checked against the scheduler through
+    # the login endpoint just proven (one command, only while such a record is open), and named first — so this answer
+    # never says "Nothing is started or billed yet" while one bills (live 2026-11, job 40), and says whether a yes to
+    # the next block's terms reuses it.
+    if app.state.endpoint_id is not None:
+        await earlier.refresh(app, app.state.endpoint_id, run_login, force=True)
+        if earlier_note := earlier.connect_note(app):
+            reuse_note, still = earlier_note + reuse_note, True
     if entry.allocation is None:  # no auto-listable allocations -> the human supplies the account
         return ConnectFacilityResult(
             phase="needs_account",

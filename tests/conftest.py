@@ -86,3 +86,14 @@ def _no_startup_pin_leaks(monkeypatch):
 
     monkeypatch.setattr(binding, "_PINNED", {})
     monkeypatch.setattr(binding, "_PINNED_ORIGIN", {})
+    monkeypatch.setattr(binding, "_PINNED_ENTRY", {})
+
+
+@pytest.fixture(autouse=True)
+def _a_known_machine_identity(monkeypatch):
+    """This machine's identity (`earlier._machine_id`) is the same known one in every test, wherever it runs (the
+    project's Linux image has no /etc/machine-id). A test of the unknown path opts out by setting `earlier._MACHINE`
+    itself ("" = read, and unknown): tests/test_restart_block_record_r3.py does, for every reader-unknown case."""
+    from hpc_bridge import earlier
+
+    monkeypatch.setattr(earlier, "_MACHINE", "this-test-machine", raising=False)

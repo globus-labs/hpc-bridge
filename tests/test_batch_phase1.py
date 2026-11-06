@@ -584,6 +584,11 @@ async def test_restart_resumes_only_with_confirm_spend(tmp_path):
     app2.ledger.pid_alive = lambda pid: pid != os.getpid()        # the old server's pid is gone
     app2.ledger.lease_stale_s = 0.0
     rt2.runner = runner2                                               # the reconnect built its runner (zero SSH)
+    # the old server's block runs on (row 3 is on it): the new server's read of the scheduler lists it, on the same
+    # config — the yes takes it over rather than asking for a second block (hpc_bridge.earlier)
+    login = _FakeRunner("fake-eid", _Res(0, "RUNNING 101 - None\n", ""))
+    app2.runner_factory = lambda eid, user_endpoint_config=None, **_kw: (
+        runner2 if (user_endpoint_config or {}).get("compute") else login)
     st = await server._status(app2, out.batch_id, detail="page", limit=100)
     assert {r.index for r in st.results} == set(range(6))
     states = {r.index: r.state for r in st.results}

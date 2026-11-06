@@ -221,6 +221,8 @@ def test_r1_1_what_holds_a_slot_of_the_block_in_front(tmp_path):
     gone = _add(led, "batch-0000000000c1", n=1, capacity=4, owner=me)
     assert len(led.reserve(gone, me, 1, uec_hash="uec-1", now=1_000.0, block_job="101")) == 1
     led.update_batch(gone, owner_pid=2 ** 22 + 11)            # its server is gone (that pid is dead here)
+    # …the server that sent its row too: since the restart block review (item 6) a row's slot follows its sender
+    led._con.execute("update task set sent_pid = ? where batch_id = ?", (2 ** 22 + 11, gone))
     led.pid_alive = lambda pid: pid != 2 ** 22 + 11
     new = _add(led, "batch-0000000000d1", n=4, capacity=4, owner=me)
     soon, late = 1_010.0, 1_000.0 + 60 + HOLD_MARGIN_S + 1

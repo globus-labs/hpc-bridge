@@ -152,6 +152,61 @@ class ShapeRuntime:
     # Cleared by a confirmation, as `switched_terms` is.
     switch_left_up: bool | None = None
     switch_left_pilots: SeenPilots | None = None
+    # The block an earlier hpc-bridge server left running that this confirmation took over, on the same terms
+    # (hpc_bridge.earlier: its block request, so the check lands on it): the answer that confirmed says so, once.
+    earlier_reused: EarlierBlock | None = None
+    # A yes stopped at the choke point before its block (warmth._provision: the bring-up learnt an endpoint whose
+    # record this process had not read): the caller reads it off the lock and decides the yes again, once.
+    earlier_unread: bool = False
+
+
+@dataclass(frozen=True)
+class EarlierBlock:
+    """A billed block request an EARLIER hpc-bridge server process made (hpc_bridge.earlier: the ledger's `block`
+    record, written when its spend was confirmed), as this process last read it from the scheduler. `jobs`: its pilots
+    the scheduler lists live — (job, state, reason, word) as scheduler_ops._live_pilots — matched by the record's job or
+    by the block request their user endpoint was started for; empty when none is listed yet (a request still young:
+    its check may still be queued). `verified`: the scheduler was read (False: the listing failed, or a facility
+    endpoint, where hpc-bridge has no scheduler channel — named from the record alone). Times: the wall clock."""
+
+    endpoint_id: str
+    request: str
+    facility: str | None
+    partition: str | None
+    account: str | None
+    uec_hash: str | None
+    scheduler: str | None
+    confirmed_at: float
+    job: str | None = None
+    up_at: float | None = None
+    walltime_s: float | None = None
+    jobs: tuple[tuple[str, str, str, str], ...] = ()
+    verified: bool = True
+    mep: bool = False
+    owner: str = ""             # the server that asked, for a notice ("pid N on host")
+    owner_host: str = ""        # …and its host alone
+
+    @property
+    def job_ids(self) -> tuple[str, ...]:
+        return tuple(j[0] for j in self.jobs) or ((self.job,) if self.job and not self.verified else ())
+
+    @property
+    def walltime_end(self) -> float | None:
+        """When its walltime ends, if it came up (wall clock)."""
+        return self.up_at + self.walltime_s if self.up_at is not None and self.walltime_s else None
+
+
+@dataclass(frozen=True)
+class EarlierView:
+    """What this process last read of the blocks earlier servers left on one endpoint (hpc_bridge.earlier.verify):
+    when (time.monotonic()), the ones still billing or still asked for, and why the scheduler could not be read
+    (`unread`; the records are then named unverified). `record_unread`: the record itself could not be read — the
+    blocks are the last good read's, unverified, and no billed block starts there until it reads again."""
+
+    at: float
+    blocks: tuple[EarlierBlock, ...] = ()
+    unread: str | None = None
+    record_unread: bool = False
 
 
 @dataclass(frozen=True)
@@ -572,6 +627,12 @@ class AppCtx:
     # also on disk, so a restart does too); and the published template each endpoint served this session (read once).
     handoffs: dict[str, Any] = field(default_factory=dict)
     handoff_meta: dict[str, dict] = field(default_factory=dict)
+    # Billed blocks EARLIER server processes of this hpc-bridge left (hpc_bridge.earlier): what this process last read
+    # of them per endpoint, from the ledger's `block` records checked against the scheduler — to name them (connect, the
+    # spend question), reuse one on the same terms, and never add a second block unasked. `earlier_told`: the blocks a
+    # spend question of this process named, as (endpoint, job or "req:<request>"): a yes after that is given knowing.
+    earlier: dict[str, EarlierView] = field(default_factory=dict)
+    earlier_told: set[tuple[str, str]] = field(default_factory=set)
 
 
 def _facility_shapes(facility: object) -> tuple[str, ...]:

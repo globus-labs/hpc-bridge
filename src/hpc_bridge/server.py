@@ -23,6 +23,7 @@ from . import (
     config,
     connect,
     dispatch,
+    earlier,
     envs,
     handoff,
     login_gate,
@@ -442,6 +443,16 @@ async def _ensure_endpoint_up(
     before = (rt0, rt0.spend_confirmed, rt0.block_epoch) if rt0 is not None else None
     st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
                                whole_node, recheck=recheck, workers=workers)
+    if (unread := app.shapes.get(shape)) is not None and unread.earlier_unread:
+        # the bring-up learnt an endpoint whose record no read of this process covers: read now (off the lock), and
+        # this yes decided again — reused, asked about, or a fresh block (hpc_bridge.earlier.unread)
+        unread.earlier_unread = False
+        await earlier.refresh(app, app.state.endpoint_id, _login_runner(app) if _has_login_shape(app) else None,
+                              force=True)
+        st = await _ensure_up_once(app, shape, partition, confirm_spend, account, cores, memory_gb, gpus, nodes,
+                                   whole_node, recheck=recheck, workers=workers)
+        if (again := app.shapes.get(shape)) is not None:
+            again.earlier_unread = False   # (once: a second miss answers as it stands — nothing started)
     chosen: envs.Chosen | None = None
     if spec is not None:
         if st._nothing_set:
@@ -604,6 +615,11 @@ async def _ensure_up_once(
         if refused is not None:
             refused.session_spend = _total_session_spend(app)
             return _set_nothing(refused)
+    if shape == DEFAULT_SHAPE and not getattr(app.shapes.get(shape), "spend_confirmed", False):
+        # a spend question or a new block may follow: what an EARLIER server left billing on this endpoint, read from
+        # the scheduler again when the last read is stale (off the lock: the read rides the login shape); no endpoint id
+        # yet, its facility's records are only named — warmth._provision reads them once the bring-up knows the id
+        await earlier.refresh(app, earlier.bound_eid(app), _login_runner(app) if _has_login_shape(app) else None)
     async with app.lock:  # serialize provisioning/state mutation across concurrent tool calls
         rt = _shape_runtime(app, shape)
         # A login shape has no partition; surface that we ignored a supplied one rather than
@@ -664,9 +680,16 @@ async def _ensure_up_once(
                 account=active_account,
                 notice=said(_hpc_bridge_error(exc)),
             )
+        if block == "needs_confirmation" and rt.earlier_unread:   # read off the lock, then decided again (the caller)
+            return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                                  session_spend=_total_session_spend(app), partition=active_partition,
+                                  account=active_account,
+                                  notice=earlier.unread_note(app) + notices._EARLIER_UNREAD)
         if block == "needs_confirmation":  # the spend floor — nothing started by this call (a reap's check may have)
             terms = _block_terms(app, rt, named=named)
             rt.question_size = notices._size_key(app, rt.user_endpoint_config)  # the size this question names
+            # what an earlier server left billing here, first: this question names it, and a yes after it is informed
+            lead = earlier.spend_lead(app, rt, yes=confirm_spend)
             return EndpointStatus(
                 status="needs_confirmation",
                 block_state="provisioning" if rt.reap_kicked else "cold",
@@ -675,7 +698,7 @@ async def _ensure_up_once(
                 partition=active_partition,
                 account=active_account,
                 block=terms,
-                notice=_needs_confirmation_notice(app, rt, terms),
+                notice=lead + _needs_confirmation_notice(app, rt, terms),
             )
         if block == "needs_account":  # the account floor (account_required facility, no account) — nothing was started
             terms = _block_terms(app, rt, named=named)
@@ -780,6 +803,8 @@ async def _ensure_up_once(
                     "check its status page, then try again."
                 )
             notice = repaired + notice + _dispatch_error_suffix(rt.last_canary)
+        if receipt_terms is not None:   # the earlier server's block it reused, or those still billing beside it
+            notice = earlier.receipt(app, rt) + (notice or "")
         if ignored:
             notice = f"{notice or ''} (login shape has no partition; ignored {partition!r})".strip()
         if ignored_size:
@@ -1343,6 +1368,24 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None, handoffs: str | N
     if handoffs not in (None, "cancel", "keep"):
         return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
                               notice=f"handoffs must be \"cancel\" or \"keep\", not {handoffs!r}. Nothing was done.")
+    if jobs not in (None, "cancel", "keep"):
+        return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=app.state.endpoint_id,
+                              notice=f"jobs must be \"cancel\" or \"keep\", not {jobs!r}. Nothing was done.")
+    if app.state.endpoint_id is None:
+        # Nothing bound (a fresh server's first call, a startup pin before its first block): the blocks the record names
+        # — an earlier server's, or this one's left by a re-bind — get THIS stop, whole, on a context bound to their
+        # endpoint for this call alone (hpc_bridge.earlier): its handoff question and scope, its Jobs-mode choice, its
+        # busy refusal; what any would ask is asked first, and nothing changes (review round 1: the block release alone
+        # had cancelled a handoff consumer's pool unasked)
+        cold = await earlier.stop_cold(app, lambda s: _stop_endpoint(s, jobs, handoffs),
+                                       ask=lambda s: _stop_question(s, jobs, handoffs), login_of=_login_runner)
+        if cold is not None:
+            # the session's own detached blocks, too — but never while the answer only ASKS: that stop pauses batches
+            # (review round 2: a question had changed state)
+            if (cold.status != "needs_confirmation" and not _has_login_shape(app) and warmth._prune_left(app)):
+                cold = earlier.combined([cold, await _stop_mep(app, None)])
+            cold.session_spend = _total_session_spend(app)
+            return cold
     t0 = time.monotonic()   # ONE budget for the whole stop, the handoff's own read included (review round 1, item 7)
     items = handoff.live(app)
     ssh = _has_login_shape(app) and app.state.endpoint_id is not None
@@ -1361,6 +1404,21 @@ async def _stop_endpoint(app: AppCtx, jobs: str | None = None, handoffs: str | N
         st.notice = f"{st.notice or ''} {handoff.mep_note(items)}".strip()
         return st
     return await _handoff_after_stop(app, st, items, handoffs or "keep", deadline=t0 + STOP_BUDGET_S)
+
+
+async def _stop_question(app: AppCtx, jobs: str | None, handoffs: str | None) -> EndpointStatus | None:
+    """What a stop of `app` would ASK before it changes anything, read only — the handoff question of an endpoint
+    hpc-bridge stood up, then the Jobs-mode one — or None. A stop with nothing bound asks it of every recorded endpoint
+    first (hpc_bridge.earlier.stop_cold), so a question about one never follows a release of another."""
+    if (handoffs is None and _has_login_shape(app) and app.state.endpoint_id is not None
+            and (items := handoff.live(app))):
+        return handoff.question(app, items, op="stop")
+    if jobs is None:
+        hands = await asyncio.wait_for(jobmode.hand_results(app, budget_s=20.0, adopt=False), 25.0)
+        live = await asyncio.wait_for(jobmode.billing_jobs(app, reconcile=False), 40.0)
+        if live or any(res.pending or res.running for _h, res in hands):
+            return jobmode.stop_question(app, live, hands)
+    return None
 
 
 async def _handoff_after_stop(app: AppCtx, st: EndpointStatus, items: list, choice: str, *,
@@ -1595,13 +1653,17 @@ async def _stop_endpoint_blocks(app: AppCtx) -> EndpointStatus:
             notice=(f"{detail}. Spend is NOT confirmed stopped: {unknown_batch}. Call stop_endpoint again once they "
                     "are settled. The login endpoint stays online for reuse."))
     if confirmed and not pending:
+        # every block of this endpoint is gone (the release read them all by its marker): their records close — an
+        # earlier server's included, which the answer names
+        theirs = earlier.released_note(app, eid, detail)
+        earlier.end_endpoint(app, eid, "stop")
         return EndpointStatus(
             status="down",  # the cancel CONFIRMED, and no task of ours is left that could start a block
             block_state="cold",
             endpoint_id=eid,
             session_spend=_total_session_spend(app),
             spend_stopped=True,  # the one result that may say so
-            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran, lost=lost),
+            notice=_stop_down_notice(app, detail, rejected=rejected, gave_up=gave_up, ran=ran, lost=lost) + theirs,
         )
     if confirmed:  # the scheduler holds nothing of ours now, but a task still queued can start a block
         released = detail if detail != "released none" else None
@@ -1934,7 +1996,9 @@ async def stop_endpoint(ctx: Context, jobs: Literal["cancel", "keep"] | None = N
     endpoint NO cancel is issued (hpc-bridge has no cancel channel there): it stops submitting and answers `draining`,
     which is final, naming the block's scheduler job (`block_job_id`), the latest it can bill until, and the command
     the user runs to end it now — relay those; do not check from here afterwards. Call when you're done with a
-    compute block.
+    compute block. In a new session with nothing connected yet it still works: it releases the blocks an earlier
+    session of hpc-bridge left running (from hpc-bridge's own record, checked against the scheduler), with the same
+    `down` / `draining` meaning.
 
     Jobs (submit_job's, or hand submits it adopted) that can still bill make a stop ASK first: it answers
     `needs_confirmation`, names each job (`jobs`) and does nothing. Ask the user, then call stop_endpoint(jobs="cancel")
@@ -2133,6 +2197,7 @@ async def _finish_teardown(app: AppCtx, eid: str, *, fac=None) -> EndpointStatus
         spent = _drop_all_shapes(app, bank=True) if ours else _total_session_spend(app)
         warmth._forget_checks(app, eid)  # the endpoint is deleted, and its user endpoints with our checks with it
         app.ssh_left.pop(eid, None)
+        earlier.end_endpoint(app, eid, "teardown")   # its blocks were released with it: their records close
     await warmth._flush_all(app, timeout=5.0)  # its record goes before the answer says it is gone
     return EndpointStatus(
         status="down",
@@ -2331,7 +2396,9 @@ async def _ready_session(
     # The spend floors report the session spend, as ensure_endpoint_up's do: a reap this call found has just banked the
     # old block.
     if not_warm == "needs_confirmation":  # billed shape, spend not acknowledged (or its block reaped) -> don't dispatch
-        return _with_spend(app, _needs_confirmation_outcome(app, rt))
+        out = _needs_confirmation_outcome(app, rt)
+        out.notice = earlier.spend_lead(app, rt) + (out.notice or "")   # an earlier server's block still billing here
+        return _with_spend(app, out)
     if not_warm == "needs_account":  # account-required facility, no account -> don't dispatch, nothing started
         return _with_spend(app, _needs_account_outcome(app, rt))
     if not_warm is not None:
@@ -3008,7 +3075,11 @@ async def cancel_tool(ctx: Context, id: str, mode: str = "drain") -> CancelResul
 
 async def _export_handoff(app: AppCtx, user_endpoint_config: Any = None, expires_hours: Any = handoff.DEFAULT_EXPIRES_H,
                           confirm_spend: bool = False, env: Any = None) -> handoff.HandoffResult:
+    if app.state.endpoint_id is not None:   # an earlier server's block still billing here: read before the canary
+        await earlier.refresh(app, app.state.endpoint_id, _login_runner(app) if _has_login_shape(app) else None)
     out = await handoff.export(app, user_endpoint_config, expires_hours, confirm_spend, env=env)
+    if (out.phase == "needs_confirmation" or confirm_spend) and (beside := earlier.handoff_note(app)):
+        out.notice = beside + (out.notice or "")   # its billed canary starts a block beside it: named, as ensure does
     envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
     return out
 
