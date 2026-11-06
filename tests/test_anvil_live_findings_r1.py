@@ -16,7 +16,7 @@ from types import SimpleNamespace
 import pytest
 
 from hpc_bridge import server
-from tests.test_batch_sizing import _canary, _measure, _run, _sized_app
+from tests.test_batch_sizing import _canary, _measure, _run, _sized_app, _yes
 
 # =====================================================================================================================
 # R1-3 — no billed block starts on terms the answers never showed
@@ -32,7 +32,7 @@ async def _restarted(*, size_owed: bool):
 
     canary = _canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192))
     app = _sized_app(canary)
-    out = await _run(app, n=10, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=10, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (review r2)
     batch.pause(app, out.batch_id, "the block ended (its walltime)")
     await batch.tick(app, out.batch_id)
     if size_owed:

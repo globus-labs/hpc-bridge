@@ -2066,8 +2066,10 @@ def _sizing_model(s: sz.Sizing | None, *, f: sz.Fit | None = None, defaulted: li
 _HOW_TO_SIZE = ("Size the rows the sbatch way: cores= (CPUs per row, as -c counts them), memory_gb= (per row; a row is "
                 "killed at it), gpus= (per row) and concurrency= (at most this many rows at once, as --array=…%N). "
                 "`facts` says what the block is (or one node of its partition) and how many rows each size fits — ask "
-                "the user in those terms. Not sure of the size? pilot=1 runs one row alone with the whole block and "
-                "proposes cores and memory from what it used.")
+                "the user in those terms. With no block confirmed, the sized call quotes the block derived from the "
+                "rows (its terms, nothing started); then, with the user's yes to those terms, the same call with "
+                "confirm_spend=True starts it. Not sure of the size? pilot=1 runs one row alone with the whole block "
+                "and proposes cores and memory from what it used.")
 
 
 def _needs_sizing(*, rows: int, missing: list[str], reason: str, facts: BlockFacts | None = None,
@@ -2196,7 +2198,11 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             derived = sz.derive_block(asked, shape=shape_, workers_fixed=fixed)
         except sz.SizingRefusal as exc:
             return _refused(str(exc))
-    st = await ensure_up(app, confirm_spend, size=derived)
+    # a yes starts a block derived from the rows only when an answer of this process quoted exactly it (review round
+    # 2: an agent's FIRST call, with the yes the user gave to the session's default terms, had started a derived block
+    # no answer named — smaller there; 8 cores × 8 at once is 65 CPUs): otherwise this call quotes it, starting nothing
+    unseen = derived is not None and confirm_spend and _derived_key(derived) not in app.batch_quoted
+    st = await ensure_up(app, confirm_spend and not unseen, size=derived)
     if (derived is not None and st.status in ("needs_confirmation", "needs_account")
             and not _is_derived(st.block, derived)):
         # the facility would not take the derived size (a partition's caps, a facility template that renders none
@@ -2212,17 +2218,20 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             words = derived.words(asked)
             if out.block is not None:
                 out.block.derived_from = words
+                app.batch_quoted.add(_derived_key(derived))   # these terms are now shown: the next yes starts them
             fixed = _fixed_workers(app)
             out.sizing = _sizing_model(asked, derived=True)
             out.sizing.slots = asked.concurrency
             mem = f"{derived.memory_gb} GB" if derived.memory_gb else "the node's memory"
+            unsaid = (" This yes was for a block no answer had shown yet, so nothing started: these are its terms — "
+                      "with the user's yes to THEM, send the same call again (confirm_spend=True)." if unseen else "")
             out.notice = (f"The block derived from the batch: {words} = {derived.cores} CPUs, {mem}"
                           + (f", {derived.gpus} GPU(s)" if derived.gpus else "") + ", one node, "
                           + (f"{derived.workers} workers ({derived.workers - 1} rows at once and one for interactive "
                              "commands)" if derived.workers else
                              f"the facility's own {fixed} workers per node" if fixed else
                              "the facility's own workers per node (measured once it runs)")
-                          + f". {out.notice}")
+                          + f".{unsaid} {out.notice}")
             b = out.block
             if b is not None and b.whole_node and b.cores_per_node:
                 fits = min((b.cores_per_node - 1) // asked.cores, sz.WIDTH_CAP)
@@ -2463,7 +2472,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
     # asks for the block derived from them again, as size first did — never the session's default (review G2)
     again = _rederive(app, b, pre)
     derived, sized_as = again if again is not None else (None, None)
-    quoted = derived is not None and app.batch_quoted.get(bid) == _derived_key(derived)
+    quoted = derived is not None and _derived_key(derived) in app.batch_quoted
     asked_yes = not confirm_spend and b["state"] == "needs_confirmation" and not resumes
     if derived is not None and sized_as is not None and (asked_yes or (confirm_spend and not quoted)):
         # the yes is asked for THAT block: its terms first, and a yes starts only a block an answer of this process
@@ -2473,7 +2482,7 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         if st0.block is None or not _is_derived(st0.block, derived):
             return _refused("the block derived from the batch's rows cannot be asked for here", bid=bid,
                             notice=st0.notice)
-        app.batch_quoted[bid] = _derived_key(derived)
+        app.batch_quoted.add(_derived_key(derived))
         out = _status_of(app, bid)
         out.phase, out.block = "needs_confirmation", st0.block
         out.block.derived_from = derived.words(sized_as)

@@ -18,7 +18,7 @@ import json
 import os
 
 from hpc_bridge import server
-from tests.test_batch_sizing import _app_with, _canary, _measure, _report, _run, _sized_app
+from tests.test_batch_sizing import _app_with, _canary, _measure, _report, _run, _sized_app, _yes
 
 # =====================================================================================================================
 # F1 — over its cores, on evidence
@@ -145,7 +145,7 @@ async def test_g2_a_size_first_batch_resumed_after_a_restart_asks_for_its_derive
 
     canary = _canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192))
     app = _sized_app(canary)
-    out = await _run(app, n=10, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=10, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert out.batch_id and app.built[-1][CORES] == 9, app.built
     batch.pause(app, out.batch_id, "the block ended (its walltime)")   # its first rows settle as the block ends
     await batch.tick(app, out.batch_id)

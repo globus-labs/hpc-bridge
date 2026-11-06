@@ -2881,7 +2881,9 @@ async def run_batch(
     SIZE THE ROWS the sbatch way, per row as submit_job's array tasks: `cores` (CPUs per row, as -c counts them),
     `memory_gb` (per row; a row past it is killed: why "memory"), `gpus` (per row, each its own) and `concurrency` (at
     most this many at once, as --array=…%N). With NO block confirmed yet the block is DERIVED from them (concurrency ×
-    the row + one CPU and one worker for your interactive commands) and the spend question names it; with no size it
+    the row + one CPU and one worker for your interactive commands) and the spend question names it: the sized call
+    quotes it (nothing starts), and the same call with confirm_spend=True — the user's yes to THOSE terms — starts it;
+    a yes for a derived block no answer has shown yet is answered with its terms, never started. With no size it
     answers phase="needs_sizing" with `facts` (the block's or the partition's CPUs, memory, GPUs and how many rows each
     size fits) — ask the user in those terms. On a confirmed block the size is checked against what the block measured
     (a row that cannot fit is refused with the numbers; too many at once is capped and said); a CPU block with no size

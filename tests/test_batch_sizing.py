@@ -126,6 +126,13 @@ async def _run(app, n: int = 6, *, command: str = "echo {x}", walltime: float = 
                                    **kw)
 
 
+async def _yes(app, n: int = 6, **kw):
+    """A new sized batch with no block, as the agent must send it (review round 2 of the Anvil live test): the size
+    first — its answer quotes the derived block, nothing starts — then the same call with the user's yes to it."""
+    await _run(app, n, **kw)
+    return await _run(app, n, confirm_spend=True, **kw)
+
+
 def _report(index: int, attempt: int = 1, *, rc: int = 0, **extra):
     rep = {"index": index, "attempt": attempt, "rc": rc, "tail_b64": "", "stderr_tail_b64": "", "job": "101",
            "host": "c1", "workers": 5, "remaining_s": 800, "started": 1000, "ended": 1002, **extra}
@@ -237,7 +244,7 @@ async def test_size_first_yes_starts_exactly_the_derived_block_and_no_row_value_
     from hpc_bridge.resources import CORES, MEM
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    out = await _run(app, n=10, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=10, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert out.phase in ("admitting", "waiting"), out
     sent = app.built[-1]
     assert sent[CORES] == 9 and sent[MEM] >= 6 and sent.get("max_workers_per_node") == 5
@@ -260,7 +267,7 @@ async def test_a_second_batch_that_fits_the_derived_block_rides_it_and_one_that_
     """On an approved block a sized batch is checked against what the block MEASURED: one whose rows fit rides it
     (no new block, no new yes); one whose row cannot fit is refused with the numbers and the block it would need."""
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    first = await _run(app, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    first = await _yes(app, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert first.batch_id
     same = await _run(app, cores=1, memory_gb=1.0, concurrency=4)
     assert same.phase in ("admitting", "waiting") and same.batch_id, same

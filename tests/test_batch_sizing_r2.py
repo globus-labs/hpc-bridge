@@ -30,6 +30,7 @@ from tests.test_batch_sizing import (
     _slot,
     _spawn,
     _wrapper_env,
+    _yes,
 )
 from tests.test_batch_sizing_r1 import _ensure
 from tests.test_server import _Res
@@ -291,7 +292,7 @@ async def test_r2h_restating_the_derived_blocks_size_with_rows_in_flight_starts_
     from hpc_bridge.resources import WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    out = await _run(app, n=8, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=8, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert out.phase == "admitting" and app.ledger.counts(out.batch_id)["in_flight"] == 4
     built = len(app.built)
     st = await server._ensure_endpoint_up(app, "compute", cores=9, memory_gb=7, confirm_spend=True)
@@ -308,7 +309,7 @@ async def test_r2_4_a_block_switch_under_batch_rows_in_flight_is_refused_naming_
     from hpc_bridge import server
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    out = await _run(app, n=8, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=8, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     uec = dict(app.shapes["compute"].user_endpoint_config)
     built = len(app.built)
     st = await server._ensure_endpoint_up(app, "compute", confirm_spend=True, **ask)
@@ -325,7 +326,7 @@ async def test_r2e_a_partition_switch_after_a_derived_block_does_not_carry_its_w
     from hpc_bridge.resources import WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    out = await _run(app, n=1, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=1, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert out.batch_id and app.built[-1]["max_workers_per_node"] == 5
     await batch.tick(app, out.batch_id)                          # its row settles: nothing of the batch is out
     assert not app.ledger.counts(out.batch_id)["in_flight"]

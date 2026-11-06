@@ -90,6 +90,10 @@ Fixed test-first (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests
   costs 6–8% of a CPU, not 28–50%); no billed block starts on terms no answer showed (a resumed batch's re-derived block
   is quoted first); `env_failed` on run_batch / submit_job answers too; every hpc-bridge venv's bin leaves PATH; the
   runnable counts are not written a look; one whole-GB rounding rule; `module` as a command word only.
+- **Review round 2** (`tests/test_anvil_live_findings_r2.py`): a NEW sized batch's `confirm_spend=True` starts its
+  derived block only when an answer of this process quoted exactly it; else the call quotes it and starts nothing (a
+  free agent cell had started a derived 3-CPU block no answer named, on its first call, with the yes the user gave to
+  connect_facility's default terms).
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
