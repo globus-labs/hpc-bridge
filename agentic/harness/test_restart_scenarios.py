@@ -93,11 +93,21 @@ def test_a_draining_end_or_a_stop_that_is_not_first_fails_it():
     assert rcs.cold_stop_released(Trace(_phase0()[:3] + [_stop("down", _DOWN, True)])).ok is False   # no job named
 
 
-def test_the_world_check_reads_the_job_state():
-    assert rcs.job_state_cmd("40") == "squeue -h -j 40 -o %t 2>/dev/null || true"
-    assert rcs.gone_verdict("40", "") == (True, "job 40 is gone from the queue")
-    assert rcs.gone_verdict("40", "CG\n")[0] is None
-    assert rcs.gone_verdict("40", "R\n")[0] is False and rcs.gone_verdict("40", "PD\n")[0] is False
+_DOWN_CTLD = "slurm_load_jobs error: Unable to contact slurm controller (connect failure)\nHPCB_RC=1\n"
+_INVALID = "slurm_load_jobs error: Invalid job id specified\nHPCB_RC=1\n"
+
+
+def test_the_world_check_reads_the_job_state_as_the_command_prints_it():
+    # what `job_state_cmd` prints: squeue's rows or its own error (stderr kept), then its exit status
+    assert rcs.job_state_cmd("40") == 'squeue -h -j 40 -o %t 2>&1; echo "HPCB_RC=$?"'
+    assert rcs.gone_verdict("40", "HPCB_RC=0\n") == ("gone", "job 40 is gone from the queue")
+    assert rcs.gone_verdict("40", _INVALID)[0] == "gone"                  # the controller no longer knows it
+    assert rcs.gone_verdict("40", "CG\nHPCB_RC=0\n")[0] == "ending"
+    assert rcs.gone_verdict("40", "R\nHPCB_RC=0\n")[0] == "listed" and rcs.gone_verdict("40", "PD\nHPCB_RC=0\n")[0] == \
+        "listed"
+    # review round 1: a squeue that cannot reach slurmctld is no listing at all — never "gone"
+    assert rcs.gone_verdict("40", _DOWN_CTLD)[0] == "unreadable"
+    assert rcs.gone_verdict("40", "")[0] == "unreadable"                  # no exit status: the command did not run
 
 
 def _ctx(outs, monkeypatch):
@@ -111,17 +121,23 @@ def _ctx(outs, monkeypatch):
 
     def ssh(cmd, timeout=120, host=None):
         seen.append(cmd)
-        return outs.pop(0) if outs else (0, "")
+        return outs.pop(0) if outs else (0, "HPCB_RC=0\n")
 
     return SimpleNamespace(trace=Trace([*_phase0(), _stop("down", _DOWN, True)]), ssh=ssh), seen
 
 
 def test_the_world_check_waits_out_an_ending_job_and_fails_one_still_running(monkeypatch):
-    ctx, seen = _ctx([(0, "CG\n"), (0, "")], monkeypatch)
+    # the world channel's rc is the remote shell's: 0 (the echo), squeue's own status rides HPCB_RC
+    ctx, seen = _ctx([(0, "CG\nHPCB_RC=0\n"), (0, "HPCB_RC=0\n")], monkeypatch)
     r = asyncio.run(rcs.cold_stop_block_gone(ctx))
     assert r.name == "world:cold_stop_block_gone" and r.ok and len(seen) == 2 and "squeue -h -j 40" in seen[0]
-    ctx, _ = _ctx([(0, "R\n")], monkeypatch)
+    ctx, _ = _ctx([(0, "R\nHPCB_RC=0\n")], monkeypatch)
     assert asyncio.run(rcs.cold_stop_block_gone(ctx)).ok is False
-    ctx, _ = _ctx([(1, "slurm_load_jobs error")], monkeypatch)
+    ctx, _ = _ctx([(0, _INVALID)], monkeypatch)
+    assert asyncio.run(rcs.cold_stop_block_gone(ctx)).ok is True
+    ctx, _ = _ctx([(0, _DOWN_CTLD)], monkeypatch)                         # slurmctld down: never read as gone
     bad = asyncio.run(rcs.cold_stop_block_gone(ctx))
     assert bad.ok is False and bad.detail.startswith("UNVERIFIABLE")
+    ctx, _ = _ctx([(255, "ssh: connect to host login port 22: Connection refused")], monkeypatch)
+    lost = asyncio.run(rcs.cold_stop_block_gone(ctx))
+    assert lost.ok is False and "world channel failed" in lost.detail

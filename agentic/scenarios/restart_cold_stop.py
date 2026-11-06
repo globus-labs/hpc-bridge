@@ -145,18 +145,30 @@ def cold_stop_honest(t: Trace) -> Result:
 
 
 def job_state_cmd(job: str) -> str:
-    """The job's state as the scheduler lists it now (empty: gone from the queue)."""
-    return f"squeue -h -j {job} -o %t 2>/dev/null || true"
+    """The job's state as the scheduler lists it now, with squeue's own error text and its exit status (HPCB_RC): a
+    squeue that fails is never an empty listing (review round 1: `2>/dev/null || true` read slurmctld down as gone)."""
+    return f'squeue -h -j {job} -o %t 2>&1; echo "HPCB_RC=$?"'
 
 
-def gone_verdict(job: str, out: str) -> tuple[bool | None, str]:
-    """(gone, what): True — not listed; None — ending (CG: wait); False — still queued or running."""
-    states = [ln.strip() for ln in out.splitlines() if ln.strip()]
-    if not states:
-        return True, f"job {job} is gone from the queue"
-    if all(s == "CG" for s in states):
-        return None, f"job {job} is ending (CG)"
-    return False, f"job {job} is still listed: {states}"
+_INVALID_JOB = re.compile(r"invalid job id", re.I)   # squeue -j on a job the controller no longer knows (it ended)
+
+
+def gone_verdict(job: str, out: str) -> tuple[str, str]:
+    """(verdict, what): "gone" — not listed by a squeue that answered (rc 0 and no row, or its "Invalid job id"),
+    "ending" — CG (wait), "listed" — still queued or running, "unreadable" — squeue failed otherwise (UNVERIFIABLE)."""
+    m = re.search(r"HPCB_RC=(\d+)", out)
+    if m is None:
+        return "unreadable", f"UNVERIFIABLE: squeue's exit status was not read: {out.strip()[-200:]!r}"
+    lines = [ln.strip() for ln in out[:m.start()].splitlines() if ln.strip()]
+    if m.group(1) != "0":
+        if any(_INVALID_JOB.search(ln) for ln in lines):
+            return "gone", f"job {job} is gone (squeue: invalid job id)"
+        return "unreadable", f"UNVERIFIABLE: squeue failed (rc={m.group(1)}): {' | '.join(lines)[:200]!r}"
+    if not lines:
+        return "gone", f"job {job} is gone from the queue"
+    if all(s == "CG" for s in lines):
+        return "ending", f"job {job} is ending (CG)"
+    return "listed", f"job {job} is still listed: {lines}"
 
 
 async def cold_stop_block_gone(ctx) -> Result:
@@ -169,11 +181,11 @@ async def cold_stop_block_gone(ctx) -> Result:
     deadline = time.monotonic() + GONE_WAIT_S
     while True:
         rc, out = await asyncio.to_thread(ctx.ssh, job_state_cmd(job), 60)
-        if rc != 0:
-            return Result(name, False, f"UNVERIFIABLE: squeue failed (rc={rc}): {out.strip()[:200]!r}")
-        gone, what = gone_verdict(job, out)
-        if gone is not None or time.monotonic() > deadline:
-            return Result(name, gone is True, what)
+        if rc != 0 and "HPCB_RC=" not in out:   # the world channel itself failed: the command never ran
+            return Result(name, False, f"UNVERIFIABLE: the world channel failed (rc={rc}): {out.strip()[:200]!r}")
+        verdict, what = gone_verdict(job, out)
+        if verdict != "ending" or time.monotonic() > deadline:
+            return Result(name, verdict == "gone", what)
         await _pause(5.0)
 
 
