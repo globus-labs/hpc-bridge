@@ -160,6 +160,9 @@ connect released both. Fixed test-first (`tests/test_restart_block_record.py`; m
     and survives a missing, slow, garbled or undecodable read;
   - a cold stop whose re-read of the record fails is `draining` with the reason, never `down`;
   - jobs dedupe by `job_id`; a MEP batch held by presumed-lost rows says `cancel` / a stop ends the wait.
+- **Review round 4** (branch `fix/restart-block-record-r4`, `tests/test_restart_block_record_r4.py`): an unreadable
+  record now fails closed at connect and at the yes too — the view keeps the last good blocks (unverified) and is
+  `record_unread`; connect says so, and a billed start answers `_EARLIER_UNREAD` until a good read clears it.
 - Not done: `teardown_endpoint` with nothing bound; a cold stop finds an endpoint only through a block record (a
   leftover handoff alone needs a connect first).
 
