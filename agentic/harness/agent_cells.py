@@ -99,6 +99,10 @@ class UserSim:
     # answer of kind "proposal". hermes ran s1 alone as a one-row pilot and proposed from it (2026-11-05); "I don't
     # know what one run needs" was no answer to that
     agrees_to_own_measure: bool = False
+    # the task's own script and its rows' arguments: a compute run_shell that ran the script on one row and printed its
+    # usage measured that row too (`shell_measured_row` — pi did, 2026-11-05)
+    task_script: str | None = None
+    task_rows: tuple[str, ...] = ()
 
     def say(self, kind: str) -> str | None:
         return {"sizes": self.sizes, "proposal": self.agree, "spend": self.yes, "account": self.account,
@@ -247,10 +251,33 @@ def rows_arg(c: ToolCall) -> list:
     return r if isinstance(r, list) else []
 
 
-def own_measurement(t: Trace) -> tuple[int, ToolCall] | None:
-    """The first answer that showed the agent a row it MEASURED itself: a done row with its usage (`peak_rss_mb`,
-    `cpu_s`) in a run_batch / status answer of a batch the agent started as a pilot or with one row. None: it measured
-    nothing so. (A pilot with rows left over pauses at hpc-bridge's own proposal; a one-row pilot ends `done`, and the
+# A usage figure in a command's output: memory (rss, resident, mem), CPU or wall time, and a number after it.
+_USAGE = re.compile(r"(?:rss|resident|mem(?:ory)?|cpu|wall|elapsed)[^\n\d]{0,30}\d|\breal\s+\d", re.I)
+
+
+def shell_measured_row(c: ToolCall, script: str, rows: tuple[str, ...]) -> str | None:
+    """The task row a compute run_shell MEASURED: it ran the task's own `script` on one row's argument — invoking it
+    (`runs_script`), or handing an interpreter code that names both (`python3 - <<EOF` with a subprocess; a probe it
+    writes and runs) — exited 0, and printed a usage figure. pi measured s1 so (2026-11-05: "wall_s 6.03 / cpu_s 12.03
+    / peak_rss_mb 208.0"). None otherwise: a run that printed only the task's output measured nothing, and one whose
+    timer was missing (`/usr/bin/time: No such file`, exit 0 through a pipe) ran nothing."""
+    from agent_checks import runs_script  # agent_checks imports this module: imported when called
+
+    r = c.result or {}
+    cmd = str(c.input.get("command") or "")
+    if (c.name != "run_shell" or str(c.input.get("shape") or "compute") != "compute" or r.get("exit_code") != 0
+            or script not in cmd or not _USAGE.search(str(r.get("stdout") or ""))):
+        return None
+    if not (runs_script(cmd, script) or re.search(r"<<|\s-c\s", cmd)):
+        return None
+    return next((row for row in rows if re.search(rf"(?<![\w.\-]){re.escape(row)}(?![\w.\-])", cmd)), None)
+
+
+def own_measurement(t: Trace, sim: UserSim | None = None) -> tuple[int, ToolCall] | None:
+    """The first call that showed the agent a row it MEASURED itself: a done row with its usage (`peak_rss_mb`,
+    `cpu_s`) in a run_batch / status answer of a batch the agent started as a pilot or with one row, or (where `sim`
+    names the task's script and rows) a compute run_shell that measured one (`shell_measured_row`). None: it measured
+    nothing. (A pilot with rows left over pauses at hpc-bridge's own proposal; a one-row pilot ends `done`, and the
     sizes are the agent's to propose.)"""
     mine = {str((c.result or {}).get("batch_id")) for _i, c in agent_calls(t)
             if is_new_batch(c) and (c.result or {}).get("batch_id") and (is_pilot(c) or len(rows_arg(c)) == 1)}
@@ -260,7 +287,21 @@ def own_measurement(t: Trace) -> tuple[int, ToolCall] | None:
                 isinstance(x, dict) and x.get("state") == "done"
                 and (x.get("peak_rss_mb") is not None or x.get("cpu_s") is not None) for x in r.get("results") or []):
             return i, c
+        if sim is not None and sim.task_script and shell_measured_row(c, sim.task_script, sim.task_rows):
+            return i, c
     return None
+
+
+def measured_how(t: Trace, own: tuple[int, ToolCall], sim: UserSim | None = None) -> str:
+    """How the agent measured its row, in words: hpc-bridge's pilot, a one-row batch, or a run_shell of the task."""
+    i, c = own
+    if c.name == "run_shell" and sim is not None and sim.task_script:
+        row = shell_measured_row(c, sim.task_script, sim.task_rows)
+        return f"by a run_shell that ran {sim.task_script} on {row} (call {i})"
+    bid = str((c.result or {}).get("batch_id"))
+    start = next((x for _k, x in agent_calls(t) if is_new_batch(x) and str((x.result or {}).get("batch_id")) == bid),
+                 None)
+    return f"by {'a pilot' if start is not None and is_pilot(start) else 'a one-row batch'} (call {i})"
 
 
 def pending(t: Trace) -> tuple[str, int] | None:
@@ -370,7 +411,7 @@ def decide(t: Trace, sim: UserSim) -> tuple[str, str] | None:
         return "sizes", sim.pilot_reply
     measured = any(c.name in ("run_batch", "status") and answer_state(c) == "needs_sizing"
                    and (c.result or {}).get("proposal") for c in t.calls)   # then the talk is of hpc-bridge's proposal
-    own = own_measurement(t) if sim.agrees_to_own_measure and not measured else None
+    own = own_measurement(t, sim) if sim.agrees_to_own_measure and not measured else None
     if (own is not None and (p is None or p[0] == "spend") and own_sizes_said(final_text(t, last))
             and not any(k > own[0] and sizes_rows(c) for k, c in agent_calls(t))
             and not any(c.name in _ENDS for _i, c in calls_in(t, last))):

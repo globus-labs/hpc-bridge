@@ -495,8 +495,11 @@ too: every requirement `<pkg>==`, no requirements file. `no_blind_rerun` counts 
 that reads it (`cat`, `head`, `wc`).
 
 **The agent's own measurement.** A one-row pilot ends `done` with no proposal of hpc-bridge's, so the agent proposes
-from the row's usage itself. In `batch_pilot_agreed` (`UserSim.agrees_to_own_measure`) the user agrees to sizes put so
-— a done row of a pilot or one-row batch, its usage read, the rest not yet sized — as to the tool's proposal.
+from the row's usage itself; an agent may also measure one row with a compute run_shell of the task (`/usr/bin/time`,
+a python rusage probe) — exit 0, the row's argument named, a usage figure printed (`shell_measured_row`). In
+`batch_pilot_agreed` (`UserSim.agrees_to_own_measure`, `task_script`, `task_rows`) the user agrees to sizes put so —
+the rest not yet sized — as to the tool's proposal, and `pilot_used` passes on any of the three ways (the user asked
+for a measurement, not for a tool), its detail naming which.
 `proposal_relayed` / `resize_after_agreement` grade it the same way, the agent's words standing for the proposal; an
 agent that never measured is still a premise not met, and one that ran the rest unasked still fails.
 
@@ -520,7 +523,9 @@ proposal offered as `memory_gb=1.5`; a temp-venv probe counted as an install). R
 **The hermes21 retry** (3cb5031): 4 of 7 OK, asking before every spend. Two more harness gaps — the listing probe
 counted as an install, and a one-row pilot's own proposal answered "I don't know what one run needs" — fixed as above;
 re-graded, 6 of 7. `batch_sized_by_user` still fails `terms_shown_before_yes`: hermes named the whole 4-core node
-before the yes, and the batch then started a 3-CPU block derived from the sizes.
+before the yes, and the batch then started a 3-CPU block derived from the sizes. **The full pass** (24 cells,
+247051a): 20 of 24; one more harness gap — pi measured s1 with a run_shell, not a pilot — fixed as above; re-graded,
+21 of 24 (two hermes21 misses, one product failure).
 
 ## Network topologies (`HPCB_FAKE_TOPOLOGY`, `harness/topology.py`)
 

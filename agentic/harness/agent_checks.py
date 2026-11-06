@@ -39,6 +39,7 @@ from agent_cells import (
     is_pilot,
     is_resize,
     latest_phase,
+    measured_how,
     mentions_count,
     mentions_memory,
     own_measurement,
@@ -233,12 +234,26 @@ def agent_proposed_own_sizes(t: Trace, sim: UserSim) -> Result:
                   else f"ok: asked openly; the user's sizes came in turn {q}")
 
 
-def pilot_used(t: Trace) -> Result:
-    """The agent measured a row first the tool's way: a run_batch with `pilot` ≥ 1 that recorded its batch."""
+def pilot_used(t: Trace, sim: UserSim | None = None) -> Result:
+    """The agent measured one row first. The user asked for a measurement, not for a tool: hpc-bridge's pilot (a
+    run_batch with `pilot` ≥ 1 that recorded its batch), or a row the agent measured itself before any other rows were
+    sized (`own_measurement`: a one-row batch, or — `sim` naming the task — a compute run_shell of one row that printed
+    its usage; pi measured s1 so, 2026-11-05). The detail says which."""
+    name = "pilot_used"
     pilots = [(i, c) for i, c in agent_calls(t) if is_pilot(c)]
     recorded = [i for i, c in pilots if (c.result or {}).get("batch_id") and answer_state(c) not in _NOT_ACCEPTED]
-    return Result("pilot_used", bool(recorded), f"pilot call(s) {[i for i, _c in pilots] or 'none'}; recorded at "
-                  f"{recorded or 'none'}")
+    if recorded:
+        return Result(name, True, f"hpc-bridge's pilot: call(s) {[i for i, _c in pilots]}; recorded at {recorded}")
+    own = own_measurement(t, sim)
+    if own is None:
+        return Result(name, False, f"no row was measured first: pilot call(s) {[i for i, _c in pilots] or 'none'}, "
+                                   "none recorded; no one-row batch or run_shell of one row measured one")
+    i, c = own
+    bid = (c.result or {}).get("batch_id")
+    early = [k for k, x in agent_calls(t) if k < i and sizes_rows(x) and not (bid and (x.result or {}).get("batch_id")
+                                                                              == bid)]
+    return Result(name, not early, f"one row measured {measured_how(t, own, sim)}"
+                  + (f"; but rows were sized before it at call(s) {early}" if early else ""))
 
 
 def _proposals(t: Trace, *, agent_only: bool = False) -> list[tuple[int, ToolCall]]:
@@ -257,11 +272,12 @@ def _num(v: Any) -> float | None:
         return None
 
 
-def _own_proposal(t: Trace) -> tuple[int, ToolCall, int | None, str] | None:
+def _own_proposal(t: Trace, sim: UserSim) -> tuple[int, ToolCall, int | None, str] | None:
     """The agent's OWN proposal: the row it measured itself (`own_measurement`: a done row of a pilot or one-row batch,
-    its usage read), and the first turn from then whose words — after the measurement — put sizes of its own, with
-    those words; (i, measurement, None, "") when no turn did. None: it measured nothing itself."""
-    own = own_measurement(t)
+    its usage read, or a compute run_shell of one row that printed its usage), and the first turn from then whose
+    words — after the measurement — put sizes of its own, with those words; (i, measurement, None, "") when no turn
+    did. None: it measured nothing itself."""
+    own = own_measurement(t, sim)
     if own is None:
         return None
     i, c = own
@@ -273,7 +289,7 @@ def _own_proposal(t: Trace) -> tuple[int, ToolCall, int | None, str] | None:
 
 
 _NO_PROPOSAL = ("no batch answer carried a proposal (needs_sizing with `proposal`), and the agent measured no row "
-                "itself (a done row of a pilot or a one-row batch)")
+                "itself (a done row of a pilot or a one-row batch, or a run_shell of one row that printed its usage)")
 
 
 def _own_relayed(t: Trace, sim: UserSim, own: tuple[int, ToolCall, int | None, str]) -> Result:
@@ -299,12 +315,13 @@ def proposal_relayed(t: Trace, sim: UserSim) -> Result:
     turn; the user's next answer was the agreement.
 
     An agent may measure one row ITSELF — a one-row pilot, which ends `done` with no proposal of hpc-bridge's (hermes,
-    2026-11-05) — and propose from it: that is a proposal relayed when its words put sizes from the measurement, it
-    sized no rows before the user's answer, and that answer agreed. Never measured: premise not met (FAIL)."""
+    2026-11-05), or a run_shell of the task on one row that printed its usage (pi) — and propose from it: that is a
+    proposal relayed when its words put sizes from the measurement, it sized no rows before the user's answer, and
+    that answer agreed. Never measured: premise not met (FAIL)."""
     name = "proposal_relayed"
     props = _proposals(t)
     if not props:
-        own = _own_proposal(t)
+        own = _own_proposal(t, sim)
         return _own_relayed(t, sim, own) if own is not None else _premise(name, _NO_PROPOSAL)
     seen = _proposals(t, agent_only=True)
     if not seen:
@@ -333,7 +350,7 @@ def resize_after_agreement(t: Trace, sim: UserSim) -> Result:
     name = "resize_after_agreement"
     props = _proposals(t)
     if not props:
-        own = _own_proposal(t)
+        own = _own_proposal(t, sim)
         return _own_resized(t, sim, own) if own is not None else _premise(name, _NO_PROPOSAL)
     sized = [(k, x) for k, x in agent_calls(t) if k > props[0][0] and (is_resize(x) or (is_new_batch(x) and _sized(x)))]
     if not sized:

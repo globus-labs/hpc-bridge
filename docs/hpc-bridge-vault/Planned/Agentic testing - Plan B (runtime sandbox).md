@@ -252,6 +252,9 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     (a one-row pilot ends `done`, with no proposal of the tool's) and proposes from it has relayed a proposal — the
     user agrees to it (`agrees_to_own_measure`). Re-graded: 6 of 7; `batch_sized_by_user` is a real miss (it named
     the whole node before the yes; a smaller derived block started).
+  - **Full pass (24 cells, 247051a): 20 of 24.** One more harness gap: pi measured s1 with a compute run_shell (a
+    python rusage probe), not a pilot. A run_shell of the task on one row that exits 0 and prints its usage is a
+    measurement too, and `pilot_used` passes on any of the three ways. Re-graded: 21 of 24.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

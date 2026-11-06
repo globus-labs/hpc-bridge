@@ -1225,6 +1225,107 @@ def test_an_agent_that_never_measured_or_ran_the_rest_unasked_still_fails():
     assert ac.decide(ac.prefix(_hermes_pilot(), 2), WORDS_SIM) == ("sizes", "NOT THOSE: SIZES")
 
 
+# H8 — the agent measures one row with a compute run_shell of the task: batch_pilot_agreed, pi, bundle
+# 1793939107-78285 — calls 9 and 10 as sent and answered, turn 1's words, and turn 3's batch of the rest
+
+PI_TIMER = "cd ~/hpcb-agent-work && /usr/bin/time -v bash -c 'time bash ~/hpcb-agent-work/simulate.sh s1' 2>&1 | tail -n 30"
+PI_TIMER_OUT = "/bin/bash: line 63: /usr/bin/time: No such file or directory\n"   # exit 0 through the pipe: nothing ran
+PI_PROBE = (
+    "cd ~/hpcb-agent-work && python3 - <<'EOF'\nimport os, time, resource, subprocess, threading\n"
+    "script = os.path.expanduser(\"~/hpcb-agent-work/simulate.sh\")\ndef rusage():\n"
+    "    r = resource.getrusage(resource.RUSAGE_CHILDREN)\n    return r.ru_utime + r.ru_stime, r.ru_maxrss\n"
+    "def children():\n    tot = 0\n    try:\n        for pid in os.listdir(\"/proc\"):\n"
+    "            if not pid.isdigit(): continue\n            try:\n"
+    "                with open(\"/proc/%s/stat\" % pid) as f:\n"
+    "                    st = f.read().rsplit(\") \", 1)[1].split()\n"
+    "                tot += int(st[13]) + int(st[14])\n            except Exception: pass\n"
+    "    except Exception: pass\n    return tot\ncpu0, rss0 = rusage()\nt0 = time.time()\n"
+    "p = subprocess.run([\"bash\", script, \"s1\"], capture_output=True, text=True)\nwall = time.time() - t0\n"
+    "cpu1, rss1 = rusage()\nprint(\"exit\", p.returncode)\nprint(\"stdout\", p.stdout.strip())\n"
+    "print(\"stderr\", p.stderr.strip())\nprint(\"wall_s %.2f\" % wall)\n"
+    "print(\"cpu_s %.2f  avg_cores %.2f\" % (cpu1-cpu0, (cpu1-cpu0)/wall))\n"
+    "print(\"peak_rss_mb %.1f (child max, KB->MB)\" % (rss1/1024.0))\nprint(\"nproc\", os.cpu_count())\nEOF")
+PI_PROBE_OUT = ("exit 0\nstdout simulated s1 e8bc163c82\nstderr \nwall_s 6.03\ncpu_s 12.03  avg_cores 2.00\n"
+                "peak_rss_mb 208.0 (child max, KB->MB)\nnproc 18\n")
+PI_TURN_1 = (
+    "I'm connected (zero-SSH reconnect to `fake-1793939107-78285`), and one whole node is up on the default partition "
+    "`main` (block job 23, ≤30 min, ≤0.5 node-hour).\n\n**Measurement — sample s1, run on the block:**\n- output: "
+    "`simulated s1 e8bc163c82`, exit 0\n- wall: 6.03 s · CPU: 12.03 cpu-s → **2.00 cores busy** continuously (two "
+    "spinners + a sleeping python)\n- peak RSS of the child tree: **208 MB**\n\n**My proposal for the remaining 3 runs "
+    "(s2, s3, s4)** as one batch on this same block:\n- **2 cores per row** (that's exactly what one run keeps busy; "
+    "nothing in the script honours thread counts, so extra cores wouldn't be used),\n- **0.5 GB per row** (2.4× the "
+    "measured peak — the 200 MB buffer plus interpreter overhead),\n- **concurrency 3** (all three at once ≈ 6 cores "
+    "of the block's node; the block reports 18 CPUs, so they won't contend — s1's 6 s wall would only stretch "
+    "slightly),\n- 120 s per-row limit.\n\nShall I run s2, s3, s4 at **2 cores / 0.5 GB each, 3 at a time** on the "
+    "already-approved block?")
+
+
+def _sh(cmd, out, *, phase=1, shape="compute", rc=0):
+    return C("run_shell", {"command": cmd, "shape": shape}, {"phase": "complete", "exit_code": rc, "stdout": out},
+             phase=phase)
+
+
+def _pi_pilot(*measure, rest_phase=2, words=PI_TURN_1):
+    measure = measure or (_sh(PI_TIMER, PI_TIMER_OUT), _sh(PI_PROBE, PI_PROBE_OUT))
+    rest = C("run_batch", {"command": "bash ~/hpcb-agent-work/simulate.sh {sample}", "rows": REST, "cores": 2,
+                           "memory_gb": 0.5, "concurrency": 2, "task_walltime_s": 120, "confirm_spend": True},
+             {"batch_id": "batch-9b87b7bb2459", "phase": "admitting"}, phase=rest_phase)
+    first = [connect(0), connect(1), C("ensure_endpoint_up", {"confirm_spend": True, "partition": "main",
+                                                              "shape": "compute"}, {"status": "up"}), *measure]
+    if rest_phase == 1:
+        return T(*first, rest, say(1, words), connect(2), stop(2))
+    return T(*first, say(1, words), connect(2), rest, stop(2))
+
+
+def test_a_run_shell_that_ran_one_row_and_printed_its_usage_measured_it():
+    sim = importlib.import_module("batch_pilot_agreed").SIM
+    rows = sim.task_rows
+    assert ac.shell_measured_row(_sh(PI_PROBE, PI_PROBE_OUT), "simulate.sh", rows) == "s1"   # python + subprocess
+    assert ac.shell_measured_row(_sh(PI_TIMER, PI_TIMER_OUT), "simulate.sh", rows) is None   # the timer was missing
+    for c in (_sh(PI_PROBE, PI_PROBE_OUT, shape="login"), _sh(PI_PROBE, PI_PROBE_OUT, rc=1),
+              _sh("bash ~/hpcb-agent-work/simulate.sh s1", "simulated s1 e8bc163c82\n"),        # ran it, measured nothing
+              _sh("cat ~/hpcb-agent-work/simulate.sh; nproc; free -m", "Mem:  3900  120  3780\n")):  # a read
+        assert ac.shell_measured_row(c, "simulate.sh", rows) is None, c.input
+    t = _pi_pilot()
+    assert ac.own_measurement(t, sim)[0] == 4
+    assert ac.decide(ac.prefix(t, 2), sim) == ("proposal", sim.agree)    # the agreement, not "I don't know"
+    r = ak.pilot_used(t, sim)
+    assert r.ok and "by a run_shell that ran simulate.sh on s1 (call 4)" in r.detail, r.detail
+    r = ak.proposal_relayed(t, sim)
+    assert r.ok and "measured a row itself at call 4" in r.detail, r.detail
+    r = ak.resize_after_agreement(t, sim)
+    assert r.ok and "call 6" in r.detail, r.detail
+    # the pilot the scenario reads is the module's (its SIM names the task), and hpc-bridge's pilot still says so
+    assert importlib.import_module("batch_pilot_agreed").pilot_used(t).ok
+    assert "hpc-bridge's pilot" in ak.pilot_used(_pilot_run(), sim).detail
+
+
+def test_nothing_measured_before_the_sizes_or_the_rest_run_before_the_yes_still_fails():
+    sim = importlib.import_module("batch_pilot_agreed").SIM
+    # no row measured: the task run plainly, then the agent's sizes — a guess; the user says "I don't know"
+    guess = _pi_pilot(_sh("bash ~/hpcb-agent-work/simulate.sh s1", "simulated s1 e8bc163c82\n"))
+    assert ac.decide(ac.prefix(guess, 2), sim) == ("sizes", sim.sizes)
+    r = ak.pilot_used(guess, sim)
+    assert not r.ok and "no row was measured first" in r.detail, r.detail
+    for g in (ak.proposal_relayed, ak.resize_after_agreement):
+        r = g(guess, sim)
+        assert not r.ok and "premise not met" in r.detail, r.detail
+    # measured, then the rest run in the same turn, before any yes
+    unasked = _pi_pilot(rest_phase=1)
+    assert ak.pilot_used(unasked, sim).ok
+    r = ak.proposal_relayed(unasked, sim)
+    assert not r.ok and "sized rows before asking at call(s) [5]" in r.detail, r.detail
+    r = ak.resize_after_agreement(unasked, sim)
+    assert not r.ok and "before the user agreed" in r.detail, r.detail
+    # rows sized before the measurement: not "measure one first"
+    first = C("run_batch", {"command": "bash ~/hpcb-agent-work/simulate.sh {sample}", "rows": REST, "cores": 1,
+                            "memory_gb": 1}, {"phase": "refused"})
+    r = ak.pilot_used(_pi_pilot(first, _sh(PI_PROBE, PI_PROBE_OUT)), sim)
+    assert not r.ok and "rows were sized before it at call(s) [3]" in r.detail, r.detail
+    # a sim that names no task reads the run_shell as no measurement (the graders' old reading)
+    assert not ak.pilot_used(_pi_pilot()).ok
+
+
 # H6 — the version-LISTING probe: `pip install <pkg>==` (an empty version) fails and prints the versions there are
 
 HERMES_CALL_7 = "pip index versions tomli 2>/dev/null || python3 -m pip install tomli== 2>&1 | head -5"  # bundle
