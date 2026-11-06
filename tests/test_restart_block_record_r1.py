@@ -181,6 +181,7 @@ async def test_1_a_cold_stop_with_cancel_ends_the_handoff_and_its_pool(tmp_path,
 async def test_2_a_pinned_sessions_first_yes_reuses_the_earlier_block_it_never_connected_to(monkeypatch):
     fac = _Slurm()
     _s1, n = await _session_1(monkeypatch, fac)
+    monkeypatch.setenv("HPC_BRIDGE_MACHINE", "mine")   # a startup pin of the facility session 1 connected
     s2 = _server(monkeypatch, fac)           # bound (a startup pin), never connected: no endpoint id yet
     assert s2.state.endpoint_id is None
     log = _scripted_login(monkeypatch, probes=[_listing(n=n)])
@@ -193,6 +194,7 @@ async def test_2_a_pinned_sessions_first_yes_reuses_the_earlier_block_it_never_c
 async def test_2_a_pinned_sessions_first_yes_on_other_terms_asks_first(monkeypatch):
     fac = _Slurm()
     _s1, n = await _session_1(monkeypatch, fac)
+    monkeypatch.setenv("HPC_BRIDGE_MACHINE", "mine")
     s2 = _server(monkeypatch, fac)
     _scripted_login(monkeypatch, probes=[_listing(n=n)])
     st = await _ensure_endpoint_up(s2, partition="other", confirm_spend=True)
@@ -394,14 +396,16 @@ def test_6_a_row_sent_before_the_sender_was_recorded_still_follows_its_batchs_ow
 # --- nits ----------------------------------------------------------------------------------------------------------------
 
 
-async def test_nit_a_record_of_another_host_is_never_taken_for_gone(monkeypatch):
+async def test_nit_a_record_of_another_machine_is_never_taken_for_gone(monkeypatch):
+    # review round 2: "another" is another MACHINE (its stable identity, known and different) — never a hostname, which
+    # a laptop's network changes
     fac = _Slurm()
     await _session_1(monkeypatch, fac)
-    Ledger.open()._con.execute("update block set owner_host = 'another-host.example'")
+    Ledger.open()._con.execute("update block set owner_host = 'another-host.example', owner_machine = 'other-id'")
     s2 = _server(monkeypatch, fac, bound=False)
-    log = _scripted_login(monkeypatch)
+    log = _scripted_login(monkeypatch, probes=[_listing()])
     st = await _stop_endpoint(s2)
-    assert log == [] and st.status == "draining" and st.spend_stopped is not True
+    assert [k for k, _c in log] == ["probe"] and st.status == "draining" and st.spend_stopped is not True
     assert "another-host.example" in st.notice and "job 40" in st.notice
 
 
