@@ -150,6 +150,16 @@ connect released both. Fixed test-first (`tests/test_restart_block_record.py`; m
     MEP stop (it paused batches); a combined answer keeps every part's `jobs` and `handoffs`;
   - on a MEP a gone server's presumed-lost row keeps its slot (`reserve(by_sender=False)`): a late delivery can run;
   - a facility endpoint's record is named "not verified" and "may have ended".
+- **Review round 3** (same branch, `tests/test_restart_block_record_r3.py`; simplify, fail closed):
+  - ONE choke point before a billed block: `earlier.unread` in `warmth._provision`, by the endpoint id the bring-up
+    learnt (any path: connect, pin, failed connect); `_ensure_endpoint_up` reads the record off the lock and runs
+    the call once more. Deleted: `pinned_records`, `reach_pinned`, `unverified_pin`, `_pin_key`, server
+    `_pinned_records_first` (a pin's facility-string match, and its web shortcut);
+  - liveness is one rule, one table test (machine id x pid namespace x hostname x pid): unknown ids fall back to
+    the hostname; a namespace on one side only is elsewhere; `_read_machine_id` uses /usr/sbin/ioreg (else PATH)
+    and survives a missing, slow, garbled or undecodable read;
+  - a cold stop whose re-read of the record fails is `draining` with the reason, never `down`;
+  - jobs dedupe by `job_id`; a MEP batch held by presumed-lost rows says `cancel` / a stop ends the wait.
 - Not done: `teardown_endpoint` with nothing bound; a cold stop finds an endpoint only through a block record (a
   leftover handoff alone needs a connect first).
 
