@@ -2294,6 +2294,18 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     if not _RESULTS_DIR.match(batch_dir(rd, bid)):
         return _refused(f"the default results directory {rd!r} cannot be used; pass results_dir=")
     led = ledger_of(app)
+    # the block's config retired (a stop released it, a reap found it gone) is decided HERE, before anything is recorded
+    # (review round 3: the batch was recorded on a block this call's yes had just built, then paused to ask for a
+    # second yes while the block billed). The yes counts for the config, as ensure_endpoint_up's yes after a stop
+    # starts a block on it and as a resume's yes takes it back; with no yes on the call, nothing is recorded and one
+    # question is asked
+    if (retired := led.retired(app.state.endpoint_id, uec_hash(rt))) is not None:
+        if not confirm_spend:
+            return BatchStatus(phase="needs_confirmation", tasks=len(rows), block=st.block,
+                               session_spend=st.session_spend, reason="the block's config was retired",
+                               notice=f"The block's config was retired ({retired}): a new batch runs on it only with "
+                                      "the user's yes — the same call with confirm_spend=True. Nothing was recorded.")
+        led.unretire(app.state.endpoint_id, uec_hash(rt))
     owner = owner_of(app)
     run = _Run(bid, rt, runner=_batch_runner(app, rt), runner_hash=uec_hash(rt), ensure_up=ensure_up)
     _note_block_from_canary(app, run, rt)
@@ -2447,6 +2459,10 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         return _refused(f"{bid} is held by another hpc-bridge server now: status('{bid}') reads it from here.", bid=bid)
     b = led.batch(bid)
     if b["state"] in ("done", "cancelled"):
+        if resize:   # never ignored without a word (review round 3: a done pilot names "a size for the next batch")
+            sizes = ", ".join(f"{k}={v}" for k, v in resize.items())
+            return _refused(f"{bid} is {b['state']}: it has no rows left to run, so a size changes nothing there — "
+                            f"start a new batch with it: run_batch(command=…, rows=…, {sizes})", bid=bid)
         return _status_of(app, bid)
     if (rec := _env_rec(b)) is not None:
         if rec.get("unbuildable"):   # never another yes that cannot work (review S1): only another env mends it
