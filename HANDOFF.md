@@ -95,6 +95,12 @@ Fixed test-first (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests
   free agent cell had started a derived 3-CPU block no answer named, on its first call, with the yes the user gave to
   connect_facility's default terms). And a pilot of every row says it runs to its end, and its done answer carries the
   `proposal` (it had promised a stop for the size, and ended `done` with no proposal: `batch_pilot_agreed`).
+- **Review round 3** (`tests/test_anvil_live_findings_r3.py`, `…_r3_node.py`): a quote is for its facility, endpoint,
+  partition, account and size (`batch._quote_key`), cleared on a re-bind, a teardown or a switch — a yes after a
+  re-bind had started 65 CPUs on another account; after a stop, a new batch's yes takes its retired config back and
+  admits (it had built the block, then paused for a second yes); a done batch's resize is refused naming a new batch;
+  `uses_module` sees `if`/`elif`/`while`/`until`/`time`/`command`/case-pattern/assignment starts and not `${ml}`; the
+  PATH scrub keeps a trailing empty entry.
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
