@@ -158,7 +158,7 @@ async def test_1_a_cold_stop_asks_about_a_live_handoff_and_cancels_nothing(tmp_p
     assert "cancels the consumer's blocks" in st.notice
 
 
-async def test_1_a_cold_stop_with_keep_spares_the_consumer_and_with_cancel_ends_the_handoff(tmp_path, monkeypatch):
+async def test_1_a_cold_stop_with_keep_spares_the_consumers_pool(tmp_path, monkeypatch):
     cold, sched, mine, loam, out = await _cold_with_handoff(tmp_path, monkeypatch)
     st = await _stop_endpoint(cold, handoffs="keep")
     assert sched.job(mine)["state"] == "CANCELLED" and sched.job(loam)["state"] == "RUNNING", sched.jobs()
@@ -166,8 +166,13 @@ async def test_1_a_cold_stop_with_keep_spares_the_consumer_and_with_cancel_ends_
     from hpc_bridge import scheduler_ops
 
     assert scheduler_ops.RELEASE_KEEP.get() is None
-    st2 = await _stop_endpoint(cold, handoffs="cancel")
-    assert sched.job(loam)["state"] == "CANCELLED" and "Ended, as asked" in st2.notice, (st2.status, st2.notice)
+
+
+async def test_1_a_cold_stop_with_cancel_ends_the_handoff_and_its_pool(tmp_path, monkeypatch):
+    cold, sched, mine, loam, _out = await _cold_with_handoff(tmp_path, monkeypatch)
+    st = await _stop_endpoint(cold, handoffs="cancel")
+    assert sched.job(mine)["state"] == sched.job(loam)["state"] == "CANCELLED", sched.jobs()
+    assert "Ended, as asked" in st.notice and st.handoffs, (st.status, st.notice)
 
 
 # --- 2. a startup pin: its endpoint first, its record before any block --------------------------------------------------
@@ -458,7 +463,7 @@ async def test_nit_an_unreachable_record_is_named_as_such_with_the_users_own_can
 
 
 async def test_nit_export_handoff_names_the_earlier_block_still_billing(tmp_path, monkeypatch):
-    from tests.test_handoff_phase2b import LOAM_UEC, SSH_EID, _export, _ssh_app
+    from tests.test_handoff_phase2b import SSH_EID, _export, _ssh_app
 
     app = _ssh_app(tmp_path)
     app.ledger = Ledger.open()
@@ -466,8 +471,9 @@ async def test_nit_export_handoff_names_the_earlier_block_still_billing(tmp_path
     _rec(app.ledger, SSH_EID, "5", job="4242", up_at=time.time(), partition="main", walltime_s=3600.0)
     listing = f"HPCB_NOW {int(time.time())}\nRUNNING 4242 - None\n"
     _scripted_login(monkeypatch, probes=[listing])
-    ask = await _export(app, LOAM_UEC)
-    assert ask.phase == "needs_confirmation" and "block job 4242" in (ask.notice or "")
+    ask = await _export(app, {"partition": "main", "walltime": "00:10:00", "max_blocks": 1})
+    assert ask.phase == "needs_confirmation", (ask.phase, ask.notice)
+    assert "block job 4242" in (ask.notice or "") and "beside" in (ask.notice or "")
 
 
 _ = (asyncio, _answer)

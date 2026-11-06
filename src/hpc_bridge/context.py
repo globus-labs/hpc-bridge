@@ -181,6 +181,7 @@ class EarlierBlock:
     verified: bool = True
     mep: bool = False
     owner: str = ""             # the server that asked, for a notice ("pid N on host")
+    owner_host: str = ""        # …and its host alone
 
     @property
     def job_ids(self) -> tuple[str, ...]:

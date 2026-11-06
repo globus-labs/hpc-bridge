@@ -24,7 +24,7 @@ from __future__ import annotations
 import time
 from types import SimpleNamespace
 
-from hpc_bridge import binding, connect, scheduler_ops, server
+from hpc_bridge import binding, connect, earlier, scheduler_ops, server
 from hpc_bridge.context import AppCtx, _no_facility_bound
 from hpc_bridge.facility.mep import MEPFacility
 from hpc_bridge.ledger import Ledger
@@ -294,8 +294,9 @@ async def test_3_a_cold_stop_reaches_every_recorded_endpoint_and_is_down_only_wh
     entry = _open(EID)[0]["entry"]
     other = "22222222-0000-0000-0000-000000000002"
     led = Ledger.open()
+    here = earlier._me().host   # (a record of another host is never released from here: review round 1)
     led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
-                     partition=None, account=None, walltime_s=None, session="gone", owner_host="h", owner_pid=1,
+                     partition=None, account=None, walltime_s=None, session="gone", owner_host=here, owner_pid=1,
                      owner_start=None)
     led.block_up(other, "9", "7")
     s2 = _server(monkeypatch, fac, bound=False)
@@ -308,7 +309,7 @@ async def test_3_a_cold_stop_reaches_every_recorded_endpoint_and_is_down_only_wh
     # one of them not confirmed: the whole answer is not `down`
     await _session_1(monkeypatch, fac)
     led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
-                     partition=None, account=None, walltime_s=None, session="gone", owner_host="h", owner_pid=1,
+                     partition=None, account=None, walltime_s=None, session="gone", owner_host=here, owner_pid=1,
                      owner_start=None)
     monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
     _scripted_login(monkeypatch, releases=["released 40\n", None, None, None])

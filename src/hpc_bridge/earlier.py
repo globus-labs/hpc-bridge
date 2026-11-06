@@ -34,7 +34,7 @@ import json
 import sys
 import time
 from collections.abc import Awaitable, Callable
-from dataclasses import replace
+from dataclasses import dataclass, replace
 from typing import Any
 
 from . import binding, config, notices, scheduler_ops
@@ -93,6 +93,17 @@ def _me() -> Owner:
     return _OWNER
 
 
+def _me_ns() -> str | None:
+    """This process's pid namespace (Linux), so a pid of another namespace sharing the state dir (a container) is never
+    read here as dead or alive; None where there is none to read (macOS)."""
+    import os
+
+    try:
+        return os.readlink("/proc/self/ns/pid")
+    except OSError:
+        return None
+
+
 def _ledger(app: AppCtx) -> Ledger:
     """The ledger, opened on first use (as batch's). Raises when it cannot be opened."""
     if app.ledger is None:
@@ -139,19 +150,25 @@ def record_request(app: AppCtx, rt: ShapeRuntime) -> None:
     if eid is None:
         return
     uec = rt.user_endpoint_config
-    entry = app.bound_entry.model_dump_json() if app.bound_entry is not None else None
-    me = _me()
+    pin = config.machine() or ""
+    # the entry the binding was built from: connect's, else a startup pin's (review round 1: a pinned session's records
+    # carried none, so a later cold stop could not reach them)
+    bound = app.bound_entry if app.bound_entry is not None else (
+        binding._PINNED_ENTRY.get(pin) if app.machine is None else None)
+    entry = bound.model_dump_json() if bound is not None else None
+    me, request = _me(), _request(app, uec)
     try:
         _ledger(app).record_block(
-            eid, _request(app, uec), facility=app.machine or config.machine() or None, entry=entry,
+            eid, request, facility=app.machine or pin or None, entry=entry,
             mep=not _has_login_shape(app), scheduler=_scheduler(app), uec_hash=wire_hash(app, uec),
             partition=uec.get("partition"), account=uec.get("account"),
             walltime_s=config._parse_hhmmss(uec.get("walltime")) or None, session=app.session_token,
-            owner_host=me.host, owner_pid=me.pid, owner_start=me.started)
+            owner_host=me.host, owner_pid=me.pid, owner_start=me.started, owner_ns=_me_ns())
     except NetworkFilesystemError:
         return   # the ledger cannot live there (batch says so); nothing can be recorded
     except Exception as exc:  # noqa: BLE001 - a record is never a reason a call fails
         _warn("written", exc)
+    _forget(app, eid, request)   # this server's request now: never named as an earlier one's again
 
 
 def record_up(app: AppCtx, rt: ShapeRuntime, job: str | None, since: float) -> None:
@@ -233,9 +250,15 @@ def _records(app: AppCtx, eid: str | None = None) -> tuple[list[dict], str | Non
 
 
 def _whose(app: AppCtx, r: dict) -> str:
-    """"mine" (this server's), "live" (another server that still runs: its own session's), or "earlier" (gone)."""
+    """"mine" (this server's), "live" (another server that still runs here: its own session's), "elsewhere" (a server
+    of another host, or of another pid namespace sharing the state dir: whether it runs cannot be told from here, so it
+    is treated as live — never reused or released), or "earlier" (a server of this host that is gone). Only this
+    host's dead pid is gone (review round 1)."""
     if r.get("session") == app.session_token:
         return "mine"
+    ns = r.get("owner_ns")
+    if str(r.get("owner_host") or "") != _me().host or (ns is not None and ns != _me_ns()):
+        return "elsewhere"
     holder = Owner(str(r.get("owner_host") or ""), int(r.get("owner_pid") or 0), r.get("owner_start"))
     try:
         return "live" if _ledger(app).holder_alive(holder) else "earlier"
@@ -249,7 +272,7 @@ def _block(r: dict, *, jobs: tuple = (), verified: bool = True) -> EarlierBlock:
         partition=r.get("partition"), account=r.get("account"), uec_hash=r.get("uec_hash"),
         scheduler=r.get("scheduler"), confirmed_at=float(r["confirmed_at"]), job=r.get("job"), up_at=r.get("up_at"),
         walltime_s=r.get("walltime_s"), jobs=tuple(jobs), verified=verified, mep=bool(r.get("mep")),
-        owner=f"pid {r.get('owner_pid')} on {r.get('owner_host')}")
+        owner=f"pid {r.get('owner_pid')} on {r.get('owner_host')}", owner_host=str(r.get("owner_host") or ""))
 
 
 # --- checked against the scheduler -----------------------------------------------------------------------------------
@@ -352,8 +375,24 @@ async def _no_runner(cmd: str) -> ShellOutcome:   # a facility endpoint's verify
     raise RuntimeError("no login endpoint")
 
 
+def bound_eid(app: AppCtx) -> str | None:
+    """The endpoint the session's blocks go to: the bound one, else — a facility endpoint pinned at startup, before its
+    first block — the facility's own (known before any bring-up)."""
+    if app.state.endpoint_id is not None:
+        return app.state.endpoint_id
+    eid = getattr(app.facility, "endpoint_id", None) if not _has_login_shape(app) else None
+    return eid if isinstance(eid, str) else None
+
+
+def has_open(app: AppCtx) -> bool:
+    """A record of an earlier server (gone, of this host) is open on any endpoint: a session that does not know its
+    endpoint yet (a startup pin) learns it before deciding a block. A ledger read; never a scheduler one."""
+    rows, _problem = _records(app)
+    return any(_whose(app, r) == "earlier" for r in rows)
+
+
 def _view(app: AppCtx) -> EarlierView | None:
-    eid = app.state.endpoint_id
+    eid = bound_eid(app)
     return app.earlier.get(eid) if eid is not None else None
 
 
@@ -495,6 +534,13 @@ def receipt(app: AppCtx, rt: ShapeRuntime) -> str:
     return notices._earlier_beside_note(beside) if beside else ""
 
 
+def handoff_note(app: AppCtx) -> str:
+    """export_handoff's words for an earlier server's block still billing on the endpoint: its billed canary starts a
+    block beside it (review round 1, as the spend question names it)."""
+    blocks = [b for b in _billing(app) if b.job_ids]
+    return notices._earlier_handoff_note(blocks) if blocks else ""
+
+
 def released_note(app: AppCtx, eid: str, detail: str) -> str:
     """A stop's release cancelled jobs an earlier server left: which ones, for its answer."""
     view = app.earlier.get(eid)
@@ -538,16 +584,32 @@ def mep_left(app: AppCtx, eid: str | None) -> str:
 
 
 Stopper = Callable[[AppCtx], Awaitable[EndpointStatus]]
+Asker = Callable[[AppCtx], Awaitable[EndpointStatus | None]]
 
 
-async def stop_cold(app: AppCtx, stop_ssh: Stopper, stop_mep: Stopper) -> EndpointStatus | None:
+@dataclass
+class _Target:
+    """One recorded endpoint a cold stop goes to: its records, and the scratch context bound to it (None: it cannot be
+    reached from here, `part` saying why)."""
+
+    eid: str
+    recs: list[dict]
+    scratch: AppCtx | None = None
+    part: EndpointStatus | None = None
+    failed: bool = False   # its ask or stop raised: `part` says so
+
+
+async def stop_cold(app: AppCtx, stop: Stopper, ask: Asker | None = None) -> EndpointStatus | None:
     """stop_endpoint with no endpoint bound (a fresh server's first call, a startup pin before its first block): the
-    blocks the record names — this server's, and earlier servers' that are gone — are reached again, every endpoint at
-    once (each stop bounded on its own), and released by the stop a bound endpoint gets (`stop_ssh`:
-    server._stop_endpoint_blocks, on a scratch context bound to that endpoint, so nothing stays bound here); a
-    facility endpoint's are named (`stop_mep`). A block
-    another server that still runs holds is named and left to it. None: nothing on record (the old "no endpoint was
-    up"). `down` with spend_stopped true only when every endpoint's stop said so."""
+    blocks the record names — this server's, and earlier servers' that are gone — are reached again, each endpoint on a
+    scratch context bound to it for this call alone (nothing stays bound here), and get the WHOLE stop a bound endpoint
+    gets (`stop`: server._stop_endpoint with the call's own jobs= and handoffs= — its handoff question and scope, its
+    Jobs-mode keep/cancel, its busy refusal; review round 1's blocker: the block release alone had cancelled a
+    handoff consumer's pool unasked). What any of them would ASK (`ask`, read only) is asked first, for all of them, and
+    then nothing is changed anywhere. A block of another server that still runs, or of another host, is named and left
+    alone. The session's lock is held throughout: a connect and a confirmation meanwhile cannot have their new block
+    released under them. None: nothing on record, or an endpoint got bound meanwhile (the caller's bound stop).
+    `down` with spend_stopped true only when every endpoint's stop said so."""
     rows, problem = _records(app)
     if problem is not None:
         return EndpointStatus(status="draining", block_state="cold", notice=notices._earlier_unread_stop(problem))
@@ -556,22 +618,114 @@ async def stop_cold(app: AppCtx, stop_ssh: Stopper, stop_mep: Stopper) -> Endpoi
     rows = [r for r in rows if not (r.get("mep") and whose[(r["endpoint_id"], r["request"])] == "mine")]
     if not rows:
         return None
-    held = {r["endpoint_id"] for r in rows if whose[(r["endpoint_id"], r["request"])] == "live"}
+    async with app.lock:
+        if app.state.endpoint_id is not None:
+            return None
+        targets = [await _target(app, eid, [r for r in rows if r["endpoint_id"] == eid], whose)
+                   for eid in dict.fromkeys(r["endpoint_id"] for r in rows)]
+        try:
+            reach = [t for t in targets if t.scratch is not None]
+            if ask is not None:
+                questions = [q for q in await asyncio.gather(*(_guarded(t, ask, read=True) for t in reach))
+                             if q is not None and q.status == "needs_confirmation"]
+                if questions:
+                    return _questions(questions)
+            reach = [t for t in reach if not t.failed]
+            done = await asyncio.gather(*(_guarded(t, stop) for t in reach))
+            for t, st in zip(reach, done, strict=True):
+                t.part = _cold_part(t, st)
+            return _combined([t.part for t in targets if t.part is not None])
+        finally:
+            for t in targets:
+                if t.scratch is not None:
+                    await _close(t.scratch)
 
-    async def one(eid: str) -> EndpointStatus:
-        recs = [r for r in rows if r["endpoint_id"] == eid]
-        if eid in held:
-            live = [_block(r, verified=False) for r in recs if whose[(eid, r["request"])] == "live"]
-            return EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
-                                  block_job_id=next((b.job for b in live if b.job), None),
-                                  notice=notices._earlier_live_stop(live))
-        if any(r.get("mep") for r in recs):
-            return await _stop_mep_cold(app, eid, recs, stop_mep)
-        return await _stop_ssh_cold(app, eid, recs, stop_ssh)
 
-    # every endpoint at once: each stop is bounded on its own (config.STOP_CALL_BUDGET_S), and together they stay
-    # within one tool call
-    return _combined(list(await asyncio.gather(*(one(e) for e in dict.fromkeys(r["endpoint_id"] for r in rows)))))
+async def _target(app: AppCtx, eid: str, recs: list[dict], whose: dict) -> _Target:
+    """A recorded endpoint: held by a server that still runs (or of another host) — named, left alone; reachable — a
+    scratch context bound to it; else why it cannot be reached from here."""
+    t = _Target(eid, recs)
+    blocks = [_block(r, verified=False) for r in recs]
+    held = [b for r, b in zip(recs, blocks, strict=True) if whose[(eid, r["request"])] in ("live", "elsewhere")]
+    if held:
+        here = all(whose[(eid, r["request"])] == "live" for r in recs if whose[(eid, r["request"])] != "earlier")
+        t.part = EndpointStatus(status="draining", block_state="warm", endpoint_id=eid,
+                                block_job_id=next((b.job for b in held if b.job), None),
+                                notice=notices._earlier_live_stop(held, here=here))
+        return t
+    facility, host = recs[-1].get("facility"), _host(recs)
+    try:
+        fac, why = await _facility(app, recs)
+        if fac is not None and app.login_flow is not None and await asyncio.to_thread(app.login_flow.login_required):
+            fac, why = None, "this session has no Globus login to reach it"
+    except Exception as exc:  # noqa: BLE001 - said: the endpoint is named, never a tool error
+        fac, why = None, f"checking how to reach it failed ({type(exc).__name__}: {str(exc)[:160]})"
+    if fac is None:
+        t.part = _unreachable(blocks, facility, eid, host, why or "the record does not say how to reach it")
+        return t
+    mep = any(r.get("mep") for r in recs)
+    t.scratch = _scratch(app, fac, eid, facility,
+                         left_blocks=[_left(b) for b in blocks if b.mep] if mep else [])
+    return t
+
+
+async def _guarded(t: _Target, call: Callable[[AppCtx], Awaitable[EndpointStatus | None]], *,
+                   read: bool = False) -> EndpointStatus | None:
+    """One endpoint's ask or stop: what it raised is that endpoint's `draining`, with the reason — never a tool error
+    that leaves the others unsaid (review round 1)."""
+    assert t.scratch is not None
+    try:
+        return await call(t.scratch)
+    except Exception as exc:  # noqa: BLE001
+        blocks = [_block(r, verified=False) for r in t.recs]
+        what = "asking what to keep" if read else "the stop there"
+        t.part = _unreachable(blocks, t.recs[-1].get("facility"), t.eid, _host(t.recs),
+                              f"{what} failed ({type(exc).__name__}: {str(exc)[:160]})")
+        t.failed = True
+        return None if read else t.part
+
+
+def _cold_part(t: _Target, st: EndpointStatus | None) -> EndpointStatus | None:
+    """A reached endpoint's stop, led by what the record named there; `down` with spend_stopped true only on that stop's
+    own — an offline endpoint's orphaned `down` is no confirmation, nor is an unconfirmed release: `draining`, with the
+    user's own cancel of the job on record."""
+    if st is None or t.failed:
+        return t.part
+    blocks = [_block(r, verified=False) for r in t.recs]
+    if any(b.mep for b in blocks):   # a facility endpoint: no cancel channel; its answer names what may still bill
+        st.notice = notices._earlier_cold_lead(blocks, t.recs[-1].get("facility"), t.eid, reached=None) + (
+            st.notice or "")
+        return st
+    ok = st.status == "down" and st.spend_stopped is True
+    out = st.model_copy()
+    out.notice = notices._earlier_cold_lead(blocks, t.recs[-1].get("facility"), t.eid,
+                                            reached=ok or st.status in ("up", "needs_confirmation")) + (st.notice or "")
+    if not ok and st.status not in ("up", "needs_confirmation"):
+        out.status, out.spend_stopped = "draining", None   # not reached, or not confirmed: never `down`
+        if "NOT confirmed" not in out.notice:
+            out.notice += " Spend is NOT confirmed stopped for the block on record."
+        out.notice += notices._earlier_user_cancel(blocks, t.recs[-1].get("scheduler"), _host(t.recs))
+    out.block_job_id = st.block_job_id or next((b.job for b in blocks if b.job), None)
+    return out
+
+
+def _questions(qs: list[EndpointStatus]) -> EndpointStatus:
+    """What the cold stop asks before changing anything anywhere: every endpoint's question, its handoffs and jobs."""
+    if len(qs) == 1:
+        return qs[0]
+    jobs: dict[str, Any] = {}
+    for q in qs:   # the same Jobs-mode jobs are every endpoint's question: each once
+        for j in q.jobs or []:
+            jobs.setdefault(str(getattr(j, "id", None) or id(j)), j)
+    notices_ = list(dict.fromkeys((q.notice or "").strip() for q in qs))
+    return EndpointStatus(status="needs_confirmation", block_state="cold", endpoint_id=None,
+                          handoffs=[h for q in qs for h in (q.handoffs or [])], jobs=list(jobs.values()),
+                          notice=" Also: ".join(notices_))
+
+
+def combined(parts: list[EndpointStatus]) -> EndpointStatus:
+    """Several endpoints' stops as one answer."""
+    return _combined(parts)
 
 
 async def _facility(app: AppCtx, recs: list[dict]) -> tuple[Any, str | None]:
@@ -598,46 +752,6 @@ def _scratch(app: AppCtx, fac: Any, eid: str | None, facility: str | None, **kw:
                   scratch_root=binding._resolve_scratch_root(fac), charge_factor=app.charge_factor,
                   runner_factory=app.runner_factory, login_flow=app.login_flow, ledger=app.ledger,
                   session_token=app.session_token, batch_autoloop=False, **kw)
-
-
-async def _stop_ssh_cold(app: AppCtx, eid: str, recs: list[dict], stop_ssh: Stopper) -> EndpointStatus:
-    blocks = [_block(r, verified=False) for r in recs]
-    facility = recs[-1].get("facility")
-    host = _host(recs)
-    fac, why = await _facility(app, recs)
-    if fac is None:
-        return _unreachable(blocks, facility, eid, host, why or "")
-    if app.login_flow is not None and await asyncio.to_thread(app.login_flow.login_required):
-        return _unreachable(blocks, facility, eid, host, "this session has no Globus login to reach it")
-    scratch = _scratch(app, fac, eid, facility)
-    try:
-        st = await stop_ssh(scratch)
-    except Exception as exc:  # noqa: BLE001 - said: never a stop that fails without naming what may still bill
-        return _unreachable(blocks, facility, eid, host,
-                            f"the stop there failed ({type(exc).__name__}: {str(exc)[:160]})")
-    finally:
-        await _close(scratch)
-    ok = st.status == "down" and st.spend_stopped is True
-    out = st.model_copy()
-    out.notice = notices._earlier_cold_lead(blocks, facility, eid) + (st.notice or "")
-    if not ok and st.status != "up":
-        out.status, out.spend_stopped = "draining", None   # not reached, or not confirmed: never `down`
-        if "NOT confirmed" not in out.notice:
-            out.notice += " Spend is NOT confirmed stopped for the block on record."
-        out.notice += notices._earlier_user_cancel(blocks, recs[-1].get("scheduler"), host)
-    out.block_job_id = st.block_job_id or next((b.job for b in blocks if b.job), None)
-    return out
-
-
-async def _stop_mep_cold(app: AppCtx, eid: str, recs: list[dict], stop_mep: Stopper) -> EndpointStatus:
-    blocks = [_block(r, verified=False) for r in recs if r.get("mep")]
-    fac, _why = await _facility(app, recs)
-    scratch = _scratch(app, fac if fac is not None else app.facility, None, recs[-1].get("facility"),
-                       left_blocks=[_left(b) for b in blocks])
-    try:
-        return await stop_mep(scratch)
-    finally:
-        await _close(scratch)
 
 
 async def _close(scratch: AppCtx) -> None:

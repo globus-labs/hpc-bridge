@@ -803,6 +803,14 @@ def _earlier_beside_note(blocks: list[EarlierBlock]) -> str:
             "endpoint, both included. ")
 
 
+def _earlier_handoff_note(blocks: list[EarlierBlock]) -> str:
+    """export_handoff, while an earlier server's block still bills on the endpoint."""
+    jobs = [j for b in blocks for j in b.job_ids]
+    which = f"block job {jobs[0]} still bills" if len(jobs) == 1 else f"block jobs {', '.join(jobs)} still bill"
+    return (f"An earlier hpc-bridge session's {which} on this endpoint, beside the block this handoff's billed canary "
+            "starts: stop_endpoint cancels every block of this endpoint (say it to the user with these terms). ")
+
+
 def _earlier_released_note(jobs: list[str]) -> str:
     return (f" Job {jobs[0]} was the block an earlier hpc-bridge session had left running." if len(jobs) == 1 else
             f" Jobs {', '.join(jobs)} were blocks an earlier hpc-bridge session had left running.")
@@ -816,11 +824,19 @@ def _earlier_what(blocks: list[EarlierBlock]) -> str:
         ", which an earlier hpc-bridge session started"
 
 
-def _earlier_cold_lead(blocks: list[EarlierBlock], facility: str | None, eid: str) -> str:
-    """A stop with no endpoint bound reached a recorded one: what it found on record, then that stop's own answer."""
+def _earlier_cold_lead(blocks: list[EarlierBlock], facility: str | None, eid: str, *, reached: bool | None) -> str:
+    """A stop with no endpoint bound went to a recorded one: what it found on record, and what happened — it reached
+    that endpoint (`reached`), it tried and could not (False: the answer after it says why), or (None) a facility
+    endpoint, where nothing can be cancelled — then that stop's own answer."""
     where = f"{facility!r} (endpoint {eid})" if facility else f"endpoint {eid}"
+    if reached is None:
+        how = "this is a facility endpoint, where hpc-bridge has no cancel channel: "
+    elif reached:
+        how = "this stop reached that endpoint over its login endpoint (AMQP, no SSH): "
+    else:
+        how = "this stop tried to reach that endpoint over its login endpoint (AMQP, no SSH): "
     return (f"No endpoint was bound in this session; hpc-bridge's record names {_earlier_what(blocks)} on {where}, so "
-            "this stop reached that endpoint over the login endpoint (AMQP, no SSH): ")
+            + how)
 
 
 def _earlier_user_cancel(blocks: list[EarlierBlock], scheduler: str | None, host: str | None) -> str:
@@ -835,21 +851,32 @@ def _earlier_user_cancel(blocks: list[EarlierBlock], scheduler: str | None, host
 
 def _earlier_unreachable(blocks: list[EarlierBlock], facility: str | None, eid: str, host: str | None,
                          why: str) -> str:
+    """A recorded block a stop with nothing bound could not reach: named as recorded, not reachable from here, why,
+    how to reach it, and the user's own cancel. It stays on record until its walltime (and queue allowance) has passed
+    (`earlier._latest_end`): bounded, and never dropped unseen."""
     sched = next((b.scheduler for b in blocks if b.scheduler), None)
     where = f"{facility!r} (endpoint {eid})" if facility else f"endpoint {eid}"
     again = f"connect_facility({facility!r})" if facility else "connect_facility to its facility"
     login = " (it asks for the login)" if "Globus login" in why else ""
-    return (f"Spend is NOT confirmed stopped: hpc-bridge's record names {_earlier_what(blocks)} on {where}, and {why}. "
-            f"{again}{login}, then stop_endpoint, releases it." + _earlier_user_cancel(blocks, sched, host))
+    return (f"Spend is NOT confirmed stopped: hpc-bridge's record names {_earlier_what(blocks)} on {where} — recorded, "
+            f"not reachable from here: {why}. {again}{login}, then stop_endpoint, releases it."
+            + _earlier_user_cancel(blocks, sched, host))
 
 
-def _earlier_live_stop(blocks: list[EarlierBlock]) -> str:
-    owner = blocks[0].owner if blocks else "another process"
+def _earlier_live_stop(blocks: list[EarlierBlock], *, here: bool = True) -> str:
+    """A recorded block a cold stop leaves alone: another server of this host that still runs holds it (`here`), or a
+    server of another host (or another pid namespace sharing the state directory) whose state cannot be read here."""
     jobs = [b.job for b in blocks if b.job]
     what = (f"block job {', '.join(jobs)}" if jobs else "a block request") + f" on endpoint {blocks[0].endpoint_id}"
-    return (f"Spend is NOT confirmed stopped: {what} belongs to another hpc-bridge session that is still running "
-            f"({owner}); this stop leaves another session's work alone — that session's stop_endpoint releases it (or "
-            "end that session, then call stop_endpoint here).")
+    if here:
+        whose = (f"belongs to another hpc-bridge session that is still running ({blocks[0].owner}); this stop leaves "
+                 "another session's work alone — that session's stop_endpoint releases it (or end that session, then "
+                 "call stop_endpoint here)")
+    else:
+        whose = (f"was started by an hpc-bridge server on another host ({blocks[0].owner_host or 'unknown'}), or in "
+                 "another process namespace sharing this state directory: whether it still runs cannot be told from "
+                 "here, so this stop leaves it alone — that session's stop_endpoint releases it")
+    return f"Spend is NOT confirmed stopped: {what} {whose}."
 
 
 def _earlier_unread_stop(problem: str) -> str:

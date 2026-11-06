@@ -86,3 +86,4 @@ def _no_startup_pin_leaks(monkeypatch):
 
     monkeypatch.setattr(binding, "_PINNED", {})
     monkeypatch.setattr(binding, "_PINNED_ORIGIN", {})
+    monkeypatch.setattr(binding, "_PINNED_ENTRY", {})
