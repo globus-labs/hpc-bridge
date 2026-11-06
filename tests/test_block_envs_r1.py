@@ -199,9 +199,9 @@ async def _batch_with_a_purged_env(tmp_path):
     """A batch of two rows on the session's built env; row 0 comes back refused (`gone`: its env purged from its root),
     row 1 done. Returns (app, runner, batch id, finish_builds)."""
     from hpc_bridge import batch, envs
-    from tests.test_batch_sizing import _app_with, _report
+    from tests.test_batch_sizing import _app_with, _measure, _report
 
-    app, _rt, runner = _app_with(None)
+    app, _rt, runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
 
     def finish_builds(**extra):
@@ -437,9 +437,9 @@ async def test_s7_a_runner_made_for_another_config_is_closed_and_replaced(tmp_pa
 
 async def test_s3_a_restarted_server_on_another_python_rebuilds_the_env_its_rows_activate(tmp_path, monkeypatch):
     from hpc_bridge import batch, envs
-    from tests.test_batch_sizing import _app_with, _report
+    from tests.test_batch_sizing import _app_with, _measure, _report
 
-    app, _rt, runner = _app_with(None)
+    app, _rt, runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
 
     def finish_builds():
@@ -471,9 +471,9 @@ async def test_s3_a_restarted_server_on_another_python_rebuilds_the_env_its_rows
 
 def test_s3_a_record_whose_text_does_not_make_its_key_is_never_rebuilt_under_it(tmp_path):
     from hpc_bridge import envs
-    from tests.test_batch_sizing import _app_with
+    from tests.test_batch_sizing import _app_with, _measure
 
-    app, _rt, _runner = _app_with(None)
+    app, _rt, _runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
     rec = {"kind": "built", "how": "login", "key": "0" * 16, "requirements": REQS.strip(), "python_asked": PY,
            "root": str(tmp_path / "scratch" / "envs")}
@@ -1031,9 +1031,9 @@ def test_u3_redact_keeps_everything_but_the_userinfo():
 
 def test_u3_a_redacted_record_is_rebuilt_only_by_the_server_that_holds_its_text(tmp_path):
     from hpc_bridge import envs
-    from tests.test_batch_sizing import _app_with
+    from tests.test_batch_sizing import _app_with, _measure
 
-    app, _rt, _runner = _app_with(None)
+    app, _rt, _runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
     spec = envs.parse({"requirements": "-i https://u:p@h.org/simple\nsix==1.17.0"})
     rec = envs.record(app, spec)

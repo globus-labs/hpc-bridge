@@ -665,8 +665,9 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
     lines = ["#!/bin/bash"]
     if sched == "pbs":
         sel = f"{spec.nodes}:ncpus={spec.cores or 1}"
-        if spec.memory_gb and spec.whole_node is False:
-            sel += f":mem={math.ceil(spec.memory_gb)}gb"
+        if spec.memory_gb and spec.whole_node is False:   # a fraction as the MB it is (review G4)
+            sel += (f":mem={int(spec.memory_gb)}gb" if float(spec.memory_gb).is_integer()
+                    else f":mem={resources.mem_mb(spec.memory_gb)}mb")
         if spec.gpus:
             sel += f":ngpus={spec.gpus}"
         lines += [f"#PBS -N hpcb-{job_id}", f"#PBS -l select={sel}", f"#PBS -l walltime={_hms(spec.walltime_s)}"]
@@ -691,8 +692,9 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
             lines.append("#SBATCH --exclusive")
         else:
             lines += ["#SBATCH --ntasks-per-node=1", f"#SBATCH --cpus-per-task={spec.cores or 1}"]
-            if spec.memory_gb:
-                lines.append(f"#SBATCH --mem={math.ceil(spec.memory_gb)}G")
+            if spec.memory_gb:   # a fraction as the MB it is (review G4: 1.5 GB had asked for 2)
+                lines.append(f"#SBATCH --mem={int(spec.memory_gb)}G" if float(spec.memory_gb).is_integer()
+                             else f"#SBATCH --mem={resources.mem_mb(spec.memory_gb)}M")
         if spec.gpus:
             lines.append(f"#SBATCH --gres=gpu:{spec.gpus}")
         if spec.array:
@@ -707,11 +709,15 @@ def job_script(app: AppCtx, *, job_id: str, envelope_id: str, spec: Spec, deadli
     ]
     if spec.array:
         lines.append(f'{batch.FIELD_VAR}index="$__hpcb_task"; export {batch.FIELD_VAR}index')
+    scrub = session_shell.ENDPOINT_VENV_SCRUB.rstrip("\n").split("\n")
     lines += [
+        "# hpc-bridge's own endpoint venv is never the job's (session_shell.ENDPOINT_VENV_SCRUB)",
+        *scrub,
         "# the session's cwd and env as they were when the job was submitted (copied beside it then, read-only)",
         'if [ -f "$__hpcb_dir/session.cwd" ]; then cd "$(cat "$__hpcb_dir/session.cwd")" 2>/dev/null '
         '|| cd "$__hpcb_dir"; else cd "$__hpcb_dir"; fi',
         '[ -f "$__hpcb_dir/session.env" ] && . "$__hpcb_dir/session.env"',
+        *scrub,
     ]
     if spec.env_rec:   # block environments: the job's env, frozen in the script (so in its hash); refused: exit 88
         # its refusal writes the job's own mark beside the script, carrying the job's nonce (made from its record's
@@ -1419,6 +1425,8 @@ async def _env_refusal_of(app: AppCtx, row: dict[str, Any]) -> str:
         return ""
     env_mod.believe_refusal(app, env_mod._known_of(app, rec), ref.why)
     _ledger(app).update_job(row["id"], reason=f"its env refused it on its node ({ref.why}): it ran nothing")
+    if (nomodule := env_mod.module_words(ref.detail, rec.get("line"))):
+        said += f" Its line: {nomodule}."
     return said
 
 

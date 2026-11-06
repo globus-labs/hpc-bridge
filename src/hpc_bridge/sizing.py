@@ -15,9 +15,13 @@ no block yet, the block is DERIVED from them before the spend question (`derive_
   N·g GPUs, W = N + 1 workers, one node.
 - **The pilot** (`pilot_proposal`): seff's pattern — cores ⌈CPU-s ÷ wall − 0.1⌉, memory 1.25 × the peak RSS rounded
   up to a quarter GB.
-- **Memory sampling** (the wrapper, hpc_bridge.batch): the row's process-group RSS is sampled once a second, so a spike
-  shorter than that can still meet the site's own OOM killer first (a cgroup's — which may take a neighbour —, Slurm's
-  OverMemoryKill, PBS's `$enforce mem`); each result carries the block cgroup's `oom_kill` delta over the row's life.
+- **Memory sampling** (the wrapper, hpc_bridge.batch): the row's memory is sampled once a second — every 0.2 s while the
+  row is young (its first 2 s) or growing fast toward its limit (the Anvil live test, F2) — so a burst within one
+  sample can still pass its limit, and meet the site's own OOM killer first (a cgroup's — which may take a neighbour
+  —, Slurm's OverMemoryKill, PBS's `$enforce mem`); each result carries the block cgroup's `oom_kill` delta over the
+  row's life.
+- **Over its size** (`over_size`): a pinned row is over its cores only on evidence — runnable threads above its cores
+  in most samples (`oversubscribed`) — never on its thread count.
 """
 from __future__ import annotations
 
@@ -40,6 +44,8 @@ WORKER_MB = 100             # one parsl worker process, idle
 DEFAULT_ROW_MB = 1024       # a derived row's memory when neither the call nor the partition says one
 PILOT_TOLERANCE = 0.1       # ⌈CPU-s ÷ wall − this⌉: a pilot that used 2.05 CPUs asks for 2
 OVER_CPU = 1.25             # an unpinned row over cores × this is flagged over its size
+OVER_SHARE = 0.5            # a pinned row: runnable threads above its cores in at least this share of the samples…
+OVER_MIN_SAMPLES = 3        # …of at least this many (`oversubscribed`)
 NEAR_MEMORY = 0.9           # a row whose peak reached this share of its limit is flagged
 KILLED = frozenset({"memory", "timeout", "cancelled"})   # a row's `why` when it was killed before its end
 QUARTER_MB = 256
@@ -568,14 +574,29 @@ def pilot_proposal(evidence: Iterable[Mapping[str, Any]], measure: BlockMeasure,
     return Proposal(cores=cores, memory_gb=mem, gpus=gpus, concurrency=f.slots, evidence=rows)
 
 
+def oversubscribed(r_over: int | None, r_samples: int | None) -> bool:
+    """A pinned row's evidence of oversubscription (the Anvil live test, F1): more RUNNABLE threads than its cores in at
+    least OVER_SHARE of the watcher's samples, over at least OVER_MIN_SAMPLES of them. A runnable thread (state R) is
+    running or waiting for a CPU: a pinned row's runnable threads beyond its cores queue for its CPUs. More than half
+    its life so is "sustained" — a fork, a pool starting, a garbage collector waking, the row's own exit, are bursts;
+    fewer than three samples (a row of a few seconds) is no evidence either way."""
+    if r_over is None or not r_samples or r_samples < OVER_MIN_SAMPLES:
+        return False
+    return r_over / r_samples >= OVER_SHARE
+
+
 def over_size(*, cores: int | None, memory_mb: int | None, pinned: bool, cpu_s: float | None, wall_s: float | None,
-              threads: int | None, peak_rss_kb: int | None, why: str | None) -> list[str]:
-    """What a settled row ran over: `cores` (unpinned: CPU-s ÷ wall past cores × OVER_CPU; pinned, which cannot show
-    that: more threads than cores) and `memory` (killed at its limit, or a peak within NEAR_MEMORY of it)."""
+              threads: int | None, peak_rss_kb: int | None, why: str | None, r_over: int | None = None,
+              r_samples: int | None = None) -> list[str]:
+    """What a settled row ran over: `cores` — unpinned, CPU-s ÷ wall past cores × OVER_CPU; pinned (which caps its
+    CPU-s at its cores), runnable threads above its cores in most of the watcher's samples (`oversubscribed`), never
+    its thread count: idle threads (its shell, `timeout`, a sleeping interpreter) count there (the Anvil live test, F1)
+    — and `memory` (killed at its limit, or a peak within NEAR_MEMORY of it). `threads` is kept for what it reports;
+    it judges nothing."""
     out = []
     k = cores or 1
     if (not pinned and cpu_s is not None and wall_s and cpu_s / wall_s > k * OVER_CPU) or \
-            (pinned and threads is not None and threads > k):
+            (pinned and oversubscribed(r_over, r_samples)):
         out.append("cores")
     if why == "memory" or (memory_mb and peak_rss_kb is not None and peak_rss_kb / 1024 >= NEAR_MEMORY * memory_mb):
         out.append("memory")

@@ -6,6 +6,14 @@
 > - **PR 3 (on PR 2, batch row sizing): built and reviewed (two rounds) 2026-11-05; both live cells pass on the fake cluster.** It covers existing envs everywhere, facility endpoints included, and built envs on an endpoint hpc-bridge stood up over SSH. A built env is made on the login node (free) and activated per command, row and job. Module [[envs]].
 > - **PR 4 (branch `feat/block-envs-mep`):** building on a facility endpoint. It comes after a live check; its open items are below.
 
+## The Anvil live test (2026-11-05, on PR 3's head `822347c`)
+
+Fixed test-first on `fix/anvil-live-findings` (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests under bash 3.2 and 5.2):
+- **F5, `module` in a facility worker's shell.** On Anvil's multi-user endpoint `env={"activate": "module load anaconda/2025.12-py313"}` was refused — `module: command not found`, rc 127 — while `. /etc/profile.d/modules.sh; module load …` worked: a worker runs a non-login shell where no module system is initialised. A line that uses `module` or `ml`, where neither is defined, now sources the first module init there is first ([[envs]] `MODULE_INITS`); one that still finds none is refused saying the worker shell has no module system initialised and naming the init line to add (`module_words`). The SSH endpoint's plain line worked and is unchanged (`module` is defined there: nothing sourced).
+- **F4, the endpoint venv in user commands.** A command saw `VIRTUAL_ENV` (and its `bin` first on PATH) naming hpc-bridge's own endpoint venv, so `uv pip install` / `pip install` could write into the venv the worker runs from (proven with a stub uv honouring VIRTUAL_ENV). Session commands, batch rows, job scripts and the env checks now run without it ([[session_shell]] `ENDPOINT_VENV_SCRUB`); a built env sets its own over it; a user's own venv is kept.
+- **G1.** A pending env whose build fails after the call that asked for it is now a structured `env_failed` (EnvInfo: its key, name and error) on the answer that first reports it — ensure_endpoint_up's, run_shell's, run_batch's or submit_job's (review round 1: the last two had dropped it) — beside the session's unchanged `env`.
+- **Review round 1:** `module`/`ml` count only as a command word; the module init runs under the line's EXIT trap (an init that calls `exit` refuses); the login node's check carries the no-module-system hint; the endpoint venv's scrub drops every hpc-bridge venv's bin from PATH, an older keyed one included.
+
 ## Review round 2 (2026-11-05, on `8e63a6d`)
 
 Round 1 checked out: both live cells passed on the fake cluster, `env_ssh_switch` included once L1 was fixed. Round 2 found 20 more defects, R2-S1..S11 on the server and R2-N1..N9 on the node, and the coordinator ruled on 15 suspicions (SS2..SS7, NS2..NS9). All are fixed as ruled; the tests are in `tests/test_block_envs_r2.py`.

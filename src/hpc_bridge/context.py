@@ -499,6 +499,7 @@ class AppCtx:
     env_seq: int = 0   # each `choose` of an env: one that waited while a later one ran applies nothing (review R2-S6)
     env_pending: Any = None
     env_note: str | None = None
+    env_failed: Any = None   # the pending env whose build failed, for the answer that says so (`env_failed`, once)
     env_known: dict[str, Any] = field(default_factory=dict)
     env_said_install: bool = False
     env_runner: Any = None
@@ -550,6 +551,12 @@ class AppCtx:
     ledger: Any = None
     batch_owner: Any = None
     batch_autoloop: bool = True
+    # every block derived from a batch's rows whose terms an answer of THIS process quoted (`batch._quote_key`: the
+    # facility, endpoint, partition, account and size): a yes starts a derived block only when it is one of them — a new
+    # sized batch's (review round 2) and a resumed one's (round 1): one call had started a block no answer had shown.
+    # Cleared by a re-bind or a teardown (`warmth._drop_all_shapes`) and by any switch of the terms (`warmth._repoint`):
+    # a quote is for the terms it showed (round 3); a stop keeps them, as it keeps `compute_choice`
+    batch_quoted: set[Any] = field(default_factory=set)
     # Batch phase 2a (hpc_bridge.jobs): this server's session — minted once per server lifespan, it is what an envelope
     # belongs to (a later session, a restarted server included, asks again); and the Jobs-mode meter's last reading.
     session_token: str = field(default_factory=lambda: secrets.token_hex(8))

@@ -60,6 +60,7 @@ KEY_ARGS = {v: k for k, v in ARG_KEYS.items()}
 DEFAULT_SLICE_CORES = 8        # D3: "a few cores" — and never more than half a node, nor a per-job cap allows
 UNKNOWN_NODE_SLICE_CORES = 4   # the same when the node's core count is not known
 MAX_COUNT = 100_000            # a sanity bound on every count (cores, GB, GPUs, nodes)
+MIN_MEMORY_GB = 1 / 1024       # a memory under a megabyte is refused (no scheduler gives less; the terms said "0 GB")
 
 Channel = Literal["ssh", "mep", "other"]
 
@@ -76,13 +77,20 @@ def requested(cores: Any = None, memory_gb: Any = None, gpus: Any = None, nodes:
     - `whole_node=False` asks for a slice (the partition must give one).
     - `cores` / `memory_gb` without `whole_node` ask for a slice too: an earlier whole_node=True is cleared, so the
       partition decides (a whole-node partition refuses a slice).
-    - `gpus=0` clears a GPU request."""
+    - `gpus=0` clears a GPU request.
+    - `memory_gb` is a number, a fraction included (1.5 GB: review G4), sent in MB where the scheduler takes MB
+      (`slurm_wire`, `pbs_wire`); the other counts are whole."""
     named = {k: v for k, v in (("cores", cores), ("memory_gb", memory_gb), ("gpus", gpus), ("nodes", nodes),
                                ("whole_node", whole_node)) if v is not None}
     for arg, v in named.items():
         if arg == "whole_node":
             if not isinstance(v, bool):
                 return {}, f"invalid whole_node {v!r}: true or false"
+            continue
+        if arg == "memory_gb":   # NaN fails the range too; under a megabyte is no amount (review round 1: "0 GB")
+            if isinstance(v, bool) or not isinstance(v, int | float) or not MIN_MEMORY_GB <= v <= MAX_COUNT:
+                return {}, (f"invalid memory_gb {v!r}: GB, a number above 0 (1.5 is fine; at least 1 MB) and at most "
+                            f"{MAX_COUNT}")
             continue
         if isinstance(v, bool) or not isinstance(v, int):
             return {}, f"invalid {arg} {v!r}: a whole number"
@@ -147,7 +155,9 @@ class Size:
     gpus: int | None = None          # per node: asked, or what the facility's own scheduler_options ask
     proposed: bool = False           # D3: hpc-bridge's default slice of a per-core partition (nothing was asked)
     by_partition: bool = False       # whole nodes because the partition hands out only whole nodes
-    send_mem: int | None = None      # the memory the wire asks for (GB, a whole number), when any
+    # the memory the wire asks for (GB), when any: a whole number goes as GB (parsl's mem_per_node), a fraction as MB
+    # where hpc-bridge's own template sends it (`slurm_wire`, `pbs_wire`) — a facility template's GB key gets whole GB
+    send_mem: float | None = None
     # the wire asks for a slice (no --exclusive; the cores and memory above) that the terms cannot claim: the partition
     # is not known to hand out slices, so its own sharing decides (whole_node None, costed as a whole node)
     wire_slice: bool = False
@@ -171,6 +181,29 @@ def _int(v: Any) -> int | None:
     except (TypeError, ValueError):
         return None
     return n if n > 0 else None
+
+
+def _mem(v: Any) -> float | None:
+    """A block's memory (GB) as the runtime config holds it: a number above 0, a fraction included (review G4)."""
+    if isinstance(v, bool) or v is None:
+        return None
+    try:
+        f = float(v)
+    except (TypeError, ValueError):
+        return None
+    return f if f > 0 and math.isfinite(f) else None
+
+
+def mem_mb(gb: float) -> int:
+    """GB as the scheduler's MB, never less than asked."""
+    return max(1, math.ceil(gb * 1024))
+
+
+def whole_gb(gb: float) -> int:
+    """GB as a template's whole-GB memory key takes it (parsl's mem_per_node): rounded UP, at least 1 — the ONE rule
+    the terms (`effective`, channel "mep") and the facility endpoint's wire (facility/mep.py) share (review round 1:
+    two rules had the terms say 2 GB while 3 were sent)."""
+    return max(1, math.ceil(gb))
 
 
 @dataclass(frozen=True)
@@ -251,7 +284,7 @@ def default_slice_cores(shape: PartitionShape | None, nodes: int = 1) -> int:
     return max(1, cores)
 
 
-def _slice_memory(cores: int, shape: PartitionShape | None) -> tuple[float | None, bool, int | None]:
+def _slice_memory(cores: int, shape: PartitionShape | None) -> tuple[float | None, bool, float | None]:
     """A slice's memory when none was asked: (GB, from the partition's default per core, the GB to send). With
     DefMemPerCPU known the scheduler gives cores × that on its own (nothing is sent: a larger --mem could make a site
     with MaxMemPerCPU charge more cores); else the node's memory per core, sent (a partition with no default per core
@@ -293,7 +326,7 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
       parsl's being the whole node);
     - anything else (local dev): nodes only."""
     nodes = _int(uec.get(NODES)) or 1
-    cores, mem = _int(uec.get(CORES)), _int(uec.get(MEM))
+    cores, mem = _int(uec.get(CORES)), _mem(uec.get(MEM))
     whole = uec.get(WHOLE)
     if channel == "other":
         return Size(nodes=nodes)
@@ -305,10 +338,13 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
         return _whole(nodes, shape, gpus, by_partition=kind == "whole_node", why_whole=why)
     per_core = kind == "per_core"
     gb: float | None
-    send: int | None
+    send: float | None
     if channel == "mep":
         if mem is not None:
-            gb, mem_default, send = float(mem), False, mem
+            # a facility template's memory key takes whole GB (parsl's mem_per_node): a fraction goes rounded UP, and
+            # the terms say what is sent — never less than asked (review G4)
+            send = float(whole_gb(mem))
+            gb, mem_default = send, False
         elif whole is False and per_core and cores and shape is not None and shape.mem_per_core_mb:
             gb, mem_default, send = round(cores * shape.mem_per_core_mb / 1024, 1), True, None
         else:
@@ -324,7 +360,7 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
         if proposed:
             cores = default_slice_cores(shape, nodes)
         if mem is not None:
-            gb, mem_default, send = float(mem), False, mem
+            gb, mem_default, send = mem, False, mem
         elif cores is not None:
             gb, mem_default, send = _slice_memory(cores, shape)
         else:
@@ -393,7 +429,7 @@ def refusal(uec: Mapping[str, Any], shape: PartitionShape | None, *, named: Iter
     named = set(named)
     chosen = named | set(chosen or ())
     nodes = _int(uec.get(NODES)) or 1
-    cores, mem, gpus, whole = _int(uec.get(CORES)), _int(uec.get(MEM)), _int(uec.get(GPUS)), uec.get(WHOLE)
+    cores, mem, gpus, whole = _int(uec.get(CORES)), _mem(uec.get(MEM)), _int(uec.get(GPUS)), uec.get(WHOLE)
     where = f"{word} {shape.name!r}" if shape is not None else f"this {word}"
 
     def arg(key: str) -> str:
@@ -453,13 +489,14 @@ def refusal(uec: Mapping[str, Any], shape: PartitionShape | None, *, named: Iter
 
 # ---- the wire: hpc-bridge's own templates ----------------------------------------------------------------------------
 
-def _merge_select(base: str | None, mem: int | None, gpus: int | None) -> str | None:
-    """A PBS chunk's resources (`select_options`) with the request's memory and GPUs in place of any the profile had."""
+def _merge_select(base: str | None, mem: float | None, gpus: int | None) -> str | None:
+    """A PBS chunk's resources (`select_options`) with the request's memory (GB; a fraction as its MB) and GPUs in
+    place of any the profile had."""
     pairs = [p for p in (base or "").split(":") if p]
     pairs = [p for p in pairs if not (mem is not None and p.startswith("mem=")) and
              not (gpus is not None and p.startswith("ngpus="))]
     if mem is not None:
-        pairs.append(f"mem={mem}gb")
+        pairs.append(f"mem={int(mem)}gb" if float(mem).is_integer() else f"mem={mem_mb(mem)}mb")
     if gpus is not None:
         pairs.append(f"ngpus={gpus}")
     return ":".join(pairs) or None
@@ -481,10 +518,13 @@ def slurm_wire(uec: Mapping[str, Any], size: Size) -> dict[str, Any]:
         out[WHOLE] = False
         if size.cores:
             out[CORES] = size.cores
-        if size.send_mem:
-            out[MEM] = size.send_mem
+        if size.send_mem and float(size.send_mem).is_integer():
+            out[MEM] = int(size.send_mem)
+        elif size.send_mem:   # parsl's mem_per_node takes whole GB: a fraction is asked as the MB it is (review G4)
+            out["scheduler_options"] = _with_line(out.get("scheduler_options"),
+                                                  f"#SBATCH --mem={mem_mb(size.send_mem)}M")
     if asked := _int(uec.get(GPUS)):
-        out["scheduler_options"] = _with_line(uec.get("scheduler_options"), f"#SBATCH --gpus-per-node={asked}")
+        out["scheduler_options"] = _with_line(out.get("scheduler_options"), f"#SBATCH --gpus-per-node={asked}")
     return out
 
 
@@ -605,7 +645,9 @@ def size_words(*, nodes: int | None, whole_node: bool | None, cores: int | None,
 
 
 def _gb(memory_gb: float, memory_default: bool) -> str:
-    gb = f"{memory_gb:.0f} GB" if memory_gb >= 10 else f"{memory_gb:g} GB"
+    # an asked size is said as asked (review G4: 12.5 GB had read "12 GB"); the partition's default per core, an
+    # estimate of what the scheduler gives, is rounded at 10 GB and above
+    gb = f"{memory_gb:.0f} GB" if memory_gb >= 10 and memory_default else f"{memory_gb:g} GB"
     return gb + (" (the partition's default per core)" if memory_default else "")
 
 

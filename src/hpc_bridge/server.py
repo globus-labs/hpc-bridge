@@ -398,7 +398,7 @@ async def _ensure_endpoint_up(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -406,6 +406,7 @@ async def _ensure_endpoint_up(
     recheck: bool = True,
     workers: int | None = None,
     env: Any = None,
+    say_env: bool = True,
 ) -> EndpointStatus:
     """ensure_endpoint_up, with the block as its check measured it from inside once it is up (`measured`, batch row
     sizing), and the session's env (`env`, block environments: hpc_bridge.envs). The env never changes the block's
@@ -476,7 +477,13 @@ async def _ensure_endpoint_up(
         st.env = chosen.info
     elif chosen is None and app.env_pending is not None:
         st.env = envs.pending_info(app)
-    words = " ".join(x for x in (chosen.notice if chosen is not None else "", envs.take_note(app)) if x)
+    # what became of a pending env since the last answer — said, and a failure in its own field — only on an answer
+    # that reaches the agent (`say_env`): run_batch's and submit_job's own ensure-ups leave it for their answers (review
+    # round 1: their answers dropped it, and the rows ran in the old env, unsaid)
+    words = " ".join(x for x in (chosen.notice if chosen is not None else "", envs.take_note(app) if say_env else "")
+                     if x)
+    if say_env:
+        st.env_failed = envs.take_failed(app)
     if words:
         st.notice = f"{words} {st.notice}".strip() if st.notice else words
     if not_looked:
@@ -501,7 +508,7 @@ async def _ensure_up_once(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -927,7 +934,7 @@ async def ensure_endpoint_up(
     confirm_spend: bool = False,
     account: str | None = None,
     cores: int | None = None,
-    memory_gb: int | None = None,
+    memory_gb: float | None = None,
     gpus: int | None = None,
     nodes: int | None = None,
     whole_node: bool | None = None,
@@ -2549,6 +2556,8 @@ async def _run_shell(
         out.phase, out.notice = envs.refused(app, ref, use.act, out.stderr_snippet or "")
     if agent_call and (note := envs.take_note(app)):   # a pending env built (or not) since the last answer: said once
         out.notice = f"{out.notice} {note}" if out.notice else note
+    if agent_call:
+        out.env_failed = envs.take_failed(app)   # …and a failed one in its own field too (review G1)
     if shared:
         out.notice = f"{out.notice} {shared}" if out.notice else shared
     return out
@@ -2752,8 +2761,9 @@ batch.login_busy = lambda app: _busy_session(app, "login", _INTERNAL_SESSION)   
 async def _batch_ensure_up(app: AppCtx, confirm_spend: bool, size: Any = None) -> EndpointStatus:
     # a check that passed within the canary TTL stands (`recheck`): run_batch right after ensure_endpoint_up said `up`
     # sent a second one, which under load outlived the canary wait and voided a live block's confirmation
+    # (the env's note and a pending env's failure are left for run_batch's own answer: `_run_batch`, review round 1)
     if size is None:
-        return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False)
+        return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, recheck=False, say_env=False)
     # batch row sizing: the block derived from the rows (sizing.DerivedBlock), asked for as ensure_endpoint_up's size —
     # its cores, memory and GPUs per node (or a whole node, where the partition hands out no less), one node — and its
     # workers (slots + 1) where the template takes them
@@ -2766,10 +2776,24 @@ async def _batch_ensure_up(app: AppCtx, confirm_spend: bool, size: Any = None) -
         nodes = 1
     if size.whole_node:
         return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, whole_node=True,
-                                         gpus=size.gpus, nodes=nodes, recheck=False, workers=size.workers)
+                                         gpus=size.gpus, nodes=nodes, recheck=False, workers=size.workers,
+                                         say_env=False)
     return await _ensure_endpoint_up(app, DEFAULT_SHAPE, confirm_spend=confirm_spend, cores=size.cores,
                                      memory_gb=size.memory_gb, gpus=size.gpus, nodes=nodes, recheck=False,
-                                     workers=size.workers)
+                                     workers=size.workers, say_env=False)
+
+
+def _say_env(app: AppCtx, out: Any) -> Any:
+    """A tool's answer that is not ensure_endpoint_up's or run_shell's (run_batch, submit_job): what became of a
+    pending env since the last answer, said in its notice, and a failed one in its `env_failed` (review round 1: the
+    tools' own ensure-ups had taken them, and their answers dropped them)."""
+    note = envs.take_note(app)
+    failed = envs.take_failed(app)
+    if note:
+        out.notice = f"{out.notice} {note}" if out.notice else note
+    if failed is not None:
+        out.env_failed = failed
+    return out
 
 
 async def _run_batch(
@@ -2796,6 +2820,7 @@ async def _run_batch(
                                 shape=shape, idempotent=idempotent, confirm_spend=confirm_spend, batch_id=batch_id,
                                 cores=cores, memory_gb=memory_gb, gpus=gpus, concurrency=concurrency, pin=pin,
                                 pilot=pilot, env=env)
+    _say_env(app, out)
     envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
     return out
 
@@ -2818,7 +2843,7 @@ async def _cancel(app: AppCtx, id: str, mode: str = "drain") -> CancelResult:  #
 
 async def _submit_job(
     app: AppCtx, command: str | None = None, session_id: str = "default", account: str | None = None,
-    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: dict | None = None,
     confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: Any = None,
@@ -2826,15 +2851,17 @@ async def _submit_job(
     if _no_facility_bound(app):
         return JobStatus(phase="refused", reason="no facility connected", notice=_no_facility_notice(app))
     if app.state.endpoint_id is None and _has_login_shape(app):
-        st = await _ensure_endpoint_up(app, "login")   # the free login shape the job is written and sent over
+        # the free login shape the job is written and sent over (the env's note is this tool's answer's: `_say_env`)
+        st = await _ensure_endpoint_up(app, "login", say_env=False)
         if st.status not in ("up", "provisioning") or app.state.endpoint_id is None:
-            return JobStatus(phase="refused", reason="login shape",
-                             notice=f"The login shape is not up ({st.status}): {st.notice or ''}".strip())
+            down = f"The login shape is not up ({st.status}): {st.notice or ''}".strip()
+            return _say_env(app, JobStatus(phase="refused", reason="login shape", notice=down))
     out = await jobmode.submit_job(
         app, command=command, session_id=session_id, account=account, partition=partition, nodes=nodes, cores=cores,
         memory_gb=memory_gb, gpus=gpus, whole_node=whole_node, walltime=walltime, array=array,
         depends_on=depends_on, adopt=adopt, envelope=envelope, confirm_spend=confirm_spend,
         exclude_jobs=exclude_jobs, env=env)
+    _say_env(app, out)
     envs.mark_said(app, out.notice)   # the install warning: said once, by the answer that carries it (R2-S10)
     return out
 
@@ -2854,14 +2881,17 @@ async def run_batch(
     SIZE THE ROWS the sbatch way, per row as submit_job's array tasks: `cores` (CPUs per row, as -c counts them),
     `memory_gb` (per row; a row past it is killed: why "memory"), `gpus` (per row, each its own) and `concurrency` (at
     most this many at once, as --array=…%N). With NO block confirmed yet the block is DERIVED from them (concurrency ×
-    the row + one CPU and one worker for your interactive commands) and the spend question names it; with no size it
+    the row + one CPU and one worker for your interactive commands) and the spend question names it: the sized call
+    quotes it (nothing starts), and the same call with confirm_spend=True — the user's yes to THOSE terms — starts it;
+    a yes for a derived block no answer has shown yet is answered with its terms, never started. With no size it
     answers phase="needs_sizing" with `facts` (the block's or the partition's CPUs, memory, GPUs and how many rows each
     size fits) — ask the user in those terms. On a confirmed block the size is checked against what the block measured
     (a row that cannot fit is refused with the numbers; too many at once is capped and said); a CPU block with no size
     given runs 1-CPU rows, the block's share of memory each, as many as fit (said in `sizing.defaulted`). Each row is
     pinned to its own CPUs (`pin=False`: not pinned) with OMP/MKL/OPENBLAS/NUMEXPR_NUM_THREADS and PYTHON_CPU_COUNT set
     to its cores. `pilot=1` (or 2): that many rows run alone with the whole block, then phase="needs_sizing" with a
-    `proposal` (cores, memory) from what they used; resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
+    `proposal` (cores, memory) from what they used (a pilot of EVERY row runs to "done", its answer carrying the
+    `proposal` for the next batch); resume with run_batch(batch_id=…, cores=…, memory_gb=…) — a
     resize changes only what it names (memory, unnamed, is the block's share again) and is kept even when the block
     still needs the user's yes (add confirm_spend=True once they give it). Every
     result carries its peak_rss_mb, cpu_s and nproc; status names rows that ran over their size.
@@ -2883,7 +2913,9 @@ async def run_batch(
     Spend: the same floor as ensure_endpoint_up — an unconfirmed block answers phase="needs_confirmation" with `block`
     (nothing recorded); confirm_spend=True confirms ONE block, as there. When the block ends (its walltime, a reap, a
     stop, a server restart) the batch pauses at needs_confirmation with a `reason`; resume it only after the user's yes
-    with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again.
+    with run_batch(batch_id=…, confirm_spend=True). `idempotent=True` lets a row lost with its worker run again; it
+    also decides whether rows killed at the default memory (the block's share, not a size the user chose) run again
+    once the user resizes the batch — without it they stay failed.
     `env` (as ensure_endpoint_up's; omitted: the session's env) is the batch's own: every row runs in it, the session's
     stays the session's, and no new block is asked for; a row whose env is gone from its node runs nothing and waits
     for its rebuild. A batch's env is fixed at its start: env= with batch_id= is refused.
@@ -2900,7 +2932,7 @@ async def run_batch(
 @mcp.tool()
 async def submit_job(
     ctx: Context, command: str | None = None, session_id: str = "default", account: str | None = None,
-    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: int | None = None,
+    partition: str | None = None, nodes: int | None = None, cores: int | None = None, memory_gb: float | None = None,
     gpus: int | None = None, whole_node: bool | None = None, walltime: str | None = None, array: str | None = None,
     depends_on: list[str] | None = None, adopt: str | None = None, envelope: EnvelopeRequest | None = None,
     confirm_spend: bool = False, exclude_jobs: list[str] | None = None, env: EnvRequest | None = None,

@@ -366,6 +366,7 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
     app.compute_choice.clear()  # chosen for this binding: a stop keeps them, a new binding or a teardown does not
+    app.batch_quoted.clear()  # so are the derived blocks its answers quoted (review round 3: a yes after a re-bind)
     # the session's env and what is known of its builds are the binding's too (block environments); a build still out
     # runs on to its end on the facility, and is found there by the next binding's own check (envs.ensure_built)
     app.env_spec = app.env_pending = app.env_note = None
@@ -1823,6 +1824,9 @@ def _repoint(app: AppCtx, shape: str, rt: ShapeRuntime, updates: dict[str, Any])
     # a re-ask's "the size was read again … the block would hold X" names a block this change replaces: the terms
     # after it are the new ones, said as such (review round 2: it was still said after cores=4)
     rt.resized = None
+    # every derived block a batch's answer quoted was quoted on the terms this change replaces: a yes to one is asked
+    # again (review round 3: 65 CPUs quoted on one partition started on another after ensure_endpoint_up moved it)
+    app.batch_quoted.clear()
     uec = rt.user_endpoint_config
     terms = _block_key(app, rt)  # partition, account and what the block holds: what the confirmation covered
     confirmed = _billable(rt) and rt.spend_confirmed
