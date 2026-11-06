@@ -294,10 +294,11 @@ async def test_3_a_cold_stop_reaches_every_recorded_endpoint_and_is_down_only_wh
     entry = _open(EID)[0]["entry"]
     other = "22222222-0000-0000-0000-000000000002"
     led = Ledger.open()
-    here = earlier._me().host   # (a record of another host is never released from here: review round 1)
+    here = earlier._me().host   # a record of this machine (round 3's spec: its id, namespace and hostname)
+    mine = dict(owner_ns=earlier._me_ns(), owner_machine=earlier._machine_id())
     led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
                      partition=None, account=None, walltime_s=None, session="gone", owner_host=here, owner_pid=1,
-                     owner_start=None)
+                     owner_start=None, **mine)
     led.block_up(other, "9", "7")
     s2 = _server(monkeypatch, fac, bound=False)
     log = _scripted_login(monkeypatch, releases=["released 40\n", "released 7\n"])
@@ -310,7 +311,7 @@ async def test_3_a_cold_stop_reaches_every_recorded_endpoint_and_is_down_only_wh
     await _session_1(monkeypatch, fac)
     led.record_block(other, "9", facility="mine", entry=entry, mep=False, scheduler="slurm", uec_hash="h",
                      partition=None, account=None, walltime_s=None, session="gone", owner_host=here, owner_pid=1,
-                     owner_start=None)
+                     owner_start=None, **mine)
     monkeypatch.setenv("HPC_BRIDGE_RELEASE_BACKOFF_S", "0")
     _scripted_login(monkeypatch, releases=["released 40\n", None, None, None])
     st = await _stop_endpoint(_server(monkeypatch, fac, bound=False))

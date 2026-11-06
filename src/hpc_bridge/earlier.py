@@ -31,10 +31,15 @@ from __future__ import annotations
 import asyncio
 import hashlib
 import json
+import os
+import re
+import shutil
+import subprocess
 import sys
 import time
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, replace
+from pathlib import Path
 from typing import Any
 
 from . import binding, config, notices, scheduler_ops
@@ -86,40 +91,39 @@ def _warn(what: str, exc: BaseException) -> None:
 def _me() -> Owner:
     """This process (cached: its start time is read once — `ps` on macOS)."""
     global _OWNER
-    import os
-
     if _OWNER is None or _OWNER.pid != os.getpid():
         _OWNER = Owner.here()
     return _OWNER
 
 
 _MACHINE: str | None = None   # this machine's identity, read once ("" once read and unknown)
+_MACHINE_ID_FILES = ("/etc/machine-id", "/var/lib/dbus/machine-id")
+_IOREG = "/usr/sbin/ioreg"
 
 
 def _read_machine_id() -> str | None:
-    """A STABLE identity of this machine — never its hostname, which a laptop's network changes (review round 2: a
-    macOS hostname with no `scutil HostName` set follows the network, and every record of this machine read as another
-    host's): Linux's /etc/machine-id (or D-Bus's copy), macOS's IOPlatformUUID; None when there is none to read."""
-    import re
-    import subprocess
-    from pathlib import Path
-
-    for path in ("/etc/machine-id", "/var/lib/dbus/machine-id"):
+    """A STABLE identity of this machine — never its hostname, which a laptop's network changes (review round 2):
+    Linux's /etc/machine-id (or D-Bus's copy), macOS's IOPlatformUUID (`ioreg` by its absolute path, else on PATH);
+    None when there is none to read — a container without one, an ioreg that is missing, slow, or unreadable."""
+    for path in _MACHINE_ID_FILES:
         try:
             value = Path(path).read_text().strip()
-        except OSError:
+        except (OSError, ValueError):   # absent, unreadable, or not text
             continue
-        if value:
+        if value and value != "uninitialized":   # (systemd's placeholder before the first boot completes)
             return value
-    if sys.platform == "darwin":
-        try:
-            out = subprocess.run(["ioreg", "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, text=True,
-                                 timeout=5, stdin=subprocess.DEVNULL).stdout
-        except (OSError, subprocess.SubprocessError):
-            return None
-        m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out or "")
-        return m.group(1) if m else None
-    return None
+    if sys.platform != "darwin":
+        return None
+    exe = shutil.which(_IOREG) or shutil.which("ioreg")
+    if exe is None:
+        return None
+    try:
+        out = subprocess.run([exe, "-rd1", "-c", "IOPlatformExpertDevice"], capture_output=True, text=True,
+                             timeout=5, stdin=subprocess.DEVNULL).stdout
+    except (OSError, ValueError, subprocess.SubprocessError):   # missing, undecodable, timed out
+        return None
+    m = re.search(r'"IOPlatformUUID"\s*=\s*"([^"]+)"', out or "")
+    return m.group(1) if m else None
 
 
 def _machine_id() -> str | None:
@@ -133,8 +137,6 @@ def _machine_id() -> str | None:
 def _me_ns() -> str | None:
     """This process's pid namespace (Linux), so a pid of another namespace sharing the state dir (a container) is never
     read here as dead or alive; None where there is none to read (macOS)."""
-    import os
-
     try:
         return os.readlink("/proc/self/ns/pid")
     except OSError:
@@ -288,20 +290,19 @@ def _records(app: AppCtx, eid: str | None = None) -> tuple[list[dict], str | Non
 
 
 def _whose(app: AppCtx, r: dict) -> str:
-    """"mine" (this server's), "live" (another server that still runs here: its own session's), "elsewhere" (a server
-    of another MACHINE — its stable identity known and different —, or of another pid namespace sharing the state dir:
-    whether it runs cannot be told from here, so it is never reused or released; it is still read against the
-    scheduler, and closed when gone), or "earlier" (a server of this machine that is gone). The hostname is never
-    consulted (review round 2: a laptop's network renames it, and round 1's host test hid every record of this machine
-    after a network change); an identity unknown on either side is this machine's, so a record it can verify through
-    the scheduler is verified."""
+    """"mine" (this server's session), "earlier" (a server of THIS machine that is gone: named, reused, released here),
+    "live" (one of this machine that still runs: its own stop releases it), or "elsewhere" (whether it runs cannot be
+    told from here: read through the scheduler where it can be — closed when gone, else named with the user's own
+    cancel — never reused or released here). This machine is: both machine ids known and equal, or — either unknown —
+    the same hostname; AND the same pid namespace, or none on either side. Anything else, one side's namespace alone
+    included, is elsewhere (review round 3: "unknown is this machine" released a live block across a Mac and a Linux
+    container sharing the state dir). The spec, as a table: tests/test_restart_block_record_r3.py,
+    `test_b_the_liveness_spec`."""
     if r.get("session") == app.session_token:
         return "mine"
     theirs, ours = r.get("owner_machine"), _machine_id()
-    if theirs and ours and theirs != ours:
-        return "elsewhere"
-    ns, my_ns = r.get("owner_ns"), _me_ns()
-    if ns is not None and my_ns is not None and ns != my_ns:
+    here = theirs == ours if theirs and ours else str(r.get("owner_host") or "") == _me().host
+    if not here or r.get("owner_ns") != _me_ns():
         return "elsewhere"
     holder = Owner(str(r.get("owner_host") or ""), int(r.get("owner_pid") or 0), r.get("owner_start"))
     try:

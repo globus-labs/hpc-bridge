@@ -71,7 +71,8 @@ def _old_ledger_module():
 def _rec(led: Ledger, eid: str, request: str, *, job: str | None = None, up_at: float | None = None,
          now: float | None = None, **over) -> None:
     kw = dict(facility="byo", entry=None, mep=False, scheduler="slurm", uec_hash="h", partition=None, account=None,
-              walltime_s=None, session="gone", owner_host=earlier._me().host, owner_pid=1, owner_start=None)
+              walltime_s=None, session="gone", owner_host=earlier._me().host, owner_pid=1, owner_start=None,
+              owner_ns=earlier._me_ns(), owner_machine=earlier._machine_id())   # a record of this machine (round 3)
     kw.update(over)
     led.record_block(eid, request, now=now, **kw)
     if job is not None:
