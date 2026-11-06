@@ -59,8 +59,13 @@ VIEW_TTL_S = 60.0
 YOUNG_S = 600.0
 # The scheduler read's own bound: the login worker may be cold, and a connect or a spend question must not hang on it.
 VERIFY_WAIT_S = 30.0
-# A record never seen up is closed after this (a facility endpoint's, which nothing here can read, or a queue lost).
-NO_JOB_MAX_S = 86400.0
+# With no scheduler read to say otherwise (a facility endpoint's record, or an endpoint this process cannot reach), a
+# record is closed only once its block cannot still run: past when it came up plus its walltime, or — never seen up —
+# past when it was asked for plus this queue allowance plus its walltime (a block can wait days in a busy queue; three
+# days is the most hpc-bridge presumes). A walltime not on the record is taken as UNKNOWN_WALLTIME_S. On an SSH endpoint
+# it can read, a scheduler read closes a record whose block is gone long before (`verify`).
+QUEUE_ALLOWANCE_S = 3 * 86400.0
+UNKNOWN_WALLTIME_S = 2 * 86400.0
 # A block past its walltime's end by this much cannot still run (the scheduler's kill grace, a requeue aside).
 WALLTIME_GRACE_S = 120.0
 
@@ -192,9 +197,19 @@ def end_request(app: AppCtx, rt: ShapeRuntime, how: str) -> None:
         _warn("closed", exc)
 
 
+def _latest_end(r: dict) -> float:
+    """The latest a record's block can still run until, with no scheduler read (wall clock): when it came up plus its
+    walltime; never seen up, when it was asked for plus QUEUE_ALLOWANCE_S plus its walltime."""
+    wall = float(r["walltime_s"] or UNKNOWN_WALLTIME_S)
+    if r["up_at"]:
+        return float(r["up_at"]) + wall
+    return float(r["confirmed_at"]) + QUEUE_ALLOWANCE_S + wall
+
+
 def _records(app: AppCtx, eid: str | None = None) -> tuple[list[dict], str | None]:
-    """The open records (of `eid`, or every endpoint), those that cannot still bill closed first: past their walltime,
-    or never seen up for a day. (rows, problem): `problem` says why the record could not be read (fail closed)."""
+    """The open records (of `eid`, or every endpoint), those whose block cannot still run closed first (`_latest_end`;
+    never on a guess shorter than that). (rows, problem): `problem` says why the record could not be read (fail
+    closed)."""
     try:
         led = _ledger(app)
         rows = led.open_blocks(eid)
@@ -204,9 +219,9 @@ def _records(app: AppCtx, eid: str | None = None) -> tuple[list[dict], str | Non
         return [], f"{type(exc).__name__}: {exc}"[:300]
     now, keep = time.time(), []
     for r in rows:
-        end = (r["up_at"] + r["walltime_s"]) if r["up_at"] and r["walltime_s"] else None
-        how = ("walltime" if end is not None and end + WALLTIME_GRACE_S < now else
-               "never up" if r["job"] is None and now - float(r["confirmed_at"]) > NO_JOB_MAX_S else None)
+        how = None
+        if _latest_end(r) + WALLTIME_GRACE_S < now:
+            how = "walltime" if r["up_at"] else "never up"
         if how is None:
             keep.append(r)
             continue

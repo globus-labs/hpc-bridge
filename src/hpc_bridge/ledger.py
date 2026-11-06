@@ -1150,13 +1150,18 @@ class Ledger:
         the block request (`hpcb_block`, else the config's hash), how to reach the endpoint again (the facility id and
         the catalog entry it was bound from), its terms and the server that asked. The same request asked again (a
         later server reusing the block, a facility endpoint's same config) takes the record over: its job and when it
-        came up stay, the owner and terms are the new confirmation's, and it is open again."""
+        came up stay while the record is OPEN (the block a later server takes over is that block); a record that had
+        ended is a new block's — its job and age go (review round 1: a facility endpoint's `cfg:` record re-opened with
+        the ended block's job and its age, and was closed as past its walltime before the new block answered). The
+        owner and terms are the new confirmation's, and it is open again."""
         at = time.time() if now is None else now
         with self._tx() as c:
             c.execute(
                 "insert into block (endpoint_id, request, facility, entry, mep, scheduler, uec_hash, partition, "
                 "account, walltime_s, confirmed_at, session, owner_host, owner_pid, owner_start) "
                 "values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) on conflict (endpoint_id, request) do update set "
+                "job = case when block.ended_at is null then block.job else null end, "
+                "up_at = case when block.ended_at is null then block.up_at else null end, "
                 "facility = excluded.facility, entry = coalesce(excluded.entry, block.entry), mep = excluded.mep, "
                 "scheduler = coalesce(excluded.scheduler, block.scheduler), uec_hash = excluded.uec_hash, "
                 "partition = excluded.partition, account = excluded.account, walltime_s = excluded.walltime_s, "
