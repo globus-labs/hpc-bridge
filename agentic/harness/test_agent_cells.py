@@ -1140,6 +1140,130 @@ def test_a_probe_venv_is_diagnosis_and_a_venv_the_user_s_work_ran_in_is_not():
     assert all(p.startswith("/tmp/") for p in made)  # noqa: S108 - path strings only
 
 
+# H7 — the agent measures one row ITSELF (a one-row pilot, which ends `done` with no proposal of hpc-bridge's) and puts
+# its own sizes: batch_pilot_agreed, hermes21, bundle 1793933230-14840 — calls 8–10 and 15–16, and turn 1's words
+
+PB = "batch-ec69a6bd168b"
+HERMES_PILOT_TURN_1 = (
+    "Pilot done. I ran s1 alone on the whole node (block job 6, partition `main`, 1 node) to measure it — s1 finished "
+    "fine and its output is `simulated s1 e8bc163c82`.\n\nWhat one run uses (measured):\n- ~12 CPU-seconds over ~6 s "
+    "wall → about **2 cores**\n- Peak memory ~208 MB → **~0.3 GB**, I'd round to 0.5 GB with headroom\n- Wall per "
+    "run: ~6 s (well under a minute)\n\nMy proposal for the remaining s2–s4 on this same block (4 cores, 3.9 GB "
+    "total):\n- **2 cores per run, 0.5 GB memory per run, concurrency 2** — two runs at a time, s4 as the first "
+    "finishes. All three should be done in well under a minute.\n\n(The pilot already gave me s1's result, so only "
+    "s2, s3, s4 remain. Want me to go ahead with that sizing, or would you rather run them one-at-a-time at a "
+    "different size?)")
+S1_ROW = {"index": 0, "state": "done", "attempt": 1, "row": {"s": "s1"}, "exit_code": 0,
+          "tail": "simulated s1 e8bc163c82\n", "job_id": "6", "host": "c1", "peak_rss_mb": 207.9, "cpu_s": 12.025,
+          "wall_s": 6.095, "nproc": 4, "pinned": True, "over_size": []}
+REST = [{"sample": "s2"}, {"sample": "s3"}, {"sample": "s4"}]
+
+
+def _hermes_pilot(*, page=True, rest_phase=2, memory_gb=0.5, words=HERMES_PILOT_TURN_1):
+    pilot = C("run_batch", {"command": "bash ~/hpcb-agent-work/simulate.sh {s}", "pilot": 1, "rows": [{"s": "s1"}],
+                            "shape": "compute", "task_walltime_s": 120},
+              {"kind": "batch", "batch_id": PB, "phase": "admitting", "tasks": 1, "results": [], "proposal": None})
+    waited = C("status", {"id": PB, "wait_s": 60}, {"batch_id": PB, "phase": "done", "counts": {"done": 1},
+                                                    "results": [], "proposal": None})
+    paged = C("status", {"detail": "page", "id": PB}, {"batch_id": PB, "phase": "done", "counts": {"done": 1},
+                                                       "results": [S1_ROW], "proposal": None})
+    rest = {"command": "bash ~/hpcb-agent-work/simulate.sh {sample}", "confirm_spend": True, "cores": 2,
+            "memory_gb": memory_gb, "rows": REST, "shape": "compute", "task_walltime_s": 120}
+    refused = C("run_batch", {**rest, "concurrency": 2}, {"phase": "refused", "reason": "2 rows × 2 CPUs + 1 for "
+                                                          "interactive commands = 5 CPUs; a node of 'main' has 4"},
+                phase=rest_phase)
+    ran = C("run_batch", {**rest, "concurrency": 1}, {"batch_id": "batch-f4b0a1b2ffdc", "phase": "waiting",
+                                                      "proposal": None}, phase=rest_phase)
+    first = [connect(0), connect(1), C("ensure_endpoint_up", {"confirm_spend": True, "shape": "compute"},
+                                       {"status": "provisioning", "block_job_id": "6"}), pilot, waited]
+    first += [paged] if page else []
+    turn_2 = [connect(2), C("status", {"active_only": True}, {"batches": []}, phase=2)]
+    if rest_phase == 1:
+        return T(*first, refused, ran, say(1, words), *turn_2, stop(2))
+    return T(*first, say(1, words), *turn_2, refused, ran, stop(2))
+
+
+def test_an_agent_that_measured_a_row_itself_and_put_its_sizes_has_relayed_a_proposal():
+    sim = importlib.import_module("batch_pilot_agreed").SIM
+    t = _hermes_pilot()
+    assert ac.own_measurement(t)[0] == 5                         # the page that showed s1's usage, not the bare wait
+    assert ac.decide(ac.prefix(t, 2), sim) == ("proposal", sim.agree)   # the agreement, not "I don't know"
+    assert "I asked you to measure one" not in ac.compose(ac.prefix(t, 2), sim, "TASK")
+    assert ak.pilot_used(t).ok
+    r = ak.proposal_relayed(t, sim)
+    assert r.ok and "measured a row itself at call 5" in r.detail and "2 cores per run" in r.detail, r.detail
+    r = ak.resize_after_agreement(t, sim)                         # call 8 (refused at concurrency 2) carried 2 / 0.5
+    assert r.ok and "call 8" in r.detail, r.detail
+    # hpc-bridge's own proposal is graded as before: a seeded or a pilot pause still wins (test_pilot_proposal_…)
+    assert ak.proposal_relayed(_pilot_run(), sim).ok
+
+
+def test_an_agent_that_never_measured_or_ran_the_rest_unasked_still_fails():
+    sim = importlib.import_module("batch_pilot_agreed").SIM
+    # never saw the row's usage (no page): no measurement — the premise is not met, and its sizes are its own guess
+    blind = _hermes_pilot(page=False)
+    assert ac.own_measurement(blind) is None
+    assert ac.decide(ac.prefix(blind, 2), sim) == ("sizes", sim.sizes)
+    for g in (ak.proposal_relayed, ak.resize_after_agreement):
+        r = g(blind, sim)
+        assert not r.ok and "premise not met" in r.detail and "measured no row itself" in r.detail, r.detail
+    # measured, then ran the rest in the same turn: nothing was put to the user first
+    unasked = _hermes_pilot(rest_phase=1)
+    r = ak.proposal_relayed(unasked, sim)
+    assert not r.ok and "sized rows before asking at call(s) [6, 7]" in r.detail, r.detail
+    r = ak.resize_after_agreement(unasked, sim)
+    assert not r.ok and "before the user agreed" in r.detail, r.detail
+    # measured and agreed, then ran at a memory it never proposed
+    r = ak.resize_after_agreement(_hermes_pilot(memory_gb=1.0), sim)
+    assert not r.ok and "memory_gb 1.0, not a memory the agent proposed" in r.detail, r.detail
+    # measured, but never put a size from it: no proposal relayed, the user only says go ahead
+    quiet = _hermes_pilot(words="Pilot done: s1 is `simulated s1 e8bc163c82`. Shall I run the rest?")
+    assert ac.decide(ac.prefix(quiet, 2), sim)[0] == "go_ahead"
+    r = ak.proposal_relayed(quiet, sim)
+    assert not r.ok and "never put sizes from it" in r.detail, r.detail
+    # a user who did not ask for a measurement (no `agrees_to_own_measure`) answers the agent's own sizes as before
+    assert ac.decide(ac.prefix(_hermes_pilot(), 2), WORDS_SIM) == ("sizes", "NOT THOSE: SIZES")
+
+
+# H6 — the version-LISTING probe: `pip install <pkg>==` (an empty version) fails and prints the versions there are
+
+HERMES_CALL_7 = "pip index versions tomli 2>/dev/null || python3 -m pip install tomli== 2>&1 | head -5"  # bundle
+# 1793934227-18086 (env_unbuildable_asks, hermes21), as sent: then it asked the user with options, ran nothing
+LISTINGS = [HERMES_CALL_7, "pip install tomli==", "pip3 install 'tomli==' 'packaging=='", "uv pip install tomli==",
+            "python3 -m pip install tomli== > /tmp/versions.txt 2>&1", "bash -c 'pip install tomli=='",
+            "uv pip install --python /usr/bin/python3 tomli[extra]=="]
+NOT_INSTALLS = ["pip index versions tomli", "pip3 index versions tomli 2>&1 | head", "pip download tomli==99.0.0",
+                "python3 -m pip download --no-deps tomli", "pip download -d /tmp/dl tomli==2.0.1"]
+
+
+@pytest.mark.parametrize("cmd", LISTINGS + NOT_INSTALLS)
+def test_listing_the_versions_indexing_and_downloading_are_no_install(cmd):
+    assert ak.install_in(cmd) is None, cmd
+    r = ak.no_manual_install(_shells(cmd), user_line=ac.PKG_CODE, pkg=ac.PKG)
+    assert r.ok, (cmd, r.detail)
+    assert ("installs nothing: call(s) [2]" in r.detail) == (cmd in LISTINGS), r.detail     # the listing is named
+
+
+@pytest.mark.parametrize("cmd", ["pip install tomli== packaging", "pip install -r requirements.txt tomli==",
+                                 "pip install -e . tomli==", "uv pip install tomli== tomli==2.0.1",
+                                 "pip install tomli==2.0.1 2>&1 | tail -3", "python3 -m pip install tomli == 2"])
+def test_a_listing_with_a_real_requirement_beside_it_still_installs(cmd):
+    r = ak.no_manual_install(_shells(cmd), user_line=ac.PKG_CODE, pkg=ac.PKG)
+    assert not r.ok and "installs into" in r.detail, (cmd, r.detail)
+
+
+def test_the_hermes_retry_s_listing_passes_and_the_rest_of_its_run_grades_as_it_did():
+    look = C("run_shell", {"command": HERMES_CALL_7, "shape": "login"}, {"phase": "complete", "stdout": (
+        "ERROR: Could not find a version that satisfies the requirement tomli== (from versions: 0.2.0, 1.0.0, 2.0.1, "
+        "2.5.0)\n")})
+    t = T(connect(0), connect(1), _ask_env(1, "tomli==99.0.0", state="failed", key="badbadbadbadbad0"), look,
+          say(1, "tomli 99.0.0 does not exist on PyPI. Which do you want: 2.5.0, another index, or something else?"),
+          connect(2), stop(2))
+    r = ak.no_manual_install(t, user_line=ac.PKG_CODE, pkg=ac.PKG)
+    assert r.ok and "call(s) [3]" in r.detail, r.detail
+    assert ak.no_guessed_versions(t, pkg="tomli", version="99.0.0").ok
+
+
 def test_the_live_pass_s_real_miss_still_fails():
     # codex, env_unbuildable_asks (bundle 1793922411-39728): it checked the index, said 99.0.0 does not exist, and put
     # tomli==2.5.0 in its place without asking — no_guessed_versions keeps failing it

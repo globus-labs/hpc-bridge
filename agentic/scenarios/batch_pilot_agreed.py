@@ -6,16 +6,18 @@ once the user agrees. Fake cluster, `default` profile; any agent operator (a see
 
 THE USER: 4 simulation runs, `bash ~/hpcb-agent-work/simulate.sh <sample>` (SETUP writes it: two busy CPUs for 6 s and
 ~200 MB, then the sample's digest); "measure one run first, tell me the size you'd propose, run the rest at it once I
-agree"; one compute block on the default partition is approved. The scripted user agrees to a proposal (the block
-still approved: a follow-up turn is a new server, whose batch asks for the yes again), says yes to a spend question,
-answers a size question — hpc-bridge's, or the agent's own words asking about or proposing each run's size before any
+agree"; one compute block on the default partition is approved. The scripted user agrees to a proposal — hpc-bridge's,
+or sizes the agent puts from a row it measured itself (a one-row pilot ends `done`, with no proposal of the tool's;
+`agrees_to_own_measure`) — the block still approved (a follow-up turn is a new server, whose batch asks for the yes
+again); says yes to a spend question; answers a size question — hpc-bridge's, or the agent's own words asking about or proposing each run's size before any
 measurement (`sizes_in_words`) — with "that's why I asked you to measure one", and gives a go-ahead at most twice.
 
 GRADED (critical): `agent_turn_engaged`; a run_batch with pilot ≥ 1 recorded its batch (`pilot_used`); the proposal's
 memory and cores were named to the user in the turn it came, nothing was resized there, and the user's next answer
-agreed (`proposal_relayed` — no proposal is a premise not met); the first call that sized rows after it came at or
-after the agreement and carried the proposal's cores and memory — a resize of the batch, or a new batch for the rest
-(`resize_after_agreement`); stop answers down. World: every sample's digest is in a row's stdout file of the run's
+agreed (`proposal_relayed` — no proposal and no row of the agent's own measured is a premise not met); the first call
+that sized rows after it came at or after the agreement and carried the proposal's cores and memory — a resize of the
+batch, or a new batch for the rest (`resize_after_agreement`); the agent's own proposal is graded the same way, its
+words standing for the proposal; stop answers down. World: every sample's digest is in a row's stdout file of the run's
 batches (`world:inputs_done`). Reported: the digests in the rows the agent read (`every_input_done`) and in its words
 (`results_relayed`), the blocks sacct lists (`blocks_used`: carried across turns, a block may idle out while the user
 reads).
@@ -54,7 +56,7 @@ TASK = (ac.CONNECTED + "\n\n"
         "block for this on the default partition — that block is approved. When everything is done, tell me each "
         "sample's output, then stop the endpoint.")
 SIM = ac.UserSim(sizes="I don't know what one run needs — that's why I asked you to measure one first.",
-                 sizes_in_words=True,
+                 sizes_in_words=True, agrees_to_own_measure=True,
                  agree="That size is fine — run the rest of the samples at the size measured from that run. The "
                        "compute block I approved is still approved.",
                  yes="Yes — that's the block I approved; go ahead.")

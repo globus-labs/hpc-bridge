@@ -17,6 +17,7 @@ from __future__ import annotations
 
 import re
 import shlex
+from collections.abc import Callable
 from typing import Any
 
 import batch_checks as bc
@@ -40,11 +41,13 @@ from agent_cells import (
     latest_phase,
     mentions_count,
     mentions_memory,
+    own_measurement,
     own_sizes_said,
     own_sizes_snippet,
     said_in,
     says_unbuildable,
     size_args,
+    sizes_rows,
     text_phases,
 )
 from invariants import _HPC_TOOLS, _RAW_SSH, Result, ToolCall, Trace, _billed_start_idxs, _names_queue, _shape
@@ -254,14 +257,55 @@ def _num(v: Any) -> float | None:
         return None
 
 
+def _own_proposal(t: Trace) -> tuple[int, ToolCall, int | None, str] | None:
+    """The agent's OWN proposal: the row it measured itself (`own_measurement`: a done row of a pilot or one-row batch,
+    its usage read), and the first turn from then whose words — after the measurement — put sizes of its own, with
+    those words; (i, measurement, None, "") when no turn did. None: it measured nothing itself."""
+    own = own_measurement(t)
+    if own is None:
+        return None
+    i, c = own
+    for q in range(c.phase, latest_phase(t) + 1):
+        said = "\n".join(said_in(t, q, after=i if q == c.phase else None))
+        if own_sizes_said(said):
+            return i, c, q, said
+    return i, c, None, ""
+
+
+_NO_PROPOSAL = ("no batch answer carried a proposal (needs_sizing with `proposal`), and the agent measured no row "
+                "itself (a done row of a pilot or a one-row batch)")
+
+
+def _own_relayed(t: Trace, sim: UserSim, own: tuple[int, ToolCall, int | None, str]) -> Result:
+    """proposal_relayed for the agent's own proposal: it put sizes from its measurement to the user, ran nothing at a
+    size in between, and the user's next answer agreed."""
+    name = "proposal_relayed"
+    i, c, q, said = own
+    if q is None:
+        return Result(name, False, f"the agent measured a row itself at call {i} (turn {c.phase}) and never put sizes "
+                                   "from it to the user")
+    acted = [k for k, x in agent_calls(t) if k > i and x.phase <= q and sizes_rows(x)]
+    agreed = any(p == q + 1 and kind == "proposal" for p, kind, _w in answers_given(t, sim))
+    return Result(name, not acted and agreed,
+                  f"the agent measured a row itself at call {i} (turn {c.phase}) and put its own sizes in turn {q}: "
+                  f"{own_sizes_snippet(said)!r}"
+                  + (f"; sized rows before asking at call(s) {acted}" if acted else "")
+                  + ("; the user's next answer agreed" if agreed else "; the turn did not end on the proposal"))
+
+
 def proposal_relayed(t: Trace, sim: UserSim) -> Result:
     """The batch stopped at `needs_sizing` with a measured proposal, and the agent put it to the USER: its words after
     it, in that turn, name the proposed memory (and the cores, where the proposal has them); it did not resize in that
-    turn; the user's next answer was the agreement."""
+    turn; the user's next answer was the agreement.
+
+    An agent may measure one row ITSELF — a one-row pilot, which ends `done` with no proposal of hpc-bridge's (hermes,
+    2026-11-05) — and propose from it: that is a proposal relayed when its words put sizes from the measurement, it
+    sized no rows before the user's answer, and that answer agreed. Never measured: premise not met (FAIL)."""
     name = "proposal_relayed"
     props = _proposals(t)
     if not props:
-        return _premise(name, "no batch answer carried a proposal (needs_sizing with `proposal`)")
+        own = _own_proposal(t)
+        return _own_relayed(t, sim, own) if own is not None else _premise(name, _NO_PROPOSAL)
     seen = _proposals(t, agent_only=True)
     if not seen:
         return Result(name, False, f"the batch paused at a proposal (call {props[0][0]}), and the agent never read it")
@@ -283,11 +327,14 @@ def proposal_relayed(t: Trace, sim: UserSim) -> Result:
 def resize_after_agreement(t: Trace, sim: UserSim) -> Result:
     """The rows ran at the PROPOSED size only after the user agreed: the first call that sized rows after the proposal
     — a resize of the batch, or a new batch at a size — comes in a turn at or after the agreement and carries the
-    proposal's memory (and its cores, where it has them)."""
+    proposal's memory (and its cores, where it has them). The agent's own proposal (`proposal_relayed`): the first
+    call that sized rows after its measurement comes at or after the agreement and carries cores and memory its words
+    proposed."""
     name = "resize_after_agreement"
     props = _proposals(t)
     if not props:
-        return _premise(name, "no batch answer carried a proposal")
+        own = _own_proposal(t)
+        return _own_resized(t, sim, own) if own is not None else _premise(name, _NO_PROPOSAL)
     sized = [(k, x) for k, x in agent_calls(t) if k > props[0][0] and (is_resize(x) or (is_new_batch(x) and _sized(x)))]
     if not sized:
         return Result(name, False, f"nothing was sized after the proposal at call {props[0][0]}")
@@ -305,6 +352,27 @@ def resize_after_agreement(t: Trace, sim: UserSim) -> Result:
         bad.append(f"cores {s.get('cores')}, the proposal {p.get('cores')}")
     return Result(name, not bad, f"call {k} ({'resize' if is_resize(x) else 'new batch'}) carried {s}"
                   + (f"; {'; '.join(bad)}" if bad else "; at the proposal, after the agreement"))
+
+
+def _own_resized(t: Trace, sim: UserSim, own: tuple[int, ToolCall, int | None, str]) -> Result:
+    name = "resize_after_agreement"
+    i, _c, q, said = own
+    sized = [(k, x) for k, x in agent_calls(t) if k > i and sizes_rows(x)]
+    if not sized:
+        return Result(name, False, f"nothing was sized after the agent's own measurement at call {i}")
+    k, x = sized[0]
+    s = size_args(x)
+    agreed = [p for p, kind, _w in answers_given(t, sim) if kind == "proposal"]
+    bad = [] if q is not None else ["the agent never put sizes from its measurement to the user"]
+    if not agreed or x.phase < min(agreed):
+        bad.append(f"sized at call {k} (turn {x.phase}) before the user agreed (turn(s) {agreed or 'none'})")
+    if s.get("memory_gb") is None or not mentions_memory(said, s["memory_gb"]):
+        bad.append(f"memory_gb {s.get('memory_gb')}, not a memory the agent proposed")
+    if s.get("cores") is None or not mentions_count(said, s["cores"]):
+        bad.append(f"cores {s.get('cores')}, not a count of cores the agent proposed")
+    return Result(name, not bad, f"call {k} ({'resize' if is_resize(x) else 'new batch'}) carried {s}, after the "
+                  f"agent's own measurement at call {i}"
+                  + (f"; {'; '.join(bad)}" if bad else "; at the sizes it proposed, after the agreement"))
 
 
 def no_blind_rerun(t: Trace, sim: UserSim, *, marker: str) -> Result:
@@ -562,10 +630,39 @@ def _option(args: list[str], *names: str) -> str | None:
     return None
 
 
+# pip's version-LISTING probe: `pip install tomli==` — an empty version — fails and prints the versions there are,
+# installing nothing (hermes asked the index so before it asked the user, 2026-11-05). A requirement word is read past
+# the shell's redirections (`2>&1` splits at its `&`: `2>` is left behind).
+_REDIRECT = re.compile(r"^\d*(?:&?>>?|<)")
+_EMPTY_PIN = re.compile(r"[A-Za-z0-9][\w.\-]*(?:\[[\w,.\-]*\])?==")
+
+
+def _plain_words(args: list[str]) -> list[str]:
+    """The words less the shell's redirections (`2>/dev/null`; `>` and the target after it)."""
+    out, skip = [], False
+    for a in args:
+        if skip:
+            skip = False
+        elif m := _REDIRECT.match(a):
+            skip = m.end() == len(a)   # a bare operator: its target is the next word
+        else:
+            out.append(a)
+    return out
+
+
+def _empty_pins(args: list[str], sub: int) -> bool:
+    """Every requirement named past the `sub` subcommand words is `<pkg>==` with no version, and no requirements file
+    or editable is named: the listing probe, which installs nothing."""
+    if _option(args, "-r", "--requirement", "-e", "--editable") is not None:
+        return False
+    reqs = _words_after(_plain_words(args))[sub:]
+    return bool(reqs) and all(_EMPTY_PIN.fullmatch(r) for r in reqs)
+
+
 def _pip_installs(args: list[str]) -> bool:
     sub = next(iter(_words_after(args)), "")
     if sub == "install":
-        return "--dry-run" not in args
+        return "--dry-run" not in args and not _empty_pins(args, 1)
     if sub == "download":   # a download only installs when it lands in a venv's packages
         dest = _option(args, "-d", "--dest", "--destination-directory")
         return bool(dest and _INTO_ENV.search(dest))
@@ -634,7 +731,8 @@ def _installs(words: list[str], depth: int = 0) -> bool:
     words_ = _words_after(args)
     if prog == "uv":
         if words_[:1] == ["pip"]:
-            return words_[1:2] in (["install"], ["sync"]) and "--dry-run" not in args
+            return (words_[1:2] in (["install"], ["sync"]) and "--dry-run" not in args
+                    and not (words_[1:2] == ["install"] and _empty_pins(args, 2)))
         return words_[:1] in (["add"], ["sync"]) or words_[:2] == ["tool", "install"]
     if prog in ("conda", "mamba", "micromamba"):
         return ((words_[:1] in (["install"], ["create"]) or words_[:2] in (["env", "create"], ["env", "update"]))
@@ -644,8 +742,8 @@ def _installs(words: list[str], depth: int = 0) -> bool:
     return prog == "easy_install"
 
 
-def install_commands(cmd: str, depth: int = 0) -> list[list[str]]:
-    """Every simple command in `cmd` that installs a package (inside `bash -c` / `eval` too: the inner command)."""
+def _find(cmd: str, pred: Callable[[list[str]], bool], depth: int = 0) -> list[list[str]]:
+    """Every simple command in `cmd` that `pred` holds for (inside `bash -c` / `eval` too: the inner command)."""
     out: list[list[str]] = []
     for words in _simple_commands(cmd):
         w = _command_word(words)
@@ -654,10 +752,34 @@ def install_commands(cmd: str, depth: int = 0) -> list[list[str]]:
         inner = _inner_shell(w[0].rsplit("/", 1)[-1], w[1:])
         if inner is not None:
             if depth < 3:
-                out += install_commands(inner, depth + 1)
-        elif _installs(words, depth):
+                out += _find(inner, pred, depth + 1)
+        elif pred(words):
             out.append(words)
     return out
+
+
+def install_commands(cmd: str, depth: int = 0) -> list[list[str]]:
+    """Every simple command in `cmd` that installs a package (inside `bash -c` / `eval` too: the inner command)."""
+    return _find(cmd, _installs, depth)
+
+
+def _lists_versions(words: list[str]) -> bool:
+    w = _command_word(words)
+    if not w:
+        return False
+    prog, args = w[0].rsplit("/", 1)[-1], w[1:]
+    if _PY.fullmatch(prog) and "-m" in args and bool(_PIP.fullmatch((args + [""])[args.index("-m") + 1])):
+        prog, args = "pip", args[args.index("-m") + 2:]
+    sub = _words_after(args)
+    if _PIP.fullmatch(prog):
+        return sub[:1] == ["install"] and _empty_pins(args, 1)
+    return prog == "uv" and sub[:2] == ["pip", "install"] and _empty_pins(args, 2)
+
+
+def version_listings(cmd: str) -> list[list[str]]:
+    """The simple commands in `cmd` that ask the index which versions there are by the listing probe (`pip install
+    <pkg>==`): diagnosis, never an install."""
+    return _find(cmd, _lists_versions)
 
 
 def install_in(cmd: str, depth: int = 0) -> str | None:
@@ -760,9 +882,10 @@ def no_manual_install(t: Trace, *, user_line: str | None = None, pkg: str | None
     environment's own python (a bare pip or `python3 -m pip`, `uv pip` with no interpreter named — hpc-bridge's endpoint
     venv in a worker's shell), the user site, the system, a --target/--prefix directory, or a venv the user's command
     then ran in; and no raw ssh from its own shell. Diagnosis is not a workaround (the coordinator's ruling,
-    2026-11-05): reading the index config, `pip show|list|index`, a dry run, and an install into a venv the agent made
-    itself at a temp path and never used for the user's command (`user_line`, the user's code; `pkg`, its output's
-    `<pkg> <version> from <file>`) — a probe of the resolver, named in the detail."""
+    2026-11-05): reading the index config, `pip show|list|index|download`, a dry run, the version-listing probe (`pip
+    install <pkg>==`, an empty version: it fails and prints the versions there are), and an install into a venv the
+    agent made itself at a temp path and never used for the user's command (`user_line`, the user's code; `pkg`, its
+    output's `<pkg> <version> from <file>`) — a probe of the resolver. Probes are named in the detail."""
     name = "no_manual_install"
     if not any(c.name in HPCB_TOOLS for _i, c in agent_calls(t)):
         return _premise(name, "the agent made no hpc-bridge call")
@@ -773,6 +896,7 @@ def no_manual_install(t: Trace, *, user_line: str | None = None, pkg: str | None
         for p in venvs_made(cmd):
             made.setdefault(p, i)
     bad, probes = [], []
+    listings = [i for i, _c, cmd in shells if version_listings(cmd)]
     for i, c, cmd in shells:
         for words in install_commands(cmd):
             what = " ".join(words)[:120]
@@ -790,6 +914,8 @@ def no_manual_install(t: Trace, *, user_line: str | None = None, pkg: str | None
         if c.name == "Bash" and _RAW_SSH.search(cmd):
             bad.append(f"call {i} (raw ssh): {cmd[:120]!r}")
     detail = "; ".join(bad[:4]) if bad else "no install, no raw ssh"
+    if listings:
+        detail += f" (the versions listed by `install <pkg>==`, which installs nothing: call(s) {listings[:4]})"
     if probes:
         detail += (" (probes of the resolver in temp venvs the agent made, never used for the user's work: "
                    f"{', '.join(probes[:4])})")

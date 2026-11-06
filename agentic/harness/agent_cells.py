@@ -94,6 +94,11 @@ class UserSim:
     # a version the user asked for that does not exist: a turn whose WORDS say so (the agent checked the index itself
     # and asked before building anything — the careful way) gets `env_failed`, as a failed build does
     unbuildable: str | None = None
+    # a user who asked for one run to be MEASURED agrees to sizes the agent puts from its own measurement (a done row
+    # of a pilot or a one-row batch, its usage read — `own_measurement`) as to hpc-bridge's proposal: `agree`, an
+    # answer of kind "proposal". hermes ran s1 alone as a one-row pilot and proposed from it (2026-11-05); "I don't
+    # know what one run needs" was no answer to that
+    agrees_to_own_measure: bool = False
 
     def say(self, kind: str) -> str | None:
         return {"sizes": self.sizes, "proposal": self.agree, "spend": self.yes, "account": self.account,
@@ -224,6 +229,40 @@ def is_resize(c: ToolCall) -> bool:
     return c.name == "run_batch" and bool(c.input.get("batch_id")) and bool(size_args(c))
 
 
+def sizes_rows(c: ToolCall) -> bool:
+    """The call sizes rows to run: a resize, or a new batch naming a size."""
+    s = size_args(c)
+    return is_resize(c) or (is_new_batch(c) and (any(k in s for k in ("cores", "memory_gb", "concurrency"))
+                                                 or bool(s.get("gpus"))))
+
+
+def rows_arg(c: ToolCall) -> list:
+    """The rows a run_batch sent (a JSON string decoded: some operators send a list argument as text)."""
+    r = c.input.get("rows")
+    if isinstance(r, str):
+        try:
+            r = json.loads(r)
+        except ValueError:
+            return []
+    return r if isinstance(r, list) else []
+
+
+def own_measurement(t: Trace) -> tuple[int, ToolCall] | None:
+    """The first answer that showed the agent a row it MEASURED itself: a done row with its usage (`peak_rss_mb`,
+    `cpu_s`) in a run_batch / status answer of a batch the agent started as a pilot or with one row. None: it measured
+    nothing so. (A pilot with rows left over pauses at hpc-bridge's own proposal; a one-row pilot ends `done`, and the
+    sizes are the agent's to propose.)"""
+    mine = {str((c.result or {}).get("batch_id")) for _i, c in agent_calls(t)
+            if is_new_batch(c) and (c.result or {}).get("batch_id") and (is_pilot(c) or len(rows_arg(c)) == 1)}
+    for i, c in agent_calls(t):
+        r = c.result or {}
+        if c.name in ("run_batch", "status") and str(r.get("batch_id")) in mine and any(
+                isinstance(x, dict) and x.get("state") == "done"
+                and (x.get("peak_rss_mb") is not None or x.get("cpu_s") is not None) for x in r.get("results") or []):
+            return i, c
+    return None
+
+
 def pending(t: Trace) -> tuple[str, int] | None:
     """What the agent's LAST turn left open for the user, and the call that asked it: the latest of a spend question,
     an account, a size, a proposal and a failed env build that nothing later in the turn settled. A stop or teardown
@@ -318,7 +357,9 @@ def decide(t: Trace, sim: UserSim) -> tuple[str, str] | None:
     stopped the endpoint wrapped up (every request here ends with a stop); one that ended otherwise, on a question in
     prose or a pause, gets the go-ahead — at most GO_AHEADS times a run, so a stuck agent is not carried along. With
     `sizes_in_words`, a turn whose words ask about each task's size, or put sizes of the agent's own, gets the user's
-    sizes (once) — before a spend question's yes, which would let the agent's own sizes through."""
+    sizes (once) — before a spend question's yes, which would let the agent's own sizes through. With
+    `agrees_to_own_measure`, sizes the agent's words put from a row it measured itself, before the rest ran, get the
+    agreement, as hpc-bridge's proposal does."""
     last = latest_phase(t)
     if last < FIRST_AGENT_PHASE:
         return None
@@ -329,6 +370,11 @@ def decide(t: Trace, sim: UserSim) -> tuple[str, str] | None:
         return "sizes", sim.pilot_reply
     measured = any(c.name in ("run_batch", "status") and answer_state(c) == "needs_sizing"
                    and (c.result or {}).get("proposal") for c in t.calls)   # then the talk is of hpc-bridge's proposal
+    own = own_measurement(t) if sim.agrees_to_own_measure and not measured else None
+    if (own is not None and (p is None or p[0] == "spend") and own_sizes_said(final_text(t, last))
+            and not any(k > own[0] and sizes_rows(c) for k, c in agent_calls(t))
+            and not any(c.name in _ENDS for _i, c in calls_in(t, last))):
+        return "proposal", sim.agree   # sizes from the agent's own measurement, the rest not yet sized
     if (sim.sizes_in_words and sim.sizes and not sized and not measured and (p is None or p[0] == "spend")
             and not any(c.name in _ENDS for _i, c in calls_in(t, last))):
         if _put_own_sizes(t, last):
