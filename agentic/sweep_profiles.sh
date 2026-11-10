@@ -117,6 +117,7 @@ home_outside_home             scripted only: a script_cell on `nersc` (after its
 noisy_failure_tail            scripted only: a script_cell on `nersc` (after its agent wave)
 partition_proposal_policy     scripted only: a script_cell on `nersc` (after its agent wave)
 returning_user                scripted only: one script_cell per returning-user cell on `returning` (the nersc cluster)
+restart_cold_stop             a scripted chain (built, not yet run live): joins the default script cells after its live proof
 topology_roundtrip            scripted only: one script_cell per network topology on `topology` (a cluster boot each)
 EXCLUDED
 }

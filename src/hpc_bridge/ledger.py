@@ -27,7 +27,7 @@ import sqlite3
 import subprocess
 import sys
 import time
-from collections.abc import Iterable
+from collections.abc import Iterable, Mapping
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any
@@ -487,6 +487,28 @@ create table if not exists meter_reading (
   unledgered text default '[]',
   detail text
 );
+create table if not exists block (
+  endpoint_id text not null,
+  request text not null,
+  facility text,
+  entry text,
+  mep integer default 0,
+  scheduler text,
+  uec_hash text,
+  partition text,
+  account text,
+  walltime_s real,
+  confirmed_at real not null,
+  job text,
+  up_at real,
+  session text,
+  owner_host text,
+  owner_pid integer,
+  owner_start text,
+  ended_at real,
+  ended_how text,
+  primary key (endpoint_id, request)
+);
 """
 
 # A Jobs-mode job's states (batch phase 2a). Admission holds a reservation from `reserved` on; a job the scheduler can
@@ -530,10 +552,17 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                            ("req_mem_default", "integer"), ("pinned", "integer"),
                            # how many of the watcher's looks read its runnable threads, how many saw more than its
                            # cores (sizing.oversubscribed), and whether a look saw an srun of its own
-                           ("r_samples", "integer"), ("r_over", "integer"), ("srun", "integer")],
+                           ("r_samples", "integer"), ("r_over", "integer"), ("srun", "integer"),
+                           # the server that sent the attempt (`reserve`): whose liveness a slot it holds follows —
+                           # never the batch's later lease holder (the restart block review, item 6)
+                           ("sent_host", "text"), ("sent_pid", "integer"), ("sent_start", "text")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
                           ("hand", "text"),
-                          ("env", "text")]}   # block environments: the env its job.sh activates (as a batch's)
+                          ("env", "text")],   # block environments: the env its job.sh activates (as a batch's)
+                  # the asking server's pid namespace (Linux: /proc/self/ns/pid) — a pid of another namespace sharing
+                  # the state dir is never read here as gone (the restart block review's liveness nit) — and its
+                  # machine's stable identity (review round 2: never the hostname, which a laptop's network changes)
+                  "block": [("owner_ns", "text"), ("owner_machine", "text")]}
 
 
 class Ledger:
@@ -570,11 +599,24 @@ class Ledger:
         con.execute("pragma journal_mode = wal")
         con.execute("pragma synchronous = normal")
         con.executescript(_SCHEMA)
-        for table, cols in _ADDED_COLUMNS.items():
-            have = {str(r[1]) for r in con.execute(f"pragma table_info({table})")}
-            for name, kind in cols:
-                if name not in have:
-                    con.execute(f"alter table {table} add column {name} {kind}")
+        # the columns a ledger of an earlier build lacks, added in ONE immediate transaction: two servers opening the
+        # same old ledger at once must not both add a column (the restart block review's concurrent-open probe:
+        # "duplicate column name"); a column another opener added meanwhile is fine
+        con.execute("begin immediate")
+        try:
+            for table, cols in _ADDED_COLUMNS.items():
+                have = {str(r[1]) for r in con.execute(f"pragma table_info({table})")}
+                for name, kind in cols:
+                    if name not in have:
+                        try:
+                            con.execute(f"alter table {table} add column {name} {kind}")
+                        except sqlite3.OperationalError as exc:
+                            if "duplicate column" not in str(exc).lower():
+                                raise
+            con.execute("commit")
+        except BaseException:
+            con.execute("rollback")
+            raise
         # after the columns (an earlier build's ledger gets `sent_uec` above): the block window's one scan (`_on_block`)
         con.execute("create index if not exists task_holding_by_uec on task (sent_uec, state) where state in "
                     f"({', '.join(repr(s) for s in HOLDING)})")
@@ -740,7 +782,8 @@ class Ledger:
         return None if r is None else str(r[0] or "retired")
 
     # -- admission -------------------------------------------------------------------------------------------------
-    def _alive(self, row: sqlite3.Row, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool]) -> bool:
+    def _alive(self, row: sqlite3.Row | Mapping[str, Any], owner: Owner | None,
+               seen: dict[tuple[str, int, str | None], bool]) -> bool:
         """Whether a batch's lease holder still runs (`holder_alive`), once per holder — the caller's own server only
         when its start time, if on record, is the caller's (review round 2: a restarted server handed the dead one's
         pid had taken that server's rows for its own, and held them for good)."""
@@ -753,34 +796,48 @@ class Ledger:
 
     def _on_block(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str, block_job: str | None,
                   at: float, margin_s: float, owner: Owner | None,
-                  seen: dict[tuple[str, int, str | None], bool]) -> tuple[dict[str, int], dict[str, int]]:
+                  seen: dict[tuple[str, int, str | None], bool], *,
+                  by_sender: bool = True) -> tuple[dict[str, int], dict[str, int]]:
         """Per batch (the caller's too), on THIS block — the endpoint and config `uec_hash` — (holds, out):
         `holds`, its rows that can still hold a worker of the block, and none that cannot be shown to (review round 1:
         an aborted batch's presumed-lost rows had shrunk every later window on a MEP's one config, for good):
-        - `in_flight`: while its batch's server runs (it settles or presumes it); a gone server's only until
-          task_walltime_s + `margin_s` past its admission (`HOLD_MARGIN_S`: the wrapper's own end, and delivery);
+        - `in_flight`: while the server that SENT it runs (it settles or presumes it; a row recorded before its sender
+          was: its batch's lease holder); a gone server's only until task_walltime_s + `margin_s` past its admission
+          (`HOLD_MARGIN_S`: the wrapper's own end, and delivery) — also once another server took the batch over;
         - `submit_unknown`: until EVIDENCE says its task can no longer run (`unheld`, `batch._unknown_evidence`), or
           reconciliation settles it — whatever its batch's state or server (review round 2: a failed POST may have
           queued it, and on a MEP the next submit with that config delivers it). Never silently: a batch it holds is
           told which batch holds it (`Reserved.holders`);
-        - `presumed_lost`: only while its server runs and it was sent to the block in front (`block_job`).
+        - `presumed_lost`: only while the server that sent it runs and it was sent to the block in front (`block_job`).
         `out`, its rows in flight or of unknown fate on the block: the fairness order, the same whoever reads it.
         One scan, on the partial index `task_holding_by_uec` (a row from before `sent_uec` was set at admission is
-        read by its batch's config)."""
-        holds, out, _use = self._on_block_use(c, endpoint_id, uec_hash, block_job, at, margin_s, owner, seen)
+        read by its batch's config). `by_sender` False (a facility endpoint): a row's slot follows its batch's lease
+        holder, as before sent_* was recorded — a gone server's row there can still be delivered late and run."""
+        holds, out, _use = self._on_block_use(c, endpoint_id, uec_hash, block_job, at, margin_s, owner, seen,
+                                              by_sender=by_sender)
         return holds, out
 
     def _on_block_use(self, c: sqlite3.Connection, endpoint_id: str | None, uec_hash: str, block_job: str | None,
-                      at: float, margin_s: float, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool]
-                      ) -> tuple[dict[str, int], dict[str, int], dict[str, list[int]]]:
+                      at: float, margin_s: float, owner: Owner | None, seen: dict[tuple[str, int, str | None], bool],
+                      *, by_sender: bool = True) -> tuple[dict[str, int], dict[str, int], dict[str, list[int]]]:
         """`_on_block`, and per batch what its holding rows hold of the block's pool (batch row sizing): [CPUs, memory
         MB, GPUs] — each attempt's own `req_*`, else its batch's size, else one CPU."""
         states = ", ".join(f"'{s}'" for s in HOLDING)
+        # whose liveness a row's slot follows: the server that SENT it (`sent_*`, set by `reserve`), else — a row from
+        # before that was recorded — its batch's lease holder. Never the holder that took the lease over: a dead
+        # server's row past its walltime cannot still hold a worker, whoever collects the batch now (live 2026-11-06,
+        # batch_restart_resume: the resume took the killed server's block over, Globus answered every REST pull with a
+        # 500, and its three ended rows held the block's whole window until it idled out). On a facility endpoint
+        # (`by_sender` False) the lease holder's, as before: a late delivery there can still run (review round 2)
+        who = ("case when t.sent_pid is null then o.owner_host else t.sent_host end as owner_host, "
+               "case when t.sent_pid is null then o.owner_pid else t.sent_pid end as owner_pid, "
+               "case when t.sent_pid is null then o.owner_start else t.sent_start end as owner_start "
+               ) if by_sender else "o.owner_host, o.owner_pid, o.owner_start "
         cols = ("t.batch_id, t.state, t.sent_job, t.unheld, coalesce(t.admitted_at, t.unknown_since, 0) as sent_at, "
                 "coalesce(t.req_cores, o.cores, 1) as rc, coalesce(t.req_memory_mb, o.memory_mb, 0) as rm, "
-                "coalesce(t.req_gpus, o.gpus, 0) as rg, "
-                "o.task_walltime_s, o.owner_host, o.owner_pid, o.owner_start from task t join batch o on o.id = "
-                f"t.batch_id where o.endpoint_id is ? and t.state in ({states}) and ")
+                "coalesce(t.req_gpus, o.gpus, 0) as rg, o.task_walltime_s, " + who +
+                "from task t join batch o on o.id = t.batch_id "
+                f"where o.endpoint_id is ? and t.state in ({states}) and ")
         holds: dict[str, int] = {}
         out: dict[str, int] = {}
         use: dict[str, list[int]] = {}
@@ -806,13 +863,15 @@ class Ledger:
         return holds, out, use
 
     def block_holders(self, batch_id: str, *, uec_hash: str, block_job: str | None = None, owner: Owner | None = None,
-                      margin_s: float = HOLD_MARGIN_S, now: float | None = None) -> dict[str, int]:
+                      margin_s: float = HOLD_MARGIN_S, now: float | None = None,
+                      by_sender: bool = True) -> dict[str, int]:
         """The OTHER batches whose rows hold slots of this batch's block, as `reserve` counts them for `owner`."""
         at = time.time() if now is None else now
         b = self._con.execute("select endpoint_id from batch where id = ?", (batch_id,)).fetchone()
         if b is None:
             raise UnknownBatch(batch_id)
-        holds, _out = self._on_block(self._con, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, {})
+        holds, _out = self._on_block(self._con, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, {},
+                                     by_sender=by_sender)
         holds.pop(batch_id, None)
         return holds
 
@@ -900,7 +959,7 @@ class Ledger:
 
     def reserve(self, batch_id: str, owner: Owner, n: int, *, uec_hash: str, now: float | None = None,
                 indices: Iterable[int] | None = None, block_job: str | None = None,
-                margin_s: float = HOLD_MARGIN_S) -> Reserved:
+                margin_s: float = HOLD_MARGIN_S, by_sender: bool = True) -> Reserved:
         """THE admission point: in one BEGIN IMMEDIATE transaction, check that `owner` holds the lease, that the config
         is not retired and how many window slots are free, and move up to `n` backlog rows (the lowest indices, or
         `indices` first) to `in_flight` with their next attempt, on the block `uec_hash` names (`sent_uec`).
@@ -913,7 +972,9 @@ class Ledger:
         WANT_FRESH_S — stamped only when the block's rows refused it, never when fairness did — still admitting, with
         a backlog and room of its own), a slot goes first to the batch with fewer rows in flight or of unknown fate on
         the block, then the one that admitted less recently, then the lower id: one order whoever reads it, so two
-        waiters never defer to each other. The answer carries the other batches holding the block (`holders`)."""
+        waiters never defer to each other. The answer carries the other batches holding the block (`holders`).
+        `by_sender` False — a facility endpoint, where a dead server's row can still be delivered late and run: every
+        row out holds, a gone sender's too, and a row's liveness is its batch's lease holder's (`_on_block`)."""
         at = time.time() if now is None else now
         with self._tx(immediate=True) as c:
             b = c.execute("select * from batch where id = ?", (batch_id,)).fetchone()
@@ -926,14 +987,32 @@ class Ledger:
             if why is not None:
                 raise RetiredConfig(str(why[0] or "this block's config was retired"))
             hold = ",".join("?" * len(HOLDING))
-
-            def held_by(bid: str) -> int:   # a batch's own window: its rows out, wherever they went
-                return int(c.execute(f"select count(*) from task where batch_id = ? and state in ({hold})",
-                                     (bid, *HOLDING)).fetchone()[0])
-
             seen: dict[tuple[str, int, str | None], bool] = {}
+
+            def held_by(bid: str) -> int:
+                """A batch's own window: its rows out, wherever they went — but not one a server that is GONE sent
+                (in flight or presumed lost) past task_walltime_s + `margin_s` since its admission: the wrapper's own
+                end, so it holds no worker any more, whoever holds the lease now (the restart block review, item 6:
+                the killed server's three rows, uncollectable through a Globus outage, held the resumed batch's whole
+                window). A submit of unknown fate always holds; a row recorded before its sender was, too; and on a
+                facility endpoint (`by_sender` False) every row out."""
+                tw = c.execute("select task_walltime_s from batch where id = ?", (bid,)).fetchone()
+                bound = float((tw[0] if tw is not None else 0.0) or 0.0) + margin_s
+                n = 0
+                for t in c.execute(f"select state, coalesce(admitted_at, unknown_since, 0) as sent_at, sent_host, "
+                                   f"sent_pid, sent_start from task where batch_id = ? and state in ({hold})",
+                                   (bid, *HOLDING)):
+                    if (by_sender and t["state"] != "submit_unknown" and t["sent_pid"] is not None
+                            and at - float(t["sent_at"] or 0.0) >= bound
+                            and not self._alive({"owner_host": t["sent_host"], "owner_pid": t["sent_pid"],
+                                                 "owner_start": t["sent_start"]}, owner, seen)):
+                        continue
+                    n += 1
+                return n
+
             held = held_by(batch_id)
-            holds, out, use = self._on_block_use(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen)
+            holds, out, use = self._on_block_use(c, b["endpoint_id"], uec_hash, block_job, at, margin_s, owner, seen,
+                                                 by_sender=by_sender)
             mine_on = holds.pop(batch_id, 0)
             mine_use = use.pop(batch_id, [0, 0, 0])
             others = sum(holds.values())
@@ -1033,9 +1112,9 @@ class Ledger:
                 c.execute("update task set state = 'in_flight', attempt = ?, admitted_at = ?, task_id = null, "
                           "started_at = null, sent_uec = ?, req_cores = ?, req_memory_mb = ?, req_gpus = ?, "
                           "req_mem_default = ?, not_before = null, pinned = null, r_samples = null, r_over = null, "
-                          "srun = null where batch_id = ? and idx = ?",
-                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, batch_id,
-                           r["idx"]))
+                          "srun = null, sent_host = ?, sent_pid = ?, sent_start = ? where batch_id = ? and idx = ?",
+                          (att, at, uec_hash, b["cores"], b["memory_mb"], b["gpus"], mem_default, owner.host,
+                           owner.pid, owner.started, batch_id, r["idx"]))
                 got.append(TaskRow(batch_id, int(r["idx"]), json.loads(r["row_json"]), att, "in_flight"))
             return got
 
@@ -1118,6 +1197,68 @@ class Ledger:
     def itask(self, task_id: str) -> dict[str, Any] | None:
         r = self._con.execute("select * from itask where task_id = ?", (task_id,)).fetchone()
         return None if r is None else dict(r)
+
+    # -- billed blocks a server asked for (a later server names, reuses or releases them: hpc_bridge.earlier) -------
+    def record_block(self, endpoint_id: str, request: str, *, facility: str | None, entry: str | None, mep: bool,
+                     scheduler: str | None, uec_hash: str | None, partition: str | None, account: str | None,
+                     walltime_s: float | None, session: str, owner_host: str, owner_pid: int, owner_start: str | None,
+                     owner_ns: str | None = None, owner_machine: str | None = None, now: float | None = None) -> None:
+        """A billed block request, recorded when spend is confirmed for it — before its check is sent: the endpoint,
+        the block request (`hpcb_block`, else the config's hash), how to reach the endpoint again (the facility id and
+        the catalog entry it was bound from), its terms and the server that asked. The same request asked again (a
+        later server reusing the block, a facility endpoint's same config) takes the record over: its job and when it
+        came up stay while the record is OPEN (the block a later server takes over is that block); a record that had
+        ended is a new block's — its job and age go (review round 1: a facility endpoint's `cfg:` record re-opened with
+        the ended block's job and its age, and was closed as past its walltime before the new block answered). The
+        owner and terms are the new confirmation's, and it is open again."""
+        at = time.time() if now is None else now
+        with self._tx() as c:
+            c.execute(
+                "insert into block (endpoint_id, request, facility, entry, mep, scheduler, uec_hash, partition, "
+                "account, walltime_s, confirmed_at, session, owner_host, owner_pid, owner_start, owner_ns, "
+                "owner_machine) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?) "
+                "on conflict (endpoint_id, request) do update set "
+                "job = case when block.ended_at is null then block.job else null end, "
+                "up_at = case when block.ended_at is null then block.up_at else null end, "
+                "facility = excluded.facility, entry = coalesce(excluded.entry, block.entry), mep = excluded.mep, "
+                "scheduler = coalesce(excluded.scheduler, block.scheduler), uec_hash = excluded.uec_hash, "
+                "partition = excluded.partition, account = excluded.account, walltime_s = excluded.walltime_s, "
+                "confirmed_at = excluded.confirmed_at, session = excluded.session, owner_host = excluded.owner_host, "
+                "owner_pid = excluded.owner_pid, owner_start = excluded.owner_start, owner_ns = excluded.owner_ns, "
+                "owner_machine = excluded.owner_machine, ended_at = null, ended_how = null",
+                (endpoint_id, request, facility, entry, int(bool(mep)), scheduler, uec_hash, partition, account,
+                 walltime_s, at, session, owner_host, owner_pid, owner_start, owner_ns, owner_machine))
+
+    def block_up(self, endpoint_id: str, request: str, job: str, *, at: float | None = None) -> None:
+        """The block asked for under `request` came up as scheduler job `job` (a check reported it). When it came up
+        is kept for the job it was first seen for: a block met again keeps its age (its walltime)."""
+        when = time.time() if at is None else at
+        with self._tx() as c:
+            c.execute("update block set up_at = case when job is ? then coalesce(up_at, ?) else ? end, job = ? "
+                      "where endpoint_id = ? and request = ?", (job, when, when, job, endpoint_id, request))
+
+    def open_blocks(self, endpoint_id: str | None = None) -> list[dict[str, Any]]:
+        """The block records not known to have ended (every endpoint's, or one's), oldest first."""
+        q = "select * from block where ended_at is null"
+        args: tuple[Any, ...] = ()
+        if endpoint_id is not None:
+            q, args = q + " and endpoint_id = ?", (endpoint_id,)
+        return [dict(r) for r in self._con.execute(q + " order by confirmed_at", args).fetchall()]
+
+    def end_blocks(self, endpoint_id: str, requests: Iterable[str] | None = None, *, how: str,
+                   now: float | None = None) -> int:
+        """Close records: every open one of the endpoint, or those of `requests` — their blocks are gone (released by
+        a stop, torn down, rejected, no longer in the scheduler, past their walltime)."""
+        at = time.time() if now is None else now
+        with self._tx() as c:
+            if requests is None:
+                return c.execute("update block set ended_at = ?, ended_how = ? where endpoint_id = ? and ended_at is "
+                                 "null", (at, how, endpoint_id)).rowcount
+            n = 0
+            for r in set(requests):
+                n += c.execute("update block set ended_at = ?, ended_how = ? where endpoint_id = ? and request = ? "
+                               "and ended_at is null", (at, how, endpoint_id, r)).rowcount
+            return n
 
     # -- envelopes (batch phase 2a) --------------------------------------------------------------------------------
     def add_envelope(self, envelope_id: str, *, facility: str | None, account: str | None, unit: str, cap: float,

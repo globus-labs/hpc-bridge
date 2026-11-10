@@ -19,6 +19,8 @@ config the cache rung read from `facilities.json` (id → the `ssh_host` the cal
 lets [[connect]] drop such a config when its bring-up fails or hands off, and re-read the record for that host on the
 next connect (Perlmutter report, left-over local state). A `details=` for the id removes the mark.
 
+**Blocks an earlier server left (2026-11-06; [[earlier]]).** `EarlierBlock` is a ledger `block` record of an earlier server process as this one last read it from the scheduler (its live pilots as (job, state, reason, word), `verified`, `mep`, its terms, the hash of its config as sent, when it came up and its walltime); `EarlierView` one endpoint's read (when, the blocks, why the scheduler could not be read). `AppCtx.earlier` keeps the latest view per endpoint, `AppCtx.earlier_told` the blocks a spend question of this process named (a yes after that is given knowing), and `ShapeRuntime.earlier_reused` the block a confirmation took over, for its answer.
+
 **Block environments (PR 3, 2026-11-05; [[envs]]).** These fields hold the session's env state:
 - `AppCtx.env_spec`: the session's env (an `envs.EnvSpec`). It applies to the user's commands on both shapes, and never to the internal session.
 - `env_pending` and `env_note` (review round 1, S4): a new built env still being built, and what became of it, said once.

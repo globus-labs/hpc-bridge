@@ -33,7 +33,7 @@ from typing import Any, Literal
 
 from globus_compute_sdk.errors import SerdeError, TaskExecutionFailed
 
-from . import dispatch, envs, resources, session_shell
+from . import dispatch, earlier, envs, resources, session_shell
 from .config import (
     CANARY_TTL_S,
     SYNC_WAIT_S,
@@ -673,6 +673,10 @@ async def _provision(
         # facility's configured default (the startup pin's), both in the shape's config.
         if getattr(app.facility, "account_required", False) and not rt.user_endpoint_config.get("account"):
             return "needs_account"  # spend stays unconfirmed: the re-call with account= re-gates cleanly
+        if earlier.must_ask(app, rt):
+            # a block an EARLIER server left bills on this endpoint, this yes would not reuse it, and no spend question
+            # of this process named it: ask first — a second block is never started unasked (hpc_bridge.earlier)
+            return "needs_confirmation"
         # a replacement already up — on these terms: a kick met before a switch is the other terms' block
         kicked_up = (rt.reap_kicked and rt.last_canary is not None and rt.last_canary.ok
                      and (rt.reap_terms is None or rt.reap_terms == _block_key(app, rt)))
@@ -711,6 +715,13 @@ async def _provision(
         adopt = getattr(app.facility, "adopt_endpoint", None)
         if app.state.endpoint_id and inspect.iscoroutinefunction(adopt):
             await adopt(app.state.endpoint_id)
+        if new_request and earlier.unread(app, app.state.endpoint_id):
+            # THE one check before a billed block starts: other servers' records of the endpoint this bring-up knows
+            # now (by its id, whatever path led here) are read first — off the lock, by the caller, which then decides
+            # this yes again (review round 3: a failed connect, and a pin by another name, started a second block)
+            rt.spend_confirmed, rt.earlier_unread = False, True
+            _bank_warm_interval(rt, app)
+            return "needs_confirmation"
         if (stale := _stale_size(app, rt)) is not None:
             # the size was asked before this endpoint's template was known (a startup pin, before its bootstrap), and
             # the endpoint it reached renders none of it: refuse before any check is sent, never drop it silently
@@ -731,7 +742,15 @@ async def _provision(
         if asked_size is not None:
             rt.question_size = None   # this confirmation covered it; the next question names its own
         if new_request:
-            _fresh_block(app, shape, rt)  # after adopt: whether this endpoint's template allows it is known now
+            # a block an earlier server left running on exactly these terms is taken over (its block request: the check
+            # lands on it), else a fresh one — after adopt: whether this endpoint's template allows it is known now
+            reuse = (earlier.reuse_for(app, rt) if rt.block_since is None and not rt.inflight
+                     and not _live_task_handles(app, shape) else None)
+            if reuse is not None:
+                earlier.adopt(app, rt, reuse)
+            else:
+                _fresh_block(app, shape, rt)
+            earlier.record_request(app, rt)  # on the record before its check is sent: a later server finds the block
         checked = block == "warm"
         if checked:  # manager online -> confirm a worker is actually live
             block = await _confirm_worker(app, shape, force=force_canary)
@@ -780,6 +799,7 @@ async def _provision(
             rt.warm_since = rt.presumed_billed_until  # the presumed block lived on: its spend clock continues
         _take_left(app, rt, job)  # names only: a block a facility stop left is this one, or gone (#178)
         rt.block_since, rt.block_job = since, job
+        earlier.record_up(app, rt, job, since)  # its job on the record: a later server checks it with the scheduler
         # the pilot the probes were about is this block now: a later re-bind names the block, never that pilot as queued
         if rt.pilots is not None:
             rt.pilots = rt.pilots.without({rt.pilots.subject, job})
@@ -1020,6 +1040,7 @@ def _void_rejected(app: AppCtx, rt: ShapeRuntime) -> None:
     rt.provisioning_since = None
     _forget_presumed(rt)
     _check_resolved(app, rt)
+    earlier.end_request(app, rt, "rejected")  # no job was issued: nothing of it for a later server to name or release
 
 # -- our checks still queued on a compute user endpoint (#24's evidence) -----------------------------------------------
 

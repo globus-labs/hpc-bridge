@@ -46,6 +46,9 @@ SESSION_KEY = "session"
 _PINNED: dict[str, str] = {}
 # Where the startup pin's default terms came from (its value -> TermsOrigin), for lifespan to bind with the facility.
 _PINNED_ORIGIN: dict[str, TermsOrigin] = {}
+# The catalog entry the startup pin's facility was built from (its value -> CatalogEntry): a billed block's record
+# carries it (hpc_bridge.earlier), so a later server with nothing bound can reach that endpoint again.
+_PINNED_ENTRY: dict[str, CatalogEntry] = {}
 
 
 def _names_machine(entry) -> bool:
@@ -229,6 +232,7 @@ def _pinned_facility(machine: str, entry, **kw) -> Facility:
         _PINNED.pop(machine, None)
         raise
     _PINNED_ORIGIN[machine] = _terms_origin(entry)
+    _PINNED_ENTRY[machine] = entry
     return fac
 
 def _default_local_facility(*, unbound: bool = False) -> LocalFacility:
