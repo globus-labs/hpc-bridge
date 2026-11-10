@@ -212,6 +212,24 @@ async def test_r1_a_facility_endpoint_whose_share_is_unknown_says_more_cores_may
 
 
 # =====================================================================================================================
+# R1 — an exported handoff's config (it goes out as it is, its canary too)
+# =====================================================================================================================
+
+async def test_r1_a_handoff_config_whose_memory_is_above_its_cores_share_is_refused_before_any_canary(tmp_path):
+    from tests.test_handoff_phase2b import _export, _sent, _ssh_app
+
+    shared = SHARED.model_copy(update={"name": "main"})
+    app = _ssh_app(tmp_path, partitions=(shared,))
+    out = await _export(app, {"partition": "main", "walltime": "00:30:00", "max_blocks": 1, "exclusive": False,
+                              "cores_per_node": 8, "mem_per_node": 16})
+    assert out.phase != "needs_confirmation" and _sent(app) == [], out
+    assert "16 GB needs 9 cores' memory share" in out.notice and "`cores_per_node`: 9" in out.notice, out.notice
+    ok = await _export(app, {"partition": "main", "walltime": "00:30:00", "max_blocks": 1, "exclusive": False,
+                             "cores_per_node": 9, "mem_per_node": 16})
+    assert ok.phase == "needs_confirmation" and ok.terms.cores_per_node == 9, ok
+
+
+# =====================================================================================================================
 # R1 — Slurm's own check, hermetic: the block script hpc-bridge's wire renders, run under a fake Slurm 23.11 that
 # raises the job's CPUs to cover its memory (as Anvil did) and a fake srun that refuses as parsl's launcher met it
 # =====================================================================================================================

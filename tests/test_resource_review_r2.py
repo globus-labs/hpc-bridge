@@ -84,8 +84,9 @@ async def test_n1_a_slice_of_anvils_per_core_partition_is_claimed_where_the_temp
     # nothing asked: no exclusive is sent, and the template's own default may be parsl's whole node — costed as one
     assert (res.block.queue, res.block.whole_node, res.block.max_charge) == ("shared", None, 32.0)
     ok = await _ensure_endpoint_up(app, shape="compute", account="cis250223", cores=8, memory_gb=16)
-    assert (ok.block.whole_node, ok.block.cores_per_node, ok.block.max_charge) == (False, 8, 2.25)
-    assert "16 GB at 1.85 GB per core counts as 9 cores" in ok.notice
+    # 16 GB is over 8 cores' share: the block asks for — and bills — 9 (the Anvil live test of 2026-11-10)
+    assert (ok.block.whole_node, ok.block.cores_per_node, ok.block.max_charge) == (False, 9, 2.25)
+    assert "16 GB needs 9 cores' memory share" in ok.notice
 
 
 async def test_n1_expanses_exclusive_false_is_no_slice_where_the_seed_does_not_describe_the_partition():

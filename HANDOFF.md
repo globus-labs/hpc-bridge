@@ -18,6 +18,35 @@ internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_networ
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
 
+## A per-core block's memory share; a reused block's age (2026-11-10, branch `fix/per-core-memory-share`, on f05cc99)
+
+A billed Anvil live test (Slurm 23.11, `shared`: per-core billing, DefMemPerCPU 1896 MB) found two bugs, fixed
+test-first in `tests/test_per_core_memory_share.py` (red on f05cc99, green after):
+- **R1 (blocker).** `ensure_endpoint_up(cores=8, memory_gb=15.5)` sent `--cpus-per-task=8 --mem=15872M`. Slurm raised
+  the job to 9 CPUs (15872 MB > 8 × 1896), parsl's launcher `srun` died at once (`SLURM_CPUS_PER_TASK=9 !=
+  SLURM_TRES_PER_TASK=cpu=8`), the block FAILED in 5 s (MISSING, BadStateException), and the size words said 8 cores.
+  hpc-bridge's own default proposal said "8 cores, 15 GB": said back, 15 GB is over the share too.
+  - **The rule** (`resources.cores_for_memory`; vault `Modules/resources.md`, "The per-core memory share"): where the
+    share is known (MaxMemPerCPU, else DefMemPerCPU), a memory above the cores' share RAISES the cores the block asks
+    for to ceil(memory / share), so the request and Slurm's CPUs agree; the terms say so ("15.5 GB needs 9 cores'
+    memory share on partition 'shared' (1896 MB each): 9 cores are billed, and the block asks for 9, not 8") and the
+    cost counts them. Chosen over capping the memory and refusing: the scheduler gives and bills those cores anyway,
+    and raising never fails at start and never understates.
+  - **Every path:** ensure_endpoint_up (sizes and the default proposal, now never over the share: "14.8 GB"), N
+    nodes, a batch's derived block (`derive_block`'s refusals count the raised CPUs; `_is_derived` matches by
+    `cores_asked`), a Jobs-mode job (`spec_of`: `--cpus-per-task` and the rate), a facility endpoint's template (the
+    cores sent beside its whole-GB memory), and an exported handoff's config (refused, naming the cores to send: it
+    goes out as written). Where no share is known nothing is guessed; the terms say the scheduler may give — and bill
+    — more cores than asked.
+  - A hermetic check of Slurm's own: a fake Slurm that raises the job's CPUs as Anvil did and a fake `srun` making
+    23.11's TRES check, run on the block script the wire renders (parsl's own where importable:
+    `uv run --with parsl==2026.8.10 …`).
+- **R2.** A reused block's "a task runs up to ~880s (the block walltime)" ignored its age (up 5 min of its 15): the
+  bound is what is left of the block's walltime from its known start (`notices._block_left_s`), in the bounds note
+  and a running task's answer.
+- Live re-check to run on Anvil (billed, needs the user's yes): `ensure_endpoint_up(cores=8, memory_gb=15.5)` on
+  `shared` comes up (9 CPUs, `srun` passes), and the default proposal's block comes up.
+
 ## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — PR #246; all 11 live cells pass
 
 - `run_batch` sizes rows the sbatch way (`cores`, `memory_gb`, `gpus`, `concurrency`; `pin`, `pilot`): with no block the

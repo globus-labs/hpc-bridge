@@ -51,6 +51,18 @@ More than one node is one shell on the first node (D2). The spend question carri
 partition's billing weights are known, the most the block can cost (`max_charge`). A size the partition cannot give, or
 the facility's template does not take, is refused before anything is submitted.
 
+**A memory above its cores' share raises the cores** (the billed Anvil live test of 2026-11-10). On a per-core
+partition Slurm raises a job's CPUs to cover a memory above their per-core share — and bills them. A block of 8 cores
+and 15.5 GB on Anvil's `shared` (DefMemPerCPU 1896 MB) went out as `--cpus-per-task=8`; Slurm made it 9 CPUs, and
+parsl's launcher `srun` refused at once (`SLURM_CPUS_PER_TASK=9 != SLURM_TRES_PER_TASK=cpu=8`): the block failed in
+5 s while its terms said 8 cores. Now, wherever the share is known (MaxMemPerCPU, else DefMemPerCPU), the block ASKS for
+ceil(memory / share) cores, its terms say so ("15.5 GB needs 9 cores' memory share on partition 'shared' (1896 MB each):
+9 cores are billed, and the block asks for 9, not 8") and its cost counts them — on every path that sends a block
+(`ensure_endpoint_up`, a batch's derived block, a Jobs-mode job, N nodes, a facility endpoint's template; an exported
+handoff that crosses is refused). hpc-bridge's own default proposal never exceeds the share (it said "15 GB" for
+8 × 1896 MB; now 14.8 GB). Where no share is known, nothing is guessed: the terms say the scheduler may give — and bill —
+more cores than asked. Rule and paths: [[resources]], "The per-core memory share".
+
 **A block derived from a batch's rows starts only on terms an answer showed** (the Anvil live test's review rounds 1
 to 3, 2026-11-05). `run_batch` with no block confirmed derives the block from the rows' size ([[batch]]); its
 `confirm_spend=True` starts that block only when an answer of this process already quoted exactly it — the same

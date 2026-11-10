@@ -194,6 +194,27 @@ installed plugin only when that version changes); git tags mark releases.
   server gone, the block it ran on retired, a meter reading hours old, a deadline passed), and is left as it is.
 
 ### Fixed
+- **A block whose memory is above its cores' share asks for, and is billed, the cores it needs.** In a billed Anvil
+  test (2026-11-10, `shared`: Slurm 23.11, per-core billing, 1896 MB per core), 8 cores with 15.5 GB went out as
+  `--cpus-per-task=8 --mem=15872M`. Slurm raised the job to 9 CPUs to cover the memory, and parsl's launcher `srun`
+  failed at once ("cpus-per-task set by two different environment variables"). The block failed in 5 s, and its terms
+  had said 8 cores.
+  - Where the partition's per-core memory share is known (MaxMemPerCPU, else DefMemPerCPU), the block now asks for
+    the cores the memory needs, here 9. The terms say so: "15.5 GB needs 9 cores' memory share on partition 'shared'
+    (1896 MB each): 9 cores are billed, and the block asks for 9, not 8". The cost counts them too.
+  - Raising the cores was chosen over refusing the memory: the scheduler gives and bills those cores anyway, and a
+    raised block never fails at start or understates the bill.
+  - hpc-bridge's own proposal on a per-core partition never exceeds the share: "8 cores, 14.8 GB", not "15 GB", which
+    said back was over it too.
+  - The same rule holds for a batch's derived block, a Jobs-mode job, several nodes and a facility endpoint's template
+    (whose memory goes in whole GB: 1.9 GB is 2 GB, over one core's share). An exported handoff's config that crosses
+    the share is refused, naming the cores to send.
+  - Where no share is known, nothing is guessed: the terms say the scheduler may give, and bill, more cores than asked.
+- **A reused block's task bound counts its age.** A block an earlier session left running, 5 minutes into its 15, read
+  "a task runs up to ~880s (the block walltime)". The bound is now what is left of its walltime (~600 s), wherever a
+  block's start is known.
+
+### Fixed
 The batch demo on the fake cluster (2026-11-03, `agentic/fakecluster/bin/try_batch.sh`), each checked against the raw
 tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
 - **`status(id, wait_s)` waits the whole `wait_s`** unless the batch ends, a row fails, is lost (or presumed so) or is
@@ -274,6 +295,14 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
 - The unit tier no longer reads the developer's `~/.ssh/config` or the network for the pin: `conftest` fakes
   `remote._ssh_config` (no Host blocks) and `remote._tcp_answers` (every host answers) unless a test is marked
   `client_view`. The Perlmutter #1 tests now assert the dead pin is dropped before any SSH reaches it.
+- `tests/test_per_core_memory_share.py` (18 tests, all red on f05cc99): the exact Anvil case (8 cores with 15.5 GB,
+  and the 8-core default said back as 15 GB), a proposal held to a MaxMemPerCPU, memory asked alone, N nodes, a
+  per-job cap, an unknown share, a batch's derived block crossing the share (asked memory, and default memory by its
+  rounding), a Jobs-mode job, Anvil's facility endpoint, an exported handoff, and a reused block's task bound. One is
+  hermetic Slurm: a fake that raises the job's CPUs to cover its memory, as Anvil did, and a fake `srun` making
+  23.11's check, run on the block script the wire renders (parsl's own with `--with parsl==2026.8.10`). It passes
+  on the request now sent and fails on the one sent on 2026-11-10. Five older tests that asserted the old count or
+  "15 GB" now assert the raised count and 14.8 GB.
 
 ## 0.1.26 — 2026-10-31 — blocks sized to the work; returning users reattach, repair and get terms the scheduler takes
 

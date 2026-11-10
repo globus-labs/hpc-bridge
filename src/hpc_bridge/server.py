@@ -120,6 +120,7 @@ from .notices import (  # noqa: F401 - re-exported
     _SSH_AUTH_DENIED,
     _allocating_notice,
     _billed_bounds_note,
+    _block_left_s,
     _block_terms,
     _busy_session_outcome,
     _check_pending_notice,
@@ -2536,7 +2537,8 @@ async def _dispatch_counted(
                     released = app.shapes.get(shape) is not rt
                     out = _with_submission_notice(
                         _running_outcome(app, task_id, runner.walltime, reset=reset,
-                                         block_state="cold" if released else "warm"), sub, shape)
+                                         block_state="cold" if released else "warm",
+                                         block_left_s=None if released else _block_left_s(rt)), sub, shape)
                     gid = getattr(fut, "task_id", None)
                     if isinstance(gid, str) and batch.is_task_uuid(gid):
                         out.globus_task_id = gid
@@ -2750,7 +2752,8 @@ async def _poll_task(app: AppCtx, task_id: str, wait: float = 0.0) -> ShellOutco
                                      facility_mep=not _has_login_shape(app), block_state=block,
                                      lost_in=still.ceiling_s + warmth._LOST_TASK_GRACE_S
                                      - (time.monotonic() - still.submitted_at))
-    return _running_outcome(app, task_id, ceiling_s, client_cancelled=cancelled, reset=reset, block_state=block)
+    return _running_outcome(app, task_id, ceiling_s, client_cancelled=cancelled, reset=reset, block_state=block,
+                            block_left_s=_block_left_s(current) if block == "warm" else None)
 
 
 @mcp.tool()

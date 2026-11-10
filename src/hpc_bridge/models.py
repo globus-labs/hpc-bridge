@@ -236,6 +236,11 @@ class BlockTerms(BaseModel):
     memory_gb: float | None = None          # per node
     memory_default: bool = False            # the partition's default memory per core (DefMemPerCPU): not sent
     gpus_per_node: int | None = None
+    # A memory above the cores' per-core memory share (hpc_bridge.resources.cores_for_memory, the Anvil live test of
+    # 2026-11-10): `cores_per_node` is the raised count the block asks for and bills, `cores_asked` the count asked
+    # (None: not raised); `memory_share_mb` the partition's share in MB per core (None: not known).
+    cores_asked: int | None = None
+    memory_share_mb: int | None = None
     size_source: SizeSource | None = None
     # Where a size nothing here asked for comes from: "parsl's default: exclusive", "the facility's scheduler_options",
     # "the facility template's own default (parsl's is the whole node)" … — the terms never claim a slice they cannot

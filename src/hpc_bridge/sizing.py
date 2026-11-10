@@ -31,6 +31,7 @@ from collections.abc import Iterable, Mapping
 from dataclasses import asdict, dataclass, field
 from typing import Any
 
+from . import resources
 from .models import PartitionShape
 
 # Rows at once on one node until a per-node watcher replaces each row's own 1 s loop (the follow-up: 64 rows measured
@@ -497,14 +498,27 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
                             workers=None if workers_fixed is not None else fits + 1, whole_node=True)
     if shape is not None:
         multi = "A batch over several nodes is phase 3's campaign pools."
-        if shape.cores and cores > shape.cores:
-            fits = (shape.cores - 1) // k
-            raise SizingRefusal(f"{n} rows × {k} CPUs + 1 for interactive commands = {cores} CPUs; a node of "
+
+        def held(rows: int) -> int:
+            """The CPUs `rows` rows' block holds: N·k + 1, raised where its memory is above their per-core memory share
+            (resources.cores_for_memory — the block asks for, and is billed, that many: the Anvil live test of
+            2026-11-10)."""
+            c = rows * k + 1
+            mem = max(1, math.ceil((rows * m + pool_mb(workers_fixed or rows + 1)) / 1024))
+            return resources.cores_for_memory(c, mem, shape) or c
+
+        holds = held(n)
+        why = (f" ({memory_gb} GB needs {holds} cores' memory share, {resources.memory_share_mb(shape)} MB each)"
+               if holds > cores else "")
+        if shape.cores and holds > shape.cores:
+            fits = max([r for r in range(1, n) if held(r) <= shape.cores], default=0)
+            raise SizingRefusal(f"{n} rows × {k} CPUs + 1 for interactive commands = {cores} CPUs{why}; a node of "
                                 f"{shape.name!r} has {shape.cores}: at most {fits} rows at once on one node. {multi}")
         cap = shape.max_cores_per_job or shape.max_cores_per_node
-        if cap and cores > cap:
-            raise SizingRefusal(f"{cores} CPUs is over {shape.name!r}'s per-job cap of {cap}: at most "
-                                f"{max(0, (cap - 1) // k)} rows of {k} CPUs at once")
+        if cap and holds > cap:
+            fits = max([r for r in range(1, n) if held(r) <= cap], default=0)
+            raise SizingRefusal(f"{holds} CPUs{why} is over {shape.name!r}'s per-job cap of {cap}: at most "
+                                f"{fits} rows of {k} CPUs at once")
         if shape.memory_gb and memory_gb > shape.memory_gb:
             fits = int((shape.memory_gb * 1024 - pool_mb(n + 1)) // m)
             raise SizingRefusal(f"{n} rows × {_gb(m)} + the pool's own = {memory_gb} GB; a node of {shape.name!r} "

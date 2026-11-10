@@ -78,7 +78,8 @@ async def test_the_spend_question_proposes_a_slice_on_a_per_core_partition():
     assert (b.whole_node, b.cores_per_node, b.memory_gb, b.memory_default, b.size_source) == (
         False, 8, 14.8, True, "proposed")
     assert (b.max_charge, b.charge_basis) == (4.0, "8 cores × 0.5 h")
-    assert ("1 node × 8 cores, 15 GB (the partition's default per core) for up to 00:30:00 (at most 0.5 node-hours; "
+    # 8 × 1896 MB said to one decimal, never up: "15 GB" said back is over the share (the Anvil live test, 2026-11-10)
+    assert ("1 node × 8 cores, 14.8 GB (the partition's default per core) for up to 00:30:00 (at most 0.5 node-hours; "
             "at most 4 billing units: 8 cores × 0.5 h)") in res.notice
     assert "hpc-bridge's proposal for this per-core partition, a slice and not the whole node" in res.notice
     assert "with cores=/memory_gb=/gpus=/nodes= in the same call" in res.notice
@@ -300,15 +301,17 @@ async def test_a_facility_endpoint_takes_the_size_its_strict_schema_lists(monkey
     assert (res.block.whole_node, res.block.cores_per_node, res.block.max_charge) == (None, 1, 32.0)
     ok = await _ensure_endpoint_up(app, shape="compute", account="cis250223", cores=8, memory_gb=16)
     # cores= sends exclusive: false where the schema lists it — but with no template read, nothing shows the template
-    # renders it: the size is asked, and the terms still count the whole node it may be (review round 2)
-    assert ok.block.cores_per_node == 8 and ok.block.whole_node is None and ok.block.size_source == "this_call"
+    # renders it: the size is asked, and the terms still count the whole node it may be (review round 2). 16 GB is
+    # over 8 cores' share of 1896 MB: 9 cores are sent (the Anvil live test of 2026-11-10)
+    assert ok.block.cores_per_node == 9 and ok.block.cores_asked == 8, ok.block
+    assert ok.block.whole_node is None and ok.block.size_source == "this_call"
     assert ok.block.max_charge == 32.0 and "a whole node's worth" in ok.notice
     gpus = await _ensure_endpoint_up(app, shape="compute", gpus=1)
     assert "this facility's endpoint sets the block size: its published template has no `gpus_per_node` setting" in (
         gpus.notice)
     await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
     sent = app.built[-1]
-    assert (sent["cores_per_node"], sent["mem_per_node"], sent["exclusive"]) == (8, 16, False)
+    assert (sent["cores_per_node"], sent["mem_per_node"], sent["exclusive"]) == (9, 16, False)
     assert "gpus_per_node" not in sent
     whole = await _ensure_endpoint_up(app, shape="compute", whole_node=True)
     assert whole.block.whole_node is True and "cores_per_node" not in _compute(app)
