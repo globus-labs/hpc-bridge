@@ -51,8 +51,17 @@
   - **An unreadable ledger** (`ledger_unreadable`): the blocks are released and the answer is never `down`.
   - **After any stop** the facility's envelopes admit nothing more.
 
+- **The job's env** (block environments, PR 3; [[envs]]). `submit_job(…, env=)` takes the job's own env, else the session's.
+  - **While it builds:** the answer is `busy` / `env_building` and nothing is submitted. That includes an env left unchecked: billed work never goes against an env not known ready (`envs.ready_for_billed`, review SS6). A ready pending env is promoted before the session's is read (R2-S11).
+  - **Its refusal on the node (SS2).** The job's record keeps a `nonce_key`; its script's activation writes `env_refused` beside it, carrying the job's nonce. A job that ends with exit 88 has that mark read (`_env_refusal_of`, believed only with its nonce): status says the job ran nothing and why, the reason is kept on the ledger, and the refusal is believed as run_shell's (`envs.believe_refusal`), so a resubmit checks or rebuilds the env first.
+  - **A failed build** is `_refused`.
+  - **The job script** (`job_script`, through `Spec.env_rec`) activates the env after the session's env line. A gone env exits 88 with the refusal on stderr.
+  - **Where it shows:** the ledger's `job.env`, `JobInfo.env` (`job_info(j, app)`: its state as this server knows it, review S11) and `JobTerms.env`.
+  - **What it says:** the job's own built env says what the session's would (`envs.built_notice`, S14; `submit_job` wraps `_submit_spec`, which holds the rest of the submit).
+  - **A gated hand submit** (D2) runs unmodified, without the env.
+
 > [!warning] The envelope binds only what hpc-bridge starts
 > `terms.binds` says it and the envelope repeats it. A submit the lexer cannot see (Python's subprocess, an `sbatch` inside a script) passes the gate; the meter's sweep counts and names it. A gated hand submit's jobs carry no envelope deadline (the command runs as written): they are counted and adopted after the fact, which is the limit the design states. A stolen Compute token is not bound at all. The site backstop is "none" unless the user names one; on the fake cluster's `site` profile, `AccountingStorageEnforce=…,safe` makes Slurm hold a job that could pass its GrpTRESMins.
 
 ## See also
-[[meter]] · [[ledger]] · [[batch]] · [[server]] · [[scheduler_ops]] · [[Batch and swarm execution]] · [[Resource requests]]
+[[meter]] · [[ledger]] · [[batch]] · [[server]] · [[scheduler_ops]] · [[Batch and swarm execution]] · [[Resource requests]] · [[envs]]

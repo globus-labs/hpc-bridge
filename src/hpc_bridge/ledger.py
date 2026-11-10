@@ -514,7 +514,10 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                             ("pilot_saved", "text"),
                             # the rows' size is still the user's to give (a sizing pause; cleared by a resize), and
                             # why the user's yes is owed as well while it waits for it (a reap, a restart, a drain)
-                            ("size_owed", "integer default 0"), ("needs_yes", "text")],
+                            ("size_owed", "integer default 0"), ("needs_yes", "text"),
+                            # block environments: the env every row runs in (JSON: envs.record — kind, how, key,
+                            # Python, path, and what activates or rebuilds it after a restart)
+                            ("env", "text")],
                   "task": [("sent_job", "text"), ("sent_uec", "text"), ("unknown_since", "real"), ("unheld", "text"),
                            ("req_cores", "integer"), ("req_memory_mb", "integer"), ("req_gpus", "integer"),
                            ("peak_rss_kb", "integer"), ("cpu_s", "real"), ("wall_s", "real"), ("nproc", "integer"),
@@ -524,7 +527,8 @@ _ADDED_COLUMNS = {"batch": [("owner_start", "text"), ("want_at", "real"),
                            # really ran pinned (the wrapper's own word)
                            ("req_mem_default", "integer"), ("pinned", "integer")],
                   "job": [("cancel_requested", "integer default 0"), ("unheld", "integer default 0"),
-                          ("hand", "text")]}
+                          ("hand", "text"),
+                          ("env", "text")]}   # block environments: the env its job.sh activates (as a batch's)
 
 
 class Ledger:
@@ -591,9 +595,10 @@ class Ledger:
                   state: str = "admitting", now: float | None = None, cores: int | None = None,
                   memory_mb: int | None = None, gpus: int | None = None, concurrency: int | None = None,
                   pin: bool = True, pilot: int = 0, sized: bool | None = None,
-                  sizing_defaulted: Iterable[str] = ()) -> str:
+                  sizing_defaulted: Iterable[str] = (), env: dict[str, Any] | None = None) -> str:
         """`cores` / `memory_mb` / `gpus` / `concurrency` (batch row sizing): each row's size and the most at once;
-        `sized` (default: any of them given) — the batch is admitted against the block's measured pool."""
+        `sized` (default: any of them given) — the batch is admitted against the block's measured pool. `env` (block
+        environments): the env every row runs in, recorded as given (None: none)."""
         at = time.time() if now is None else now
         if sized is None:
             sized = any(v is not None for v in (cores, memory_mb, gpus, concurrency)) or bool(pilot)
@@ -601,11 +606,12 @@ class Ledger:
             c.execute("insert into batch (id, created_at, facility, endpoint_id, session_id, uec_hash, command, "
                       "script_hash, task_walltime_s, results_dir, idempotent, capacity, state, owner_host, owner_pid, "
                       "owner_start, heartbeat, cores, memory_mb, gpus, concurrency, pin, pilot, sized, "
-                      "sizing_defaulted) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
+                      "sizing_defaulted, env) values (?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?,?)",
                       (batch_id, at, facility, endpoint_id, session_id, uec_hash, command, script_hash,
                        float(task_walltime_s), results_dir, int(bool(idempotent)), int(capacity), state, owner.host,
                        owner.pid, owner.started, at, cores, memory_mb, gpus, concurrency, int(bool(pin)),
-                       int(pilot or 0), int(bool(sized)), json.dumps(list(sizing_defaulted))))
+                       int(pilot or 0), int(bool(sized)), json.dumps(list(sizing_defaulted)),
+                       json.dumps(env) if env else None))
             c.executemany("insert into task (batch_id, idx, row_json, state) values (?,?,?,'backlog')",
                           [(batch_id, i, json.dumps(r)) for i, r in enumerate(rows)])
             c.execute("insert into event (at, batch_id, kind, data) values (?,?,?,?)",

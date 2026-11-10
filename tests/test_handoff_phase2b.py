@@ -568,7 +568,7 @@ async def test_no_value_becomes_shell_code(tmp_path, monkeypatch, key, value):
 
 V1_SECTIONS = {"schema", "version", "handoff_id", "created_at", "expires_at", "hpc_bridge_version", "facility",
                "endpoint", "user_endpoint_config", "template", "worker", "client_requirements", "terms", "validation",
-               "release"}
+               "release", "env"}   # env: block environments, additive (null with no env; a v1 reader ignores it)
 
 
 async def test_the_record_names_no_consumer(tmp_path, monkeypatch):

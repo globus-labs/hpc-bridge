@@ -243,6 +243,9 @@ class TaskHandle:
     # polled.
     guard: Guard | None = None
     epoch: int = 0  # its runtime's block_epoch when it was sent: a switch since then means it ran on the old block
+    # Its env's activation and that dispatch's nonce (block environments: (nonce, envs.Activation)); None: no env. A
+    # result its env refused ran nothing: it is said as run_shell says it, however late it is polled (review S9).
+    env: Any = None
 
 
 @dataclass
@@ -484,6 +487,22 @@ class AppCtx:
     # (warmth._drop_all_shapes: a connect_facility, a teardown or a detach); a new Globus login keeps them, as it keeps
     # a live shape's.
     compute_choice: dict[str, Any] = field(default_factory=dict)
+    # Block environments (hpc_bridge.envs): the session's env (an envs.EnvSpec, the user's choice for both shapes' user
+    # commands — never hpc-bridge's internal session), a built env asked for that is still being built (`env_pending`:
+    # it becomes the session's once ready, the session's own serving meanwhile — review S4) and what became of it, said
+    # once (`env_note`), what this server knows of each env by root and key (its state, a build out, when its full check
+    # last passed), whether "installing runs build code" was said, and the runner env builds and checks go to — the
+    # login node's own user endpoint for them, never the login shape's one worker — with the endpoint and config it was
+    # made for (`env_runner_key`: another is a new runner). Like the choice above they outlive a stop, and are
+    # forgotten with the binding (warmth._drop_all_shapes).
+    env_spec: Any = None
+    env_seq: int = 0   # each `choose` of an env: one that waited while a later one ran applies nothing (review R2-S6)
+    env_pending: Any = None
+    env_note: str | None = None
+    env_known: dict[str, Any] = field(default_factory=dict)
+    env_said_install: bool = False
+    env_runner: Any = None
+    env_runner_key: Any = None
     # The facility's billing unit, from its allocation listing (connect_facility: e.g. "SU"); None: not known, and the
     # terms' cost says "billing units". Forgotten with the binding's shapes (warmth._drop_all_shapes).
     charge_unit: str | None = None

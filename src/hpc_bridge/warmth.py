@@ -33,7 +33,7 @@ from typing import Any, Literal
 
 from globus_compute_sdk.errors import SerdeError, TaskExecutionFailed
 
-from . import dispatch, resources, session_shell
+from . import dispatch, envs, resources, session_shell
 from .config import (
     CANARY_TTL_S,
     SYNC_WAIT_S,
@@ -366,6 +366,11 @@ def _drop_all_shapes(app: AppCtx, *, bank: bool) -> float:
     spent = _total_session_spend(app) if bank else 0.0
     app.shapes.clear()
     app.compute_choice.clear()  # chosen for this binding: a stop keeps them, a new binding or a teardown does not
+    # the session's env and what is known of its builds are the binding's too (block environments); a build still out
+    # runs on to its end on the facility, and is found there by the next binding's own check (envs.ensure_built)
+    app.env_spec = app.env_pending = app.env_note = None
+    app.env_known.clear()
+    envs.drop_runner(app)
     app.charge_unit = None  # the binding's allocation listing said it
     app.released_spend = 0.0  # the binding's released blocks are in `spent`; a new binding starts from zero
     app.state = EndpointState()
@@ -854,6 +859,7 @@ async def _repair_broken_env(app: AppCtx, shape: str, rt: ShapeRuntime, block: B
     app.env_repair_tasks.pop(eid, None)
     app.env_repair_handoff.pop(eid, None)
     app.env_repaired.add(eid)   # done only once the facility verified it (a restart it claims is one that happened)
+    envs.drop_runner(app)   # the manager restarted: the build runner is made afresh too (block environments, S7)
     app.env_repairs[eid] = (f"the endpoint could not start a user endpoint ({cause}): its environment was broken. "
                             f"hpc-bridge {done}. ")
     if new_eid and new_eid != eid:
@@ -2089,6 +2095,7 @@ def _forget_identity_verdicts(app: AppCtx) -> None:
             rt.no_account = None
             rt.last_canary = None
         rt.runner_stale = True
+    envs.drop_runner(app)   # the build runner's Executor too (block environments: review S7)
 
 async def _ensure_warm_runner(app: AppCtx, shape: str) -> ProvisionResult | None:
     """Ensure a worker is live and the shape's runner is bound to it; returns the block state
@@ -2109,12 +2116,15 @@ def _busy_session(app: AppCtx, shape: str, session_id: str) -> str | None:
 
 def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, ceiling_s: float, *,
                    client_cancelled: bool = False, runtime: ShapeRuntime | None = None, reset: bool = False,
-                   submission: Submission | None = None, guard: session_shell.Guard | None = None) -> str:
+                   submission: Submission | None = None, guard: session_shell.Guard | None = None,
+                   env: Any = None) -> str:
     """Register a still-running task as a poll handle and return its id. Caller holds app.lock — or calls it in one
     synchronous step with no await around it (a cancelled call, which must not wait for the lock), which nothing can
     interleave with either. `runtime`: the shape runtime it was dispatched on (its result is noted there only while
     that runtime is still the shape's — a released block's runtime is never rebuilt for it). `guard`: its wrong-block
-    guard (the job and nonce), so a refusal found when it is polled is still the replacement found."""
+    guard (the job and nonce), so a refusal found when it is polled is still the replacement found. `env`: its env's
+    (nonce, activation) — block environments — so a refusal found when it is polled is still a command that never
+    ran (review S9)."""
     app.task_seq += 1
     task_id = f"{shape}-{app.task_seq}"
     sent_on = runtime if runtime is not None else app.shapes.get(shape)
@@ -2131,6 +2141,7 @@ def _register_task(app: AppCtx, shape: str, session_id: str, command: str, fut, 
         submission=submission,
         guard=guard,
         epoch=sent_on.block_epoch if sent_on is not None else 0,
+        env=env,
     )
 
     def _stamp(_f: object) -> None:  # runs on the SDK's thread when the task resolves; one float assignment
@@ -2171,6 +2182,10 @@ def _resolve_task(app: AppCtx, task_id: str) -> ShellOutcome | None:
         # refused on a replacement block, however late it is polled (a client-cancelled call's command included)
         return _wrong_block_outcome(app, handle.shape, handle.runtime, handle.guard, refused, reset=handle.reset,
                                     at=handle.done_at, epoch=handle.epoch)
+    if handle.env is not None:   # block environments: its env refused it on the node — it ran nothing (review S9)
+        nonce, act = handle.env
+        if (ref := envs.refusal(out.exit_code, out.stderr_snippet, nonce)) is not None:
+            out.phase, out.notice = envs.refused(app, ref, act, out.stderr_snippet or "")
     current = app.shapes.get(handle.shape)
     # proof of life for the block it ran on — not a reason to rebuild a released shape, nor news about a newer block
     # (a released runtime, or a switch since it was sent: the same runtime now stands for another block)
