@@ -19,6 +19,7 @@ from __future__ import annotations
 
 import os
 import resource
+import shlex
 import shutil
 import subprocess
 import sys
@@ -91,7 +92,7 @@ if [ "${SLURM_OVERLAP:-}" != 1 ]; then
   echo "srun: Job 101 step creation temporarily disabled, retrying (Requested nodes are busy)" >&2; exit 1
 fi
 while [ $# -gt 0 ]; do case "$1" in -*) shift;; *) break;; esac; done
-"$(dirname "$0")/libexec/srun" 2 &
+"$(dirname "$0")/libexec/srun" -c 'sleep "$0"; :' 2 &
 "$@"
 rc=$?
 wait
@@ -101,9 +102,12 @@ exit $rc"""
 def _fake_srun(tmp: Path) -> None:
     _fake_tool(tmp, "srun", _FAKE_SRUN)
     (tmp / "bin" / "libexec").mkdir(exist_ok=True)
-    link = tmp / "bin" / "libexec" / "srun"          # `sleep` under the name srun: the step's client, as ps shows it
+    # the step's client, as ps shows it: bash under the name srun, sleeping (`:` last, so bash never execs the sleep).
+    # Not `sleep` itself under that name: Ubuntu 26.04's is uutils coreutils' multicall binary, which refuses to run
+    # under a name not its own. Not a script: macOS's ps names a script's process by its interpreter.
+    link = tmp / "bin" / "libexec" / "srun"
     if not link.exists():
-        link.symlink_to(shutil.which("sleep"))
+        link.symlink_to(_BASH)
 
 
 def test_f3_a_rows_srun_runs_under_slurm_23s_environment(tmp_path):
@@ -131,9 +135,24 @@ def test_f3_on_slurm_22_no_tres_variable_is_made_up(tmp_path):
     assert rep.tail.strip() == "[unset] 3", rep.tail
 
 
-def test_f3_the_result_says_when_a_row_ran_srun_steps(tmp_path):
+# Ubuntu 26.04's `sleep` is uutils coreutils' multicall binary, which refuses to run under a name not its own ("Security
+# violation: Requested utility `srun` does not match executable name"). A `sleep` that refuses another name as that one
+# does, and runs the real one under its own.
+_MULTICALL_SLEEP = """case "${{0##*/}}" in sleep) exec {real} "$@";; esac
+echo "Security violation: Requested utility \\`${{0##*/}}\\` does not match executable name" >&2
+exit 1"""
+
+
+@pytest.mark.parametrize("sleep", ["host", "multicall"])
+def test_f3_the_result_says_when_a_row_ran_srun_steps(tmp_path, monkeypatch, sleep):
     """A row's srun step runs on CPUs Slurm picks within the block, not on the row's slot, and outside its memory
-    watch: the result says the row ran one (seen by the watcher while it ran), so status can say so."""
+    watch: the result says the row ran one (seen by the watcher while it ran), so status can say so. Whatever `sleep`
+    the host has: the fake step's client was `sleep` under the name srun, and on Ubuntu 26.04 it died at once, unseen
+    (CI, 2026-11)."""
+    if sleep == "multicall":
+        (tmp_path / "multicall").mkdir()
+        _fake_tool(tmp_path / "multicall", "sleep", _MULTICALL_SLEEP.format(real=shlex.quote(shutil.which("sleep"))))
+        monkeypatch.setenv("PATH", f"{tmp_path / 'multicall' / 'bin'}{os.pathsep}{os.environ['PATH']}")
     _fake_srun(tmp_path)
     ran = _row(tmp_path, "srun -n1 true", _slot(cores=1), **_ANVIL_STEP_ENV)
     plain = _row(tmp_path, "sleep 2", _slot(cores=1), index=1, **_ANVIL_STEP_ENV)

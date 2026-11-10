@@ -19,6 +19,8 @@ and the endpoint ids are this test process's own (`_own`).
 """
 import os
 import re
+import shlex
+import shutil
 import subprocess
 import sys
 import time
@@ -369,6 +371,55 @@ def test_a_bad_state_in_an_hour_a_clock_change_repeats_is_no_evidence(tmp_path):
     _put_cell(tmp_path, cell, 3, started=datetime(2026, 10, 15, 12, 0, 0))
     out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [3]), tmp_path, env=tz)
     assert next(ln.split() for ln in out.splitlines() if ln.startswith("HPCB_UEP 1 "))[15] == "0"
+
+
+@needs_posix_shell
+def test_a_bad_state_at_a_local_time_a_clock_change_skips_is_no_evidence(tmp_path):
+    # a local time the spring-forward skips names no instant: GNU's date refuses it, but uutils coreutils' (Ubuntu
+    # 26.04) and BSD's (macOS) place it an hour later. A log's time is taken only when it turns back into that very time.
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    bad = next(ln for ln in _fixture(cell.compute).splitlines() if "Setting bad state" in ln)
+    to_bad = _stamps(bad)[0] - _stamps(_fixture(cell.compute))[0]
+    _put_cell(tmp_path, cell, 3, started=datetime(2026, 3, 8, 2, 30, 0) - to_bad)       # 02:30: never on a clock there
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [3]), tmp_path, env={"TZ": "America/Chicago"})
+    times = [ln.split()[12:16] for ln in out.splitlines() if ln.startswith("HPCB_UEP ")]
+    assert times == [["2026-03-08", "02:30:00", "-", "1"]] * 2, times
+    assert "cannot place" in _verdict(out, cell, 3, 10_000).why
+
+
+# Ubuntu 26.04's `date` (uutils coreutils 0.10.0) reads `-d` leniently: "- -" — what the command passed for a log with no
+# bad state — is the current time there, rc 0 (GNU's reads it as today's midnight; BSD's has no -d). So the two samples'
+# rows differed by the second each was taken in, and a log that had not failed read "its user endpoint changed while
+# hpc-bridge looked" (every time with the real 3 s gap; CI on ubuntu-latest = 26.04, 2026-11). This `date` answers "- -"
+# as that one does, and passes everything else to the real one.
+_UUTILS_DATE = """#!/bin/sh
+if [ "$1" = -d ] && [ "$2" = "- -" ]; then shift 2; exec {real} "$@"; fi
+exec {real} "$@"
+"""
+
+
+@needs_posix_shell
+def test_a_log_with_no_bad_state_carries_no_time_whatever_date_makes_of_none(tmp_path):
+    from hpc_bridge import scheduler_ops
+
+    cell = REJECTED
+    started = datetime.now().replace(microsecond=0) - timedelta(minutes=5)
+    shift = started - _stamps(_fixture(cell.compute))[0]
+    full = _restamp(_named(_fixture(cell.compute), 7, None), shift).splitlines()
+    gc = tmp_path / "gc"
+    _put_cell(gc, cell, None, started=started, compute="".join(ln + "\n" for ln in full if "Setting bad state" not in ln))
+    tools = tmp_path / "tools"
+    tools.mkdir()
+    (tools / "date").write_text(_UUTILS_DATE.format(real=shlex.quote(shutil.which("date") or "date")))
+    (tools / "date").chmod(0o755)
+    # the samples more than a second apart (3 s in production), so a time read as "now" differs between them
+    out = _run(scheduler_ops._uep_evidence_cmd(cell.eid, [7], gap_s=1.1), gc,
+               env={"PATH": f"{tools}{os.pathsep}{os.environ['PATH']}"})
+    times = [ln.split()[12:16] for ln in out.splitlines() if ln.startswith("HPCB_UEP ")]
+    assert times == [["-", "-", "-", "1"]] * 2, times
+    assert "no bad state since it last started" in _verdict(out, cell, 7, started - timedelta(seconds=1)).why
 
 
 @needs_posix_shell
