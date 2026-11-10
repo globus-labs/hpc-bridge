@@ -13,7 +13,7 @@ facility requires an allocation), and stop is honest (`down` confirmed / `draini
 tools; the operational guidance also ships over MCP (`hpcbridge://guidance/operations`) for hosts without skills.
 
 Unit tier **1582 passed, 4 skipped**; agentic harness hermetic tests **1056 passed** (the CI list: 1032). The live tier has
-**122 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
+**123 scenarios** and a local **fake cluster with 14 profiles** (`default site mep totp pbs lmod f2b totp_f2b polaris
 internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_network host_forward bastion vip`,
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
@@ -101,6 +101,70 @@ Fixed test-first (`tests/test_anvil_live_findings.py`, `…_node.py`; node tests
   admits (it had built the block, then paused for a second yes); a done batch's resize is refused naming a new batch;
   `uses_module` sees `if`/`elif`/`while`/`until`/`time`/`command`/case-pattern/assignment starts and not `${ml}`; the
   PATH scrub keeps a trailing empty entry.
+
+## A block an earlier server left running (2026-11-06, branch `fix/restart-block-record`, on PR #248)
+
+Free agent chains on fake `default` (each phase a fresh server on the same state dir, no teardown between): a new
+session's connect said "Nothing is started or billed yet" while job 40 ran; its yes added a second block (40+41, 9+10,
+25+26); its stop before any connect said `down`, "no endpoint was up", releasing nothing (job 33); only a stop after a
+connect released both. Fixed test-first (`tests/test_restart_block_record.py`; module `earlier`, vault
+`Modules/earlier.md`):
+- every billed block request is recorded in the ledger (`block`) before its check is sent, with its job once a check
+  reports it; a later server checks the records against the scheduler (the endpoint's pilots by its marker, over the
+  free login shape) before it names, reuses or releases anything; a record whose job is gone is closed quietly;
+- connect_facility and the spend question name what still bills; a yes on exactly its terms takes its block request
+  (no second block); a yes that would add a second one no spend question named asks first (the conservative choice:
+  the connect's naming alone does not count);
+- stop_endpoint with nothing bound reaches each recorded endpoint again (the facility from the recorded catalog entry,
+  a scratch context, the usual stop) and is `down` only when that stop is; unreachable (no Globus login, offline, no
+  entry) is `draining`, naming the job and the user's own cancel; a facility endpoint's records get the NO CANCEL
+  answer; another server still running keeps its block.
+- Live cell to run (scripted chain, kept out of the sweep until its proof): `HPCB_OPERATOR=script HPCB_TARGET=fake
+  HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh restart_cold_stop`. Worth re-running too: the free chain cells that
+  showed it, and `batch_restart_resume` (its resume now takes the killed server's block over when its config matches).
+- **Review round 1** (branch `fix/restart-block-record-r1`, `tests/test_restart_block_record_r1.py`):
+  - blocker: a cold stop ran the block release alone and cancelled a handoff consumer's pool unasked; it now runs the
+    WHOLE stop on the scratch context (handoff question and scope, Jobs-mode keep/cancel, busy refusal), asks first for
+    every endpoint, and holds the session's lock;
+  - a startup pin's first billed call brings up the free login shape first, so the record is read before any block
+    (it had started a second block beside job 40), and a pinned session's records carry its catalog entry;
+  - a record re-opened after it ended drops the ended block's job and age; with no scheduler read a record closes only
+    past its walltime (never seen up: three days of queue allowance plus its walltime; two days when unknown);
+  - `restart_cold_stop`'s world check keeps squeue's stderr and exit status: a failing squeue is UNVERIFIABLE;
+  - live `batch_restart_resume` FAILED on d205841: Globus answered every REST pull with a 500 (StorageException), and
+    on the reused block the killed server's three ended rows held the whole window until the block idled out (then
+    read as a reap). A row's slot now follows the server that SENT it (`task.sent_*`): a gone sender's frees after
+    task_walltime_s + HOLD_MARGIN_S. Re-run it live;
+  - nits: a record of another host or pid namespace is never taken for gone; one endpoint's failure is its own
+    `draining`; the cold lead says whether it reached the endpoint; export_handoff names an earlier block; an
+    unreachable record is "recorded, not reachable from here", with the user's own cancel; the ledger adds columns
+    in one immediate transaction (concurrent opens).
+- **Review round 2** (branch `fix/restart-block-record-r2`, `tests/test_restart_block_record_r2.py`):
+  - liveness keys on a stable machine identity (`owner_machine`: /etc/machine-id, macOS IOPlatformUUID), never the
+    hostname — a laptop's network change had hidden every record of this machine; unknown means this machine's;
+    another machine's record is still read against the scheduler and closed when gone (a cold stop reads it first);
+  - a pinned session reads only ITS facility's records; a spend question never bootstraps (over the web when the
+    endpoint answers, else named unverified and read after the yes); the yes brings the login shape up once — a
+    failed bootstrap is that call's answer, never a second SSH attempt;
+  - a cold stop's failed ask still releases that endpoint, answered `draining` unconfirmed; a cold question adds no
+    MEP stop (it paused batches); a combined answer keeps every part's `jobs` and `handoffs`;
+  - on a MEP a gone server's presumed-lost row keeps its slot (`reserve(by_sender=False)`): a late delivery can run;
+  - a facility endpoint's record is named "not verified" and "may have ended".
+- **Review round 3** (same branch, `tests/test_restart_block_record_r3.py`; simplify, fail closed):
+  - ONE choke point before a billed block: `earlier.unread` in `warmth._provision`, by the endpoint id the bring-up
+    learnt (any path: connect, pin, failed connect); `_ensure_endpoint_up` reads the record off the lock and runs
+    the call once more. Deleted: `pinned_records`, `reach_pinned`, `unverified_pin`, `_pin_key`, server
+    `_pinned_records_first` (a pin's facility-string match, and its web shortcut);
+  - liveness is one rule, one table test (machine id x pid namespace x hostname x pid): unknown ids fall back to
+    the hostname; a namespace on one side only is elsewhere; `_read_machine_id` uses /usr/sbin/ioreg (else PATH)
+    and survives a missing, slow, garbled or undecodable read;
+  - a cold stop whose re-read of the record fails is `draining` with the reason, never `down`;
+  - jobs dedupe by `job_id`; a MEP batch held by presumed-lost rows says `cancel` / a stop ends the wait.
+- **Review round 4** (branch `fix/restart-block-record-r4`, `tests/test_restart_block_record_r4.py`): an unreadable
+  record now fails closed at connect and at the yes too — the view keeps the last good blocks (unverified) and is
+  `record_unread`; connect says so, and a billed start answers `_EARLIER_UNREAD` until a good read clears it.
+- Not done: `teardown_endpoint` with nothing bound; a cold stop finds an endpoint only through a block record (a
+  leftover handoff alone needs a connect first).
 
 ## Confirmed spend-honesty bug on main (2026-10-15) — fix in progress
 
@@ -338,7 +402,7 @@ This repo ships a **live-agent regression harness** — its own test tier, separ
 
 **How one run works** (`harness/run.py`): `SETUP` (optional cluster prep) → drive the agent on the scenario's `PROMPT` (a `human_sim.py` persona answers any `AskUserQuestion`) → grade the trace against **invariants** (`harness/invariants.py`, 14 deterministic checks (three of them report-only unless a scenario gates them) like "no raw SSH after the endpoint is up", "spend was confirmed before a billed block", "stop was honest") → **world postchecks** over SSH (did a block actually get left running?) → **run-scoped teardown** (only this run's endpoint and `uep.<eid>` blocks — never `scancel -u`; pool users are claimed cross-process with `flock`, so two `run_suite`s can run at once). Every run writes a **provenance bundle** to `agentic/runs/<id>/` (`record.json` with the grading, `messages.jsonl`, `transcript.md`, `endpoint-logs.txt`, `server-stderr.log` — the MCP server's own stderr) — gitignored, but they're how you debug a failure after the fact, and `harness/regrade.py` can replay a stored bundle through the *current* invariants offline.
 
-**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 122 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
+**A scenario** is one file in `agentic/scenarios/` declaring a `PROMPT`, a persona, `EXTRA_INVARIANTS`, `EXPECT_OK` (which invariants gate the verdict), and optional `SETUP`/`POSTCHECKS`/`PHASES` (a cross-restart chain). On `main`: 123 scenarios — `agentic/README.md` lists them all, with the regression set, and `agentic/fakecluster/README.md` the fake-cluster ones. To add coverage you add a scenario + (usually) a grader, and a hermetic unit test for the grader in `harness/test_invariants.py` — that last part is the discipline that lets a green run be trusted. `mep_compute_only.py` is a good template for the MEP path; `happy_path.py` for the SSH path.
 
 **Prerequisites** (one-time, in `agentic/.env` — gitignored): `CLAUDE_CODE_OAUTH_TOKEN` (subscription, from `claude setup-token` — **not** an API key), `HPCB_TEST_GLOBUS_DB` (a Globus `storage.db` whose identity the target facility maps — for the MEP that means `gusellerm@uchicago.edu`; check with `python agentic/whoami_globus.py`), and the scoped SSH test user/key (`HPCB_TEST_SSH_*`, default user `hpcbridge-test`; the pool `hpcbridge-test-00..09` for `run_suite`). `HPCB_TEST_GLOBUS_DB_NOACCOUNT` (a second, unmapped identity's db) feeds `mep_no_account`. The fake cluster's `mep` and `pbs_mep` profiles also need `HPCB_MEP_EMAIL` (a real contact address for the managers they register with Globus). Full setup + the pre-merge regression set are in `agentic/README.md`; the design rationale is `docs/hpc-bridge-vault/Planned/Agentic testing - Plan B (runtime sandbox).md`. **`agentic/fakecluster/`** is a compose Slurm cluster wired into both runners (`--target fake`), with PROFILES (`default`; `site` = 3 nodes / debug,compute,gpu / enforced accounting / fake mybalance / 2 login nodes; `mep` = site + two root-run facility MEPs in login01, strict and open schema — the zero-SSH path, with a per-cluster local catalog via the plugin's `HPC_BRIDGE_CATALOG_FILE` seam; `pbs_mep` = the OpenPBS `polaris` cluster + one facility MEP whose template is shaped like ALCF Polaris's), a cluster-admin channel (`ADMIN_SETUP`/`ADMIN_CLEANUP`), mid-run hooks (`MIDRUN_HOOKS`: a `cmd` after a tool result — on every operator but the ACP ones, the free CLI operators via the server's journal — or, Claude SDK only, an Esc DURING a call; `agentic/README.md` → "Mid-run hooks") and declarative scenario coupling (`TARGETS`/`REQUIRES`). See `agentic/fakecluster/README.md`.
 

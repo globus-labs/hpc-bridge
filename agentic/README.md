@@ -62,7 +62,7 @@ agentic/
                            first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 122 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 123 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -99,6 +99,8 @@ agentic/
                            returning users (`nersc`; two sessions, the first on this or the previous release; the first
                            of them scripted, one pairwise cell a run, the others an agent in session 2):
                              returning_user · returning_perlmutter_replay · returning_all_well · returning_new_laptop
+                           a block an earlier server left running (a scripted two-server chain on `default`; red on
+                           main; kept out of the sweep until its live proof): restart_cold_stop
                            batch phase 1 (`default`, one on `mep`; red on main until the batch tools land; all but the
                            first scripted): batch_fanout_collect · batch_crosses_walltime · batch_restart_resume ·
                              batch_two_servers_one_ledger · batch_block_reaped_midrun · batch_big_output · batch_abort_midrun ·
