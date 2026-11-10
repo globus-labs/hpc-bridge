@@ -53,12 +53,16 @@ agentic/
     returning.py         ← the RETURNING-USER cells: factors, the two-session chain, the user's part, the invariants
                            every cell holds (see "Returning users" below); returning_cells.tsv is its checked-in table
     pairwise.py          ← a deterministic all-pairs generator with pair constraints (the returning-user cells)
+    agent_cells.py       ← the AGENT cells of sizing and envs: the chain (a scripted connect, the request, follow-up turns
+                           composed from the conversation) and the scripted user who answers each (see "Agent cells")
+    agent_checks.py      ← their graders: arguments passed, answers met and acted on, the user's yes vs. the billed
+                           block, the world on the facility; a premise that never happened fails, never passes
     prev_release.py      ← OLDER releases (`previous`, from pyproject's version history; 0.1.20 pinned), exported
                            before every jail build and installed at /opt/hpcb-prev/<slot> (a returning-user cell's
                            first session may run one)
     test_invariants.py   ← hermetic unit tests (52) for the grading core + scenario graders
     judge.py             ← optional LLM-judge rubric pass                                   [later]
-  scenarios/             ← 114 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
+  scenarios/             ← 122 scenarios, one file each (test_sweep_script.py keeps this list equal to the folder):
                            connect + reuse: happy_path · zero_config_list · needs_login_paste · registry_over_cache · endpoint_reuse ·
                              endpoint_reuse_chain · byo_teardown_clean · unknown_host_key · no_ssh_access · no_facility_first ·
                              lmod_bootstrap · login_pin_teardown · internal_hostnames · otp_preauth · f2b_stranger · f2b_banned
@@ -84,6 +88,11 @@ agentic/
                              batch_pilot_proposal · batch_size_first_terms · batch_gpu_rows · batch_row_srun
                            block environments (scripted, on `default`; kept out of the sweep until their live proof; a
                            facility endpoint's builds are PR 4's): env_ssh_build_cache · env_ssh_switch
+                           sizing + envs, AGENT-driven (any agent operator; a seeded chain whose scripted user answers each
+                           turn — "Agent cells" below; `default`, one on `lmod`; kept out of the sweep until their live
+                           proof): batch_sized_by_user · batch_asks_user_for_size · batch_pilot_agreed ·
+                             batch_memory_kill_resized · env_built_for_user · env_module_switch · env_unbuildable_asks ·
+                             batch_rows_in_user_env
                            the Perlmutter report (scripted RED proofs, `site` / `nersc`; fail on main until fixed):
                              stale_login_pin · kept_entry_after_failure · cached_password_otp · home_outside_home ·
                              noisy_failure_tail · partition_proposal_policy
@@ -430,6 +439,93 @@ journal (0.1.20) has the script's own steps as its record (`script_runner.steps_
 - `returning` is a script-only sweep profile. It boots the `nersc` cluster and runs `returning_user` once per cell,
   each row `returning_user <cell> — RESULT: …`.
 - `nersc` runs the three agent cells in every wave, then the Perlmutter report's scripted proofs.
+
+## Agent cells: sizing and envs driven by a model (`harness/agent_cells.py`, `harness/agent_checks.py`)
+
+The scripted sizing and env cells prove the tools work; these eight ask whether a MODEL driving them uses them well —
+finds `cores`, `pilot`, `env` from the tool schemas and the skill (the user's words never name an argument:
+`test_agent_cells.py` checks), asks the user what only the user knows, and starts nothing billed without the yes.
+
+**The chain.** The free operators cannot answer a question mid-turn, so each cell is a seeded chain (as the
+returning-user agent cells): phase 0 is scripted — the user connected earlier (the probe's proposal confirmed, the
+login shape up), or, where a cell's premise must not hang on the agent's choices, the world it starts in is seeded
+there too (`batch_memory_kill_resized`: the analyses already killed at the default memory, the batch paused at a
+proposal); phase 1 is the agent with the user's request; phases 2–6 are follow-up turns that run only when the turn
+before left something open. A follow-up's prompt is COMPOSED when it runs (a callable `prompt` in `PHASES`,
+run.py `_phase_spec`): the conversation replayed — the request, the agent's last words of each turn, the user's
+answers — and the user's answer now; the bundle's chain marker keeps it (`prompt`). Each turn is a new MCP server, so a
+batch carried over asks for the yes again (the spend acknowledgement lives in the process): the answers that carry
+one over say the approved block still stands. The agent's words are stamped with their phase (`Trace.text_phase`, in
+`_combine` and `regrade.chain_trace`): a grader reads what was said in the turn a question came.
+
+**The scripted user** (`UserSim`, `decide`) answers by what hpc-bridge's answers in the last turn left open, latest
+first: a spend question → yes; `needs_sizing` → the cell's sizes; a proposal → agreement; `needs_account` → the
+account; a failed env build → the cell's reply. A careful agent asks in WORDS before any tool call: a cell whose user
+`sizes_in_words` answers a turn whose words ask about each task's size, or put sizes of the agent's own ("1 CPU per row
+… 4 at a time — shall I start?"), with the user's sizes, not a yes; one whose user knows a version is `unbuildable`
+answers words saying so (the agent checked the index itself) as it would a failed build. A turn that stopped the endpoint wrapped up; one
+that ended otherwise gets a go-ahead, at most twice a run. It is a pure function of the trace, so the graders recompute
+every answer (`answers_given`) and a regrade needs no dialogue — but a regrade after the sim changed recomputes what
+the CURRENT sim would have said; the chain marker's `prompt` keeps what was said.
+
+| cell | profile | the user | gated (besides agent_engaged, agent_turn_engaged, stop_down, ends_with_stop, stop_is_honest) |
+|---|---|---|---|
+| `batch_sized_by_user` | default | 6 tasks, 1 core + 0.5 GB each, ≤ 2 at once; "wait for my yes" | `sizes_as_given`, `terms_shown_before_yes` (the block that started, however reached), `yes_before_billed_block`, `batch_done`, `results_relayed`; world: `block_as_confirmed`, one block |
+| `batch_asks_user_for_size` | default | the same, no size; "ask me" | `asked_for_sizes` (asked in words or on needs_sizing before any sized or recorded batch; never "premise not met"), `user_sizes_used`, `yes_before_billed_block`, `batch_done`; world: `block_as_confirmed`, one block; reported: `agent_proposed_own_sizes` |
+| `batch_pilot_agreed` | default | "measure one run first, then propose" | `pilot_used`, `proposal_relayed`, `resize_after_agreement`; world: `inputs_done` |
+| `batch_memory_kill_resized` | default | phase 0 SEEDS the pause (a 4-core 3 GB block, rows of 1.1 GB run unsized, killed); "what happened? ask before changing anything" | `proposal_relayed`, `no_blind_rerun` (no rerun and no size of its own before the ok), `resize_after_agreement`; world: `inputs_done` |
+| `env_built_for_user` | default | needs tomli==2.0.1, absent | `env_requested`, `pkg_ran_in_env`, `no_manual_install`; world: `no_stray_install` |
+| `env_module_switch` | lmod | a baseline, then the `python/3.11` module from now on | `activate_env_used`, `module_active_after_switch`, `switch_no_new_block`; world: one block |
+| `env_unbuildable_asks` | default | needs tomli==99.0.0 (no such release) | `failure_relayed`, `no_build_loop`, `no_guessed_versions`, `failed_env_not_session` (from a failed build, or the agent's own check before any build — the user answers either), `no_manual_install`; world: `no_stray_install`; reported: `env_requested` |
+| `batch_rows_in_user_env` | default | 4 checks each importing tomli==2.0.1 | `env_requested`, `batch_used`, `no_manual_install`; world: `rows_ran_in_env`, `no_stray_install`, one block |
+
+```bash
+HPCB_OPERATOR=pi HPCB_TARGET=fake HPCB_FAKE_PROFILE=default ./agentic/run_smoke.sh batch_sized_by_user
+HPCB_OPERATOR=codex HPCB_TARGET=fake HPCB_FAKE_PROFILE=lmod ./agentic/run_smoke.sh env_module_switch
+```
+The env cells need the fake login node to reach PyPI, as the scripted env cells do. `batch_memory_kill_resized`
+counts on the block's measure (its docstring has the numbers, live 2026-11-05: 2.7 GB usable); if the kill never comes,
+its seeding phase aborts and the cell is SETUP FAILED. `no_manual_install` reads each simple command for an INSTALL
+(pip / python -m pip / uv pip install|sync, uv add, conda|mamba|micromamba install|create, a pip download into a venv,
+through `bash -c` too) — reading the index config, `pip show|list|index`, a dry run are diagnosis, and so is an install
+into a venv the agent made at a temp path and never used for the user's command (a probe of the resolver); one into the
+environment's own python, the user site, the system, or a venv the user's command then ran in is a workaround. The
+version-listing probe, `pip install <pkg>==` (an empty version fails and prints the versions there are), is diagnosis
+too: every requirement `<pkg>==`, no requirements file. `no_blind_rerun` counts a command that RUNS the task's script, never one
+that reads it (`cat`, `head`, `wc`).
+
+**The agent's own measurement.** A one-row pilot ends `done` with no proposal of hpc-bridge's, so the agent proposes
+from the row's usage itself; an agent may also measure one row with a compute run_shell of the task (`/usr/bin/time`,
+a python rusage probe) — exit 0, the row's argument named, a usage figure printed (`shell_measured_row`). In
+`batch_pilot_agreed` (`UserSim.agrees_to_own_measure`, `task_script`, `task_rows`) the user agrees to sizes put so —
+the rest not yet sized — as to the tool's proposal, and `pilot_used` passes on any of the three ways (the user asked
+for a measurement, not for a tool), its detail naming which.
+`proposal_relayed` / `resize_after_agreement` grade it the same way, the agent's words standing for the proposal; an
+agent that never measured is still a premise not met, and one that ran the rest unasked still fails.
+
+**The user is there between turns.** Every agent phase says so (`agent_cells.TURNS` at the top of the prompt) and
+carries `user_between_turns`, which `_run_chain` hands the operator: no operator then tells it "there is no human"
+(runner.py's and hermes_runner's autonomous leads), Claude loses AskUserQuestion (nobody answers it inside a one-shot
+turn), and Hermes loses `clarify` (`-z` mode answers it "no user available — decide yourself"). The returning-user
+cells keep their framing: they pre-authorise everything and their user's part is an act outside the chat.
+
+**The spend graders** skip a start a script made (`Trace.scripted_phases`) and the blocks a cell's request approved
+(`PREAPPROVED_BLOCKS`), and in a chain count a spend question asked in prose in an earlier turn.
+
+**The first live pass** (pi on qwen, fake `default`, 9a09af9, 2026-11-05): 4 of 7 OK. The three failures were the
+harness's: `no_manual_install` read a dry-run resolve and a config grep as installs; the user answered "Shall I
+start…?" with a plain yes when the agent had proposed sizes of its own in words, never having called run_batch; and the
+memory kill's premise hung on the agent leaving the rows unsized (it sized them to the block's whole memory). All three
+fixed as above. **The second** (b2aa547, 7 cells × pi / hermes21 / codex): 12 of 21 OK; 8 of the 9 failures were the
+harness's (hermes told "no human" and answered by its own `clarify` — 5; a read of the script counted as a re-run; the
+proposal offered as `memory_gb=1.5`; a temp-venv probe counted as an install). Re-graded offline after the fixes: 15 of
+21 OK — the 5 hermes21 cells need a run with the new framing, and codex's substituted tomli version is a real miss.
+**The hermes21 retry** (3cb5031): 4 of 7 OK, asking before every spend. Two more harness gaps — the listing probe
+counted as an install, and a one-row pilot's own proposal answered "I don't know what one run needs" — fixed as above;
+re-graded, 6 of 7. `batch_sized_by_user` still fails `terms_shown_before_yes`: hermes named the whole 4-core node
+before the yes, and the batch then started a 3-CPU block derived from the sizes. **The full pass** (24 cells,
+247051a): 20 of 24; one more harness gap — pi measured s1 with a run_shell, not a pilot — fixed as above; re-graded,
+21 of 24 (two hermes21 misses, one product failure).
 
 ## Network topologies (`HPCB_FAKE_TOPOLOGY`, `harness/topology.py`)
 

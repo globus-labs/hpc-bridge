@@ -218,6 +218,43 @@ Baked into `Dockerfile` / `entrypoint.sh` / `run_smoke.sh`, but worth knowing: *
     - Results: 21 of 22 scripted cells OK, the six #236 proofs OK, the three agent cells OK.
     - c08 reaches hello world. It still fails `ru_policy_surfaced`: on the previous release's long-lived compute user
       endpoint the site's refusal arrives as a task traceback, never the scheduler's words — left open.
+- **Agent cells for batch row sizing and block environments (2026-11-05, branch `harness/agent-sizing-env-cells`,
+  built, not yet run live).** The 13 sizing and env cells were scripted; eight agent cells ask whether a model uses the
+  tools well (`agentic/harness/agent_cells.py`, `agent_checks.py`; `agentic/README.md`, "Agent cells").
+  - **A scripted user for the free operators.** Each cell is a seeded chain: a scripted connect, the user's request,
+    then up to four follow-up turns. A follow-up runs only when the turn before left something open in hpc-bridge's
+    answers (a spend question, a size, a proposal, an account, a failed build) or ended without a stop (a go-ahead,
+    once). Its prompt is composed when it runs: `PHASES` may give a callable `prompt(trace)` (`run._phase_spec`); the
+    conversation is replayed, as the hermes runner's one-shot turns replay it, and the chain marker keeps it.
+  - **The answers are a pure function of the trace**, so the graders recompute them (`answers_given`): "the user's yes
+    came before the billed block" is the phase of the yes against the phase of each billed start.
+  - **`Trace.text_phase`** stamps each of the agent's texts with its phase (`_combine`, `regrade.chain_trace`): a text
+    said before a phase's first call sits, by `text_at`, where the last words of the phase before it do.
+  - **A new MCP server per turn** forgets the spend acknowledgement: a batch carried over asks for the yes again. The
+    answers that carry one over say the approved block still stands; the cells whose batch spans turns report, not
+    gate, the number of blocks.
+  - **First live pass (pi on qwen, fake `default`, 2026-11-05): 4 of 7 OK; the three failures were the harness's.**
+    Fixed: `no_manual_install` reads each simple command for an install (a config grep and a dry-run resolve are
+    diagnosis); a careful agent asks in WORDS first, so the user can answer a turn's words about sizes
+    (`UserSim.sizes_in_words`) and gives a go-ahead up to twice; and a premise must come from the WORLD, never the
+    agent's choice — `batch_memory_kill_resized` now seeds the default-memory kill in its scripted phase,
+    `asked_for_sizes` passes on sizes asked in words, `terms_shown_before_yes` / `world:block_as_confirmed` grade
+    the block that started however the agent got there, and `env_unbuildable_asks` accepts an agent that checks the
+    version itself and asks before building anything.
+  - **Second live pass (b2aa547, 7 cells × pi / hermes21 / codex): 12 of 21 OK; 8 of 9 failures the harness's.**
+    A chain phase is now framed as a conversation for every operator (`user_between_turns`): never the autonomous "no
+    human" lead, no AskUserQuestion for Claude, no `clarify` for Hermes (in `-z` mode it answered "decide yourself",
+    and hermes21 did). A temp venv the agent made to probe the resolver is diagnosis; reading a script is not running
+    it; the spend graders skip a script's starts (`Trace.scripted_phases`) and a block the request approved
+    (`PREAPPROVED_BLOCKS`). Offline regrade: 15 of 21 OK.
+  - **hermes21 retry (3cb5031): 4 of 7 OK; it now asks before every spend.** Two more harness gaps: `pip install
+    tomli==` (the version-listing probe) is diagnosis, not an install; and an agent that measures one row itself
+    (a one-row pilot ends `done`, with no proposal of the tool's) and proposes from it has relayed a proposal — the
+    user agrees to it (`agrees_to_own_measure`). Re-graded: 6 of 7; `batch_sized_by_user` is a real miss (it named
+    the whole node before the yes; a smaller derived block started).
+  - **Full pass (24 cells, 247051a): 20 of 24.** One more harness gap: pi measured s1 with a compute run_shell (a
+    python rusage probe), not a pilot. A run_shell of the task on one row that exits 0 and prints its usage is a
+    measurement too, and `pilot_used` passes on any of the three ways. Re-graded: 21 of 24.
 
 ## Deferred
 - Cost-gating scenarios (need Plan A's real balance) — fake-seams variants until then.

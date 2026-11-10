@@ -169,7 +169,9 @@ def chain_trace(rows: list) -> Trace:
             phases.append((int(m["chain_phase"]), []))
         elif phases:
             phases[-1][1].append(m)
-    calls, texts, text_at = [], [], []
+    calls, texts, text_at, text_phase = [], [], [], []
+    scripted = [int(m["chain_phase"]) for m in rows if isinstance(m, dict) and "chain_phase" in m
+                and str(m.get("operator") or "").startswith("script")]
     for k, seg in phases:
         head = next((m for m in seg if isinstance(m, dict)), {})
         t = trace_from_bundle_messages(seg) if "harness" in head and "rc" in head else trace_from_rows(seg)
@@ -179,7 +181,9 @@ def chain_trace(rows: list) -> Trace:
             c.phase = k
             calls.append(c)
         texts += t.texts
-    return Trace(calls, texts, text_at if len(text_at) == len(texts) else [])
+        text_phase += [k] * len(t.texts)
+    return Trace(calls, texts, text_at if len(text_at) == len(texts) else [], text_phase=text_phase,
+                 scripted_phases=scripted)
 
 
 def _rows(d: Path) -> list:
@@ -243,6 +247,7 @@ def regrade(runs_dir: Path, *, strict: bool = False) -> int:
         t.user_said = dialogue_words(rec.get("dialogue"))   # what the user said, as run.py stamps it live
         t.user_said_at = dialogue_positions(rec.get("dialogue"))
         scen = load_scenario(scen_name, rec)   # under THIS bundle's run env: its graders are this run's
+        t.preapproved_blocks = int(getattr(scen, "PREAPPROVED_BLOCKS", 0) or 0)   # as run.py stamps it live
         # the floor replays too — without the jail's secret material (no_secret_material says so, vacuously), but with
         # the scenario's USER_SECRETS (a fixture in the module: the replay compares exactly what the live run did)
         results = check_all(t) + [fn(t) for fn in floor_graders(own_user=cfg.get("pool_user"),
