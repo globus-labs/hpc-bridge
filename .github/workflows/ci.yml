@@ -36,7 +36,9 @@ jobs:
 
   test:
     name: pytest (py${{ matrix.python }})
-    runs-on: ubuntu-latest
+    # Pinned: ubuntu-latest became 26.04 (2026-11), whose core tools change how the node-side shell (the endpoint
+    # evidence check, the batch row watcher) behaves under the tests. Back to ubuntu-latest once it passes there.
+    runs-on: ubuntu-24.04
     strategy:
       fail-fast: false
       matrix:
