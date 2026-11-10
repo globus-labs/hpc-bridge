@@ -165,12 +165,24 @@ def setup_pi(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str]
     return {"PI_CODING_AGENT_DIR": str(home), "PI_OFFLINE": "1", "PI_SKIP_VERSION_CHECK": "1", "PI_TELEMETRY": "0"}
 
 
-def setup_hermes21(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str] = ()) -> dict[str, str]:
+# Hermes 0.21's default `cli` toolsets (`hermes_cli.tools_config._get_platform_tools({}, "cli")`), less `clarify`: in
+# `-z` mode hermes answers clarify itself — "[oneshot mode: no user available. Pick the best … and continue.]" — so a
+# model that asks the user the structured way is told to decide for them. A chain phase whose user answers between
+# turns (agent_cells.py) drops it: the model asks in prose and ends its turn, and the next phase carries the answer
+# (the qwen pass of 2026-11-05: hermes21 asked via clarify every time, then confirmed spend and resized on its own).
+# An explicit list is honoured as given (checked against 0.21.0's resolver); MCP servers are added regardless.
+HERMES21_CLI_TOOLSETS = ("browser", "clarify", "code_execution", "computer_use", "cronjob", "delegation", "file",
+                         "image_gen", "kanban", "memory", "session_search", "skills", "terminal", "todo", "tts",
+                         "vision", "web")
+
+
+def setup_hermes21(work: Path, repo: str, env: dict[str, str], *, extra: Iterable[str] = (),
+                   no_clarify: bool = False) -> dict[str, str]:
     base, model = _model()
     home = work / "hermes"
     home.mkdir(parents=True, exist_ok=True)
     cmd = _server_cmd(repo, "hermes21")
-    cfg = {
+    cfg: dict[str, Any] = {
         "model": {"provider": "custom", "base_url": base, "api_key": "${ALCF_INFERENCE_TOKEN}", "default": model,
                   "context_length": 131072, "max_tokens": 4096},
         "approvals": {"mode": "off"},
@@ -178,6 +190,8 @@ def setup_hermes21(work: Path, repo: str, env: dict[str, str], *, extra: Iterabl
                                        "env": {k: env[k] for k in _server_env_names(env, extra)},
                                        "connect_timeout": 180, "timeout": 600}},
     }
+    if no_clarify:
+        cfg["platform_toolsets"] = {"cli": [t for t in HERMES21_CLI_TOOLSETS if t != "clarify"]}
     (home / "config.yaml").write_text(yaml.safe_dump(cfg, sort_keys=False))
     return {"HERMES_HOME": str(home)}
 
@@ -677,7 +691,10 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
                        persona: str | None = None, user_goal: str = "", ablate_skill: bool = False,
                        max_turns: int = 40, extra_env: dict[str, str] | None = None,
                        midrun_hooks: list[dict] | None = None, hook_runner=None,
-                       harness: str = "codex"):
+                       harness: str = "codex", user_between_turns: bool = False):
+    # `user_between_turns`: a chain phase whose user answers in the next turn (agent_cells.py). Pi and Codex get the
+    # prompt as it is (it says so itself; neither has a tool that answers for the user); Hermes loses `clarify`, which
+    # in `-z` mode answers "no user available — decide yourself" (setup_hermes21).
     if persona:
         raise NotImplementedError(f"the {harness} operator drives autonomous scenarios only (no persona) for now")
     if harness not in HARNESSES:
@@ -707,8 +724,10 @@ async def run_scenario(prompt: str, *, repo_root: Path, model: str = "default", 
         os.environ["HPCB_RELAY_LOG"] = str(rec / "relay.jsonl")
         relay = start_relay(_model()[0])
         env.update(setup_codex(rec, repo, env, base_url=relay.base_url, extra=extra))
+    elif harness == "hermes21":
+        env.update(setup_hermes21(rec, repo, env, extra=extra, no_clarify=user_between_turns))
     else:
-        env.update({"pi": setup_pi, "hermes21": setup_hermes21}[harness](rec, repo, env, extra=extra))
+        env.update(setup_pi(rec, repo, env, extra=extra))
     if not ablate_skill:  # where each looks: ~/.agents/skills (Codex, Pi), $HERMES_HOME/skills (Hermes)
         _install_skill(repo_root, Path.home() / ".agents" / "skills",
                        Path(env.get("HERMES_HOME", rec / "hermes")) / "skills")

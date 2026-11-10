@@ -399,6 +399,7 @@ These use the checkpoint's numbering. The table and API above say what was built
 
   Its `needs_uv` tests run the REAL uv, offline. Every node test passes under bash 3.2 and 5.2.
 - **`agentic/harness/envs_checks.py` and `test_envs_scenarios.py`:** the scripted cells `env_ssh_build_cache` and `env_ssh_switch`, on the fake `default` profile. They are kept out of the sweep until their live proof. They need PyPI reachable from the fake cluster's login node.
+- **The agent cells** (`agentic/harness/agent_cells.py`, `agent_checks.py`, `test_agent_cells.py`; built 2026-11-05, not yet run live): a model drives the tools, a scripted user answers. `env_built_for_user` (a package the cluster lacks: an env built from it, no pip install), `env_module_switch` (`lmod`: the user's module as an `activate` env, switched on a live block with no new spend question), `env_unbuildable_asks` (a version that does not exist: the installer's reason relayed, no loop, no guessed version), `batch_rows_in_user_env` (rows that import the package run in a built env). `agentic/README.md`, "Agent cells".
 
 ## See also
 [[envs]] · [[Batch and swarm execution]] · [[batch]] · [[sizing]] · [[jobs]] · [[handoff]] · [[session_shell]] · [[shapes]] · [[Per-architecture endpoint venvs]] · [[facility-mep]]

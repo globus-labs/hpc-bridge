@@ -158,11 +158,19 @@ def _mcp_servers(repo_root: Path, extra_env: dict[str, str] | None = None) -> di
     }
 
 
-def _system_prompt(repo_root: Path, interactive: bool, include_skill: bool = True) -> str:
+def _system_prompt(repo_root: Path, interactive: bool, include_skill: bool = True, between_turns: bool = False) -> str:
     # First cut: inject the driving-hpc skill as standing guidance. (Faithful on-demand
     # Skill-tool loading is a later refinement; here we test whether the guidance CONTENT
     # drives the right behaviour.)
-    if interactive:
+    # `between_turns`: a chain phase whose user answers in the NEXT turn (agent_cells.py) — never the autonomous
+    # "no human" claim, which tells an agent to decide for the user (hermes did, the qwen pass of 2026-11-05).
+    if between_turns and not interactive:
+        lead = (
+            "You are driving real HPC through the hpc-bridge tools on behalf of a user who answers BETWEEN your "
+            "turns: when you need something from them — a yes to spend, a size, a choice — ask in plain text and "
+            "end your turn; their answer comes at the start of your next turn. Do not decide those for them. "
+        )
+    elif interactive:
         lead = (
             "You are driving real HPC through the hpc-bridge tools on behalf of a user. "
             "The user is present and answers questions via the AskUserQuestion tool — use it "
@@ -181,6 +189,15 @@ def _system_prompt(repo_root: Path, interactive: bool, include_skill: bool = Tru
         return lead + "Use the tools' own descriptions to decide how to proceed."
     skill = (repo_root / "skills" / "driving-hpc" / "SKILL.md").read_text()
     return lead + "Follow this operational guidance:\n\n" + skill
+
+
+def _turn_options(interactive: bool, between_turns: bool) -> dict[str, Any]:
+    """What a one-shot turn's options add for a chain phase whose user answers between turns: AskUserQuestion is
+    taken away (no one answers it inside the turn; the question must end the turn, in prose, for the next phase to
+    carry the answer)."""
+    if between_turns and not interactive:
+        return {"disallowed_tools": ["AskUserQuestion"]}
+    return {}
 
 
 def _live(msg: Any) -> None:
@@ -211,6 +228,7 @@ async def run_scenario(
     extra_env: dict[str, str] | None = None,
     midrun_hooks: list[dict] | None = None,
     hook_runner=None,
+    user_between_turns: bool = False,
 ) -> RunResult:
     """Run one scripted scenario end-to-end and return the captured Trace + result.
 
@@ -228,11 +246,13 @@ async def run_scenario(
         model=model,
         allowed_tools=[f"mcp__endpoint__{t}" for t in HPC_BRIDGE_TOOLS] + ["Bash", "Read", "Write"],
         mcp_servers=_mcp_servers(repo_root, extra_env),
-        system_prompt=_system_prompt(repo_root, interactive, include_skill=not ablate_skill),
+        system_prompt=_system_prompt(repo_root, interactive, include_skill=not ablate_skill,
+                                     between_turns=user_between_turns),
         setting_sources=[],  # SDK isolation: ignore host ~/.claude + project settings
         cwd=str(repo_root),
         max_turns=max_turns,            # safety rail: bound a runaway agent
         max_budget_usd=max_budget_usd,  # safety rail: bound cost per scenario
+        **_turn_options(interactive, user_between_turns),
     )
     if effort:
         # Reasoning level (low..max): effort guides adaptive thinking DEPTH, so pair it with
