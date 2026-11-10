@@ -306,6 +306,34 @@ def neighbour_survived(t: Trace, *, index: int, word: str) -> Result:
                   f"tail={str(r.get('tail') or '')[-80:]!r}")
 
 
+def srun_ran(t: Trace, *, rows: int) -> Result:
+    """Each row's own `srun` step ran (the Anvil live test, F3): every row done, rc 0, the step's own line and srun's rc
+    0 in its tail (on the base the step died: `cpus-per-task set by two different environment variables`)."""
+    got = {i: r for b in rows_reported(t).values() for i, r in b.items()}
+    bad = []
+    for i in range(rows):
+        r = got.get(i)
+        tail = str((r or {}).get("tail") or "")
+        if r is None or r.get("state") != "done" or r.get("exit_code") != 0 or "HPCB_STEP_OK" not in tail \
+                or "HPCB_SRUN_RC=0" not in tail:
+            bad.append(f"row {i}: " + ("never reported" if r is None else
+                                       f"state={r.get('state')!r} rc={r.get('exit_code')!r} tail={tail[-120:]!r} "
+                                       f"stderr={str(r.get('stderr_tail') or '')[-160:]!r}"))
+    return Result("srun_ran_in_each_row", not bad, "; ".join(bad) or f"all {rows} rows ran their step")
+
+
+def srun_steps_said(t: Trace, *, rows: int) -> Result:
+    """Each row's result says it ran srun steps (`srun_steps`), and an answer says where such a step runs: on CPUs Slurm
+    picks within the block, not the row's slot (the documented limit of a row's own srun)."""
+    got = {i: r for b in rows_reported(t).values() for i, r in b.items()}
+    flagged = [i for i in range(rows) if (got.get(i) or {}).get("srun_steps") is True]
+    said = any("srun steps" in str(r.get("notice") or "") and "not the row's slot" in str(r.get("notice") or "")
+               for r in statuses(t))
+    ok = len(flagged) == rows and said
+    return Result("srun_steps_said", ok, f"rows saying srun_steps: {flagged} of {rows}; an answer said where a step "
+                                         f"runs: {said}")
+
+
 def pilot_proposed(t: Trace, *, cores: int, memory_gb: tuple[float, float]) -> Result:
     """A pilot ended at needs_sizing with a proposal: cores = ⌈CPU-s ÷ wall⌉, memory = 1.25 × peak RSS (in range)."""
     props = [dict(r.get("proposal") or {}) for r in statuses(t) if r.get("phase") == "needs_sizing" and r.get("proposal")]

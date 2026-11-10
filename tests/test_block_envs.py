@@ -365,9 +365,11 @@ class _EnvRunners(_Runners):
         uec = dict(user_endpoint_config or {})
         r = _EnvRunner(self, eid, uec)
         if uec.get("compute", True):   # a block's worker answers with its job and walltime, read from inside it
+            from tests.test_batch_phase1 import _block_measure  # …and what the block is (every batch waits for it)
+
             r._canary = CanaryResult(ok=True, worker_host="c1", worker_python=f"{PY}.0", worker_dill="0.3.9",
                                      worker_job=self.block.job, worker_remaining_s=900.0,
-                                     answered_at=time.monotonic())
+                                     answered_at=time.monotonic(), block_measure=_block_measure())
         self.built.append(r)
         self.kwargs.append((uec, dict(kw)))
         return r
@@ -984,9 +986,9 @@ async def test_a_batch_row_whose_env_is_gone_ran_nothing_goes_back_and_the_env_i
     """The batch engine's own world (rows in flight until the test settles them): a row refused by its env's check is
     no failure — it ran nothing — so it goes back to the backlog while the env is rebuilt on the login node."""
     from hpc_bridge import batch, envs
-    from tests.test_batch_sizing import _app_with, _report
+    from tests.test_batch_sizing import _app_with, _measure, _report
 
-    app, _rt, runner = _app_with(None)
+    app, _rt, runner = _app_with(_measure())   # measured: every batch waits for it (G3)
     app.scratch_root = str(tmp_path / "scratch")
     env = _box(tmp_path)
 
