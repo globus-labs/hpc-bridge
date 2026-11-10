@@ -248,7 +248,8 @@ def test_the_guard_reads_the_job_the_canary_reports_and_sits_before_everything()
     guard_end = w.index(f"exit {WRONG_BLOCK_EXIT}")
     for later in ("umask 077", "mkdir -p", "cd ", ".env", "eval ", "pwd >"):
         assert w.index(later) > guard_end, later
-    assert wrap("echo hi", Session("s", "/r")) == w[w.index("umask 077"):]   # no guard: exactly as before
+    # no guard: exactly as before (what follows the guard: the endpoint venv's scrub, then umask — the Anvil F4)
+    assert wrap("echo hi", Session("s", "/r")) == w[guard_end + w[guard_end:].index("\nfi\n") + 4:]
     assert WRONG_BLOCK_MARKER not in wrap("echo hi", Session("s", "/r"))
 
 

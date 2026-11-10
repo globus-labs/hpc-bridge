@@ -90,6 +90,15 @@ MAX_WAIT_S = 60.0
 KILL_GRACE_S = 5
 READER_GRACE_S = 2                     # after the leftover group is killed: the stream readers' time to reach EOF
 WATCH_POLL_S = 1                       # the wrapper's watcher: how often it looks at the clock and the marker
+# …and, for a row with a memory limit (the Anvil live test, F2), every WATCH_FAST_S while it is young (its first
+# WATCH_YOUNG looks: 2 s) or while it grew, since the last look, by a WATCH_GROW_SHARE-th of its limit a second or more
+WATCH_FAST_S = 0.2
+WATCH_YOUNG = 10
+WATCH_GROW_SHARE = 10
+# The full look reads the states of at most this many threads of each process of a row (review round 1: a row of
+# thousands of threads), and the runnable counts reach the results directory every this many looks and at the end
+WATCH_THREAD_CAP = 256
+WATCH_FLUSH_LOOKS = 30
 # The longest the wrapper holds its worker past task_walltime_s, by its own arithmetic: the watcher sees the deadline
 # within one poll, TERMs the group and waits the kill grace before KILL; the cleanup then waits the kill grace again,
 # KILLs, and gives the stream readers the reader grace twice (review round 2: 7 s had been assumed, 14 s measured).
@@ -812,7 +821,7 @@ def under_home(path: str) -> bool:
 
 _WRAPPER = r"""umask 077
 exec 3>&1 4>&2 2>/dev/null
-__hb_rd=@@RD@@
+@@SCRUB@@__hb_rd=@@RD@@
 __hb_t="$__hb_rd/tasks/@@I@@"
 __hb_a="$__hb_rd/tasks/@@I@@/attempt-@@N@@"
 @@REMAINING@@
@@ -854,6 +863,7 @@ __hb_oomc() {
 __hb_o0=$(__hb_oomc)
 __hb_tok=@@TOKEN@@
 __hb_nl=""; ps -o nlwp= -p $$ >/dev/null 2>&1 && __hb_nl="-o nlwp="   # procps tells threads; BSD ps does not
+__hb_ps=""; ps -o pid= -p $$ >/dev/null 2>&1 && __hb_ps=1               # a node with no ps: /proc (`__hb_members`)
 # The row's processes, one "pid kB threads comm" line each: its process group, every descendant of its shell (a child
 # that left the group — coreutils `timeout`, setsid — included) and, on Linux, every process of this user carrying the
 # row's token in its environment (one that was reparented). One `ps` snapshot.
@@ -861,29 +871,94 @@ __hb_members() {
   __hb_tp=""
   [ -d /proc/self ] && __hb_tp=$(grep -l -s -a -F "HPCB_ROW_TOKEN=$__hb_tok" /proc/[0-9]*/environ 2>/dev/null \
     | sed 's#^/proc/\([0-9][0-9]*\)/environ$#\1#' | tr '\n' ' ')
-  ps -A -o pid= -o ppid= -o pgid= -o rss= $__hb_nl -o comm= 2>/dev/null \
-    | awk -v g="$__hb_c" -v tp="$__hb_tp" -v nl="${__hb_nl:+1}" '
-      BEGIN { n = split(tp, a, " "); for (i = 1; i <= n; i++) tok[a[i]] = 1 }
-      $1 ~ /^[0-9]+$/ { k++; pid[k] = $1; pp[k] = $2; th[k] = (nl ? $5 : 0); cm[k] = (nl ? $6 : $5); rs[k] = $4
-        if ($1 == g || $3 == g || ($1 in tok)) mem[$1] = 1 }
-      END {
-        do { more = 0
-          for (i = 1; i <= k; i++) if (!(pid[i] in mem) && (pp[i] in mem)) { mem[pid[i]] = 1; more = 1 }
-        } while (more)
-        for (i = 1; i <= k; i++) if (pid[i] in mem) print pid[i], rs[i], th[i], cm[i]
-      }'
+  if [ -n "$__hb_ps" ]; then
+    ps -A -o pid= -o ppid= -o pgid= -o rss= $__hb_nl -o comm= 2>/dev/null \
+      | awk -v g="$__hb_c" -v tp="$__hb_tp" -v nl="${__hb_nl:+1}" '
+        BEGIN { n = split(tp, a, " "); for (i = 1; i <= n; i++) tok[a[i]] = 1 }
+        $1 ~ /^[0-9]+$/ { k++; pid[k] = $1; pp[k] = $2; th[k] = (nl ? $5 : 0); cm[k] = (nl ? $6 : $5); rs[k] = $4
+          if ($1 == g || $3 == g || ($1 in tok)) mem[$1] = 1 }
+        END {
+          do { more = 0
+            for (i = 1; i <= k; i++) if (!(pid[i] in mem) && (pp[i] in mem)) { mem[pid[i]] = 1; more = 1 }
+          } while (more)
+          for (i = 1; i <= k; i++) if (pid[i] in mem) print pid[i], rs[i], th[i], cm[i]
+        }'
+  else   # a node with no `ps` (a minimal image): its tree and its token's processes, read from /proc
+    __hb_tree
+    awk -v p="$__hb_all $__hb_tp" 'BEGIN { n = split(p, P, " ")
+      for (i = 1; i <= n; i++) { if (P[i] in seen) continue; seen[P[i]] = 1
+        f = "/proc/" P[i] "/status"; nm = ""; th = 0; rs = 0
+        while ((getline l < f) > 0) { split(l, x, " ")
+          if (x[1] == "Name:") nm = x[2]; else if (x[1] == "Threads:") th = x[2]; else if (x[1] == "VmRSS:") rs = x[2] }
+        close(f)
+        if (nm != "") print P[i], rs, th, nm } }'
+  fi
+}
+# The row's tree from the command's own shell, as pids in `__hb_all` (Linux: the children each process's MAIN thread
+# started, /proc/<pid>/task/<pid>/children, read with the shell's builtins — no process started, no scan of every
+# process, and one read per process however many threads it has: review round 1, a row of 6000 threads. A child
+# another thread started is the full look's, through `ps`, and its token's.)
+__hb_tree() {
+  __hb_q=$__hb_c; __hb_all=""
+  while [ -n "$__hb_q" ]; do
+    __hb_n=""
+    for __hb_x in $__hb_q; do
+      __hb_all="$__hb_all $__hb_x"
+      __hb_z=""; read -r __hb_z < "/proc/$__hb_x/task/$__hb_x/children"; __hb_n="$__hb_n $__hb_z"
+    done
+    case "$__hb_n" in *[0-9]*) __hb_q=$__hb_n;; *) __hb_q="";; esac
+  done
 }
 # The row's memory now and its threads: Linux sums each process's Pss (/proc/<pid>/smaps_rollup: a page shared
 # copy-on-write by a forked pool counts once, split among its sharers), elsewhere — or where that file is unreadable —
 # its RSS, which counts a shared page once per process. The command's own shell (it waits for the command) is no
-# thread of the row's.
+# thread of the row's. Then, on Linux, how many of its threads are RUNNABLE — state R in /proc/<pid>/task/<tid>/stat:
+# running, or waiting for a CPU; an idle shell, `timeout` or a sleeping interpreter is not (the Anvil live test, F1)
+# — or -1 where that cannot be read; and whether a process of it is `srun` (a step of the row's own: it runs where
+# Slurm places it, not on the row's slot, and outside this watch — F3). "kB threads runnable srun", one line.
+# The thread states are read for at most @@RCAP@@ threads of each process (review round 1: a row of thousands of
+# threads — an idle pool — cost the watcher a quarter to half a CPU, and their paths in one awk argument passed Linux's
+# 128 KiB cap, so the look printed nothing): a process's busy threads beyond them are not counted — a lower bound,
+# which still sees an oversubscribed row's processes of few threads each (OpenMP, a pool of processes). The paths go
+# to awk on its standard input, never in an argument.
 __hb_sample() {
-  __hb_members | awk -v g="$__hb_c" '
-    { m = $2; f = "/proc/" $1 "/smaps_rollup"
+  __hb_ms=$(__hb_members)
+  { printf '%s\n' "$__hb_ms"
+    if [ -r /proc/self/stat ]; then
+      while read -r __hb_x __hb_y; do
+        [ -n "$__hb_x" ] || continue
+        __hb_n=0
+        for __hb_y in /proc/"$__hb_x"/task/[0-9]*; do
+          __hb_n=$((__hb_n + 1)); [ "$__hb_n" -gt @@RCAP@@ ] && break
+          printf '%s/stat\n' "$__hb_y"
+        done
+      done <<__HB_EOF
+$__hb_ms
+__HB_EOF
+    fi; } | awk -v g="$__hb_c" '
+    /^\// { lx = 1; if ((getline l < $0) > 0) { sub(/^.*\) /, "", l); if (substr(l, 1, 1) == "R") rn++ }
+      close($0); next }
+    NF >= 4 { m = $2; f = "/proc/" $1 "/smaps_rollup"
       while ((getline l < f) > 0) if (l ~ /^Pss:/) { split(l, x, " "); m = x[2] }
       close(f); mem += m
-      if (!($1 == g && $4 ~ /(^|\/)-?(ba|da|k)?sh$/)) thr += $3 }
-    END { printf "%d %d\n", mem, thr }'
+      if (!($1 == g && $4 ~ /(^|\/)-?(ba|da|k)?sh$/)) thr += $3
+      if ($4 ~ /(^|\/)srun$/) sr = 1 }
+    END { printf "%d %d %d %d\n", mem, thr, (lx ? rn : -1), sr }'
+}
+# A quick look (Linux; the fast looks between the full ones, F2): the memory of the row's tree alone (`__hb_tree`), read
+# by one awk — no scan of every process, no environ read (a look every 0.2 s must cost next to nothing). A process that
+# left the tree (setsid, reparented) is the full look's, once a second.
+__hb_quick() {
+  __hb_tree
+  awk -v p="$__hb_all" 'BEGIN { n = split(p, P, " ")
+    for (i = 1; i <= n; i++) { m = 0; f = "/proc/" P[i] "/smaps_rollup"
+      while ((getline l < f) > 0) if (l ~ /^Pss:/) { split(l, x, " "); m = x[2] }
+      close(f)
+      if (!m) { f = "/proc/" P[i] "/status"
+        while ((getline l < f) > 0) if (l ~ /^VmRSS:/) { split(l, x, " "); m = x[2] }
+        close(f) }
+      mem += m }
+    printf "%d\n", mem }'
 }
 # A signal to the row: its process group and every process __hb_members finds (the ones killed are the ones measured)
 __hb_kill() {
@@ -896,7 +971,7 @@ __hb_start=$(date +%s)
 printf '{"index": @@I@@, "attempt": @@N@@, "job": "%s", "host": "%s", "start": %s, "remaining_s": %s}\n' \
   "$__hb_j" "$__hb_host" "$__hb_start" "${__hb_rem:-null}" > "$__hb_a/meta.json"
 __hb_f="${TMPDIR:-/tmp}/hpcb-$$-@@I@@-@@N@@"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q" "$__hb_f.go"
 mkfifo "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
 tail -c @@TAIL@@ < "$__hb_f.t" > "$__hb_a/.stdout.tail" 3>&- 4>&- &
 __hb_p1=$!
@@ -917,33 +992,77 @@ set -m
 (
   export HPCB_ROW_INDEX=@@I@@ HPCB_ATTEMPT=@@N@@ HPCB_TASK_DIR="$__hb_a" HPCB_ROW_TOKEN="$__hb_tok"
   @@SESSION@@
-@@ENV@@
+@@RESCRUB@@@@ENV@@
   @@SLOTENV@@
   @@FIELDS@@
   @@PIN@@
   (env -u OMP_NUM_THREADS -u OMP_THREAD_LIMIT nproc || getconf _NPROCESSORS_ONLN) 2>/dev/null | head -n 1 \
     > "$__hb_a/.nproc"
+  : > "$__hb_f.go" 2>/dev/null   # the user's command starts now: its young window counts from here (node-local)
   eval "$(printf %s @@B64@@ | base64 --decode)"
 ) > "$__hb_f.o" 2> "$__hb_f.e" < /dev/null 3>&- 4>&- &
 __hb_c=$!
 set +m
 @@CLAIMED@@
+# The watcher: the deadline, the cancel marker and the row's use, every @@POLL@@ s — every @@FAST@@ s while a row with a
+# memory limit is young (its first @@YOUNG@@ looks) or grew, since the last look, by @@GROWKB@@ kB a second or more
+# toward its limit (the Anvil live test, F2: a row allocating 2 GB at once peaked at 2 GB on a 1 GB slot before the
+# 1 s look saw it). The fast looks are quick (`__hb_quick`; one in @@FASTN@@ is full) and need a node whose /proc lists
+# each task's children (Linux); elsewhere, or where `sleep` takes no fraction, the looks stay a second apart. A burst
+# within one look can still pass the limit.
+# - The young window counts from the user's command, not from the watcher: a slow env activation never eats it (review
+#   round 1) — the row marks its start node-locally (`$__hb_f.go`).
+# - Growth is judged against the last look of the same kind, per second: a quick look sees the row's tree, a full one
+#   more (a reparented process, the group), so the two never read as growth between them.
+# - The runnable-thread counts (F1) stay in the watcher, and go to the results directory every @@FLUSH@@ looks and when
+#   the watch ends — its end, the command's, or the wrapper's TERM: never a write a look (review round 1: GPFS on
+#   Anvil, ~127 metadata writes a second for a full node). Its sleeps are waited on, so a TERM is taken at once.
 (
   __hb_dl=$((__hb_start + @@WALL@@))
-  __hb_pk=0; __hb_th=0
+  __hb_pk=0; __hb_th=0; __hb_ns=0; __hb_no=0; __hb_lw=0; __hb_sr=0; __hb_fq=0
+  __hb_u=0; __hb_pq=""; __hb_uq=0; __hb_pf=""; __hb_uf=0
+  __hb_fs=""; __hb_yn=0
+  if [ -n "@@MEMKB@@" ] && [ -r "/proc/$__hb_c/task/$__hb_c/children" ]; then __hb_fs=@@FAST@@; __hb_yn=@@YOUNG@@; fi
+  __hb_flush() { [ "$__hb_ns" -gt 0 ] && [ "$__hb_ns" != "$__hb_lw" ] && echo "$__hb_ns $__hb_no" > "$__hb_a/.rq"
+    __hb_lw=$__hb_ns; }
+  trap '__hb_flush; exit 0' TERM
+  __hb_nx=${__hb_fs:-@@POLL@@}
   while :; do
-    sleep @@POLL@@
+    __hb_du=@@FASTN@@; [ "$__hb_nx" = "$__hb_fs" ] && __hb_du=1
+    sleep "$__hb_nx" & wait $! || { __hb_fs=""; __hb_du=@@FASTN@@; sleep @@POLL@@ & wait $!; }
+    __hb_u=$((__hb_u + __hb_du))
     if [ -e "$__hb_rd/@@CANCEL@@" ]; then echo cancelled > "$__hb_a/.why"; break; fi
-    if [ "$(date +%s)" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
-    kill -0 "$__hb_c" || exit 0
-    __hb_s=$(__hb_sample)
-    __hb_r=${__hb_s% *}; __hb_t=${__hb_s#* }
+    if [ "${EPOCHSECONDS:-$(date +%s)}" -ge "$__hb_dl" ]; then echo timeout > "$__hb_a/.why"; break; fi
+    kill -0 "$__hb_c" || { __hb_flush; exit 0; }
+    __hb_fq=$((__hb_fq + 1))
+    if [ "$__hb_du" = 1 ] && [ $((__hb_fq % @@FASTN@@)) != 0 ]; then
+      __hb_kd=q; set -- $(__hb_quick) -1 -1 -1
+    else
+      __hb_kd=f; set -- $(__hb_sample)
+    fi
+    __hb_r=${1:-0}; __hb_t=${2:-0}; __hb_rn=${3:--1}; __hb_su=${4:-0}
     case "$__hb_r" in ''|*[!0-9]*) __hb_r=0;; esac
     case "$__hb_t" in ''|*[!0-9]*) __hb_t=0;; esac
+    case "$__hb_rn" in ''|*[!0-9]*) __hb_rn=-1;; esac
     if [ "$__hb_r" -gt "$__hb_pk" ]; then __hb_pk=$__hb_r; echo "$__hb_pk" > "$__hb_a/.peak"; fi
     if [ "$__hb_t" -gt "$__hb_th" ]; then __hb_th=$__hb_t; echo "$__hb_th" > "$__hb_a/.threads"; fi
+    # a sized row's runnable threads against its cores (F1): how many looks saw them, and how many saw more
+    if [ -n "@@KR@@" ] && [ "$__hb_rn" -ge 0 ]; then
+      __hb_ns=$((__hb_ns + 1)); [ "$__hb_rn" -gt 0@@KR@@ ] && __hb_no=$((__hb_no + 1))
+      [ $((__hb_ns - __hb_lw)) -ge @@FLUSH@@ ] && __hb_flush
+    fi
+    if [ "$__hb_su" = 1 ] && [ "$__hb_sr" = 0 ]; then __hb_sr=1; : > "$__hb_a/.srun"; fi
     if [ -n "@@MEMKB@@" ] && [ "$__hb_r" -gt "0@@MEMKB@@" ]; then echo memory > "$__hb_a/.why"; break; fi
+    if [ "$__hb_kd" = q ]; then __hb_p=$__hb_pq; __hb_pu=$__hb_uq; __hb_pq=$__hb_r; __hb_uq=$__hb_u
+    else __hb_p=$__hb_pf; __hb_pu=$__hb_uf; __hb_pf=$__hb_r; __hb_uf=$__hb_u; fi
+    __hb_nx=@@POLL@@
+    if [ -n "$__hb_fs" ]; then
+      if [ "$__hb_yn" -gt 0 ]; then [ -e "$__hb_f.go" ] && __hb_yn=$((__hb_yn - 1)); __hb_nx=$__hb_fs
+      elif [ -n "$__hb_p" ] && [ $(( (__hb_r - __hb_p) * @@FASTN@@ )) -ge $(( @@GROWKB@@ * (__hb_u - __hb_pu) )) ]
+      then __hb_nx=$__hb_fs; fi
+    fi
   done
+  __hb_flush
   __hb_kill TERM
   __hb_k=0
   while [ "$__hb_k" -lt @@GRACE@@ ] && kill -0 "$__hb_c"; do sleep 1; __hb_k=$((__hb_k + 1)); done
@@ -960,9 +1079,10 @@ __hb_kill TERM
 __hb_g=$!
 wait "$__hb_t1" "$__hb_t2" "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
 kill "$__hb_g"
+wait "$__hb_w"   # the watcher's TERM wrote its counts (`.rq`): at once, or after its kill grace's current second
 [ -s "$__hb_a/.stdout.tail" ] || tail -c @@TAIL@@ "$__hb_a/stdout" > "$__hb_a/.stdout.tail"
 [ -s "$__hb_a/.stderr.tail" ] || tail -c @@ETAIL@@ "$__hb_a/stderr" > "$__hb_a/.stderr.tail"
-rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q"
+rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q" "$__hb_f.go"
 __hb_why=$(cat "$__hb_a/.why")
 case "$__hb_why" in timeout) __hb_rc=@@TRC@@;; cancelled) __hb_rc=@@CRC@@;; memory) __hb_rc=@@MRC@@;; esac
 echo "$__hb_rc" > "$__hb_a/rc"
@@ -976,9 +1096,11 @@ __hb_cs=$(LC_ALL=C awk 'FNR == 2 {for (i = 1; i <= NF; i++) if (split($i, p, "m"
   "$__hb_a/.times0" "$__hb_a/.times1" 2>/dev/null)
 __hb_pk=$(cat "$__hb_a/.peak" 2>/dev/null); __hb_th=$(cat "$__hb_a/.threads" 2>/dev/null)
 __hb_np=$(cat "$__hb_a/.nproc" 2>/dev/null)
+__hb_rq=$(cat "$__hb_a/.rq" 2>/dev/null); __hb_rs=${__hb_rq% *}; __hb_ro=${__hb_rq#* }
+__hb_su=false; [ -f "$__hb_a/.srun" ] && __hb_su=true
 __hb_o1=$(__hb_oomc); __hb_oom=""
 case "$__hb_o0$__hb_o1" in ''|*[!0-9]*) ;; *) __hb_oom=$((__hb_o1 - __hb_o0));; esac
-for __hb_v in __hb_pk __hb_th __hb_np __hb_oom; do
+for __hb_v in __hb_pk __hb_th __hb_np __hb_oom __hb_rs __hb_ro; do
   eval "case \"\$$__hb_v\" in ''|*[!0-9]*) $__hb_v=null;; esac"
 done
 case "$__hb_wl" in ''|*[!0-9.]*) __hb_wl=null;; esac
@@ -1004,6 +1126,7 @@ __hb_r="$__hb_r, \"tail_b64\": \"$__hb_tl\", \"stderr_tail_b64\": \"$__hb_el\""
 __hb_r="$__hb_r, \"cpus\": \"$__hb_cpus\", \"gpu_ids\": \"$__hb_gids\", \"pinned\": $__hb_pn"
 __hb_r="$__hb_r, \"peak_rss_kb\": $__hb_pk, \"cpu_s\": $__hb_cs, \"wall_s\": $__hb_wl, \"nproc\": $__hb_np"
 __hb_r="$__hb_r, \"threads\": $__hb_th, \"oom_kills\": $__hb_oom"
+__hb_r="$__hb_r, \"r_samples\": $__hb_rs, \"r_over\": $__hb_ro, \"srun\": $__hb_su"
 # block environments: the row's env refused it before its command (gone from its root, another architecture, the
 # user's line failed) — it ran nothing; the mark is the activation's own line, believed only with THIS attempt's nonce
 # (review N12: a row that writes the file itself ran, and is reported as a row that ran)
@@ -1179,13 +1302,38 @@ _THREAD_VARS = ("OMP_NUM_THREADS", "MKL_NUM_THREADS", "OPENBLAS_NUM_THREADS", "N
                 "PYTHON_CPU_COUNT", "SLURM_CPUS_PER_TASK", "SRUN_CPUS_PER_TASK")
 
 
+# A row's own `srun` (the Anvil live test, F3) inherits the block job's and the worker launcher step's Slurm variables,
+# two of which break it on Slurm 23.11+: SLURM_TRES_PER_TASK — the job's `cpu=<the block's CPUs>`, which srun reads as
+# --tres-per-task — disagreeing with the row's SLURM_CPUS_PER_TASK ("cpus-per-task set by two different environment
+# variables"), and the launcher step's SLURM_CPU_BIND* — a mask_cpu of the block's CPUs, outside any step the row starts
+# ("CPU binding outside of job step allocation"). The cpu= part is made the row's cores and the rest kept (a GPU per
+# task stays the step's), only where the job set it: Slurm before 23.11 sets none, and none is made up. No binding is
+# inherited: Slurm binds the step as it binds any. The step then runs on CPUs Slurm picks within the block, NOT on the
+# row's slot (a step over the job's CPUs pinned to the row's would need srun's own options rewritten — documented, and
+# the result says when a row ran one: `srun`).
+_SRUN_ENV = r"""unset SLURM_CPU_BIND SLURM_CPU_BIND_LIST SLURM_CPU_BIND_TYPE SLURM_CPU_BIND_VERBOSE
+  if [ -n "${SLURM_TRES_PER_TASK+x}" ]; then
+    __hb_x=",$SLURM_TRES_PER_TASK,"
+    while :; do
+      case "$__hb_x" in
+        (*,cpu[=:]*) __hb_y=${__hb_x#*,cpu[=:]}; __hb_x="${__hb_x%%,cpu[=:]*},${__hb_y#*,}";;
+        (*) break;;
+      esac
+    done
+    __hb_x=${__hb_x#,}; __hb_x=${__hb_x%,}
+    export SLURM_TRES_PER_TASK="cpu=@@K@@${__hb_x:+,$__hb_x}"
+    unset __hb_x __hb_y
+  fi"""
+
+
 def _slot_env(slot: Slot) -> str:
     """The row's environment, set AFTER the session's (overriding it): its claimed CPUs, every thread count its
-    libraries read = its cores, a nested `srun` that shares the pool's step (SLURM_OVERLAP) and asks for its cores, and
-    — on a block with GPUs — its own GPUs only (none for a CPU row)."""
+    libraries read = its cores, a nested `srun` that shares the pool's step (SLURM_OVERLAP), asks for its cores and can
+    run on Slurm 23.11+ (`_SRUN_ENV`), and — on a block with GPUs — its own GPUs only (none for a CPU row)."""
     k = int(slot.cores)
     parts = ['export HPCB_SLOT_CPUS="$__hb_cpus" HPCB_SLOT_GPUS="$__hb_gids"']
     parts.append("export " + " ".join(f"{v}={k}" for v in _THREAD_VARS) + " SLURM_OVERLAP=1")
+    parts.append(_SRUN_ENV.replace("@@K@@", str(k)))
     kind = slot.gpu_kind if slot.gpu_kind in _GPU_VARS else None
     if slot.gpu_ids and slot.gpus > 0:
         parts.append("export " + " ".join(f'{v}="$__hb_gids"' for v in _GPU_VARS[kind]))
@@ -1231,10 +1379,17 @@ def task_script(command: str, *, results_dir: str, index: int, attempt: int, tas
         slot_env, pin = _slot_env(slot), (_PIN if slot.pin else ":")
         claimed, release = _CLAIMED, "__hb_free"
         memkb = str(int(slot.memory_mb) * 1024) if slot.memory_mb else ""
+        kr = str(max(1, int(slot.cores)))
     else:
-        claim, slot_env, pin, claimed, release, memkb = ":", ":", ":", ":", ":", ""
+        claim, slot_env, pin, claimed, release, memkb, kr = ":", ":", ":", ":", ":", "", ""
+    grow = max(int(memkb) // WATCH_GROW_SHARE, 16 * 1024) if memkb else 0
     body = (_WRAPPER.replace("@@CLAIM@@", claim).replace("@@CLAIMED@@", claimed).replace("@@RELEASE@@", release)
             .replace("@@SLOTENV@@", slot_env).replace("@@PIN@@", pin).replace("@@MEMKB@@", memkb)
+            .replace("@@KR@@", kr).replace("@@FAST@@", f"{WATCH_FAST_S:g}").replace("@@YOUNG@@", str(WATCH_YOUNG))
+            .replace("@@FASTN@@", str(max(1, round(1 / WATCH_FAST_S)))).replace("@@GROWKB@@", str(grow))
+            .replace("@@RCAP@@", str(WATCH_THREAD_CAP)).replace("@@FLUSH@@", str(WATCH_FLUSH_LOOKS))
+            .replace("@@SCRUB@@", session_shell.ENDPOINT_VENV_SCRUB)
+            .replace("@@RESCRUB@@", session_shell.ENDPOINT_VENV_SCRUB)
             .replace("@@MRC@@", str(MEMORY_RC)).replace("@@TOKEN@@", secrets.token_hex(8))
             .replace("@@RD@@", quoted_dir(results_dir)).replace("@@I@@", str(int(index)))
             .replace("@@N@@", str(int(attempt))).replace("@@REMAINING@@", session_shell.REMAINING_SH)
@@ -1284,6 +1439,10 @@ class TaskReport:
     cpus: str | None = None
     gpu_ids: str | None = None
     pinned: bool | None = None          # the row really ran under taskset on its CPUs; None: not said (unsized)
+    # the looks that read its runnable threads (Linux), and how many saw more than its cores (sizing.oversubscribed)
+    r_samples: int | None = None
+    r_over: int | None = None
+    srun: bool | None = None            # a look saw an `srun` of the row's own: a step it ran (F3)
     ran: bool | None = None             # False: the wrapper said the command never started (a refusal before it)
     env_refused: str | None = None      # block environments: the row's env refused it (its activation's own line)
 
@@ -1335,6 +1494,8 @@ def parse_result(stdout: str | None) -> TaskReport | None:
                 nproc=_whole(d.get("nproc")), threads=_whole(d.get("threads")), oom_kills=_whole(d.get("oom_kills")),
                 cpus=str(d["cpus"]) if d.get("cpus") else None, gpu_ids=str(d["gpu_ids"]) if d.get("gpu_ids") else None,
                 pinned=d["pinned"] if isinstance(d.get("pinned"), bool) else None,
+                r_samples=_whole(d.get("r_samples")), r_over=_whole(d.get("r_over")),
+                srun=d["srun"] if isinstance(d.get("srun"), bool) else None,
                 ran=d["ran"] if isinstance(d.get("ran"), bool) else None,
                 env_refused=_b64(d["env_refused_b64"]).strip() or None if d.get("env_refused_b64") else None)
     return None
@@ -1561,7 +1722,18 @@ def _note_block_from_canary(app: AppCtx, run: _Run, rt: ShapeRuntime) -> None:
 
 
 def measure_of(app: AppCtx, rt: ShapeRuntime | None, run: _Run | None = None) -> sz.BlockMeasure | None:
-    """The block `rt` as measured from inside: this batch's note of it, else its check's, else the ledger's."""
+    """The block `rt` as measured from inside: this batch's note of it, else its check's, else the ledger's. A measure
+    that names no worker count (no PARSL_WORKER_COUNT where it ran) takes the one PR 1's window used: a check's or a
+    result's, else the config's `max_workers_per_node` — every row of a batch waits for this measure now (review G3),
+    so its slots are never more than the block's workers less the interactive one."""
+    m = _measured(app, rt, run)
+    if m is None or m.workers is not None or rt is None:
+        return m
+    w = (run.workers_seen if run is not None else None) or workers_of(rt)
+    return dataclasses.replace(m, workers=w) if w else m
+
+
+def _measured(app: AppCtx, rt: ShapeRuntime | None, run: _Run | None) -> sz.BlockMeasure | None:
     if run is not None and run.measure is not None:
         return run.measure
     if rt is None:
@@ -1804,9 +1976,11 @@ def _sizing_args(cores: Any, memory_gb: Any, gpus: Any, concurrency: Any, pin: A
             return f"{name}={v!r} is not a whole number"
         if not low <= v <= _SIZE_MAX:
             return f"{name}={v!r}: from {low} to {_SIZE_MAX}"
+    from .resources import MIN_MEMORY_GB
+
     if memory_gb is not None and (isinstance(memory_gb, bool) or not isinstance(memory_gb, int | float)
-                                  or not 0 < float(memory_gb) <= _SIZE_MAX):
-        return f"memory_gb={memory_gb!r}: GB per row, a number above 0"
+                                  or not MIN_MEMORY_GB <= float(memory_gb) <= _SIZE_MAX):
+        return f"memory_gb={memory_gb!r}: GB per row, a number above 0 (at least 1 MB)"
     if not isinstance(pin, bool):
         return f"pin={pin!r}: true or false"
     if isinstance(pilot, bool) or not isinstance(pilot, int) or pilot not in (0, 1, 2):
@@ -1892,8 +2066,10 @@ def _sizing_model(s: sz.Sizing | None, *, f: sz.Fit | None = None, defaulted: li
 _HOW_TO_SIZE = ("Size the rows the sbatch way: cores= (CPUs per row, as -c counts them), memory_gb= (per row; a row is "
                 "killed at it), gpus= (per row) and concurrency= (at most this many rows at once, as --array=…%N). "
                 "`facts` says what the block is (or one node of its partition) and how many rows each size fits — ask "
-                "the user in those terms. Not sure of the size? pilot=1 runs one row alone with the whole block and "
-                "proposes cores and memory from what it used.")
+                "the user in those terms. With no block confirmed, the sized call quotes the block derived from the "
+                "rows (its terms, nothing started); then, with the user's yes to those terms, the same call with "
+                "confirm_spend=True starts it. Not sure of the size? pilot=1 runs one row alone with the whole block "
+                "and proposes cores and memory from what it used.")
 
 
 def _needs_sizing(*, rows: int, missing: list[str], reason: str, facts: BlockFacts | None = None,
@@ -2022,7 +2198,12 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             derived = sz.derive_block(asked, shape=shape_, workers_fixed=fixed)
         except sz.SizingRefusal as exc:
             return _refused(str(exc))
-    st = await ensure_up(app, confirm_spend, size=derived)
+    # a yes starts a block derived from the rows only when an answer of this process quoted exactly it (review round
+    # 2: an agent's FIRST call, with the yes the user gave to the session's default terms, had started a derived block
+    # no answer named — smaller there; 8 cores × 8 at once is 65 CPUs): otherwise this call quotes it, starting nothing.
+    # Exactly it: on this facility, endpoint, partition and account too (`_quote_key`, review round 3)
+    unseen = derived is not None and confirm_spend and _quote_key(app, derived) not in app.batch_quoted
+    st = await ensure_up(app, confirm_spend and not unseen, size=derived)
     if (derived is not None and st.status in ("needs_confirmation", "needs_account")
             and not _is_derived(st.block, derived)):
         # the facility would not take the derived size (a partition's caps, a facility template that renders none
@@ -2038,17 +2219,20 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             words = derived.words(asked)
             if out.block is not None:
                 out.block.derived_from = words
+                app.batch_quoted.add(_quote_key(app, derived))   # these terms are now shown: the next yes starts them
             fixed = _fixed_workers(app)
             out.sizing = _sizing_model(asked, derived=True)
             out.sizing.slots = asked.concurrency
             mem = f"{derived.memory_gb} GB" if derived.memory_gb else "the node's memory"
+            unsaid = (" This yes was for a block no answer had shown yet, so nothing started: these are its terms — "
+                      "with the user's yes to THEM, send the same call again (confirm_spend=True)." if unseen else "")
             out.notice = (f"The block derived from the batch: {words} = {derived.cores} CPUs, {mem}"
                           + (f", {derived.gpus} GPU(s)" if derived.gpus else "") + ", one node, "
                           + (f"{derived.workers} workers ({derived.workers - 1} rows at once and one for interactive "
                              "commands)" if derived.workers else
                              f"the facility's own {fixed} workers per node" if fixed else
                              "the facility's own workers per node (measured once it runs)")
-                          + f". {out.notice}")
+                          + f".{unsaid} {out.notice}")
             b = out.block
             if b is not None and b.whole_node and b.cores_per_node:
                 fits = min((b.cores_per_node - 1) // asked.cores, sz.WIDTH_CAP)
@@ -2058,8 +2242,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                               + out.notice)
         elif pilot:
             out.notice = (f"A pilot of {pilot} row(s) runs alone on this block — the partition's proposed size, said "
-                          "in the terms above — then the batch stops at needs_sizing with a size proposed from what "
-                          f"it used. {out.notice}")
+                          f"in the terms above — then {_pilot_then(pilot, len(rows))}. {out.notice}")
         return out
     rt = app.shapes.get("compute")
     if st.status not in ("up", "provisioning") or rt is None or app.state.endpoint_id is None:
@@ -2111,6 +2294,18 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
     if not _RESULTS_DIR.match(batch_dir(rd, bid)):
         return _refused(f"the default results directory {rd!r} cannot be used; pass results_dir=")
     led = ledger_of(app)
+    # the block's config retired (a stop released it, a reap found it gone) is decided HERE, before anything is recorded
+    # (review round 3: the batch was recorded on a block this call's yes had just built, then paused to ask for a
+    # second yes while the block billed). The yes counts for the config, as ensure_endpoint_up's yes after a stop
+    # starts a block on it and as a resume's yes takes it back; with no yes on the call, nothing is recorded and one
+    # question is asked
+    if (retired := led.retired(app.state.endpoint_id, uec_hash(rt))) is not None:
+        if not confirm_spend:
+            return BatchStatus(phase="needs_confirmation", tasks=len(rows), block=st.block,
+                               session_spend=st.session_spend, reason="the block's config was retired",
+                               notice=f"The block's config was retired ({retired}): a new batch runs on it only with "
+                                      "the user's yes — the same call with confirm_spend=True. Nothing was recorded.")
+        led.unretire(app.state.endpoint_id, uec_hash(rt))
     owner = owner_of(app)
     run = _Run(bid, rt, runner=_batch_runner(app, rt), runner_hash=uec_hash(rt), ensure_up=ensure_up)
     _note_block_from_canary(app, run, rt)
@@ -2143,8 +2338,7 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
                       "`./-name`.")
     s = out.sizing
     if pilot:
-        how = (f"a pilot first: {pilot} row(s) alone with the whole block, then it stops at needs_sizing with a size "
-               "proposed from what they used")
+        how = f"a pilot first: {pilot} row(s) alone with the whole block, then {_pilot_then(pilot, len(rows))}"
     elif s is not None and s.slots is not None:
         how = (f"at most {s.slots} out at once ({s.cores} CPU{'s' if s.cores != 1 else ''}"
                + (f", {s.memory_gb:g} GB" if s.memory_gb else "") + (f", {s.gpus} GPU(s)" if s.gpus else "")
@@ -2178,6 +2372,72 @@ def _merged(b: dict[str, Any], named: dict[str, Any]) -> sz.Sizing:
                      pin=bool(named.get("pin", b.get("pin", 1))))
 
 
+def _rederive(app: AppCtx, b: dict[str, Any], pre: ShapeRuntime | None) -> tuple[sz.DerivedBlock, sz.Sizing] | None:
+    """A batch resumed with no block confirmed in this session (a server restart, a stop): when the user sized its rows
+    with a concurrency, the block derived from them again (`sizing.derive_block`, as size first derives it) and that
+    size — review G2: the yes had confirmed the new session's DEFAULT block, and the batch lost its own. None: the
+    session's confirmed block serves (a reaped one keeps the batch's own config), or nothing to derive from (an unsized
+    batch, a pilot, no concurrency)."""
+    if pre is not None and pre.spend_confirmed:
+        return None
+    if not b.get("sized") or b.get("cores") is None:
+        return None
+    base = json.loads(b.get("pilot_saved") or "null") or b
+    if not base.get("concurrency") or (b.get("pilot") and not b.get("pilot_saved")):
+        return None
+    defaulted = json.loads(b.get("sizing_defaulted") or "[]")
+    s = sz.Sizing(cores=int(base.get("cores") or 1),
+                  memory_mb=None if "memory_gb" in defaulted else base.get("memory_mb"),
+                  gpus=int(base.get("gpus") or 0), concurrency=int(base["concurrency"]), pin=bool(b.get("pin", 1)))
+    try:
+        return sz.derive_block(s, shape=_partition_shape(app), workers_fixed=_fixed_workers(app)), s
+    except sz.SizingRefusal:
+        return None
+
+
+def _pilot_then(pilot: int, rows: int) -> str:
+    """What a pilot's batch does once its pilot rows ran (review round 2's addendum: a pilot of every row had been said
+    to stop for a size, and ran to `done` with no proposal)."""
+    if pilot >= rows:
+        return ("the batch runs to its end (the pilot is every row): its result reports each row's use (peak_rss_mb, "
+                "cpu_s, wall_s) and the size that use suggests (`proposal`) — a size for the next batch")
+    return "it stops at needs_sizing with a size proposed from what they used"
+
+
+def _pilot_done_proposal(app: AppCtx, run: _Run, b: dict[str, Any]) -> None:
+    """A pilot batch that ran to its end with its pilot never closed (the pilot was every row): the user's own size
+    restored, and the size its rows' use suggests recorded as its `proposal` — the done answer carries it, as a pilot's
+    pause does (sizing.pilot_proposal)."""
+    led = ledger_of(app)
+    bid = run.batch_id
+    saved = json.loads(b.get("pilot_saved") or "null")
+    if saved:
+        _restore_pilot(led, bid, saved)
+    measure = measure_of(app, run.rt, run)
+    ran = [t for t in led.tasks(bid, states=TERMINAL) if int(t.get("attempt") or 0) > 0]
+    if measure is None or not ran:
+        return
+    p = sz.pilot_proposal([_use_of(t) for t in ran], measure, gpus=int((saved or b).get("gpus") or 0))
+    led.update_batch(bid, proposal=json.dumps({"cores": p.cores, "memory_gb": p.memory_gb, "gpus": p.gpus,
+                                               "concurrency": p.concurrency, "evidence": p.evidence}, default=str))
+
+
+def _derived_key(d: sz.DerivedBlock) -> tuple[Any, ...]:
+    """A derived block's size, comparable (`_quote_key`)."""
+    return (d.cores, d.memory_gb, d.gpus, d.workers, d.nodes, d.whole_node)
+
+
+def _quote_key(app: AppCtx, d: sz.DerivedBlock) -> tuple[Any, ...]:
+    """The terms a yes to a derived block would start it on, comparable: the facility and the endpoint bound, the
+    partition and account the block goes out with, and its size — what an answer quoted is what a yes starts
+    (`AppCtx.batch_quoted`). Review round 3: keyed by the size alone, a quote outlived its facility, account and
+    partition (a yes after a re-bind started 65 CPUs on another account that no answer of that binding had named)."""
+    rt = app.shapes.get("compute")
+    uec = rt.user_endpoint_config if rt is not None else warmth._seed_uec(app, "compute")
+    return (app.machine or getattr(app.facility, "name", None), app.state.endpoint_id, uec.get("partition"),
+            uec.get("account"), *_derived_key(d))
+
+
 async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: bool,
                   resize: dict[str, Any] | None = None) -> BatchStatus:
     if not _ID.match(bid):
@@ -2199,6 +2459,10 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         return _refused(f"{bid} is held by another hpc-bridge server now: status('{bid}') reads it from here.", bid=bid)
     b = led.batch(bid)
     if b["state"] in ("done", "cancelled"):
+        if resize:   # never ignored without a word (review round 3: a done pilot names "a size for the next batch")
+            sizes = ", ".join(f"{k}={v}" for k, v in resize.items())
+            return _refused(f"{bid} is {b['state']}: it has no rows left to run, so a size changes nothing there — "
+                            f"start a new batch with it: run_batch(command=…, rows=…, {sizes})", bid=bid)
         return _status_of(app, bid)
     if (rec := _env_rec(b)) is not None:
         if rec.get("unbuildable"):   # never another yes that cannot work (review S1): only another env mends it
@@ -2249,12 +2513,39 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         b = led.batch(bid)
     if sizing_wanted and not confirm_spend:
         out = _status_of(app, bid)
-        both = (f"run_batch(batch_id='{bid}', cores=…, memory_gb=…{', gpus=…' if b.get('gpus') else ''}, "
-                "confirm_spend=True) — its size and the user's yes for the block, in one call" if unconfirmed else
-                _resize_call(bid, int(b.get("gpus") or 0)))
+        # never the size and the yes in one call where the block is not confirmed: the size first — its answer quotes
+        # the block it needs — then the user's yes for THAT block (review round 1: the one-call form started a block no
+        # answer had shown)
+        both = (f"its size first, {_resize_call(bid, int(b.get('gpus') or 0))} — the answer quotes the block it needs —"
+                f" then the user's yes for that block: run_batch(batch_id='{bid}', confirm_spend=True)" if unconfirmed
+                else _resize_call(bid, int(b.get("gpus") or 0)))
         out.notice = (f"{bid} waits for its rows' size ({b['pause_reason']}): {both}. " + (out.notice or "")).strip()
         return out
-    if not confirm_spend and b["state"] == "needs_confirmation" and not resumes:
+    # its block gone (no block confirmed in this session: a server restart, a stop), a batch whose rows the user sized
+    # asks for the block derived from them again, as size first did — never the session's default (review G2)
+    again = _rederive(app, b, pre)
+    derived, sized_as = again if again is not None else (None, None)
+    quoted = derived is not None and _quote_key(app, derived) in app.batch_quoted
+    asked_yes = not confirm_spend and b["state"] == "needs_confirmation" and not resumes
+    if derived is not None and sized_as is not None and (asked_yes or (confirm_spend and not quoted)):
+        # the yes is asked for THAT block: its terms first, and a yes starts only a block an answer of this process
+        # showed (review round 1: after a restart, a new size and the yes in one call had started a 65-CPU block
+        # nobody saw) — a yes for another, or for none shown, is answered with the terms
+        st0 = await ensure_up(app, False, size=derived)
+        if st0.block is None or not _is_derived(st0.block, derived):
+            return _refused("the block derived from the batch's rows cannot be asked for here", bid=bid,
+                            notice=st0.notice)
+        app.batch_quoted.add(_quote_key(app, derived))
+        out = _status_of(app, bid)
+        out.phase, out.block = "needs_confirmation", st0.block
+        out.block.derived_from = derived.words(sized_as)
+        kept = " Its new size is recorded." if resize is not None else ""
+        unseen = (" This yes was for a block no answer had shown yet, so nothing started." if confirm_spend else "")
+        out.notice = (f"{bid}'s block is gone; it resumes on the block derived from its rows again — "
+                      f"{derived.words(sized_as)} (`block`: its terms) — once the user says yes to THAT block: "
+                      f"run_batch(batch_id='{bid}', confirm_spend=True).{kept}{unseen} {st0.notice or ''}").strip()
+        return out
+    if asked_yes:
         out = _status_of(app, bid)
         kept = " Its new size is recorded." if resize is not None else ""
         out.notice = (f"{bid} is paused ({b['pause_reason']}); it resumes only on the user's yes: "
@@ -2265,7 +2556,13 @@ async def _resume(app: AppCtx, bid: str, *, ensure_up: EnsureUp, confirm_spend: 
         # the batch's own pause already told the user the block was reaped (its reason names it): this yes is for
         # the new block, given knowing the old one is gone — the first call to find the reap was the batch's
         pre.reap_told = True
-    st = await ensure_up(app, confirm_spend)
+    st = await ensure_up(app, confirm_spend, size=derived)
+    if derived is not None and st.status in ("needs_confirmation", "needs_account") and not _is_derived(st.block,
+                                                                                                       derived):
+        return _refused("the block derived from the batch's rows cannot be asked for here", bid=bid,
+                        notice=st.notice)
+    if derived is not None and sized_as is not None and st.block is not None:
+        st.block.derived_from = derived.words(sized_as)
     if st.status in ("needs_confirmation", "needs_account"):
         if resumes:   # the block was confirmed when the size came, and is not now: the size is in, the yes is not
             pause(app, bid, "its rows' size is recorded; the block needs the user's yes")
@@ -2803,9 +3100,12 @@ def _admit_locked(app: AppCtx, run: _Run) -> int:
         return 0
     slot: Slot | None = None
     measure = measure_of(app, rt, run) if b.get("cores") is not None else None
-    if b.get("cores") is not None and (b.get("sized") or b.get("pilot")) and measure is None:
+    if b.get("cores") is not None and measure is None:
+        # sized or not (review G3: an unsized row admitted before the measure ran with no slot and no memory watch):
+        # every row of a batch recorded with a size waits for the block's own measure
         run.waiting = ("the block's size is not measured yet (its first check has not answered from inside it): "
-                       "nothing is admitted until it is")
+                       "nothing is admitted until it is — each row then runs in a slot of its own, watched at its "
+                       "memory")
         return 0
     if measure is not None:   # batch row sizing: the rows' slots on the block as it measured
         sized = _sized_now(app, run, rt, b, measure)
@@ -3267,7 +3567,9 @@ def _settle_result(app: AppCtx, run: _Run, index: int, attempt: int, res: Any, g
                               "peak_rss_kb": rep.peak_rss_kb, "cpu_s": rep.cpu_s, "wall_s": rep.wall_s,
                               "nproc": rep.nproc, "cpus": rep.cpus, "gpu_ids": rep.gpu_ids, "why": rep.why,
                               "threads": rep.threads, "oom_kills": rep.oom_kills,
-                              "pinned": None if rep.pinned is None else int(rep.pinned)}
+                              "pinned": None if rep.pinned is None else int(rep.pinned),
+                              "r_samples": rep.r_samples, "r_over": rep.r_over,
+                              "srun": None if rep.srun is None else int(rep.srun)}
     if rep.cancelled:
         state, by = "cancelled", f"evidence: the {CANCEL_MARKER} marker (cancel abort)"
     elif rep.no_space:
@@ -3352,6 +3654,8 @@ def _env_refused(app: AppCtx, run: _Run, index: int, attempt: int, rec: dict[str
     elif ref.why == "unsafe":
         why = (f"it is in a directory that is not the user's alone ({env_mod.said(ref.detail)!r}: owned by another "
                "user, or writable by its group or anyone)")
+    elif (nomodule := env_mod.module_words(ref.detail, rec.get("line"))):
+        why = f"its line could not activate it on the block's node — {nomodule}"
     else:
         why = (f"its line could not activate it on the block's node ({env_mod.said(ref.detail)}) — run the batch with "
                "a line that works on the compute nodes")
@@ -3462,6 +3766,8 @@ def _maybe_done(app: AppCtx, run: _Run) -> None:
     if c.get("backlog", 0) == 0 and _held(c) == 0 and not run.futures:
         b = led.batch(run.batch_id)
         if b["state"] not in ("done", "cancelled"):
+            if b.get("pilot") and not b.get("proposal"):   # a pilot of every row: its size, on the done answer
+                _pilot_done_proposal(app, run, b)
             led.update_batch(run.batch_id, state="done", pause_reason=None)
             led.event(run.batch_id, "batch.done", c)
 
@@ -3807,7 +4113,8 @@ def _over(t: dict[str, Any], b: dict[str, Any] | None) -> list[str]:
         return []
     return sz.over_size(cores=t.get("req_cores") or b.get("cores"), memory_mb=t.get("req_memory_mb") or
                         b.get("memory_mb"), pinned=_ran_pinned(t, b), cpu_s=t.get("cpu_s"), wall_s=t.get("wall_s"),
-                        threads=t.get("threads"), peak_rss_kb=t.get("peak_rss_kb"), why=t.get("why"))
+                        threads=t.get("threads"), peak_rss_kb=t.get("peak_rss_kb"), why=t.get("why"),
+                        r_over=t.get("r_over"), r_samples=t.get("r_samples"))
 
 
 def _ran_pinned(t: dict[str, Any], b: dict[str, Any]) -> bool:
@@ -3826,7 +4133,8 @@ def _task_result(t: dict[str, Any], b: dict[str, Any] | None = None) -> BatchTas
         task_id=t.get("task_id"), peak_rss_mb=round(pk / 1024, 1) if isinstance(pk, int) else None,
         cpu_s=t.get("cpu_s"), wall_s=t.get("wall_s"), nproc=t.get("nproc"), cpus=t.get("cpus"),
         gpu_ids=t.get("gpu_ids"), why=t.get("why"),
-        pinned=None if t.get("pinned") is None else bool(t["pinned"]), over_size=_over(t, b))
+        pinned=None if t.get("pinned") is None else bool(t["pinned"]), over_size=_over(t, b),
+        srun_steps=None if t.get("srun") is None else bool(t["srun"]))
 
 
 def gpu_note(app: AppCtx, run: _Run | None, b: dict[str, Any]) -> str:
@@ -3868,11 +4176,14 @@ def _over_note(led: Ledger, bid: str, b: dict[str, Any]) -> str:
         return ""
     over: dict[str, list[int]] = {}
     loose: list[int] = []
+    steps: list[int] = []
     for t in led.tasks(bid, states=TERMINAL):
         for what in _over(t, b):
             over.setdefault(what, []).append(int(t["idx"]))
         if b.get("pin", 1) and t.get("pinned") is not None and not t["pinned"]:
             loose.append(int(t["idx"]))
+        if t.get("srun"):
+            steps.append(int(t["idx"]))
 
     def rows(idx: list[int]) -> str:
         return ", ".join(str(i) for i in idx[:8]) + ("…" if len(idx) > 8 else "")
@@ -3881,6 +4192,9 @@ def _over_note(led: Ledger, bid: str, b: dict[str, Any]) -> str:
     if loose:
         text += (f" Row(s) {rows(loose)} ran NOT pinned (taskset was missing on the node or refused the mask): they "
                  "could use every CPU of the block.")
+    if steps:
+        text += (f" Row(s) {rows(steps)} ran srun steps: a step runs on CPUs Slurm picks within the block, not the "
+                 "row's slot (it may share another row's), and outside the row's memory watch.")
     if over:
         said = "; ".join(f"{what}: row(s) {rows(idx)}" for what, idx in over.items())
         text += (f" Rows ran over their size ({said}) — each result carries its peak_rss_mb, cpu_s and nproc. "
@@ -3949,6 +4263,10 @@ def _status_of(app: AppCtx, bid: str, *, detail: str = "summary", offset: int = 
         text += (f" Paused for its size: {reason}. Resume with run_batch(batch_id='{bid}', cores=…, memory_gb=…, "
                  "gpus=…, concurrency=…) once the user has said it; a size that fits this block needs no new yes.")
     text += _over_note(led, bid, b) + gpu_note(app, run, b)
+    if phase == "done" and b.get("pilot") and (p := _proposal_of(b)) is not None:
+        cores = f"{p.cores} CPU(s)" if p.cores is not None else "no CPU count (no row's CPU-seconds could be read)"
+        text += (f" Its rows' use suggests {cores} and {p.memory_gb:g} GB per row (`proposal`; {p.concurrency} at once "
+                 "on this block): a size for the next batch.")
     if owner:
         text += f" Another hpc-bridge server holds this batch ({owner}): this is a read of the ledger."
     if c.get("failed") and detail == "summary":

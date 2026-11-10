@@ -35,6 +35,7 @@ from tests.test_batch_sizing import (
     _slot,
     _spawn,
     _wrapper_env,
+    _yes,
 )
 from tests.test_server import _Res
 
@@ -350,7 +351,7 @@ async def test_f1_a_block_asked_by_cores_after_a_derived_one_runs_one_worker_per
     from hpc_bridge.resources import CORES, WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    out = await _run(app, n=1, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    out = await _yes(app, n=1, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     assert out.batch_id and app.built[-1]["max_workers_per_node"] == 5
     assert WORKERS not in app.compute_choice
     await batch.tick(app, out.batch_id)
@@ -368,7 +369,7 @@ async def test_f1_the_derived_blocks_own_size_restated_is_that_block():
     from hpc_bridge.resources import WORKERS
 
     app = _sized_app(_canary(_measure(cpus=9, cpu_ids=tuple(range(9)), workers=5, mem_limit_mb=8192)))
-    await _run(app, n=1, cores=2, memory_gb=1.5, concurrency=4, confirm_spend=True)
+    await _yes(app, n=1, cores=2, memory_gb=1.5, concurrency=4)   # quoted, then the yes (Anvil review r2)
     built = len(app.built)
     st = await server._ensure_endpoint_up(app, "compute", cores=9, memory_gb=7)
     assert st.status == "up" and len(app.built) == built, st

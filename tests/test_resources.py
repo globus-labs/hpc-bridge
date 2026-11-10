@@ -33,7 +33,8 @@ def test_the_arguments_become_config_updates_only_for_what_the_call_named():
 
 
 @pytest.mark.parametrize("kw, why", [
-    ({"cores": 0}, "invalid cores 0"), ({"nodes": -1}, "invalid nodes -1"), ({"memory_gb": True}, "a whole number"),
+    # (memory_gb is a number, a fraction included: the Anvil live test's G4)
+    ({"cores": 0}, "invalid cores 0"), ({"nodes": -1}, "invalid nodes -1"), ({"memory_gb": True}, "a number above 0"),
     ({"cores": "8"}, "a whole number"), ({"gpus": -1}, "from 0"), ({"whole_node": "yes"}, "true or false"),
     ({"cores": 10**6}, "from 1 to 100000"),
 ])

@@ -51,5 +51,22 @@ More than one node is one shell on the first node (D2). The spend question carri
 partition's billing weights are known, the most the block can cost (`max_charge`). A size the partition cannot give, or
 the facility's template does not take, is refused before anything is submitted.
 
+**A block derived from a batch's rows starts only on terms an answer showed** (the Anvil live test's review rounds 1
+to 3, 2026-11-05). `run_batch` with no block confirmed derives the block from the rows' size ([[batch]]); its
+`confirm_spend=True` starts that block only when an answer of this process already quoted exactly it — the same
+facility, endpoint, partition and account as well as the same size (`AppCtx.batch_quoted`, `batch._quote_key`; round
+3: keyed by the size alone, a quote outlived a re-bind and a partition switch, and a yes started 65 CPUs on another
+account). A re-bind or a teardown clears the quotes (`warmth._drop_all_shapes`), and so does any real switch of the
+terms (`warmth._repoint`); a stop keeps them, as it keeps the session's choice. Otherwise the call answers
+`needs_confirmation` with the derived block's terms (`block.derived_from`) and starts nothing; the user's yes to THOSE terms is the same call again. A free agent cell
+had relayed connect_facility's default terms, got the yes, and sent the sized batch with `confirm_spend=True` on its
+first call: a derived 3-CPU block no answer named started (8 cores × 8 at once would have been 65 CPUs). The same holds
+for a resumed batch whose block is gone (round 1). A block already confirmed, or one already quoted, costs no extra
+round trip. `ensure_endpoint_up(confirm_spend=True, cores=…)` is unchanged: there the agent states the size itself.
+After a stop, the block's config is retired ([[batch]]); a new batch's yes counts for it — the config is taken back
+and the batch admits, as ensure_endpoint_up's yes after a stop starts a block on it — and with no yes on the call
+nothing is recorded and the one question is asked (round 3: the yes had built the block, then the batch paused to ask
+again while it billed).
+
 ## See also
 [[shapes]] · [[MEP & templated endpoints]] · [[facility-mep]] · [[Cost control]] · [[server]] · [[cost]] · [[scheduler_ops]] · [[notices]]

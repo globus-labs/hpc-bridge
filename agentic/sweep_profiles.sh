@@ -99,6 +99,7 @@ batch_needs_sizing_then_sized batch row sizing (built, not yet run live): joins 
 batch_pilot_proposal          batch row sizing (built, not yet run live): joins batch_cells (default) after its live proof
 batch_size_first_terms        batch row sizing (built, not yet run live): joins script_only (slices) after its live proof
 batch_gpu_rows                batch row sizing (built, not yet run live): joins batch_cells (site) after its live proof
+batch_row_srun                the Anvil live test (F3; built, not yet run live): joins batch_cells (default) after its live proof
 env_ssh_build_cache           block envs (built, not yet run live): joins batch_cells (default) after its live proof
 env_ssh_switch                block envs (built, not yet run live): joins batch_cells (default) after its live proof
 batch_sized_by_user           agent cell, sizing (built, not yet run live): joins cells() default after its live proof
