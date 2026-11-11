@@ -161,6 +161,6 @@ case "${1:-}" in
   --warm) warm ;;
   --record) record ;;
   --gif) [ -n "${2:-}" ] || die "--gif needs the take: build.sh --gif <hero.mp4>"; gif "$2" ;;
-  -h|--help) sed -n '2,40p' "$0" ;;
+  -h|--help) awk 'NR > 1 && /^#/ { sub(/^# ?/, ""); print; next } NR > 1 { exit }' "$0" ;;
   *) die "unknown argument: $1 (try --help)" ;;
 esac
