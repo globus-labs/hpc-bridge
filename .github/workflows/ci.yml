@@ -35,14 +35,15 @@ jobs:
       - run: uv run --with mypy python -m mypy
 
   test:
-    name: pytest (py${{ matrix.python }})
-    # Pinned: ubuntu-latest became 26.04 (2026-11), whose core tools change how the node-side shell (the endpoint
-    # evidence check, the batch row watcher) behaves under the tests. Back to ubuntu-latest once it passes there.
-    runs-on: ubuntu-24.04
+    name: pytest (py${{ matrix.python }}, ${{ matrix.os }})
+    # Both coreutils the node-side shell meets: GNU (ubuntu-24.04, as on RHEL-family HPC nodes) and uutils (ubuntu-latest
+    # is 26.04 since 2026-11, whose Rust coreutils broke the endpoint evidence check's `date -d`).
+    runs-on: ${{ matrix.os }}
     strategy:
       fail-fast: false
       matrix:
         python: ["3.11", "3.14"]
+        os: [ubuntu-24.04, ubuntu-latest]
     steps:
       - uses: actions/checkout@v4
       - uses: astral-sh/setup-uv@v6
