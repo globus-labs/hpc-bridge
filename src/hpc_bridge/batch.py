@@ -961,9 +961,9 @@ __hb_quick() {
     printf "%d\n", mem }'
 }
 # A signal to the row: its process group and every process __hb_members finds (the ones killed are the ones measured).
-# The members are listed BEFORE the group is signalled: the group's signal ends the row's shell, the wrapper wakes and
-# TERMs the watcher, and a child that left the group was never signalled by it — off Linux, where no token lets the
-# cleanup find it, it outlived the kill.
+# The members are listed BEFORE the group is signalled: listed after, the group's signal had often ended the row's
+# shell already, and a child that left the group was reparented out of the tree — off Linux, where no token finds it,
+# it outlived the kill (macOS, 2026-11-11; the watcher's own TERM is the other half, below).
 __hb_kill() {
   __hb_kl=$(__hb_members | awk '{print $1}')
   kill -"$1" -- "-$__hb_c" 2>/dev/null
@@ -1066,6 +1066,10 @@ set +m
       then __hb_nx=$__hb_fs; fi
     fi
   done
+  # A kill decided is carried out: the wrapper TERMs this watcher once the row's shell ends — which this kill causes,
+  # often before its last signal is sent (a child that left the group then outlived it, off Linux). Ignored from here;
+  # the watch ends by itself, its grace loop over at once with the shell gone.
+  trap '' TERM
   __hb_flush
   __hb_kill TERM
   __hb_k=0
@@ -1083,7 +1087,8 @@ __hb_kill TERM
 __hb_g=$!
 wait "$__hb_t1" "$__hb_t2" "$__hb_p1" "$__hb_p2" "$__hb_p3" "$__hb_p4"
 kill "$__hb_g"
-wait "$__hb_w"   # the watcher's TERM wrote its counts (`.rq`): at once, or after its kill grace's current second
+wait "$__hb_w"   # the watcher's TERM wrote its counts (`.rq`): at once, or after its kill grace's current second (a
+                 # watcher killing the row ignores the TERM and ends by itself: that second, then its last kill)
 [ -s "$__hb_a/.stdout.tail" ] || tail -c @@TAIL@@ "$__hb_a/stdout" > "$__hb_a/.stdout.tail"
 [ -s "$__hb_a/.stderr.tail" ] || tail -c @@ETAIL@@ "$__hb_a/stderr" > "$__hb_a/.stderr.tail"
 rm -f "$__hb_f.o" "$__hb_f.e" "$__hb_f.t" "$__hb_f.u" "$__hb_f.p" "$__hb_f.q" "$__hb_f.go"
