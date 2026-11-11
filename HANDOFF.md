@@ -18,6 +18,46 @@ internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_networ
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
 
+## A per-core block's memory share; a reused block's age (2026-11-10, branch `fix/per-core-memory-share`, on f05cc99)
+
+A billed Anvil live test (Slurm 23.11, `shared`: per-core billing, DefMemPerCPU = MaxMemPerCPU = 1896 MB) found two bugs, fixed
+test-first in `tests/test_per_core_memory_share.py` (red on f05cc99, green after):
+- **R1 (blocker).** `ensure_endpoint_up(cores=8, memory_gb=15.5)` sent `--cpus-per-task=8 --mem=15872M`. Slurm raised
+  the job to 9 CPUs (15872 MB > 8 × 1896), parsl's launcher `srun` died at once (`SLURM_CPUS_PER_TASK=9 !=
+  SLURM_TRES_PER_TASK=cpu=8`), the block FAILED in 5 s (MISSING, BadStateException), and the size words said 8 cores.
+  hpc-bridge's own default proposal said "8 cores, 15 GB": said back, 15 GB is over the share too.
+  - **The rule** (`resources.cores_for_memory`; vault `Modules/resources.md`, "The per-core memory share"): where the
+    ENFORCED share is known (MaxMemPerCPU), a memory above the cores' share RAISES the cores the block asks
+    for to ceil(memory / share), so the request and Slurm's CPUs agree; the terms say so ("15.5 GB needs 9 cores'
+    memory share on partition 'shared' (1896 MB each): 9 cores are billed, and the block asks for 9, not 8") and the
+    cost counts them. Chosen over capping the memory and refusing: the scheduler gives and bills those cores anyway,
+    and raising never fails at start and never understates.
+  - **Every path:** ensure_endpoint_up (sizes and the default proposal, now never over the share: "14.8 GB"), N
+    nodes, a batch's derived block (`derive_block`'s refusals count the raised CPUs; `_is_derived` matches by
+    `cores_asked`), a Jobs-mode job (`spec_of`: `--cpus-per-task` and the rate), a facility endpoint's template (the
+    cores sent beside its whole-GB memory), and an exported handoff's config (refused, naming the cores to send: it
+    goes out as written). Where no share is known nothing is guessed; the terms say the scheduler may give — and bill
+    — more cores than asked.
+  - **Round 2** (Anvil's live `scontrol show partition`: `gpu` has DefMemPerCPU=3750 and no MaxMemPerCPU, and Slurm
+    adds no CPUs for memory there): DefMemPerCPU alone never raises cores; it only caps the default proposal's
+    memory. (a) MaxMemPerCPU known: raise; (b) known to have none (discovery saw MaxMemPerNode or an UNLIMITED cap:
+    `PartitionShape.max_mem_per_core_known`): no raise, no line; (c) not known: no raise, one line. PBS raises only
+    on a share a registry entry states. The Anvil seed now states `shared`'s MaxMemPerCPU=1896 (`debug` unknown):
+    **the published registry needs a re-ingest** for facility users to get it.
+  - **Review round of #253:** a partition's `MaxMemPerNode=UNLIMITED` falls back to the cluster's MaxMemPerCPU
+    (Slurm 23.11 `_valid_pn_min_mem`), which the probe now reads from `scontrol show config`; unread, it is case (c),
+    never (b). The raised cores meet every cap on every path (a node's cores, MaxCPUsPerNode, the QOS per-job cap),
+    refused naming the cap and the most memory that fits; a handoff never advises more cores than a node has. A
+    derived block's DEFAULTED memory is held to its cores' share (16 rows: 17 CPUs, not 18). The age bound says
+    "about": it counts from the block's first answer, not Slurm's StartTime.
+  - A hermetic check of Slurm's own: a fake Slurm that raises the job's CPUs as Anvil did and a fake `srun` making
+    23.11's TRES check, run on the block script the wire renders (parsl's own where importable:
+    `uv run --with parsl==2026.8.10 …`).
+- **R2.** A reused block's "a task runs up to ~880s (the block walltime)" ignored its age (up 5 min of its 15): the
+  bound is about what is left of the block's walltime from its first answer (`notices._block_left_s`), in the bounds
+  note and a running task's answer. It can overstate by the worker's start-up (Slurm's StartTime is a little earlier).
+- Live re-check to run on Anvil (billed, needs the user's yes): `ensure_endpoint_up(cores=8, memory_gb=15.5)` on
+  `shared` comes up (9 CPUs, `srun` passes), and the default proposal's block comes up.
 ## Ubuntu 26.04's coreutils (2026-11-10, branch `fix/ubuntu-2604-node-shell`)
 
 GitHub's `ubuntu-latest` became Ubuntu 26.04, whose coreutils are **uutils 0.10.0** (Rust, one multicall binary);

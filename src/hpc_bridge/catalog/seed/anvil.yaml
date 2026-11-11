@@ -54,9 +54,12 @@
     # login shape (sinfo, scontrol show partition: per core, DefMemPerCPU=1896, TRESBillingWeights=CPU=1.0): a request
     # (cores=, memory_gb=, whole_node=) is checked against it and the terms carry its cost. The template's schema lists
     # cores_per_node / mem_per_node / exclusive; `wholenode` hands out whole nodes (its OverSubscribe says NO).
+    # `shared` ENFORCES 1896 MB per core (MaxMemPerCPU=1896, read live 2026-11-10): a memory above its cores' share
+    # makes Slurm add CPUs, so a block asks for — and bills — them (hpc_bridge.resources.cores_for_memory). `debug`'s
+    # MaxMemPerCPU was never read: left unknown (the terms say more cores may bill).
     partitions:
       - {name: shared, kind: per_core, why: "SelectType=select/cons_tres, OverSubscribe=NO", cores: 128,
-         memory_gb: 251.4, mem_per_core_mb: 1896, billing: {cpu: 1.0}}
+         memory_gb: 251.4, mem_per_core_mb: 1896, max_mem_per_core_mb: 1896, billing: {cpu: 1.0}}
       - {name: debug, kind: per_core, why: "SelectType=select/cons_tres, OverSubscribe=NO", cores: 128,
          memory_gb: 251.4, mem_per_core_mb: 1896, billing: {cpu: 1.0}}
       - {name: wholenode, kind: whole_node, why: "Anvil's whole-node partition", cores: 128, memory_gb: 251.4,

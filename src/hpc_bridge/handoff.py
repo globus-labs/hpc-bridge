@@ -831,6 +831,25 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
         size, shape = notices._block_size(app, sized)
     if size.nodes != nodes:
         size = dataclasses.replace(size, nodes=nodes)
+    if size.cores_asked is not None:
+        # the config goes out as it is (its canary too): a memory above its cores' per-core share would have Slurm
+        # raise the block's CPUs past `--cpus-per-task`, and parsl's srun fail at start (the Anvil live test of
+        # 2026-11-10) — never sent; the caller sends the cores it needs (billed either way)
+        kmap = _kmap(app, plan.access)
+        if (over := resources.cores_cap(size.cores or 0, nodes, shape)) is not None:
+            # cores no node, MaxCPUsPerNode or QOS cap allows: never advised (review round of #253: "Send 130" on
+            # 128-core nodes) — the memory itself cannot be had there
+            raise HandoffRefusal("invalid", (
+                f"Refused, nothing was sent: {resources.memory_cores_words(size, shape, billed=False)} — {over}, "
+                f"so no block of this partition holds `{kmap.get(resources.MEM, resources.MEM)}` with its cores' "
+                f"memory share: {resources.less_memory(nodes, shape)}."))
+        raise HandoffRefusal("invalid", (
+            f"Refused, nothing was sent: {resources.memory_cores_words(size, shape, billed=False)} — "
+            f"`{kmap.get(resources.MEM, resources.MEM)}` is above the per-core memory share of "
+            f"`{kmap.get(resources.CORES, resources.CORES)}`={size.cores_asked}, so the scheduler would raise the "
+            f"block to {size.cores} CPUs and parsl's srun would fail at start on the cores it was asked for. Send "
+            f"`{kmap.get(resources.CORES, resources.CORES)}`: {size.cores} (it is billed for {size.cores} either way), "
+            "or less memory."))
     got = resources.charge(size, shape, 3600.0)
     if got is not None:
         # the exact hourly rate: `charge` rounds its figure to 2 decimals, so it is read over a million hours and

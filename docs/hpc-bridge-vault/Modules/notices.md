@@ -7,13 +7,27 @@ Split step 3 (2026-09-03). A notice IS the product — the agent reads it and ac
 
 **The block's size (2026-10-24, [[Resource requests]]).** `_block_terms` reads the size through `_block_size`
 (`notices.py:366`: the facility's `block_size` on hpc-bridge's own template, the received keys on a facility endpoint)
-and the cost through `resources.charge`; `_terms_line` says it ("1 node × 8 cores, 15 GB (the partition's default per
+and the cost through `resources.charge`; `_terms_line` says it ("1 node × 8 cores, 14.8 GB (the partition's default per
 core) …; at most 4 billing units: 8 cores × 0.5 h" — the unit `AppCtx.charge_unit`, from the allocation listing, where known) and `_size_sentence` (`:513`) what it means — hpc-bridge's proposal on a
 per-core partition (ask the user), whole nodes because the partition gives only those, and N > 1 nodes (D2: one shell
 on the first node, srun/mpiexec, unused nodes bill). `_connect_terms_note` asks "whether that slice is enough";
 `_spend_floor_guidance` says to send `cores=/memory_gb=/gpus=/nodes=` in the same call. `_size_refusal` (`:394`) is the
 validation ([[server]]). A switch's words come from `_changed` / `_old_terms` (`:795`): "partition or account" as
 before, "partition, account or size" when the size moved, the old size named.
+
+**The per-core memory share (the Anvil live test of 2026-11-10).** `BlockTerms.cores_asked` / `memory_share_mb` (the enforced
+share, MaxMemPerCPU) / `memory_share_known` carry a raise ([[resources]] `cores_for_memory`): `cores_per_node` is the
+raised count the block asks for and bills.
+`_memory_cores_sentence` says what the cost line does not already say — the raise ("15.5 GB needs 9 cores' memory
+share on partition 'shared' (1896 MB each): …"), the cores a known share bills at least where no core count is sent, nothing
+where the partition is known to enforce no share (round 2: Anvil's `gpu`), or, where that is not known, that the
+scheduler may give and bill more cores than asked (nothing guessed). **A task's bound
+counts the block's age:** `_block_left_s` is what is left of the confirmed block's walltime from `block_since` (a
+reused or met-again block keeps its age: [[warmth]] `_answering_block_since`); `_billed_bounds_note` and
+`_running_outcome(block_left_s=)` say it — "about": counted from the block's first answer, not the scheduler's start
+time, so the block may end up to its worker's start-up sooner (review round of #253) — where it is shorter than the
+task ceiling — a reused block 5 min into its 15 had
+read "a task runs up to ~880s (the block walltime)".
 
 **Review round 1.** `_size_why` (`:348`) says where a size nothing asked for comes from (parsl's default exclusive, the
 facility's options, its template's default); `_size_refusal` also refuses `nodes>1` on a facility endpoint and a `gpus=`

@@ -8,7 +8,8 @@
 # fields it asked for); QOS is Name|MaxTRES|MaxTRESPU (MaxTRES — the per-job cap — was not asked: empty). Not captured
 # that day, and added here as the probe would read it: SELECT_TYPE (Anvil's `shared` partition shares nodes by core,
 # which only select/cons_res or cons_tres do). `wide` and `gpu` had no scontrol line in the capture: their kind is not
-# known. Account names and balances are left out.
+# known. Account names and balances are left out. `shared`'s MaxMemPerCPU=1896 was read live on 2026-11-10 (the
+# per-core memory share Slurm enforces) and added here; `debug`'s was never read, so it stays unknown.
 HPCB_PROBE_BEGIN
 USER=x-tester
 HOME=/home/x-tester
@@ -36,7 +37,7 @@ PSHAPE=gpu-debug|128|515400
 PSHAPE=profiling|128|257400
 SELECT_TYPE=select/cons_tres
 PDETAIL=PartitionName=debug QoS=part-debug DefaultTime=00:15:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP DefMemPerCPU=1896 TRESBillingWeights=CPU=1.0
-PDETAIL=PartitionName=shared QoS=part-shared DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP DefMemPerCPU=1896 TRESBillingWeights=CPU=1.0
+PDETAIL=PartitionName=shared QoS=part-shared DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP DefMemPerCPU=1896 MaxMemPerCPU=1896 TRESBillingWeights=CPU=1.0
 PDETAIL=PartitionName=standard QoS=part-standard DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP TRESBillingWeights=CPU=1.0
 PDETAIL=PartitionName=wholenode QoS=part-standard DefaultTime=00:30:00 MaxNodes=UNLIMITED MaxTime=UNLIMITED OverSubscribe=NO State=UP TRESBillingWeights=CPU=1.0
 QOS=normal||

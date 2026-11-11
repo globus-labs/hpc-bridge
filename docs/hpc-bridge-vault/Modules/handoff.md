@@ -20,6 +20,9 @@
      - The terms state the value the config sends for every size key it carries: `init_blocks`, `min_blocks`, `max_blocks`, `nodes_per_block`, `walltime`, `max_workers_per_node`, `available_accelerators`, and (since the demo) `cores_per_node`, `cpus_per_node`, `mem_per_node`, `gpus_per_node`, `exclusive`, `select_options`; the question names them (`_block_words`).
      - The block is sized from the config AS SENT (`SlurmFacility.block_size(…, propose=False)`): no `dispatch_uec` gives a handoff D3's proposed slice, so on a per-core partition a config that asks for no slice is parsl's whole node (`--exclusive`) — the terms had costed a 2-core slice of a 4-core node.
      - The rate is a block's billing per hour where the partition's weights are known, else node-hours.
+     - A config whose memory is above its cores' per-core memory share is refused (`invalid`), naming the cores to
+       send: it goes out as written, its canary too, and Slurm would raise the block's CPUs past `--cpus-per-task` —
+       parsl's srun then fails at start ([[resources]] `cores_for_memory`, the Anvil live test of 2026-11-10).
      - `worst_case = max_blocks × rate × (hours × max(1, min_charge ÷ idle) + max(walltime, min_charge))`: blocks back to back, each charged at least the minimum, plus one block started just before the record expires.
      - `canary_worst_case = max(1, init_blocks) × rate × max(walltime, min_charge)`.
      - A minimum charge with an unreadable idle window is refused as `unbounded`.

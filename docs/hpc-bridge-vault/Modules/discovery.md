@@ -27,7 +27,8 @@ Reached from `connect_facility`'s registry-miss path: `_propose_or_ask` ([[serve
 > Discovery *proposes* discovered facts for the user to confirm; it must not silently commit. A wrong `interface`/`env_setup` is caught by the [[Warmth, the canary & cold-start|canary]] (the worker never registers), so the draft is **checkable, not trusted** — elicit → propose → confirm → validate.
 
 **What each partition hands out (2026-10-24, [[Resource requests]]).** The probe also prints `PSHAPE=` (`sinfo
--o '%P|%c|%m|%G'`), `SELECT_TYPE=` / `SELECT_PARAMS=` (`scontrol show config`), `PDETAIL=` (`scontrol show partition
+-o '%P|%c|%m|%G'`), `SELECT_TYPE=` / `SELECT_PARAMS=` and the cluster's memory cap `CONF_MAXMEMPERCPU=` / `CONF_MAXMEMPERNODE=` (`scontrol show
+config`: a partition with no cap of its own falls back to it — review round of #253), `PDETAIL=` (`scontrol show partition
 -o`) and `QOS=` (`sacctmgr -nP show qos format=Name,MaxTRES,MaxTRESPU`), each capped by `hpcb_capped`; on PBS `PNODE=`
 (`pbsnodes -a`: ncpus, mem, ngpus, sharing, queue), `PQUEUE=` (`qstat -Qf` resources_default/max) and `PSERVER=`
 (`qstat -Bf`). `parse_probe` classifies them with [[resources]] `classify_slurm` / `classify_pbs` into the draft's

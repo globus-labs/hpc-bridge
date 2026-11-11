@@ -9,6 +9,7 @@ functions read the context and return text or a result model. `server` re-export
 from __future__ import annotations
 
 import asyncio
+import math
 import re
 import time
 from collections.abc import Collection, Mapping
@@ -276,12 +277,36 @@ def _billed_bounds_note(app: AppCtx, rt: ShapeRuntime) -> str:
     it, exit 124) and, if it outlives the sync-wait, comes back as a poll handle (poll_task) — it is
     NOT cut at ~110s any more. The block idle-releases after `max_idletime` once nothing is running or
     queued, so keep long work in the FOREGROUND (a running task holds the block); a detached process
-    is not a Compute task and would be idle-released out from under itself."""
-    ceiling = int(_task_ceiling_s(rt.user_endpoint_config))
-    return (f"billed block bounds — a task runs up to ~{ceiling}s (the block walltime); one that "
+    is not a Compute task and would be idle-released out from under itself. A block whose start is known — one an
+    earlier server left running and this one reused, one met again after a switch — is bounded by what is left of its
+    walltime, never the whole of it (the Anvil live test of 2026-11-10: a reused block 5 min into its 15 read ~880s)."""
+    ceiling = _task_ceiling_s(rt.user_endpoint_config)
+    left = _block_left_s(rt)
+    if left is not None and left < ceiling:
+        wall = rt.user_endpoint_config.get("walltime")
+        age = int((time.monotonic() - rt.block_since) // 60) if rt.block_since is not None else 0
+        # counted from the block's first answer, not the scheduler's start time: about, and it may end up to the
+        # worker's start-up sooner (review round of #253)
+        bound = (f"~{int(left)}s (about what is left of the block's {wall} walltime, counted from its first answer "
+                 f"~{age} min ago — the scheduler's clock started a little before it; a task still running when it "
+                 "ends is killed with the block)")
+    else:
+        bound = f"~{int(ceiling)}s (the block walltime)"
+    return (f"billed block bounds — a task runs up to {bound}; one that "
             f"outlives the ~{int(SYNC_WAIT_S)}s sync-wait returns a poll handle (poll_task), it is NOT "
             f"cut. The block idle-releases after {_idle_window_text(app)} once nothing runs or is queued, so run "
             "long work as a foreground task — don't detach it (a detached process isn't a Compute task).")
+
+def _block_left_s(rt: ShapeRuntime | None) -> float | None:
+    """What is left of the shape's confirmed block's walltime, from its known start (`ShapeRuntime.block_since`: dated
+    by its scheduler job, so a reused block keeps its age — warmth._answering_block_since), or None when its start or
+    its walltime is not known."""
+    if rt is None or rt.block_since is None:
+        return None
+    wall = _parse_hhmmss(rt.user_endpoint_config.get("walltime"))
+    if not wall:
+        return None
+    return max(0.0, rt.block_since + wall - time.monotonic())
 
 def _idle_window_text(app: AppCtx) -> str:
     """The idle-release window as the agent should relay it: a number only when it is KNOWN. A facility endpoint's
@@ -370,6 +395,8 @@ def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) 
         compute_only=not _has_login_shape(app),
         whole_node=size.whole_node, cores_per_node=size.cores, memory_gb=size.memory_gb,
         memory_default=size.memory_default, gpus_per_node=size.gpus, size_source=size_source,
+        cores_asked=size.cores_asked, memory_share_mb=resources.enforced_share_mb(shape),
+        memory_share_known=not resources.share_unknown(shape),
         size_why=_size_why(size, app),
         max_charge=cost[0] if cost else None, charge_basis=cost[1] if cost else None,
         charge_unit=(getattr(app, "charge_unit", None) or "billing units") if cost else None,
@@ -576,7 +603,37 @@ def _size_sentence(app: AppCtx, t: BlockTerms) -> str:
         out += ("Whether that node is shared is the facility template's own default (parsl's is the whole node), so "
                 + ("the most it can bill is counted as a whole node. " if t.max_charge is not None else
                    "it may hold — and bill — the whole node. "))
-    return out + resources.multinode_note(t.nodes, t.compute_only)
+    return out + _memory_cores_sentence(app, t) + resources.multinode_note(t.nodes, t.compute_only)
+
+
+def _memory_cores_sentence(app: AppCtx, t: BlockTerms) -> str:
+    """What a memory sent with a slice does to its cores (the Anvil live test of 2026-11-10), where the cost line does
+    not already say it — case (a), an enforced share (MaxMemPerCPU): the cores raised to it
+    (`resources.cores_for_memory`), or, with no core count sent, the cores the scheduler gives — and bills — at least;
+    (b) known to have none: nothing (Slurm adds no CPUs for memory there); (c) not known: that the scheduler may give
+    and bill more cores than asked (nothing is guessed)."""
+    if t.memory_gb is None or t.memory_default or t.whole_node is True:
+        return ""
+    word = _queue_word(app)
+    basis = t.charge_basis or ""
+    if t.cores_asked is not None and t.cores_per_node and t.memory_share_mb:
+        if "memory share" in basis:
+            return ""
+        shape = resources.shape_of(getattr(app.facility, "partitions", None), t.queue)
+        size = resources.Size(cores=t.cores_per_node, memory_gb=t.memory_gb, cores_asked=t.cores_asked,
+                              share_mb=t.memory_share_mb)
+        return resources.memory_cores_words(size, shape, word, billed=t.whole_node is False) + ". "
+    if t.memory_share_mb and t.cores_per_node is None:
+        need = math.ceil(resources.mem_mb(t.memory_gb) / t.memory_share_mb)
+        where = f"{word} '{t.queue}'" if t.queue else f"this {word}"
+        return (f"{t.memory_gb:g} GB is {need} cores' memory share on {where} ({t.memory_share_mb} MB "
+                f"each): the scheduler gives — and bills — at least {need} cores, whatever core count the template "
+                "asks for. ")
+    if (not t.memory_share_known and word == "partition" and "may bill too" not in basis
+            and (t.whole_node is False or t.max_charge is None)):
+        return (f"The memory is sent with the cores; this {word}'s per-core memory share is not known, so where the "
+                "memory is above the cores' share the scheduler may give — and bill — more cores than asked. ")
+    return ""
 
 
 def _connect_terms_note(app: AppCtx, terms: BlockTerms | None, *, listed: bool = False, left: bool = False) -> str:
@@ -1823,12 +1880,18 @@ def _reserved_session_outcome(session_id: str) -> ShellOutcome:
     )
 
 def _running_outcome(app: AppCtx, task_id: str, ceiling_s: float, *, client_cancelled: bool = False,
-                     reset: bool = False, block_state: BlockState = "warm") -> ShellOutcome:
-    """`block_state`: "cold" once the block it went to was released under it (the shape is gone)."""
+                     reset: bool = False, block_state: BlockState = "warm",
+                     block_left_s: float | None = None) -> ShellOutcome:
+    """`block_state`: "cold" once the block it went to was released under it (the shape is gone). `block_left_s`: what
+    is left of the block's walltime (`_block_left_s`), when its start is known — a task never outlives its block."""
     state = "the reset is still queued or running" if reset else "still running"
     why = f"({_CLIENT_CANCELLED})" if client_cancelled else f"past the ~{int(SYNC_WAIT_S)}s sync-wait"
+    runs = (f"It runs until the block's walltime ends, about ~{int(block_left_s)}s from now (counted from the "
+            "block's first answer, so it may end a little sooner), then is killed with the block"
+            if block_left_s is not None and block_left_s < ceiling_s else
+            f"It runs up to ~{int(ceiling_s)}s (the block walltime) then is killed (exit 124)")
     tail = ("The session stays busy until it ends." if reset else
-            f"It runs up to ~{int(ceiling_s)}s (the block walltime) then is killed (exit 124); for anything longer, "
+            f"{runs}; for anything longer, "
             "checkpoint and resume across blocks, or submit a batch job (billed to the allocation like a block, so "
             "only with the user's spend confirmation)."
             + (" The block stays warm while it runs." if block_state == "warm" else ""))

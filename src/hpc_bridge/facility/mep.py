@@ -137,7 +137,9 @@ class MEPFacility:
         from .. import resources
 
         back = {dst: src for src, dst in self.key_map.items()}
-        sent = {back.get(k, k): v for k, v in self.dispatch_uec(dict(uec)).items()}
+        # what is sent BEFORE the cores are raised to the memory's share: `effective` raises them by the same rule
+        # (resources.cores_for_memory) and says from what
+        sent = {back.get(k, k): v for k, v in self._wire(dict(uec), cover=False).items()}
         shape = resources.shape_of(self.partitions, sent.get("partition"))
         return resources.effective(sent, shape, channel="mep", takes=self.renders(resources.WHOLE),
                                    scheduler=self.scheduler)
@@ -342,7 +344,12 @@ class MEPFacility:
         """The config actually SENT with a submit: the runtime config minus the plugin's internal markers when
         the facility's schema forbids unknown keys. `compute: True` must stay in the runtime dict — the
         server's account/partition logic keys on it (dropping it there silently skipped the account the user
-        confirmed; Anvil live, 2026-09-04) — but a strict schema would reject it on the wire."""
+        confirmed; Anvil live, 2026-09-04) — but a strict schema would reject it on the wire. A memory above its cores'
+        per-core share on a partition the registry knows raises the cores sent (resources.cores_for_memory: the count
+        Slurm would raise the job to — the Anvil live test of 2026-11-10)."""
+        return MEPFacility._wire(self, uec, cover=True)   # (called unbound by a duck-typed facility too)
+
+    def _wire(self, uec: dict, *, cover: bool) -> dict:
         # facility-defined key names (NeSI: account -> ACCOUNT_ID, walltime -> WALL_TIME), applied here and only
         # here so a value the server wrote under hpc-bridge's name after construction is renamed too. A None
         # value is not sent under the facility's name (a required key must fail as "missing", not as null).
@@ -366,6 +373,9 @@ class MEPFacility:
             mem = uec.get(resources.MEM)
             if isinstance(mem, int | float) and not isinstance(mem, bool) and mem > 0:
                 uec[resources.MEM] = resources.whole_gb(mem)
+                cores = resources._int(uec.get(resources.CORES))
+                if cover and cores and uec.get(resources.WHOLE) is not True:   # cores that cover the memory sent
+                    uec[resources.CORES] = resources.cores_for_memory(cores, uec[resources.MEM], shape)
         for src, dst in self.key_map.items():
             if src in uec:
                 val = uec.pop(src)

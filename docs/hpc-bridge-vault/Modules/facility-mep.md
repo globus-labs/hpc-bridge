@@ -43,7 +43,11 @@
 > partition the entry calls per-core (review round 2); a curated whole-node partition is whole, and is sent
 > `exclusive: true` (where the template takes it) and none of the entry's `cores_per_node`/`mem_per_node`; else the
 > template's own default, costed as a whole node (review round 1). Several nodes are not offered. The Anvil entry
-> sends no `exclusive` (round 2: on every partition it read as a slice, `wide` and `gpu` too).
+> sends no `exclusive` (round 2: on every partition it read as a slice, `wide` and `gpu` too). A memory above the
+> cores' per-core share, on a partition the entry knows that share for, raises the `cores_per_node` sent beside the
+> whole-GB memory (`_wire(cover=True)`; [[resources]] `cores_for_memory`, the Anvil live test of 2026-11-10): Anvil's
+> 8 cores with 15.5 GB go as 9 cores and 16 GB, 1 core with 1.9 GB as 2 cores and 2 GB. `block_size` reads the keys
+> before that raise (`cover=False`) and `effective` makes it by the same rule, so the terms say from what.
 
 ## See also
 [[facility-base]] · [[facility-remote]] · [[server]] · [[Facility catalog]] · [[MEP & templated endpoints]] · [[Endpoint reuse and MEP integration]] · [[MEP facilities survey]] · [[Cost control]] · [[shapes]]

@@ -101,7 +101,8 @@ fi
 HPCB_P=$(sinfo -h -o '%P|%a' 2>/dev/null); [ -n "$HPCB_P" ] && printf '%s\n' "$HPCB_P" | sed 's/^/PART=/'
 sinfo -h -o 'PSHAPE=%P|%c|%m|%G' 2>/dev/null | head -200 || true
 hpcb_capped scontrol show config 2>/dev/null \
-  | awk '$1=="SelectType"{print "SELECT_TYPE="$3} $1=="SelectTypeParameters"{print "SELECT_PARAMS="$3}' || true
+  | awk '$1=="SelectType"{print "SELECT_TYPE="$3} $1=="SelectTypeParameters"{print "SELECT_PARAMS="$3}
+         $1=="MaxMemPerCPU"{print "CONF_MAXMEMPERCPU="$3} $1=="MaxMemPerNode"{print "CONF_MAXMEMPERNODE="$3}' || true
 HPCB_D=$(hpcb_capped scontrol show partition -o 2>/dev/null | head -100)
 [ -n "$HPCB_D" ] && printf '%s\n' "$HPCB_D" | sed 's/^/PDETAIL=/'
 hpcb_capped sacctmgr -nP show qos format=Name,MaxTRES,MaxTRESPU 2>/dev/null | head -200 | sed 's/^/QOS=/' || true
@@ -339,9 +340,11 @@ def parse_probe(stdout: str, *, ssh_host: str) -> tuple[FacilityDetails, list[st
         partitions = resources.classify_pbs(queues=f.get("QUEUE", []), nodes=f.get("PNODE", []),
                                             queue_attrs=f.get("PQUEUE", []), server_attrs=f.get("PSERVER", []))
     else:
+        # the cluster's own memory cap (slurm.conf): Slurm falls back to it on a partition that sets none of its own
         partitions = resources.classify_slurm(select_type=f.get("SELECT_TYPE"), select_params=f.get("SELECT_PARAMS"),
                                               shapes=f.get("PSHAPE", []), details=f.get("PDETAIL", []),
-                                              qos=f.get("QOS", []))
+                                              qos=f.get("QOS", []), cluster_max_mem_per_cpu=f.get("CONF_MAXMEMPERCPU"),
+                                              cluster_max_mem_per_node=f.get("CONF_MAXMEMPERNODE"))
     if partitions and (note := resources.summary(partitions)):
         notes.append(note)
 

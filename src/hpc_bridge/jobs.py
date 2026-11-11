@@ -606,9 +606,23 @@ def spec_of(app: AppCtx, *, command: Any, session_id: str, account: Any, partiti
                          "per-core partition")
     if slice_ask or (whole_node is None and shape is not None and shape.kind == "per_core"):
         c = int(cores) if cores is not None else resources.default_slice_cores(shape, n)
-        size = resources.Size(nodes=n, whole_node=False, cores=c,
-                              memory_gb=float(memory_gb) if memory_gb is not None else None,
-                              gpus=int(gpus) if gpus else None)
+        mem = float(memory_gb) if memory_gb is not None else None
+        # a memory above the cores' per-core share: the job asks for the cores it needs (`--cpus-per-task`), the count
+        # Slurm would raise it to — so a `srun` in it passes Slurm's own check — and is billed for them (the Anvil
+        # live test of 2026-11-10)
+        held = resources.cores_for_memory(c, mem, shape) or c
+        size = resources.Size(nodes=n, whole_node=False, cores=held, memory_gb=mem, gpus=int(gpus) if gpus else None,
+                              send_mem=mem, cores_asked=c if held > c else None,
+                              share_mb=resources.enforced_share_mb(shape) if held > c else None)
+        # every cap, on the cores the job asks for (review round of #253: only a node's cores were checked, raised or
+        # not — a job over MaxCPUsPerNode or its QOS's per-job cap pends and never starts)
+        if (over := resources.cores_cap(held, n, shape)) is not None:
+            if held > c:
+                raise JobRefusal(f"memory_gb={memory_gb!r} needs {held} cores' memory share on partition {part!r} "
+                                 f"({size.share_mb} MB each), {over}: such a job pends and never starts — "
+                                 f"{resources.less_memory(n, shape)}")
+            raise JobRefusal(f"cores={c!r} on partition {part!r} is {over}: such a job pends and never starts — ask "
+                             "for fewer cores or another partition")
     else:
         size = resources._whole(n, shape, int(gpus) if gpus else None)
     got = resources.charge(size, shape, 3600.0)
@@ -621,6 +635,8 @@ def spec_of(app: AppCtx, *, command: Any, session_id: str, account: Any, partiti
                              "cores= (a slice) or pick a partition whose node size is known")
         rate = float(billed * size.nodes)
         per_hour = f"{size.nodes} node{'s' if size.nodes > 1 else ''} × {billed} cores (its CPUs, the default billing)"
+        if raised := resources.memory_cores_words(size, shape):
+            per_hour += f"; {raised}"
     min_h = shape.min_charge_h if shape is not None else None
     per_task = rate * max(wall / 3600, min_h or 0.0)
     hours = f"{_g(wall / 3600)} h" + (f" (at least the queue's minimum charge of {_g(min_h)} h)"

@@ -2093,12 +2093,14 @@ def _would_need(s: sz.Sizing) -> str:
 
 def _is_derived(block: Any, derived: sz.DerivedBlock) -> bool:
     """The terms are the derived block: a whole node where it is one, else its cores per node (a size the facility
-    refused leaves the terms on the block before it)."""
+    refused leaves the terms on the block before it) — the cores asked, where its memory raised them to its per-core
+    share (`BlockTerms.cores_asked`: the Anvil live test of 2026-11-10)."""
     if block is None:
         return False
     if derived.whole_node:
         return block.whole_node is True
-    return block.cores_per_node == derived.cores
+    asked = block.cores_asked if block.cores_asked is not None else block.cores_per_node
+    return asked == derived.cores
 
 
 def _multi_node(rt: ShapeRuntime, measure: sz.BlockMeasure | None) -> str | None:
@@ -2226,7 +2228,11 @@ async def run_batch(app: AppCtx, *, ensure_up: EnsureUp, command: str | None = N
             mem = f"{derived.memory_gb} GB" if derived.memory_gb else "the node's memory"
             unsaid = (" This yes was for a block no answer had shown yet, so nothing started: these are its terms — "
                       "with the user's yes to THEM, send the same call again (confirm_spend=True)." if unseen else "")
-            out.notice = (f"The block derived from the batch: {words} = {derived.cores} CPUs, {mem}"
+            b0 = out.block
+            held = b0.cores_per_node if b0 is not None and b0.cores_asked == derived.cores else None
+            cpus = (f"{derived.cores} CPUs — raised to {held}, its memory's per-core share (the terms below say it)"
+                    if held and held > derived.cores else f"{derived.cores} CPUs")
+            out.notice = (f"The block derived from the batch: {words} = {cpus}, {mem}"
                           + (f", {derived.gpus} GPU(s)" if derived.gpus else "") + ", one node, "
                           + (f"{derived.workers} workers ({derived.workers - 1} rows at once and one for interactive "
                              "commands)" if derived.workers else

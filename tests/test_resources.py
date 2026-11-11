@@ -206,7 +206,8 @@ def test_a_facility_endpoint_is_a_slice_only_when_exclusive_false_reaches_it():
     assert (s.whole_node, s.cores) == (None, 1)
     assert resources.charge(s, SHARED, 900) == (32.0, "a whole node's worth, the most it can be: 128 cores × 0.25 h")
     sl = resources.effective({CORES: 1, NODES: 1, WHOLE: False}, SHARED, channel="mep")
-    assert (sl.whole_node, sl.cores, sl.memory_gb, sl.memory_default, sl.proposed) == (False, 1, 1.9, True, False)
+    # 1896 MB said 1.8 GB, never up: 1.9 GB said back is over one core's share (the Anvil live test of 2026-11-10)
+    assert (sl.whole_node, sl.cores, sl.memory_gb, sl.memory_default, sl.proposed) == (False, 1, 1.8, True, False)
     assert resources.charge(sl, SHARED, 900) == (0.25, "1 core × 0.25 h")
     assert resources.effective({NODES: 1}, SHARED, channel="mep").whole_node is None   # no D3 there
     assert resources.effective({WHOLE: True, NODES: 1}, SHARED, channel="mep").cores == 128
@@ -312,9 +313,14 @@ def test_the_cost_estimate_of_a_slice_a_whole_node_and_several_nodes():
     assert resources.charge(whole, SHARED, 1800) == (64.0, "128 cores × 0.5 h")
     two = resources.effective(_uec(**{NODES: 2, CORES: 4}), SHARED, channel="ssh")
     assert resources.charge(two, SHARED, 3600) == (8.0, "2 nodes × 4 cores × 1 h")
-    w = SHARED.model_copy(update={"billing": {"cpu": 1.0, "mem_gb": 0.25, "gpu": 16.0}})
+    w = SHARED.model_copy(update={"billing": {"cpu": 1.0, "mem_gb": 0.25, "gpu": 16.0}, "mem_per_core_mb": None})
     g = resources.effective(_uec(**{CORES: 4, MEM: 16, GPUS: 1}), w, channel="ssh")
     assert resources.charge(g, w, 900) == (6.0, "(4 cores + 16 GB × 0.25 + 1 GPU × 16) × 0.25 h")
+    # with an enforced per-core share (MaxMemPerCPU), 16 GB is 9 cores' share: the block asks for 9, billed beside its
+    # memory weight (the Anvil live test of 2026-11-10); DefMemPerCPU alone adds none (round 2)
+    ws = w.model_copy(update={"mem_per_core_mb": 1896, "max_mem_per_core_mb": 1896})
+    g9 = resources.effective(_uec(**{CORES: 4, MEM: 16, GPUS: 1}), ws, channel="ssh")
+    assert resources.charge(g9, ws, 900)[0] == 7.25 and g9.cores == 9
     assert resources.charge(slice_, SHARED.model_copy(update={"billing": None}), 1800) is None   # weights unknown
     # a size nobody knows is costed as a whole node, never less
     assert resources.charge(resources.Size(nodes=1), SHARED, 1800) == (
@@ -324,7 +330,7 @@ def test_the_cost_estimate_of_a_slice_a_whole_node_and_several_nodes():
 def test_the_size_words():
     w = resources.size_words
     assert w(nodes=1, whole_node=False, cores=8, memory_gb=14.8, memory_default=True, gpus=None) == (
-        "1 node × 8 cores, 15 GB (the partition's default per core)")
+        "1 node × 8 cores, 14.8 GB (the partition's default per core)")      # never rounded up (2026-11-10)
     assert w(nodes=1, whole_node=True, cores=128, memory_gb=251.4, memory_default=False, gpus=None) == (
         "1 whole node (128 cores)")
     assert w(nodes=2, whole_node=False, cores=2, memory_gb=2.0, memory_default=False, gpus=1) == (
