@@ -51,6 +51,8 @@ one block for as long as you are active plus that timeout, not one block per com
 
 > Connect me to the cluster at `login.example.edu`
 
+This path has been proven live on UChicago's Midway (Slurm) and on ALCF Polaris over SSH (PBS).
+
 The agent probes the login node over SSH, proposes the facility settings it discovered (scheduler,
 the network interface the endpoint should bind, scratch space, an environment setup line) and asks
 you to confirm or correct them. On a multi-factor facility the probe cannot log in by itself: if the

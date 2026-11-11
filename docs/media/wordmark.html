@@ -1,0 +1,23 @@
+<!doctype html>
+<!-- The README's wordmark: wordmark.png for GitHub's light page, wordmark-dark.png for its dark one.
+     scripts/readme-media/build.sh renders each <figure data-out> at 2x on a transparent background (render.mjs marks).
+     System fonts only (SF Pro on macOS): an <img> can't load web fonts, and the PNG needs none. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+:root { --ink: #10233a; --acc: #0b7f8a; }
+body { margin: 0; padding: 20px; display: grid; gap: 20px; justify-content: start; background: transparent; }
+figure { margin: 0; width: 560px; height: 140px; display: flex; align-items: center; justify-content: center; color: var(--ink); }
+figure.dark { --ink: #e6edf3; --acc: #56d0d6; }
+/* SF Pro, bold and tight; the hyphen is the bridge, a span in the accent. */
+.mark { display: flex; align-items: baseline; font: 700 86px/1 system-ui, -apple-system, "Helvetica Neue", sans-serif; letter-spacing: -0.035em; }
+svg { width: 56px; height: 86px; margin: 0 2px 0 4px; align-self: center; transform: translateY(3px); overflow: visible; }
+path { fill: none; stroke: var(--acc); stroke-width: 9.5; stroke-linecap: round; }
+</style>
+</head>
+<body>
+<figure data-out="wordmark.png"><div class="mark">hpc<svg viewBox="0 0 56 86" aria-hidden="true"><path d="M 5 58 Q 28 18 51 58" /></svg>bridge</div></figure>
+<figure class="dark" data-out="wordmark-dark.png"><div class="mark">hpc<svg viewBox="0 0 56 86" aria-hidden="true"><path d="M 5 58 Q 28 18 51 58" /></svg>bridge</div></figure>
+</body>
+</html>

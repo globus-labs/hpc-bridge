@@ -1,0 +1,98 @@
+<!doctype html>
+<!-- The README's "How it works" figure. scripts/readme-media/build.sh renders it to how-it-works.png at 2x, framed
+     (rounded corners, a soft shadow and a transparent margin, so its light surface sits on GitHub's light and dark
+     pages alike). Drawn 880 px wide, about the width GitHub shows it at, so its smallest type (13 px) stays 13 px.
+     Panels, boxes and words are HTML placed by hand; the wires are the SVG, drawn over them. The numbers match the
+     README's four steps. -->
+<html>
+<head>
+<meta charset="utf-8">
+<style>
+:root {
+  --ink: #10233a; --soft: #475a6e; --faint: #6b7a8b; --line: #c9d4df; --panel: #ffffff; --surface: #eef3f7;
+  --box: #f7f9fb; --acc: #0b7f8a; --acc-soft: #e1f2f3; --mono: ui-monospace, "SF Mono", Menlo, monospace;
+}
+* { box-sizing: border-box; }
+body { margin: 0; }
+figure { position: relative; margin: 0; width: 880px; height: 482px; background: var(--surface); color: var(--ink); font-family: system-ui, -apple-system, "Helvetica Neue", sans-serif; }
+.panel, .box, .pill, .label, h3 { position: absolute; }
+.panel { top: 20px; width: 232px; background: var(--panel); border: 1.5px solid var(--line); border-radius: 14px; }
+h3 { top: 32px; margin: 0; font: 700 15px/20px system-ui; }
+h3 span { font-weight: 500; color: var(--faint); margin-left: 6px; }
+.box { width: 204px; padding: 10px 12px; border: 1.5px solid var(--line); border-radius: 10px; background: var(--box); }
+.box b { display: block; font: 650 15px/19px system-ui; }
+.box p { margin: 3px 0 0; font: 400 13px/17px system-ui; color: var(--soft); }
+.box.acc { border-color: var(--acc); background: var(--acc-soft); }
+.box.block { background: var(--ink); border-color: var(--ink); color: #f2f6fa; }
+.box.block p { color: #c9d6e2; }
+.box.block .bill { color: #ffc56b; font-weight: 650; }
+.pill { width: 180px; padding: 7px 10px; border-radius: 8px; background: var(--acc-soft); border: 1.5px solid var(--acc); font: 650 14px/18px system-ui; }
+.n { display: inline-flex; align-items: center; justify-content: center; width: 19px; height: 19px; margin-right: 7px; border-radius: 50%; background: var(--acc); color: #fff; font: 700 12px/1 system-ui; vertical-align: 1px; }
+.box.block .n { background: #56d0d6; color: var(--ink); }
+.label { font: 600 13px/17px system-ui; color: var(--soft); }
+.label code { font: 600 12.5px/17px var(--mono); color: var(--ink); }
+.label .sub { display: block; margin-left: 26px; font-weight: 400; }
+.label.ssh { color: var(--ink); }
+svg.wires { position: absolute; inset: 0; }
+.wire { fill: none; stroke: var(--soft); stroke-width: 2; }
+.wire.acc { stroke: var(--acc); stroke-width: 2.4; }
+.wire.ssh { stroke: var(--ink); stroke-dasharray: 7 6; stroke-width: 1.8; }
+</style>
+</head>
+<body>
+<figure role="img" aria-label="Your laptop runs the coding agent and hpc-bridge. hpc-bridge logs you in to Globus once, then sends commands through Globus Compute to an endpoint on the facility's login node, which runs them on a billed compute block, a Slurm or PBS job that releases itself when idle. The endpoint is set up once over SSH, or is the facility's own, with no SSH at all.">
+  <!-- the three places -->
+  <div class="panel" style="left: 24px; height: 276px"></div>
+  <div class="panel" style="left: 324px; height: 276px"></div>
+  <div class="panel" style="left: 624px; height: 442px"></div>
+  <h3 style="left: 40px">Your laptop</h3>
+  <h3 style="left: 340px">Globus</h3>
+  <h3 style="left: 640px">Your facility <span>Slurm or PBS</span></h3>
+
+  <!-- your laptop -->
+  <div class="box" style="left: 38px; top: 64px; height: 80px"><b>Your coding agent</b><p>Claude Code, or another MCP host</p></div>
+  <div class="box acc" style="left: 38px; top: 196px; height: 82px"><b>hpc-bridge</b><p>an MCP server, with the spend gate in it</p></div>
+  <div class="label" style="left: 150px; top: 161px">MCP</div>
+
+  <!-- Globus -->
+  <div class="box" style="left: 338px; top: 64px; height: 80px"><b>Globus Auth</b><p>your one login, in a browser: a scoped token</p></div>
+  <div class="box" style="left: 338px; top: 196px; height: 82px"><b>Globus Compute</b><p>takes each command to the endpoint, and its output back</p></div>
+
+  <!-- your facility -->
+  <div class="box" style="left: 638px; top: 64px; height: 254px">
+    <b>Login node</b>
+    <p>Discovery and commands arrive here through Globus, never by a fresh SSH; reconnecting later needs none either.</p>
+  </div>
+  <div class="pill" style="left: 650px; top: 214px"><span class="n">2</span>Compute endpoint</div>
+  <div class="label" style="left: 652px; top: 260px; width: 180px; font-weight: 400">yours, set up once; or the facility's own, with zero SSH</div>
+  <div class="box block" style="left: 638px; top: 350px; height: 100px">
+    <b><span class="n">3</span>Compute block</b>
+    <p>a scheduler job, <span class="bill">billed</span>: a warm node, your shell on it</p>
+    <p style="margin-top: 5px"><span class="n">4</span>releases itself when idle</p>
+  </div>
+  <div class="label" style="left: 752px; top: 325px"><code>sbatch</code> · <code>qsub</code></div>
+
+  <!-- the bootstrap -->
+  <div class="label ssh" style="left: 150px; top: 344px; width: 430px"><span class="n">1</span>SSH once, with your key, to set up the endpoint<span class="sub">none at all where the facility runs its own endpoint</span></div>
+
+  <svg class="wires" width="880" height="482" viewBox="0 0 880 482" aria-hidden="true">
+    <defs>
+      <marker id="h" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#475a6e" /></marker>
+      <marker id="ha" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6" markerHeight="6" orient="auto-start-reverse"><path d="M 0 0 L 10 5 L 0 10 z" fill="#0b7f8a" /></marker>
+      <marker id="hs" viewBox="0 0 10 10" refX="8.5" refY="5" markerWidth="6.5" markerHeight="6.5" orient="auto"><path d="M 0 0 L 10 5 L 0 10 z" fill="#10233a" /></marker>
+    </defs>
+    <!-- agent ⇄ hpc-bridge (MCP) -->
+    <path class="wire" d="M 140 146 V 194" marker-start="url(#h)" marker-end="url(#h)" />
+    <!-- hpc-bridge → Globus Auth: the one login -->
+    <path class="wire" d="M 244 212 C 286 206, 300 150, 334 132" marker-end="url(#h)" />
+    <!-- hpc-bridge ⇄ Globus Compute ⇄ the endpoint: every command and its output -->
+    <path class="wire acc" d="M 244 248 H 334" marker-start="url(#ha)" marker-end="url(#ha)" />
+    <path class="wire acc" d="M 544 233 H 646" marker-start="url(#ha)" marker-end="url(#ha)" />
+    <!-- the endpoint → the block: it submits the scheduler job and hands it the work -->
+    <path class="wire acc" d="M 740 320 V 346" marker-end="url(#ha)" />
+    <!-- the one-time SSH bootstrap, dashed -->
+    <path class="wire ssh" d="M 140 280 V 412 H 596 V 296 H 634" marker-end="url(#hs)" />
+  </svg>
+</figure>
+</body>
+</html>
