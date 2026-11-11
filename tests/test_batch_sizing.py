@@ -40,6 +40,7 @@ from __future__ import annotations
 
 import json
 import os
+import shlex
 import shutil
 import signal
 import subprocess
@@ -638,12 +639,25 @@ def test_the_memory_kill_ends_the_row_at_its_limit_and_spares_its_neighbour(tmp_
 @pytest.mark.skipif(_BASH is None, reason="needs bash")
 def test_every_result_reports_peak_rss_cpu_seconds_wall_and_nproc(tmp_path):
     _fake_tool(tmp_path, "taskset", "true")
-    busy = "end=$(( $(date +%s) + 2 )); n=0; while [ $(date +%s) -lt $end ]; do n=$((n + 1)); done; echo $n"
+    # The row is busy for 2 s of wall AND until the wrapper's watch has looked at it (a look that saw its memory
+    # writes `.peak`) AND until it has used half a CPU-second by its own `times` — so a loaded machine stretches the
+    # row instead of shrinking what there is to measure. A 2 s row of wall alone ended before the watch's first look on
+    # a loaded runner (peak 0: CI, 2026-11-11), and got as little as 0.72 CPU-s with every CPU contended. 40 s past
+    # its 2 s is a ceiling only: a watch that never looks ends the row, and the assertions below fail.
+    times = shlex.quote(str(tmp_path / "row.times"))
+    busy = ('end=$(( $(date +%s) + 2 )); cap=$(( end + 40 )); n=0; '
+            'while [ "$(date +%s)" -lt "$cap" ]; do n=$((n + 1)); i=0; while [ $i -lt 2000 ]; do i=$((i + 1)); done; '
+            '{ [ "$(date +%s)" -ge "$end" ] && [ -s "$HPCB_TASK_DIR/.peak" ]; } || continue; '
+            f'times > {times}; '
+            "awk '{for (i = 1; i <= NF; i++) if (split($i, p, \"m\") == 2) s += p[1] * 60 + p[2]} "
+            f"END {{exit !(s >= 0.5)}}' {times} && break; done; echo $n")
+    t0 = time.monotonic()
     rep = _result(_spawn(_script(busy, tmp_path / "rd", 0, _slot(pin=False)), _wrapper_env(tmp_path)))
-    # 2 s of busy loop: well over the near-zero of CPU time lost on exec (W11), with room for a loaded machine
-    # (0.72 s seen with every CPU contended)
+    took = time.monotonic() - t0
+    # well over the near-zero of CPU time lost on exec (W11): the row used 0.5 CPU-s by its own count
     assert rep.rc == 0 and rep.cpu_s is not None and rep.cpu_s >= 0.25, rep
-    assert rep.wall_s is not None and 1.0 <= rep.wall_s <= 10
+    # the row's wall, inside the wrapper's own life (+1: whole seconds where bash has no EPOCHREALTIME, macOS's 3.2)
+    assert rep.wall_s is not None and 1.0 <= rep.wall_s <= took + 1, (rep.wall_s, took)
     assert isinstance(rep.nproc, int) and rep.nproc >= 1
     assert rep.peak_rss_kb is not None and rep.peak_rss_kb > 0
 

@@ -960,10 +960,14 @@ __hb_quick() {
       mem += m }
     printf "%d\n", mem }'
 }
-# A signal to the row: its process group and every process __hb_members finds (the ones killed are the ones measured)
+# A signal to the row: its process group and every process __hb_members finds (the ones killed are the ones measured).
+# The members are listed BEFORE the group is signalled: the group's signal ends the row's shell, the wrapper wakes and
+# TERMs the watcher, and a child that left the group was never signalled by it — off Linux, where no token lets the
+# cleanup find it, it outlived the kill.
 __hb_kill() {
+  __hb_kl=$(__hb_members | awk '{print $1}')
   kill -"$1" -- "-$__hb_c" 2>/dev/null
-  for __hb_x in $(__hb_members | awk '{print $1}'); do kill -"$1" "$__hb_x" 2>/dev/null; done
+  for __hb_x in $__hb_kl; do kill -"$1" "$__hb_x" 2>/dev/null; done
 }
 __hb_t0=$(printf %s "${EPOCHREALTIME:-}" | tr , .)
 __hb_start=$(date +%s)

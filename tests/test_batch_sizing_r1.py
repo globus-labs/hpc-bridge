@@ -12,6 +12,7 @@ from __future__ import annotations
 import json
 import os
 import shutil
+import signal
 import sys
 import time
 from pathlib import Path
@@ -144,16 +145,51 @@ def test_w2_a_planted_symlink_never_truncates_the_users_files(tmp_path):
 def test_w3_the_memory_watch_sees_and_kills_a_child_that_left_the_rows_process_group(tmp_path):
     """A child that calls setpgid(0, 0) — coreutils `timeout` does — or setsid() was invisible to a watch over the
     process group: never killed at its memory. The row is its group, its shell's descendant tree and (Linux) every
-    process carrying its token; the same set is measured and killed."""
+    process carrying its token; the same set is measured and killed.
+
+    Killed means the child itself is gone, not that the wrapper returned in time: the set is listed BEFORE the group
+    is signalled. Listed after (macOS, 2026-11-11), the group's TERM had already ended the row's shell, the child was
+    reparented to init and out of the tree — and off Linux no token finds it: the row reported its memory kill
+    while the 400 MB child slept on to its own end, and the wrapper returned only by its reader grace. The child
+    sleeps far past any kill, so only the kill can end it in time; its pages are random (a memory compressor cannot
+    shrink them under the watch: macOS)."""
     from hpc_bridge import batch
 
     _fake_tool(tmp_path, "taskset", "true")
-    hog = (f"{_PY3} -c \"import os, time; os.setpgid(0, 0); b = b'x' * (400 << 20); time.sleep(20)\"")
-    t0 = time.monotonic()
-    rep = _result(_spawn(_script(hog, tmp_path / "rd", 0, _slot(memory_mb=100, pin=False)), _wrapper_env(tmp_path)))
-    assert rep.why == "memory" and rep.rc == batch.MEMORY_RC, (
-        f"a 400 MB row with a 100 MB limit ran to its end: rc={rep.rc} why={rep.why!r} peak_rss_kb={rep.peak_rss_kb}")
-    assert time.monotonic() - t0 < 15                      # killed, not run out its 20 s
+    pidf = tmp_path / "hog.pid"
+    hog = (f"{_PY3} -c \"import os, time; open('{pidf}', 'w').write(str(os.getpid())); os.setpgid(0, 0); "
+           "b = os.urandom(1 << 20) * 400; time.sleep(600)\"")
+    try:
+        rep = _result(_spawn(_script(hog, tmp_path / "rd", 0, _slot(memory_mb=100, pin=False)),
+                             _wrapper_env(tmp_path)))
+        assert rep.why == "memory" and rep.rc == batch.MEMORY_RC, (
+            f"a 400 MB row with a 100 MB limit ran to its end: rc={rep.rc} why={rep.why!r} peak_rss_kb={rep.peak_rss_kb}")
+        pid = int(pidf.read_text())
+        assert _gone(pid, within_s=30), f"the row reported its memory kill, but its child (pid {pid}) still runs"
+    finally:
+        _kill_pidfile(pidf)
+
+
+def _gone(pid: int, *, within_s: float) -> bool:
+    """The process is gone (its reaper collected it) within `within_s` — a ceiling, polled: a killed process goes at
+    once, one never signalled stays."""
+    deadline = time.monotonic() + within_s
+    while True:
+        try:
+            os.kill(pid, 0)
+        except (ProcessLookupError, PermissionError):  # gone, or the pid is now another user's
+            return True
+        if time.monotonic() >= deadline:
+            return False
+        time.sleep(0.1)
+
+
+def _kill_pidfile(pidf: Path) -> None:
+    """A test's own child left running when an assertion failed: never leave it."""
+    try:
+        os.kill(int(pidf.read_text()), signal.SIGKILL)
+    except (OSError, ValueError):
+        pass
 
 
 @needs_bash
