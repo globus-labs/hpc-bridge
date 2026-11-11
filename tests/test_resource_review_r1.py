@@ -30,7 +30,7 @@ from tests.test_resource_requests import _app, _Sized
 from tests.test_spend_terms import _mep_app, _runners
 
 SHARED = PartitionShape(name="shared", kind="per_core", why="x", cores=128, memory_gb=251.4, mem_per_core_mb=1896,
-                        billing={"cpu": 1.0})
+                        max_mem_per_core_mb=1896, billing={"cpu": 1.0})     # Anvil's, MaxMemPerCPU read 2026-11-10
 WHOLE = PartitionShape(name="wholenode", kind="whole_node", why="Anvil's whole-node partition", cores=128,
                        memory_gb=251.4, billing={"cpu": 1.0})
 GPU = PartitionShape(name="gpu", kind="per_core", why="x", cores=128, memory_gb=512, gpus=4, mem_per_core_mb=3800,
@@ -227,7 +227,7 @@ async def test_4_memory_past_the_per_core_share_bills_as_cores():
     capped = SHARED.model_copy(update={"max_mem_per_core_mb": 4000})                   # MaxMemPerCPU is the share
     s = resources.effective({"cores_per_node": 1, "mem_per_node": 200, "nodes_per_block": 1}, capped, channel="ssh")
     assert resources.billed_cores(s, capped)[0] == 52
-    noshare = SHARED.model_copy(update={"mem_per_core_mb": None})
+    noshare = SHARED.model_copy(update={"mem_per_core_mb": None, "max_mem_per_core_mb": None})
     s2 = resources.effective({"cores_per_node": 1, "mem_per_node": 200, "nodes_per_block": 1}, noshare,
                              channel="ssh")
     assert "memory beyond the cores' share may bill too" in resources.charge(s2, noshare, 1800)[1]

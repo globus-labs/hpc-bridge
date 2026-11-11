@@ -19,8 +19,10 @@ from tests.fakes import FakeFacility, fake_mep_entry
 from tests.test_mep_server import ANVIL_SCHEMA, DELTA_SCHEMA, _Meta, _Templated
 from tests.test_spend_terms import _mep_app, _runners
 
+# Anvil's `shared`: DefMemPerCPU=1896 and — read live 2026-11-10 — MaxMemPerCPU=1896, the share Slurm enforces
 SHARED = PartitionShape(name="shared", kind="per_core", why="SelectType=select/cons_tres, OverSubscribe=NO",
-                        cores=128, memory_gb=251.4, mem_per_core_mb=1896, billing={"cpu": 1.0})
+                        cores=128, memory_gb=251.4, mem_per_core_mb=1896, max_mem_per_core_mb=1896,
+                        billing={"cpu": 1.0})
 WHOLE_P = PartitionShape(name="wholenode", kind="whole_node", why="OverSubscribe=EXCLUSIVE", cores=128,
                          memory_gb=251.4, billing={"cpu": 1.0})
 CAPPED = PartitionShape(name="capped", kind="per_core", cores=128, max_cores_per_job=127)

@@ -114,7 +114,8 @@ async def test_r1_a_raised_count_over_a_per_job_cap_is_refused_before_anything_s
 
 
 async def test_r1_where_the_share_is_unknown_nothing_is_guessed_and_the_terms_say_so():
-    noshare = SHARED.model_copy(update={"mem_per_core_mb": None, "why": "OverSubscribe=YES", "billing": None})
+    noshare = SHARED.model_copy(update={"mem_per_core_mb": None, "max_mem_per_core_mb": None,
+                                          "why": "OverSubscribe=YES", "billing": None})
     app = _app(partitions=(noshare,))
     res = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=15.5)
     assert res.block.cores_per_node == 8, res.block
@@ -203,7 +204,8 @@ async def test_r1_anvils_facility_endpoint_sends_the_raised_cores_beside_its_who
 async def test_r1_a_facility_endpoint_whose_share_is_unknown_says_more_cores_may_bill(monkeypatch):
     from tests.test_resource_review_r2 import _anvil
 
-    noshare = SHARED.model_copy(update={"mem_per_core_mb": None, "why": "OverSubscribe=YES", "billing": None})
+    noshare = SHARED.model_copy(update={"mem_per_core_mb": None, "max_mem_per_core_mb": None,
+                                          "why": "OverSubscribe=YES", "billing": None})
     app, _res = await _anvil(monkeypatch)
     app.facility.partitions = (noshare,)
     r = await _ensure_endpoint_up(app, shape="compute", account="cis250223", memory_gb=4)
@@ -374,3 +376,111 @@ async def test_r2_a_reused_earlier_block_states_what_is_left_of_its_walltime(mon
     assert "~880s" not in st.notice, st.notice
     n_s = int(st.notice.split("a task runs up to ~")[1].split("s")[0])
     assert n_s <= 600, st.notice
+
+
+# =====================================================================================================================
+# Round 2 (2026-11-10, Anvil's live `scontrol show partition`): only an ENFORCED share raises cores. `shared` reads
+# DefMemPerCPU=1896 MaxMemPerCPU=1896 — Slurm's own MaxMemPerCPU enforcement is what added the CPU; `gpu` reads
+# DefMemPerCPU=3750 with no MaxMemPerCPU (MaxMemPerNode=UNLIMITED), where Slurm adds no CPUs for memory. Three cases:
+# (a) MaxMemPerCPU known: raise; (b) known to have none: no raise, no line; (c) not known: no raise, one honest line.
+# DefMemPerCPU alone only caps the default proposal's memory.
+# =====================================================================================================================
+
+_SCONTROL = [
+    "PartitionName=shared AllowGroups=ALL Default=YES QoS=part-shared DefaultTime=00:30:00 MaxNodes=1 "
+    "OverSubscribe=NO State=UP TotalNodes=250 DefMemPerCPU=1896 MaxMemPerCPU=1896 TRESBillingWeights=CPU=1.0",
+    "PartitionName=wholenode QoS=part-standard OverSubscribe=EXCLUSIVE State=UP TotalNodes=750 "
+    "DefMemPerNode=UNLIMITED MaxMemPerNode=UNLIMITED TRESBillingWeights=CPU=1.0",
+    "PartitionName=gpu QoS=part-gpu OverSubscribe=NO State=UP TotalNodes=16 DefMemPerCPU=3750 "
+    "MaxMemPerNode=UNLIMITED TRESBillingWeights=GRES/gpu=1.0",
+    # the 2026-10-24 capture asked for a few fields only: the per-core cap is not known from it
+    "PartitionName=debug QoS=part-debug OverSubscribe=NO State=UP DefMemPerCPU=1896 TRESBillingWeights=CPU=1.0",
+]
+
+
+def _discovered() -> dict[str, PartitionShape]:
+    parts = resources.classify_slurm(select_type="select/cons_tres", select_params="CR_CORE_MEMORY",
+                                     shapes=["shared|128|257400|(null)", "wholenode|128|257400|(null)",
+                                             "gpu|128|515400|gpu:4", "debug|128|257400|(null)"],
+                                     details=_SCONTROL, qos=[])
+    return {p.name: p for p in parts}
+
+
+def test_round2_discovery_reads_the_enforced_share_and_whether_there_is_one():
+    p = _discovered()
+    assert (p["shared"].mem_per_core_mb, p["shared"].max_mem_per_core_mb) == (1896, 1896)
+    assert p["gpu"].mem_per_core_mb == 3750 and p["gpu"].max_mem_per_core_mb is None
+    assert p["gpu"].max_mem_per_core_known is True                       # (b): read, and there is none
+    assert p["wholenode"].max_mem_per_core_known is True
+    assert p["debug"].max_mem_per_core_known is False                    # (c): not in what was read
+    assert resources.enforced_share_mb(p["shared"]) == 1896 and resources.enforced_share_mb(p["gpu"]) is None
+    assert not resources.share_unknown(p["shared"]) and not resources.share_unknown(p["gpu"])
+    assert resources.share_unknown(p["debug"]) and resources.share_unknown(None)
+
+
+async def test_round2_a_max_equal_to_def_raises_as_on_anvils_shared():
+    shared = _discovered()["shared"].model_copy(update={"cores": 128, "memory_gb": 251.4})
+    app = _app(partitions=(shared,), walltime="00:15:00")
+    r = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=15.5)
+    assert (r.block.cores_per_node, r.block.cores_asked, r.block.max_charge) == (9, 8, 2.25), r.block
+    assert "15.5 GB needs 9 cores' memory share on partition 'shared' (1896 MB each)" in r.notice, r.notice
+
+
+async def test_round2_a_def_only_partition_never_raises_cores_nor_bills_them():
+    gpu = _discovered()["gpu"].model_copy(update={"billing": {"cpu": 1.0}})
+    app = _app(partitions=(gpu,), partition="gpu", walltime="00:15:00")
+    # 60 GB is over 8 × 3750 MB, but Slurm adds no CPUs for memory without a MaxMemPerCPU
+    r = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=60)
+    assert (r.block.cores_per_node, r.block.cores_asked, r.block.max_charge) == (8, None, 2.0), r.block
+    assert "memory share" not in r.notice and "more cores than asked" not in r.notice, r.notice   # (b): no line
+    assert "may bill too" not in r.notice, r.notice
+    assert resources.cores_for_memory(8, 60, gpu) == 8
+    await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert app.built[-1]["cores_per_node"] == 8, app.built[-1]
+
+
+async def test_round2_the_default_on_a_def_only_partition_is_capped_by_def_and_raises_nothing():
+    gpu = _discovered()["gpu"].model_copy(update={"billing": {"cpu": 1.0}})
+    app = _app(partitions=(gpu,), partition="gpu")
+    d = await _ensure_endpoint_up(app, shape="compute")
+    b = d.block
+    assert (b.cores_per_node, b.memory_gb, b.memory_default, b.cores_asked) == (8, 29.2, True, None), b
+    assert b.memory_gb * 1024 <= 8 * 3750                                # never above cores × DefMemPerCPU
+    await _ensure_endpoint_up(app, shape="compute", confirm_spend=True)
+    assert "mem_per_node" not in app.built[-1] or app.built[-1]["mem_per_node"] is None, app.built[-1]
+    # the default's size said back rounded up (30 GB: over 8 × 3750 MB) adds no CPU there
+    up = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=30)
+    assert up.block.cores_per_node == 8, up.block
+
+
+async def test_round2_an_unknown_share_raises_nothing_and_says_so_once():
+    debug = _discovered()["debug"].model_copy(update={"cores": 128, "memory_gb": 251.4})
+    app = _app(partitions=(debug,), partition="debug")
+    r = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=15.5)
+    assert (r.block.cores_per_node, r.block.cores_asked) == (8, None), r.block
+    said = r.notice.count("more cores than asked") + r.notice.count("may bill too")
+    assert said == 1, r.notice
+    assert "8 cores × 0.5 h" in (r.block.charge_basis or ""), r.block.charge_basis
+
+
+async def test_round2_anvils_registry_entry_states_shareds_cap_and_leaves_debug_unknown(monkeypatch):
+    from tests.test_resource_review_r2 import _anvil, _seed
+
+    entry = _seed("anvil.yaml", "anvil")
+    parts = {p.name: p for p in entry.defaults.partitions or []}
+    assert parts["shared"].max_mem_per_core_mb == 1896                  # read live 2026-11-10
+    assert parts["debug"].max_mem_per_core_mb is None and not parts["debug"].max_mem_per_core_known
+    app, _res = await _anvil(monkeypatch)
+    r = await _ensure_endpoint_up(app, shape="compute", account="cis250223", partition="debug", cores=1,
+                                  memory_gb=4)
+    assert r.block.cores_per_node == 1, r.block                          # (c): not raised …
+    said = r.notice.count("more cores than asked") + r.notice.count("may bill too")
+    assert said == 1, r.notice                                           # … and said once
+
+
+def test_round2_pbs_raises_only_on_a_share_a_registry_entry_states():
+    plain = PartitionShape(name="workq", kind="per_core", cores=64, memory_gb=256.0, mem_per_core_mb=4000)
+    stated = plain.model_copy(update={"max_mem_per_core_mb": 4000})
+    uec = {"compute": True, "partition": "workq", "nodes_per_block": 1, "cores_per_node": 2, "mem_per_node": 16}
+    assert resources.effective(uec, plain, channel="ssh", scheduler="pbs", profile_cpus=64).cores == 2
+    assert resources.effective(uec, stated, channel="ssh", scheduler="pbs", profile_cpus=64).cores == 5   # 16384 / 4000

@@ -392,7 +392,8 @@ def _block_terms(app: AppCtx, rt: ShapeRuntime, *, named: Collection[str] = ()) 
         compute_only=not _has_login_shape(app),
         whole_node=size.whole_node, cores_per_node=size.cores, memory_gb=size.memory_gb,
         memory_default=size.memory_default, gpus_per_node=size.gpus, size_source=size_source,
-        cores_asked=size.cores_asked, memory_share_mb=resources.memory_share_mb(shape),
+        cores_asked=size.cores_asked, memory_share_mb=resources.enforced_share_mb(shape),
+        memory_share_known=not resources.share_unknown(shape),
         size_why=_size_why(size, app),
         max_charge=cost[0] if cost else None, charge_basis=cost[1] if cost else None,
         charge_unit=(getattr(app, "charge_unit", None) or "billing units") if cost else None,
@@ -604,9 +605,10 @@ def _size_sentence(app: AppCtx, t: BlockTerms) -> str:
 
 def _memory_cores_sentence(app: AppCtx, t: BlockTerms) -> str:
     """What a memory sent with a slice does to its cores (the Anvil live test of 2026-11-10), where the cost line does
-    not already say it: the cores raised to the memory's per-core share (`resources.cores_for_memory`); with the share
-    known and no core count sent, the cores the scheduler gives — and bills — at least; with no share known, that the
-    scheduler may give and bill more cores than asked (nothing is guessed)."""
+    not already say it — case (a), an enforced share (MaxMemPerCPU): the cores raised to it
+    (`resources.cores_for_memory`), or, with no core count sent, the cores the scheduler gives — and bills — at least;
+    (b) known to have none: nothing (Slurm adds no CPUs for memory there); (c) not known: that the scheduler may give
+    and bill more cores than asked (nothing is guessed)."""
     if t.memory_gb is None or t.memory_default or t.whole_node is True:
         return ""
     word = _queue_word(app)
@@ -624,7 +626,7 @@ def _memory_cores_sentence(app: AppCtx, t: BlockTerms) -> str:
         return (f"{t.memory_gb:g} GB is {need} cores' memory share on {where} ({t.memory_share_mb} MB "
                 f"each): the scheduler gives — and bills — at least {need} cores, whatever core count the template "
                 "asks for. ")
-    if (not t.memory_share_mb and word == "partition" and "may bill too" not in basis
+    if (not t.memory_share_known and word == "partition" and "may bill too" not in basis
             and (t.whole_node is False or t.max_charge is None)):
         return (f"The memory is sent with the cores; this {word}'s per-core memory share is not known, so where the "
                 "memory is above the cores' share the scheduler may give — and bill — more cores than asked. ")

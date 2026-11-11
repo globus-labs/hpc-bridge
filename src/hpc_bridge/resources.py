@@ -221,34 +221,45 @@ def tenth_down(gb: float) -> float:
 
 # ---- the per-core memory share ---------------------------------------------------------------------------------------
 #
-# The Anvil live test of 2026-11-10 (`shared`: Slurm 23.11, per-core billing, DefMemPerCPU=1896 MB): a block of 8 cores
-# and 15.5 GB went out as `--cpus-per-task=8 --mem=15872M`. 15872 MB is more than 8 × 1896, so Slurm raised the job to
-# 9 CPUs, and parsl's launcher `srun` died at once ("cpus-per-task set by two different environment variables
-# SLURM_CPUS_PER_TASK=9 != SLURM_TRES_PER_TASK=cpu=8"): the block FAILED in 5 s, while its terms said 8 cores. The
-# rule, on every path that sends a block's cores and memory (the SSH template's wire, a facility template's, a
-# Jobs-mode job, a batch's derived block): where the partition's per-core memory share is known, a memory above the
-# cores' share raises the cores to ceil(memory / share) — what the scheduler would raise the job to and bill. The
-# request and Slurm's own CPU count then agree (srun's check passes), and the terms say it and bill it. The other
-# choice — hold the memory to the share and refuse — would make the user ask again for what the scheduler gives anyway:
-# raising never fails at start and never understates. Where no share is known nothing is guessed; the terms say the
-# scheduler may bill more cores (`notices._memory_cores_sentence`).
+# The Anvil live test of 2026-11-10 (`shared`: Slurm 23.11, per-core billing, DefMemPerCPU=1896 MaxMemPerCPU=1896): a
+# block of 8 cores and 15.5 GB went out as `--cpus-per-task=8 --mem=15872M`. 15872 MB is more than 8 × 1896, so Slurm's
+# MaxMemPerCPU enforcement raised the job to 9 CPUs, and parsl's launcher `srun` died at once ("cpus-per-task set by
+# two different environment variables SLURM_CPUS_PER_TASK=9 != SLURM_TRES_PER_TASK=cpu=8"): the block FAILED in 5 s,
+# while its terms said 8 cores. The rule, on every path that sends a block's cores and memory (the SSH template's
+# wire, a facility template's, a Jobs-mode job, a batch's derived block): where the partition's ENFORCED per-core share
+# is known (MaxMemPerCPU), a memory above the cores' share raises the cores to ceil(memory / share) — what Slurm raises
+# the job to and bills. The request and Slurm's own CPU count then agree (srun's check passes), and the terms say it
+# and bill it. The other choice — hold the memory to the share and refuse — would make the user ask again for what the
+# scheduler gives anyway: raising never fails at start and never understates. Three cases (round 2, from Anvil's live
+# `scontrol show partition`):
+# - (a) MaxMemPerCPU known: raise, and the terms state the billed cores;
+# - (b) known to have none (scontrol showed MaxMemPerNode, or MaxMemPerCPU=UNLIMITED: Anvil's `gpu`, DefMemPerCPU=3750
+#   alone): Slurm adds no CPUs for memory — no raise, no line. DefMemPerCPU alone NEVER raises cores: it only caps the
+#   default proposal's memory (`_slice_memory`: at most cores × DefMemPerCPU, which stays under any equal cap);
+# - (c) not known (a registry entry stating no cap, a discovery capture without the field): no raise, and the terms say
+#   the scheduler may give and bill more cores than asked (`notices._memory_cores_sentence`).
+# On PBS, which adds no ncpus for memory by itself, the raise happens only where a registry entry states an enforced
+# share (`max_mem_per_core_mb`): its probe never reads one.
 
-def memory_share_mb(shape: PartitionShape | None) -> int | None:
-    """The per-core memory share of a partition, where discovery or the registry knows it: MaxMemPerCPU (Slurm raises
-    a job's CPUs to cover memory above it), else DefMemPerCPU (Anvil, with no MaxMemPerCPU shown, raises them all the
-    same and bills "the cores you request or the share of memory you request, whichever is larger"). The one share
-    the raise and the bill read (`cores_for_memory`, `billed_cores`)."""
-    if shape is None:
-        return None
-    return shape.max_mem_per_core_mb or shape.mem_per_core_mb or None
+def enforced_share_mb(shape: PartitionShape | None) -> int | None:
+    """The ENFORCED per-core memory share of a partition — Slurm's MaxMemPerCPU from discovery, or a registry entry's
+    `max_mem_per_core_mb` — or None. The one share the raise and the bill read (`cores_for_memory`, `billed_cores`).
+    DefMemPerCPU is no such share: Slurm adds no CPUs for memory above it (Anvil's `gpu`, 2026-11-10)."""
+    return shape.max_mem_per_core_mb if shape is not None else None
+
+
+def share_unknown(shape: PartitionShape | None) -> bool:
+    """Case (c): whether the partition's enforced per-core share is not known — neither read by discovery nor stated by
+    the registry (`PartitionShape.max_mem_per_core_known`) — so a memory above the cores' share may still add cores."""
+    return shape is None or (shape.max_mem_per_core_mb is None and not shape.max_mem_per_core_known)
 
 
 def cores_for_memory(cores: int | None, memory_gb: float | None, shape: PartitionShape | None) -> int | None:
     """The cores a request of `cores` with `memory_gb` SENT holds on `shape`: raised to ceil(memory MB / share) where
-    the memory is above the cores' per-core share (`memory_share_mb`), else `cores` as asked (no share known, no memory
-    sent, no cores sent). The memory is read as the scheduler gets it (`mem_mb`: whole GB as `--mem=<GB>g` is that many
-    MB too)."""
-    share = memory_share_mb(shape)
+    the memory is above the cores' enforced per-core share (`enforced_share_mb`), else `cores` as asked (no enforced
+    share, no memory sent, no cores sent). The memory is read as the scheduler gets it (`mem_mb`: whole GB as
+    `--mem=<GB>g` is that many MB too)."""
+    share = enforced_share_mb(shape)
     if not cores or not memory_gb or not share:
         return cores
     return max(cores, math.ceil(mem_mb(memory_gb) / share))
@@ -260,7 +271,7 @@ def _cover(size: Size, shape: PartitionShape | None) -> Size:
     held = cores_for_memory(size.cores, size.send_mem, shape)
     if held is None or size.cores is None or held <= size.cores:
         return size
-    return dataclasses.replace(size, cores=held, cores_asked=size.cores, share_mb=memory_share_mb(shape))
+    return dataclasses.replace(size, cores=held, cores_asked=size.cores, share_mb=enforced_share_mb(shape))
 
 
 def memory_cores_words(size: Size, shape: PartitionShape | None, word: str = "partition", *,
@@ -358,16 +369,17 @@ def _slice_memory(cores: int, shape: PartitionShape | None) -> tuple[float | Non
     """A slice's memory when none was asked: (GB, from the partition's default per core, the GB to send). With
     DefMemPerCPU known the scheduler gives cores × that on its own (nothing is sent: a larger --mem could make a site
     with MaxMemPerCPU charge more cores); else the node's memory per core, sent (a partition with no default per core
-    may give a job the whole node's memory). Never above the cores' per-core share (the Anvil live test of 2026-11-10):
-    the default is said to one decimal rounded DOWN (`tenth_down`: 8 × 1896 MB read "15 GB", which said back is over
-    it), and a node's memory per core above a MaxMemPerCPU is held to that share, so a proposal never raises cores."""
+    may give a job the whole node's memory). Never above cores × DefMemPerCPU (the Anvil live test of 2026-11-10): the
+    default is said to one decimal rounded DOWN (`tenth_down`: 8 × 1896 MB read "15 GB", which said back is over
+    Anvil's equal MaxMemPerCPU), and a node's memory per core above a MaxMemPerCPU is held to it, so a proposal never
+    raises cores. DefMemPerCPU caps the default only: it never raises cores (`enforced_share_mb`)."""
     if shape is None:
         return None, False, None
     if shape.mem_per_core_mb:
         return tenth_down(cores * shape.mem_per_core_mb / 1024), True, None
     if shape.memory_gb and shape.cores:
         gb = float(max(1, math.floor(cores * shape.memory_gb / shape.cores)))
-        share = memory_share_mb(shape)
+        share = enforced_share_mb(shape)
         if share and mem_mb(gb) > cores * share:
             gb = tenth_down(cores * share / 1024)
         return gb, False, gb
@@ -463,19 +475,19 @@ def effective(uec: Mapping[str, Any], shape: PartitionShape | None, *, channel: 
 
 
 def billed_cores(size: Size, shape: PartitionShape | None) -> tuple[int | None, str]:
-    """The cores a slice is charged for, and why when more than it holds: a site that counts memory — Slurm raises a
-    job's CPUs to cover memory above MaxMemPerCPU, and Anvil bills "the cores you request or the share of memory you
-    request, whichever is larger" — charges max(cores, ceil(memory / the per-core share)), the share being
-    `memory_share_mb`'s. A slice whose wire sends its cores beside its memory already holds that many (`effective`
-    raises them: `Size.cores_asked`); this still counts a memory whose cores the wire does not send (a facility
-    template's own core count). A whole node bills every core. A partition whose billing weighs memory itself (Mem=…)
-    counts it there, not as cores."""
+    """The cores a slice is charged for, and why when more than it holds: Slurm raises a job's CPUs to cover memory
+    above MaxMemPerCPU and bills them (Anvil's `shared`), so a slice is charged max(cores, ceil(memory / the enforced
+    share)), the share being `enforced_share_mb`'s — DefMemPerCPU alone adds no CPUs and is never counted (round 2,
+    2026-11-10). A slice whose wire sends its cores beside its memory already holds that many (`effective` raises them:
+    `Size.cores_asked`); this still counts a memory whose cores the wire does not send (a facility template's own core
+    count). A whole node bills every core. A partition whose billing weighs memory itself (Mem=…) counts it there, not
+    as cores."""
     if size.whole_node is not False:   # every core of the node: known only from the partition (review round 2)
         return (shape.cores if shape is not None else None), ""
     cores = size.cores
     if shape is None or (shape.billing or {}).get("mem_gb"):
         return cores, ""
-    share = memory_share_mb(shape)
+    share = enforced_share_mb(shape)
     if cores and size.memory_gb and share and not size.memory_default:
         by_mem = math.ceil(mem_mb(size.memory_gb) / share)
         if by_mem > cores:
@@ -568,7 +580,7 @@ def refusal(uec: Mapping[str, Any], shape: PartitionShape | None, *, named: Iter
     job_cores = shape.cores if whole is True or shape.kind == "whole_node" else by_mem
     if shape.max_cores_per_job and job_cores and job_cores * nodes > shape.max_cores_per_job:
         asked = f"{nodes} node{'s' if nodes > 1 else ''} × {job_cores} cores" if nodes > 1 else f"{job_cores} cores"
-        why = (f" ({sent:g} GB needs {by_mem} cores' memory share, {memory_share_mb(shape)} MB each)" if raised
+        why = (f" ({sent:g} GB needs {by_mem} cores' memory share, {enforced_share_mb(shape)} MB each)" if raised
                and sent is not None else "")
         return (f"{asked}{why} is over the QOS cap of {where}: at most {shape.max_cores_per_job} cores per job (a "
                 f"block over it pends and never starts). Ask for fewer cores, less memory or fewer nodes.")
@@ -703,7 +715,7 @@ def charge(size: Size, shape: PartitionShape | None, walltime_s: float) -> tuple
     elif size.cores_asked is not None and size.whole_node is False:
         basis += f" ({memory_cores_words(size, shape)})"
     elif (size.whole_node is False and size.memory_gb and not size.memory_default and not w.get("mem_gb")
-          and not (shape.max_mem_per_core_mb or shape.mem_per_core_mb)):
+          and share_unknown(shape)):   # case (c): a cap may add cores; (b), none, adds nothing to say
         basis += " (memory beyond the cores' share may bill too: no per-core memory share is known)"
     return round(total, 2), basis
 
@@ -929,6 +941,9 @@ def classify_slurm(*, select_type: str | None, select_params: str | None, shapes
                 memory_gb=round(row["mem_mb"] / 1024, 1) if row.get("mem_mb") else None,
                 gpus=row.get("gpus"), max_gpus_per_node=row.get("max_gpus"),
                 mem_per_core_mb=_lead_int(t.get("DefMemPerCPU")), max_mem_per_core_mb=_lead_int(t.get("MaxMemPerCPU")),
+                # scontrol prints one of MaxMemPerCPU / MaxMemPerNode (UNLIMITED included): either says the per-core
+                # cap was read — with no MaxMemPerCPU number, there is none (2026-11-10: Anvil's `gpu`)
+                max_mem_per_core_known="MaxMemPerCPU" in t or "MaxMemPerNode" in t,
                 max_cores_per_node=_lead_int(t.get("MaxCPUsPerNode")), nodes=_lead_int(t.get("TotalNodes")),
                 max_cores_per_job=_cap(*caps, key="cpu"),
                 max_nodes_per_job=_least(_cap(*caps, key="node"), _lead_int(t.get("MaxNodes"))),

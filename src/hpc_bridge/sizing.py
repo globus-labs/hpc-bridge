@@ -508,7 +508,7 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
             return resources.cores_for_memory(c, mem, shape) or c
 
         holds = held(n)
-        why = (f" ({memory_gb} GB needs {holds} cores' memory share, {resources.memory_share_mb(shape)} MB each)"
+        why = (f" ({memory_gb} GB needs {holds} cores' memory share, {resources.enforced_share_mb(shape)} MB each)"
                if holds > cores else "")
         if shape.cores and holds > shape.cores:
             fits = max([r for r in range(1, n) if held(r) <= shape.cores], default=0)

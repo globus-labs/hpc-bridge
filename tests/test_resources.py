@@ -316,9 +316,9 @@ def test_the_cost_estimate_of_a_slice_a_whole_node_and_several_nodes():
     w = SHARED.model_copy(update={"billing": {"cpu": 1.0, "mem_gb": 0.25, "gpu": 16.0}, "mem_per_core_mb": None})
     g = resources.effective(_uec(**{CORES: 4, MEM: 16, GPUS: 1}), w, channel="ssh")
     assert resources.charge(g, w, 900) == (6.0, "(4 cores + 16 GB × 0.25 + 1 GPU × 16) × 0.25 h")
-    # with a per-core share known, 16 GB is 9 cores' share: the block asks for 9, billed beside its memory weight (the
-    # Anvil live test of 2026-11-10)
-    ws = w.model_copy(update={"mem_per_core_mb": 1896})
+    # with an enforced per-core share (MaxMemPerCPU), 16 GB is 9 cores' share: the block asks for 9, billed beside its
+    # memory weight (the Anvil live test of 2026-11-10); DefMemPerCPU alone adds none (round 2)
+    ws = w.model_copy(update={"mem_per_core_mb": 1896, "max_mem_per_core_mb": 1896})
     g9 = resources.effective(_uec(**{CORES: 4, MEM: 16, GPUS: 1}), ws, channel="ssh")
     assert resources.charge(g9, ws, 900)[0] == 7.25 and g9.cores == 9
     assert resources.charge(slice_, SHARED.model_copy(update={"billing": None}), 1800) is None   # weights unknown

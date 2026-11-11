@@ -15,11 +15,13 @@ on the first node, srun/mpiexec, unused nodes bill). `_connect_terms_note` asks 
 validation ([[server]]). A switch's words come from `_changed` / `_old_terms` (`:795`): "partition or account" as
 before, "partition, account or size" when the size moved, the old size named.
 
-**The per-core memory share (the Anvil live test of 2026-11-10).** `BlockTerms.cores_asked` / `memory_share_mb` carry a
-raise ([[resources]] `cores_for_memory`): `cores_per_node` is the raised count the block asks for and bills.
+**The per-core memory share (the Anvil live test of 2026-11-10).** `BlockTerms.cores_asked` / `memory_share_mb` (the enforced
+share, MaxMemPerCPU) / `memory_share_known` carry a raise ([[resources]] `cores_for_memory`): `cores_per_node` is the
+raised count the block asks for and bills.
 `_memory_cores_sentence` says what the cost line does not already say — the raise ("15.5 GB needs 9 cores' memory
-share on partition 'shared' (1896 MB each): …"), the cores a known share bills at least where no core count is sent, or,
-with no share known, that the scheduler may give and bill more cores than asked (nothing guessed). **A task's bound
+share on partition 'shared' (1896 MB each): …"), the cores a known share bills at least where no core count is sent, nothing
+where the partition is known to enforce no share (round 2: Anvil's `gpu`), or, where that is not known, that the
+scheduler may give and bill more cores than asked (nothing guessed). **A task's bound
 counts the block's age:** `_block_left_s` is what is left of the confirmed block's walltime from `block_since` (a
 reused or met-again block keeps its age: [[warmth]] `_answering_block_since`); `_billed_bounds_note` and
 `_running_outcome(block_left_s=)` say it where it is shorter than the task ceiling — a reused block 5 min into its 15 had

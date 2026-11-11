@@ -613,7 +613,7 @@ def spec_of(app: AppCtx, *, command: Any, session_id: str, account: Any, partiti
         held = resources.cores_for_memory(c, mem, shape) or c
         size = resources.Size(nodes=n, whole_node=False, cores=held, memory_gb=mem, gpus=int(gpus) if gpus else None,
                               send_mem=mem, cores_asked=c if held > c else None,
-                              share_mb=resources.memory_share_mb(shape) if held > c else None)
+                              share_mb=resources.enforced_share_mb(shape) if held > c else None)
         if held > c and shape is not None and shape.cores and held > shape.cores:
             raise JobRefusal(f"memory_gb={memory_gb!r} needs {held} cores' memory share on partition {part!r} "
                              f"({size.share_mb} MB each), more than a node has ({shape.cores} cores)")

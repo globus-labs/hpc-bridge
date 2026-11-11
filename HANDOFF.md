@@ -20,14 +20,14 @@ cluster is the real-hardware check.
 
 ## A per-core block's memory share; a reused block's age (2026-11-10, branch `fix/per-core-memory-share`, on f05cc99)
 
-A billed Anvil live test (Slurm 23.11, `shared`: per-core billing, DefMemPerCPU 1896 MB) found two bugs, fixed
+A billed Anvil live test (Slurm 23.11, `shared`: per-core billing, DefMemPerCPU = MaxMemPerCPU = 1896 MB) found two bugs, fixed
 test-first in `tests/test_per_core_memory_share.py` (red on f05cc99, green after):
 - **R1 (blocker).** `ensure_endpoint_up(cores=8, memory_gb=15.5)` sent `--cpus-per-task=8 --mem=15872M`. Slurm raised
   the job to 9 CPUs (15872 MB > 8 × 1896), parsl's launcher `srun` died at once (`SLURM_CPUS_PER_TASK=9 !=
   SLURM_TRES_PER_TASK=cpu=8`), the block FAILED in 5 s (MISSING, BadStateException), and the size words said 8 cores.
   hpc-bridge's own default proposal said "8 cores, 15 GB": said back, 15 GB is over the share too.
   - **The rule** (`resources.cores_for_memory`; vault `Modules/resources.md`, "The per-core memory share"): where the
-    share is known (MaxMemPerCPU, else DefMemPerCPU), a memory above the cores' share RAISES the cores the block asks
+    ENFORCED share is known (MaxMemPerCPU), a memory above the cores' share RAISES the cores the block asks
     for to ceil(memory / share), so the request and Slurm's CPUs agree; the terms say so ("15.5 GB needs 9 cores'
     memory share on partition 'shared' (1896 MB each): 9 cores are billed, and the block asks for 9, not 8") and the
     cost counts them. Chosen over capping the memory and refusing: the scheduler gives and bills those cores anyway,
@@ -38,6 +38,12 @@ test-first in `tests/test_per_core_memory_share.py` (red on f05cc99, green after
     cores sent beside its whole-GB memory), and an exported handoff's config (refused, naming the cores to send: it
     goes out as written). Where no share is known nothing is guessed; the terms say the scheduler may give — and bill
     — more cores than asked.
+  - **Round 2** (Anvil's live `scontrol show partition`: `gpu` has DefMemPerCPU=3750 and no MaxMemPerCPU, and Slurm
+    adds no CPUs for memory there): DefMemPerCPU alone never raises cores; it only caps the default proposal's
+    memory. (a) MaxMemPerCPU known: raise; (b) known to have none (discovery saw MaxMemPerNode or an UNLIMITED cap:
+    `PartitionShape.max_mem_per_core_known`): no raise, no line; (c) not known: no raise, one line. PBS raises only
+    on a share a registry entry states. The Anvil seed now states `shared`'s MaxMemPerCPU=1896 (`debug` unknown):
+    **the published registry needs a re-ingest** for facility users to get it.
   - A hermetic check of Slurm's own: a fake Slurm that raises the job's CPUs as Anvil did and a fake `srun` making
     23.11's TRES check, run on the block script the wire renders (parsl's own where importable:
     `uv run --with parsl==2026.8.10 …`).

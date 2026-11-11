@@ -80,8 +80,14 @@ class PartitionShape(BaseModel):
     gpus: int | None = None               # per node (0: none)
     max_gpus_per_node: int | None = None  # the LARGEST node's GPUs (a mixed CPU/GPU partition's smallest has none)
     mem_per_core_mb: int | None = None    # Slurm DefMemPerCPU: what a slice gets per core when it asks for no memory
-    # Slurm MaxMemPerCPU: memory above it per CPU raises the job's CPUs (and the charge) — the per-core memory share
+    # Slurm MaxMemPerCPU: memory above it per CPU raises the job's CPUs (and the charge) — the ENFORCED per-core memory
+    # share, the only one that raises a block's cores (hpc_bridge.resources.enforced_share_mb; DefMemPerCPU never does:
+    # Anvil's `gpu`, DefMemPerCPU=3750 with no MaxMemPerCPU, adds no CPUs for memory — 2026-11-10)
     max_mem_per_core_mb: int | None = None
+    # Whether that enforced share is KNOWN: discovery read the partition's memory caps (scontrol prints MaxMemPerCPU or
+    # MaxMemPerNode) or a registry entry states it. True with max_mem_per_core_mb None: there is none (no CPUs are
+    # added for memory); False: not known (the terms say the scheduler may give and bill more cores than asked).
+    max_mem_per_core_known: bool = False
     max_cores_per_node: int | None = None  # Slurm MaxCPUsPerNode: a job's cores on one node of this partition
     nodes: int | None = None               # the nodes the partition has (TotalNodes / the nodes serving the queue)
     max_cores_per_job: int | None = None  # the QOS per-job (or per-user) cap: Expanse `shared` is 127
@@ -143,6 +149,11 @@ class PartitionShape(BaseModel):
     @classmethod
     def _hours(cls, v: Any) -> float | None:
         return _positive(v)
+
+    @field_validator("max_mem_per_core_known", mode="before")
+    @classmethod
+    def _known(cls, v: Any) -> bool:
+        return v is True   # anything but a plain true is "not known" (the honest side: the terms say more may bill)
 
     @field_validator("billing", mode="before")
     @classmethod
@@ -236,11 +247,14 @@ class BlockTerms(BaseModel):
     memory_gb: float | None = None          # per node
     memory_default: bool = False            # the partition's default memory per core (DefMemPerCPU): not sent
     gpus_per_node: int | None = None
-    # A memory above the cores' per-core memory share (hpc_bridge.resources.cores_for_memory, the Anvil live test of
-    # 2026-11-10): `cores_per_node` is the raised count the block asks for and bills, `cores_asked` the count asked
-    # (None: not raised); `memory_share_mb` the partition's share in MB per core (None: not known).
+    # A memory above the cores' ENFORCED per-core memory share (hpc_bridge.resources.cores_for_memory, the Anvil live
+    # test of 2026-11-10): `cores_per_node` is the raised count the block asks for and bills, `cores_asked` the count
+    # asked (None: not raised); `memory_share_mb` the partition's enforced share, MaxMemPerCPU, in MB per core (None:
+    # none, or not known); `memory_share_known` whether it is known — a value, or known to be none (False: the terms
+    # say the scheduler may give and bill more cores than asked).
     cores_asked: int | None = None
     memory_share_mb: int | None = None
+    memory_share_known: bool = False
     size_source: SizeSource | None = None
     # Where a size nothing here asked for comes from: "parsl's default: exclusive", "the facility's scheduler_options",
     # "the facility template's own default (parsl's is the whole node)" … — the terms never claim a slice they cannot
