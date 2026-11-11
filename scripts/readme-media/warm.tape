@@ -22,7 +22,7 @@ Set Height 740
 Set Framerate 4
 Set TypingSpeed 15ms
 
-Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --settings "$HPCB_SETTINGS" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && clear`
+Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --model claude-opus-5-5 --settings "$HPCB_SETTINGS" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && clear`
 Enter
 Sleep 1s
 Type "claude"

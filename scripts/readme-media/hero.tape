@@ -38,7 +38,7 @@ Set Theme { "name": "hpc-bridge", "background": "#0d1722", "foreground": "#dce6f
 
 # Off camera: the demo folder, a short prompt, and `claude` as this checkout's plugin with the tools build.sh allows.
 Hide
-Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --permission-mode default --settings "$HPCB_SETTINGS" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && PS1='\[\e[36m\]~/hpcb-batch-demo\[\e[0m\] \$ ' && clear`
+Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --model claude-opus-5-5 --permission-mode default --settings "$HPCB_SETTINGS" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && PS1='\[\e[36m\]~/hpcb-batch-demo\[\e[0m\] \$ ' && clear`
 Enter
 Sleep 800ms
 Show
