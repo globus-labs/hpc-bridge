@@ -51,11 +51,8 @@ Enter
 Hide
 # wait:start
 Sleep 20s
-# The start-up banner (model, plan, any promo) has no setting to hide it: clear it off camera.
-Type "/clear"
-Sleep 300ms
-Enter
-Sleep 3s
+# The start-up banner (model, plan, any promo) stays: no setting or key removes it (neither /clear nor Ctrl+L).
+# build.sh blanks it in the GIF instead (HERO_BLANK).
 Show
 Sleep 1.2s
 

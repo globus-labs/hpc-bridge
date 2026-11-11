@@ -61,9 +61,17 @@ gif() {  # $1: the take (mp4) → docs/media/demo.gif
   local mp4="$1" out="$MEDIA/demo.gif" speed="${HERO_SPEED:-1}" fps="${HERO_FPS:-12}"
   [ -f "$mp4" ] || die "no take at $mp4"
   command -v ffmpeg >/dev/null || die "ffmpeg is not on PATH"
+  # HERO_BLANK="x,y,w,h,t0,t1" paints that box with the terminal's background from t0 to t1 s of the take. Claude Code
+  # draws its start-up banner (model, plan, any promo) at the top until the first answer scrolls it away; no setting or
+  # key removes it (neither /clear nor Ctrl+L). The 2026-11-11 take: 26,60,1148,218,1.1,11.1.
+  local blank=""
+  if [ -n "${HERO_BLANK:-}" ]; then
+    IFS=, read -r bx by bw bh bt0 bt1 <<< "$HERO_BLANK"
+    blank="drawbox=x=${bx}:y=${by}:w=${bw}:h=${bh}:color=0x0d1722:t=fill:enable='between(t,${bt0},${bt1})',"
+  fi
   # One palette from the whole take, undithered: text stays crisp, and a frame that doesn't change costs nothing.
   ffmpeg -v error -y -i "$mp4" -filter_complex \
-    "[0:v]setpts=PTS/${speed},fps=${fps},split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" \
+    "[0:v]${blank}setpts=PTS/${speed},fps=${fps},split[a][b];[a]palettegen=max_colors=128:stats_mode=diff[p];[b][p]paletteuse=dither=none:diff_mode=rectangle" \
     -loop 0 "$out"
   local secs bytes
   secs="$(ffprobe -v error -show_entries format=duration -of csv=p=0 "$out")"
