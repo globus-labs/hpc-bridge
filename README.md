@@ -20,7 +20,7 @@ Ask for a compute node in plain language: the agent shows you what it will cost,
   <img src="https://raw.githubusercontent.com/globus-labs/hpc-bridge/main/docs/media/demo.gif" width="100%" alt="A Claude Code session that connects to a cluster, asks before it starts a billed block, runs a batch and releases the block">
 </p>
 <p align="center"><sub>Claude Code connects to a small Slurm test cluster and shows the terms of the block it would start: its
-partition, its size and the most it can bill. After a yes, six rows of a batch run on the block, one core each, and
+partition, its size and the most it can bill. After a yes, six rows of a batch run on the block, two at a time, and
 the block is released.</sub></p>
 
 hpc-bridge is a Claude Code plugin, and an MCP server for any other agent host. It finds the facility you name, or
