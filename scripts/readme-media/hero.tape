@@ -3,11 +3,12 @@
 # gets a yes, runs six rows two at a time, and releases the block.
 #
 # Run it through build.sh, never on its own: `scripts/readme-media/build.sh --record`. build.sh checks the cluster
-# and the alias, seeds a throwaway Claude Code config (no first-run prompts, the demo folder trusted), and exports what
-# this tape reads: HPCB_DEMO_DIR (the session's folder, outside the repo), HPCB_PLUGIN_DIR (this checkout),
-# HPCB_ALLOW / HPCB_DENY (the tools the session may and may not use), HPC_BRIDGE_STATE_DIR (the demo's own state).
-# It bills Claude usage, and needs the warm-up first (build.sh --warm): with the cluster's settings cached and its
-# endpoint up, the connect here is a zero-SSH reattach that asks nothing, and the one question is the spend question.
+# and the alias, and exports what this tape reads: HPCB_DEMO_DIR (the session's folder, outside the repo),
+# HPCB_PLUGIN_DIR (this checkout), HPCB_SETTINGS (per-session settings: the installed plugins off, so the one
+# hpc-bridge is this checkout's), HPCB_ALLOW / HPCB_DENY (the tools the session may and may not use), and
+# HPC_BRIDGE_STATE_DIR (the demo's own state). The session is you, on your own ~/.claude, and bills Claude usage. It
+# needs warm.tape first (build.sh --warm): with the cluster's settings cached and its endpoint up, the connect here is
+# a zero-SSH reattach that asks nothing, and the one question is the spend question.
 #
 # The long waits (Claude Code starting, the agent working, the block starting) are cut: hidden while they run, so
 # the GIF holds only the shown stretches (about 28 s). They are fixed sleeps, not `Wait` regexes: VHS 0.12.1's
@@ -37,7 +38,7 @@ Set Theme { "name": "hpc-bridge", "background": "#0d1722", "foreground": "#dce6f
 
 # Off camera: the demo folder, a short prompt, and `claude` as this checkout's plugin with the tools build.sh allows.
 Hide
-Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && PS1='\[\e[36m\]~/hpcb-batch-demo\[\e[0m\] \$ ' && clear`
+Type `cd "$HPCB_DEMO_DIR" && claude() { command claude --plugin-dir "$HPCB_PLUGIN_DIR" --settings "$HPCB_SETTINGS" --allowedTools "$HPCB_ALLOW" --disallowedTools "$HPCB_DENY" "$@"; } && PS1='\[\e[36m\]~/hpcb-batch-demo\[\e[0m\] \$ ' && clear`
 Enter
 Sleep 800ms
 Show

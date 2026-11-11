@@ -3,9 +3,9 @@
 #
 #   scripts/readme-media/build.sh               the stills, from their HTML: docs/media/wordmark.png, wordmark-dark.png
 #                                               and how-it-works.png (free: a headless Chromium, no network)
-#   scripts/readme-media/build.sh --warm        BILLS CLAUDE USAGE. An interactive session, before the first take: you
-#                                               connect it to the fake cluster once, so its settings are cached and its
-#                                               endpoint is up, and each take's connect is a zero-SSH reattach
+#   scripts/readme-media/build.sh --warm        BILLS CLAUDE USAGE. Runs warm.tape, unattended and not for the README:
+#                                               a session connects to the fake cluster once, so its settings are cached
+#                                               and its endpoint is up, and each take's connect then asks nothing
 #   scripts/readme-media/build.sh --record      BILLS CLAUDE USAGE. Records hero.tape (a real session on the fake
 #                                               cluster), then makes docs/media/demo.gif from it
 #   scripts/readme-media/build.sh --gif <mp4>   only the last step: docs/media/demo.gif from a take already recorded
@@ -13,23 +13,28 @@
 # The stills need Node and Playwright with its Chromium. Playwright is not a dependency of hpc-bridge: point NODE_PATH
 # at any node_modules that has it. They are set in macOS's system fonts; a render elsewhere sets other faces.
 #
-# --warm and --record need: the fake cluster up with its `default` profile and the ssh alias hpcb-fake (both from
-# agentic/fakecluster/bin/try_batch.sh, which this script never starts or stops), a Globus login on this machine
-# (~/.globus_compute, shared with your other sessions), and claude, vhs and ffmpeg on PATH. Each session runs in
-# HPCB_DEMO_DIR (default ~/hpcb-batch-demo, outside the repo, so the repo's .claude/settings.local.json, which disables
-# the dev server, does not apply) with its own hpc-bridge state (<demo>/state: your ~/.hpc-bridge is never touched),
-# this checkout as the plugin, and a throwaway Claude Code config seeded so nothing asks first (onboarding done, the
-# demo folder trusted, hpc-bridge's tools allowed), authenticated by CLAUDE_CODE_OAUTH_TOKEN (from the environment, or
-# the main checkout's agentic/.env). HERO_OWN_CONFIG=1 uses your own ~/.claude instead: then disable a marketplace
-# install of hpc-bridge for the session (/plugin), so only this checkout's tools load.
+# --warm and --record run Claude Code as YOU, with your own ~/.claude (its login, settings and trusted folders; the
+# demo folder must be trusted, as try_batch.sh's first --launch leaves it). They never read a token: CLAUDE_CODE_OAUTH_TOKEN
+# and ANTHROPIC_API_KEY are unset for the session, so it bills your Claude Code plan. Nothing under ~/.claude is edited.
+# Per session only (`--settings`, a file in the take's folder): every plugin your settings enable is turned off,
+# the installed hpc-bridge (hpc-bridge@hpc-bridge) included, so the one hpc-bridge loaded is this checkout
+# (`--plugin-dir`, which Claude Code names hpc-bridge@inline). hpc-bridge's tools are allowed; AskUserQuestion, Bash
+# and the editing and web tools are denied, so every question is plain text and nothing waits on a permission prompt.
+# HERO_OWN_CONFIG=1 names this mode; it is the only one.
 #
-# Knobs (--record, --gif):
-#   HERO_WAIT_START, HERO_WAIT_ASK, HERO_WAIT_RESULTS, HERO_WAIT_RELEASE   seconds for hero.tape's hidden waits
-#                                    (defaults in the tape: 20, 150, 240, 60): only long enough matters, they're cut
+# They also need: the fake cluster up with its `default` profile and the ssh alias hpcb-fake (both from
+# agentic/fakecluster/bin/try_batch.sh, which this script never starts or stops), a Globus login on this machine
+# (~/.globus_compute), and claude, vhs and ffmpeg on PATH. Each session runs in HPCB_DEMO_DIR (default
+# ~/hpcb-batch-demo, outside the repo, so the repo's .claude/settings.local.json, which disables the dev server, does
+# not apply) with its own hpc-bridge state (<demo>/state: your ~/.hpc-bridge is never touched).
+#
+# Knobs, in seconds unless said:
+#   WARM_WAIT_START, WARM_WAIT_ASK, WARM_WAIT_UP         warm.tape's waits (defaults 20, 120, 420)
+#   HERO_WAIT_START, HERO_WAIT_ASK, HERO_WAIT_RESULTS, HERO_WAIT_RELEASE
+#                                                        hero.tape's hidden waits (defaults 20, 150, 240, 60): only long
+#                                                        enough matters, they're cut from the GIF
 #   HERO_SPEED   play the take this many times faster in the GIF (default 1)
 #   HERO_FPS     the GIF's frame rate (default 12)
-#   HERO_FULLSCREEN=1   Claude Code's flicker-free full-screen renderer (CLAUDE_CODE_NO_FLICKER=1), if the classic one
-#                       flickers in the take
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 REPO="$(cd "$HERE/../.." && pwd)"
@@ -40,9 +45,7 @@ DEMO="${HPCB_DEMO_DIR:-$HOME/hpcb-batch-demo}"
 STATE="$DEMO/state"   # keep it short: ssh's ControlPath (<state>/cm/<40 hex>) must fit ~104 bytes
 TAKES="$DEMO/recordings"
 ALLOW="mcp__plugin_hpc-bridge_endpoint,mcp__plugin_hpc-bridge_endpoint__*,Skill"
-DENY_RECORD="AskUserQuestion,Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"   # one plain-text question; no prompts
-DENY_WARM="Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"
-WARM_PROMPT="Connect me to the cluster at hpcb-fake. Use the settings you discover, bring the endpoint up, and stop there: don't start a compute block."
+DENY="AskUserQuestion,Bash,Edit,Write,NotebookEdit,WebFetch,WebSearch"
 
 die() { echo "build.sh: $*" >&2; exit 1; }
 
@@ -72,89 +75,82 @@ gif() {  # $1: the take (mp4) → docs/media/demo.gif
 
 preflight() {  # what --warm and --record need, checked, never started
   command -v claude >/dev/null || die "the claude CLI is not on PATH"
+  command -v vhs >/dev/null || die "vhs is not on PATH"
   command -v uv >/dev/null || die "uv is not on PATH (the plugin runs its server with uv)"
   command -v docker >/dev/null && docker ps --format '{{.Names}}' 2>/dev/null | grep -q '^hpcb-fake-login-1$' \
     || die "the fake cluster isn't up: run agentic/fakecluster/bin/try_batch.sh (profile default) first"
   ssh -o BatchMode=yes -o ConnectTimeout=10 hpcb-fake true 2>/dev/null \
     || die "ssh hpcb-fake failed: try_batch.sh adds the alias to ~/.ssh/config and checks it"
+  [ -f "$HOME/.globus_compute/storage.db" ] \
+    || die "no Globus login on this machine (~/.globus_compute/storage.db): log in once in an ordinary session first"
   mkdir -p "$DEMO" "$STATE" "$TAKES"
+  local demo; demo="$(cd "$DEMO" && pwd -P)"
+  python3 - "$demo" <<'PY' || echo "build.sh: $DEMO may not be a trusted folder in ~/.claude.json: the tape would type into the trust prompt. Open claude there once and trust it." >&2
+import json, os, sys
+d = json.load(open(os.path.expanduser("~/.claude.json")))
+sys.exit(0 if d.get("projects", {}).get(sys.argv[1], {}).get("hasTrustDialogAccepted") else 1)
+PY
   # The server's environment is resolved once, before the take, so its first start fits the start-up wait.
   uv sync --quiet --locked --extra integration --directory "$REPO"
 }
 
-session_env() {  # $1: the tools to deny. Exports what the session (and hero.tape) reads.
-  # Your own hpc-bridge settings stay out (an HPC_BRIDGE_SSH_HOST or endpoint id would bypass the demo's facility).
+session_env() {  # $1: the take's folder. Exports what the tapes read; edits nothing under ~/.claude.
+  # Your own hpc-bridge settings stay out (an HPC_BRIDGE_SSH_HOST or endpoint id would bypass the demo's facility),
+  # and so do tokens: the session logs in as your ~/.claude does.
   for v in $(env | grep -oE '^HPC_BRIDGE_[A-Z_]+' || true); do unset "$v"; done
-  export HPC_BRIDGE_STATE_DIR="$STATE" HPCB_DEMO_DIR="$DEMO" HPCB_PLUGIN_DIR="$REPO" HPCB_ALLOW="$ALLOW" HPCB_DENY="$1"
-  export DISABLE_AUTOUPDATER=1 CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC=1
-  [ "${HERO_FULLSCREEN:-}" = 1 ] && export CLAUDE_CODE_NO_FLICKER=1
-  [ "${HERO_OWN_CONFIG:-}" = 1 ] && return 0
-  if [ -z "${CLAUDE_CODE_OAUTH_TOKEN:-}" ]; then
-    local main env_file
-    main="$(cd "$(git -C "$REPO" rev-parse --path-format=absolute --git-common-dir)/.." && pwd)"
-    env_file="$main/agentic/.env"
-    [ -f "$env_file" ] && CLAUDE_CODE_OAUTH_TOKEN="$(grep '^CLAUDE_CODE_OAUTH_TOKEN=' "$env_file" | head -1 | cut -d= -f2- || true)"
-    [ -n "${CLAUDE_CODE_OAUTH_TOKEN:-}" ] \
-      || die "no CLAUDE_CODE_OAUTH_TOKEN (environment, or $env_file); mint one with \`claude setup-token\`, or set HERO_OWN_CONFIG=1"
-  fi
-  export CLAUDE_CODE_OAUTH_TOKEN
-  CFG="$(mktemp -d "${TMPDIR:-/tmp}/hpcb-hero-claude.XXXXXX")"
-  trap 'rm -rf "$CFG"' EXIT
-  export CLAUDE_CONFIG_DIR="$CFG"
-  # Onboarding done, the release notes seen (the versions copied from your own config, nothing else), the demo
-  # folder trusted, and the tools allowed, so the session opens on the prompt and nothing asks before the agent does.
-  python3 - "$CFG" "$(cd "$DEMO" && pwd -P)" "$ALLOW" "$1" <<'PY'
+  unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR
+  # The per-session settings: every plugin your settings enable is off for this session, and the installed
+  # hpc-bridge whether or not they name it (a project's settings may), so only --plugin-dir's hpc-bridge loads.
+  python3 - "$1/session-settings.json" <<'PY'
 import json, os, sys
-cfg, demo, allow, deny = sys.argv[1:]
-own = {}
-try:
-    own = json.load(open(os.path.expanduser("~/.claude.json")))
-except Exception:
-    pass
-seed = {"hasCompletedOnboarding": True, "theme": "dark", "projects": {demo: {"hasTrustDialogAccepted": True, "allowedTools": []}}}
-for k in ("lastOnboardingVersion", "lastReleaseNotesSeen"):
-    if k in own:
-        seed[k] = own[k]
-json.dump(seed, open(os.path.join(cfg, ".claude.json"), "w"), indent=1)
-settings = {"permissions": {"allow": allow.split(","), "deny": deny.split(",")}, "spinnerTipsEnabled": False}
-json.dump(settings, open(os.path.join(cfg, "settings.json"), "w"), indent=1)
+enabled = {}
+for f in ("~/.claude/settings.json", "~/.claude/settings.local.json"):
+    try:
+        enabled.update(json.load(open(os.path.expanduser(f))).get("enabledPlugins") or {})
+    except Exception:
+        pass
+off = {name: False for name in enabled}
+off["hpc-bridge@hpc-bridge"] = False
+json.dump({"enabledPlugins": off, "spinnerTipsEnabled": False}, open(sys.argv[1], "w"), indent=1)
+print("plugins off for the session:", ", ".join(sorted(off)))
 PY
+  export HPC_BRIDGE_STATE_DIR="$STATE" HPCB_DEMO_DIR="$DEMO" HPCB_PLUGIN_DIR="$REPO"
+  export HPCB_SETTINGS="$1/session-settings.json" HPCB_ALLOW="$ALLOW" HPCB_DENY="$DENY" DISABLE_AUTOUPDATER=1
+}
+
+with_waits() {  # $1: the tape, $2: the env prefix (HERO_WAIT_ or WARM_WAIT_): each `# wait:<name>` Sleep from the env
+  awk -v prefix="$2" '
+    /^# wait:[a-z]+$/ { name = toupper(substr($0, 8)); print; next }
+    name != "" && /^Sleep / { v = ENVIRON[prefix name]; if (v != "") $0 = "Sleep " v "s"; name = "" }
+    { print }
+  ' "$1"
 }
 
 warm() {
   preflight
-  session_env "$DENY_WARM"
-  cat <<EOF
-== A warm-up session (bills Claude usage). Paste this, answer its questions, and quit (/exit) once the endpoint is up:
-
-  $WARM_PROMPT
-
-EOF
-  cd "$DEMO"
-  command claude --plugin-dir "$REPO" --allowedTools "$ALLOW" --disallowedTools "$DENY_WARM"
+  local take; take="$TAKES/warm-$(date +%Y%m%d-%H%M%S)"
+  mkdir -p "$take"
+  session_env "$take"
+  with_waits "$HERE/warm.tape" WARM_WAIT_ > "$take/warm.tape"
+  echo "== Warm-up (bills Claude usage; about ten minutes, unattended) in $take"
+  (cd "$take" && vhs warm.tape)
   if grep -q 'hpcb-fake' "$STATE/facilities.json" 2>/dev/null; then
     echo "The cluster's settings are cached in $STATE. Next: $0 --record"
   else
-    echo "No settings for hpcb-fake cached in $STATE yet: the take's connect would ask about them. Run --warm again." >&2
+    die "no settings for hpcb-fake cached in $STATE: watch $take/warm.mp4 for why; a longer WARM_WAIT_UP if the bring-up was still going"
   fi
 }
 
 record() {
-  command -v vhs >/dev/null || die "vhs is not on PATH"
   command -v ffmpeg >/dev/null || die "ffmpeg is not on PATH"
   preflight
   grep -q 'hpcb-fake' "$STATE/facilities.json" 2>/dev/null \
     || die "no settings for hpcb-fake cached in $STATE: run $0 --warm first"
-  session_env "$DENY_RECORD"
-  local take="$TAKES/hero-$(date +%Y%m%d-%H%M%S)"
+  local take; take="$TAKES/hero-$(date +%Y%m%d-%H%M%S)"
   mkdir -p "$take"
-  # The tape with each `# wait:<name>` Sleep set from HERO_WAIT_<NAME>, where given.
-  awk '
-    /^# wait:[a-z]+$/ { name = toupper(substr($0, 8)); print; next }
-    name != "" && /^Sleep / { v = ENVIRON["HERO_WAIT_" name]; if (v != "") $0 = "Sleep " v "s"; name = "" }
-    { print }
-  ' "$HERE/hero.tape" > "$take/hero.tape"
-  echo "== Recording (bills Claude usage; several minutes of wall-clock time, about 28 s of GIF) into $take"
+  session_env "$take"
+  with_waits "$HERE/hero.tape" HERO_WAIT_ > "$take/hero.tape"
+  echo "== Recording (bills Claude usage; about eight minutes, about 28 s of GIF) in $take"
   (cd "$take" && vhs hero.tape)
   echo "The take: $take/hero.mp4. Look at it before you keep the GIF."
   gif "$take/hero.mp4"
@@ -165,6 +161,6 @@ case "${1:-}" in
   --warm) warm ;;
   --record) record ;;
   --gif) [ -n "${2:-}" ] || die "--gif needs the take: build.sh --gif <hero.mp4>"; gif "$2" ;;
-  -h|--help) sed -n '2,37p' "$0" ;;
+  -h|--help) sed -n '2,40p' "$0" ;;
   *) die "unknown argument: $1 (try --help)" ;;
 esac
