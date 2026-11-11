@@ -13,7 +13,8 @@ Prefer to watch first? [hpc-bridge in seven minutes](https://www.youtube.com/wat
 | [Quickstart](quickstart.md) | your first session, step by step, and what to expect |
 | [Facilities](facilities.md) | choosing a machine: what each facility needs from you |
 | [The Globus login](login.md) | the one credential hpc-bridge needs, and why your browser opens |
-| [Costs and stopping](costs-and-stopping.md) | how spend is gated, what "stop" means, long-running work |
+| [Batches, jobs and environments](batches-jobs-envs.md) | running many inputs on one block, work that outlives the session, and the software it runs in |
+| [Costs and stopping](costs-and-stopping.md) | how spend is gated, what a block and a job cost, what "stop" means, long-running work |
 | [Troubleshooting](troubleshooting.md) | what a refusal or a stuck state means and what to do |
 | [Trusting the facility](trust.md) | connecting to a cluster you don't fully trust: planted instructions in its output |
 
@@ -35,10 +36,7 @@ discovers). [Facilities](facilities.md) has the table and the registered machine
 Nothing hpc-bridge-specific is configured by hand. [Install](install.md) has each prerequisite in full.
 
 **What it is not, yet:** it moves command output, not files (use Globus Transfer or `scp` for results);
-Slurm and PBS are the supported schedulers. Batches, tracked jobs and environments (0.1.27) are newer than this
-guide: until it covers them, the [README](../../README.md#what-it-can-do) says what each does, and the vault's
-[Batch and swarm execution](../hpc-bridge-vault/Planned/Batch%20and%20swarm%20execution.md) and
-[Block environments](../hpc-bridge-vault/Planned/Block%20environments.md) notes have the detail.
+Slurm and PBS are the supported schedulers.
 
 The developer documentation (design, internals, the tool reference) lives in the
 [vault](../hpc-bridge-vault/Home.md).

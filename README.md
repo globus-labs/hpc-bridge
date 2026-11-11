@@ -88,24 +88,26 @@ comes back as a task the agent polls, and keeps the block busy while it runs.
 The same command over many inputs is one batch. You size a row as you would an sbatch array task, in cores, memory and
 GPUs; hpc-bridge derives the block from the rows, pins each row to its own CPUs, and records every row in a ledger
 that outlives the session. Not sure of the size? A pilot runs one row alone on the block and proposes one from what it
-used.
+used. [Batches](docs/user/batches-jobs-envs.md#batches) has the prompts and the limits.
 
 ### Jobs that outlive the session
 
 Long or array work can go to the scheduler as jobs, under a budget you approve once: a cap and a deadline, with each
-job's worst case counted against it. Jobs need a facility hpc-bridge reaches over SSH.
+job's worst case counted against it. Jobs need a facility hpc-bridge reaches over SSH; see
+[Jobs](docs/user/batches-jobs-envs.md#jobs).
 
 ### Environments
 
 Name an environment once, and every command, row and job runs in it: a `module load` or `conda activate` line on any
 facility, or, where hpc-bridge set up the endpoint itself, one it builds from a requirements list on the login node,
-for free. Switching environments starts no new block.
+for free. Switching environments starts no new block; see [Environments](docs/user/batches-jobs-envs.md#environments).
 
 ### The spend gate
 
 Nothing billed starts without your yes. Before a block, a job or a batch that needs one, the agent shows its terms:
 the partition, the account, the size, the walltime and the most it can bill, never understated. The check is in the
-server, not in the agent's judgement.
+server, not in the agent's judgement. [Costs and stopping](docs/user/costs-and-stopping.md) has the
+details.
 
 ### Picking up where you left off
 
@@ -132,8 +134,9 @@ its own endpoint, goes through Globus.</sub></p>
 
 ## Facilities
 
-The public registry has five: **ALCF Polaris** (PBS), **Purdue Anvil**, **NCSA Delta** and **Globus Labs' cluster**,
-each through the facility's own endpoint with zero SSH, and **SDSC Expanse** (Slurm), over SSH with a one-time code.
+The public registry includes **ALCF Polaris** (PBS), **Purdue Anvil** and **NCSA Delta**, each through the
+facility's own endpoint with zero SSH, and **SDSC Expanse** (Slurm), over SSH with a one-time code, though SDSC asks
+that workflow tools not run on its login nodes ([what that means here](docs/user/facilities.md#sdsc-expanse-and-its-login-nodes)).
 Any other Slurm or PBS cluster you reach with an SSH key works too: the agent probes its login node and proposes the
 settings for you to confirm. [Facilities](docs/user/facilities.md) says what each one needs from you, and
 [Adding a facility](docs/adding-a-facility.md) how a cluster joins the registry.
@@ -147,9 +150,9 @@ unfiltered, so read [Trusting the facility](docs/user/trust.md) before you conne
 
 ## Status
 
-**0.1.27.** Tested live, over its releases, on ALCF Polaris, Purdue Anvil, NCSA Delta, SDSC Expanse and UChicago's
-Midway, and against a local Slurm and PBS test cluster; batches with sized rows and environments were proven on
-Anvil. Each release's changes are in the [CHANGELOG](CHANGELOG.md). Please
+**0.1.27.** Tested live on Purdue Anvil in November 2026, this release's batches, sized rows and environments
+included, and on ALCF Polaris and NCSA Delta in October 2026; also against a local Slurm and PBS test cluster. Each
+release's changes are in the [CHANGELOG](CHANGELOG.md). Please
 [report rough edges](https://github.com/globus-labs/hpc-bridge/issues).
 
 ## Docs

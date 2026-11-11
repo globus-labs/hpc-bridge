@@ -22,7 +22,7 @@ an unknown host key is refused with **"UNKNOWN HOST KEY"** until you have connec
 | Facility | Access | Scheduler | Notes |
 |---|---|---|---|
 | **Purdue Anvil** (`anvil`, ACCESS) | facility-run endpoint, zero SSH | Slurm | your ACCESS identity must map to your Anvil account. Compute-only; account = your ACCESS project id lowercased (e.g. `cis250223`); default partition `shared`, one core per block. The entry sends no GPU request, and Anvil's GPU partitions need one, so a GPU job (and its `-gpu` account) cannot be used through this entry yet: hpc-bridge has no per-session way to add scheduler directives to a registry facility. Validated 2026-10-09. Anvil over SSH is no longer in the registry; it still works as a bring-your-own cluster (`anvil.rcac.purdue.edu`). |
-| **SDSC Expanse** (`expanse`, ACCESS) | SSH bootstrap on `login.expanse.sdsc.edu`, with a one-time code | Slurm | every login needs a TOTP code even with a key; the agent asks you for the current code and opens the shared session itself (a password, by contrast, is never handled in the chat: you would get an `ssh` command for your own terminal). The first connect installs `uv` and Globus Compute into your home there (a minute or two). Account = your Expanse project id (e.g. `chi152`); default partition `shared`, `debug` for short tests. Validated 2026-09-04 (login shape). |
+| **SDSC Expanse** (`expanse`, ACCESS) | SSH bootstrap on `login.expanse.sdsc.edu`, with a one-time code | Slurm | every login needs a TOTP code even with a key; the agent asks you for the current code and opens the shared session itself (a password, by contrast, is never handled in the chat: you would get an `ssh` command for your own terminal). The first connect installs `uv` and Globus Compute into your home there (a minute or two). Account = your Expanse project id (e.g. `chi152`); default partition `shared`, `debug` for short tests. SDSC asks that workflow tools not run on its login nodes: see [below](#sdsc-expanse-and-its-login-nodes). Validated 2026-10-06, on an older Globus Compute client than today's. |
 | **NCSA Delta** (`delta`, ACCESS) | facility-run endpoint, zero SSH | Slurm | compute-only; every command runs on a billed block. You need a Delta allocation and its NCSA project code as the account (looks like `bgta-delta-gpu`; see it with `accounts` on a Delta login node). Default partition `gpuA40x4` with one GPU requested; CPU partitions charge a CPU allocation. Validated 2026-09-04. |
 | **ALCF Polaris** (`polaris`) | facility-run endpoint, zero SSH | PBS Pro | link your ALCF identity (ALCF username + MobilePASS+) to your Globus login so the facility can map you to your ALCF account. Compute-only; account = your ALCF project name (e.g. `Diaspora`); default queue `debug` (`partition` sets the queue). The entry sends no scheduler directives, so jobs get the facility's default, `-l filesystems=home`: a job that needs `eagle` or `grand` cannot request them through this entry yet (hpc-bridge has no per-session way to add scheduler directives to a registry facility). Workers run ALCF's own Python 3.13 install. A stopped block idle-releases after 240 s. Validated 2026-10-13. |
 | **Globus Labs cluster** (`globus-labs`) | facility-run endpoint, zero SSH | Slurm | Globus Labs members only (the facility maps their identities). Compute-only: there is no login node, every command runs on a billed block on partition `main` that stays warm between commands; no allocation account needed; unmetered lab hardware (3 ARM DGX Spark nodes, aarch64: bring ARM builds) |
@@ -30,6 +30,20 @@ an unknown host key is refused with **"UNKNOWN HOST KEY"** until you have connec
 More facilities operate Globus Compute multi-user endpoints (ALCF Polaris and Crux, NeSI). hpc-bridge reads each facility endpoint's published template contract when it attaches,
 so adding one is a registry entry plus a live check; see the vault's
 [MEP facilities survey](../hpc-bridge-vault/Reference/MEP%20facilities%20survey.md).
+
+## SDSC Expanse and its login nodes
+
+SDSC's [Expanse user guide](https://www.sdsc.edu/systems/expanse/user_guide.html) ("Logging in to Expanse", notes
+and hints) asks you not to use the login nodes "as hosts for running workflow management tools". The registry
+reaches Expanse by the SSH bootstrap, which runs a Globus Compute endpoint (a small manager process, idle between
+tasks) on the login node and leaves it running between sessions so the next connect needs no SSH. The free
+discovery commands the agent runs (`sinfo`, `squeue`) run on the login node too; everything else runs in the billed
+block on a compute node. That plausibly falls under SDSC's rule, so on Expanse:
+
+- ask the agent for a *teardown* at the end of each session: it stops and removes the endpoint, and the next
+  session sets it up again (one SSH login with a one-time code, and a minute or two), as for any facility that
+  [forbids persistent processes on login nodes](#what-hpc-bridge-does-on-your-cluster);
+- or ask SDSC, through ACCESS support, whether a Globus Compute endpoint on a login node is acceptable for your use.
 
 ## Which Globus identity to use
 
@@ -50,8 +64,6 @@ one block for as long as you are active plus that timeout, not one block per com
 ## Bringing your own cluster
 
 > Connect me to the cluster at `login.example.edu`
-
-This path has been proven live on UChicago's Midway (Slurm) and on ALCF Polaris over SSH (PBS).
 
 The agent probes the login node over SSH, proposes the facility settings it discovered (scheduler,
 the network interface the endpoint should bind, scratch space, an environment setup line) and asks
