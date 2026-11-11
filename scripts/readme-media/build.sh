@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # Remake the README's media.
 #
-#   scripts/readme-media/build.sh               the stills, from their HTML: docs/media/wordmark.png, wordmark-dark.png
+#   scripts/readme-media/build.sh               the stills, from their HTML: docs/media/wordmark.png
 #                                               and how-it-works.png (free: a headless Chromium, no network)
 #   scripts/readme-media/build.sh --warm        BILLS CLAUDE USAGE. Runs warm.tape, unattended and not for the README:
 #                                               a session connects to the fake cluster once, so its settings are cached
