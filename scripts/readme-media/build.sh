@@ -99,6 +99,10 @@ session_env() {  # $1: the take's folder. Exports what the tapes read; edits not
   # and so do tokens: the session logs in as your ~/.claude does.
   for v in $(env | grep -oE '^HPC_BRIDGE_[A-Z_]+' || true); do unset "$v"; done
   unset CLAUDE_CODE_OAUTH_TOKEN ANTHROPIC_API_KEY CLAUDE_CONFIG_DIR
+  # Nor does a session this script was started from: run from inside Claude Code, its markers (CLAUDECODE,
+  # CLAUDE_CODE_CHILD_SESSION, its messaging socket and token…) made the recorded session a child of it, and a child
+  # shows "Transcript saving is off — inherited CLAUDE_CODE_CHILD_SESSION marker" in the frame.
+  for v in $(env | grep -oE '^CLAUDE[A-Z_]*' || true); do unset "$v"; done
   # The per-session settings: every plugin your settings enable is off for this session, and the installed
   # hpc-bridge whether or not they name it (a project's settings may), so only --plugin-dir's hpc-bridge loads.
   python3 - "$1/session-settings.json" <<'PY'
