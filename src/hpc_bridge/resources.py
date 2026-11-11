@@ -265,6 +265,35 @@ def cores_for_memory(cores: int | None, memory_gb: float | None, shape: Partitio
     return max(cores, math.ceil(mem_mb(memory_gb) / share))
 
 
+def cores_cap(cores: int, nodes: int, shape: PartitionShape | None) -> str | None:
+    """The first cap `cores` per node on `nodes` nodes is over on `shape`, in words — a node's cores, MaxCPUsPerNode,
+    the QOS per-job cap — or None. A raised count (`cores_for_memory`) is checked against every one of them on every
+    path that sends a block (review round of #253: a raise past MaxCPUsPerNode built a block that pends forever)."""
+    if shape is None:
+        return None
+    if shape.cores and cores > shape.cores:
+        return f"more than a node has ({shape.cores} cores)"
+    if shape.max_cores_per_node and cores > shape.max_cores_per_node:
+        return f"more than a job may use on one node (MaxCPUsPerNode={shape.max_cores_per_node})"
+    if shape.max_cores_per_job and cores * nodes > shape.max_cores_per_job:
+        return f"over the QOS cap of {shape.max_cores_per_job} cores per job"
+    return None
+
+
+def less_memory(nodes: int, shape: PartitionShape | None, word: str = "partition") -> str:
+    """What to change when a memory's cores are over a cap: "ask for less memory (at most 14.8 GB per node holds within
+    its caps) or another partition" — the most the enforced share gives the most cores any cap allows."""
+    if shape is None:
+        return f"ask for less memory, or another {word}"
+    caps = [c for c in (shape.cores, shape.max_cores_per_node,
+                        shape.max_cores_per_job // max(1, nodes) if shape.max_cores_per_job else None) if c]
+    share = enforced_share_mb(shape)
+    if caps and share:
+        return (f"ask for less memory (at most {tenth_down(min(caps) * share / 1024):g} GB per node holds within its "
+                f"caps) or another {word}")
+    return f"ask for less memory, or another {word}"
+
+
 def _cover(size: Size, shape: PartitionShape | None) -> Size:
     """`size` with its cores raised to its memory's share (`cores_for_memory`), where the wire sends both cores and
     memory (`send_mem`)."""
@@ -574,9 +603,11 @@ def refusal(uec: Mapping[str, Any], shape: PartitionShape | None, *, named: Iter
                                             and shape.kind == "per_core" else None)
     by_mem = cores_for_memory(base, sent, shape) if base and sent and whole is not True else cores
     raised = by_mem is not None and base is not None and by_mem > base
-    if raised and by_mem is not None and shape.cores and by_mem > shape.cores:
-        return (f"{arg(MEM)} counts as {by_mem} cores on {where} (its per-core memory share), more than a node has "
-                f"({shape.cores} cores).")
+    if raised and by_mem is not None and (over := cores_cap(by_mem, nodes, shape)) is not None:
+        # every cap, on the RAISED count (review round of #253: past MaxCPUsPerNode it pended forever)
+        return (f"{arg(MEM)} counts as {by_mem} cores on {where} (its per-core memory share, "
+                f"{enforced_share_mb(shape)} MB each), {over}: such a block pends and never starts. "
+                f"{less_memory(nodes, shape, word).capitalize()}.")
     job_cores = shape.cores if whole is True or shape.kind == "whole_node" else by_mem
     if shape.max_cores_per_job and job_cores and job_cores * nodes > shape.max_cores_per_job:
         asked = f"{nodes} node{'s' if nodes > 1 else ''} × {job_cores} cores" if nodes > 1 else f"{job_cores} cores"
@@ -848,15 +879,42 @@ def _least(*vals: int | None) -> int | None:
     return min(got) if got else None
 
 
+def _enforced_share(t: Mapping[str, str], cluster_cpu: str | None, cluster_node: str | None) -> tuple[int | None, bool]:
+    """A partition's enforced per-core memory share and whether it is known, from its `scontrol show partition` fields
+    `t` and the cluster's `scontrol show config` values (review round of #253; Slurm 23.11 `job_mgr.c`
+    `_valid_pn_min_mem`: a partition with no memory cap of its own uses the cluster's MaxMemPerCPU, and
+    `partition_info.c` prints such a partition as `MaxMemPerNode=UNLIMITED`):
+    - its own `MaxMemPerCPU=N` → N; its own `MaxMemPerCPU=UNLIMITED`, or a numeric `MaxMemPerNode=N` (a per-node cap) →
+      known, none;
+    - `MaxMemPerNode=UNLIMITED` (none of its own) → the cluster's: its MaxMemPerCPU=N → N; its MaxMemPerNode (any value)
+      or MaxMemPerCPU=UNLIMITED → known, none; the cluster's not read → NOT known (the terms say more cores may bill);
+    - neither field (a capture that asked for others) → not known."""
+    if "MaxMemPerCPU" in t:
+        return _lead_int(t.get("MaxMemPerCPU")), True
+    node = (t.get("MaxMemPerNode") or "").strip()
+    if not node:
+        return None, False
+    if _lead_int(node) is not None:
+        return None, True
+    if cluster_cpu is not None and cluster_cpu.strip():
+        return _lead_int(cluster_cpu), True
+    if cluster_node is not None and cluster_node.strip():
+        return None, True
+    return None, False
+
+
 def classify_slurm(*, select_type: str | None, select_params: str | None, shapes: Iterable[str],
-                   details: Iterable[str], qos: Iterable[str]) -> list[PartitionShape]:
+                   details: Iterable[str], qos: Iterable[str], cluster_max_mem_per_cpu: str | None = None,
+                   cluster_max_mem_per_node: str | None = None) -> list[PartitionShape]:
     """Each Slurm partition the probe saw, as a PartitionShape:
     - `shapes`: `sinfo -h -o '%P|%c|%m|%G'` lines (cores and memory in MB per node, GRES), one per node config — the
       smallest node of a partition is its shape (its GPUs: the largest node's too, for the GPU check);
     - `details`: `scontrol show partition -o` lines (OverSubscribe, ExclusiveUser, DefMemPerCPU, MaxMemPerCPU,
       MaxNodes, MaxCPUsPerNode, TotalNodes, TRESBillingWeights, QoS);
     - `qos`: `sacctmgr -nP show qos format=Name,MaxTRES,MaxTRESPU` lines — the partition QOS's per-job and per-user caps
-      (a job can exceed neither).
+      (a job can exceed neither);
+    - `cluster_max_mem_per_cpu` / `cluster_max_mem_per_node`: `scontrol show config`'s MaxMemPerCPU / MaxMemPerNode
+      (slurm.conf; None: not read) — the cap a partition with none of its own falls back to (`_enforced_share`).
     Whole-node: SelectType=select/linear (the whole cluster: only whole nodes are ever allocated),
     OverSubscribe=EXCLUSIVE, ExclusiveUser=YES, or — named as such, the weakest evidence — a partition called
     whole/exclusive (Anvil's `wholenode`, whose OverSubscribe says NO: a submit plugin makes it whole). Per-core only on
@@ -930,6 +988,7 @@ def classify_slurm(*, select_type: str | None, select_params: str | None, shapes
     for name in order:
         row, t = by_name.get(name, {}), detail.get(name, {})
         kind, why = kinds[name]
+        share, share_known = _enforced_share(t, cluster_max_mem_per_cpu, cluster_max_mem_per_node)
         q = t.get("QoS", "")
         if kind == "per_core" and q in whole_qos:
             twin = next(n for n, (k, _w) in kinds.items() if k == "whole_node" and detail.get(n, {}).get("QoS") == q)
@@ -940,10 +999,8 @@ def classify_slurm(*, select_type: str | None, select_params: str | None, shapes
                 name=name, kind=kind, why=why, cores=row.get("cores"),
                 memory_gb=round(row["mem_mb"] / 1024, 1) if row.get("mem_mb") else None,
                 gpus=row.get("gpus"), max_gpus_per_node=row.get("max_gpus"),
-                mem_per_core_mb=_lead_int(t.get("DefMemPerCPU")), max_mem_per_core_mb=_lead_int(t.get("MaxMemPerCPU")),
-                # scontrol prints one of MaxMemPerCPU / MaxMemPerNode (UNLIMITED included): either says the per-core
-                # cap was read — with no MaxMemPerCPU number, there is none (2026-11-10: Anvil's `gpu`)
-                max_mem_per_core_known="MaxMemPerCPU" in t or "MaxMemPerNode" in t,
+                mem_per_core_mb=_lead_int(t.get("DefMemPerCPU")), max_mem_per_core_mb=share,
+                max_mem_per_core_known=share_known,
                 max_cores_per_node=_lead_int(t.get("MaxCPUsPerNode")), nodes=_lead_int(t.get("TotalNodes")),
                 max_cores_per_job=_cap(*caps, key="cpu"),
                 max_nodes_per_job=_least(_cap(*caps, key="node"), _lead_int(t.get("MaxNodes"))),

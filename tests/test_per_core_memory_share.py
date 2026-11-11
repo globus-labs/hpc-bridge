@@ -1,13 +1,13 @@
 """A per-core partition's memory share (the billed Anvil live test of 2026-11-10; Purdue Anvil `shared`: Slurm 23.11,
-per-core billing, DefMemPerCPU=1896 MB). Written failing first, each before its fix.
+per-core billing, DefMemPerCPU = MaxMemPerCPU = 1896 MB). Written failing first, each before its fix.
 
 R1 (blocker). `ensure_endpoint_up(cores=8, memory_gb=15.5)` sent `--cpus-per-task=8` and `--mem=15872M`. 15872 MB is
 more than 8 × 1896 MB, so Slurm raised the job to 9 CPUs; parsl's launcher `srun` then died at once ("cpus-per-task set
 by two different environment variables SLURM_CPUS_PER_TASK=9 != SLURM_TRES_PER_TASK=cpu=8"), the job FAILED in 5 s and
 the executor went to BadStateException — while the terms said 8 cores. hpc-bridge's own default proposal said "8
 cores, 15 GB": 15 GB said back is over the share too. The rule now (`resources.cores_for_memory`): where a partition's
-per-core memory share is known (MaxMemPerCPU, else DefMemPerCPU) and a block's memory is above its cores' share, the
-block ASKS for ceil(memory / share) cores — the count Slurm would raise it to — so the request and Slurm's CPUs agree,
+ENFORCED per-core memory share is known (MaxMemPerCPU — the partition's own, else the cluster's; DefMemPerCPU alone
+never raises: round 2) and a block's memory is above its cores' share, the block ASKS for ceil(memory / share) cores — the count Slurm would raise it to — so the request and Slurm's CPUs agree,
 the terms say it in hpc-bridge's words and the bill counts it. A default proposal never exceeds its cores' share.
 Every path: ensure_endpoint_up, a batch's derived block, a Jobs-mode job, N nodes, a facility endpoint's template.
 
@@ -156,10 +156,18 @@ async def test_r1_a_derived_block_of_default_memory_rows_crossing_the_share_by_i
     from tests.test_batch_sizing import _run, _sized_app
 
     app = _sized_app()
-    # 16 rows × 1 CPU at the partition's 1896 MB: 17 CPUs, ⌈30336 + the pool's 1956 MB⌉ = 32 GB > 17 × 1896 MB
+    # 16 rows × 1 CPU at the partition's 1896 MB: 17 CPUs, ⌈30336 + the pool's 1956 MB⌉ = 32 GB > 17 × 1896 MB — a
+    # DEFAULTED memory is held to the cores' share (review round of #253: it had raised the block to 18 cores the user
+    # never asked for), so 31 GB and 17 CPUs
     out = await _run(app, n=16, cores=1, concurrency=16)
     assert out.phase == "needs_confirmation", (out.phase, out.notice)
-    assert out.block.cores_per_node == 18 and out.block.memory_gb == 32, out.block
+    assert (out.block.cores_per_node, out.block.memory_gb, out.block.cores_asked) == (17, 31, None), out.block
+    b32 = sizing.derive_block(sizing.Sizing(cores=1, concurrency=32), shape=SHARED)
+    assert (b32.cores, b32.memory_gb) == (33, 61), b32                  # it had been 63 GB: 35 cores
+    assert resources.cores_for_memory(b32.cores, b32.memory_gb, SHARED) == 33
+    # a memory the rows ASKED for is never held: 4 rows × 4 GB still raise to 10 (the test above)
+    asked = sizing.derive_block(sizing.Sizing(cores=1, memory_mb=4096, concurrency=4), shape=SHARED)
+    assert asked.memory_gb == 17 and resources.cores_for_memory(asked.cores, asked.memory_gb, SHARED) == 10
 
 
 # =====================================================================================================================
@@ -349,12 +357,15 @@ def test_r2_the_bounds_note_counts_the_blocks_age():
     n = int(aged.split("a task runs up to ~")[1].split("s")[0])
     assert 590 <= n <= 600, aged
     assert "left of the block's 00:15:00 walltime" in aged, aged
+    # counted from its first answer, not Slurm's StartTime: about, never exact (review round of #253)
+    assert "about what is left" in aged and "first answer" in aged, aged
 
 
 def test_r2_a_running_tasks_words_never_outlast_the_block():
     app = _app(walltime="00:15:00")
     out = notices._running_outcome(app, "t-1", 880.0, block_left_s=600.0)
     assert "~880s" not in out.notice and "~600s" in out.notice, out.notice
+    assert "about ~600s" in out.notice and "first answer" in out.notice, out.notice
 
 
 async def test_r2_a_reused_earlier_block_states_what_is_left_of_its_walltime(monkeypatch):
@@ -402,7 +413,10 @@ def _discovered() -> dict[str, PartitionShape]:
     parts = resources.classify_slurm(select_type="select/cons_tres", select_params="CR_CORE_MEMORY",
                                      shapes=["shared|128|257400|(null)", "wholenode|128|257400|(null)",
                                              "gpu|128|515400|gpu:4", "debug|128|257400|(null)"],
-                                     details=_SCONTROL, qos=[])
+                                     details=_SCONTROL, qos=[],
+                                     # Anvil's cluster sets no per-CPU cap of its own (`gpu` falls back to none):
+                                     # `scontrol show config` reads MaxMemPerNode = UNLIMITED (review round of #253)
+                                     cluster_max_mem_per_node="UNLIMITED")
     return {p.name: p for p in parts}
 
 
@@ -484,3 +498,119 @@ def test_round2_pbs_raises_only_on_a_share_a_registry_entry_states():
     uec = {"compute": True, "partition": "workq", "nodes_per_block": 1, "cores_per_node": 2, "mem_per_node": 16}
     assert resources.effective(uec, plain, channel="ssh", scheduler="pbs", profile_cpus=64).cores == 2
     assert resources.effective(uec, stated, channel="ssh", scheduler="pbs", profile_cpus=64).cores == 5   # 16384 / 4000
+
+
+# =====================================================================================================================
+# Review round of #253 (2026-11-10)
+# 1. `MaxMemPerNode=UNLIMITED` on a partition is no "known: no share": Slurm 23.11 (`job_mgr.c` `_valid_pn_min_mem`)
+#    falls back to the cluster's own MaxMemPerCPU (slurm.conf) for a partition with none of its own, which
+#    `partition_info.c` prints as `MaxMemPerNode=UNLIMITED`. The probe reads the cluster's from `scontrol show config`.
+# 2. A raise past MaxCPUsPerNode (or a QOS per-job cap) is refused on every path, naming the cap and what to change.
+# 4. export_handoff never advises more cores than a node has.
+# =====================================================================================================================
+
+_GLOBAL_LINE = ("PartitionName=shared QoS=part-shared OverSubscribe=NO State=UP TotalNodes=250 DefMemPerCPU=1896 "
+                "MaxMemPerNode=UNLIMITED TRESBillingWeights=CPU=1.0")
+
+
+def _one(detail: str, **conf) -> PartitionShape:
+    return resources.classify_slurm(select_type="select/cons_tres", select_params="CR_CORE_MEMORY",
+                                    shapes=["shared|128|257400|(null)"], details=[detail], qos=[], **conf)[0]
+
+
+def test_review1_a_cluster_wide_maxmempercpu_applies_where_the_partition_sets_none():
+    p = _one(_GLOBAL_LINE, cluster_max_mem_per_cpu="1896")
+    assert (p.max_mem_per_core_mb, p.max_mem_per_core_known) == (1896, True), p
+    assert resources.cores_for_memory(8, 15.5, p) == 9
+    # the cluster read, with no per-CPU cap of its own (MaxMemPerNode = UNLIMITED): known — there is none
+    none = _one(_GLOBAL_LINE, cluster_max_mem_per_node="UNLIMITED")
+    assert (none.max_mem_per_core_mb, none.max_mem_per_core_known) == (None, True), none
+
+
+def test_review1_a_partitions_own_setting_overrides_the_cluster():
+    own = _one(_GLOBAL_LINE.replace("MaxMemPerNode=UNLIMITED", "MaxMemPerCPU=4000"), cluster_max_mem_per_cpu="1896")
+    assert (own.max_mem_per_core_mb, own.max_mem_per_core_known) == (4000, True), own
+    unl = _one(_GLOBAL_LINE.replace("MaxMemPerNode=UNLIMITED", "MaxMemPerCPU=UNLIMITED"),
+               cluster_max_mem_per_cpu="1896")
+    assert (unl.max_mem_per_core_mb, unl.max_mem_per_core_known) == (None, True), unl
+    per_node = _one(_GLOBAL_LINE.replace("MaxMemPerNode=UNLIMITED", "MaxMemPerNode=200000"),
+                    cluster_max_mem_per_cpu="1896")
+    assert (per_node.max_mem_per_core_mb, per_node.max_mem_per_core_known) == (None, True), per_node
+
+
+def test_review1_an_unlimited_partition_with_the_cluster_not_read_is_unknown():
+    p = _one(_GLOBAL_LINE)
+    assert (p.max_mem_per_core_mb, p.max_mem_per_core_known) == (None, False), p      # (c), never (b)
+    assert resources.share_unknown(p)
+
+
+@pytest.mark.skipif(_BASH is None, reason="no bash")
+def test_review1_the_probe_reads_the_clusters_cap_from_scontrol_show_config(tmp_path, monkeypatch):
+    from hpc_bridge import discovery
+
+    monkeypatch.delenv("HPC_BRIDGE_REMOTE_VENV", raising=False)
+    d = tmp_path / "bin"
+    d.mkdir()
+    tools = {
+        "sinfo": "#!/bin/sh\ncase $3 in\n  '%P|%a') echo 'shared*|up' ;;\n"
+                 "  'PSHAPE=%P|%c|%m|%G') echo 'PSHAPE=shared*|128|257400|(null)' ;;\nesac\n",
+        "scontrol": "#!/bin/sh\ncase $2 in\n"
+                    "  config) printf '%s\\n' 'SelectType              = select/cons_tres' "
+                    "'SelectTypeParameters    = CR_CORE_MEMORY' 'MaxMemPerCPU            = 1896' ;;\n"
+                    f"  partition) echo '{_GLOBAL_LINE}' ;;\nesac\n",
+        "sacctmgr": "#!/bin/sh\n", "id": "#!/bin/sh\necho alice users\n", "whoami": "#!/bin/sh\necho alice\n",
+    }
+    for name, body in tools.items():
+        (d / name).write_text(body)
+        (d / name).chmod(0o755)
+    env = {"PATH": f"{d}:/usr/bin:/bin", "HOME": str(tmp_path), "USER": "alice", "LC_ALL": "C"}
+    r = subprocess.run([_BASH, "--noprofile", "--norc", "-c", discovery._probe_script()], env=env,
+                       capture_output=True, text=True, timeout=60, check=False)
+    assert "HPCB_PROBE_END" in r.stdout, r.stderr
+    draft, _notes = discovery.parse_probe(r.stdout, ssh_host="cluster.example.org")
+    shared = {p.name: p for p in draft.partitions or []}["shared"]
+    assert (shared.max_mem_per_core_mb, shared.max_mem_per_core_known) == (1896, True), shared
+
+
+async def test_review2_a_raise_past_maxcpuspernode_is_refused_naming_the_cap():
+    capped = SHARED.model_copy(update={"max_cores_per_node": 8})
+    app = _app(partitions=(capped,))
+    res = await _ensure_endpoint_up(app, shape="compute", cores=8, memory_gb=15.5, confirm_spend=True)
+    assert app.built == [], app.built
+    assert "MaxCPUsPerNode=8" in res.notice and "less memory" in res.notice, res.notice
+    assert "14.8 GB" in res.notice, res.notice                    # the most 8 cores' share holds
+
+
+def test_review2_derive_block_checks_maxcpuspernode_beside_a_qos_cap():
+    shape = SHARED.model_copy(update={"max_cores_per_job": 200, "max_cores_per_node": 9})
+    with pytest.raises(sizing.SizingRefusal, match="MaxCPUsPerNode"):     # 10 CPUs (the memory's) on a 9-CPU cap
+        sizing.derive_block(sizing.Sizing(cores=1, memory_mb=4096, concurrency=4), shape=shape)
+
+
+@pytest.mark.parametrize("cap", [{"max_cores_per_node": 8}, {"max_cores_per_job": 8}])
+def test_review2_a_jobs_raised_cores_meet_every_cap(cap):
+    from hpc_bridge import jobs
+
+    app = _app(partitions=(SHARED.model_copy(update=cap),))
+    with pytest.raises(jobs.JobRefusal) as exc:
+        jobs.spec_of(app, command="true", session_id="default", account=None, partition="shared", nodes=None,
+                     cores=8, memory_gb=15.5, gpus=None, whole_node=None, walltime="00:15:00", array=None,
+                     depends_on=None)
+    msg = str(exc.value)
+    assert "9" in msg and ("MaxCPUsPerNode" in msg or "per job" in msg) and "less memory" in msg, msg
+    # and the unraised count meets them too (it had checked a node's cores only)
+    with pytest.raises(jobs.JobRefusal):
+        jobs.spec_of(app, command="true", session_id="default", account=None, partition="shared", nodes=None,
+                     cores=9, memory_gb=None, gpus=None, whole_node=None, walltime="00:15:00", array=None,
+                     depends_on=None)
+
+
+async def test_review4_a_handoff_memory_no_node_holds_is_refused_as_such(tmp_path):
+    from tests.test_handoff_phase2b import _export, _sent, _ssh_app
+
+    app = _ssh_app(tmp_path, partitions=(SHARED.model_copy(update={"name": "main"}),))
+    out = await _export(app, {"partition": "main", "walltime": "00:30:00", "max_blocks": 1, "exclusive": False,
+                              "cores_per_node": 120, "mem_per_node": 240})
+    assert out.phase != "needs_confirmation" and _sent(app) == [], out
+    assert "`cores_per_node`: 130" not in out.notice, out.notice           # never advise more cores than a node has
+    assert "128 cores" in out.notice and "less memory" in out.notice, out.notice

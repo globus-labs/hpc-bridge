@@ -836,6 +836,13 @@ def terms_of(app: AppCtx, plan: Plan, hours: float) -> HandoffTerms:
         # raise the block's CPUs past `--cpus-per-task`, and parsl's srun fail at start (the Anvil live test of
         # 2026-11-10) — never sent; the caller sends the cores it needs (billed either way)
         kmap = _kmap(app, plan.access)
+        if (over := resources.cores_cap(size.cores or 0, nodes, shape)) is not None:
+            # cores no node, MaxCPUsPerNode or QOS cap allows: never advised (review round of #253: "Send 130" on
+            # 128-core nodes) — the memory itself cannot be had there
+            raise HandoffRefusal("invalid", (
+                f"Refused, nothing was sent: {resources.memory_cores_words(size, shape, billed=False)} — {over}, "
+                f"so no block of this partition holds `{kmap.get(resources.MEM, resources.MEM)}` with its cores' "
+                f"memory share: {resources.less_memory(nodes, shape)}."))
         raise HandoffRefusal("invalid", (
             f"Refused, nothing was sent: {resources.memory_cores_words(size, shape, billed=False)} — "
             f"`{kmap.get(resources.MEM, resources.MEM)}` is above the per-core memory share of "

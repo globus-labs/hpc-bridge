@@ -214,9 +214,18 @@ installed plugin only when that version changes); git tags mark releases.
     Where the cap is not known, nothing is guessed: the terms say the scheduler may give, and bill, more cores than
     asked. On PBS only a share the registry states raises cores. The Anvil registry entry now states `shared`'s
     1896 MB per core.
+  - A partition with no memory cap of its own (`MaxMemPerNode=UNLIMITED`) uses the cluster's MaxMemPerCPU, as Slurm
+    does. The login-node probe now reads it from `scontrol show config`. Where it was not read, the cap is unknown,
+    never "none".
+  - Raised cores are checked against every cap: a node's cores, MaxCPUsPerNode and the QOS per-job cap. This holds
+    for a block, a batch's derived block and a Jobs-mode job. A block that would pend forever is refused, naming the
+    cap and the most memory that fits. An exported handoff no longer advises more cores than a node has.
+  - A batch's derived block whose rows take the partition's default memory now stays within its cores' share. 16
+    rows had been raised from 17 cores to 18 by the pool's memory and whole-GB rounding.
 - **A reused block's task bound counts its age.** A block an earlier session left running, 5 minutes into its 15, read
-  "a task runs up to ~880s (the block walltime)". The bound is now what is left of its walltime (~600 s), wherever a
-  block's start is known.
+  "a task runs up to ~880s (the block walltime)". The bound is now about what is left of its walltime (~600 s),
+  wherever a block's start is known. It is counted from the block's first answer, so the block may end a little
+  sooner.
 
 ### Fixed
 The batch demo on the fake cluster (2026-11-03, `agentic/fakecluster/bin/try_batch.sh`), each checked against the raw
@@ -308,7 +317,10 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
   23.11's check, run on the block script the wire renders (parsl's own with `--with parsl==2026.8.10`). It passes
   on the request now sent and fails on the one sent on 2026-11-10. The enforced-share tests read Anvil's live
   `scontrol` lines: Def-only `gpu` raises nothing, Max-equals-Def `shared` raises, an unknown cap says so once, a
-  Def-only default is capped and raises nothing, PBS raises only on a stated share. Five older tests that asserted the old count or
+  Def-only default is capped and raises nothing, PBS raises only on a stated share. The review round of #253 adds
+  the cluster-wide cap (a slurm.conf-only cap, a partition override, an unread cluster, and the probe itself under
+  bash 3.2 and 5.2), every cap on the raised cores (a block, a derived block, both of a job's), the derived default
+  memory, and the handoff's advice. That makes 34 tests. Five older tests that asserted the old count or
   "15 GB" now assert the raised count and 14.8 GB.
 
 ## 0.1.26 — 2026-10-31 — blocks sized to the work; returning users reattach, repair and get terms the scheduler takes

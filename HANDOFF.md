@@ -44,12 +44,18 @@ test-first in `tests/test_per_core_memory_share.py` (red on f05cc99, green after
     `PartitionShape.max_mem_per_core_known`): no raise, no line; (c) not known: no raise, one line. PBS raises only
     on a share a registry entry states. The Anvil seed now states `shared`'s MaxMemPerCPU=1896 (`debug` unknown):
     **the published registry needs a re-ingest** for facility users to get it.
+  - **Review round of #253:** a partition's `MaxMemPerNode=UNLIMITED` falls back to the cluster's MaxMemPerCPU
+    (Slurm 23.11 `_valid_pn_min_mem`), which the probe now reads from `scontrol show config`; unread, it is case (c),
+    never (b). The raised cores meet every cap on every path (a node's cores, MaxCPUsPerNode, the QOS per-job cap),
+    refused naming the cap and the most memory that fits; a handoff never advises more cores than a node has. A
+    derived block's DEFAULTED memory is held to its cores' share (16 rows: 17 CPUs, not 18). The age bound says
+    "about": it counts from the block's first answer, not Slurm's StartTime.
   - A hermetic check of Slurm's own: a fake Slurm that raises the job's CPUs as Anvil did and a fake `srun` making
     23.11's TRES check, run on the block script the wire renders (parsl's own where importable:
     `uv run --with parsl==2026.8.10 …`).
 - **R2.** A reused block's "a task runs up to ~880s (the block walltime)" ignored its age (up 5 min of its 15): the
-  bound is what is left of the block's walltime from its known start (`notices._block_left_s`), in the bounds note
-  and a running task's answer.
+  bound is about what is left of the block's walltime from its first answer (`notices._block_left_s`), in the bounds
+  note and a running task's answer. It can overstate by the worker's start-up (Slurm's StartTime is a little earlier).
 - Live re-check to run on Anvil (billed, needs the user's yes): `ensure_endpoint_up(cores=8, memory_gb=15.5)` on
   `shared` comes up (9 CPUs, `srun` passes), and the default proposal's block comes up.
 

@@ -614,9 +614,15 @@ def spec_of(app: AppCtx, *, command: Any, session_id: str, account: Any, partiti
         size = resources.Size(nodes=n, whole_node=False, cores=held, memory_gb=mem, gpus=int(gpus) if gpus else None,
                               send_mem=mem, cores_asked=c if held > c else None,
                               share_mb=resources.enforced_share_mb(shape) if held > c else None)
-        if held > c and shape is not None and shape.cores and held > shape.cores:
-            raise JobRefusal(f"memory_gb={memory_gb!r} needs {held} cores' memory share on partition {part!r} "
-                             f"({size.share_mb} MB each), more than a node has ({shape.cores} cores)")
+        # every cap, on the cores the job asks for (review round of #253: only a node's cores were checked, raised or
+        # not — a job over MaxCPUsPerNode or its QOS's per-job cap pends and never starts)
+        if (over := resources.cores_cap(held, n, shape)) is not None:
+            if held > c:
+                raise JobRefusal(f"memory_gb={memory_gb!r} needs {held} cores' memory share on partition {part!r} "
+                                 f"({size.share_mb} MB each), {over}: such a job pends and never starts — "
+                                 f"{resources.less_memory(n, shape)}")
+            raise JobRefusal(f"cores={c!r} on partition {part!r} is {over}: such a job pends and never starts — ask "
+                             "for fewer cores or another partition")
     else:
         size = resources._whole(n, shape, int(gpus) if gpus else None)
     got = resources.charge(size, shape, 3600.0)

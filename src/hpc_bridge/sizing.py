@@ -478,7 +478,20 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
     cores = n * k + 1
     workers = None if workers_fixed is not None else n + 1
     m = row_memory_mb(sizing, shape)
-    memory_gb = max(1, math.ceil((n * m + pool_mb(workers or workers_fixed or n + 1)) / 1024))
+
+    def block_gb(rows: int) -> int:
+        """The memory of a block of `rows` rows: ⌈rows · m + the pool's own⌉ GB — and where the rows' memory is the
+        partition's DEFAULT (none asked), never above the block's cores' per-core share (the enforced one, else
+        DefMemPerCPU), as the plain default slice (resources._slice_memory): the pool and the whole-GB rounding had
+        pushed 16 rows' block over 17 × 1896 MB, raising it to 18 cores no one asked for (review round of #253).
+        Never below the rows' own default memory. A memory the rows asked for is never held."""
+        gb = max(1, math.ceil((rows * m + pool_mb(workers_fixed or rows + 1)) / 1024))
+        share = (resources.enforced_share_mb(shape) or (shape.mem_per_core_mb if shape is not None else None))
+        if sizing.memory_mb is None and share:
+            gb = min(gb, max((rows * k + 1) * share // 1024, math.ceil(rows * m / 1024), 1))
+        return gb
+
+    memory_gb = block_gb(n)
     gpus = n * g
     if shape is not None and shape.kind == "whole_node" and shape.cores:
         # a partition that hands out only whole nodes: the block IS a whole node — as many rows of this size as fit it
@@ -504,8 +517,7 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
             (resources.cores_for_memory — the block asks for, and is billed, that many: the Anvil live test of
             2026-11-10)."""
             c = rows * k + 1
-            mem = max(1, math.ceil((rows * m + pool_mb(workers_fixed or rows + 1)) / 1024))
-            return resources.cores_for_memory(c, mem, shape) or c
+            return resources.cores_for_memory(c, block_gb(rows), shape) or c
 
         holds = held(n)
         why = (f" ({memory_gb} GB needs {holds} cores' memory share, {resources.enforced_share_mb(shape)} MB each)"
@@ -514,11 +526,18 @@ def derive_block(sizing: Sizing, *, shape: PartitionShape | None = None, workers
             fits = max([r for r in range(1, n) if held(r) <= shape.cores], default=0)
             raise SizingRefusal(f"{n} rows × {k} CPUs + 1 for interactive commands = {cores} CPUs{why}; a node of "
                                 f"{shape.name!r} has {shape.cores}: at most {fits} rows at once on one node. {multi}")
-        cap = shape.max_cores_per_job or shape.max_cores_per_node
-        if cap and holds > cap:
+        # every cap, on the CPUs the block holds (review round of #253: a QOS cap hid MaxCPUsPerNode)
+        less = " (or less memory per row)" if holds > cores else ""
+        if shape.max_cores_per_node and holds > shape.max_cores_per_node:
+            fits = max([r for r in range(1, n) if held(r) <= shape.max_cores_per_node], default=0)
+            raise SizingRefusal(f"{holds} CPUs{why} is more than {shape.name!r} lets a job use on one node "
+                                f"(MaxCPUsPerNode={shape.max_cores_per_node}): at most {fits} rows of {k} CPUs at once"
+                                + less)
+        if shape.max_cores_per_job and holds > shape.max_cores_per_job:
+            cap = shape.max_cores_per_job
             fits = max([r for r in range(1, n) if held(r) <= cap], default=0)
             raise SizingRefusal(f"{holds} CPUs{why} is over {shape.name!r}'s per-job cap of {cap}: at most "
-                                f"{fits} rows of {k} CPUs at once")
+                                f"{fits} rows of {k} CPUs at once" + less)
         if shape.memory_gb and memory_gb > shape.memory_gb:
             fits = int((shape.memory_gb * 1024 - pool_mb(n + 1)) // m)
             raise SizingRefusal(f"{n} rows × {_gb(m)} + the pool's own = {memory_gb} GB; a node of {shape.name!r} "

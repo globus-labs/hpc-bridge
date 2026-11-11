@@ -285,8 +285,11 @@ def _billed_bounds_note(app: AppCtx, rt: ShapeRuntime) -> str:
     if left is not None and left < ceiling:
         wall = rt.user_endpoint_config.get("walltime")
         age = int((time.monotonic() - rt.block_since) // 60) if rt.block_since is not None else 0
-        bound = (f"~{int(left)}s (what is left of the block's {wall} walltime: it has been up ~{age} min; a task still "
-                 "running when it ends is killed with the block)")
+        # counted from the block's first answer, not the scheduler's start time: about, and it may end up to the
+        # worker's start-up sooner (review round of #253)
+        bound = (f"~{int(left)}s (about what is left of the block's {wall} walltime, counted from its first answer "
+                 f"~{age} min ago — the scheduler's clock started a little before it; a task still running when it "
+                 "ends is killed with the block)")
     else:
         bound = f"~{int(ceiling)}s (the block walltime)"
     return (f"billed block bounds — a task runs up to {bound}; one that "
@@ -1883,8 +1886,9 @@ def _running_outcome(app: AppCtx, task_id: str, ceiling_s: float, *, client_canc
     is left of the block's walltime (`_block_left_s`), when its start is known — a task never outlives its block."""
     state = "the reset is still queued or running" if reset else "still running"
     why = f"({_CLIENT_CANCELLED})" if client_cancelled else f"past the ~{int(SYNC_WAIT_S)}s sync-wait"
-    runs = (f"It runs until the block's walltime ends, ~{int(block_left_s)}s from now at the latest, then is killed "
-            "with the block" if block_left_s is not None and block_left_s < ceiling_s else
+    runs = (f"It runs until the block's walltime ends, about ~{int(block_left_s)}s from now (counted from the "
+            "block's first answer, so it may end a little sooner), then is killed with the block"
+            if block_left_s is not None and block_left_s < ceiling_s else
             f"It runs up to ~{int(ceiling_s)}s (the block walltime) then is killed (exit 124)")
     tail = ("The session stays busy until it ends." if reset else
             f"{runs}; for anything longer, "

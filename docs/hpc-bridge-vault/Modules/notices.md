@@ -24,7 +24,9 @@ where the partition is known to enforce no share (round 2: Anvil's `gpu`), or, w
 scheduler may give and bill more cores than asked (nothing guessed). **A task's bound
 counts the block's age:** `_block_left_s` is what is left of the confirmed block's walltime from `block_since` (a
 reused or met-again block keeps its age: [[warmth]] `_answering_block_since`); `_billed_bounds_note` and
-`_running_outcome(block_left_s=)` say it where it is shorter than the task ceiling — a reused block 5 min into its 15 had
+`_running_outcome(block_left_s=)` say it — "about": counted from the block's first answer, not the scheduler's start
+time, so the block may end up to its worker's start-up sooner (review round of #253) — where it is shorter than the
+task ceiling — a reused block 5 min into its 15 had
 read "a task runs up to ~880s (the block walltime)".
 
 **Review round 1.** `_size_why` (`:348`) says where a size nothing asked for comes from (parsl's default exclusive, the
