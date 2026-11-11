@@ -110,7 +110,7 @@ server, not in the agent's judgement.
 ### Picking up where you left off
 
 A block an earlier session left running is named when you reconnect. A yes on the same terms reuses it, anything else
-asks first, and a stop releases it, so a new chat never starts a second block beside it or calls it gone while it
+asks first, and a stop covers it too, so a new chat never starts a second block beside it or calls it gone while it
 bills.
 
 ## How it works
