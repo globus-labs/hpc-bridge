@@ -5,7 +5,47 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## Unreleased
 
+## 0.1.27 — 2026-11-11 — batches, sized rows and environments; a block asks for the cores its memory needs; an earlier session's block is named, reused or released
+
 ### Added
+- **Environments: commands, batch rows, jobs and handoffs run in the one you name** (#247; vault
+  `Planned/Block environments.md`, `Modules/envs.md`). `env` on `ensure_endpoint_up`, `run_batch`, `submit_job` and
+  `export_handoff`; `{}` clears it and leaving it out keeps it, as with partition. Switching env starts no new block.
+  - **An existing env**, `{"activate": "module load pytorch/2.4; conda activate ml"}`, works on every facility, a
+    facility multi-user endpoint included.
+  - **A built env**, `{"requirements": "<requirements.txt text>", "python"?, "root"?}`, on an endpoint hpc-bridge
+    stood up over SSH: built with uv on the free login node by its own small user endpoint, keyed by the Python (the
+    client's major.minor by default) and the normalized requirements, then made read-only. It is pending until ready
+    (commands keep the old env meanwhile); a failed build leaves the env as it was and quotes the installer
+    (`env_failed`). `-r`, `-c`, `-e`, local paths, `--trusted-host` and options outside an allow-list are refused by
+    name, and index credentials are redacted wherever hpc-bridge says or stores them. On a facility endpoint
+    `requirements` is refused by name and nothing in the call is set; building there comes later.
+  - **A command whose env is gone or broken runs nothing** (rc 88, a refusal its own output cannot forge). A purged
+    env is rebuilt on the login node (`run_shell` answers the new phase `env_building`; a batch row goes back to its
+    backlog); what a rebuild cannot fix (a failed build, the user's line failing, a node of another architecture) is
+    said by name. A command checks its env cheaply; the full check runs when the env is chosen, when a block is newly
+    confirmed, and every 24 h.
+  - **A handoff carries its env** (`HandoffRecord.env`), and its canary checks it from inside the block
+    (`validation.env_ok`).
+- **Batch rows have a size, and a block is derived from them** (#246; vault `Planned/Batch and swarm execution.md`,
+  "Batch row sizing"; `Modules/sizing.md`): `run_batch(…, cores, memory_gb, gpus, concurrency, pin, pilot)`, the
+  sbatch way. On an SSH facility a batch ran one row at a time (our template fixed 2 workers per node); the workers now
+  follow the block.
+  - **No block yet:** the block is derived from the rows (N rows at once of k cores and m GB: N·k+1 CPUs, N·m GB plus
+    the worker pool's own, N·g GPUs and N+1 workers on one node), and the spend question shows it. With no size given,
+    the answer is `needs_sizing` with the block's facts, for the agent to ask the user.
+  - **A confirmed block** is measured from inside (CPU affinity, cgroup cpuset, `cpu.max` and `memory.max`, SMT
+    siblings, the scheduler's counts, GPUs; the least of them). A size that does not fit is refused with the numbers,
+    and a concurrency over what fits is capped and said. With no size, rows take 1 CPU and their share of memory; the
+    first row killed at that memory pauses the batch at `needs_sizing`, with a size measured from it.
+  - **`pilot=N`** runs N rows alone on the whole block, then proposes a size from their use (cores from CPU-seconds ÷
+    wall, memory 1.25 × peak RSS) for the user to confirm or change.
+  - **On the node** each row claims its own CPUs and GPUs, is pinned (`taskset`; `pin=False` opts out) with its
+    `OMP`/`MKL`/`OPENBLAS` threads set to its cores, and is killed past its memory (rc 87). One slot pool per block is
+    shared by every batch on it. Each result gives peak RSS, CPU-seconds, wall time, processes and threads, the CPUs it
+    ran on, and whether it was pinned.
+  - **Limits:** a sized batch runs on one node (a multi-node block is refused for it), and a switch of size, partition
+    or account is refused while batch rows are in flight, naming them.
 - **Batches (phase 2b): `export_handoff`, the endpoint handoff.** A 17th tool, plus `stop_endpoint(handoffs=…)` and
   `teardown_endpoint(handoffs=…)` (vault `Planned/Batch and swarm execution.md` §8, §12 D6; `Modules/handoff.md`).
   - **The terms come first.** `export_handoff(user_endpoint_config, expires_hours=24)` first answers
@@ -194,40 +234,6 @@ installed plugin only when that version changes); git tags mark releases.
   server gone, the block it ran on retired, a meter reading hours old, a deadline passed), and is left as it is.
 
 ### Fixed
-- **A block whose memory is above its cores' share asks for, and is billed, the cores it needs.** In a billed Anvil
-  test (2026-11-10, `shared`: Slurm 23.11, per-core billing, MaxMemPerCPU=1896), 8 cores with 15.5 GB went out as
-  `--cpus-per-task=8 --mem=15872M`. Slurm raised the job to 9 CPUs to cover the memory, and parsl's launcher `srun`
-  failed at once ("cpus-per-task set by two different environment variables"). The block failed in 5 s, and its terms
-  had said 8 cores.
-  - Where the partition enforces a per-core memory share (MaxMemPerCPU), the block now asks for the cores the
-    memory needs, here 9. The terms say so: "15.5 GB needs 9 cores' memory share on partition 'shared'
-    (1896 MB each): 9 cores are billed, and the block asks for 9, not 8". The cost counts them too.
-  - Raising the cores was chosen over refusing the memory: the scheduler gives and bills those cores anyway, and a
-    raised block never fails at start or understates the bill.
-  - hpc-bridge's own proposal on a per-core partition never exceeds the share: "8 cores, 14.8 GB", not "15 GB", which
-    said back was over it too.
-  - The same rule holds for a batch's derived block, a Jobs-mode job, several nodes and a facility endpoint's template
-    (whose memory goes in whole GB: 1.9 GB is 2 GB, over one core's share). An exported handoff's config that crosses
-    the share is refused, naming the cores to send.
-  - DefMemPerCPU alone never raises cores: Slurm adds none for memory there (Anvil's `gpu`). It only caps the
-    default proposal's memory. Discovery tells a partition with no MaxMemPerCPU from one whose cap was never read.
-    Where the cap is not known, nothing is guessed: the terms say the scheduler may give, and bill, more cores than
-    asked. On PBS only a share the registry states raises cores. The Anvil registry entry now states `shared`'s
-    1896 MB per core.
-  - A partition with no memory cap of its own (`MaxMemPerNode=UNLIMITED`) uses the cluster's MaxMemPerCPU, as Slurm
-    does. The login-node probe now reads it from `scontrol show config`. Where it was not read, the cap is unknown,
-    never "none".
-  - Raised cores are checked against every cap: a node's cores, MaxCPUsPerNode and the QOS per-job cap. This holds
-    for a block, a batch's derived block and a Jobs-mode job. A block that would pend forever is refused, naming the
-    cap and the most memory that fits. An exported handoff no longer advises more cores than a node has.
-  - A batch's derived block whose rows take the partition's default memory now stays within its cores' share. 16
-    rows had been raised from 17 cores to 18 by the pool's memory and whole-GB rounding.
-- **A reused block's task bound counts its age.** A block an earlier session left running, 5 minutes into its 15, read
-  "a task runs up to ~880s (the block walltime)". The bound is now about what is left of its walltime (~600 s),
-  wherever a block's start is known. It is counted from the block's first answer, so the block may end a little
-  sooner.
-
-### Fixed
 The batch demo on the fake cluster (2026-11-03, `agentic/fakecluster/bin/try_batch.sh`), each checked against the raw
 tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
 - **`status(id, wait_s)` waits the whole `wait_s`** unless the batch ends, a row fails, is lost (or presumed so) or is
@@ -275,9 +281,83 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
   understated it by half on a 4-core node).
 - **The demo script** gives the session its own hpc-bridge state (`HPC_BRIDGE_STATE_DIR=~/hpcb-batch-demo/state`, the
   shell's other `HPC_BRIDGE_*` left out), so "connect to a new facility called fake" is new; `--down` offers to remove
-  it. Its abort prompt waits for one running row, not two (a batch runs one row at a time on an SSH block for now).
+  it. Its abort prompt waits for one running row, not two (the demo's 2-core block runs one row at a time).
 
 ### Fixed
+- **A block whose memory is above its cores' share asks for, and is billed, the cores it needs.** In a billed Anvil
+  test (2026-11-10, `shared`: Slurm 23.11, per-core billing, MaxMemPerCPU=1896), 8 cores with 15.5 GB went out as
+  `--cpus-per-task=8 --mem=15872M`. Slurm raised the job to 9 CPUs to cover the memory, and parsl's launcher `srun`
+  failed at once ("cpus-per-task set by two different environment variables"). The block failed in 5 s, and its terms
+  had said 8 cores.
+  - Where the partition enforces a per-core memory share (MaxMemPerCPU), the block now asks for the cores the
+    memory needs, here 9. The terms say so: "15.5 GB needs 9 cores' memory share on partition 'shared'
+    (1896 MB each): 9 cores are billed, and the block asks for 9, not 8". The cost counts them too.
+  - Raising the cores was chosen over refusing the memory: the scheduler gives and bills those cores anyway, and a
+    raised block never fails at start or understates the bill.
+  - hpc-bridge's own proposal on a per-core partition never exceeds the share: "8 cores, 14.8 GB", not "15 GB", which
+    said back was over it too.
+  - The same rule holds for a batch's derived block, a Jobs-mode job, several nodes and a facility endpoint's template
+    (whose memory goes in whole GB: 1.9 GB is 2 GB, over one core's share). An exported handoff's config that crosses
+    the share is refused, naming the cores to send.
+  - DefMemPerCPU alone never raises cores: Slurm adds none for memory there (Anvil's `gpu`). It only caps the
+    default proposal's memory. Discovery tells a partition with no MaxMemPerCPU from one whose cap was never read.
+    Where the cap is not known, nothing is guessed: the terms say the scheduler may give, and bill, more cores than
+    asked. On PBS only a share the registry states raises cores. The Anvil registry entry now states `shared`'s
+    1896 MB per core.
+  - A partition with no memory cap of its own (`MaxMemPerNode=UNLIMITED`) uses the cluster's MaxMemPerCPU, as Slurm
+    does. The login-node probe now reads it from `scontrol show config`. Where it was not read, the cap is unknown,
+    never "none".
+  - Raised cores are checked against every cap: a node's cores, MaxCPUsPerNode and the QOS per-job cap. This holds
+    for a block, a batch's derived block and a Jobs-mode job. A block that would pend forever is refused, naming the
+    cap and the most memory that fits. An exported handoff no longer advises more cores than a node has.
+  - A batch's derived block whose rows take the partition's default memory now stays within its cores' share. 16
+    rows had been raised from 17 cores to 18 by the pool's memory and whole-GB rounding.
+- **A reused block's task bound counts its age.** A block an earlier session left running, 5 minutes into its 15, read
+  "a task runs up to ~880s (the block walltime)". The bound is now about what is left of its walltime (~600 s),
+  wherever a block's start is known. It is counted from the block's first answer, so the block may end a little
+  sooner.
+- **A stop's evidence holds on a login node with uutils coreutils** (#252; Ubuntu 26.04's Rust coreutils). For a user
+  endpoint log with no bad state, the evidence check handed "- -" to `date -d`, which uutils reads as the current time
+  (GNU as today's midnight). The stop's two samples then differed by the second each was taken in, and the stop said
+  "its user endpoint changed while hpc-bridge looked" in place of the real reason. No time is handed to `date` now,
+  and an epoch counts only when it turns back into the log's own local time, which also refuses a time a
+  spring-forward skips (uutils and BSD place it an hour later).
+- **A billed block an earlier session left running is named, reused or released, never doubled or called `down`**
+  (#250; vault `Modules/earlier.md`). Each chat usually runs a fresh server on the same state dir, and what a server
+  knew of its blocks lived only in that process: the next session's connect said "Nothing is started or billed yet"
+  while the block ran, its yes started a second block beside it, and a stop before any connect answered `down` and
+  released nothing.
+  - Every billed block request is recorded in the ledger (`block`) before its check is sent. A later server checks the
+    records against the scheduler (one free login-shape read, by the endpoint's marker) before it names, reuses or
+    releases anything.
+  - Connect names the earlier block and says whether a yes would reuse it. A yes on the same terms reuses it; any other
+    yes first asks, naming it, and starts nothing.
+  - A stop with nothing connected runs the whole stop (the handoff and Jobs-mode questions included) on every recorded
+    endpoint: `down` only once the release is confirmed, else `draining`, naming the job and the user's own `scancel`
+    / `squeue -j`.
+  - Only this server's records, or those of a server shown to be gone, are reused or released; any other is named and
+    never touched. An unreadable record fails closed (named; a billed start asks; a cold stop is `draining`). A
+    facility endpoint's records are named unverified. On SSH, a batch row sent by a server that has since died frees
+    its slot after `task_walltime_s` plus a margin.
+  - Still open: `teardown_endpoint` with nothing bound says "no endpoint was up", and a leftover handoff alone needs a
+    connect first.
+- **What the billed Anvil live test of 2026-11-05 found in row sizing and environments** (#248; Slurm 23.11, GPFS, the
+  facility multi-user endpoint), fixed test-first:
+  - **A row's own `srun` runs** (it inherited the block's `SLURM_TRES_PER_TASK` and CPU binding). The step still lands
+    on CPUs Slurm picks within the block, not the row's slot; each result says `srun_steps`.
+  - **"Over its cores" needs evidence:** runnable threads above the row's cores in most of at least three looks, never
+    its idle threads. The memory watch looks every 0.2 s while a row is young or growing fast (a fast row had reached
+    2 GB on a 1 GB slot).
+  - **User commands no longer see hpc-bridge's endpoint venv** as `VIRTUAL_ENV` or on `PATH`, so a bare `pip install`
+    cannot write into it; a user's own venv is kept.
+  - **`module` in an activate line** on a worker shell with no module system sources the site's init first, else the
+    refusal names the fix.
+  - **`memory_gb` is a number everywhere** (1.5 GB → `--mem=1536M`), with one whole-GB rounding rule for the terms and
+    what is sent. `env_failed` reports a pending env's failed build once, on whichever answer meets it first.
+  - **No derived block starts on terms no answer showed.** `run_batch(confirm_spend=True)` starts one only if an answer
+    of this process quoted that block on the same facility, endpoint, partition, account and size; otherwise it quotes
+    it and starts nothing. A batch resumed after a restart re-derives its block and shows it. After a stop, a new
+    batch's yes no longer builds the block and then asks a second yes while it bills.
 - **The login-node pin is chosen from the client's side, and overrides HostName only.** Found by a user driving the
   fake cluster from the host (`hpcb-fake` → `localhost:2222`, a Docker port-forward): the bootstrap pinned
   `$SSH_CONNECTION`'s server field, `172.20.0.7`, a Docker-internal address the Mac cannot reach, and every later
@@ -297,6 +377,15 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
     is cleared from `endpoints.json` (the record kept) when the alias's own host answers, and kept in use through a
     client outage. This also covers a connect that reuses an online endpoint with no SSH at all.
   - **`_tcp_answers` has no default port.** Every probe passes the alias's own port.
+- **What the 2026-11-02 free sweep found** (#243):
+  - **A failed first connect leads with what failed.** Since 0.1.26 (#236) a new laptop's failed SSH probe (NO SSH
+    ACCESS, CANNOT REACH, the pre-auth handoff) opened with the zero-SSH reattach's note; the note now follows.
+  - **`run_batch` trusts a check that just passed**, as `run_shell` does. It forced a second canary moments after
+    `ensure_endpoint_up`'s; under load that one outlived its wait, the live block read as reaped, and the spend was
+    asked again.
+  - **A busy login channel is waited for.** `submit_job`'s admission reads wait up to 30 s for the internal login
+    session; if it is still busy, the answer is the new phase `busy` (`login_channel_busy`): nothing is submitted or
+    refused, and the same call admits later.
 
 ### Testing
 - `tests/test_login_pin_nat.py` (27 tests, red on 49e342e but for 3 controls): the port-forward, the reachable FQDN, ProxyJump and
@@ -322,6 +411,21 @@ tool output and fixed test-first (`tests/test_batch_demo_findings.py`):
   bash 3.2 and 5.2), every cap on the raised cores (a block, a derived block, both of a job's), the derived default
   memory, and the handoff's advice. That makes 34 tests. Five older tests that asserted the old count or
   "15 GB" now assert the raised count and 14.8 GB.
+- **Scripted cells for this release's features:** `batch_rows_overlap`, `batch_cores_fit`, `batch_shared_pool`,
+  `batch_memory_kill`, `batch_needs_sizing_then_sized`, `batch_pilot_proposal`, `batch_size_first_terms`,
+  `batch_gpu_rows` (#246); `env_ssh_build_cache`, `env_ssh_switch` (#247); `batch_row_srun` (#248); `restart_cold_stop`
+  (#250).
+- **Agent cells for row sizing and environments** (#249): eight chains in which a scripted user answers between the
+  free operators' one-shot turns (`batch_sized_by_user`, `batch_asks_user_for_size`, `batch_pilot_agreed`,
+  `batch_memory_kill_resized`, `env_built_for_user`, `env_module_switch`, `env_unbuildable_asks`,
+  `batch_rows_in_user_env`). 21 of 24 on free qwen (pi, hermes21, codex); the one product failure was #250's bug.
+- **The sweep dashboard says what each cell tests** (#242): a square's hover and the failures list show the scenario's
+  `SUMMARY` (else its docstring's first paragraph), and a returning-user cell its factor levels.
+- **CI's pytest runs on both coreutils the node shell meets:** GNU (`ubuntu-24.04`, as on RHEL-family HPC nodes) and
+  uutils (`ubuntu-latest`, Ubuntu 26.04 since 2026-11). #251 pinned the job to 24.04 when 26.04 failed two hermetic
+  tests of node-side shell; #252 fixed both and runs each Python on both. Its regression tests are red on the old
+  code everywhere: a `date` that answers "- -" as uutils does, a `sleep` that refuses another name as uutils' does
+  (the F3 test's fake `srun` is bash under that name now), and a bad state at a skipped local time.
 
 ## 0.1.26 — 2026-10-31 — blocks sized to the work; returning users reattach, repair and get terms the scheduler takes
 
