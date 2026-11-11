@@ -1,5 +1,20 @@
 # Trusting the facility you connect to
 
+## What hpc-bridge holds, and what it never handles
+
+- **One credential: a Globus login** on the machine where your agent runs ([The Globus login](login.md)). After the
+  one-time setup, every command carries a scoped Globus token, never SSH material.
+- **SSH is key-only and used once,** to set up the endpoint on an SSH facility (and again only for a teardown). A
+  facility that runs its own endpoint needs no SSH at all.
+- **Passwords never pass through the agent.** A facility that asks for a one-time code (TOTP or a Duo passcode) at
+  login gets it from you in the chat, single-use. A facility that asks for a password gets nothing: the agent hands
+  you an `ssh` command to run in your own terminal and shares that session.
+- **The agent runs as you** on the login node, so treat what it runs there as you would your own shell.
+
+The rest of this page is about the one thing that crosses the other way: what the facility prints.
+
+## Planted instructions in facility output
+
 hpc-bridge hands the agent what the facility prints: command output, scheduler messages, login banners, and any
 file the agent reads on the cluster. It does not filter that text. So anything that can write to what the agent
 reads can put instructions in front of it, the way a web page can for a browsing agent. That includes the site
