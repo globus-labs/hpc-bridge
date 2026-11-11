@@ -3024,6 +3024,14 @@ async def test_teardown_on_a_one_time_code_facility_asks_for_the_code_before_any
     assert torn == ["eid-1"] and res.status == "down" and app.state.endpoint_id is None
 
 
+def _wait_for_the_ops(monkeypatch) -> None:
+    """The next teardown_endpoint call waits for the ops' own end: the seam is unset, so the 60 s default is only a
+    ceiling. A call that must see the finish never gets 0.05 s: after `release` the task still writes the record on
+    its thread, which a slow runner took past that wait (`tearing_down` where `down` was due: CI, 2026-11-11). The
+    calls before `release` keep 0.05 s — the ops are held, so they cannot finish whatever the machine's speed."""
+    monkeypatch.delenv("HPC_BRIDGE_TEARDOWN_WAIT_S")
+
+
 async def test_teardown_hands_back_tearing_down_when_the_login_node_ops_outlive_the_wait(monkeypatch):
     # Expanse live 2026-09-04: gce stop + delete took ~3 min and the tool call fell into the client's 120 s
     # background rescue. The ops now run in a server-side task: one call waits a bounded time and returns
@@ -3057,6 +3065,7 @@ async def test_teardown_hands_back_tearing_down_when_the_login_node_ops_outlive_
     res = await _teardown_endpoint(app)  # still running: waits again, same answer, does NOT start a second teardown
     assert res.status == "tearing_down" and torn == []
     release.set()
+    _wait_for_the_ops(monkeypatch)
     res = await _teardown_endpoint(app)
     assert res.status == "down" and torn == ["eid-1"] and app.teardown_task is None
     assert "SSH connection to the login node was closed" in res.notice
@@ -3090,6 +3099,7 @@ async def test_finished_teardown_does_not_clear_a_facility_bound_meanwhile(monke
     app.state = EndpointState(endpoint_id="eid-2")  # a connect_facility meanwhile bound a fresh endpoint
     app.shapes["login"] = ShapeRuntime(user_endpoint_config={"provider_type": "LocalProvider"})
     release.set()
+    _wait_for_the_ops(monkeypatch)
     res = await _teardown_endpoint(app)
     assert res.status == "down" and res.endpoint_id == "eid-1"
     assert app.state.endpoint_id == "eid-2" and "login" in app.shapes  # the new binding survives
