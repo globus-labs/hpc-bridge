@@ -1054,8 +1054,11 @@ def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None 
     - `HPCB_UEP <S> <n> <id> <starts> <start> <request> <subscribed> <bad> <shutdown> <lines> <pid> <epoch> <dst>
       <microseconds>` for each user endpoint whose log names block request `n` (a `grep -lF` over this endpoint's user
       endpoint logs, confirmed exactly by awk, `_UEP_AWK`): the bad state's time turned into epoch seconds ON the login
-      node, in its own zone (GNU `date -d`, else BSD `date -j -f`), and `<dst>` 1 when that local time is one a clock
-      change makes ambiguous (the same wall time an hour either side) or it could not be turned at all;
+      node, in its own zone (GNU or uutils `date -d`, else BSD `date -j -f`), and `<dst>` 1 when that local time is one
+      a clock change makes ambiguous (the same wall time an hour either side) or it could not be turned at all — no
+      time to turn (no bad state), or an epoch that does not turn back into that very local time (date's `-d` is
+      lenient: uutils coreutils, Ubuntu 26.04's, reads "- -" as now; uutils and BSD place a skipped hour's time an hour
+      later), with `<epoch>` `-`;
     - `HPCB_PS <S> <id> <count>` (processes whose arguments name `uep.<eid>.<id>`: a user endpoint's title and command
       line do; the list is read before anything names an id, and the script itself names none, so it never counts
       itself), `HPCB_PID <S> <id> none|old|fresh|unknown` (`daemon.pid`, refreshed every 15 s while it lives), and
@@ -1081,11 +1084,18 @@ def _uep_evidence_cmd(eid: str, blocks: Collection[int], *, gap_s: float | None 
     return (
         # (its names stay clear of the session wrapper's `__hb_*`, around which this runs)
         f'r="{_GC_DIR}"; '
-        # a local log time -> "<epoch> <0|1>", 1 when a clock change makes it ambiguous or it cannot be turned at all
-        '_hpcb_ep() { _hpcb_e=$(date -d "$1" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null); '
-        'case "$_hpcb_e" in ""|*[!0-9]*) echo "- 1"; return;; esac; _hpcb_a=0; '
-        'for _hpcb_o in -3600 3600; do _hpcb_t=$(date -d "@$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || '
-        'date -r "$((_hpcb_e + _hpcb_o))" "+%Y-%m-%d %H:%M:%S" 2>/dev/null) || _hpcb_a=1; '
+        # epoch seconds -> the login node's local time (GNU or uutils `date -d @`, else BSD `date -r`)
+        '_hpcb_lt() { date -d "@$1" "+%Y-%m-%d %H:%M:%S" 2>/dev/null || '
+        'date -r "$1" "+%Y-%m-%d %H:%M:%S" 2>/dev/null; }; '
+        # a local log time -> "<epoch> <0|1>", 1 when a clock change makes it ambiguous or it cannot be turned at all.
+        # No time ("- -": no bad state) is never handed to date, and an epoch counts only if it turns back into that
+        # very time: date's -d is lenient — uutils coreutils (Ubuntu 26.04) reads "- -" as now and GNU's as midnight,
+        # and uutils and BSD place a time a spring-forward skips an hour later
+        '_hpcb_ep() { case "$1" in [0-9]*) ;; *) echo "- 1"; return;; esac; '
+        '_hpcb_e=$(date -d "$1" +%s 2>/dev/null || date -j -f "%Y-%m-%d %H:%M:%S" "$1" +%s 2>/dev/null); '
+        'case "$_hpcb_e" in ""|*[!0-9]*) echo "- 1"; return;; esac; '
+        '[ "$(_hpcb_lt "$_hpcb_e")" = "$1" ] || { echo "- 1"; return; }; _hpcb_a=0; '
+        'for _hpcb_o in -3600 3600; do _hpcb_t=$(_hpcb_lt "$((_hpcb_e + _hpcb_o))") || _hpcb_a=1; '
         '[ "$_hpcb_t" = "$1" ] && _hpcb_a=1; done; echo "$_hpcb_e $_hpcb_a"; }; '
         # one user endpoint's process count, pid file and manager-log facts (matched, or with a log that cannot be read)
         f'_hpcb_facts() {{ if [ "$pok" = 1 ]; then c=$(printf "%s\\n" "$pl" | awk -v m="{uep}$1" '

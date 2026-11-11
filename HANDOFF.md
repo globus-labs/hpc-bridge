@@ -18,6 +18,26 @@ internal hostile pbs_mep slices nersc`) and **4 network topologies** (`in_networ
 `HPCB_FAKE_TOPOLOGY`: where the client sits; `topology_roundtrip`) that is now the main regression backbone; the lab
 cluster is the real-hardware check.
 
+## Ubuntu 26.04's coreutils (2026-11-10, branch `fix/ubuntu-2604-node-shell`)
+
+GitHub's `ubuntu-latest` became Ubuntu 26.04, whose coreutils are **uutils 0.10.0** (Rust, one multicall binary);
+two unit tests went red there (#251 pins the pytest job to 24.04 meanwhile — move it back once this merges). Node shell
+must keep working on GNU (RHEL/Rocky, Debian), uutils (Ubuntu 26.04) and BSD/macOS with bash 3.2.
+- **Product** (`scheduler_ops._uep_evidence_cmd`): `date -d` is lenient — uutils reads `- -` (a log with no bad state)
+  as the current time, GNU as today's midnight, both rc 0 — so the stop's two samples disagreed and said "changed
+  while hpc-bridge looked" in place of the real reason. No time goes to date now, and an epoch counts only when it
+  turns back into the log's own time (also refusing a skipped spring-forward time, which uutils and BSD place an hour
+  later). Vault `Modules/scheduler_ops.md`.
+- **Test** (F3's fake srun): `sleep` symlinked as `srun` dies on uutils ("Requested utility `srun` does not match
+  executable name"); the step client is bash under that name now.
+- Reproduced and proven in the local `ubuntu:26.04` image (uv copied out of `hpc-bridge-agentic-pr3`; Python and
+  deps in the throwaway container; tzdata mounted from `debian:bookworm-slim` — the image has none). The pr3 image
+  has no procps: every `ps`-reading node test fails there, on main too.
+- The whole unit tier on 26.04: nothing else of this class. A container needs `--init` (with `sleep infinity` as PID 1
+  a killed test child stays a zombie that `kill -0` still finds), a system `python3`, uv off `bin/run-with-uv`'s
+  probe list, and a writable checkout (`test_bundled_rejects_a_malformed_entry` writes into `tests/`), or tests fail
+  for the container's sake.
+
 ## Batch row sizing (2026-11-04, branch `feat/batch-row-sizing`, PR 2 after the batch demo fixes) — PR #246; all 11 live cells pass
 
 - `run_batch` sizes rows the sbatch way (`cores`, `memory_gb`, `gpus`, `concurrency`; `pin`, `pilot`): with no block the
