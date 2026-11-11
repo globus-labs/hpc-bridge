@@ -5,6 +5,24 @@ installed plugin only when that version changes); git tags mark releases.
 
 ## Unreleased
 
+### Fixed
+- **A batch row's memory kill now kills a child that left the row's process group, off Linux too.** `__hb_kill` listed
+  the row's processes after it had signalled the group. That signal ended the row's shell, which woke the wrapper. The
+  wrapper then TERMed the watcher while it was still listing, so the child that had left the group was never signalled.
+  On Linux the cleanup found it by the row's token (a TERM-ignoring one 5 s late). On macOS/BSD nothing did, and the
+  400 MB child slept on after the row reported `why: memory`. The set is now listed first, and a watcher that has
+  decided to kill ignores the wrapper's TERM until it is done (vault `Modules/batch.md`).
+
+### Testing
+- **Six timing-sensitive tests no longer depend on the machine's speed** (load-flaky on CI's py3.14 jobs, 2026-11-11).
+  - Three teardown tests (`test_server.py`, `test_plugin_review_fixes.py`): a call that must see the ops finish
+    waits for them, the 60 s default only a ceiling. A 0.05 s wait lost to the record's write on its thread.
+  - The peak-RSS row (`test_batch_sizing.py`) runs until the watch has looked (`.peak`) and it has used 0.5 CPU-s by
+    its own `times`; `wall_s` is bounded by the wrapper's observed life, not 10 s.
+  - W3 (`test_batch_sizing_r1.py`) checks the child is gone, not the wrapper's time; red on macOS before the fix above.
+    R2's worst case (`test_batch_demo_findings.py`) is now a child no kill can find, since the fix kills the old one.
+  - The slow login profile (`test_endpoint_venv_build.py`) is slow on bash's `SECONDS`, not a sleep past a 1 s deadline.
+
 ## 0.1.27 — 2026-11-11 — batches, sized rows and environments; a block asks for the cores its memory needs; an earlier session's block is named, reused or released
 
 ### Added

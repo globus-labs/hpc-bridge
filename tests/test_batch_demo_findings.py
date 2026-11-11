@@ -471,8 +471,10 @@ def test_r2_fairness_order_is_the_same_for_every_reader_and_two_waiters_never_de
 def test_r2_the_wrapper_holds_its_worker_no_longer_than_its_own_arithmetic_says(tmp_path):
     """The worker is free task_walltime_s + WRAPPER_TAIL_S after the task starts, by the wrapper's own arithmetic: the
     watcher's poll, the kill grace twice (the watcher's TERM->KILL wait, the cleanup's) and the reader grace twice. A
-    command that ignores TERM and leaves a child in its own process group holding stdout is that worst case (round 1's
-    bound, 7 s, had been short of it; and it had depended on the configurable admission margin)."""
+    command that ignores TERM and leaves holding stdout a child no kill can find — in a group of its own, out of the
+    row's tree (its parent subshell gone) and without the row's token — is that worst case (round 1's bound, 7 s, had
+    been short of it; and it had depended on the configurable admission margin). A child of the row's own shell no
+    longer is: the watcher lists the row before it signals the group, so it is killed with the shell."""
     import os
     import signal
 
@@ -482,7 +484,7 @@ def test_r2_the_wrapper_holds_its_worker_no_longer_than_its_own_arithmetic_says(
     rd = tmp_path / "rd"
     pidf = tmp_path / "esc.pid"
     wall = 1
-    cmd = f"trap '' TERM; set -m; sleep 40 & echo $! > {pidf}; sleep 40"
+    cmd = f"trap '' TERM; set -m; ( env -u HPCB_ROW_TOKEN sleep 40 & echo $! > {pidf} ); sleep 40"
     script = batch.task_script(cmd, results_dir=str(rd), index=0, attempt=1, task_walltime_s=wall)
     try:
         _run_wrapper(script, {}, tmp_path)

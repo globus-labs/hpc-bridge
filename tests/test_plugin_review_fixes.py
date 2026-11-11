@@ -34,7 +34,7 @@ from hpc_bridge.server import AppCtx, ShapeRuntime, _idle_release_s
 from hpc_bridge.state import EndpointRecord, LoginNodeStore
 from tests.fakes import FakeCatalog, FakeFacility, fake_entry
 from tests.test_remote_facility import _BootstrapCLI, _no_endpoints, _profile
-from tests.test_server import _FakeRunner, _Res
+from tests.test_server import _FakeRunner, _Res, _wait_for_the_ops
 
 ALIAS = "anvil.rcac.purdue.edu"
 HOUR = estimate_spend(3600, 1, 1.0)
@@ -486,6 +486,7 @@ async def test_a_stale_gate_result_is_not_replayed_after_the_code(monkeypatch, t
     gate.set()
     await app.teardown_task  # the code request lands with nobody waiting
     alive["v"], app.pending_preauth, app.preauth_resume = True, None, None  # complete_preauth succeeded
+    _wait_for_the_ops(monkeypatch)  # the fresh teardown's own end: a thread hop and the record's write, then `down`
     assert (await server._teardown_endpoint(app)).status == "down"
 
 

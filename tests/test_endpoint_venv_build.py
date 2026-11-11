@@ -990,11 +990,14 @@ async def test_real_the_teardown_search(box):
     assert vs.calls(box) == []  # never a build
 
 
-async def test_real_a_slow_login_profile_does_not_eat_the_search(box, monkeypatch):
-    # SECONDS counts from the shell's start: a login profile slower than the deadline used to skip every candidate
-    monkeypatch.setattr(ev, "_FIND_DEADLINE_S", 1)
+async def test_real_a_slow_login_profile_does_not_eat_the_search(box):
+    # SECONDS counts from the shell's start: a login profile slower than the deadline used to skip every candidate.
+    # The profile is slow on bash's own clock — it sets SECONDS ten deadlines on, as that many seconds of profile
+    # would — not by sleeping past a 1 s deadline: whole seconds tick, so a loaded machine whose loop start fell on
+    # a tick read 1 and tried nothing (load-flaky). The real deadline then holds the search, not the machine's speed.
     vs.venv(box, box["key"], PIN)
-    (box["home"] / ".bash_profile").write_text(f'sleep 2; export PATH="{box["stub"]}:/usr/bin:/bin"\n')
+    (box["home"] / ".bash_profile").write_text(
+        f'SECONDS={10 * ev._FIND_DEADLINE_S}; export PATH="{box["stub"]}:/usr/bin:/bin"\n')
     assert (await ev.find_working(_shell(box), box["mv"])).cli == str(box["key"])
 
 
