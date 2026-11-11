@@ -1,8 +1,5 @@
 <p align="center">
-  <picture>
-    <source media="(prefers-color-scheme: dark)" srcset="https://raw.githubusercontent.com/globus-labs/hpc-bridge/main/docs/media/wordmark-dark.png">
-    <img src="https://raw.githubusercontent.com/globus-labs/hpc-bridge/main/docs/media/wordmark.png" alt="hpc-bridge" width="400">
-  </picture>
+  <img src="https://raw.githubusercontent.com/globus-labs/hpc-bridge/main/docs/media/wordmark.png" alt="hpc-bridge" width="400">
 </p>
 
 <p align="center"><b>Drive a supercomputer from your coding agent.</b><br>
