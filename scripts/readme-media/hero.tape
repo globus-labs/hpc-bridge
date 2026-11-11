@@ -51,6 +51,11 @@ Enter
 Hide
 # wait:start
 Sleep 20s
+# The start-up banner (model, plan, any promo) has no setting to hide it: clear it off camera.
+Type "/clear"
+Sleep 300ms
+Enter
+Sleep 3s
 Show
 Sleep 1.2s
 
@@ -76,8 +81,9 @@ Sleep 240s
 Show
 Sleep 5s
 
-# 4. Release the block (cut until the agent has said so).
-Type "Release the block."
+# 4. Make sure nothing is left billing (the agent usually releases the block once the rows are done; asked either way,
+#    it says so, or releases it). Cut until it has answered.
+Type "Is anything still billing?"
 Sleep 300ms
 Enter
 Sleep 2s

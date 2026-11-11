@@ -115,11 +115,20 @@ for f in ("~/.claude/settings.json", "~/.claude/settings.local.json"):
         pass
 off = {name: False for name in enabled}
 off["hpc-bridge@hpc-bridge"] = False
-json.dump({"enabledPlugins": off, "spinnerTipsEnabled": False}, open(sys.argv[1], "w"), indent=1)
+# What a viewer of the README should see is the session, not this machine's: no auto memory (read or written), no
+# suggested next prompt, no background-agents hint, no turn timings, one plain spinner word (Claude Code settings
+# reference; every key holds for this session only, through --settings).
+json.dump({"enabledPlugins": off, "spinnerTipsEnabled": False, "autoMemoryEnabled": False,
+           "promptSuggestionEnabled": False, "disableAgentView": True, "showTurnDuration": False,
+           "spinnerVerbs": {"mode": "replace", "verbs": ["Working"]}},
+          open(sys.argv[1], "w"), indent=1)
 print("plugins off for the session:", ", ".join(sorted(off)))
 PY
   export HPC_BRIDGE_STATE_DIR="$STATE" HPCB_DEMO_DIR="$DEMO" HPCB_PLUGIN_DIR="$REPO"
   export HPCB_SETTINGS="$1/session-settings.json" HPCB_ALLOW="$ALLOW" HPCB_DENY="$DENY" DISABLE_AUTOUPDATER=1
+  # The env twins of the settings above (they win over a setting), set after the CLAUDE* markers were cleared: no auto
+  # memory loaded or written, no suggested prompt, no working directory in the logo, no email or org in the header.
+  export CLAUDE_CODE_DISABLE_AUTO_MEMORY=1 CLAUDE_CODE_ENABLE_PROMPT_SUGGESTION=false CLAUDE_CODE_HIDE_CWD=1 IS_DEMO=1
 }
 
 with_waits() {  # $1: the tape, $2: the env prefix (HERO_WAIT_ or WARM_WAIT_): each `# wait:<name>` Sleep from the env
